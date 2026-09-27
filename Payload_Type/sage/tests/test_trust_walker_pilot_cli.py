@@ -2238,7 +2238,22 @@ def _replayed_improvement_pair(contract, order, *, ledger, candidate_metric=True
             "arm": arm,
             "objective_disposition": "proven",
             "measurement_identity_complete": True,
-            "measurement_identity": {"source_version": pair_contract.source_identity_for_arm(arm)},
+            "measurement_identity": {
+                "protocol_id": "synthetic-improvement-v1",
+                "pair_id": f"synthetic-{ledger[:8]}",
+                "logical_seed": 1,
+                "policy_arm": arm,
+                "model_provider": "synthetic-provider",
+                "model_id": "synthetic-model",
+                "model_version": "synthetic-model-v1",
+                "backend_route": "synthetic-route",
+                "generation_config": {"temperature": 0},
+                "wrapper_id": "synthetic-wrapper",
+                "wrapper_revision": "synthetic-wrapper-v1",
+                "authority_mode": "auto",
+                "execution_path": "synthetic-native-replay",
+                "source_version": pair_contract.source_identity_for_arm(arm),
+            },
         }
         for arm in order
     ]
@@ -2265,6 +2280,42 @@ def _replayed_improvement_pair(contract, order, *, ledger, candidate_metric=True
     }
 
 
+def _supervised_comparison_input(contract, *, margin="1/7"):
+    cases = cli.operator_replay_benchmark.load_cases()
+    baseline = {
+        case.id: json.dumps(case.expected.dry_run_answer())
+        for case in cases
+    }
+    candidate = dict(baseline)
+    degraded = cases[0].expected.dry_run_answer()
+    degraded["capability"] = "wrong-capability"
+    candidate[cases[0].id] = json.dumps(degraded)
+    model_binding = {
+        "model_provider": "synthetic-provider",
+        "model_id": "synthetic-model",
+        "model_version": "synthetic-model-v1",
+        "backend_route": "synthetic-route",
+        "generation_config": {"temperature": 0},
+        "wrapper_id": "synthetic-wrapper",
+        "wrapper_revision": "synthetic-wrapper-v1",
+        "authority_mode": "auto",
+        "execution_path": "synthetic-native-replay",
+    }
+    return {
+        "cases": [case.to_dict() for case in cases],
+        "baseline_proposals": baseline,
+        "candidate_proposals": candidate,
+        "noninferiority_margin": margin,
+        "source_binding": {
+            "baseline_source_identity": contract.baseline_source_identity,
+            "candidate_source_identity": contract.candidate_source_identity,
+            "baseline_model_binding": model_binding,
+            "candidate_model_binding": model_binding,
+            "cases_hash": cli.operator_replay_benchmark.cases_hash(cases),
+        },
+    }
+
+
 def test_improvement_reducer_accepts_only_two_order_balanced_threshold_passing_native_replays():
     contract = cli.ImprovementContract("a" * 64, "b" * 64)
     result = cli.reduce_improvement_replays([
@@ -2274,6 +2325,107 @@ def test_improvement_reducer_accepts_only_two_order_balanced_threshold_passing_n
 
     assert result["disposition"] == "accept"
     assert result["meaningful_effect_met_in_both_pairs"] is True
+    assert result["auto_only_development"] is True
+    assert result["overall_improvement_allowed"] is False
+    assert result["supervised_proposal_quality"] is None
+
+
+def test_improvement_reducer_requires_source_model_case_bound_supervised_quality_for_overall_claim():
+    contract = cli.ImprovementContract("a" * 64, "b" * 64)
+    pairs = [
+        _replayed_improvement_pair(contract, cli.IMPROVEMENT_ARM_ORDER, ledger="1" * 64),
+        _replayed_improvement_pair(contract, tuple(reversed(cli.IMPROVEMENT_ARM_ORDER)), ledger="2" * 64),
+    ]
+
+    result = cli.reduce_improvement_replays(
+        pairs,
+        contract.to_record(),
+        _supervised_comparison_input(contract),
+    )
+
+    assert result["disposition"] == "accept"
+    assert result["supervised_proposal_quality"]["supervised_quality"]["noninferiority_passed"] is True
+    assert result["overall_improvement_allowed"] is True
+
+
+def test_improvement_reducer_rejects_overall_claim_when_supervised_quality_exceeds_margin():
+    contract = cli.ImprovementContract("a" * 64, "b" * 64)
+    pairs = [
+        _replayed_improvement_pair(contract, cli.IMPROVEMENT_ARM_ORDER, ledger="1" * 64),
+        _replayed_improvement_pair(contract, tuple(reversed(cli.IMPROVEMENT_ARM_ORDER)), ledger="2" * 64),
+    ]
+
+    result = cli.reduce_improvement_replays(
+        pairs,
+        contract.to_record(),
+        _supervised_comparison_input(contract, margin="0"),
+    )
+
+    assert result["disposition"] == "accept"
+    assert result["supervised_proposal_quality"]["supervised_quality"]["noninferiority_passed"] is False
+    assert result["overall_improvement_allowed"] is False
+
+
+@pytest.mark.parametrize("mutation, reason", [
+    ("baseline_source", "source binding differs"),
+    ("model_binding", "model binding differs"),
+    ("cases_hash", "case binding differs"),
+])
+def test_improvement_reducer_refuses_supervised_source_model_or_corpus_binding_mismatch(mutation, reason):
+    contract = cli.ImprovementContract("a" * 64, "b" * 64)
+    pairs = [
+        _replayed_improvement_pair(contract, cli.IMPROVEMENT_ARM_ORDER, ledger="1" * 64),
+        _replayed_improvement_pair(contract, tuple(reversed(cli.IMPROVEMENT_ARM_ORDER)), ledger="2" * 64),
+    ]
+    supervised = _supervised_comparison_input(contract)
+    if mutation == "baseline_source":
+        supervised["source_binding"]["baseline_source_identity"] = "c" * 64
+    elif mutation == "model_binding":
+        supervised["source_binding"]["candidate_model_binding"] = {
+            **supervised["source_binding"]["candidate_model_binding"],
+            "model_id": "different-model",
+        }
+    else:
+        supervised["source_binding"]["cases_hash"] = "0" * 64
+
+    with pytest.raises(cli.PilotError, match=reason):
+        cli.reduce_improvement_replays(pairs, contract.to_record(), supervised)
+
+
+@pytest.mark.parametrize(("margin", "overall_allowed"), [("1/7", True), ("0", False)])
+def test_summarize_improvement_cli_replays_supervised_comparison_and_allows_bound_result(
+    tmp_path, monkeypatch, capsys, margin, overall_allowed,
+):
+    contract = cli.ImprovementContract("a" * 64, "b" * 64)
+    pairs = {
+        "first": _replayed_improvement_pair(contract, cli.IMPROVEMENT_ARM_ORDER, ledger="1" * 64),
+        "second": _replayed_improvement_pair(
+            contract, tuple(reversed(cli.IMPROVEMENT_ARM_ORDER)), ledger="2" * 64,
+        ),
+    }
+    comparison_path = tmp_path / "supervised-comparison.json"
+    comparison_path.write_text(json.dumps(_supervised_comparison_input(contract, margin=margin)), encoding="utf-8")
+    monkeypatch.setattr(
+        cli,
+        "replay_pair",
+        lambda path: pairs["first" if Path(path).name == "first" else "second"],
+    )
+
+    assert cli.main([
+        "summarize-improvement",
+        "--pair-one-artifact-dir", str(tmp_path / "first"),
+        "--pair-two-artifact-dir", str(tmp_path / "second"),
+        "--supervised-comparison", str(comparison_path),
+        "--baseline-source-identity", contract.baseline_source_identity,
+        "--candidate-source-identity", contract.candidate_source_identity,
+    ]) == 0
+    report = json.loads(capsys.readouterr().out)
+
+    assert report["disposition"] == "accept"
+    assert report["overall_improvement_allowed"] is overall_allowed
+    assert report["supervised_proposal_quality"]["corpus"]["cases_hash"] == (
+        _supervised_comparison_input(contract, margin=margin)["source_binding"]["cases_hash"]
+    )
 
 
 def test_improvement_reducer_direction_neutrally_rejects_flat_candidate():

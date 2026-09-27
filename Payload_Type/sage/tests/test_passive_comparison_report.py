@@ -100,6 +100,38 @@ def test_labeled_cli_may_render_the_explicitly_descriptive_comparison(tmp_path, 
     report = json.loads(capsys.readouterr().out)
     assert report["measurement"]["performance_assertion_allowed"] is True
     assert "bare_outcomes" in report["comparison"]
+    assert report["measurement_scope"] == "development"
+    assert report["headline_lift_allowed"] is False
+
+
+def test_forged_final_metadata_cannot_turn_a_development_comparison_into_a_headline(tmp_path, capsys):
+    rows = [result("bare", "disproven"), result("harness", "proven")]
+    for row in rows:
+        label = _label(row["side"])
+        row["measurement_identity"] = label
+        row["card"]["measurement_identity"] = label
+        row["source_case_id"] = "dev-case-1"
+    source = tmp_path / "labeled-results.jsonl"
+    source.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+    forged = tmp_path / "forged-final.json"
+    forged.write_text(json.dumps({
+        "split_registry_id": "forged-registry", "release_cohort_id": "forged-release",
+        "cohort_id": "final-1", "report_id": "report-1", "receipt_history_complete": True,
+        "cohorts": [{
+            "cohort_id": "final-1", "role": "final_audit", "topology_cluster_id": "final-cluster",
+            "source_case_ids": ["final-case-1"], "semantic_source_ids": ["final-source"],
+            "prospective_budget_id": "final-budget", "prospective_case_budget": 1,
+        }],
+        "semantic_ancestry": [{"source_id": "final-source"}],
+        "split_use_history": [],
+    }), encoding="utf-8")
+
+    assert reporter.main(["--results", str(source), "--scenario", "fixture", "--headline-audit", str(forged)]) == 2
+    report = json.loads(capsys.readouterr().out)
+    assert report["comparison"]["harness_outcomes"]["proven"] == 1
+    assert report["headline_lift_allowed"] is False
+    assert report["measurement_scope"] == "headline_request_refused"
+    assert "headline_producer_origin_unbound" in report["headline_lift_reason_codes"]
 
 
 def test_summary_selects_only_admitted_amendment_heads_and_excludes_burned_rows():

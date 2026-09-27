@@ -138,6 +138,33 @@ def comparison_labels(identities: Any) -> dict[str, Any]:
     return {**labels, "performance_assertion_allowed": not failures, "identity_failures": failures}
 
 
+def reporting_scope(
+    reduced_result: Mapping[str, Any],
+    *,
+    reducer_name: str,
+    headline_request: Mapping[str, Any] | None = None,
+    producer_case_ids: tuple[str, ...] | list[str] | None = None,
+    producer_origins: tuple[Mapping[str, Any], ...] | list[Mapping[str, Any]] | None = None,
+    history_source_bound: bool = False,
+) -> dict[str, Any]:
+    """Mark ordinary measurements as development-only unless a final receipt qualifies.
+
+    This is intentionally separate from ``measurement_identity``: legacy M1 labels
+    remain byte-for-byte valid, while a headline needs additional M2-only metadata.
+    """
+
+    from .evaluation_foundation import headline_lift_decision
+
+    return headline_lift_decision(
+        reduced_result,
+        reducer_name=reducer_name,
+        headline_request=headline_request,
+        producer_case_ids=producer_case_ids,
+        producer_origins=producer_origins,
+        history_source_bound=history_source_bound,
+    ).to_dict()
+
+
 def _load_script(name: str):
     path = ROOT / "skills/sage-eval-gauge/scripts" / f"{name}.py"
     spec = importlib.util.spec_from_file_location(f"_claims_{name}", path)
@@ -149,7 +176,7 @@ def _load_script(name: str):
 
 def _reduce(name: str, inputs: dict[str, Any]) -> Any:
     # No user-supplied import name or executable path is accepted here.
-    from . import fitness, composite_gauge, gate_experiment
+    from . import fitness, composite_gauge, gate_experiment, operator_replay_benchmark
     reducers = {
         "canonical_row": fitness.canonical_row_verdict,
         "canonical_aggregate": fitness.canonical_aggregate_verdict,
@@ -164,6 +191,10 @@ def _reduce(name: str, inputs: dict[str, Any]) -> Any:
         result = _load_script("run_trust_walker_pilot").replay_pair(**inputs)
     elif name == "comparison":
         result = _load_script("summarize_comparison").summarize(**inputs)
+    elif name == "headline_lift":
+        result = reporting_scope(**inputs, history_source_bound=True)
+    elif name == "supervised_noninferiority":
+        result = operator_replay_benchmark.supervised_noninferiority_report(**inputs)
     elif name == "trust_walker_batch":
         result = reduce_trust_walker_batch(**inputs)
     elif name == "trust_walker_improvement":
@@ -191,7 +222,8 @@ def _reduce(name: str, inputs: dict[str, Any]) -> Any:
 
 REDUCERS = ("canonical_row", "canonical_aggregate", "composite_row", "composite_report",
             "comparison", "scorecard", "noise_floor", "gate_experiment",
-            "trust_walker_pair", "trust_walker_batch", "trust_walker_improvement", "capability_effect")
+            "trust_walker_pair", "trust_walker_batch", "trust_walker_improvement", "capability_effect",
+            "headline_lift", "supervised_noninferiority")
 
 
 def replay_capability_effect(effect: str, evidence: dict, *, expected_target: str,
@@ -451,6 +483,26 @@ def verify_claims(path: str | Path) -> dict[str, Any]:
                 raise ClaimError("gate aggregate labels differ from its ScoreCard claims")
         if claim["reducer"] == "composite_report" and identity != [row.get("identity") for row in inputs.get("records", [])]:
             raise ClaimError("composite report labels differ from its row identities")
+        if claim["reducer"] == "headline_lift":
+            raw_inputs = claim["inputs"]
+            result_ref = raw_inputs.get("reduced_result") if isinstance(raw_inputs, dict) else None
+            case_ref = raw_inputs.get("producer_case_ids") if isinstance(raw_inputs, dict) else None
+            origin_ref = raw_inputs.get("producer_origins") if isinstance(raw_inputs, dict) else None
+            if (not isinstance(result_ref, dict) or set(result_ref) != {"claim", "pointer"}
+                    or result_ref.get("pointer") != "/result"
+                    or result_ref.get("claim") not in reducer_by_id
+                    or reducer_by_id.get(result_ref.get("claim")) == "headline_lift"):
+                raise ClaimError("headline lift requires one recomputed producer result")
+            if (not isinstance(case_ref, dict) or set(case_ref) != {"claim", "pointer"}
+                    or case_ref.get("claim") != result_ref.get("claim")
+                    or case_ref.get("pointer") != "/result/producer_case_ids"):
+                raise ClaimError("headline lift requires producer-derived case IDs")
+            if (not isinstance(origin_ref, dict) or set(origin_ref) != {"claim", "pointer"}
+                    or origin_ref.get("claim") != result_ref.get("claim")
+                    or origin_ref.get("pointer") != "/result/producer_origins"):
+                raise ClaimError("headline lift requires producer-derived origin metadata")
+            if identity != identities[result_ref["claim"]]:
+                raise ClaimError("headline lift labels differ from its recomputed producer")
         # Paths for native replay are bound to the retained pilot ledger itself,
         # not taken from an arbitrary executable or a live command recipe.
         if claim["reducer"] == "trust_walker_pair":

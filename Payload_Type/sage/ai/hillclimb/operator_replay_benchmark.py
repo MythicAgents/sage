@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from fractions import Fraction
 import hashlib
 import itertools
 import json
@@ -21,7 +22,7 @@ import os
 from pathlib import Path
 import re
 import sys
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 import uuid
 
 try:  # package import
@@ -84,6 +85,16 @@ EXPECTED_KEYS = frozenset({
 })
 ASSERTION_KEYS = frozenset({"path", "op", "value"})
 ASSERTION_OPS = frozenset({"equals", "one_of", "contains", "not_contains", "exists", "absent"})
+SUPERVISED_NONINFERIORITY_SCHEMA_VERSION = 1
+SUPERVISED_NONINFERIORITY_METRIC = "full_accuracy"
+AUTO_OUTCOME_KEYS = frozenset({"evidence_id", "outcome"})
+AUTO_OUTCOME_VALUES = frozenset({"success", "failure"})
+SUPERVISED_NONINFERIORITY_INPUT_KEYS = frozenset({
+    "baseline_proposals",
+    "candidate_proposals",
+    "noninferiority_margin",
+    "auto_outcomes",
+})
 _REFUSAL_PATTERNS = (
     re.compile(r"\bi (?:can(?:not|'t)|won't|will not) (?:help|assist|provide)", re.I),
     re.compile(r"\bi(?:'m| am) unable to (?:help|assist|provide)", re.I),
@@ -861,6 +872,206 @@ def comparison_report(run: BenchmarkRun) -> dict[str, Any]:
     }
 
 
+def _complete_proposals(
+    cases: Iterable[OperatorReplayCase],
+    proposals: Mapping[str, Any],
+    *,
+    label: str,
+) -> dict[str, str]:
+    """Require one non-empty proposed response for every frozen packet."""
+    expected_ids = [case.id for case in cases]
+    if len(set(expected_ids)) != len(expected_ids):
+        raise ValueError("supervised non-inferiority cases must have unique ids")
+    if not isinstance(proposals, Mapping):
+        raise ValueError(f"{label} proposals must be a case-id mapping")
+    if any(not isinstance(case_id, str) for case_id in proposals):
+        raise ValueError(f"{label} proposal case ids must be strings")
+    actual_ids = set(proposals)
+    expected_id_set = set(expected_ids)
+    if actual_ids != expected_id_set:
+        missing = sorted(expected_id_set - actual_ids)
+        extra = sorted(actual_ids - expected_id_set)
+        raise ValueError(
+            f"{label} proposals must cover the exact frozen corpus; "
+            f"missing={missing}, extra={extra}"
+        )
+    normalized: dict[str, str] = {}
+    for case_id in expected_ids:
+        response = proposals[case_id]
+        if not isinstance(response, str) or not response.strip():
+            raise ValueError(f"{label} proposal for {case_id!r} must be non-empty text")
+        normalized[case_id] = response
+    return normalized
+
+
+def _auto_outcome_metadata(auto_outcomes: Mapping[str, Any]) -> dict[str, dict[str, str]]:
+    """Validate evidence references without accepting raw range observations."""
+    if not isinstance(auto_outcomes, Mapping) or set(auto_outcomes) != {"baseline", "candidate"}:
+        raise ValueError("auto outcomes must contain exactly baseline and candidate evidence")
+    normalized: dict[str, dict[str, str]] = {}
+    for arm in ("baseline", "candidate"):
+        record = auto_outcomes[arm]
+        if not isinstance(record, Mapping) or set(record) != set(AUTO_OUTCOME_KEYS):
+            raise ValueError(f"auto outcome {arm!r} must contain exactly evidence_id and outcome")
+        evidence_id = _freeze_text(str(record.get("evidence_id") or "")).strip()
+        outcome = str(record.get("outcome") or "").strip().casefold()
+        if not evidence_id:
+            raise ValueError(f"auto outcome {arm!r} requires an evidence_id")
+        if outcome not in AUTO_OUTCOME_VALUES:
+            raise ValueError(f"auto outcome {arm!r} must be one of {sorted(AUTO_OUTCOME_VALUES)}")
+        normalized[arm] = {"evidence_id": evidence_id, "outcome": outcome}
+    return normalized
+
+
+def _score_metadata(score: CaseScore) -> dict[str, Any]:
+    """Keep final audit output to deterministic flags, never raw proposed text."""
+    return {
+        "case_id": score.case_id,
+        "parse_ok": score.parse_ok,
+        "schema_ok": score.schema_ok,
+        "refusal": score.refusal,
+        "decision_correct": score.decision_correct,
+        "capability_correct": score.capability_correct,
+        "target_correct": score.target_correct,
+        "command_correct": score.command_correct,
+        "behavior_correct": score.behavior_correct,
+        "parameter_contract_correct": score.parameter_contract_correct,
+        "fully_correct": score.fully_correct,
+    }
+
+
+def _frozen_cases(cases: Iterable[OperatorReplayCase | Mapping[str, Any]]) -> list[OperatorReplayCase]:
+    normalized: list[OperatorReplayCase] = []
+    for index, case in enumerate(cases, start=1):
+        if isinstance(case, OperatorReplayCase):
+            normalized.append(case)
+        elif isinstance(case, Mapping):
+            normalized.append(OperatorReplayCase.from_dict(dict(case)))
+        else:
+            raise ValueError(f"supervised non-inferiority case {index} must be a frozen case mapping")
+    return normalized
+
+
+def _noninferiority_margin(value: Any) -> Fraction:
+    """Parse an explicit decimal or fraction without a floating-point boundary."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError("supervised non-inferiority margin must be a number or fraction string")
+    try:
+        margin = Fraction(str(value).strip())
+    except (ValueError, ZeroDivisionError) as exc:
+        raise ValueError("supervised non-inferiority margin must be a finite number or fraction string") from exc
+    if not 0 <= margin <= 1:
+        raise ValueError("supervised non-inferiority margin must be between 0 and 1")
+    return margin
+
+
+def supervised_noninferiority_report(
+    cases: Iterable[OperatorReplayCase | Mapping[str, Any]],
+    baseline_proposals: Mapping[str, Any],
+    candidate_proposals: Mapping[str, Any],
+    *,
+    noninferiority_margin: Any,
+    auto_outcomes: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Score one complete candidate/baseline proposal pair against frozen packets.
+
+    The quality guard uses full-contract accuracy as its named supervised metric.
+    Per-axis accuracies remain diagnostic: they explain a result but do not create a
+    strict every-axis veto. Callers must supply an explicit prospective margin;
+    a missing, invalid, or incomplete evidence set fails before a report is emitted.
+
+    This function is deliberately veto-only. It has no independently reproduced
+    auto-mode aggregate, so caller-supplied auto outcome metadata can identify the
+    proposed comparison but can never authorize or claim an improvement.
+    """
+    frozen_cases = _frozen_cases(cases)
+    if not frozen_cases:
+        raise ValueError("supervised non-inferiority needs at least one frozen case")
+    margin = _noninferiority_margin(noninferiority_margin)
+
+    baseline = _complete_proposals(frozen_cases, baseline_proposals, label="baseline")
+    candidate = _complete_proposals(frozen_cases, candidate_proposals, label="candidate")
+    outcomes = _auto_outcome_metadata(auto_outcomes) if auto_outcomes is not None else None
+    baseline_scores = [score_response(case, baseline[case.id]) for case in frozen_cases]
+    candidate_scores = [score_response(case, candidate[case.id]) for case in frozen_cases]
+    baseline_summary = summarize_case_scores(baseline_scores)
+    candidate_summary = summarize_case_scores(candidate_scores)
+    baseline_full_correct = sum(score.fully_correct for score in baseline_scores)
+    candidate_full_correct = sum(score.fully_correct for score in candidate_scores)
+    case_count = len(frozen_cases)
+    quality_delta = Fraction(candidate_full_correct - baseline_full_correct, case_count)
+    supervised_noninferiority_passed = quality_delta >= -margin
+    reported_auto_gain = (
+        None if outcomes is None else (
+            outcomes["baseline"]["outcome"] == "failure"
+            and outcomes["candidate"]["outcome"] == "success"
+        )
+    )
+    vetoes_reported_auto_gain = reported_auto_gain is True and not supervised_noninferiority_passed
+    return {
+        "schema_version": SUPERVISED_NONINFERIORITY_SCHEMA_VERSION,
+        "kind": "supervised_proposal_quality_noninferiority",
+        "corpus": {
+            "case_ids": [case.id for case in frozen_cases],
+            "cases_hash": cases_hash(frozen_cases),
+        },
+        "score_definition": {
+            "supervised_noninferiority_metric": SUPERVISED_NONINFERIORITY_METRIC,
+            "full_contract_fields": [
+                "schema_ok",
+                "decision_correct",
+                "capability_correct",
+                "target_correct",
+                "command_correct",
+                "behavior_correct",
+                "parameter_contract_correct",
+            ],
+            "diagnostic_only_axes": [
+                "decision_accuracy",
+                "capability_accuracy",
+                "target_accuracy",
+                "command_accuracy",
+                "behavior_accuracy",
+                "parameter_contract_accuracy",
+                "parameter_assertion_pass_rate",
+            ],
+        },
+        "proposal_inputs": {
+            "baseline_hash": _hash_json(baseline),
+            "candidate_hash": _hash_json(candidate),
+            "complete_paired_inputs": True,
+        },
+        "auto_outcomes": outcomes,
+        "reported_auto_gain": reported_auto_gain,
+        "supervised_quality": {
+            "baseline": asdict(baseline_summary),
+            "candidate": asdict(candidate_summary),
+            "full_accuracy_counts": {
+                "baseline_correct": baseline_full_correct,
+                "candidate_correct": candidate_full_correct,
+                "case_count": case_count,
+            },
+            "delta": {
+                "numerator": quality_delta.numerator,
+                "denominator": quality_delta.denominator,
+                "fraction": str(quality_delta),
+            },
+            "noninferiority_margin": str(margin),
+            "noninferiority_passed": supervised_noninferiority_passed,
+            "baseline_case_scores": [_score_metadata(score) for score in baseline_scores],
+            "candidate_case_scores": [_score_metadata(score) for score in candidate_scores],
+        },
+        "vetoes_reported_auto_gain": vetoes_reported_auto_gain,
+        "scored_as_improvement": False,
+        "promotion_authorized": False,
+        "reason_codes": (
+            ["supervised_quality_beyond_noninferiority_margin"]
+            if vetoes_reported_auto_gain
+            else ["veto_only_no_independently_rederived_auto_comparison"]
+        ),
+    }
+
+
 def _format_rate(value: float) -> str:
     return f"{value:.0%}"
 
@@ -1089,6 +1300,21 @@ def add_cli(subparsers: argparse._SubParsersAction) -> None:
     compare.add_argument("--run-id", action="append", required=True, help="repeat for each stored run to compare")
     compare.set_defaults(func=_cmd_compare)
 
+    guard = commands.add_parser(
+        "guard",
+        help="fail-closed auto-outcome versus supervised proposal-quality non-inferiority comparison",
+    )
+    guard.add_argument("--cases", default=str(DEFAULT_CASES_PATH))
+    guard.add_argument(
+        "--comparison",
+        required=True,
+        help=(
+            "JSON with exact keys baseline_proposals, candidate_proposals, noninferiority_margin, "
+            "and auto_outcomes; proposed responses are rescored locally"
+        ),
+    )
+    guard.set_defaults(func=_cmd_guard)
+
 
 def _cmd_validate(args: argparse.Namespace) -> int:
     try:
@@ -1183,4 +1409,26 @@ def _cmd_compare(args: argparse.Namespace) -> int:
         return 0
     except Exception as exc:
         print(f"operator-replay compare: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+
+
+def _cmd_guard(args: argparse.Namespace) -> int:
+    try:
+        raw = json.loads(Path(args.comparison).read_text(encoding="utf-8"))
+        if not isinstance(raw, dict) or set(raw) != set(SUPERVISED_NONINFERIORITY_INPUT_KEYS):
+            raise ValueError(
+                "comparison input must contain exactly "
+                f"{sorted(SUPERVISED_NONINFERIORITY_INPUT_KEYS)}"
+            )
+        report = supervised_noninferiority_report(
+            load_cases(args.cases),
+            raw["baseline_proposals"],
+            raw["candidate_proposals"],
+            noninferiority_margin=raw["noninferiority_margin"],
+            auto_outcomes=raw["auto_outcomes"],
+        )
+        print(json.dumps(report, indent=2, sort_keys=True, ensure_ascii=True))
+        return 1 if report["vetoes_reported_auto_gain"] else 0
+    except Exception as exc:
+        print(f"operator-replay guard: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2

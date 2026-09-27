@@ -88,6 +88,7 @@ try:  # package import
     from . import phase15_r5_retrospective_falsifiers
     from . import replanning_benchmark
     from . import reliability
+    from .reproducible_claims import reporting_scope
     from .scenarios import goad_scenarios
     from .range_state import Milestone
 except Exception:  # script / sys.path import
@@ -132,6 +133,7 @@ except Exception:  # script / sys.path import
     import phase15_r5_retrospective_falsifiers  # type: ignore
     import replanning_benchmark  # type: ignore
     import reliability  # type: ignore
+    from reproducible_claims import reporting_scope  # type: ignore
     from scenarios import goad_scenarios  # type: ignore
     from range_state import Milestone  # type: ignore
 
@@ -150,14 +152,35 @@ def _measurement_allowed(report: gx.GateExperimentReport) -> bool:
     return bool(getattr(report, "measurement", {}).get("performance_assertion_allowed"))
 
 
-def _print_report(report: gx.GateExperimentReport, *, diagnostic: bool = False) -> None:
+def _headline_request(path: str | None) -> dict | None:
+    if not path:
+        return None
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _print_report(
+    report: gx.GateExperimentReport,
+    *,
+    diagnostic: bool = False,
+    headline_request: dict | None = None,
+) -> dict:
+    result = report.to_dict()
+    headline = reporting_scope(
+        result,
+        reducer_name="gate_experiment",
+        headline_request=None if diagnostic else headline_request,
+    )
     if not _measurement_allowed(report) and not diagnostic:
         print("gate-experiment: performance assertion refused: missing or stale measurement labels", file=sys.stderr)
-        return
-    print(json.dumps({"kind": "gate_experiment", **report.to_dict()}, indent=2, default=str))
+        return headline
+    print(json.dumps({"kind": "gate_experiment", **result, **headline}, indent=2, default=str))
     if diagnostic:
         print("\nDIAGNOSTIC ONLY: synthetic gate output is not a retained benchmark-performance claim.", flush=True)
-        return
+        return headline
     rho = "n/a" if report.spearman_rho is None else f"{report.spearman_rho:.3f}"
     print(
         f"\nVERDICT: {report.verdict}  (rho={rho}, "
@@ -165,6 +188,7 @@ def _print_report(report: gx.GateExperimentReport, *, diagnostic: bool = False) 
         f"{report.note}",
         flush=True,
     )
+    return headline
 
 
 def _retained_gate_cards(path: str) -> dict[str, list]:
@@ -225,6 +249,14 @@ def _orchestrate_reset_fn():
 
 
 def _cmd_gate_experiment(args: argparse.Namespace) -> int:
+    headline_request = _headline_request(args.headline_audit)
+
+    def result_code(report: gx.GateExperimentReport, *, diagnostic: bool = False) -> int:
+        headline = _print_report(report, diagnostic=diagnostic, headline_request=headline_request)
+        if args.headline_audit and headline["headline_lift_allowed"] is not True:
+            return 2
+        return 0 if report.verdict == "PASS" else 1
+
     if args.scorecards:
         try:
             report = gx.aggregate_gate_experiment(
@@ -235,10 +267,9 @@ def _cmd_gate_experiment(args: argparse.Namespace) -> int:
             print("gate-experiment: could not load retained ScoreCards", file=sys.stderr)
             return 2
         if not _measurement_allowed(report):
-            _print_report(report)
+            _print_report(report, headline_request=headline_request)
             return 2
-        _print_report(report)
-        return 0 if report.verdict == "PASS" else 1
+        return result_code(report)
     scenarios = goad_scenarios(args.engagement_id)
     if args.scenario:
         scenarios = [s for s in scenarios if s.name == args.scenario]
@@ -252,8 +283,7 @@ def _cmd_gate_experiment(args: argparse.Namespace) -> int:
             gx.synthetic_runner(_DEMO_PROFILES),
             seeds=args.seeds, results_dir=args.results_dir, write_record=bool(args.results_dir),
         )
-        _print_report(report, diagnostic=True)
-        return 0 if report.verdict == "PASS" else 1
+        return result_code(report, diagnostic=True)
 
     if not args.live:
         print(
@@ -277,10 +307,9 @@ def _cmd_gate_experiment(args: argparse.Namespace) -> int:
         results_dir=args.results_dir, rho_threshold=args.rho_threshold,
     )
     if not _measurement_allowed(report):
-        _print_report(report)
+        _print_report(report, headline_request=headline_request)
         return 2
-    _print_report(report)
-    return 0 if report.verdict == "PASS" else 1
+    return result_code(report)
 
 
 def _cmd_noise_floor(args: argparse.Namespace) -> int:
@@ -296,7 +325,12 @@ def _cmd_noise_floor(args: argparse.Namespace) -> int:
     if not report.measurement.get("performance_assertion_allowed"):
         print("noise-floor: performance assertion refused: missing or stale measurement labels", file=sys.stderr)
         return 2
-    print(json.dumps(asdict(report), indent=2, default=str))
+    headline = reporting_scope(
+        asdict(report),
+        reducer_name="noise_floor",
+        headline_request=_headline_request(args.headline_audit),
+    )
+    print(json.dumps({**asdict(report), **headline}, indent=2, default=str))
     print(
         f"\nNOISE FLOOR ({report.scenario}, n={report.repeats}, hash={report.verifier_hash}):\n"
         f"  capability mean={report.capability_mean:.3f} stdev={report.capability_stdev:.3f} "
@@ -305,7 +339,7 @@ def _cmd_noise_floor(args: argparse.Namespace) -> int:
         f"  least-stable milestone={report.least_stable_milestone} @ agreement {report.least_stable_agreement:.2f}",
         flush=True,
     )
-    return 0
+    return 2 if args.headline_audit and headline["headline_lift_allowed"] is not True else 0
 
 
 def _cmd_null_model_factorial(_args: argparse.Namespace) -> int:
@@ -443,6 +477,8 @@ def main(argv: list[str] | None = None) -> int:
     ge.add_argument("--results-dir", default=None)
     ge.add_argument("--scorecards", default=None,
                     help="retained JSON/JSONL {config, card} rows; pure offline aggregate, no runner")
+    ge.add_argument("--headline-audit", default=None,
+                    help="metadata-only final-audit split/receipt request; invalid or reused cohorts are refused")
     ge.set_defaults(func=_cmd_gate_experiment)
 
     nf = sub.add_parser("noise-floor", help="compute noise floor + MDE from already-recorded gauge runs (no lab)")
@@ -450,6 +486,8 @@ def main(argv: list[str] | None = None) -> int:
     nf.add_argument("--side", default="harness", choices=["harness", "bare"])
     nf.add_argument("--n", type=int, default=None, help="use only the last N recorded runs (default: all)")
     nf.add_argument("--results", default=None, help="path to bare_vs_harness.jsonl (default: .hillclimb/results/)")
+    nf.add_argument("--headline-audit", default=None,
+                    help="metadata-only final-audit split/receipt request; invalid or reused cohorts are refused")
     nf.set_defaults(func=_cmd_noise_floor)
 
     vc = sub.add_parser("verify-claims", help="reproduce a retained source-bound claim manifest offline")

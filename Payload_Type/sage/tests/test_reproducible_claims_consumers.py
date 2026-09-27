@@ -10,6 +10,8 @@ from pathlib import Path
 import pytest
 
 from ai.hillclimb import composite_gauge, fitness, reproducible_claims as claims
+from ai.hillclimb.evaluation_foundation import SplitUseRecord
+from ai.hillclimb.experiment_contracts import content_hash
 from ai.hillclimb.reliability import noise_floor
 
 
@@ -24,6 +26,7 @@ def _fixture_module(name):
 
 _composite_fixtures = _fixture_module("test_hillclimb_composite_gauge")
 _claims_fixtures = _fixture_module("test_reproducible_claims")
+_operator_replay_fixtures = _fixture_module("test_hillclimb_operator_replay_benchmark")
 ARMS = _composite_fixtures.ARMS
 ARM_CONTRACTS = _composite_fixtures.ARM_CONTRACTS
 EFFECTS = _composite_fixtures.EFFECTS
@@ -244,3 +247,137 @@ def test_descriptive_comparison_marks_card_root_identity_split_nonassertive(tmp_
     assert summary["scope"] == "descriptive_summary_only"
     assert summary["measurement"]["performance_assertion_allowed"] is False
     assert summary["identity_mismatch_lines"] == [1]
+
+
+def test_supervised_noninferiority_reducer_stays_veto_only_and_recomputes_frozen_inputs():
+    cases, baseline, candidate, outcomes = _operator_replay_fixtures._supervised_quality_inputs()
+
+    report = claims._reduce("supervised_noninferiority", {
+        "cases": [case.to_dict() for case in cases],
+        "baseline_proposals": baseline,
+        "candidate_proposals": candidate,
+        "noninferiority_margin": "1/2",
+        "auto_outcomes": outcomes,
+    })
+
+    assert report["reported_auto_gain"] is True
+    assert report["vetoes_reported_auto_gain"] is False
+    assert report["scored_as_improvement"] is False
+    assert report["promotion_authorized"] is False
+
+
+def _headline_claim_manifest(tmp_path):
+    path, manifest, document, source = _write_manifest(tmp_path)
+    origin = {
+        "split_registry_id": "synthetic-registry", "cohort_id": "final-cohort",
+        "role": "final_audit", "source_case_id": "synthetic-final-case",
+    }
+    for row in document["comparison_records"]:
+        row["evaluation_origin"] = dict(origin)
+    document["comparison_inputs"]["records"] = document["comparison_records"]
+    document["comparison_result"] = claims._reduce("comparison", document["comparison_inputs"])
+    parent = document["comparison_result"]
+    document["headline_reducer_name"] = "comparison"
+    reservation = SplitUseRecord(
+        record_kind="reservation", reservation_id="synthetic-reservation", registry_id="synthetic-registry",
+        release_cohort_id="synthetic-release", cohort_id="final-cohort", role="final_audit",
+        topology_cluster_id="final-cluster", ancestry_roots=("synthetic-final-source",),
+        source_case_ids=("synthetic-final-case",), prospective_budget_id="synthetic-budget",
+    )
+    retirement = SplitUseRecord(
+        record_kind="retirement", reservation_id="synthetic-reservation", registry_id="synthetic-registry",
+        release_cohort_id="synthetic-release", cohort_id="final-cohort", role="final_audit",
+        topology_cluster_id="final-cluster", ancestry_roots=("synthetic-final-source",),
+        source_case_ids=("synthetic-final-case",), prospective_budget_id="synthetic-budget",
+        report_id="report-1", reducer_name="comparison",
+        result_sha256=content_hash({"reducer_name": "comparison", "result": parent}),
+    )
+    def history_row(record):
+        payload = record.to_dict()
+        return {"record_hash": content_hash(payload), **payload}
+    document["headline_request"] = {
+        "split_registry_id": "synthetic-registry", "release_cohort_id": "synthetic-release", "cohort_id": "final-cohort", "report_id": "report-1",
+        "receipt_history_complete": True,
+        "cohorts": [{
+            "cohort_id": "final-cohort", "role": "final_audit", "topology_cluster_id": "final-cluster",
+            "source_case_ids": ["synthetic-final-case"], "semantic_source_ids": ["synthetic-final-source"],
+            "prospective_budget_id": "synthetic-budget", "prospective_case_budget": 1,
+        }],
+        "semantic_ancestry": [{"source_id": "synthetic-final-source"}],
+        "split_use_history": [history_row(reservation), history_row(retirement)],
+    }
+    document["headline_result"] = claims.reporting_scope(
+        parent,
+        reducer_name="comparison",
+        headline_request=document["headline_request"],
+        producer_case_ids=parent["producer_case_ids"],
+        producer_origins=parent["producer_origins"],
+        history_source_bound=True,
+    )
+    ref = lambda pointer: _source_ref("", pointer)
+    manifest["claims"].append(_claim(
+        "headline", "headline_lift",
+        {
+            "reduced_result": {"claim": "comparison", "pointer": "/result"},
+            "producer_case_ids": {"claim": "comparison", "pointer": "/result/producer_case_ids"},
+            "producer_origins": {"claim": "comparison", "pointer": "/result/producer_origins"},
+            "reducer_name": ref("/headline_reducer_name"),
+            "headline_request": ref("/headline_request"),
+        },
+        ref("/comparison_labels"),
+        ref("/headline_result"),
+    ))
+    _rewrite(path, manifest, document, source)
+    return path, manifest, document, source
+
+
+def test_verify_claims_allows_only_a_source_bound_synthetic_final_audit_receipt(tmp_path):
+    path, _manifest, _document, _source = _headline_claim_manifest(tmp_path)
+
+    report = claims.verify_claims(path)
+
+    headline = next(item for item in report["claims"] if item["id"] == "headline")
+    assert headline["result_sha256"]
+    assert "headline" in report["effective_claims"]
+
+
+@pytest.mark.parametrize("mutation", ["dev", "mixed", "reused"])
+def test_verify_claims_refuses_dev_mixed_or_reused_final_audit_metadata(tmp_path, mutation):
+    path, manifest, document, source = _headline_claim_manifest(tmp_path)
+    if mutation == "dev":
+        document["comparison_records"][0]["evaluation_origin"]["role"] = "dev"
+    elif mutation == "mixed":
+        document["comparison_records"][0].pop("evaluation_origin")
+    else:
+        reservation = dict(document["headline_request"]["split_use_history"][0])
+        reservation.pop("record_hash")
+        reservation["reservation_id"] = "synthetic-reservation-renamed"
+        reservation["release_cohort_id"] = "later-synthetic-release"
+        document["headline_request"]["split_use_history"].append({
+            "record_hash": content_hash(reservation), **reservation,
+        })
+    document["comparison_inputs"]["records"] = document["comparison_records"]
+    document["comparison_result"] = claims._reduce("comparison", document["comparison_inputs"])
+    # Keep the parent report and its retirement receipt mutually consistent, so
+    # the refusal exercises the actual producer-origin/reuse guard.
+    retirement = document["headline_request"]["split_use_history"][1]
+    retirement["result_sha256"] = content_hash({"reducer_name": "comparison", "result": document["comparison_result"]})
+    receipt_payload = dict(retirement)
+    receipt_payload.pop("record_hash")
+    retirement["record_hash"] = content_hash(receipt_payload)
+    actual = claims.reporting_scope(
+        document["comparison_result"], reducer_name="comparison", headline_request=document["headline_request"],
+        producer_case_ids=document["comparison_result"]["producer_case_ids"],
+        producer_origins=document["comparison_result"]["producer_origins"], history_source_bound=True,
+    )
+    reason = {
+        "dev": "headline_producer_role_not_final_audit",
+        "mixed": "headline_producer_origin_unbound",
+        "reused": "final_audit_reservation_missing_or_reused",
+    }[mutation]
+    assert actual["headline_lift_allowed"] is False
+    assert reason in actual["headline_lift_reason_codes"]
+    _rewrite(path, manifest, document, source)
+
+    with pytest.raises(claims.ClaimError, match="asserted result does not reproduce"):
+        claims.verify_claims(path)

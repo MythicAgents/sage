@@ -17,10 +17,15 @@ from ai.hillclimb.experiment_contracts import select_comparison_results
 from ai.hillclimb.fitness import ScoreCard
 from ai.hillclimb.live_seams import summarize_task_quiescence
 from ai.hillclimb.range_state import Milestone
-from ai.hillclimb.reproducible_claims import comparison_labels
+from ai.hillclimb.reproducible_claims import comparison_labels, reporting_scope
 
 
-def summarize(records: list, scenario: str) -> dict:
+def summarize(
+    records: list,
+    scenario: str,
+    *,
+    headline_request: dict | None = None,
+) -> dict:
     """Retain record counts and malformed-result locations, including unsuccessful attempts."""
     cards = {"bare": [], "harness": []}
     kinds: Counter = Counter()
@@ -28,6 +33,8 @@ def summarize(records: list, scenario: str) -> dict:
     identity_mismatches = []
     other_scenarios = 0
     identities = []
+    producer_case_ids = []
+    producer_origins = []
     card_fields = {field.name for field in fields(ScoreCard)}
     selected = select_comparison_results(records, scenario)
     selected_ids = {id(record) for record in selected}
@@ -42,6 +49,20 @@ def summarize(records: list, scenario: str) -> dict:
             continue
         if id(record) not in selected_ids:
             continue
+        origin = record.get("evaluation_origin")
+        if isinstance(origin, dict):
+            retained_origin = {
+                key: origin.get(key)
+                for key in ("split_registry_id", "cohort_id", "role", "source_case_id")
+            }
+        else:
+            # Every selected row must carry its own producer provenance.  Do not
+            # let a summary-level header relabel historical development evidence.
+            retained_origin = {}
+        producer_origins.append(retained_origin)
+        source_case_id = retained_origin.get("source_case_id")
+        if isinstance(source_case_id, str) and source_case_id.strip() and source_case_id.strip() not in producer_case_ids:
+            producer_case_ids.append(source_case_id.strip())
         side = record.get("side")
         payload = record.get("card")
         if not isinstance(side, str) or side not in cards or not isinstance(payload, dict):
@@ -81,7 +102,7 @@ def summarize(records: list, scenario: str) -> dict:
             "identity_failures": [*measurement["identity_failures"],
                                   "ScoreCard labels differ from retained result metadata"],
         }
-    return {
+    report = {
         "scope": "descriptive_summary_only",
         "protocol_validity": "not_assessed",
         "record_count": len(records),
@@ -91,7 +112,20 @@ def summarize(records: list, scenario: str) -> dict:
         "comparison": comparison,
         "measurement": measurement,
         "identity_mismatch_lines": identity_mismatches,
+        "producer_case_ids": producer_case_ids,
+        "producer_origins": producer_origins,
     }
+    # A comparison remains useful development evidence.  Headline status is a
+    # separate final-audit decision over the computed comparison, never a flag
+    # supplied by the input records.
+    report.update(reporting_scope(
+        report,
+        reducer_name="comparison",
+        headline_request=headline_request,
+        producer_case_ids=producer_case_ids,
+        producer_origins=producer_origins,
+    ))
+    return report
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -100,17 +134,27 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--scenario", required=True)
     parser.add_argument("--task-states", type=Path, help="Optional retained JSON array; never queried live")
     parser.add_argument("--operation-id", type=int)
+    parser.add_argument(
+        "--headline-audit", type=Path,
+        help="optional metadata-only final-audit split/receipt request; does not open outcome packets",
+    )
     args = parser.parse_args(argv)
     if args.task_states and (args.operation_id is None or args.operation_id <= 0):
         parser.error("--task-states requires a positive --operation-id")
     records = []
     try:
+        headline_request = None
+        if args.headline_audit:
+            try:
+                headline_request = json.loads(args.headline_audit.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                headline_request = {}
         for line in args.results.read_text().splitlines():
             try:
                 records.append(json.loads(line))
             except json.JSONDecodeError:
                 records.append(None)
-        report = summarize(records, args.scenario)
+        report = summarize(records, args.scenario, headline_request=headline_request)
         if args.task_states:
             try:
                 rows = json.loads(args.task_states.read_text())
@@ -149,7 +193,9 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(safe_report, indent=2, allow_nan=False))
         return 2
     print(json.dumps(report, indent=2, allow_nan=False))
-    return 2 if report["invalid_record_lines"] else 0
+    return 2 if report["invalid_record_lines"] or (
+        args.headline_audit is not None and report["headline_lift_allowed"] is not True
+    ) else 0
 
 
 if __name__ == "__main__":

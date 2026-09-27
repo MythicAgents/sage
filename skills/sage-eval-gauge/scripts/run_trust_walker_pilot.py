@@ -31,6 +31,7 @@ if str(PAYLOAD) not in sys.path:
 
 from ai import task_budget
 from ai.hillclimb import bare_bloodhound, bare_mythic_tools, effect_registry, live_seams
+from ai.hillclimb import operator_replay_benchmark
 from ai.hillclimb.bare_runner import BareModelRunner, make_stdout_logger
 from ai.hillclimb.range_state import Milestone
 from ai.hillclimb.trust_walker_outcome import (
@@ -180,6 +181,31 @@ query TrustWalkerPreservedRequest($requestId: Int!) {
 }
 """
 _ENGAGEMENT_FILENAME_SAFE = re.compile(r"[^A-Za-z0-9._-]")
+SUPERVISED_COMPARISON_KEYS = frozenset({
+    "cases",
+    "baseline_proposals",
+    "candidate_proposals",
+    "noninferiority_margin",
+    "source_binding",
+})
+SUPERVISED_SOURCE_BINDING_KEYS = frozenset({
+    "baseline_source_identity",
+    "candidate_source_identity",
+    "baseline_model_binding",
+    "candidate_model_binding",
+    "cases_hash",
+})
+SUPERVISED_MODEL_BINDING_KEYS = (
+    "model_provider",
+    "model_id",
+    "model_version",
+    "backend_route",
+    "generation_config",
+    "wrapper_id",
+    "wrapper_revision",
+    "authority_mode",
+    "execution_path",
+)
 
 
 class SetupInvariantError(PilotError):
@@ -3712,15 +3738,17 @@ def summarize_improvement_experiment(
     pair_one: str | Path,
     pair_two: str | Path,
     contract: ImprovementContract,
+    supervised_comparison: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     return reduce_improvement_replays(
-        [replay_pair(pair_one), replay_pair(pair_two)], contract.to_record(),
+        [replay_pair(pair_one), replay_pair(pair_two)], contract.to_record(), supervised_comparison,
     )
 
 
 def reduce_improvement_replays(
     pairs: list[dict[str, Any]],
     contract: Mapping[str, Any],
+    supervised_comparison: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Reduce exactly two current native pair replays under one frozen contract.
 
@@ -3798,13 +3826,68 @@ def reduce_improvement_replays(
         comparisons.append(comparison)
     return summarize_improvement_comparisons(
         (contracts[0], contracts[1]), (comparisons[0], comparisons[1]), frozen_contract,
+        supervised_comparison=supervised_comparison,
     )
+
+
+def _model_binding(comparisons: tuple[Mapping[str, Any], Mapping[str, Any]], arm_name: str) -> dict[str, Any]:
+    bindings: list[dict[str, Any]] = []
+    for comparison in comparisons:
+        arm = next(
+            (item for item in comparison.get("arms") or [] if isinstance(item, Mapping) and item.get("arm") == arm_name),
+            None,
+        )
+        identity = arm.get("measurement_identity") if isinstance(arm, Mapping) else None
+        if not isinstance(identity, Mapping) or any(key not in identity for key in SUPERVISED_MODEL_BINDING_KEYS):
+            raise PilotError("supervised comparison requires complete rederived auto measurement identities")
+        bindings.append({key: identity[key] for key in SUPERVISED_MODEL_BINDING_KEYS})
+    if bindings[0] != bindings[1]:
+        raise PilotError("supervised comparison auto model bindings differ across order-balanced pairs")
+    return bindings[0]
+
+
+def _reduce_supervised_comparison(
+    supervised_comparison: Mapping[str, Any],
+    comparisons: tuple[Mapping[str, Any], Mapping[str, Any]],
+    contract: ImprovementContract,
+) -> dict[str, Any]:
+    if not isinstance(supervised_comparison, Mapping) or set(supervised_comparison) != set(SUPERVISED_COMPARISON_KEYS):
+        raise PilotError("supervised comparison input has unsupported or missing fields")
+    binding = supervised_comparison["source_binding"]
+    if not isinstance(binding, Mapping) or set(binding) != set(SUPERVISED_SOURCE_BINDING_KEYS):
+        raise PilotError("supervised comparison source binding is incomplete")
+    if (
+        binding["baseline_source_identity"] != contract.baseline_source_identity
+        or binding["candidate_source_identity"] != contract.candidate_source_identity
+    ):
+        raise PilotError("supervised comparison source binding differs from the rederived auto comparison")
+    expected_baseline_model = _model_binding(comparisons, "baseline-sage")
+    expected_candidate_model = _model_binding(comparisons, "candidate-sage")
+    if (
+        binding["baseline_model_binding"] != expected_baseline_model
+        or binding["candidate_model_binding"] != expected_candidate_model
+    ):
+        raise PilotError("supervised comparison model binding differs from the rederived auto comparison")
+    try:
+        report = operator_replay_benchmark.supervised_noninferiority_report(
+            supervised_comparison["cases"],
+            supervised_comparison["baseline_proposals"],
+            supervised_comparison["candidate_proposals"],
+            noninferiority_margin=supervised_comparison["noninferiority_margin"],
+        )
+    except (TypeError, ValueError) as exc:
+        raise PilotError("supervised comparison input is incomplete or invalid") from exc
+    if binding["cases_hash"] != report["corpus"]["cases_hash"]:
+        raise PilotError("supervised comparison case binding differs from the rescored frozen corpus")
+    return report
 
 
 def summarize_improvement_comparisons(
     contract_records: tuple[Mapping[str, Any], Mapping[str, Any]],
     comparisons: tuple[Mapping[str, Any], Mapping[str, Any]],
     contract: ImprovementContract,
+    *,
+    supervised_comparison: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Apply the same frozen decision to live summaries or separately derived reanalysis."""
     first, second = comparisons
@@ -3853,10 +3936,32 @@ def summarize_improvement_comparisons(
     else:
         disposition = "reject"
         reason = "the candidate did not meet the frozen meaningful-effect threshold in both pairs"
+    supervised_report = (
+        _reduce_supervised_comparison(supervised_comparison, (first, second), contract)
+        if supervised_comparison is not None else None
+    )
+    overall_improvement_allowed = bool(
+        disposition == "accept"
+        and supervised_report is not None
+        and supervised_report["supervised_quality"]["noninferiority_passed"] is True
+    )
+    overall_reason = (
+        "the rederived auto comparison and source/model/case-bound supervised quality comparison pass"
+        if overall_improvement_allowed
+        else "supervised proposal quality comparison is required before an overall improvement claim"
+        if disposition == "accept" and supervised_report is None
+        else "the source/model/case-bound supervised quality comparison exceeds its non-inferiority margin"
+        if disposition == "accept" and supervised_report is not None
+        else "the rederived auto comparison does not accept the candidate"
+    )
     return {
         "schema": "sage-trust-walker-isc8-improvement-experiment-result-v1",
         "disposition": disposition,
         "reason": reason,
+        "auto_only_development": True,
+        "overall_improvement_allowed": overall_improvement_allowed,
+        "overall_reason": overall_reason,
+        "supervised_proposal_quality": supervised_report,
         "protocol_ready": protocol_ready,
         "identity_bound": identity_bound,
         "orders_bound": orders_bound,
@@ -3908,6 +4013,10 @@ def build_parser() -> argparse.ArgumentParser:
     summary = sub.add_parser("summarize-improvement")
     summary.add_argument("--pair-one-artifact-dir", required=True)
     summary.add_argument("--pair-two-artifact-dir", required=True)
+    summary.add_argument(
+        "--supervised-comparison",
+        help="private JSON with frozen packets, complete paired proposals, explicit margin, and source/model/case binding",
+    )
     _add_improvement_identity_args(summary, roots=False)
     replay = sub.add_parser("replay-pair", help="Reproduce a retained comparison from native evidence, offline.")
     replay.add_argument("--artifact-dir", required=True)
@@ -4000,10 +4109,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "summarize-improvement":
         try:
+            supervised_comparison = (
+                json.loads(Path(args.supervised_comparison).read_text(encoding="utf-8"))
+                if args.supervised_comparison else None
+            )
             result = summarize_improvement_experiment(
                 args.pair_one_artifact_dir,
                 args.pair_two_artifact_dir,
                 contract,
+                supervised_comparison,
             )
         except (PilotError, OSError, RuntimeError) as exc:
             print(json.dumps({
