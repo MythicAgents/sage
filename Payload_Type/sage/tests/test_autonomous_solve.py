@@ -1984,7 +1984,8 @@ def test_handoff_tool_schema_exposes_title_and_instruction_in_one_call():
     assert "input_payload" not in tool.args
     assert "input_type" not in tool.args
     assert "short operator-facing title" in tool.args["handoff_title"]["description"]
-    assert "complete, self-contained instruction" in tool.args["handoff_instruction"]["description"]
+    assert "complete, self-contained worker task" in tool.args["handoff_instruction"]["description"]
+    assert "handoff_instruction" not in tool.tool_call_schema.model_json_schema().get("required", [])
 
 
 def test_sandbox_handoff_schema_carries_inline_payload_to_worker():

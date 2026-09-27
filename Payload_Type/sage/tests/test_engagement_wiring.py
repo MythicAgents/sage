@@ -5471,7 +5471,7 @@ def test_build_capability_commands_recovers_krbtgt_key_from_recorded_dcsync_task
         f"rc4_hmac          : {'b' * 32}\r\n"
     )
 
-    async def fake_task_output(mythic, task_display_id):
+    async def fake_task_output(mythic, task_display_id, custom_return_attributes=None):
         assert task_display_id == 86
         return [{"response_text": base64.b64encode(dcsync_output.encode()).decode()}]
 

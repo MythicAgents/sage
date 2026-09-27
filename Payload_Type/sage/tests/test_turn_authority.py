@@ -5119,16 +5119,39 @@ def test_hitl_steering_retains_proposal_authority_for_a_different_action():
     )
     model._supervised_objective_active = False
     model._stop_requested = False
+    model._message_seq = 1
+    model.state = {
+        "_request_id": "chat:1:request:steer",
+        "_request_lane": "supervised_workflow",
+        "_message_seq": 1,
+        "supervisor_messages": [HumanMessage(
+            content="Use callback 1 to determine the current working directory.",
+            additional_kwargs={
+                "_request_id": "chat:1:request:steer",
+                "_operator_input": True,
+            },
+        )],
+    }
     model._graph_run_config = lambda thread_id: {
         "configurable": {"thread_id": thread_id}
     }
 
     class Graph:
         async def aget_state(self, _config):
-            return SimpleNamespace(interrupts=(interrupt,), tasks=())
+            return SimpleNamespace(
+                interrupts=(interrupt,),
+                tasks=(),
+                values={
+                    **model.state,
+                    "supervisor_messages": list(model.state["supervisor_messages"]),
+                },
+            )
 
-        async def astream(self, _command, _config):
+        async def astream(self, command, _config):
             assert model._turn_authority.mode == "supervised_action"
+            steer = command.update["supervisor_messages"]
+            assert len(steer) == 1
+            assert steer[0].content == "Use a different read-only command."
             if False:
                 yield None
 

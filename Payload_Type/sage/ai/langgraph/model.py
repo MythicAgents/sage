@@ -3205,20 +3205,6 @@ def _tool_messages_as_text(messages: list[AnyMessage]) -> str:
     return "\n\n".join(parts)
 
 
-def _tool_messages_as_text(messages: list[AnyMessage]) -> str:
-    """Serialize worker tool results for summary synthesis, including structured MCP content."""
-    parts: list[str] = []
-    for msg in messages:
-        if not isinstance(msg, ToolMessage):
-            continue
-        if msg.name and msg.name.startswith("transfer_to_"):
-            continue
-        text = _message_content_as_text(msg.content).strip()
-        if text:
-            parts.append(text)
-    return "\n\n".join(parts)
-
-
 def _terminal_worker_answer(messages: list[AnyMessage]) -> tuple[AIMessage, str] | None:
     """Return the worker's final prose, excluding interim text on tool calls."""
     if not messages or not isinstance(messages[-1], AIMessage):
@@ -4236,6 +4222,7 @@ class Model:
         self._subgoal_evidence_records: set[str] = set()
         self._request_dynamic_proposals = False
         self._active_approval_claim: dict[str, Any] | None = None
+        self._supervised_execution_snapshots: list[dict[str, Any]] = []
         self._graph_signature = None
         try:
             from .policy import resolve_policy_mode
@@ -4830,6 +4817,7 @@ class Model:
                 self._subgoal_evidence_records = set()
                 # Request-scoped, like the subgoal itself: a new operator message is a new plan.
                 self._supervised_repeat_refusals = 0
+                self._denied_action_keys = set()
             state = getattr(self, "state", None)
             if isinstance(state, dict):
                 state["_request_id"] = contract.request_id
@@ -4840,6 +4828,7 @@ class Model:
             self._request_execution_digest = contract.digest
             self._request_admitted_action_digests = set()
             self._active_approval_claim = None
+            self._supervised_execution_snapshots = []
         self._request_contract = contract
         ledger = self._ensure_request_event_ledger(contract.request_id)
         contract_event_id = stable_event_id(
@@ -4994,6 +4983,26 @@ class Model:
             if selected
             else ""
         )
+        revision = self._supervised_operator_revision()
+        if (not selected and str(context.get("approval_id") or "").strip()
+                and revision is not None):
+            # The native service calls this only after claiming a matching approval
+            # response. A denied proposal did not execute; keep that decision visible
+            # to the Supervisor without deriving it from worker prose or tool text.
+            prior = list(getattr(self, "_supervised_execution_snapshots", []))[-3:]
+            self._supervised_execution_snapshots = [
+                *prior,
+                *(
+                    {"request_id": narrowed.request_id,
+                     "request_contract_digest": narrowed.digest,
+                     "approval_id": str(context.get("approval_id") or ""),
+                     "action_digest": action_digest,
+                     "operator_revision": revision,
+                     "decision": "denied",
+                     "action": copy.deepcopy(action), "task_events": []}
+                    for action in actions[:4]
+                ),
+            ][-4:]
         return rebound
 
     def reject_request_actions(self, context: Any) -> None:
@@ -5084,6 +5093,20 @@ class Model:
         setter = getattr(mythic_client, "set_approval_claim", None)
         if callable(setter):
             setter(self._active_approval_claim)
+        revision = self._supervised_operator_revision()
+        if revision is not None:
+            self._supervised_execution_snapshots = [
+                *getattr(self, "_supervised_execution_snapshots", [])[-3:],
+                {
+                    "request_id": contract.request_id,
+                    "request_contract_digest": contract.digest,
+                    "approval_id": self._active_approval_claim["approval_id"],
+                    "operator_revision": revision,
+                    "decision": "accepted",
+                    "action": copy.deepcopy(approved_actions[0]),
+                    "task_events": [],
+                },
+            ]
 
     def clear_approval_claim(self) -> None:
         self._active_approval_claim = None
@@ -5091,6 +5114,238 @@ class Model:
         clearer = getattr(mythic_client, "clear_approval_claim", None)
         if callable(clearer):
             clearer()
+
+    def _supervised_operator_revision(self) -> int | None:
+        state = getattr(self, "state", None)
+        if not isinstance(state, dict):
+            return None
+        try:
+            entries = _assisted_operator_input_entries(state)
+        except RuntimeError:
+            return None
+        return max((revision for revision, _ in entries), default=None) if entries else None
+
+    def _mark_supervised_redirect(
+        self, *, request_id: str, revision: int, action_digest: str,
+        rejected_actions: list[dict[str, Any]],
+    ) -> None:
+        """Relabel only the exact native denial that carried this operator steer."""
+        from sage_chat.hitl import approval_action_fingerprint
+
+        if not action_digest:
+            return
+        contract = getattr(self, "_request_contract", None)
+        rejected_ids = {approval_action_fingerprint(action) for action in rejected_actions}
+        for decision in getattr(self, "_supervised_execution_snapshots", []):
+            if (decision.get("request_id") == request_id
+                    and decision.get("request_contract_digest") == getattr(contract, "digest", None)
+                    and decision.get("operator_revision") == revision
+                    and decision.get("decision") == "denied"
+                    and decision.get("action_digest") == action_digest
+                    and isinstance(decision.get("action"), dict)
+                    and approval_action_fingerprint(decision.get("action")) in rejected_ids):
+                decision["decision"] = "redirected"
+                decision["operator_revision"] = revision + 1
+
+    def _supervised_execution_context(self) -> str:
+        """Project native approval and task facts without treating prose as execution proof."""
+        from .request_contract import RequestContract, RequestLane
+
+        contract = getattr(self, "_request_contract", None)
+        if (not isinstance(contract, RequestContract)
+                or contract.lane != RequestLane.SUPERVISED_WORKFLOW):
+            return ""
+        revision = self._supervised_operator_revision()
+        if revision is None:
+            return ""
+        observations = []
+        for snapshot in getattr(self, "_supervised_execution_snapshots", [])[-4:]:
+            if (snapshot.get("request_id") != contract.request_id
+                    or snapshot.get("request_contract_digest") != contract.digest
+                    or snapshot.get("operator_revision") != revision):
+                continue
+            action = snapshot.get("action") or {}
+            args = action.get("args") if isinstance(action.get("args"), dict) else {}
+            observations.append({
+                "native_decision": snapshot.get("decision"),
+                "selected_tool": action.get("name"),
+                "command": args.get("command"),
+                "callback_display_id": args.get("callback_display_id"),
+                "task_events": [
+                    {key: event.get(key) for key in (
+                        "task_id", "command", "callback_display_id", "event_status",
+                        "task_completed", "task_status")}
+                    for event in snapshot.get("task_events", [])[-4:]
+                ],
+            })
+        return (
+            "[supervised-runtime] Guarded tool calls create a native approval pause. "
+            "A chat message saying accept is not approval of a card; only its exact native accepted "
+            "selection may execute. An accepted selection alone proves no task effect or success. "
+            "A denied proposal was not executed by that decision. Report that result rather than "
+            "submitting the same denied action again merely to complete this request. A redirect "
+            "denies that proposal and supplies a revised operator instruction; any new guarded "
+            "action requires its own native card. "
+            "A task event's completed/error label describes the waiter/output classification, not "
+            "independent task completion. task_completed=true means the exact Mythic task was terminal "
+            "at observation, not that its intended effect succeeded; false means still pending, and "
+            "null means unknown. Report task output and task state at their stated scope. "
+            "Do not re-propose an already accepted action merely to report its result; further "
+            "authorized steps may still be proposed. "
+            + json.dumps({"native_decisions": observations}, sort_keys=True, separators=(",", ":"))
+        )
+
+    def _supervised_task_output_evidence(self, request_id: str) -> list[dict[str, Any]]:
+        """Project bounded accepted-task observations as untrusted handback data."""
+        from .request_contract import RequestContract, RequestLane
+
+        contract = getattr(self, "_request_contract", None)
+        if (not isinstance(contract, RequestContract)
+                or contract.lane != RequestLane.SUPERVISED_WORKFLOW
+                or not request_id or request_id != contract.request_id):
+            return []
+        revision = self._supervised_operator_revision()
+        if revision is None:
+            return []
+        records: list[dict[str, Any]] = []
+        for snapshot in getattr(self, "_supervised_execution_snapshots", [])[-4:]:
+            if (snapshot.get("request_id") != request_id
+                    or snapshot.get("request_contract_digest") != contract.digest
+                    or snapshot.get("operator_revision") != revision
+                    or snapshot.get("decision") != "accepted"):
+                continue
+            action = snapshot.get("action")
+            args = action.get("args") if isinstance(action, dict) else None
+            if (not isinstance(action, dict)
+                    or action.get("name") != "issue_task_and_waitfor_task_output"
+                    or not isinstance(args, dict)):
+                continue
+            for event in snapshot.get("task_events", [])[-4:]:
+                if (not isinstance(event, dict)
+                        or event.get("event_status") != "completed"
+                        or type(event.get("task_id")) is not int
+                        or event["task_id"] < 0
+                        or event.get("command") != args.get("command")
+                        or str(event.get("callback_display_id")) != str(args.get("callback_display_id"))
+                        or not isinstance(event.get("response_text_excerpt"), str)
+                        or not event["response_text_excerpt"].strip()):
+                    continue
+                excerpt = event["response_text_excerpt"]
+                scoped_content_omitted = (
+                    _strip_supervised_engagement_context(excerpt) != excerpt.strip()
+                )
+                records.append({
+                    "source": "accepted_task_event",
+                    "request_id": request_id,
+                    "source_request_id": request_id,
+                    "origin": "current_request",
+                    "task_id": event["task_id"],
+                    "callback_display_id": event["callback_display_id"],
+                    "logical_command": event["command"],
+                    "event_status": event["event_status"],
+                    "task_completed": event.get("task_completed"),
+                    "task_status": event.get("task_status"),
+                    "response_text_excerpts": [] if scoped_content_omitted else [excerpt],
+                    "partial_snapshot": True,
+                    "truncated": event.get("output_truncated") is True,
+                    "scoped_content_omitted": scoped_content_omitted,
+                })
+        return records
+
+    @staticmethod
+    def _supervised_parameters(value: Any, *, command: str = "") -> Any:
+        """Compare the approved direct task parameters with the issued task form."""
+        if value in (None, ""):
+            return {}
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped.startswith("{") and stripped.endswith("}"):
+                try:
+                    value = json.loads(stripped)
+                except ValueError:
+                    value = stripped
+            else:
+                value = stripped
+        if command == "shell" and isinstance(value, dict) and set(value) == {"command"}:
+            value = value["command"]
+        return value
+
+    def _observe_supervised_execution_event(self, event: dict[str, Any]) -> None:
+        """Admit only an observer event bound to the selected native approval."""
+        from .request_contract import RequestContract, RequestLane
+
+        contract = getattr(self, "_request_contract", None)
+        if (not isinstance(contract, RequestContract)
+                or contract.lane != RequestLane.SUPERVISED_WORKFLOW
+                or event.get("source") != "mythic"):
+            return
+        snapshots = getattr(self, "_supervised_execution_snapshots", [])
+        revision = self._supervised_operator_revision()
+        if revision is None:
+            return
+        snapshot = next((item for item in reversed(snapshots)
+                         if item.get("request_id") == contract.request_id
+                         and item.get("request_contract_digest") == contract.digest
+                         and item.get("approval_id") == event.get("approval_id")
+                         and item.get("operator_revision") == revision), None)
+        if (snapshot is None or snapshot.get("decision") != "accepted"
+                or not str(event.get("approval_id") or "")):
+            return
+        if (event.get("request_id") != contract.request_id
+                or event.get("request_contract_digest") != contract.digest):
+            return
+        action = snapshot.get("action") or {}
+        args = action.get("args") if isinstance(action.get("args"), dict) else {}
+        command = str(event.get("tool_name") or event.get("command") or "").strip()
+        callback = event.get("callback_id")
+        if action.get("name") != "issue_task_and_waitfor_task_output":
+            return
+        if (command != str(args.get("command") or "").strip()
+                or str(callback) != str(args.get("callback_display_id"))
+                or not _type_exact_json_equal(
+                    self._supervised_parameters(event.get("parameters"), command=command),
+                    self._supervised_parameters(args.get("parameters"), command=command),
+                )):
+            return
+        task_id = event.get("task_id")
+        event_id = str(event.get("event_id") or "").strip()
+        if not event_id or task_id in (None, "") or not command or callback in (None, ""):
+            return
+        events = snapshot["task_events"]
+        status = str(event.get("status") or "").strip().casefold()
+        if status == "started":
+            if any(item["event_id"] == event_id for item in events):
+                return
+            events.append({"event_id": event_id, "task_id": task_id, "command": command,
+                           "callback_display_id": callback, "event_status": "started",
+                           "task_completed": None, "task_status": None})
+            del events[:-4]
+            return
+        if status not in {"completed", "error"}:
+            return
+        observed = next((item for item in events if item["event_id"] == event_id
+                         and item["task_id"] == task_id and item["command"] == command
+                         and str(item["callback_display_id"]) == str(callback)), None)
+        if observed is None or observed["event_status"] != "started":
+            return
+        observed["event_status"] = status
+        observed["task_completed"] = (event.get("task_completed")
+                                      if type(event.get("task_completed")) is bool else None)
+        task_status = event.get("task_status")
+        known_states = frozenset({"submitted", "processing", "preprocessing", "processed",
+                                  "queued", "completed", "success", "error", "failed", "timeout"})
+        normalized_status = (task_status.strip().casefold()
+                             if isinstance(task_status, str) else "")
+        observed["task_status"] = (normalized_status
+                                   if normalized_status in known_states else None)
+        # A completed waiter event with output is an observation, not proof of task
+        # completion. Exception/error events are deliberately excluded: their
+        # output can be an exception string rather than target response bytes.
+        output = event.get("output")
+        if status == "completed" and isinstance(output, str) and output.strip():
+            output_cap = 24000
+            observed["response_text_excerpt"] = output[:output_cap]
+            observed["output_truncated"] = len(output) > output_cap
 
     def _request_contract_authority(self) -> TurnAuthority:
         """Return native typed authority, failing closed when its contract is unavailable."""
@@ -6147,6 +6402,8 @@ class Model:
         status = str(event.get("status") or "").strip().casefold()
         if not event_id or source not in {"mythic", "mcp"} or not tool_name:
             return
+        self._observe_supervised_execution_event({**event, "source": source,
+                                                  "tool_name": tool_name, "status": status})
         activity = event.get("activity") if isinstance(event.get("activity"), dict) else {}
         arguments = event.get("arguments")
         if source == "mythic":
@@ -7411,6 +7668,7 @@ class Model:
                                     and isinstance(msg.content, str)
                                     and msg.content.strip()
                                     and not msg.additional_kwargs.get("_is_final_report")
+                                    and not msg.additional_kwargs.get("_worker_task_references")
                                 ):
                                     _last_summary = msg.content.strip()
                                     break
@@ -7726,6 +7984,7 @@ class Model:
                             "expected, you can redirect me or start a new request."
                         ),
                         name=node_name,
+                        additional_kwargs={"_internal_progress_notice": True},
                     )
                     new_messages_from_agent = list(new_messages_from_agent) + [_warn_msg]
                 # ISC-3b: detect same-pair ping-pong (Supervisor ↔ X without progress).
@@ -7746,6 +8005,7 @@ class Model:
                                 "indicate a routing loop. Tell me how you'd like to proceed."
                             ),
                             name=node_name,
+                            additional_kwargs={"_internal_progress_notice": True},
                         )
                         new_messages_from_agent = list(new_messages_from_agent) + [_bounce_msg]
                         self._pair_bounce_count = 0
@@ -7980,8 +8240,11 @@ class Model:
                             return ""
 
                         terminal_payload = _terminal_execute_capability_payload(new_messages_from_agent)
+                        terminal_answer = _terminal_worker_answer(new_messages_from_agent)
                         if terminal_payload is not None:
                             summary_text = _terminal_execute_capability_report(terminal_payload)
+                        elif terminal_answer is not None:
+                            summary_text = terminal_answer[1]
                         else:
                             worker_text_parts = []
                             for msg in substantive_messages:
@@ -8034,6 +8297,10 @@ class Model:
                             if isinstance(_rc, RequestContract) and _rc.lane == RequestLane.SUPERVISED_WORKFLOW:
                                 _supervised_lane = True
                                 supervisor_summary_text = _strip_supervised_engagement_context(summary_text)
+                                # The scope filter also trims harmless outer whitespace. Keep
+                                # exact specialist wording when it removed no scoped content.
+                                if supervisor_summary_text == summary_text.strip():
+                                    supervisor_summary_text = summary_text
                                 if len(supervisor_summary_text) < len(summary_text):
                                     logger.info(
                                         f"🔇 [{node_name}] Stripped engagement context from supervised summary "
@@ -8041,6 +8308,20 @@ class Model:
                                     )
                         except Exception:
                             pass  # fail-open: copy unmodified summary
+
+                        if (
+                            terminal_answer is not None
+                            and terminal_payload is None
+                            and handoff_outcome is None
+                            and supervisor_summary_text == terminal_answer[1]
+                            and _completion_request_id
+                        ):
+                            summary_kwargs["_worker_final_answer"] = {
+                                "request_id": _completion_request_id,
+                                "worker": node_name,
+                                "source_seq": _get_seq(terminal_answer[0]),
+                                "sha256": hashlib.sha256(supervisor_summary_text.encode()).hexdigest(),
+                            }
 
                         summary_ai_msg = AIMessage(
                             content=supervisor_summary_text,
@@ -8051,6 +8332,35 @@ class Model:
 
                         # ALWAYS copy to Supervisor channel (only the NEW messages with operator.add)
                         update["supervisor_messages"] = [response_header, summary_ai_msg]
+                        task_refs = _worker_task_output_references(
+                            new_messages_from_agent,
+                            request_id=_completion_request_id,
+                        )
+                        if task_refs:
+                            references_message = AIMessage(
+                                content="Supporting Mythic task output references: " + ", ".join(
+                                    f"task {task_id} ({origin})" for task_id, origin in task_refs
+                                ) + ". These references identify output reads; they do not independently verify the specialist's interpretation.",
+                                name=node_name,
+                                additional_kwargs={
+                                    "_worker_task_references": True,
+                                    "_request_id": _completion_request_id,
+                                },
+                            )
+                            _tag_msg(references_message, self._next_seq())
+                            update["supervisor_messages"].append(references_message)
+                        if _completion_request_id:
+                            task_evidence = _handoff_task_output_evidence(
+                                self, new_messages_from_agent,
+                                request_id=_completion_request_id,
+                                supervised=_supervised_lane,
+                            )
+                            if task_evidence:
+                                evidence_message = _worker_task_evidence_message(
+                                    task_evidence, request_id=_completion_request_id, worker=node_name,
+                                )
+                                _tag_msg(evidence_message, self._next_seq())
+                                update["supervisor_messages"].append(evidence_message)
                         logger.info(f"✅ Copied summary from {node_name} to Supervisor channel ({len(supervisor_summary_text)} chars)")
 
                         # ALSO copy to calling agent channel if this was a worker-to-worker handoff
@@ -11135,6 +11445,7 @@ class Model:
             handback_to_supervisor_tool = _create_handback_to_supervisor_tool(
                 self.mythic_client,
                 autonomous=self._autonomous_execution_enabled_for_turn(),
+                source_model=self,
             )
 
             # Add handoff to Mythic_Payload for payload creation needs
@@ -11997,9 +12308,55 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         # rejected ones. Skipped entirely when nothing was rejected.
         _open_at_decision = self._open_tool_lifecycle_ids() if rejected_actions else ()
 
+        # The rejected tool's ToolMessage carries native Respond/Select text to
+        # the paused specialist. Append the same transport-authenticated text as
+        # a revisioned operator input at the parent checkpoint so Supervisor sees
+        # it too. The Model-owned copy serves Supervisor handoff tools, which run
+        # inside a nested graph with no direct access to the parent SageState.
+        resume_update = None
+        if steer:
+            checkpoint_state = getattr(snapshot, "values", None)
+            owner_state = getattr(self, "state", None)
+            if not isinstance(checkpoint_state, dict) or not isinstance(owner_state, dict):
+                raise RuntimeError(_HITL_GUARDED_REQUEST_UNAVAILABLE)
+            checkpoint_request_id = str(checkpoint_state.get("_request_id") or "").strip()
+            owner_request_id = str(owner_state.get("_request_id") or "").strip()
+            checkpoint_lane = str(checkpoint_state.get("_request_lane") or "")
+            owner_lane = str(owner_state.get("_request_lane") or "")
+            if (
+                not checkpoint_request_id
+                or checkpoint_request_id != owner_request_id
+                or checkpoint_lane != owner_lane
+                or checkpoint_lane not in {"conversational", "supervised_workflow"}
+            ):
+                raise RuntimeError(_HITL_GUARDED_REQUEST_UNAVAILABLE)
+
+            entries = _assisted_operator_input_entries(checkpoint_state)
+            current_revision = max(revision for revision, _ in entries)
+            self._mark_supervised_redirect(
+                request_id=checkpoint_request_id, revision=current_revision,
+                action_digest=expected_action_digest,
+                rejected_actions=rejected_actions,
+            )
+            steer_msg = HumanMessage(
+                content=steer,
+                additional_kwargs={
+                    "_request_id": checkpoint_request_id,
+                    "_operator_input": True,
+                    "_operator_input_revision": current_revision + 1,
+                    "_operator_steer": True,
+                },
+            )
+            _tag_msg(steer_msg, self._next_seq())
+            owner_state.setdefault("supervisor_messages", []).append(steer_msg)
+            resume_update = {
+                "supervisor_messages": [steer_msg],
+                "_message_seq": self._message_seq,
+            }
+
         # Resume the paused graph with the decision payload the installed middleware expects.
         async for event in self.graph.astream(
-            Command(resume={"decisions": decisions}),
+            Command(resume={"decisions": decisions}, update=resume_update),
             self._graph_run_config(thread_id)
         ):
             if self._stop_requested:
@@ -12331,6 +12688,9 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             additional_kwargs={
                 "_request_id": request_contract.request_id,
                 "_operator_input": True,
+                # A HITL steer advances this revision while preserving the
+                # request-opening instruction as transport history.
+                "_operator_input_revision": 0,
             },
         )
         user_msg_seq = self._next_seq()
@@ -13327,7 +13687,8 @@ def _deterministic_post_ingest_owner(mythic_client) -> _HandoffDirective | None:
         return None
 
 
-def _create_handback_to_supervisor_tool(mythic_client=None, *, autonomous: bool = False):
+def _create_handback_to_supervisor_tool(mythic_client=None, *, autonomous: bool = False,
+                                       source_model: Model | None = None):
     """
     Let a specialist yield control to the Supervisor WITHOUT ending the run, so the Supervisor can route
     to another agent (BloodHound for graph work, Mythic_Payload for a build) or finalize. This is the
@@ -13360,11 +13721,104 @@ def _create_handback_to_supervisor_tool(mythic_client=None, *, autonomous: bool 
                 }
             },
         )
-        updated_state = {**runtime.state}
-        updated_state["supervisor_messages"] = [msg]
-        updated_state["messages"] = [msg]
-        updated_state["next_owner"] = "Supervisor"
-        updated_state["_last_calling_agent"] = "Mythic_Operator"
+        supervisor_messages: list[AnyMessage] = [msg]
+        current_worker_messages: list[AnyMessage] = []
+        if source_model is not None:
+            # Command.PARENT routes directly to Supervisor: the outer worker node's
+            # normal summary/evidence copy does not run on this path.
+            worker_messages = list(runtime.state.get("messages") or [])
+            # The inner agent may retain earlier handbacks. Only this delegation
+            # can attest its typed outcome and task reads.
+            for index in range(len(worker_messages) - 1, -1, -1):
+                candidate = worker_messages[index]
+                if (isinstance(candidate, HumanMessage) and
+                        candidate.additional_kwargs.get("_delegated_to") == "Mythic_Operator"):
+                    worker_messages = worker_messages[index + 1:]
+                    current_worker_messages = list(worker_messages)
+                    break
+            worker_messages.append(msg)
+            for worker_message in current_worker_messages:
+                _tag_msg(worker_message, source_model._next_seq())
+            _tag_msg(msg, source_model._next_seq())
+            authority = getattr(source_model, "_turn_authority", TurnAuthority(mode="observe"))
+            handoff = _worker_handoff_metadata(
+                worker_messages, source_worker="Mythic_Operator",
+                source_turn_id=authority.turn_id,
+            )
+            if handoff is None:
+                # A later malformed handback must supersede an earlier typed
+                # outcome in this request, without inventing a completed one.
+                invalid_message = AIMessage(
+                    content="Worker handback was not admitted.", name="Mythic_Operator",
+                    additional_kwargs={"_worker_handoff_invalid": True},
+                )
+                _tag_msg(invalid_message, source_model._next_seq())
+                supervisor_messages.append(invalid_message)
+            else:
+                metadata, summary_text = handoff
+                contract = getattr(source_model, "_request_contract", None)
+                request_id = str(getattr(contract, "request_id", "") or "").strip()
+                supervised = bool(
+                    contract is not None and
+                    getattr(getattr(contract, "lane", None), "value", "") == "supervised_workflow"
+                )
+                if supervised:
+                    filtered = _strip_supervised_engagement_context(summary_text)
+                    summary_text = (summary_text if filtered == summary_text.strip() else filtered)
+                    if summary_text != handoff[1]:
+                        metadata = _worker_outcome.build_handoff_metadata(
+                            source_worker="Mythic_Operator",
+                            source_turn_id=authority.turn_id,
+                            source_seq=metadata["source_seq"],
+                            reason=reason, summary=summary_text,
+                            outcome=outcome, next_owner=next_owner,
+                            verified_revision=metadata["verified_revision"],
+                        )
+                        if metadata is None:
+                            summary_text = ""
+                summary_message = AIMessage(
+                    content=summary_text, name="Mythic_Operator",
+                    additional_kwargs={"_worker_outcome": metadata} if metadata is not None else {},
+                )
+                _tag_msg(summary_message, source_model._next_seq())
+                if request_id:
+                    task_refs = _worker_task_output_references(worker_messages, request_id=request_id)
+                    if task_refs:
+                        references_message = AIMessage(
+                            content="Supporting Mythic task output references: " + ", ".join(
+                                f"task {task_id} ({origin})" for task_id, origin in task_refs
+                            ) + ". These references identify output reads; they do not independently verify the specialist's interpretation.",
+                            name="Mythic_Operator",
+                            additional_kwargs={"_worker_task_references": True,
+                                               "_request_id": request_id},
+                        )
+                        _tag_msg(references_message, source_model._next_seq())
+                        supervisor_messages.append(references_message)
+                    evidence = _handoff_task_output_evidence(
+                        source_model, worker_messages, request_id=request_id,
+                        supervised=supervised,
+                    )
+                    if evidence:
+                        evidence_message = _worker_task_evidence_message(
+                            evidence, request_id=request_id, worker="Mythic_Operator",
+                        )
+                        _tag_msg(evidence_message, source_model._next_seq())
+                        supervisor_messages.append(evidence_message)
+                supervisor_messages.append(summary_message)
+        # Parent channels use operator.add; copying the full inner state would
+        # append historical messages again on every explicit handback.
+        updated_state = {
+            "supervisor_messages": supervisor_messages,
+            "messages": [msg],
+            "next_owner": "Supervisor",
+            "_last_calling_agent": "Mythic_Operator",
+        }
+        if current_worker_messages:
+            # The parent command also bypasses the worker wrapper's normal
+            # channel append. Retain only this delegation's new transcript.
+            updated_state["mythic_operator_messages"] = current_worker_messages + [msg]
+        if source_model is not None:
+            updated_state["_message_seq"] = source_model._message_seq
         return Command(
             goto="Supervisor",
             update=updated_state,
@@ -13475,13 +13929,14 @@ def _create_recursion_summary_tool():
 
     return request_continuation
 
-def _current_assisted_operator_input(state: Mapping[str, Any]) -> str | None:
+def _assisted_operator_input_entries(
+    state: Mapping[str, Any],
+) -> list[tuple[int, str]] | None:
     """Return the exact transport-bound operator input for an assisted handoff.
 
     Supervisor prose selects a worker but never becomes authority. Conversation and
-    supervised workers receive only the operator input tagged with the current typed
-    request identity. Autonomous and legacy callers retain their existing instruction
-    ownership.
+    supervised workers use revisioned inputs tagged with the current typed request
+    identity. Autonomous and legacy callers retain their instruction ownership.
     """
     lane = str(state.get("_request_lane") or "")
     if lane not in {"conversational", "supervised_workflow"}:
@@ -13489,7 +13944,7 @@ def _current_assisted_operator_input(state: Mapping[str, Any]) -> str | None:
     request_id = str(state.get("_request_id") or "").strip()
     if not request_id:
         raise RuntimeError("assisted handoff lacks current operator input request identity")
-    matches: list[str] = []
+    matches: list[tuple[int, str]] = []
     for message in state.get("supervisor_messages", ()):
         if not isinstance(message, HumanMessage):
             continue
@@ -13501,11 +13956,29 @@ def _current_assisted_operator_input(state: Mapping[str, Any]) -> str | None:
             or metadata.get("_hide_from_stream")
         ):
             continue
-        matches.append(_message_content_as_text(message.content))
-    unique = tuple(dict.fromkeys(matches))
-    if len(unique) != 1:
+        revision = metadata.get("_operator_input_revision", 0)
+        if type(revision) is not int or revision < 0:
+            raise RuntimeError("assisted handoff has invalid current operator input revision")
+        if revision > 0 and metadata.get("_operator_steer") is not True:
+            raise RuntimeError("assisted handoff has unauthenticated operator input revision")
+        if revision == 0 and metadata.get("_operator_steer"):
+            raise RuntimeError("assisted handoff has invalid request-opening operator input")
+        matches.append((revision, _message_content_as_text(message.content)))
+    if not matches:
         raise RuntimeError("assisted handoff lacks one exact current operator input")
-    return unique[0]
+    return matches
+
+
+def _current_assisted_operator_input(state: Mapping[str, Any]) -> str | None:
+    """Return the highest typed operator-input revision for an assisted handoff."""
+    entries = _assisted_operator_input_entries(state)
+    if not entries:
+        return None
+    current_revision = max(revision for revision, _ in entries)
+    current = [text for revision, text in entries if revision == current_revision]
+    if len(current) != 1:
+        raise RuntimeError("assisted handoff lacks one exact current operator input")
+    return current[0]
 
 
 def _create_handoff_tool(
@@ -13560,6 +14033,8 @@ def _create_handoff_tool(
             if assisted_operator_lookup is not None
             else _current_assisted_operator_input(runtime.state)
         )
+        if assisted_operator_input is None and not str(handoff_instruction or "").strip():
+            raise ValueError("autonomous handoff requires a complete handoff_instruction")
         try:
             logger.info(
                 f"🧭 [handoff] → {agent_name} | title={str(handoff_title or '')[:120]!r} | "
@@ -13874,7 +14349,7 @@ def _create_handoff_tool(
         @tool(name, description=description)
         def handoff_tool(
             runtime: ToolRuntime,
-            handoff_instruction: Annotated[str, "The complete, self-contained instruction for the target agent: a full sentence stating exactly what to do, with NO pronouns and NO references to 'it'/'that'/'the previous task'. Example: 'List all active Mythic callbacks and report each host, user, and integrity level.'"],
+            handoff_instruction: Annotated[str, "For assisted conversation or supervised requests, omit this field: the exact current operator input is delivered to the worker. For autonomous requests, provide the complete, self-contained worker task."] = "",
             handoff_title: Annotated[str, "A short operator-facing title for the sub-agent card, usually 3-8 words and never the full instruction. Example: 'List active callbacks'."] = "",
         ) -> Command:
             return _build_handoff_command(runtime, handoff_instruction, handoff_title)
