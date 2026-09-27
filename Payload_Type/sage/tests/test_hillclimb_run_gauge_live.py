@@ -1341,7 +1341,15 @@ def test_stageb_selected_protocol_projects_and_admits_synthetic_lifecycle(
             task_quiescence_seconds=0.01,
             task_poll_seconds=0.002,
         )
+        # This fixture tests lifecycle projection/admission. Sample each real
+        # producer once before terminal rather than racing 10 ms thread windows
+        # under full-suite load; dedicated observer tests cover late producers.
+        monkeypatch.setattr(observer, "_task_loop", observer._poll_tasks)
+        monkeypatch.setattr(observer, "_objective_loop", observer._poll_objective)
         observer.start()
+        for thread in (observer._task_thread, observer._objective_thread):
+            thread.join(timeout=2)
+            assert not thread.is_alive()
         observer_result = observer.finish(
             wrapper_status="completed" if arm == "shipping_sage" else "done",
             wrapper_objective_recognized=False,
@@ -1358,6 +1366,7 @@ def test_stageb_selected_protocol_projects_and_admits_synthetic_lifecycle(
             token_ceiling=rgl.gate1p_stageb.TOKEN_ADMISSION_CEILING,
             pair_id=pair_id,
         )
+        assert semantics["countable"] is True, semantics
         assert {
             key: semantics[key]
             for key in (
@@ -2150,6 +2159,18 @@ def test_preflight_manifest_offline_checks_are_callable():
         if cost == "offline":
             ok, detail = check()
             assert isinstance(ok, bool) and isinstance(detail, str)
+
+
+def test_preflight_loop_has_no_observation_compatibility(monkeypatch,capsys):
+    monkeypatch.delenv(rgl.observation_channel.ENV_NAME,raising=False)
+    monkeypatch.setattr(rgl.observation_channel,"emit",lambda *_a,**_k:pytest.fail("unexpected emission"))
+    monkeypatch.setattr(rgl,"scenario_preconditions",lambda _cfg,_scenario:[
+        ("objective-recognizable","offline",lambda:(True,"recognized")),
+        ("mythic-queries-valid","smoke",lambda:(False,"operator-visible detail"))])
+    assert rgl.main(["preflight","--scenario","cross-forest-objective"])==2
+    output=capsys.readouterr().out
+    assert "OK   objective-recognizable: recognized" in output
+    assert "FAIL mythic-queries-valid: operator-visible detail" in output
 
 
 def test_preflight_smoke_checks_declared_and_fail_closed(monkeypatch):

@@ -30,18 +30,18 @@ from pathlib import Path
 from typing import Callable, Mapping
 
 try:
-    from . import (development_row_kernel, effect_registry, experiment_contracts, gate1p_protocol, gate1p_stagea, gate1p_stageb, live_seams, reproducible_claims,
+    from . import (effect_registry, experiment_contracts, gate1p_protocol, gate1p_stagea, gate1p_stageb, live_seams, reproducible_claims,
                    bare_runner, bare_mythic_tools, bare_bloodhound, probes as probes_mod)
     from .scenarios import all_scenarios, CHILD, OBJECTIVE
     from .range_state import Milestone
     from .fitness import ScoreCard
+    from ai import observation_channel, resource_budget
 except Exception:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from ai.hillclimb import (  # type: ignore
         gate1p_stagea,
         gate1p_stageb,
         gate1p_protocol,
-        development_row_kernel,
         experiment_contracts,
         reproducible_claims,
         effect_registry,
@@ -54,6 +54,7 @@ except Exception:
     from ai.hillclimb.scenarios import all_scenarios, CHILD, OBJECTIVE  # type: ignore
     from ai.hillclimb.range_state import Milestone  # type: ignore
     from ai.hillclimb.fitness import ScoreCard  # type: ignore
+    from ai import observation_channel, resource_budget  # type: ignore
 
 
 @dataclass
@@ -73,7 +74,7 @@ class Config:
     model_api_endpoint: str | None = None
     model_api_key: str | None = None
     null_model: bool = False
-    measurement_kind: str = "legacy"  # legacy | diagnostic | row
+    measurement_kind: str = "legacy"  # legacy | diagnostic | row | capture
     protocol_id: str | None = None
     pair_id: str | None = None
     arm_index: int | None = None
@@ -83,6 +84,7 @@ class Config:
     source_version: str | None = None
     model_version: str | None = None
     logical_seed: int | None = None
+    measurement_arm: str | None = None
     live_authority_id: str | None = None
     row_contract_path: str | None = None
     row_contract_sha256: str | None = None
@@ -114,9 +116,24 @@ class Config:
         return Path(value).expanduser() if value else None
 
 
-_DEVELOPMENT_ROW_SCHEMA = development_row_kernel.CONTRACT_SCHEMA
-_DEVELOPMENT_ROW_OBSERVER_VERSION = development_row_kernel.OBSERVER_VERSION
-_DEVELOPMENT_ROW_ID = development_row_kernel.ROW_ID
+def _development_kernel():
+    # Only the explicit historical row lane needs this module. In particular,
+    # importing or executing a new capture must not load its old authority path.
+    from ai.hillclimb import development_row_kernel
+    return development_row_kernel
+
+
+def __getattr__(name):
+    if name == "development_row_kernel":
+        return _development_kernel()
+    aliases = {
+        "_DEVELOPMENT_ROW_SCHEMA": "CONTRACT_SCHEMA",
+        "_DEVELOPMENT_ROW_OBSERVER_VERSION": "OBSERVER_VERSION",
+        "_DEVELOPMENT_ROW_ID": "ROW_ID",
+    }
+    if name in aliases:
+        return getattr(_development_kernel(), aliases[name])
+    raise AttributeError(name)
 
 
 def _measurement_identity_for_run(cfg: Config, card: ScoreCard, side: str,
@@ -144,7 +161,7 @@ def _measurement_identity_for_run(cfg: Config, card: ScoreCard, side: str,
         "protocol_id": str(cfg.protocol_id or "unknown"),
         "pair_id": str(cfg.pair_id or "unknown"),
         "logical_seed": cfg.logical_seed,
-        "policy_arm": str(getattr(card, "policy_mode", "") or "unknown"),
+        "policy_arm": str(cfg.measurement_arm or getattr(card, "policy_mode", "") or "unknown"),
         "model_provider": provider or "unknown",
         "model_id": model or "unknown",
         "model_version": str(cfg.model_version or "unknown"),
@@ -154,7 +171,9 @@ def _measurement_identity_for_run(cfg: Config, card: ScoreCard, side: str,
             "model_context_limit": cfg.model_context_limit,
             "max_steps": cfg.max_steps,
             "solve_timeout": cfg.solve_timeout,
-            "token_ceiling": cfg.model_token_budget if cfg.measurement_kind == "row" else None,
+            "token_ceiling": (
+                cfg.model_token_budget if cfg.measurement_kind in {"row", "capture"} else None
+            ),
             "null_model": cfg.null_model,
         },
         "wrapper_id": "run_gauge_live",
@@ -223,12 +242,12 @@ class DevelopmentRowProtocol:
     ):
         self.path = Path(contract_path).expanduser().resolve()
         self.row_id = str(row_id)
-        self.contract, self.contract_sha256 = development_row_kernel.load_contract(
+        self.contract, self.contract_sha256 = _development_kernel().load_contract(
             self.path,
             expected_sha256=expected_contract_sha256,
         )
-        development_row_kernel.contamination_markers(self.contract)
-        self.row_index, self.policy_mode = development_row_kernel.matrix_row(
+        _development_kernel().contamination_markers(self.contract)
+        self.row_index, self.policy_mode = _development_kernel().matrix_row(
             self.contract, self.row_id
         )
         self.protocol_id = str(self.contract.get("contract_id") or "")
@@ -238,7 +257,7 @@ class DevelopmentRowProtocol:
             raise gate1p_stagea.ProtocolError("development-row objective_domain is required")
 
     def storage_paths(self, *, repo_root: Path) -> tuple[Path, Path]:
-        return development_row_kernel.contract_storage_paths(
+        return _development_kernel().contract_storage_paths(
             self.contract,
             repo_root=repo_root,
         )
@@ -345,7 +364,7 @@ class DevelopmentRowProtocol:
                 "development-row request differs from the frozen contract: " + ", ".join(failed)
             )
         if require_live_authority:
-            development_row_kernel.validate_live_authority(
+            _development_kernel().validate_live_authority(
                 self.contract,
                 row_id=self.row_id,
                 live_authority_id=live_authority_id,
@@ -353,12 +372,12 @@ class DevelopmentRowProtocol:
         return self.row_id
 
     def response_usage_disposition(self, response_records: object, *, model_calls: object) -> dict:
-        return development_row_kernel.response_usage_disposition(
+        return _development_kernel().response_usage_disposition(
             self.contract, self.row_id, response_records, model_calls=model_calls
         )
 
     def canonical_oracle_fact(self, raw: object) -> dict[str, object]:
-        return development_row_kernel.canonical_oracle_fact(self.contract, raw)
+        return _development_kernel().canonical_oracle_fact(self.contract, raw)
 
     def build_objective_oracle(self, probe: Callable[[], object], *, artifact_pointer: str, target: str):
         protocol = self
@@ -390,12 +409,12 @@ class DevelopmentRowProtocol:
         return gate1p_stagea.LiveEpisodeObserver(
             **kwargs,
             oracle_canonicalizer=self.canonical_oracle_fact,
-            observer_version=_DEVELOPMENT_ROW_OBSERVER_VERSION,
+            observer_version=_development_kernel().OBSERVER_VERSION,
             thread_name_prefix="sage-development-row",
         )
 
     def observer_facts_disposition(self, observer: object, *, arm: str) -> dict:
-        return development_row_kernel.observer_facts_disposition(
+        return _development_kernel().observer_facts_disposition(
             self.contract, arm, observer
         )
 
@@ -405,7 +424,7 @@ class DevelopmentRowProtocol:
         expected = self.execution.get("completed_call_token_ceiling_per_row")
         if token_ceiling != expected:
             return {"countable": False, "reason": "token ceiling differs from the contract"}
-        return development_row_kernel.outcome_disposition(
+        return _development_kernel().outcome_disposition(
             self.contract, arm, observer, total_tokens=total_tokens
         )
 
@@ -455,7 +474,7 @@ class DevelopmentRowProtocol:
         history_root, _ledger = self.storage_paths(
             repo_root=Path(__file__).resolve().parents[4],
         )
-        return development_row_kernel.admission_disposition(
+        return _development_kernel().admission_disposition(
             self.contract,
             contract_sha256=self.contract_sha256,
             row=row,
@@ -919,6 +938,16 @@ def scenario_preconditions(cfg: "Config", scenario_name: str) -> list:
     return checks
 
 
+def _emit_preflight_check(name: str, passed: bool, error_type: str | None) -> None:
+    if not os.environ.get(observation_channel.ENV_NAME):
+        return
+    payload = {"event": "m3_preflight_check", "schema": "sage-m3-preflight-check-v1",
+               "name": name, "passed": passed, "status": "passed" if passed else "failed",
+               "error_type": error_type}
+    if observation_channel.emit("tool_event", payload) is not True:
+        raise RuntimeError("preflight observation delivery failed")
+
+
 def validate_harness_runtime_telemetry(
     configured_policy_mode: str,
     telemetry: dict,
@@ -1289,6 +1318,18 @@ def episode_protocol_snapshot(
             "evaluation-plane data leaked into Sage or model context",
         ],
     }
+    if cfg.measurement_kind == "capture":
+        snapshot.update({
+            "model_token_budget": cfg.model_token_budget,
+            "model_context_limit": cfg.model_context_limit,
+            "max_output_tokens": cfg.max_output_tokens,
+            "live_authority_id": cfg.live_authority_id,
+            "resource_episode_id": os.environ.get(resource_budget._EPISODE_ENV),
+            "pair_id": cfg.pair_id,
+            "logical_seed": cfg.logical_seed,
+            "model_version": cfg.model_version,
+            "measurement_arm": cfg.measurement_arm,
+        })
     if cfg.measurement_kind == "row" and scenario_name in _GATE1P_PRIMARY_SCENARIOS:
         protocol = gate1p_protocol.protocol_for_request(
             protocol_id=cfg.protocol_id, scenario=scenario_name,
@@ -1407,6 +1448,82 @@ def _check_campaign_limits(cfg: Config, scenario_name: str) -> None:
             raise SystemExit(f"campaign next-attempt refused: {disposition.reason}")
 
 
+class _CaptureObjectiveOracle:
+    """Reuse typed outcome proof without a historical campaign's authority."""
+
+    def __init__(self, probe: Callable[[], object], target: str):
+        self.probe = probe
+        self.target = target
+        self.last_result: effect_registry.ProofResult | None = None
+
+    def __call__(self) -> dict:
+        try:
+            raw = self.probe()
+        except Exception:
+            # Raw evaluator exceptions can contain credentials or observations.
+            raise gate1p_stagea.ObserverUnavailable("capture objective probe failed") from None
+        self.last_result = effect_registry.admit_observation(
+            Milestone.OBJECTIVE, raw, expected_target=self.target,
+        )
+        return self.canonicalize({
+            "success": self.last_result.proven,
+            "proof_record": self.last_result.to_record(),
+        })
+
+    def canonicalize(self, raw: object) -> dict:
+        if not isinstance(raw, Mapping) or set(raw) != {"success", "proof_record"}:
+            raise gate1p_stagea.ObserverUnavailable("capture objective evidence malformed")
+        result = effect_registry.admit_record(
+            Milestone.OBJECTIVE, raw["proof_record"], expected_target=self.target,
+        )
+        if result.disposition not in {
+            effect_registry.ProofDisposition.PROVEN,
+            effect_registry.ProofDisposition.DISPROVEN,
+        } or type(raw["success"]) is not bool or raw["success"] != result.proven:
+            raise gate1p_stagea.ObserverUnavailable("capture objective proof unavailable or contradictory")
+        return {"success": result.proven, "proof_record": result.to_record()}
+
+
+def _retain_failed_capture(cfg, side, scenario_name, error, observer):
+    """Settle an unexpected wrapper failure and retain only safe metadata on disk."""
+    observation = None
+    settlement_error = None
+    try:
+        if observer is not None:
+            observation = observer.finish(
+                wrapper_status="interrupted" if isinstance(error, KeyboardInterrupt) else "error",
+                wrapper_objective_recognized=None,
+            )
+    except Exception as exc:
+        settlement_error = type(exc).__name__
+    record = {
+        "record_type": "capture_failure",
+        "measurement_kind": "capture",
+        "episode_id": os.environ[resource_budget._EPISODE_ENV],
+        "protocol_id": cfg.protocol_id,
+        "source_version": cfg.source_version,
+        "side": side,
+        "scenario": scenario_name,
+        "error_type": type(error).__name__,
+        "settlement_error_type": settlement_error,
+        "evidence_state": "unadmitted",
+        "performance_assertion_allowed": False,
+        "ts": time.time(),
+    }
+    try:
+        delivered = observation_channel.emit("tool_event", {
+            "event": "measurement_capture_failure",
+            "metadata": record,
+            "task_state_observation": observation,
+        })
+        record["capture_status"] = "captured" if delivered is True else "failed-capture"
+    except Exception as exc:
+        record["capture_status"] = "failed-capture"
+        record["capture_error_type"] = type(exc).__name__
+    record["record_hash"] = experiment_contracts.content_hash(record)
+    _append_jsonl(cfg.results_path, record)
+
+
 def run_side(
     cfg: Config,
     side: str,
@@ -1416,6 +1533,57 @@ def run_side(
 ) -> ScoreCard:
     """Run ONE side on ONE scenario (range assumed freshly reset), score via the shared probes, record."""
     attempt_started = time.monotonic()
+    capture_ledger = None
+    if cfg.measurement_kind == "capture":
+        required = {
+            "protocol_id": cfg.protocol_id,
+            "source_version": cfg.source_version,
+            "model_provider": cfg.model_provider,
+            "model_id": cfg.model_id,
+            "pair_id": cfg.pair_id,
+            "model_version": cfg.model_version,
+            "measurement_arm": cfg.measurement_arm,
+        }
+        missing = [name for name, value in required.items() if not str(value or "").strip()]
+        positive = {
+            "solve_timeout": cfg.solve_timeout,
+            "model_token_budget": cfg.model_token_budget,
+            "model_context_limit": cfg.model_context_limit,
+            "max_output_tokens": cfg.max_output_tokens,
+        }
+        missing.extend(
+            name for name, value in positive.items()
+            if type(value) is not int or value <= 0
+        )
+        if type(cfg.logical_seed) is not int or cfg.logical_seed < 0:
+            missing.append("logical_seed")
+        if cfg.max_output_tokens and cfg.model_context_limit \
+                and cfg.max_output_tokens > cfg.model_context_limit:
+            missing.append("max_output_tokens<=model_context_limit")
+        if not str(cfg.live_authority_id or "").strip():
+            missing.append("live_authority_id")
+        for name in (
+            resource_budget._CONFIG_ENV,
+            resource_budget._LEDGER_ENV,
+            resource_budget._EPISODE_ENV,
+            observation_channel.ENV_NAME,
+        ):
+            if not str(os.environ.get(name) or "").strip():
+                missing.append(name)
+        if missing:
+            raise gate1p_stagea.ProtocolError(
+                "capture mode requires complete prospective bindings: " + ", ".join(missing)
+            )
+        ledger = resource_budget.configured_ledger()
+        if ledger is None:
+            raise gate1p_stagea.ProtocolError("capture mode requires a configured shared resource ledger")
+        scope = ledger.status().get("episodes", {}).get(os.environ[resource_budget._EPISODE_ENV])
+        if not isinstance(scope, dict) or scope.get("activated_epoch") is not None \
+                or scope.get("closed_epoch") is not None \
+                or scope.get("action_seconds") != cfg.solve_timeout \
+                or scope.get("provider_token_limit") != cfg.model_token_budget:
+            raise gate1p_stagea.ProtocolError("capture episode scope is missing, consumed or mismatched")
+        capture_ledger = ledger
     row_arm = ""
     generic_row = cfg.measurement_kind == "row" and scenario_name not in _GATE1P_PRIMARY_SCENARIOS
     if not generic_row:
@@ -1481,7 +1649,7 @@ def run_side(
             live_authority_id=cfg.live_authority_id,
             require_live_authority=True,
         )
-        started = development_row_kernel.started_disposition(
+        started = _development_kernel().started_disposition(
             row_protocol.contract,
             repo_root=Path(__file__).resolve().parents[4],
             row_id=row_protocol.row_id,
@@ -1510,10 +1678,12 @@ def run_side(
         _validate_gate1p_pair_control(cfg, row_arm, protocol=row_protocol)
     client = live_seams.default_mythic_client()
     mythic_operation_id = getattr(client, "current_operation_id", None)
-    if row_arm and (type(mythic_operation_id) is not int or mythic_operation_id <= 0):
+    if (row_arm or capture_ledger is not None) and (
+        type(mythic_operation_id) is not int or mythic_operation_id <= 0
+    ):
         raise gate1p_stagea.ProtocolError("the authenticated Mythic operation identity is unavailable")
     runtime_telemetry: dict = {}
-    if row_arm:
+    if row_arm or capture_ledger is not None:
         prestart_tasks = live_seams.mythic_operation_task_states(
             expected_operation_id=int(mythic_operation_id)
         )
@@ -1531,7 +1701,7 @@ def run_side(
     needed = _scored_referee_domains(scn)   # same scope the preflight validates creds for (single source)
     if evaluation_reader_factory is not None:
         reader_factory = evaluation_reader_factory
-    elif row_arm:
+    elif row_arm or capture_ledger is not None:
         reader_factory = lambda: live_seams.make_referee_reader(strict=True)
     else:
         reader_factory = live_seams.make_referee_reader
@@ -1666,6 +1836,25 @@ def run_side(
             ),
         )
 
+    if capture_ledger is not None:
+        objective_domain = str((getattr(scn, "domains", {}) or {}).get("objective") or "")
+        gate1p_oracle = _CaptureObjectiveOracle(probes[Milestone.OBJECTIVE], objective_domain)
+        observer = gate1p_stagea.LiveEpisodeObserver(
+            pair_id=os.environ[resource_budget._EPISODE_ENV],
+            arm=side,
+            objective_probe=gate1p_oracle,
+            task_fetcher=lambda: live_seams.mythic_operation_task_states(
+                expected_operation_id=int(mythic_operation_id)
+            ),
+            # Reuse the independent observer mechanics, without a historical
+            # campaign's allocation, target checker or row-admission protocol.
+            oracle_canonicalizer=gate1p_oracle.canonicalize,
+            objective_settle_seconds=300,
+            task_quiescence_seconds=300,
+            observer_version="sage-capture-objective-task-observer-v1",
+            thread_name_prefix="sage-capture",
+        )
+
     canonical_outcome: dict[str, object] = {"countable": False, "reason": "not a paired row"}
     canonical_response_records: list[dict[str, object]] = []
     bare_model_contract: dict[str, object] | None = None
@@ -1701,19 +1890,31 @@ def run_side(
                 eval_force_capability_prefix_json=os.environ.get(
                     "SAGE_EVAL_FORCE_CAPABILITY_PREFIX_JSON"
                 ) or None,
+                capture_settlement=capture_ledger is not None,
+                expected_runtime_identity=(
+                    {
+                        "provider": str(harness_route.get("provider") or ""),
+                        "model": str(harness_route.get("model") or ""),
+                        "route": _READINESS._route_summary(harness_route.get("api_endpoint") or ""),
+                    }
+                    if capture_ledger is not None else None
+                ),
             )
         _start_wall = time.time()
         _start_monotonic = time.monotonic()
         _deadline = _start_wall + cfg.solve_timeout
+        if capture_ledger is not None:
+            capture_ledger.activate_episode(os.environ[resource_budget._EPISODE_ENV])
         if observer is not None:
             observer.start()
-            _append_jsonl(cfg.results_path, {
+            if row_arm:
+                _append_jsonl(cfg.results_path, {
                 "record_type": "arm_started",
                 "measurement_kind": "row",
                 "protocol": protocol_snapshot,
                 "ts": time.time(),
                 "event": dict(observer.coordinator.events[0]),
-            })
+                })
         print(f"[harness/{scenario_name}] started {time.strftime('%H:%M:%S', time.localtime(_start_wall))} · "
               f"times out by {time.strftime('%H:%M:%S', time.localtime(_deadline))} "
               f"(+{cfg.solve_timeout // 60} min via --solve-timeout, unless Sage finishes first)", flush=True)
@@ -1729,13 +1930,28 @@ def run_side(
         except Exception as exc:
             solve_error = exc
             solve_status = f"error:{type(exc).__name__}"
-            print(f"✗ harness wrapper error: {type(exc).__name__}: {exc}", flush=True)
+            detail = type(exc).__name__ if capture_ledger is not None else f"{type(exc).__name__}: {exc}"
+            print(f"✗ harness wrapper error: {detail}", flush=True)
         _elapsed = max(0.0, time.monotonic() - _start_monotonic)
         _elapsed_display = int(_elapsed)
         print(f"[harness/{scenario_name}] solve returned {time.strftime('%H:%M:%S')} "
               f"(elapsed {_elapsed_display // 60}m{_elapsed_display % 60}s, "
               f"status={solve_status})", flush=True)
         native_result = getattr(solve, "last_result", None)
+        if capture_ledger is not None:
+            producer_settlement = (
+                native_result.get("producer_settlement")
+                if isinstance(native_result, dict) else None
+            )
+            settlement_deadline = (
+                producer_settlement.get("settlement_deadline_monotonic")
+                if isinstance(producer_settlement, dict) else None
+            )
+            if not isinstance(settlement_deadline, (int, float)):
+                settlement_deadline = time.monotonic() + 300.0
+            remaining_settlement = max(0.0, float(settlement_deadline) - time.monotonic())
+            observer.objective_settle_seconds = remaining_settlement
+            observer.task_quiescence_seconds = remaining_settlement
         runtime_telemetry = (
             dict(native_result.get("runtime_telemetry") or {})
             if isinstance(native_result, dict)
@@ -1754,7 +1970,7 @@ def run_side(
             if observer is not None
             else {}
         )
-        if isinstance(row_protocol, DevelopmentRowProtocol):
+        if isinstance(row_protocol, DevelopmentRowProtocol) or capture_ledger is not None:
             gate1p_objective_result = getattr(gate1p_oracle, "last_result", None)
         telemetry_validation_error = None
         try:
@@ -1764,13 +1980,13 @@ def run_side(
                 configured_provider=harness_route["provider"],
                 configured_model=harness_route["model"],
                 require_all_response_provenance=cfg.measurement_kind != "diagnostic",
-                require_complete_usage=bool(row_arm),
-                expected_token_budget=cfg.model_token_budget if row_arm else None,
-                expected_model_context_limit=cfg.model_context_limit if row_arm else None,
-                expected_max_output_tokens=cfg.max_output_tokens if row_arm else None,
+                require_complete_usage=bool(row_arm) or capture_ledger is not None,
+                expected_token_budget=cfg.model_token_budget if row_arm or capture_ledger is not None else None,
+                expected_model_context_limit=cfg.model_context_limit if row_arm or capture_ledger is not None else None,
+                expected_max_output_tokens=cfg.max_output_tokens if row_arm or capture_ledger is not None else None,
             )
         except RuntimeError as exc:
-            if cfg.measurement_kind not in {"diagnostic", "row"}:
+            if cfg.measurement_kind not in {"diagnostic", "row", "capture"}:
                 raise
             telemetry_validation_error = str(exc)
         if row_arm:
@@ -1790,6 +2006,9 @@ def run_side(
                 if usage_evidence.get("countable") is True
                 else {"countable": False, "reason": usage_evidence.get("reason")}
             )
+        elif cfg.measurement_kind == "capture":
+            records = runtime_telemetry.get("model_response_records")
+            canonical_response_records = list(records) if isinstance(records, list) else []
         if (
             observer_result
             and canonical_outcome.get("countable") is True
@@ -1804,7 +2023,7 @@ def run_side(
             probes[Milestone.OBJECTIVE] = _admitted_row_objective_probe(
                 canonical_outcome, gate1p_objective_result,
             )
-        elif observer_result:
+        elif observer_result and capture_ledger is None:
             def _observer_unavailable():
                 raise gate1p_stagea.ObserverUnavailable(
                     str(canonical_outcome.get("reason") or "observer unavailable")
@@ -1836,16 +2055,27 @@ def run_side(
                 "bare_model": bare_model_contract,
                 "ts": time.time(),
             })
+        if capture_ledger is not None:
+            capture_ledger.activate_episode(os.environ[resource_budget._EPISODE_ENV])
         if observer is not None:
             observer.start()
-            _append_jsonl(cfg.results_path, {
+            if row_arm:
+                _append_jsonl(cfg.results_path, {
                 "record_type": "arm_started",
                 "measurement_kind": "row",
                 "protocol": protocol_snapshot,
                 "ts": time.time(),
                 "event": dict(observer.coordinator.events[0]),
-            })
-        result = bare.run(scn.objective)
+                })
+        try:
+            result = bare.run(scn.objective)
+        except BaseException as exc:
+            if capture_ledger is None:
+                raise
+            _retain_failed_capture(cfg, side, scenario_name, exc, observer)
+            if isinstance(exc, KeyboardInterrupt):
+                raise KeyboardInterrupt from None
+            raise RuntimeError(f"capture attempt failed: {type(exc).__name__}") from None
         termination = dict(result.termination)
         runtime_telemetry = {
             "controller_cycle_count": 0,
@@ -1866,6 +2096,8 @@ def run_side(
             if observer is not None
             else {}
         )
+        if capture_ledger is not None:
+            gate1p_objective_result = gate1p_oracle.last_result
         if row_arm:
             usage_evidence = _response_usage_disposition(
                 row_protocol,
@@ -1883,11 +2115,13 @@ def run_side(
                 if usage_evidence.get("countable") is True
                 else {"countable": False, "reason": usage_evidence.get("reason")}
             )
+        elif cfg.measurement_kind == "capture":
+            canonical_response_records = list(result.model_response_records)
         if canonical_outcome.get("countable") is True:
             probes[Milestone.OBJECTIVE] = _admitted_row_objective_probe(
                 canonical_outcome, gate1p_objective_result,
             )
-        elif observer_result:
+        elif observer_result and capture_ledger is None:
             def _observer_unavailable():
                 raise gate1p_stagea.ObserverUnavailable(
                     str(canonical_outcome.get("reason") or "observer unavailable")
@@ -2050,6 +2284,93 @@ def run_side(
                 "result_ledger": str(cfg.results_path),
                 "error": artifact_capture_error,
             }
+    if cfg.measurement_kind == "capture":
+        native_result = getattr(locals().get("solve"), "last_result", None)
+        raw_result = (
+            asdict(result) if side == "bare" and isinstance(
+                locals().get("result"), bare_runner.BareModelResult
+            ) else None
+        )
+        card_record = asdict(card)
+        missing_capture_facts = []
+        if not observer_result.get("oracle"):
+            missing_capture_facts.append("oracle")
+        # The reused task-state observer is not an exhaustive response,
+        # credential, chat, process or sink inventory. That separate producer
+        # must supply its own evidence before any composite row is admitted.
+        missing_capture_facts.append("complete_inventory")
+        if observer_result.get("task_window_observed") is not True:
+            missing_capture_facts.append("task_state_window")
+        if not card_record.get("proof_dispositions"):
+            missing_capture_facts.append("scorecard_proof_records")
+        if not canonical_response_records:
+            missing_capture_facts.append("response_records")
+        if side == "harness" and (
+            not isinstance(native_result, dict)
+            or (native_result.get("producer_settlement") or {}).get(
+                "native_producer_terminal"
+            ) is not True
+        ):
+            missing_capture_facts.append("native_producer_terminal")
+        capture_episode = {
+            "event": "measurement_capture_episode",
+            "schema": "sage-measurement-capture-episode-v1",
+            "episode_id": os.environ[resource_budget._EPISODE_ENV],
+            "requested_identity": protocol_snapshot,
+            "native_solver_result": native_result if side == "harness" else None,
+            "raw_result": raw_result,
+            "response_records": list(canonical_response_records),
+            "scorecard": card_record,
+            "proof_records": {
+                "scorecard_proof_dispositions": card_record.get("proof_dispositions"),
+                "objective_proof": (
+                    gate1p_objective_result.to_record()
+                    if isinstance(gate1p_objective_result, effect_registry.ProofResult)
+                    else None
+                ),
+            },
+            "oracle": observer_result.get("oracle") if observer_result else None,
+            "task_state_observation": observer_result,
+            "complete_inventory": None,
+            "telemetry_validation_error": telemetry_validation_error,
+            "missing_facts": missing_capture_facts,
+        }
+        capture_hash = None
+        try:
+            capture_hash = experiment_contracts.content_hash(capture_episode)
+            if observation_channel.emit("tool_event", capture_episode) is not True:
+                raise observation_channel.ObservationChannelError("observation delivery failed")
+            capture_status = {"status": "captured", "error_type": None}
+        except Exception as exc:
+            capture_status = {"status": "failed-capture", "error_type": type(exc).__name__}
+        capture_record = {
+            "schema_version": 2,
+            "record_type": "capture_result",
+            "attempt_id": f"{scenario_name}:{side}:{int(time.time() * 1_000_000)}",
+            "measurement_kind": "capture",
+            "side": side,
+            "scenario": scenario_name,
+            "protocol_id": cfg.protocol_id,
+            "source_version": cfg.source_version,
+            "episode_id": os.environ[resource_budget._EPISODE_ENV],
+            "episode_hash": capture_hash,
+            "capture": capture_status,
+            "evidence_state": "unadmitted",
+            "countability": {
+                "outcome": False,
+                "cost": False,
+                "pair": False,
+                "performance_assertion_allowed": False,
+            },
+            "ts": time.time(),
+        }
+        capture_record["record_hash"] = experiment_contracts.content_hash(capture_record)
+        _append_jsonl(cfg.results_path, capture_record)
+        if capture_status["status"] != "captured":
+            raise RuntimeError(
+                f"measurement capture failed: {capture_status['error_type']}"
+            )
+        return card
     outcome_measurement_error = None
     if row_arm and telemetry_validation_error:
         outcome_measurement_error = telemetry_validation_error
@@ -2291,13 +2612,18 @@ def build_bare_runner(cfg: Config, *, require_bloodhound: bool = False) -> bare_
         tools_spec=bare_mythic_tools.bare_tool_specs() + bh_specs,
         max_steps=cfg.max_steps,
         timeout=cfg.solve_timeout,
-        logger=bare_runner.make_stdout_logger(),
-        token_ceiling=(cfg.model_token_budget if cfg.measurement_kind == "row" else None),
-        require_complete_usage=cfg.measurement_kind == "row",
+        logger=(None if cfg.measurement_kind == "capture" else bare_runner.make_stdout_logger()),
+        token_ceiling=(cfg.model_token_budget if cfg.measurement_kind in {"row", "capture"} else None),
+        require_complete_usage=cfg.measurement_kind in {"row", "capture"},
     )
 
 
-def compare(cfg: Config, scenario_name: str) -> None:
+def compare(
+    cfg: Config,
+    scenario_name: str,
+    *,
+    headline_request: Mapping | None = None,
+) -> dict:
     p = cfg.results_path
     if not p.exists():
         raise SystemExit(f"no records at {p}; run both sides first")
@@ -2345,11 +2671,39 @@ def compare(cfg: Config, scenario_name: str) -> None:
     if not labels["performance_assertion_allowed"]:
         print(f"[{scenario_name}] retained comparison diagnostics; performance assertion refused: "
               f"{'; '.join(labels['identity_failures'])}")
-        return
+        return reproducible_claims.reporting_scope(
+            {}, reducer_name="bare_vs_harness_comparison", headline_request=headline_request,
+        )
     cmp = bare_runner.compare_bare_vs_harness(scenario_name, bare, harness)
+    producer_case_ids = []
+    producer_origins = []
+    for record in [*bare_records, *harness_records]:
+        origin = record.get("evaluation_origin") if isinstance(record, Mapping) else None
+        retained_origin = {
+            key: origin.get(key)
+            for key in ("split_registry_id", "cohort_id", "role", "source_case_id")
+        } if isinstance(origin, Mapping) else {}
+        producer_origins.append(retained_origin)
+        source_case_id = retained_origin.get("source_case_id")
+        if isinstance(source_case_id, str) and source_case_id.strip() and source_case_id.strip() not in producer_case_ids:
+            producer_case_ids.append(source_case_id.strip())
+    headline = reproducible_claims.reporting_scope(
+        {
+            "comparison": asdict(cmp),
+            "producer_case_ids": producer_case_ids,
+            "producer_origins": producer_origins,
+        },
+        reducer_name="bare_vs_harness_comparison",
+        headline_request=headline_request,
+        producer_case_ids=producer_case_ids,
+        producer_origins=producer_origins,
+    )
     print(f"[{scenario_name}] verdict={cmp.verdict} delta={cmp.delta:+.3f} "
           f"(harness={cmp.harness_objective_success_rate:.3f} "
-          f"bare={cmp.bare_objective_success_rate:.3f} mde={cmp.min_detectable_effect:.3f})")
+          f"bare={cmp.bare_objective_success_rate:.3f} mde={cmp.min_detectable_effect:.3f}) "
+          f"measurement_scope={headline['measurement_scope']} "
+          f"headline_lift_allowed={str(headline['headline_lift_allowed']).lower()}")
+    return headline
 
 
 def main(argv=None) -> int:
@@ -2386,7 +2740,7 @@ def main(argv=None) -> int:
                    help="explicit harness model ID; required for controlled multi-model runs")
     r.add_argument("--null-model", action="store_true",
                    help="headless ablation: disable the policy model after Model initialization")
-    r.add_argument("--measurement-kind", choices=["legacy", "diagnostic", "row"], default="legacy",
+    r.add_argument("--measurement-kind", choices=["legacy", "diagnostic", "row", "capture"], default="legacy",
                    help="measurement admission class; Gate 1P row mode requires the exact paired protocol")
     r.add_argument("--protocol-id", default=None,
                    help="concise prospective protocol identity for diagnostic/row attempts")
@@ -2403,6 +2757,8 @@ def main(argv=None) -> int:
                    help="source-bound model version required for a performance assertion")
     r.add_argument("--logical-seed", type=int, default=None,
                    help="prospective non-negative logical seed required for a performance assertion")
+    r.add_argument("--measurement-arm", default=None,
+                   help="prospective measurement variant identity; does not change runtime policy")
     r.add_argument("--campaign-limits", type=Path,
                    help="JSON object of declared CostLimits; unavailable axes fail before client creation")
     r.add_argument("--campaign-id", help="Retained campaign identity shared across scenarios in this ledger")
@@ -2442,6 +2798,8 @@ def main(argv=None) -> int:
     c = sub.add_parser("compare", help="combine recorded ScoreCards for a scenario into a verdict")
     c.add_argument("--scenario", required=True)
     c.add_argument("--pair-id", default=None)
+    c.add_argument("--headline-audit", type=Path,
+                   help="metadata-only final-audit split/receipt request; direct reports fail closed")
     pf = sub.add_parser("preflight",
                         help="fast (<5s) check that the scenario objective is completion-recognizable; "
                              "run BEFORE a reset+solve so a dropped/opaque objective fails cheap, not after 60 min")
@@ -2494,8 +2852,11 @@ def main(argv=None) -> int:
         for name, check in offline:
             try:
                 ok, detail = check()
-            except Exception as e:
-                ok, detail = False, f"check raised: {e}"
+                error_type = None if ok else "PreflightCheckFailed"
+            except Exception:
+                ok, detail, error_type = False, "check raised", "PreflightCheckRaised"
+            passed = bool(ok)
+            _emit_preflight_check(name, passed, error_type)
             print(f"[preflight/{args.scenario}] {'OK  ' if ok else 'FAIL'} {name}: {detail}", flush=True)
             if not ok:
                 failures.append(name)
@@ -2541,6 +2902,8 @@ def main(argv=None) -> int:
         cfg.model_version = args.model_version
     if getattr(args, "logical_seed", None) is not None:
         cfg.logical_seed = args.logical_seed
+    if getattr(args, "measurement_arm", None):
+        cfg.measurement_arm = args.measurement_arm
     if getattr(args, "campaign_limits", None) is not None:
         cfg.campaign_limits = experiment_contracts.CostLimits(**json.loads(args.campaign_limits.read_text()))
     cfg.campaign_id = getattr(args, "campaign_id", None)
@@ -2651,8 +3014,19 @@ def main(argv=None) -> int:
             ap.error(str(exc))
 
     if args.cmd == "compare":
-        compare(cfg, args.scenario)
-        return 0
+        headline_request = None
+        if args.headline_audit is not None:
+            try:
+                value = json.loads(args.headline_audit.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                value = {}
+            headline_request = value if isinstance(value, Mapping) else {}
+        headline = (
+            compare(cfg, args.scenario)
+            if headline_request is None
+            else compare(cfg, args.scenario, headline_request=headline_request)
+        )
+        return 2 if args.headline_audit is not None and headline["headline_lift_allowed"] is not True else 0
 
     if not args.go:
         if selected_development_row is not None:

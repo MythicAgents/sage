@@ -1,4 +1,5 @@
 import subprocess
+import asyncio
 import copy
 import importlib.util
 import json
@@ -60,6 +61,151 @@ def _stageb_protocol_argv(*extra):
         "sage-seed-apollo-v252-mythic4-20260829",
         *extra,
     ]
+
+
+def _capture_cli(*extra):
+    return [
+        str(PY), str(SCRIPT), "--scenario", "child-domain-control", "--side", "harness",
+        "--measurement-kind", "capture", "--protocol-id", "m3-protocol",
+        "--pair-id", "m3-pair", "--model-version", "version-1", "--logical-seed", "0",
+        "--measurement-arm", "shipping", "--source-version", "tree:test",
+        "--provider", "openai", "--model", "model-a", "--model-token-budget", "100",
+        "--model-context-limit", "200", "--max-output-tokens", "20", "--solve-timeout", "10",
+        "--live-authority-id", "test-authority", "--resource-budget-config", "/tmp/config",
+        "--resource-budget-ledger", "/tmp/ledger", "--resource-episode-id", "episode",
+        "--observation-directory", "/tmp/observer", "--capture-results-path", "/tmp/results",
+        *extra,
+    ]
+
+
+@pytest.mark.parametrize("missing", ("--pair-id", "--model-version", "--logical-seed", "--measurement-arm"))
+def test_capture_cli_requires_complete_measurement_identity_before_reset(missing):
+    command = _capture_cli("--go")
+    index = command.index(missing)
+    del command[index:index + 2]
+    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, check=False)
+    assert result.returncode == 2 and missing in result.stderr
+    assert "rollback " not in result.stdout
+
+
+def test_capture_cli_rejects_negative_seed_before_reset():
+    command = _capture_cli("--go")
+    command[command.index("--logical-seed") + 1] = "-1"
+    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, check=False)
+    assert result.returncode == 2 and "must be non-negative" in result.stderr
+    assert "rollback " not in result.stdout
+
+
+def test_capture_run_side_forwards_identity_through_actual_child_parser(monkeypatch, tmp_path):
+    invocations = []
+    monkeypatch.setattr(orchestrate, "full_reset_and_ready", lambda **_kwargs: (1, 2))
+    monkeypatch.setattr(
+        orchestrate, "_run", lambda name, argv, cwd, timeout, env=None, **_kwargs:
+        invocations.append((name, argv, cwd, timeout, env)),
+    )
+    orchestrate.run_side(
+        "child-domain-control", "harness", go=False, solve_timeout=10, policy_mode="llm",
+        provider="openai", model="model-a", measurement_kind="capture", protocol_id="m3-protocol",
+        pair_id="m3-pair", model_version="version-1", logical_seed=0, measurement_arm="shipping",
+        model_token_budget=100, model_context_limit=200, max_output_tokens=20,
+        source_version="tree:test", resource_budget_config=tmp_path / "config",
+        resource_budget_ledger=tmp_path / "ledger", resource_episode_id="episode",
+        observation_directory=tmp_path / "observer", capture_results_path=tmp_path / "results",
+        engagement_state_directory=tmp_path / "engagement", engagement_id="engagement-1",
+        skip_preflight=True,
+    )
+    name, argv, cwd, _timeout, env = invocations[-1]
+    assert name.startswith("gauge ") and cwd == orchestrate.PAYLOAD
+    for flag, expected in (
+        ("--pair-id", "m3-pair"), ("--model-version", "version-1"),
+        ("--logical-seed", "0"), ("--measurement-arm", "shipping"),
+    ):
+        assert argv[argv.index(flag) + 1] == expected
+    result = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, check=False)
+    assert result.returncode == 0 and "measurement: capture protocol=m3-protocol" in result.stdout
+
+
+def test_capture_run_side_calls_after_reset_before_gauge_and_passes_observer_config(monkeypatch, tmp_path):
+    events = []
+    reset_kwargs = {}
+    def reset(**kwargs):
+        events.append("reset")
+        reset_kwargs.update(kwargs)
+        return 31, 32
+    monkeypatch.setattr(orchestrate, "full_reset_and_ready", reset)
+    monkeypatch.setattr(
+        orchestrate, "_run", lambda name, *_args, **_kwargs: events.append(name),
+    )
+    route_env = {
+        orchestrate.PROCESS_OBSERVER_CONFIG_ENV: "/tmp/observer-config.json",
+        orchestrate.PROCESS_OBSERVER_CONFIG_SHA256_ENV: "a" * 64,
+    }
+    orchestrate.run_side(
+        "child-domain-control", "harness", go=False, solve_timeout=10, policy_mode="llm",
+        provider="openai", model="model-a", measurement_kind="capture", protocol_id="m3-protocol",
+        pair_id="m3-pair", model_version="version-1", logical_seed=0, measurement_arm="shipping",
+        model_token_budget=100, model_context_limit=200, max_output_tokens=20,
+        source_version="tree:test", resource_budget_config=tmp_path / "config",
+        resource_budget_ledger=tmp_path / "ledger", resource_episode_id="episode",
+        observation_directory=tmp_path / "observer", capture_results_path=tmp_path / "results",
+        engagement_state_directory=tmp_path / "engagement", engagement_id="engagement-1",
+        route_env=route_env, skip_preflight=True,
+        after_reset=lambda sage, apollo: events.append(("after", sage, apollo)),
+    )
+    assert events == ["reset", ("after", 31, 32), "gauge harness/child-domain-control"]
+    assert reset_kwargs["restart_env"][orchestrate.PROCESS_OBSERVER_CONFIG_ENV] == route_env[
+        orchestrate.PROCESS_OBSERVER_CONFIG_ENV
+    ]
+    assert reset_kwargs["restart_env"][orchestrate.PROCESS_OBSERVER_CONFIG_SHA256_ENV] == "a" * 64
+    assert reset_kwargs["restart_env"]["SAGE_ENGAGEMENT_STATE_DIR"] == str(tmp_path / "engagement")
+    assert reset_kwargs["restart_env"]["SAGE_ENGAGEMENT_ID"] == "engagement-1"
+
+
+def test_capture_after_reset_failure_prevents_gauge_launch(monkeypatch, tmp_path):
+    monkeypatch.setattr(orchestrate, "full_reset_and_ready", lambda **_kwargs: (None, 32))
+    calls = []
+    monkeypatch.setattr(orchestrate, "_run", lambda *_args, **_kwargs: calls.append("gauge"))
+    with pytest.raises(RuntimeError, match="snapshot failed"):
+        orchestrate.run_side(
+            "child-domain-control", "harness", go=False, solve_timeout=10, policy_mode="llm",
+            provider="openai", model="model-a", measurement_kind="capture", protocol_id="m3-protocol",
+            pair_id="m3-pair", model_version="version-1", logical_seed=0, measurement_arm="shipping",
+            model_token_budget=100, model_context_limit=200, max_output_tokens=20,
+            source_version="tree:test", resource_budget_config=tmp_path / "config",
+            resource_budget_ledger=tmp_path / "ledger", resource_episode_id="episode",
+            observation_directory=tmp_path / "observer", capture_results_path=tmp_path / "results",
+            engagement_state_directory=tmp_path / "engagement", engagement_id="engagement-1",
+            skip_preflight=True, after_reset=lambda *_ids: (_ for _ in ()).throw(RuntimeError("snapshot failed")),
+        )
+    assert calls == []
+
+
+def test_capture_observer_config_pair_and_scope_reject_before_reset(monkeypatch, tmp_path):
+    resets = []
+    monkeypatch.setattr(orchestrate, "full_reset_and_ready", lambda **_kwargs: resets.append(True))
+    common = dict(
+        scenario="child-domain-control", side="harness", go=False, solve_timeout=10,
+        provider="openai", model="model-a", protocol_id="m3-protocol", pair_id="m3-pair",
+        model_version="version-1", logical_seed=0, measurement_arm="shipping", model_token_budget=100,
+        model_context_limit=200, max_output_tokens=20, source_version="tree:test",
+        resource_budget_config=tmp_path / "config", resource_budget_ledger=tmp_path / "ledger",
+        resource_episode_id="episode", observation_directory=tmp_path / "observer",
+        capture_results_path=tmp_path / "results", skip_preflight=True,
+        engagement_state_directory=tmp_path / "engagement", engagement_id="engagement-1",
+    )
+    with pytest.raises(SystemExit, match="configuration is incomplete"):
+        orchestrate.run_side(
+            measurement_kind="capture", route_env={orchestrate.PROCESS_OBSERVER_CONFIG_ENV: "/tmp/x"},
+            **common,
+        )
+    with pytest.raises(SystemExit, match="capture-only"):
+        orchestrate.run_side(
+            measurement_kind="row", route_env={
+                orchestrate.PROCESS_OBSERVER_CONFIG_ENV: "/tmp/x",
+                orchestrate.PROCESS_OBSERVER_CONFIG_SHA256_ENV: "a" * 64,
+            }, **common,
+        )
+    assert resets == []
 
 
 def test_gate1p_stageb_dry_run_emits_only_allocated_protocol_and_matrix_schedule():
@@ -1942,11 +2088,19 @@ def test_full_reset_syncs_range_time_after_all_guests_report_ips(monkeypatch):
         ludus_range_id="SAGELAPSR520260715",
         ludus_mcp_server="ludus_sagerepl",
     )
+    stages=[]
     assert orchestrate.full_reset_and_ready(
         foothold=foothold,
         ludus_range_id="SAGELAPSR520260715",
         ludus_mcp_server="ludus_sagerepl",
+        setup_stage_callback=stages.append,
     ) == (None, 7)
+    terminal={row["stage"]:row["status"] for row in stages}
+    assert set(terminal)=={
+        "stop-sage","archive-dbs","reset-mythic","ludus-rollback","ludus-poweron","range-boot",
+        "clock-reachability","sync-range-time","wipe-bloodhound","bloodhound-empty","restart-sage",
+        "bootstrap-foothold","foothold-power","foothold-launch","readiness","callback-discovery"}
+    assert set(terminal.values())=={"passed"}
 
     poweron_index = next(index for index, event in enumerate(events) if event[:2] == ("run", "ludus poweron"))
     guest_poll_index = next(index for index, event in enumerate(events) if event == ("readiness", "range boot"))
@@ -1980,6 +2134,39 @@ def test_full_reset_syncs_range_time_after_all_guests_report_ips(monkeypatch):
         "sync",
         "--yes",
     ]
+    noncapture_bootstrap=next(event[2] for event in events if event[:2]==("run","bootstrap foothold"))
+    assert "--sage-chat-registration-timeout" not in noncapture_bootstrap
+
+
+def test_capture_reset_uses_existing_registration_timeout_and_wait_accepts_delayed_chat(monkeypatch,tmp_path):
+    calls=[]
+    monkeypatch.setattr(orchestrate,"_range_env",lambda *_a,**_k:{})
+    monkeypatch.setattr(orchestrate,"_run",lambda name,argv,cwd,timeout,**_k:calls.append((name,list(argv))))
+    monkeypatch.setattr(orchestrate,"_poll",lambda *_a,**_k:"")
+    monkeypatch.setattr(orchestrate,"_wait_for_range_boot",lambda **_k:{"ready":True})
+    monkeypatch.setattr(orchestrate,"discover_callbacks",lambda *_a,**_k:7)
+    orchestrate.full_reset_and_ready(capture_total_timeout=1800,setup_stage_callback=lambda _event:None)
+    argv=next(argv for name,argv in calls if name=="bootstrap foothold")
+    script=ROOT/"skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py"
+    spec=importlib.util.spec_from_file_location("capture_registration_wait",script)
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    parsed=module.build_parser().parse_args(argv[2:])
+    assert parsed.sage_chat_registration_timeout==120
+    assert module.build_parser().parse_args(["bootstrap-reset"]).sage_chat_registration_timeout==30
+    class Clock:
+        value=0.0
+        def time(self):return self.value
+    clock=Clock();attempts=[]
+    async def query(*_a,**_k):
+        attempts.append(clock.value);return {"consuming_container":([{"container_running":True,"deleted":False}]
+            if clock.value>=69 else [])}
+    async def sleep(value):clock.value+=value
+    monkeypatch.setattr(module.mythic,"execute_custom_query",query);monkeypatch.setattr(module.asyncio,"get_running_loop",lambda:clock)
+    monkeypatch.setattr(module.asyncio,"sleep",sleep);monkeypatch.setattr(module,"_emit_registration_diagnostic",lambda **_k:None)
+    with pytest.raises(RuntimeError,match="Timed out"):
+        asyncio.run(module.wait_for_running_sage_chat_container(object(),timeout_seconds=30))
+    clock.value=0;attempts.clear()
+    assert asyncio.run(module.wait_for_running_sage_chat_container(object(),timeout_seconds=120))["container_running"] is True
 
 
 def test_foothold_launch_env_maps_alternate_password_source(monkeypatch):
@@ -2125,6 +2312,70 @@ def test_run_side_preflight_authenticates_exact_model_route_before_reset(monkeyp
     assert argv[argv.index("--max-output-tokens") + 1] == "8192"
     assert env["API_ENDPOINT"] == route_env["API_ENDPOINT"]
     assert env["API_KEY"] == route_env["API_KEY"]
+
+
+def test_capture_preflight_uses_global_ledger_before_episode_activation(monkeypatch, tmp_path):
+    resource_path = ROOT / "Payload_Type/sage/ai/resource_budget.py"
+    spec = importlib.util.spec_from_file_location("capture_preflight_resource_budget", resource_path)
+    resource = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(resource)
+    config, ledger = tmp_path / "config.json", tmp_path / "ledger.jsonl"
+    config.write_text(json.dumps({
+        "schema": resource.CONFIG_SCHEMA,
+        "resources": {
+            "episodes": {"limit": 2, "cleanup_reserve": 0},
+            "control_requests": {"limit": 20, "cleanup_reserve": 2},
+            "provider_requests": {"limit": 4, "cleanup_reserve": 0},
+            "provider_tokens": {"limit": 98304, "cleanup_reserve": 0},
+            "payload_task_attempts": {"limit": 2, "cleanup_reserve": 0},
+        }, "calendar_seconds": 300, "cleanup_seconds": 30,
+    }))
+    operator = resource.ResourceLedger(config, ledger)
+    operator.register_episode(
+        "measured", action_seconds=100, settlement_seconds=30,
+        provider_token_limit=65536, per_call_token_reservation=32768,
+        payload_task_limit=1,
+    )
+    seen = []
+
+    def fake_run(name, _argv, _cwd, _timeout, env=None, **_kwargs):
+        seen.append((name, dict(env or {})))
+        if name.startswith("preflight "):
+            with monkeypatch.context() as child:
+                for key, value in (env or {}).items():
+                    child.setenv(key, value)
+                child.setenv("SAGE_RESOURCE_BUDGET_CONFIG", str(config))
+                child.setenv("SAGE_RESOURCE_BUDGET_LEDGER", str(ledger))
+                resource.configured_ledger().reserve(
+                    {"provider_requests": 1, "provider_tokens": 32768}, "route-preflight"
+                )
+
+    monkeypatch.setenv("SAGE_RESOURCE_EPISODE_ID", "measured")
+    monkeypatch.setattr(orchestrate, "_run", fake_run)
+    monkeypatch.setattr(orchestrate, "full_reset_and_ready", lambda **_kwargs: (None, 7))
+    orchestrate.run_side(
+        "child-domain-control", "harness", go=False, solve_timeout=10,
+        provider="openai", model="model-a", measurement_kind="capture",
+        protocol_id="m3-protocol", pair_id="m3-pair", model_version="version-1",
+        logical_seed=0, measurement_arm="shipping", model_token_budget=65536,
+        model_context_limit=32768, max_output_tokens=4096, source_version="tree:test",
+        resource_budget_config=config, resource_budget_ledger=ledger,
+        resource_episode_id="measured", observation_directory=tmp_path / "observer",
+        capture_results_path=tmp_path / "results",
+        engagement_state_directory=tmp_path / "engagement", engagement_id="engagement-1",
+        route_env={"SAGE_RESOURCE_EPISODE_ID": "wrong-stale-selection"},
+    )
+    assert seen[0][1]["SAGE_RESOURCE_EPISODE_ID"] == ""
+    assert operator.status()["effective_resource_charges"]["provider_tokens"] == 32768
+    with pytest.raises(resource.ResourceBudgetExceeded, match="pending"):
+        resource.ResourceLedger(config, ledger, episode_id="measured").reserve(
+            {"provider_requests": 1, "provider_tokens": 32768}, "measured-turn"
+        )
+    operator.activate_episode("measured")
+    resource.ResourceLedger(config, ledger, episode_id="measured").reserve(
+        {"provider_requests": 1, "provider_tokens": 32768}, "measured-turn"
+    )
 
 
 def test_gate1p_diagnostic_cli_requires_explicit_bloodhound_dir():
@@ -3261,6 +3512,25 @@ def test_isc11_direct_launch_accepts_only_qualified_absent_localuser_and_reaps_r
     orchestrate._launch_replication_foothold_direct(_isc11_foothold())
 
     assert events == ["launch retained replication Apollo", "terminate", ("wait", 15)]
+
+
+def test_isc11_direct_launch_exception_still_uses_deadline_group_cleanup(monkeypatch):
+    expected = "No session owned by 'localuser' was found; refusing to report cleanup success."
+    monkeypatch.setattr(orchestrate.subprocess, "run", lambda *_a, **_k: SimpleNamespace(
+        returncode=2, stderr=json.dumps({"error": expected}), stdout="",
+    ))
+    rdp = SimpleNamespace(pid=12345, poll=lambda: None)
+    monkeypatch.setattr(orchestrate.subprocess, "Popen", lambda *_a, **_k: rdp)
+    monkeypatch.setattr(orchestrate, "_run", lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("stop")))
+    deadline = orchestrate._ResetDeadline(30)
+    cleaned = []
+    monkeypatch.setattr(deadline, "run", lambda *_a, **_k: SimpleNamespace(
+        returncode=2, stderr=json.dumps({"error": expected}), stdout="",
+    ))
+    monkeypatch.setattr(deadline, "terminate", lambda process: cleaned.append(process))
+    with pytest.raises(RuntimeError, match="stop"):
+        orchestrate._launch_replication_foothold_direct(_isc11_foothold(), deadline)
+    assert cleaned == [rdp]
 
 
 def test_isc11_contract_validation_binds_profile_route_tranche_and_authority():

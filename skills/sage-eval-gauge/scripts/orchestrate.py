@@ -23,6 +23,7 @@ import json
 import math
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -39,6 +40,8 @@ DEFAULT_SNAPSHOT = "sage-seed-apollo-staged-20260710"
 DEFAULT_RETAINED_CALLBACK_CONFIG = (
     ROOT / "skills" / "sage-callback-bootstrap" / "apollo_callback_config.json"
 )
+PROCESS_OBSERVER_CONFIG_ENV = "SAGE_PROCESS_OBSERVER_CONFIG"
+PROCESS_OBSERVER_CONFIG_SHA256_ENV = "SAGE_PROCESS_OBSERVER_CONFIG_SHA256"
 DEFAULT_ROUTE_ENV = ROOT / "skills" / "sage-eval-gauge" / ".env.local"
 RUN_AS_RESOLVER_PATH = (
     ROOT / "skills" / "sage-foothold-launch" / "scripts" / "run_as_resolver.py"
@@ -485,6 +488,9 @@ RESET_STEPS = [
         900,
     ),
 ]
+
+# Instrumented capture startups can take about 70 seconds to register Sage Chat.
+_CAPTURE_SAGE_CHAT_REGISTRATION_TIMEOUT_SECONDS = 120
 LUDUS_STATUS = [PY, "skills/sage-goad-reset/scripts/ludus.py", "status"]
 CALLBACKS = [PY, "skills/sage-live-runner/scripts/sage_task.py", "callbacks"]
 
@@ -729,11 +735,82 @@ def _phase8_goad_regression_eval_env(
     }
 
 
-def _run(name, argv, cwd, timeout, env: dict[str, str] | None = None):
+def _run(name, argv, cwd, timeout, env: dict[str, str] | None = None,
+         deadline: "_ResetDeadline | None" = None):
     print(f"\n=== {name} ===\n$ (cd {cwd}) {' '.join(argv)}", flush=True)
-    proc = subprocess.run(argv, cwd=str(cwd), timeout=timeout, text=True, env=env)
+    proc = (subprocess.run(argv, cwd=str(cwd), timeout=timeout, text=True, env=env)
+            if deadline is None else deadline.run(argv, cwd=cwd, cap=timeout, env=env))
     if proc.returncode != 0:
-        raise SystemExit(f"ABORT: step '{name}' failed (exit {proc.returncode}) — not running the gauge on a bad range.")
+        error=SystemExit(f"ABORT: step '{name}' failed (exit {proc.returncode}) — not running the gauge on a bad range.")
+        error.setup_exit_code=proc.returncode
+        raise error
+
+
+class _ResetDeadline:
+    def __init__(self, seconds: float, *, now=time.monotonic, sleep=time.sleep):
+        if not math.isfinite(float(seconds)) or float(seconds) <= 0:
+            raise ValueError("capture reset timeout must be finite and positive")
+        self._now, self._sleep = now, sleep
+        self.expires = now() + float(seconds)
+
+    def remaining(self, cap: float | None = None) -> float:
+        value = self.expires - self._now()
+        if value <= 0:
+            raise SystemExit("ABORT: capture reset total deadline exhausted before next dispatch")
+        return value if cap is None else min(value, float(cap))
+
+    def run(self, argv, *, cwd, cap, env=None, capture_output=False, text=True):
+        timeout = self.remaining(cap)
+        process = subprocess.Popen(
+            argv, cwd=str(cwd), env=env,
+            stdout=subprocess.PIPE if capture_output else None,
+            stderr=subprocess.PIPE if capture_output else None,
+            text=text, start_new_session=True,
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self.terminate(process)
+            error=SystemExit("ABORT: capture reset total deadline exhausted during child dispatch")
+            error.setup_timeout_seconds=timeout
+            raise error from None
+        except BaseException:
+            self.terminate(process)
+            raise
+        return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+
+    def terminate(self, process) -> None:
+        # Every process started by this class is a session/process-group leader.
+        # The group can outlive its direct parent, so poll() is not a cleanup gate.
+        pgid = process.pid
+        def group_exists() -> bool:
+            try:
+                os.killpg(pgid, 0)
+                return True
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        grace_until = min(self.expires, self._now() + 0.5)
+        while group_exists() and self._now() < grace_until:
+            self._sleep(min(0.02, grace_until - self._now()))
+        if group_exists():
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if process.poll() is None:
+            process.wait()
+
+    def wait(self, seconds: float) -> None:
+        remaining = self.remaining()
+        self._sleep(min(float(seconds), remaining))
+        if float(seconds) >= remaining:
+            raise SystemExit("ABORT: capture reset total deadline exhausted while waiting")
 
 
 def _replication_direct_launch_vectors(foothold: FootholdSpec) -> dict[str, list[str]]:
@@ -767,13 +844,20 @@ def _replication_direct_launch_vectors(foothold: FootholdSpec) -> dict[str, list
     }
 
 
-def _launch_replication_foothold_direct(foothold: FootholdSpec) -> None:
-    """Run the attempt-003 qualified direct-helper sequence and always reap local RDP."""
+def _launch_replication_foothold_direct(
+    foothold: FootholdSpec, deadline: _ResetDeadline | None = None,
+) -> None:
+    """Run the direct-helper sequence and reap its local RDP process group.
+
+    A PTY session that escapes that owned process group remains an operator cleanup boundary.
+    """
     vectors = _replication_direct_launch_vectors(foothold)
     env = foothold.launch_env()
-    logoff = subprocess.run(
+    logoff = (subprocess.run(
         vectors["logoff"], cwd=str(ROOT), capture_output=True, text=True, timeout=180, env=env,
-    )
+    ) if deadline is None else deadline.run(
+        vectors["logoff"], cwd=ROOT, cap=180, capture_output=True, text=True, env=env,
+    ))
     if logoff.returncode != 0:
         try:
             error = str(json.loads(logoff.stderr).get("error") or "")
@@ -783,15 +867,27 @@ def _launch_replication_foothold_direct(foothold: FootholdSpec) -> None:
         if logoff.returncode != 2 or error != expected:
             detail = (logoff.stderr or logoff.stdout or "no diagnostic output").strip()
             raise SystemExit(f"ABORT: replication prelaunch session cleanup failed: {detail}")
+    if deadline is not None:
+        deadline.remaining()
     rdp = subprocess.Popen(
         vectors["rdp"], cwd=str(ROOT), env=env,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
     try:
-        _run("launch retained replication Apollo", vectors["launch"], ROOT, 900, env=env)
+        launch_cap = 900
+        if deadline is not None:
+            # Both the launch command's group and the RDP helper need time to
+            # receive TERM; the helper must then reap its separate PTY session.
+            launch_cap = min(launch_cap, deadline.remaining() - 2.0)
+            if launch_cap <= 0:
+                raise SystemExit("ABORT: capture reset deadline cannot fit RDP cleanup")
+        _run("launch retained replication Apollo", vectors["launch"], ROOT, launch_cap, env=env,
+             deadline=deadline)
     finally:
-        if rdp.poll() is None:
+        if deadline is not None:
+            deadline.terminate(rdp)
+        elif rdp.poll() is None:
             rdp.terminate()
             try:
                 rdp.wait(timeout=15)
@@ -810,19 +906,44 @@ def _poll(
     interval=20,
     env: dict[str, str] | None = None,
     predicate_returncodes: tuple[int, ...] = (0,),
+    deadline: _ResetDeadline | None = None,
 ):
     print(f"\n=== poll: {name} (<= {timeout}s) ===", flush=True)
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        proc = subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True, env=env)
+    if deadline is None:
+        poll_deadline = time.monotonic() + timeout
+        while time.monotonic() < poll_deadline:
+            proc = subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True, env=env)
+            if proc.returncode not in predicate_returncodes:
+                detail = (proc.stderr or proc.stdout or "no diagnostic output").strip()
+                error=SystemExit(
+                    f"ABORT: poll '{name}' command failed (exit {proc.returncode}): {detail}"
+                )
+                error.setup_exit_code=proc.returncode
+                raise error
+            if predicate(proc.stdout):
+                return proc.stdout
+            time.sleep(interval)
+        raise SystemExit(f"ABORT: '{name}' not ready within {timeout}s — fix the lab before running the gauge.")
+
+    poll_deadline = min(deadline.expires, deadline._now() + timeout)
+    while deadline._now() < poll_deadline:
+        child_cap = poll_deadline - deadline._now()
+        proc = deadline.run(argv, cwd=cwd, cap=child_cap, capture_output=True, text=True, env=env)
         if proc.returncode not in predicate_returncodes:
             detail = (proc.stderr or proc.stdout or "no diagnostic output").strip()
-            raise SystemExit(
+            error=SystemExit(
                 f"ABORT: poll '{name}' command failed (exit {proc.returncode}): {detail}"
             )
+            error.setup_exit_code=proc.returncode
+            raise error
         if predicate(proc.stdout):
             return proc.stdout
-        time.sleep(interval)
+        poll_remaining = poll_deadline - deadline._now()
+        if poll_remaining <= 0:
+            break
+        deadline.wait(min(interval, poll_remaining))
+    if deadline._now() >= deadline.expires:
+        deadline.remaining()
     raise SystemExit(f"ABORT: '{name}' not ready within {timeout}s — fix the lab before running the gauge.")
 
 
@@ -859,14 +980,22 @@ def _wait_for_range_boot(
     range_profile_id: str = _RANGE_PROFILES.DEFAULT_PROFILE_ID,
     timeout: float,
     interval: float = 20,
+    deadline: _ResetDeadline | None = None,
 ) -> dict:
+    outer_timeout = float(timeout) if deadline is None else deadline.remaining(timeout)
+    if deadline is not None and outer_timeout <= (
+        _READINESS.LUDUS_PROBE_TIMEOUT_SECONDS + _READINESS.DEFAULT_TIMEOUT_GRACE_SECONDS
+    ):
+        raise SystemExit("ABORT: capture reset deadline cannot fit another Ludus readiness probe")
     decision = _READINESS.poll_readiness(
         lambda: _READINESS.range_boot_observation(range_id, mcp_server, range_profile_id),
         lane="range_boot",
-        outer_timeout_seconds=timeout,
+        outer_timeout_seconds=outer_timeout,
         child_timeout_seconds=_READINESS.LUDUS_PROBE_TIMEOUT_SECONDS,
         grace_seconds=_READINESS.DEFAULT_TIMEOUT_GRACE_SECONDS,
         poll_seconds=interval,
+        sleep=time.sleep if deadline is None else deadline.wait,
+        now=time.monotonic if deadline is None else deadline._now,
     )
     if decision.get("ready") is not True:
         raise SystemExit(
@@ -881,9 +1010,14 @@ def _bloodhound_is_empty(out: str) -> bool:
     return bool(match and int(match.group(1)) == 0)
 
 
-def discover_callbacks(foothold: FootholdSpec | None = None) -> int:
+def discover_callbacks(
+    foothold: FootholdSpec | None = None, deadline: _ResetDeadline | None = None,
+) -> int:
     foothold = foothold or FootholdSpec()
-    proc = subprocess.run(CALLBACKS, cwd=str(ROOT), capture_output=True, text=True)
+    proc = (subprocess.run(CALLBACKS, cwd=str(ROOT), capture_output=True, text=True)
+            if deadline is None else deadline.run(
+                CALLBACKS, cwd=ROOT, cap=deadline.remaining(), capture_output=True, text=True
+            ))
     if proc.returncode != 0:
         raise SystemExit(
             f"ABORT: callback inventory failed (exit {proc.returncode}): "
@@ -1026,6 +1160,8 @@ def full_reset_and_ready(
     foothold: FootholdSpec | None = None,
     ludus_range_id: str | None = None,
     ludus_mcp_server: str | None = None,
+    capture_total_timeout: float | None = None,
+    setup_stage_callback: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> tuple[None, int]:
     """Full clean reset -> readiness -> callback discovery; returns (None, apollo_cb).
 
@@ -1040,7 +1176,26 @@ def full_reset_and_ready(
     foothold = foothold or FootholdSpec()
     ludus_range_id = ludus_range_id or foothold.ludus_range_id
     ludus_mcp_server = ludus_mcp_server or foothold.ludus_mcp_server
+    deadline = None if capture_total_timeout is None else _ResetDeadline(capture_total_timeout)
+    deadline_kw = {} if deadline is None else {"deadline": deadline}
     range_env = _range_env(ludus_range_id, ludus_mcp_server, foothold.range_profile_id)
+    def stage(name:str,call):
+        if setup_stage_callback is not None:setup_stage_callback({"stage":name,"status":"started",
+            "error_class":None,"exit_code":None,"timeout_seconds":None})
+        try:value=call()
+        except BaseException as error:
+            if setup_stage_callback is not None:setup_stage_callback({"stage":name,"status":"failed",
+                "error_class":("SystemExit" if isinstance(error,SystemExit) else
+                    "TimeoutExpired" if isinstance(error,subprocess.TimeoutExpired) else "UnexpectedError"),
+                "exit_code":getattr(error,"setup_exit_code",None),
+                "timeout_seconds":getattr(error,"setup_timeout_seconds",getattr(error,"timeout",None))})
+            raise
+        if setup_stage_callback is not None:setup_stage_callback({"stage":name,"status":"passed",
+            "error_class":None,"exit_code":None,"timeout_seconds":None})
+        return value
+    names={"stop sage":"stop-sage","archive dbs":"archive-dbs","reset mythic":"reset-mythic",
+        "ludus rollback":"ludus-rollback","ludus poweron":"ludus-poweron","sync range time":"sync-range-time",
+        "wipe bloodhound":"wipe-bloodhound","restart sage":"restart-sage","bootstrap foothold":"bootstrap-foothold"}
     for name, argv, cwd, timeout in RESET_STEPS:
         step_argv = argv
         if name == "ludus rollback" and snapshot:
@@ -1059,13 +1214,14 @@ def full_reset_and_ready(
                 mcp_server=ludus_mcp_server,
             )
         if name == "sync range time":
-            _wait_for_range_boot(
+            stage("range-boot",lambda:_wait_for_range_boot(
                 range_id=ludus_range_id,
                 mcp_server=ludus_mcp_server,
                 range_profile_id=foothold.range_profile_id,
                 timeout=1800,
-            )
-            _poll(
+                **deadline_kw,
+            ))
+            stage("clock-reachability",lambda:_poll(
                 "range WinRM clock probes respond",
                 _sync_range_time_argv(
                     "check",
@@ -1077,7 +1233,8 @@ def full_reset_and_ready(
                 timeout=600,
                 env=range_env,
                 predicate_returncodes=(0, 1),
-            )
+                **deadline_kw,
+            ))
             step_argv = _sync_range_time_argv(
                 "sync",
                 "--yes",
@@ -1093,11 +1250,14 @@ def full_reset_and_ready(
                 "--retained-callback-config",
                 str(retained_callback_config),
             ]
+            if capture_total_timeout is not None:
+                step_argv.extend(["--sage-chat-registration-timeout",
+                                  str(_CAPTURE_SAGE_CHAT_REGISTRATION_TIMEOUT_SECONDS)])
         if name == "restart sage" and restart_env:
             step_argv = list(argv) + [f"{k}={v}" for k, v in restart_env.items()]
-        _run(name, step_argv, cwd, timeout, env=range_env)
+        stage(names[name],lambda:_run(name, step_argv, cwd, timeout, env=range_env, **deadline_kw))
         if name == "wipe bloodhound":
-            _poll(
+            stage("bloodhound-empty",lambda:_poll(
                 "BloodHound authoritative domain count is zero",
                 [
                     "uv", "--directory", BH, "run", "python",
@@ -1108,20 +1268,23 @@ def full_reset_and_ready(
                 timeout=120,
                 interval=5,
                 env=range_env,
-            )
-    _poll(
+                **deadline_kw,
+            ))
+    stage("foothold-power",lambda:_poll(
         f"{foothold.host} powered on",
         _ludus_argv("status", range_id=ludus_range_id, mcp_server=ludus_mcp_server),
         ROOT,
         lambda out: _foothold_guest_up(out, foothold.ip),
         timeout=1800,
         env=range_env,
-    )
+        **deadline_kw,
+    ))
     if foothold.direct_retained_launch:
-        _launch_replication_foothold_direct(foothold)
+        stage("foothold-launch",lambda:_launch_replication_foothold_direct(foothold, **deadline_kw))
     else:
-        _run("launch retained apollo", foothold.launch_argv(), ROOT, 900, env=foothold.launch_env())
-    _poll(
+        stage("foothold-launch",lambda:_run("launch retained apollo", foothold.launch_argv(), ROOT, 900,
+             env=foothold.launch_env(), **deadline_kw))
+    stage("readiness",lambda:_poll(
         "sage chat + apollo ready",
         foothold.readiness_argv(),
         ROOT,
@@ -1129,8 +1292,9 @@ def full_reset_and_ready(
         timeout=1200,
         env=range_env,
         predicate_returncodes=(0, 1),
-    )
-    callback_id = discover_callbacks(foothold)
+        **deadline_kw,
+    ))
+    callback_id = stage("callback-discovery",lambda:discover_callbacks(foothold, **deadline_kw))
     return None, callback_id
 
 
@@ -1200,18 +1364,93 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_m
              measurement_kind: str = "legacy",
              protocol_id: str | None = None,
              pair_id: str | None = None,
+             model_version: str | None = None,
+             logical_seed: int | None = None,
+             measurement_arm: str | None = None,
              arm_index: int | None = None,
              model_token_budget: int | None = None,
              model_context_limit: int | None = None,
              max_output_tokens: int | None = None,
              source_version: str | None = None,
              live_authority_id: str | None = None,
+             resource_budget_config: Path | None = None,
+             resource_budget_ledger: Path | None = None,
+             resource_episode_id: str | None = None,
+             observation_directory: Path | None = None,
+             capture_results_path: Path | None = None,
+             engagement_state_directory:Path|None=None,
+             engagement_id:str|None=None,
              row_contract: Path | None = None,
              row_contract_sha256: str | None = None,
              row_id: str | None = None,
              skip_preflight: bool = False,
-             before_reset: Callable[[], None] | None = None) -> int:
+             before_reset: Callable[[], None] | None = None,
+             setup_stage_callback: Callable[[Mapping[str, Any]], None] | None = None,
+             after_reset: Callable[[int | None, int], None] | None = None) -> int:
     foothold = _configure_foothold_for_scenario(scenario, foothold)
+    capture_env: dict[str, str] = {}
+    if measurement_kind == "capture":
+        required = {
+            "protocol_id": protocol_id,
+            "pair_id": pair_id,
+            "source_version": source_version,
+            "model_version": model_version,
+            "measurement_arm": measurement_arm,
+            "provider": provider,
+            "model": model,
+            "live_authority_id": live_authority_id if go else "dry-run",
+            "resource_budget_config": resource_budget_config,
+            "resource_budget_ledger": resource_budget_ledger,
+            "resource_episode_id": resource_episode_id,
+            "observation_directory": observation_directory,
+            "capture_results_path": capture_results_path,
+        }
+        if side == "harness":
+            required.update(engagement_state_directory=engagement_state_directory,
+                            engagement_id=engagement_id)
+        missing = [name for name, value in required.items() if not str(value or "").strip()]
+        positive = {
+            "solve_timeout": solve_timeout,
+            "model_token_budget": model_token_budget,
+            "model_context_limit": model_context_limit,
+            "max_output_tokens": max_output_tokens,
+        }
+        missing.extend(
+            name for name, value in positive.items()
+            if type(value) is not int or value <= 0
+        )
+        if max_output_tokens and model_context_limit and max_output_tokens > model_context_limit:
+            missing.append("max_output_tokens<=model_context_limit")
+        if type(logical_seed) is not int or logical_seed < 0:
+            missing.append("logical_seed")
+        if missing:
+            raise SystemExit(
+                "ABORT: capture mode requires complete prospective bindings: " + ", ".join(missing)
+            )
+        capture_env = {
+            "SAGE_RESOURCE_BUDGET_CONFIG": str(resource_budget_config),
+            "SAGE_RESOURCE_BUDGET_LEDGER": str(resource_budget_ledger),
+            "SAGE_RESOURCE_EPISODE_ID": str(resource_episode_id),
+            "SAGE_OBSERVATION_DIRECTORY": str(observation_directory),
+            "SAGE_EVAL_RESULTS_PATH": str(capture_results_path),
+            "SAGE_EVAL_CAPTURE_REPLAY_CONTEXT": "1",
+        }
+        if side == "harness":
+            capture_env.update(SAGE_ENGAGEMENT_STATE_DIR=str(engagement_state_directory),
+                               SAGE_ENGAGEMENT_ID=str(engagement_id))
+    observer_config = str((route_env or {}).get(PROCESS_OBSERVER_CONFIG_ENV) or "").strip()
+    observer_config_sha256 = str(
+        (route_env or {}).get(PROCESS_OBSERVER_CONFIG_SHA256_ENV) or ""
+    ).strip()
+    if observer_config or observer_config_sha256:
+        if measurement_kind != "capture":
+            raise SystemExit("ABORT: process observer configuration is capture-only")
+        if not observer_config or not observer_config_sha256:
+            raise SystemExit("ABORT: capture process observer configuration is incomplete")
+        capture_env.update({
+            PROCESS_OBSERVER_CONFIG_ENV: observer_config,
+            PROCESS_OBSERVER_CONFIG_SHA256_ENV: observer_config_sha256,
+        })
     if measurement_kind == "row" and pair_id:
         gate1p = _gate1p_stagea_protocol()
         inherited = {**os.environ, **(route_env or {})}
@@ -1226,12 +1465,17 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_m
     # (the gauge's read-only/seam-injected design makes that seam invisible to offline unit tests). Aborts
     # (via _run's non-zero SystemExit) on a dropped/opaque/unparseable objective.
     if not skip_preflight:
+        preflight_env = {**(route_env or {}), **capture_env}
+        if measurement_kind == "capture":
+            # Route authentication is globally charged before the measured episode is active.
+            # An explicit empty value also overrides stale operator-process/route selections.
+            preflight_env["SAGE_RESOURCE_EPISODE_ID"] = ""
         _run_side_preflight(
             scenario,
             provider=provider,
             model=model,
             max_output_tokens=max_output_tokens,
-            route_env=route_env,
+            route_env=preflight_env,
         )
     # Sage always uses the bounded execution kernel for autonomous solves. Policy mode identifies who selects
     # each semantic capability: the product LLM policy or the preserved symbolic regression baseline.
@@ -1247,7 +1491,8 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_m
         "SAGE_ENGAGEMENT_NETBIOS_MAP": _engagement_netbios_map(scenario, engagement_netbios_map),
     }
     restart_env.update(_scenario_restart_env(scenario))
-    if measurement_kind == "row":
+    restart_env.update(capture_env)
+    if measurement_kind in {"row", "capture"}:
         restart_env.update({
             "SAGE_EVAL_MODEL_TOKEN_BUDGET": str(model_token_budget or ""),
             "SAGE_EVAL_MODEL_CONTEXT_LIMIT": str(model_context_limit or ""),
@@ -1260,11 +1505,17 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_m
         "foothold": foothold,
         "ludus_range_id": ludus_range_id,
     }
+    if measurement_kind == "capture":
+        reset_kwargs["capture_total_timeout"] = 1800
     if ludus_mcp_server is not None:
         reset_kwargs["ludus_mcp_server"] = ludus_mcp_server
+    if setup_stage_callback is not None:
+        reset_kwargs["setup_stage_callback"] = setup_stage_callback
     if before_reset is not None:
         before_reset()
-    _sage_cb, apollo_cb = full_reset_and_ready(**reset_kwargs)
+    sage_cb, apollo_cb = full_reset_and_ready(**reset_kwargs)
+    if after_reset is not None:
+        after_reset(sage_cb, apollo_cb)
     argv = [PY, "ai/hillclimb/run_gauge_live.py", "run", "--side", side, "--scenario", scenario,
             "--apollo-cb", str(apollo_cb), "--solve-timeout", str(solve_timeout),
             "--policy-mode", policy_mode]
@@ -1280,6 +1531,12 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_m
         argv.extend(["--protocol-id", protocol_id])
     if pair_id:
         argv.extend(["--pair-id", pair_id])
+    if model_version:
+        argv.extend(["--model-version", model_version])
+    if logical_seed is not None:
+        argv.extend(["--logical-seed", str(logical_seed)])
+    if measurement_arm:
+        argv.extend(["--measurement-arm", measurement_arm])
     if arm_index is not None:
         argv.extend(["--arm-index", str(arm_index)])
     if model_token_budget is not None:
@@ -1376,6 +1633,7 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_m
     )
     if route_env:
         child_env.update(route_env)
+    child_env.update(capture_env)
     if measurement_kind == "row" and pair_id:
         artifact_dir = _gate1p_artifact_dir(route_env)
         child_env["SAGE_EVAL_ARTIFACT_DIR"] = str(artifact_dir)
@@ -2917,6 +3175,20 @@ def main(argv=None) -> int:
         default=None,
         help="independently expected SHA-256 identity of the ISC-11 contract",
     )
+    ap.add_argument("--measurement-kind", choices=["legacy", "capture"], default="legacy",
+                    help="generic capture is an unadmitted development observation")
+    ap.add_argument("--protocol-id", default=None,
+                    help="prospective capture protocol identity")
+    ap.add_argument("--pair-id", default=None,
+                    help="prospective capture pair identity")
+    ap.add_argument("--model-version", default=None,
+                    help="source-bound prospective model version")
+    ap.add_argument("--logical-seed", type=int, default=None,
+                    help="non-negative prospective logical seed")
+    ap.add_argument("--measurement-arm", default=None,
+                    help="prospective capture variant identity")
+    ap.add_argument("--model-token-budget", type=int, default=None,
+                    help="prospective capture cumulative model-token budget")
     ap.add_argument("--model-context-limit", type=int, default=None,
                     help="verified provider per-request context limit for the paired row")
     ap.add_argument("--max-output-tokens", type=int, default=None,
@@ -2928,6 +3200,16 @@ def main(argv=None) -> int:
         default=None,
         help="separate explicit live authority identifier; required with --go for an allocated Gate 1P run",
     )
+    ap.add_argument("--resource-budget-config", type=Path,
+                    help="operator-frozen shared resource budget config")
+    ap.add_argument("--resource-budget-ledger", type=Path,
+                    help="shared append-only global resource ledger")
+    ap.add_argument("--resource-episode-id",
+                    help="registered externally activated episode identity")
+    ap.add_argument("--observation-directory", type=Path,
+                    help="operator-owned passive observation FIFO directory")
+    ap.add_argument("--capture-results-path", type=Path,
+                    help="metadata-only capture result ledger")
     ap.add_argument("--solve-timeout", type=int, default=1800,
                     help="seconds per gauge solve (default 1800=30min). The per-run subprocess cap is raised "
                          "to cover this + post-solve scoring overhead, so long solves are not killed early.")
@@ -3132,6 +3414,49 @@ def main(argv=None) -> int:
         args.isc11_replication_canary_contract is not None,
     ))) > 1:
         ap.error("Gate 1P modes are mutually exclusive with the ISC-11 replication canary")
+    if args.measurement_kind == "capture" and any((
+        args.gate1p_stage_a_diagnostic,
+        args.gate1p_stage_a_pair,
+        args.gate1p_stage_b_protocol,
+        args.gate1p_control_floor_canary,
+        args.isc11_replication_canary_contract is not None,
+    )):
+        ap.error("generic capture does not select a historical row or diagnostic protocol")
+    if args.measurement_kind == "capture" and args.go:
+        capture_required = {
+            "--protocol-id": args.protocol_id,
+            "--pair-id": args.pair_id,
+            "--model-version": args.model_version,
+            "--logical-seed": args.logical_seed,
+            "--measurement-arm": args.measurement_arm,
+            "--source-version": args.source_version,
+            "--provider": args.provider,
+            "--model": args.model,
+            "--model-token-budget": args.model_token_budget,
+            "--model-context-limit": args.model_context_limit,
+            "--max-output-tokens": args.max_output_tokens,
+            "--live-authority-id": args.live_authority_id,
+            "--resource-budget-config": args.resource_budget_config,
+            "--resource-budget-ledger": args.resource_budget_ledger,
+            "--resource-episode-id": args.resource_episode_id,
+            "--observation-directory": args.observation_directory,
+            "--capture-results-path": args.capture_results_path,
+        }
+        missing = [
+            name for name, value in capture_required.items()
+            if value is None or (isinstance(value, str) and not value.strip())
+        ]
+        if missing:
+            ap.error("capture --go requires " + ", ".join(missing))
+        for name in ("model_token_budget", "model_context_limit", "max_output_tokens"):
+            if type(getattr(args, name)) is not int or getattr(args, name) <= 0:
+                ap.error(f"--{name.replace('_', '-')} must be positive in capture mode")
+        if args.solve_timeout <= 0:
+            ap.error("--solve-timeout must be positive in capture mode")
+        if args.max_output_tokens > args.model_context_limit:
+            ap.error("--max-output-tokens cannot exceed --model-context-limit")
+        if args.logical_seed < 0:
+            ap.error("--logical-seed must be non-negative")
     if args.isc11_replication_canary_contract is not None:
         if args.side is not None or args.seeds != 1 or null_model or args.treatment:
             ap.error("the ISC-11 canary requires no --side, --seeds 1, and no ablation/treatment")
@@ -3351,7 +3676,7 @@ def main(argv=None) -> int:
                               "row" if args.gate1p_stage_a_pair or args.gate1p_stage_b_protocol
                               or args.gate1p_control_floor_canary
                               else "diagnostic" if args.gate1p_stage_a_diagnostic
-                              else "legacy"
+                              else args.measurement_kind
                           ),
                           (
                               gate1p.PROTOCOL_ID if args.gate1p_stage_a_pair
@@ -3359,7 +3684,7 @@ def main(argv=None) -> int:
                               else control_floor.PROTOCOL_ID if args.gate1p_control_floor_canary
                               else "gate1p-stage-a-diagnostic-v1"
                               if args.gate1p_stage_a_diagnostic
-                              else None
+                              else args.protocol_id
                           ),
                           (
                               gate1p.PAIR_ID if args.gate1p_stage_a_pair
@@ -3371,7 +3696,7 @@ def main(argv=None) -> int:
                               else stageb.TOKEN_ADMISSION_CEILING
                               if args.gate1p_stage_b_protocol
                               else control_floor.TOKEN_ADMISSION_CEILING
-                              if args.gate1p_control_floor_canary else None
+                              if args.gate1p_control_floor_canary else args.model_token_budget
                           ),
                           args.model_context_limit,
                           args.max_output_tokens,
@@ -3448,25 +3773,36 @@ def main(argv=None) -> int:
                          measurement_kind=(
                              "row" if args.gate1p_stage_a_pair
                              else "diagnostic" if args.gate1p_stage_a_diagnostic
-                             else "legacy"
+                             else args.measurement_kind
                          ),
                          protocol_id=(
                              gate1p.PROTOCOL_ID if args.gate1p_stage_a_pair
                              else "gate1p-stage-a-diagnostic-v1"
-                             if args.gate1p_stage_a_diagnostic else None
+                             if args.gate1p_stage_a_diagnostic else args.protocol_id
                          ),
-                         pair_id=gate1p.PAIR_ID if args.gate1p_stage_a_pair else None,
+                         pair_id=gate1p.PAIR_ID if args.gate1p_stage_a_pair else args.pair_id,
+                         model_version=args.model_version,
+                         logical_seed=args.logical_seed,
+                         measurement_arm=args.measurement_arm,
                          arm_index=arm_index if args.gate1p_stage_a_pair else None,
                          model_token_budget=(
-                             gate1p.TOKEN_ADMISSION_CEILING if args.gate1p_stage_a_pair else None
+                             gate1p.TOKEN_ADMISSION_CEILING
+                             if args.gate1p_stage_a_pair else args.model_token_budget
                          ),
                          model_context_limit=args.model_context_limit,
                          max_output_tokens=args.max_output_tokens,
                          source_version=args.source_version,
                          live_authority_id=(
-                             args.live_authority_id if args.gate1p_stage_a_pair else None
-                         ))
-    if not args.side and not args.null_model_factorial and not args.gate1p_stage_a_diagnostic:
+                             args.live_authority_id
+                             if args.gate1p_stage_a_pair or args.measurement_kind == "capture" else None
+                         ),
+                         resource_budget_config=args.resource_budget_config,
+                         resource_budget_ledger=args.resource_budget_ledger,
+                         resource_episode_id=args.resource_episode_id,
+                         observation_directory=args.observation_directory,
+                         capture_results_path=args.capture_results_path)
+    if (not args.side and not args.null_model_factorial
+            and not args.gate1p_stage_a_diagnostic and args.measurement_kind != "capture"):
         compare(
             args.scenario,
             pair_id=gate1p.PAIR_ID if args.gate1p_stage_a_pair else None,
