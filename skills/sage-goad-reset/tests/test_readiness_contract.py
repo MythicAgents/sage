@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import importlib.util
 import json
 from pathlib import Path
@@ -285,6 +286,39 @@ def test_ludus_status_requires_exact_six_vm_ips():
     assert report["expected_ips"]["srv02"] == "10.4.10.22"
 
 
+def test_fixture_inventory_accepts_only_declared_bsl_router_interfaces():
+    common = [
+        {"name": "router", "poweredOn": True, "ip": "10.16.20.254"},
+        {"name": "dc01", "poweredOn": True, "ip": "10.16.10.10"},
+        {"name": "srv01", "poweredOn": True, "ip": "10.16.10.11"},
+        {"name": "srv02", "poweredOn": True, "ip": "10.16.10.12"},
+        {"name": "srv03", "poweredOn": True, "ip": "10.16.10.13"},
+        {"name": "elastic", "poweredOn": True, "ip": "10.16.20.2"},
+        {"name": "kali", "poweredOn": True, "ip": "10.16.99.1"},
+    ]
+    valid = MODULE.ludus_status(
+        {"rangeNumber": 16, "VMs": common},
+        "bsl-ad-elastic",
+        qualification_observation=True,
+    )
+    wrong_router = copy.deepcopy(common)
+    wrong_router[0]["ip"] = "10.16.20.253"
+    invalid = MODULE.ludus_status(
+        {"rangeNumber": 16, "VMs": wrong_router},
+        "bsl-ad-elastic",
+        qualification_observation=True,
+    )
+
+    assert valid["ready"] is True
+    assert valid["live_ready"] is False
+    assert valid["expected_ips"]["router"] == "10.16.10.254"
+    assert valid["accepted_ips"]["router"] == [
+        "10.16.10.254", "10.16.20.254", "10.16.99.254",
+    ]
+    assert invalid["ready"] is False
+    assert "unexpected Ludus VM IPs: router" in invalid["blockers"]
+
+
 def test_ludus_status_accepts_structured_prefixed_names_from_live_goad_range():
     report = MODULE.ludus_status({
         "rangeNumber": 4,
@@ -364,6 +398,59 @@ def test_live_qualified_profile_drives_non_goad_inventory():
     assert report["expected_ips"]["ws01"] == "10.7.10.31"
     assert report["range_profile"]["id"] == "sage-replication-range"
     assert report["blockers"] == []
+
+
+def _bsl_shaped_profile() -> dict:
+    return {
+        "id": "bsl-vlan-synthetic",
+        "source": {"kind": "external", "path": "bsl-synthetic-source"},
+        "qualification": {"state": "defined_only", "receipt": ""},
+        "network": {"first_octet": 10, "vlan": 10, "range_number_octet": True},
+        "vms": [
+            {"role": "dc01", "aliases": ["dc01"], "suffixes": [], "last_octet": 10, "os": "windows"},
+            {"role": "dc02", "aliases": ["dc02"], "suffixes": [], "last_octet": 11, "os": "windows"},
+            {"role": "srv02", "aliases": ["srv02"], "suffixes": [], "last_octet": 12, "os": "windows"},
+            {"role": "srv03", "aliases": ["srv03"], "suffixes": [], "last_octet": 13, "os": "windows"},
+            {"role": "elastic", "aliases": ["elastic"], "suffixes": [], "last_octet": 2, "vlan": 20, "os": "linux"},
+            {"role": "kali", "aliases": ["kali"], "suffixes": [], "last_octet": 1, "vlan": 99, "os": "linux"},
+        ],
+        "topology": {"capabilities": ["collect-directory-graph"], "branches": ["synthetic"]},
+        "foothold": {
+            "role": "dc01", "principal": "SYNTHETIC\\operator", "callback_host": "DC01",
+            "callback_user": "operator", "password_env": "SYNTHETIC_OPERATOR_PASSWORD",
+        },
+        "bindings": [],
+    }
+
+
+def test_ludus_status_uses_effective_vm_vlans_and_keeps_defined_only_profile_blocked():
+    profile = _bsl_shaped_profile()
+    state = {
+        "rangeNumber": 7,
+        "rangeState": "SUCCESS",
+        "VMs": [
+            {"name": "dc01", "poweredOn": True, "ip": "10.7.10.10"},
+            {"name": "dc02", "poweredOn": True, "ip": "10.7.10.11"},
+            {"name": "srv02", "poweredOn": True, "ip": "10.7.10.12"},
+            {"name": "srv03", "poweredOn": True, "ip": "10.7.10.13"},
+            {"name": "elastic", "poweredOn": True, "ip": "10.7.20.2"},
+            {"name": "kali", "poweredOn": True, "ip": "10.7.99.1"},
+        ],
+    }
+
+    accepted_inventory = MODULE.ludus_status(state, profile)
+    assert accepted_inventory["expected_ips"]["elastic"] == "10.7.20.2"
+    assert accepted_inventory["expected_ips"]["kali"] == "10.7.99.1"
+    assert accepted_inventory["ready"] is False
+    assert accepted_inventory["blockers"] == [
+        "range profile bsl-vlan-synthetic is defined_only, not live-qualified"
+    ]
+
+    wrong_vlan = copy.deepcopy(state)
+    wrong_vlan["VMs"][4]["ip"] = "10.7.10.2"
+    rejected_inventory = MODULE.ludus_status(wrong_vlan, profile)
+    assert rejected_inventory["ready"] is False
+    assert "unexpected Ludus VM IPs: elastic" in rejected_inventory["blockers"]
 
 
 def test_profile_drives_authenticated_windows_guest_set():

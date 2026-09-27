@@ -130,11 +130,42 @@ That variant leaves the auto-created `SAGEREPL` default range unused.
 - `sage-structural-b`: seven Windows guests defining candidate family S2 with a
   partner-forest LAPS/CA lane and a nested-child DCSync lane.
 
+`topology.capabilities` in the range profile catalog is the union available across
+known routes. It is not an ISC-10 required set. `required_capabilities` is always
+derived as the intersection of `required_routes`, never copied from the union. A
+profile receives a structural identity only when its route coverage is complete for
+the exact `required_route_scenario`, source-pinned start, objective and proof protocol.
+Other scenarios bound to the same runtime reset profile cannot inherit that identity.
+Unknown vulnerabilities
+and undeclared products are outside that bounded route universe; this is not a claim
+that the lab is exhaustive against every Windows mechanism.
+
+The selected bounded development set uses different semantic requirements. GOAD
+requires establishing or using authority from NORTH across an independent forest
+boundary into ESSOS and, under its existing objective oracle, fresh ESSOS krbtgt
+material. This boundary requirement covers the linked-SQL route without calling it
+trust-specific authentication. The replication range requires fresh objective-domain
+krbtgt material under the same exact oracle; graph collection and its GPO branch are
+optional. The BSL case requires certificate-based Domain Admin authentication plus a
+privileged-directory allow/deny differential, whether the certificate comes from
+enrollment or CA signing-key access. These sets establish source-bounded structural
+identity only. They do not establish reset readiness, a model result or generality.
+
+The GOAD `cross-forest-objective` case alone uses the verified
+`sage-seed-apollo-v252-mythic4-20260829` retained-foothold snapshot. It is the
+existing source-bound start compatible with the current retained callback export.
+The other GOAD scenarios keep their historical snapshot bindings.
+
 The structural blueprints use the same 4 GB / 2 vCPU Windows profile as the
 replication purpose range. Their all-powered envelope is eight VMs, 30 GiB RAM,
 and 16 vCPUs after including the Ludus router. The sources are not independently
 accepted or authorized for live use; if a later review authorizes activation,
 power on only one purpose range at a time.
+
+For an external GOAD manifest, pass the explicitly configured GOAD subtree to both
+the reset producer and its later validator with `--external-source-dir`. The argument
+binds the manifest hash without persisting or guessing an operator path. Replication
+and BSL source directories are repository-owned and need no external-source argument.
 
 ## Snapshots And Gauge Reset
 

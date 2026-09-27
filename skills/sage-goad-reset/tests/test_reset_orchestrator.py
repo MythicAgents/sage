@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import importlib.util
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+SAGE_PACKAGE_ROOT = Path(__file__).resolve().parents[3] / "Payload_Type" / "sage"
+sys.path.insert(0, str(SAGE_PACKAGE_ROOT))
+from ai.hillclimb.scenarios import structural_scenario_manifests
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "reset_orchestrator.py"
@@ -70,6 +76,23 @@ def _config() -> dict:
         "mythic_user": "mythic_admin",
         "mythic_env_path": "/opt/mythic-install/.env",
     }
+
+
+def _external_goad_manifest(tmp_path: Path) -> tuple[dict, Path]:
+    external = tmp_path / "configured-goad"
+    external.mkdir()
+    item = external / "source.yml"
+    item.write_text("exact synthetic source\n", encoding="utf-8")
+    digest = hashlib.sha256()
+    digest.update(item.relative_to(external).as_posix().encode())
+    digest.update(b"\0")
+    digest.update(hashlib.sha256(item.read_bytes()).digest())
+    manifest = next(
+        value.as_mapping() for value in structural_scenario_manifests()
+        if value.profile_id == "goad-trust-walker"
+    )
+    manifest["source_sha256"] = digest.hexdigest()
+    return manifest, external
 
 
 def _successful_phase(
@@ -193,6 +216,524 @@ def test_unqualified_profile_can_be_planned_but_not_started(capsys):
     assert reset.main(["start", *common, "--yes"]) == 2
     blocked = json.loads(capsys.readouterr().out)
     assert "not live-qualified" in blocked["error"]
+
+
+def test_reset_plan_propagates_explicit_external_source_to_manifest_validation(tmp_path, capsys):
+    manifest, external = _external_goad_manifest(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    common = [
+        "--snapshot", manifest["snapshot_id"],
+        "--range-profile", manifest["profile_id"],
+        "--scenario-manifest", str(manifest_path),
+        "--callback-host", "http://example.invalid",
+        "--mythic-env-path", "/tmp/mythic.env",
+    ]
+
+    assert reset.main(["plan", *common]) == 2
+    assert "external_source_unverified" in json.loads(capsys.readouterr().out)["error"]
+
+    assert reset.main(["plan", *common, "--external-source-dir", str(external)]) == 0
+    planned = json.loads(capsys.readouterr().out)
+    assert planned["scenario_manifest_binding"]["source_sha256"] == manifest["source_sha256"]
+    assert planned["live_activity_performed"] is False
+
+
+def test_reset_binding_validation_propagates_explicit_external_source(tmp_path):
+    manifest, external = _external_goad_manifest(tmp_path)
+    invalid_checkpoint = {"schema": "deliberately-invalid"}
+    kwargs = {
+        "expected_run_id": "reset-test",
+        "not_before": "2026-01-01T00:00:00+00:00",
+    }
+
+    with pytest.raises(reset.ResetError, match="external_source_unverified"):
+        reset.validate_scenario_reset_binding(
+            manifest, invalid_checkpoint, tmp_path / "checkpoint.json", **kwargs,
+        )
+    with pytest.raises(reset.ResetError, match="unsupported reset checkpoint"):
+        reset.validate_scenario_reset_binding(
+            manifest, invalid_checkpoint, tmp_path / "checkpoint.json",
+            external_source_dir=external, **kwargs,
+        )
+
+
+def test_structural_scenario_reset_binding_rejects_missing_wrong_or_simulated_evidence(tmp_path):
+    manifest = next(
+        item.as_mapping()
+        for item in structural_scenario_manifests()
+        if item.profile_id == "sage-structural-a"
+    )
+    config = _config()
+    config["range_profile_id"] = manifest["profile_id"]
+    config["snapshot"] = manifest["snapshot_id"]
+    checkpoint = reset._new_checkpoint(config, "reset-test")
+    binding = {"expected_run_id": "reset-test", "not_before": "2026-01-01T00:00:00+00:00"}
+
+    with pytest.raises(reset.ResetError, match="reset evidence is missing"):
+        reset.validate_scenario_reset_binding(manifest, None, tmp_path / "missing.json", **binding)
+    with pytest.raises(reset.ResetError, match="checkpoint profile does not match"):
+        wrong_profile_config = {**config, "range_profile_id": "goad-trust-walker"}
+        wrong_profile = reset._new_checkpoint(wrong_profile_config, "reset-test")
+        reset.validate_scenario_reset_binding(manifest, wrong_profile, tmp_path / "wrong-profile.json", **binding)
+    with pytest.raises(reset.ResetError, match="checkpoint snapshot does not match"):
+        wrong_snapshot_config = {**config, "snapshot": "invented-snapshot"}
+        wrong_snapshot = reset._new_checkpoint(wrong_snapshot_config, "reset-test")
+        reset.validate_scenario_reset_binding(manifest, wrong_snapshot, tmp_path / "wrong-snapshot.json", **binding)
+    with pytest.raises(reset.ResetError, match="task_observations do not match"):
+        wrong_task = copy.deepcopy(checkpoint)
+        wrong_task["task_observations"] = [_reset_observation()]
+        reset.validate_scenario_reset_binding(manifest, wrong_task, tmp_path / "wrong-task.json", **binding)
+    simulated_path = tmp_path / "simulated-valid-shape.json"
+    orchestrator = reset.ResetOrchestrator(
+        simulated_path, phase_runner=_successful_phase, task_observer=_zero_tasks
+    )
+    assert orchestrator.start(_config(), run_id="reset-test")[0] == 0
+    _, simulated = orchestrator.resume(operator_foothold_launched=True)
+    simulated["inputs"] = reset._redact(config)
+    for phase in simulated["phases"]:
+        phase["command"] = reset._redact(reset._phase_commands(config)[phase["name"]])
+    with pytest.raises(reset.ResetError, match="does not bind scenario manifest source"):
+        reset.validate_scenario_reset_binding(manifest, simulated, simulated_path, **binding)
+    with pytest.raises(reset.ResetError, match="run ID does not match"):
+        reset.validate_scenario_reset_binding(
+            manifest, simulated, simulated_path,
+            expected_run_id="other-run", not_before=binding["not_before"],
+        )
+    with pytest.raises(reset.ResetError, match="predates prospective not-before"):
+        reset.validate_scenario_reset_binding(
+            manifest, simulated, simulated_path,
+            expected_run_id=binding["expected_run_id"], not_before="2999-01-01T00:00:00+00:00",
+        )
+    simulated["scenario_manifest_binding"] = reset._scenario_manifest_binding(manifest)
+    with pytest.raises(reset.ResetError, match="profile_not_live_qualified"):
+        reset.validate_scenario_reset_binding(manifest, simulated, simulated_path, **binding)
+
+
+def test_scenario_manifest_validation_cli_runs_local_positive_and_negative_fixture(tmp_path, capsys):
+    profile_module = reset._load_module("range_profile_cli_fixture", reset.RANGE_PROFILE)
+    selected = profile_module.get_profile("sage-replication-range")
+    source_path = selected["source"]["path"]
+    manifest = {
+        "schema": profile_module.SCENARIO_RESET_MANIFEST_SCHEMA,
+        "scenario_id": "replication-purpose-range-visible-cost",
+        "profile_id": selected["id"],
+        "source_path": source_path,
+        "source_sha256": profile_module.source_tree_sha256(source_path),
+        "available_capabilities": sorted(profile_module.available_capability_set(selected)),
+        "required_capabilities": sorted(profile_module.required_capability_set(selected)),
+        "required_routes": [sorted(route) for route in profile_module.declared_required_routes(selected)],
+        "required_route_coverage": profile_module.required_route_coverage(selected),
+        "oracle_dependencies": ["mythic-task-output-or-artifact"],
+        "snapshot_id": profile_module.require_scenario(
+            selected, "replication-purpose-range-visible-cost"
+        )["snapshot"],
+        "reset_checkpoint_schema": reset.SCHEMA,
+    }
+    base_path = tmp_path / "base.json"
+    orchestrator = reset.ResetOrchestrator(
+        base_path, phase_runner=_successful_phase, task_observer=_zero_tasks
+    )
+    assert orchestrator.start(_config(), run_id="cli-reset-test")[0] == 0
+    _, checkpoint = orchestrator.resume(operator_foothold_launched=True)
+    config = {**_config(), "range_profile_id": selected["id"], "snapshot": manifest["snapshot_id"]}
+    checkpoint["inputs"] = reset._redact(config)
+    for phase in checkpoint["phases"]:
+        phase["command"] = reset._redact(reset._phase_commands(config)[phase["name"]])
+    checkpoint["scenario_manifest_binding"] = reset._scenario_manifest_binding(manifest)
+    manifest_path = tmp_path / "manifest.json"
+    checkpoint_path = tmp_path / "checkpoint.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
+
+    common = [
+        "validate-scenario-manifest", "--manifest", str(manifest_path),
+        "--checkpoint", str(checkpoint_path), "--expected-run-id", "cli-reset-test",
+        "--not-before", "2026-01-01T00:00:00+00:00",
+    ]
+    assert reset.main([
+        *common,
+        "--expected-range-id", "GOAD",
+        "--expected-ludus-mcp-server", "ludus_goad",
+    ]) == 0
+    assert json.loads(capsys.readouterr().out)["live_activity_performed"] is False
+
+    # Omitting optional selectors preserves the historical binding contract.
+    assert reset.main(common) == 0
+    assert json.loads(capsys.readouterr().out)["live_activity_performed"] is False
+
+    for selector, value, error in (
+        ("--expected-range-id", "other-range", "range ID does not match"),
+        ("--expected-ludus-mcp-server", "other-server", "MCP server does not match"),
+        ("--expected-range-id", "", "range ID must be a non-empty string"),
+        ("--expected-ludus-mcp-server", "", "MCP server must be a non-empty string"),
+    ):
+        assert reset.main([*common, selector, value]) == 2
+        assert error in json.loads(capsys.readouterr().out)["error"]
+
+    assert reset.main([*common, "--expected-run-id", "wrong-run"]) == 2
+    assert "run ID does not match" in json.loads(capsys.readouterr().out)["error"]
+
+
+def _fixture_manifest(profile_module, profile_id="sage-replication-range", snapshot=None):
+    selected = profile_module.get_profile(profile_id)
+    source_path = selected["source"]["path"]
+    scenario = selected["bindings"][0]["scenario"]
+    return {
+        "schema": profile_module.SCENARIO_RESET_MANIFEST_SCHEMA,
+        "scenario_id": scenario,
+        "profile_id": selected["id"],
+        "source_path": source_path,
+        "source_sha256": profile_module.source_tree_sha256(source_path),
+        "available_capabilities": sorted(profile_module.available_capability_set(selected)),
+        "required_capabilities": sorted(profile_module.required_capability_set(selected)),
+        "required_routes": [sorted(route) for route in profile_module.declared_required_routes(selected)],
+        "required_route_coverage": profile_module.required_route_coverage(selected),
+        "oracle_dependencies": ["mythic-task-output-or-artifact"],
+        "snapshot_id": snapshot or profile_module.require_scenario(selected, scenario)["snapshot"],
+        "reset_checkpoint_schema": reset.RANGE_FIXTURE_QUALIFICATION_SCHEMA,
+    }
+
+
+def _fixture_action_bindings(config):
+    return {
+        name: {
+            "mechanism": "internal-observer" if name in {
+                "capture-task-and-callback-baseline", "fresh-callback-selection",
+            } else "direct-function",
+            "adapter": "tests.fixture_observer" if name in {
+                "capture-task-and-callback-baseline", "fresh-callback-selection",
+            } else "tests.fixture_phase",
+            "range_profile_id": config["range_profile_id"],
+            "ludus_range_id": config["ludus_range_id"],
+            "ludus_mcp_server": config["ludus_mcp_server"],
+        }
+        for name in reset.RANGE_FIXTURE_QUALIFICATION_PHASES
+    }
+
+
+def _fixture_phase(name, action_binding, config, *, callback_id=2):
+    result_binding = {
+        "mechanism": action_binding["mechanism"],
+        "adapter": action_binding["adapter"],
+    }
+    if name == "wait-range-ips":
+        return {
+            **result_binding,
+            "schema": "sage-range-fixture-inventory-v1",
+            "observation_id": "fixture-inventory",
+            "live_ready": False,
+            "inventory": {
+                "ready": True,
+                "live_ready": False,
+                "qualification_observation": True,
+                "range_profile": {"id": config["range_profile_id"]},
+            },
+        }
+    if name == "await-operator-foothold-launch":
+        return {
+            **result_binding,
+            "operator_acknowledged": True, "payload_tasks_issued": 0,
+        }
+    if name == "final-start-readiness":
+        return {
+            **result_binding,
+            "ok": True, "endpoint_observed": True, "callback_id": callback_id,
+        }
+    return {
+        **result_binding,
+        "ok": True, "exit_code": 0, "observer_state": {"observed": name},
+    }
+
+
+def _fixture_callback(callback_id, *, observed_at=None, active=True):
+    return {
+        "display_id": callback_id,
+        "host": "srv02",
+        "domain": "fixture.local",
+        "user": "user1",
+        "payload_type": "apollo",
+        "payload_uuid": "fixture-payload-uuid",
+        "operation_id": 7,
+        "active": active,
+        "integrity_level": 2,
+        "observed_at": observed_at or reset._now(),
+    }
+
+
+def _fixture_expectation():
+    return {
+        "host": "srv02", "domain": "fixture.local", "user": "user1",
+        "payload_type": "apollo", "payload_uuid": "fixture-payload-uuid",
+        "operation_id": 7, "active": True, "integrity": "medium",
+    }
+
+
+def test_range_fixture_qualification_captures_real_scope_without_v2_admission(tmp_path, capsys):
+    profile_module = reset._load_module("range_fixture_profile", reset.RANGE_PROFILE)
+    manifest = _fixture_manifest(profile_module)
+    config = {**_config(), "range_profile_id": manifest["profile_id"], "snapshot": manifest["snapshot_id"]}
+    checkpoint_path = tmp_path / "fixture.json"
+    callbacks = iter([
+        [_fixture_callback(1, observed_at="2026-01-01T00:00:00+00:00", active=False)],
+        [
+            _fixture_callback(1, observed_at="2026-01-01T00:00:00+00:00", active=False),
+            _fixture_callback(2, observed_at="2999-01-01T00:00:00+00:00"),
+        ],
+    ])
+
+    result = reset.run_range_fixture_qualification(
+        config, manifest=manifest, run_id="fixture-reset", checkpoint_path=checkpoint_path,
+        callback_expectation=_fixture_expectation(),
+        action_bindings=_fixture_action_bindings(config),
+        phase_runner=_fixture_phase,
+        task_observer=lambda _config: _task_observation(count=3, max_task_id=9),
+        callback_observer=lambda _config: next(callbacks),
+    )
+    checkpoint = result["checkpoint"]
+    assert result["live_ready"] is False
+    assert result["observation_only"] is True
+    assert [phase["name"] for phase in checkpoint["phases"]] == list(reset.RANGE_FIXTURE_QUALIFICATION_PHASES)
+    assert checkpoint["task_baseline"]["count"] == 3
+    assert checkpoint["fresh_callback"]["display_id"] == 2
+    assert checkpoint["fresh_callback"]["active"] is True
+    assert all("command" not in phase for phase in checkpoint["phases"])
+    assert all(
+        phase["action_binding"]["mechanism"] in {
+            "internal-observer", "direct-function",
+        }
+        for phase in checkpoint["phases"]
+    )
+    assert checkpoint["phases"][1]["action_binding"]["adapter"] == "tests.fixture_phase"
+    assert checkpoint["terminal"]["state"] == "complete"
+    assert "reset-mythic" not in {phase["name"] for phase in checkpoint["phases"]}
+
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    assert reset.main([
+        "validate-range-fixture-qualification", "--manifest", str(manifest_path),
+        "--checkpoint", str(checkpoint_path), "--expected-run-id", "fixture-reset",
+        "--not-before", "2026-01-01T00:00:00+00:00",
+        "--expected-range-id", "GOAD", "--expected-ludus-mcp-server", "ludus_goad",
+    ]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["live_ready"] is False
+    assert report["observation_only"] is True
+
+    altered = copy.deepcopy(checkpoint)
+    altered["fresh_callback"]["payload_uuid"] = "other-payload"
+    with pytest.raises(reset.ResetError, match="does not match expectation"):
+        reset.validate_range_fixture_qualification(
+            manifest, altered, checkpoint_path,
+            expected_run_id="fixture-reset",
+            not_before="2026-01-01T00:00:00+00:00",
+            expected_range_id="GOAD",
+            expected_ludus_mcp_server="ludus_goad",
+        )
+
+    altered = copy.deepcopy(checkpoint)
+    altered["phases"][1]["action_binding"]["adapter"] = "other.adapter"
+    with pytest.raises(reset.ResetError, match="mechanism does not match"):
+        reset.validate_range_fixture_qualification(
+            manifest, altered, checkpoint_path,
+            expected_run_id="fixture-reset",
+            not_before="2026-01-01T00:00:00+00:00",
+            expected_range_id="GOAD",
+            expected_ludus_mcp_server="ludus_goad",
+        )
+
+    assert reset.main([
+        "validate-range-fixture-qualification", "--manifest", str(manifest_path),
+        "--checkpoint", str(checkpoint_path), "--expected-run-id", "fixture-reset",
+        "--not-before", "2026-01-01T00:00:00+00:00",
+        "--expected-range-id", "other", "--expected-ludus-mcp-server", "ludus_goad",
+    ]) == 2
+    assert "selector does not match" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_range_fixture_qualification_allows_private_allocated_snapshot_for_defined_only_profile(tmp_path):
+    profile_module = reset._load_module("range_fixture_bsl_profile", reset.RANGE_PROFILE)
+    manifest = next(item.as_mapping() for item in structural_scenario_manifests() if item.profile_id == "bsl-ad-elastic")
+    manifest["snapshot_id"] = "private-allocation-snapshot"
+    assert manifest["reset_checkpoint_schema"] == reset.RANGE_FIXTURE_QUALIFICATION_SCHEMA
+    config = {**_config(), "range_profile_id": "bsl-ad-elastic", "snapshot": manifest["snapshot_id"], "ludus_range_id": "fixture-range", "ludus_mcp_server": "fixture-server"}
+    callbacks = iter([
+        [_fixture_callback(10, observed_at="2026-01-01T00:00:00+00:00")],
+        [
+            _fixture_callback(10, observed_at="2026-01-01T00:00:00+00:00"),
+            _fixture_callback(11, observed_at="2999-01-01T00:00:00+00:00"),
+        ],
+    ])
+    result = reset.run_range_fixture_qualification(
+        config, manifest=manifest, run_id="defined-only-fixture", checkpoint_path=tmp_path / "defined-only.json",
+        callback_expectation=_fixture_expectation(),
+        action_bindings=_fixture_action_bindings(config),
+        phase_runner=lambda *args: _fixture_phase(*args, callback_id=11),
+        task_observer=lambda _config: _task_observation(count=2, max_task_id=7),
+        callback_observer=lambda _config: next(callbacks),
+    )
+    assert result["live_ready"] is False
+    assert profile_module.get_profile("bsl-ad-elastic")["qualification"]["state"] == "defined_only"
+
+    old_schema = {**manifest, "reset_checkpoint_schema": reset.SCHEMA}
+    with pytest.raises(reset.ResetError, match="checkpoint schema does not match"):
+        reset.run_range_fixture_qualification(
+            config, manifest=old_schema, run_id="old-schema-fixture",
+            checkpoint_path=tmp_path / "old-schema.json",
+            callback_expectation=_fixture_expectation(),
+            action_bindings=_fixture_action_bindings(config),
+            phase_runner=_fixture_phase,
+            task_observer=lambda _config: _task_observation(count=2, max_task_id=7),
+            callback_observer=lambda _config: [],
+        )
+
+
+def test_range_fixture_qualification_fails_changed_task_baseline_and_multiple_callbacks(tmp_path):
+    profile_module = reset._load_module("range_fixture_negative_profile", reset.RANGE_PROFILE)
+    manifest = _fixture_manifest(profile_module)
+    config = {**_config(), "range_profile_id": manifest["profile_id"], "snapshot": manifest["snapshot_id"]}
+    observations = iter([_task_observation(count=1, max_task_id=2), _task_observation(count=2, max_task_id=3)])
+    callbacks = iter([[_fixture_callback(1)], [_fixture_callback(1), _fixture_callback(2), _fixture_callback(3)]])
+    with pytest.raises(reset.ResetError, match="task baseline changed"):
+        reset.run_range_fixture_qualification(
+            config, manifest=manifest, run_id="negative-fixture", checkpoint_path=tmp_path / "negative.json",
+            callback_expectation=_fixture_expectation(),
+            action_bindings=_fixture_action_bindings(config),
+            phase_runner=_fixture_phase, task_observer=lambda _config: next(observations),
+            callback_observer=lambda _config: next(callbacks),
+        )
+    persisted = json.loads((tmp_path / "negative.json").read_text())
+    assert persisted["terminal"]["state"] == "blocked"
+    assert persisted["phases"][-2]["status"] == "failed"
+
+    callbacks = iter([
+        [_fixture_callback(1, observed_at="2026-01-01T00:00:00+00:00")],
+        [
+            _fixture_callback(1, observed_at="2026-01-01T00:00:00+00:00"),
+            _fixture_callback(2, observed_at="2999-01-01T00:00:00+00:00"),
+        ],
+    ])
+
+    def failed_poweron(name, action_binding, config):
+        if name == "poweron-range":
+            return {
+                "mechanism": action_binding["mechanism"],
+                "adapter": action_binding["adapter"],
+                "ok": False, "exit_code": 1, "observer_state": "off",
+            }
+        return _fixture_phase(name, action_binding, config)
+
+    with pytest.raises(reset.ResetError, match="result field ok must be true"):
+        reset.run_range_fixture_qualification(
+            config, manifest=manifest, run_id="failed-action-fixture",
+            checkpoint_path=tmp_path / "failed-action.json",
+            callback_expectation=_fixture_expectation(),
+            action_bindings=_fixture_action_bindings(config),
+            phase_runner=failed_poweron,
+            task_observer=lambda _config: _task_observation(count=1, max_task_id=2),
+            callback_observer=lambda _config: next(callbacks),
+        )
+    failed = json.loads((tmp_path / "failed-action.json").read_text())
+    assert failed["terminal"]["state"] == "blocked"
+    assert failed["phases"][2]["name"] == "poweron-range"
+    assert failed["phases"][2]["status"] == "failed"
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        (AssertionError(), "AssertionError"),
+        (RuntimeError("adapter failure"), "adapter failure"),
+    ],
+)
+def test_range_fixture_qualification_persists_nonempty_adapter_failure(tmp_path, failure, expected):
+    profile_module = reset._load_module("range_fixture_adapter_failure", reset.RANGE_PROFILE)
+    manifest = _fixture_manifest(profile_module)
+    config = {**_config(), "range_profile_id": manifest["profile_id"], "snapshot": manifest["snapshot_id"]}
+
+    def failing_rollback(name, action_binding, runner_config):
+        if name == "rollback-range":
+            raise failure
+        return _fixture_phase(name, action_binding, runner_config)
+
+    with pytest.raises(reset.ResetError, match=expected):
+        reset.run_range_fixture_qualification(
+            config, manifest=manifest, run_id="adapter-failure-fixture",
+            checkpoint_path=tmp_path / "adapter-failure.json",
+            callback_expectation=_fixture_expectation(),
+            action_bindings=_fixture_action_bindings(config),
+            phase_runner=failing_rollback,
+            task_observer=lambda _config: _task_observation(count=1, max_task_id=2),
+            callback_observer=lambda _config: [_fixture_callback(1)],
+        )
+
+    persisted = json.loads((tmp_path / "adapter-failure.json").read_text())
+    reset._validate_range_fixture_checkpoint(
+        persisted, tmp_path / "adapter-failure.json",
+    )
+    assert persisted["terminal"] == {"state": "blocked", "reason": expected}
+    assert persisted["phases"][0]["status"] == "completed"
+    assert persisted["phases"][1]["name"] == "rollback-range"
+    assert persisted["phases"][1]["status"] == "failed"
+    assert persisted["phases"][1]["error"] == expected
+
+
+def test_explicit_manifest_capture_is_persisted_before_synthetic_reset_steps(tmp_path):
+    profile_module = reset._load_module("range_profile_capture_fixture", reset.RANGE_PROFILE)
+    selected = profile_module.get_profile("sage-replication-range")
+    source_path = selected["source"]["path"]
+    manifest = {
+        "schema": profile_module.SCENARIO_RESET_MANIFEST_SCHEMA,
+        "scenario_id": "replication-purpose-range-visible-cost",
+        "profile_id": selected["id"],
+        "source_path": source_path,
+        "source_sha256": profile_module.source_tree_sha256(source_path),
+        "available_capabilities": sorted(profile_module.available_capability_set(selected)),
+        "required_capabilities": sorted(profile_module.required_capability_set(selected)),
+        "required_routes": [sorted(route) for route in profile_module.declared_required_routes(selected)],
+        "required_route_coverage": profile_module.required_route_coverage(selected),
+        "oracle_dependencies": ["mythic-task-output-or-artifact"],
+        "snapshot_id": profile_module.require_scenario(
+            selected, "replication-purpose-range-visible-cost"
+        )["snapshot"],
+        "reset_checkpoint_schema": reset.SCHEMA,
+    }
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    args = reset.build_parser().parse_args([
+        "plan", "--snapshot", manifest["snapshot_id"], "--range-profile", selected["id"],
+        "--callback-host", "http://example.invalid", "--mythic-env-path", "/tmp/mythic.env",
+        "--scenario-manifest", str(manifest_path),
+    ])
+    config = reset._config_from_args(args)
+    capture = reset._scenario_manifest_capture(args, config)
+    checkpoint_path = tmp_path / "checkpoint.json"
+
+    def runner(*args):
+        persisted = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        assert persisted["scenario_manifest_binding"] == capture
+        return _successful_phase(*args)
+
+    orchestrator = reset.ResetOrchestrator(
+        checkpoint_path, phase_runner=runner, task_observer=_zero_tasks
+    )
+    assert orchestrator.start(
+        config, run_id="captured-reset", scenario_manifest_binding=capture
+    )[0] == 0
+    _, checkpoint = orchestrator.resume(operator_foothold_launched=True)
+    assert reset.validate_scenario_reset_binding(
+        manifest, checkpoint, checkpoint_path,
+        expected_run_id="captured-reset", not_before="2026-01-01T00:00:00+00:00",
+    )["run_id"] == "captured-reset"
+    assert "scenario_manifest_binding" not in reset._new_checkpoint(_config(), "legacy-reset")
+
+    mismatched = reset.build_parser().parse_args([
+        "plan", "--snapshot", "wrong-snapshot", "--range-profile", selected["id"],
+        "--callback-host", "http://example.invalid", "--mythic-env-path", "/tmp/mythic.env",
+        "--scenario-manifest", str(manifest_path),
+    ])
+    with pytest.raises(reset.ResetError, match="snapshot does not match"):
+        reset._scenario_manifest_capture(mismatched, reset._config_from_args(mismatched))
 
 
 def test_wait_for_range_delegates_to_canonical_fresh_poller(monkeypatch):

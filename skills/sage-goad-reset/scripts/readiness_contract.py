@@ -514,13 +514,17 @@ def write_startup_identity(
 def ludus_status(
     range_state: dict[str, Any] | None,
     profile: str | dict[str, Any] | None = None,
+    *,
+    qualification_observation: bool = False,
 ) -> dict[str, Any]:
     profile_module, selected = _range_profile(profile)
     range_number = (range_state or {}).get("rangeNumber")
     try:
         expected_ips = profile_module.expected_ips(selected, range_number)
+        accepted_ips = profile_module.accepted_ips(selected, range_number)
     except ValueError as exc:
         expected_ips = {}
+        accepted_ips = {}
         profile_error = str(exc)
     else:
         profile_error = ""
@@ -548,7 +552,8 @@ def ludus_status(
     wrong_ip = [
         name
         for name, expected_ip in expected_ips.items()
-        if name in by_name and str(by_name[name].get("ip") or "") != expected_ip
+        if name in by_name
+        and str(by_name[name].get("ip") or "") not in accepted_ips.get(name, {expected_ip})
     ]
     powered_off = [
         name
@@ -558,7 +563,10 @@ def ludus_status(
     blockers = []
     if profile_error:
         blockers.append(f"range profile could not derive expected IPs: {profile_error}")
-    if selected["qualification"]["state"] != "live_qualified":
+    if (
+        selected["qualification"]["state"] != "live_qualified"
+        and not qualification_observation
+    ):
         blockers.append(
             f"range profile {selected['id']} is {selected['qualification']['state']}, not live-qualified"
         )
@@ -572,15 +580,24 @@ def ludus_status(
         blockers.append(f"unexpected Ludus VM IPs: {', '.join(wrong_ip)}")
     if powered_off:
         blockers.append(f"Ludus VMs not powered on: {', '.join(powered_off)}")
-    return {
+    result = {
         "ready": not blockers,
         "range_profile": profile_module.profile_summary(selected),
         "range_number": range_number,
         "range_state": (range_state or {}).get("rangeState"),
         "expected_ips": expected_ips,
+        "accepted_ips": {
+            name: sorted(addresses) for name, addresses in accepted_ips.items()
+        },
         "vms": rows,
         "blockers": blockers,
     }
+    if qualification_observation:
+        # This only records whether the live inventory matches the reusable
+        # profile.  It deliberately carries no launch/release authority.
+        result["qualification_observation"] = True
+        result["live_ready"] = False
+    return result
 
 
 def clock_status(observation: dict[str, Any] | None) -> dict[str, Any]:
@@ -955,14 +972,20 @@ def probe_ludus_status(
     range_id: str | None = None,
     mcp_server: str | None = None,
     profile: str | dict[str, Any] | None = None,
+    *,
+    qualification_observation: bool = False,
 ) -> dict[str, Any]:
     module = _load_module("sage_readiness_ludus", REPO_ROOT / "skills" / "sage-goad-reset" / "scripts" / "ludus.py")
     code, payload = module._call(
         "GET", "/api/v2/range", range_id=range_id, mcp_server=mcp_server
     )
     if code != 200 or not isinstance(payload, dict):
-        return ludus_status({}, profile)
-    return ludus_status(payload, profile)
+        return ludus_status(
+            {}, profile, qualification_observation=qualification_observation
+        )
+    return ludus_status(
+        payload, profile, qualification_observation=qualification_observation
+    )
 
 
 def probe_clock_status(
@@ -987,6 +1010,25 @@ def range_boot_observation(
     return {
         "observation_id": _new_observation_id(),
         "sections": {"ludus": probe_ludus_status(range_id, mcp_server, profile)},
+    }
+
+
+def range_fixture_inventory_observation(
+    range_id: str | None = None,
+    mcp_server: str | None = None,
+    profile: str | dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Read a range inventory for fixture qualification without releasing it."""
+    return {
+        "schema": "sage-range-fixture-inventory-v1",
+        "observation_id": _new_observation_id(),
+        "inventory": probe_ludus_status(
+            range_id,
+            mcp_server,
+            profile,
+            qualification_observation=True,
+        ),
+        "live_ready": False,
     }
 
 

@@ -2,6 +2,30 @@
   "schema": "sage-range-profile-catalog-v1",
   "profiles": [
     {
+      "id": "bsl-ad-elastic",
+      "source": {"kind": "repo", "path": "ludus/bsl-ad-elastic"},
+      "qualification": {"state": "defined_only", "receipt": ""},
+      "network": {"first_octet": 10, "vlan": 10, "range_number_octet": true},
+      "vms": [
+        {"role": "router", "aliases": ["router"], "suffixes": ["router-debian11-x64", "router-debian12-x64"], "last_octet": 254, "accepted_vlans": [10, 20, 99], "os": "linux"},
+        {"role": "dc01", "aliases": ["dc01", "hoth"], "suffixes": ["dc01"], "last_octet": 10, "os": "windows"},
+        {"role": "srv01", "aliases": ["srv01", "coruscant"], "suffixes": ["srv01"], "last_octet": 11, "os": "windows"},
+        {"role": "srv02", "aliases": ["srv02", "mustafar"], "suffixes": ["srv02"], "last_octet": 12, "os": "windows"},
+        {"role": "srv03", "aliases": ["srv03", "tatooine"], "suffixes": ["srv03"], "last_octet": 13, "os": "windows"},
+        {"role": "elastic", "aliases": ["elastic"], "suffixes": ["elastic"], "last_octet": 2, "vlan": 20, "os": "linux"},
+        {"role": "kali", "aliases": ["kali"], "suffixes": ["kali"], "last_octet": 1, "vlan": 99, "os": "linux"}
+      ],
+      "topology": {
+        "capabilities": ["enroll-certificate-for-admin-authentication", "use-ca-signing-key-to-issue-admin-certificate", "certificate-based-domain-admin-authentication", "privileged-directory-access-differential"],
+        "branches": ["certificate-enrollment->certificate-domain-authentication", "ca-signing-key->certificate-domain-authentication"],
+        "required_routes": [["enroll-certificate-for-admin-authentication", "certificate-based-domain-admin-authentication", "privileged-directory-access-differential"], ["use-ca-signing-key-to-issue-admin-certificate", "certificate-based-domain-admin-authentication", "privileged-directory-access-differential"]],
+        "required_route_scenario": "bsl-certificate-domain-control",
+        "required_route_coverage": "complete"
+      },
+      "foothold": {"role": "srv02", "principal": "GALACTIC\\moff.gideon", "callback_host": "mustafar", "callback_user": "moff.gideon", "password_env": "SAGE_BSL_START_PASSWORD"},
+      "bindings": [{"scenario": "bsl-certificate-domain-control", "snapshot": "unallocated"}]
+    },
+    {
       "id": "goad-trust-walker",
       "source": {"kind": "external", "path": "operator-supplied/goad"},
       "qualification": {"state": "live_qualified", "receipt": "sage-readiness-contract-v1"},
@@ -15,14 +39,17 @@
         {"role": "srv03", "aliases": ["srv03", "braavos"], "suffixes": ["goad-srv03"], "last_octet": 23, "os": "windows"}
       ],
       "topology": {
-        "capabilities": ["collect-directory-graph", "abuse-controlled-gpo", "read-managed-local-admin-secret", "abuse-certificate-services", "replicate-directory-secrets", "cross-forest-authentication"],
-        "branches": ["controlled-gpo->directory-replication", "managed-local-admin->certificate-services", "certificate-services->cross-forest-authentication"]
+        "capabilities": ["collect-directory-graph", "abuse-controlled-gpo", "replicate-child-domain-secrets", "forge-cross-realm-kerberos-context", "abuse-sql-login-impersonation", "traverse-cross-forest-sql-link", "read-objective-managed-local-admin-secret", "abuse-objective-certificate-services", "establish-or-use-authority-across-independent-forest-boundary", "obtain-fresh-objective-domain-krbtgt-material"],
+        "branches": ["controlled-gpo->child-replication->cross-realm-context", "sql-impersonation->cross-forest-linked-server", "objective-laps->certificate-services"],
+        "required_routes": [["collect-directory-graph", "abuse-controlled-gpo", "replicate-child-domain-secrets", "forge-cross-realm-kerberos-context", "establish-or-use-authority-across-independent-forest-boundary", "obtain-fresh-objective-domain-krbtgt-material"], ["abuse-sql-login-impersonation", "traverse-cross-forest-sql-link", "establish-or-use-authority-across-independent-forest-boundary", "obtain-fresh-objective-domain-krbtgt-material"], ["read-objective-managed-local-admin-secret", "abuse-objective-certificate-services", "establish-or-use-authority-across-independent-forest-boundary", "obtain-fresh-objective-domain-krbtgt-material"]],
+        "required_route_scenario": "cross-forest-objective",
+        "required_route_coverage": "complete"
       },
       "foothold": {"role": "srv02", "principal": "NORTH\\samwell.tarly", "callback_host": "CASTELBLACK", "callback_user": "samwell.tarly", "password_env": "SAGE_RUN_AS_PASSWORD"},
       "bindings": [
         {"scenario": "single-hop-system", "snapshot": "sage-seed-apollo-staged-20260710"},
         {"scenario": "child-da", "snapshot": "sage-seed-apollo-staged-20260710"},
-        {"scenario": "cross-forest-objective", "snapshot": "sage-seed-apollo-staged-20260710"},
+        {"scenario": "cross-forest-objective", "snapshot": "sage-seed-apollo-v252-mythic4-20260829"},
         {"scenario": "child-control", "snapshot": "sage-seed-apollo-staged-20260710"},
         {"scenario": "direct-laps-objective", "snapshot": "sage-seed-apollo-staged-20260710"},
         {"scenario": "direct-laps-ca-export-recovery", "snapshot": "sage-seed-apollo-staged-20260710"},
@@ -44,8 +71,11 @@
         {"role": "ws01", "aliases": ["ws01"], "suffixes": ["ws01"], "last_octet": 31, "os": "windows"}
       ],
       "topology": {
-        "capabilities": ["collect-directory-graph", "abuse-controlled-gpo", "replicate-directory-secrets"],
-        "branches": ["controlled-gpo->directory-replication", "direct-directory-replication"]
+        "capabilities": ["collect-directory-graph", "abuse-controlled-gpo", "obtain-fresh-objective-domain-krbtgt-material"],
+        "branches": ["controlled-gpo->directory-replication", "direct-directory-replication"],
+        "required_routes": [["collect-directory-graph", "abuse-controlled-gpo", "obtain-fresh-objective-domain-krbtgt-material"], ["obtain-fresh-objective-domain-krbtgt-material"]],
+        "required_route_scenario": "replication-purpose-range-visible-cost",
+        "required_route_coverage": "complete"
       },
       "foothold": {"role": "ws01", "principal": "REPLICATION\\user1", "callback_host": "WS01", "callback_user": "user1", "password_env": "SAGE_REPLICATION_USER1_PASSWORD"},
       "bindings": [
@@ -69,10 +99,15 @@
       ],
       "topology": {
         "capabilities": ["collect-directory-graph", "abuse-child-domain-gpo", "replicate-child-domain-secrets", "abuse-partner-certificate-services", "cross-forest-authentication"],
-        "branches": ["child-domain-gpo->child-directory-replication", "partner-certificate-services->cross-forest-authentication"]
+        "branches": ["child-domain-gpo->child-directory-replication", "partner-certificate-services->cross-forest-authentication"],
+        "required_routes": [["collect-directory-graph", "abuse-child-domain-gpo", "replicate-child-domain-secrets"], ["collect-directory-graph", "abuse-partner-certificate-services", "cross-forest-authentication"]],
+        "required_route_scenario": "structural-a-frontier",
+        "required_route_coverage": "incomplete"
       },
       "foothold": {"role": "ws01", "principal": "MARBLE\\analyst1", "callback_host": "MARBLE-WS01", "callback_user": "analyst1", "password_env": "SAGE_STRUCTURAL_A_PASSWORD"},
-      "bindings": []
+      "bindings": [
+        {"scenario": "structural-a-frontier", "snapshot": "unallocated"}
+      ]
     },
     {
       "id": "sage-structural-b",
@@ -91,10 +126,15 @@
       ],
       "topology": {
         "capabilities": ["collect-directory-graph", "read-partner-managed-local-admin-secret", "abuse-partner-certificate-services", "replicate-nested-child-secrets", "cross-forest-authentication"],
-        "branches": ["partner-managed-local-admin->partner-certificate-services", "nested-child-control->nested-child-directory-replication"]
+        "branches": ["partner-managed-local-admin->partner-certificate-services", "nested-child-control->nested-child-directory-replication"],
+        "required_routes": [["collect-directory-graph", "read-partner-managed-local-admin-secret", "abuse-partner-certificate-services", "cross-forest-authentication"], ["collect-directory-graph", "replicate-nested-child-secrets"]],
+        "required_route_scenario": "structural-b-frontier",
+        "required_route_coverage": "incomplete"
       },
       "foothold": {"role": "ws01", "principal": "QUARTZ\\analyst1", "callback_host": "QUARTZ-WS01", "callback_user": "analyst1", "password_env": "SAGE_STRUCTURAL_B_PASSWORD"},
-      "bindings": []
+      "bindings": [
+        {"scenario": "structural-b-frontier", "snapshot": "unallocated"}
+      ]
     }
   ]
 }

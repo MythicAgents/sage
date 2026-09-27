@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from datetime import datetime, timezone
+import hashlib
 import importlib.util
 import json
 import os
@@ -32,6 +33,7 @@ READINESS_CONTRACT = RESET_DIR / "scripts" / "readiness_contract.py"
 RANGE_PROFILE = RESET_DIR / "scripts" / "range_profile.py"
 DEFAULT_CHECKPOINT_DIR = REPO_ROOT / ".sage_engagement" / "reset_runs"
 SCHEMA = "sage-goad-reset-orchestration-v2"
+RANGE_FIXTURE_QUALIFICATION_SCHEMA = "sage-range-fixture-qualification-v1"
 TASK_COUNT_QUERY = """
 query SageResetTaskCount($operationId: Int!) {
   whoami {
@@ -69,6 +71,20 @@ PHASE_NAMES = (
     "post-callback-preflight",
     "final-readiness",
 )
+RANGE_FIXTURE_QUALIFICATION_PHASES = (
+    "capture-task-and-callback-baseline",
+    "rollback-range",
+    "poweron-range",
+    "wait-range-ips",
+    "sync-range-time",
+    "await-operator-foothold-launch",
+    "fresh-callback-selection",
+    "final-start-readiness",
+)
+_FIXTURE_ACTION_BINDING_KEYS = {
+    "mechanism", "adapter", "range_profile_id", "ludus_range_id",
+    "ludus_mcp_server",
+}
 AMBIGUOUS_ON_INTERRUPT = {
     "reset-mythic",
     "bootstrap-chat-and-foothold",
@@ -144,6 +160,12 @@ class ResetError(RuntimeError):
 
 def _raise_reset(message: str) -> None:
     raise ResetError(message)
+
+
+def _failure_reason(exc: Exception) -> str:
+    """Persist a non-empty diagnostic without exposing an exception object."""
+    message = str(exc).strip()
+    return message or type(exc).__name__
 
 
 def _now() -> str:
@@ -393,9 +415,14 @@ def _phase_commands(config: dict[str, Any]) -> dict[str, list[str]]:
     }
 
 
-def _new_checkpoint(config: dict[str, Any], run_id: str) -> dict[str, Any]:
+def _new_checkpoint(
+    config: dict[str, Any],
+    run_id: str,
+    *,
+    scenario_manifest_binding: dict[str, str] | None = None,
+) -> dict[str, Any]:
     commands = _phase_commands(config)
-    return {
+    checkpoint = {
         "schema": SCHEMA,
         "run_id": run_id,
         "created_at": _now(),
@@ -422,6 +449,11 @@ def _new_checkpoint(config: dict[str, Any], run_id: str) -> dict[str, Any]:
         },
         "terminal": {"state": "in_progress", "reason": None},
     }
+    if scenario_manifest_binding is not None:
+        checkpoint["scenario_manifest_binding"] = _validate_scenario_manifest_binding(
+            scenario_manifest_binding
+        )
+    return checkpoint
 
 
 def _checkpoint_summary(
@@ -570,7 +602,9 @@ def _validate_completed_result(
     )
 
 
-def _validate_inputs(inputs: Any, path: Path) -> dict[str, Any]:
+def _validate_inputs(
+    inputs: Any, path: Path, *, require_live_qualified: bool = True
+) -> dict[str, Any]:
     if not isinstance(inputs, dict):
         _raise_invalid(path, "inputs must be an object")
     if set(inputs) != INPUT_KEYS:
@@ -599,9 +633,9 @@ def _validate_inputs(inputs: Any, path: Path) -> dict[str, Any]:
             _raise_invalid(path, f"inputs.{key} must be a string")
     profile_module = _load_module("sage_reset_range_profile_checkpoint", RANGE_PROFILE)
     try:
-        profile_module.require_live_qualified(
-            profile_module.get_profile(inputs["range_profile_id"])
-        )
+        profile = profile_module.get_profile(inputs["range_profile_id"])
+        if require_live_qualified:
+            profile_module.require_live_qualified(profile)
     except ValueError as exc:
         _raise_invalid(path, f"inputs.range_profile_id is not releasable: {exc}")
     if inputs.get("bootstrap_mode") not in {
@@ -709,9 +743,16 @@ def _validate_observation(
     return value
 
 
-def _validate_checkpoint(checkpoint: Any, path: Path) -> dict[str, Any]:
+def _validate_checkpoint(
+    checkpoint: Any, path: Path, *, require_live_qualified: bool = True
+) -> dict[str, Any]:
     if not isinstance(checkpoint, dict) or checkpoint.get("schema") != SCHEMA:
         raise ResetError(f"unsupported reset checkpoint at {path}")
+    if "scenario_manifest_binding" in checkpoint:
+        try:
+            _validate_scenario_manifest_binding(checkpoint["scenario_manifest_binding"])
+        except ResetError as exc:
+            _raise_invalid(path, str(exc))
     if not isinstance(checkpoint.get("run_id"), str) or not checkpoint[
         "run_id"
     ].strip():
@@ -719,7 +760,9 @@ def _validate_checkpoint(checkpoint: Any, path: Path) -> dict[str, Any]:
     for key in ("created_at", "updated_at"):
         if not isinstance(checkpoint.get(key), str) or not checkpoint[key]:
             _raise_invalid(path, f"{key} must be a non-empty string")
-    inputs = _validate_inputs(checkpoint.get("inputs"), path)
+    inputs = _validate_inputs(
+        checkpoint.get("inputs"), path, require_live_qualified=require_live_qualified
+    )
 
     phases = checkpoint.get("phases")
     if not isinstance(phases, list):
@@ -1003,6 +1046,638 @@ def _validate_checkpoint(checkpoint: Any, path: Path) -> dict[str, Any]:
     return checkpoint
 
 
+def validate_scenario_reset_binding(
+    manifest: Any,
+    checkpoint: Any,
+    path: Path,
+    *,
+    expected_run_id: str,
+    not_before: str,
+    expected_range_id: str | None = None,
+    expected_ludus_mcp_server: str | None = None,
+    external_source_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Bind a scenario manifest to a completed reset checkpoint without granting readiness.
+
+    Optional range and MCP-server selectors compare prospective caller inputs to
+    persisted checkpoint inputs. They identify the intended reset record; they
+    do not prove endpoint provenance or readiness.
+    """
+    if checkpoint is None:
+        raise ResetError("reset evidence is missing")
+    if not isinstance(expected_run_id, str) or not expected_run_id.strip():
+        raise ResetError("expected reset run ID is missing")
+    selectors = {
+        "range ID": expected_range_id,
+        "Ludus MCP server": expected_ludus_mcp_server,
+    }
+    for label, value in selectors.items():
+        if value is not None and (
+            not isinstance(value, str) or not value.strip()
+        ):
+            raise ResetError(
+                f"expected {label} must be a non-empty string when supplied"
+            )
+    bound = _aware_time(not_before)
+    if bound is None:
+        raise ResetError("reset not-before bound must be timezone-aware ISO-8601")
+    profile_module = _load_module("sage_reset_range_profile_manifest", RANGE_PROFILE)
+    report = profile_module.validate_scenario_manifest(
+        manifest, external_source_dir=external_source_dir,
+    )
+    if not report["manifest_valid"]:
+        raise ResetError("scenario manifest is invalid: " + ", ".join(report["errors"]))
+    parsed = _validate_checkpoint(checkpoint, path, require_live_qualified=False)
+    if parsed["run_id"] != expected_run_id:
+        raise ResetError("checkpoint run ID does not match prospective binding")
+    created_at = _aware_time(parsed["created_at"])
+    if created_at is None or created_at < bound:
+        raise ResetError("checkpoint predates prospective not-before bound")
+    inputs = parsed["inputs"]
+    if inputs["range_profile_id"] != manifest["profile_id"]:
+        raise ResetError("checkpoint profile does not match scenario manifest")
+    if inputs["snapshot"] != manifest["snapshot_id"]:
+        raise ResetError("checkpoint snapshot does not match scenario manifest")
+    if (
+        expected_range_id is not None
+        and inputs["ludus_range_id"] != expected_range_id.strip()
+    ):
+        raise ResetError("checkpoint range ID does not match prospective selector")
+    if (
+        expected_ludus_mcp_server is not None
+        and inputs["ludus_mcp_server"] != expected_ludus_mcp_server.strip()
+    ):
+        raise ResetError(
+            "checkpoint Ludus MCP server does not match prospective selector"
+        )
+    if parsed["schema"] != manifest["reset_checkpoint_schema"]:
+        raise ResetError("checkpoint schema does not match scenario manifest")
+    expected_binding = _scenario_manifest_binding(manifest)
+    if parsed.get("scenario_manifest_binding") != expected_binding:
+        raise ResetError(
+            "reset checkpoint does not bind scenario manifest source; future reset producer must persist "
+            "scenario_manifest_binding with the manifest hash, profile, source, and snapshot"
+        )
+    if report["readiness_blockers"]:
+        raise ResetError(
+            "scenario reset binding is not live-ready: "
+            + ", ".join(report["readiness_blockers"])
+        )
+    if parsed["terminal"]["state"] != "complete":
+        raise ResetError("reset checkpoint is incomplete")
+    return parsed
+
+
+def _scenario_manifest_binding(manifest: dict[str, Any]) -> dict[str, str]:
+    encoded = json.dumps(manifest, separators=(",", ":"), sort_keys=True).encode()
+    return {
+        "manifest_sha256": hashlib.sha256(encoded).hexdigest(),
+        "profile_id": manifest["profile_id"],
+        "source_path": manifest["source_path"],
+        "source_sha256": manifest["source_sha256"],
+        "snapshot_id": manifest["snapshot_id"],
+    }
+
+
+def _validate_scenario_manifest_binding(value: Any) -> dict[str, str]:
+    expected = {
+        "manifest_sha256", "profile_id", "source_path", "source_sha256", "snapshot_id",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ResetError("scenario manifest binding has invalid fields")
+    binding = {key: value[key] for key in expected}
+    if any(not isinstance(item, str) or not item.strip() for item in binding.values()):
+        raise ResetError("scenario manifest binding values must be non-empty strings")
+    for key in ("manifest_sha256", "source_sha256"):
+        if not re.fullmatch(r"[0-9a-f]{64}", binding[key]):
+            raise ResetError(f"scenario manifest binding {key} must be a SHA-256 hex digest")
+    return binding
+
+
+def _scenario_manifest_capture(
+    args: argparse.Namespace, config: dict[str, Any]
+) -> dict[str, str] | None:
+    value = str(getattr(args, "scenario_manifest", "") or "").strip()
+    if not value:
+        return None
+    path = Path(value).expanduser()
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ResetError(f"unable to load scenario manifest: {exc}") from exc
+    if not isinstance(manifest, dict):
+        raise ResetError("scenario manifest must be a JSON object")
+    profile_module = _load_module("sage_reset_range_profile_capture", RANGE_PROFILE)
+    report = profile_module.validate_scenario_manifest(
+        manifest,
+        external_source_dir=getattr(args, "external_source_dir", None),
+    )
+    if not report["manifest_valid"]:
+        raise ResetError("scenario manifest is invalid: " + ", ".join(report["errors"]))
+    if manifest["profile_id"] != config["range_profile_id"]:
+        raise ResetError("scenario manifest profile does not match reset profile")
+    if manifest["snapshot_id"] != config["snapshot"]:
+        raise ResetError("scenario manifest snapshot does not match reset snapshot")
+    if manifest["reset_checkpoint_schema"] != SCHEMA:
+        raise ResetError("scenario manifest checkpoint schema does not match reset schema")
+    return _validate_scenario_manifest_binding(_scenario_manifest_binding(manifest))
+
+
+def _fixture_callback_expectation(value: Any) -> dict[str, Any]:
+    expected = {
+        "host", "domain", "user", "payload_type", "integrity",
+        "operation_id", "payload_uuid", "active",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ResetError("fixture callback expectation has invalid fields")
+    normalized = {
+        key: str(value[key] or "").strip().casefold()
+        for key in ("host", "domain", "user", "payload_type", "integrity", "payload_uuid")
+    }
+    if any(not item for item in normalized.values()):
+        raise ResetError("fixture callback expectation fields must be non-empty")
+    if normalized["integrity"] not in {"low", "medium", "high"}:
+        raise ResetError("fixture callback expectation integrity is unsupported")
+    operation_id = value.get("operation_id")
+    if not _is_int(operation_id) or operation_id <= 0:
+        raise ResetError("fixture callback expectation operation_id is invalid")
+    if value.get("active") is not True:
+        raise ResetError("fixture callback expectation active must be true")
+    normalized["operation_id"] = operation_id
+    normalized["active"] = True
+    return normalized
+
+
+def _fixture_callback_row(
+    value: Any, *, require_active: bool = True,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ResetError("fixture callback observation must be an object")
+    callback_id = value.get("display_id")
+    if not _is_int(callback_id) or callback_id <= 0:
+        raise ResetError("fixture callback observation has invalid display_id")
+    observed_at = _aware_time(value.get("observed_at"))
+    if observed_at is None:
+        raise ResetError("fixture callback observation timestamp must be timezone-aware")
+    fields = {
+        key: str(value.get(key) or "").strip().casefold()
+        for key in ("host", "domain", "user", "payload_type", "payload_uuid")
+    }
+    if any(not item for item in fields.values()):
+        raise ResetError("fixture callback observation identity is incomplete")
+    operation_id = value.get("operation_id")
+    if not _is_int(operation_id) or operation_id <= 0:
+        raise ResetError("fixture callback observation operation_id is invalid")
+    active = value.get("active")
+    if not isinstance(active, bool):
+        raise ResetError("fixture callback observation active is invalid")
+    if require_active and active is not True:
+        raise ResetError("fixture callback observation must be active")
+    level = value.get("integrity_level")
+    if not _is_int(level) or level not in {1, 2, 3}:
+        raise ResetError("fixture callback observation integrity_level is invalid")
+    integrity = {1: "low", 2: "medium", 3: "high"}[level]
+    return {
+        "display_id": callback_id,
+        **fields,
+        "integrity": integrity,
+        "integrity_level": level,
+        "operation_id": operation_id,
+        "active": active,
+        "observed_at": observed_at.isoformat(),
+    }
+
+
+def _fixture_action_binding(
+    value: Any, config: dict[str, Any], *, label: str,
+) -> dict[str, str]:
+    if not isinstance(value, dict) or set(value) != _FIXTURE_ACTION_BINDING_KEYS:
+        raise ResetError(f"{label} has invalid fields")
+    binding = {key: str(value[key] or "").strip() for key in value}
+    if any(not item for item in binding.values()):
+        raise ResetError(f"{label} values must be non-empty")
+    for key in ("range_profile_id", "ludus_range_id", "ludus_mcp_server"):
+        if binding[key] != config[key]:
+            raise ResetError(f"{label} {key} does not match inputs")
+    return binding
+
+
+def _fixture_action_bindings(value: Any, config: dict[str, Any]) -> dict[str, dict[str, str]]:
+    if not isinstance(value, dict) or set(value) != set(RANGE_FIXTURE_QUALIFICATION_PHASES):
+        raise ResetError("fixture qualification action bindings must cover each phase")
+    return {
+        phase: _fixture_action_binding(item, config, label=f"action binding {phase}")
+        for phase, item in value.items()
+    }
+
+
+def _fixture_phase_output(
+    phase_name: str,
+    output: Any,
+    *,
+    action_binding: dict[str, str],
+    error: Callable[[str], None],
+) -> dict[str, Any]:
+    """Validate evidence-bearing range-fixture phase output.
+
+    The v2 reset protocol deliberately permits generic successful phase maps.
+    This narrow observation scope does not: its range effects must retain a
+    checked transport result and an observer state, while inventory remains a
+    non-releasing observation.
+    """
+    if not isinstance(output, dict):
+        error(f"{phase_name} result must be an object")
+    if phase_name not in {
+        "capture-task-and-callback-baseline", "fresh-callback-selection",
+    } and (
+        output.get("mechanism") != action_binding["mechanism"]
+        or output.get("adapter") != action_binding["adapter"]
+    ):
+        error(f"{phase_name} result mechanism does not match its action binding")
+    if phase_name == "wait-range-ips":
+        inventory = output.get("inventory")
+        if (
+            output.get("schema") != "sage-range-fixture-inventory-v1"
+            or output.get("live_ready") is not False
+            or not isinstance(output.get("observation_id"), str)
+            or not output["observation_id"].strip()
+            or not isinstance(inventory, dict)
+            or inventory.get("qualification_observation") is not True
+            or inventory.get("live_ready") is not False
+            or inventory.get("ready") is not True
+        ):
+            error("wait-range-ips requires a ready non-releasing fixture inventory")
+        return output
+    if phase_name == "await-operator-foothold-launch":
+        _validate_phase_output(phase_name, output, error=error)
+        return output
+    if phase_name in {
+        "rollback-range", "poweron-range", "sync-range-time",
+    }:
+        _validate_phase_output(phase_name, output, error=error)
+        if output.get("ok") is not True or output.get("exit_code") != 0:
+            error(f"{phase_name} requires explicit ok and exit_code zero")
+        observer_state = output.get("observer_state")
+        if not isinstance(observer_state, (str, dict, list)) or not observer_state:
+            error(f"{phase_name} requires a non-empty observer_state")
+        return output
+    if phase_name == "final-start-readiness":
+        if (
+            output.get("ok") is not True
+            or output.get("endpoint_observed") is not True
+            or not _is_int(output.get("callback_id"))
+            or output["callback_id"] <= 0
+        ):
+            error("final-start-readiness requires a task-free endpoint observation")
+        return output
+    if phase_name == "capture-task-and-callback-baseline":
+        if (
+            output.get("ok") is not True
+            or not _is_int(output.get("task_count"))
+            or output["task_count"] < 0
+            or not _is_int(output.get("callback_count"))
+            or output["callback_count"] < 0
+        ):
+            error("capture baseline result is invalid")
+        return output
+    if phase_name == "fresh-callback-selection":
+        if output.get("ok") is not True or not _is_int(output.get("callback_id")):
+            error("fresh callback selection result is invalid")
+        return output
+    error(f"fixture qualification phase is unsupported: {phase_name}")
+    raise AssertionError("error callback must raise")
+
+
+def _validate_fixture_completed_result(
+    phase_name: str, value: Any, path: Path, *, label: str,
+    action_binding: dict[str, str],
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {"phase", "succeeded", "output"}:
+        _raise_invalid(path, f"{label} has an invalid success envelope")
+    if value.get("phase") != phase_name or value.get("succeeded") is not True:
+        _raise_invalid(path, f"{label} does not match its completed phase")
+    return _fixture_phase_output(
+        phase_name,
+        value.get("output"),
+        action_binding=action_binding,
+        error=lambda message: _raise_invalid(path, f"{label}: {message}"),
+    )
+
+
+def _fixture_manifest_and_inputs(manifest: Any, config: dict[str, Any]) -> dict[str, Any]:
+    profile_module = _load_module("sage_reset_range_fixture_profile", RANGE_PROFILE)
+    report = profile_module.validate_scenario_manifest(
+        manifest, qualification_observation=True,
+    )
+    if not report["manifest_valid"]:
+        raise ResetError("scenario manifest is invalid: " + ", ".join(report["errors"]))
+    if manifest.get("reset_checkpoint_schema") != RANGE_FIXTURE_QUALIFICATION_SCHEMA:
+        raise ResetError("fixture qualification manifest checkpoint schema does not match")
+    if manifest.get("snapshot_id") == profile_module.UNALLOCATED_SNAPSHOT:
+        raise ResetError("fixture qualification requires an allocated snapshot")
+    if config.get("range_profile_id") != manifest["profile_id"]:
+        raise ResetError("fixture qualification profile does not match scenario manifest")
+    if config.get("snapshot") != manifest["snapshot_id"]:
+        raise ResetError("fixture qualification snapshot does not match scenario manifest")
+    for key, label in (("ludus_range_id", "range ID"), ("ludus_mcp_server", "Ludus MCP server")):
+        if not isinstance(config.get(key), str) or not config[key].strip():
+            raise ResetError(f"fixture qualification {label} must be non-empty")
+    return report
+
+
+def _new_range_fixture_checkpoint(
+    config: dict[str, Any], run_id: str, *, manifest: dict[str, Any],
+    callback_expectation: dict[str, Any], action_bindings: dict[str, dict[str, str]],
+) -> dict[str, Any]:
+    return {
+        "schema": RANGE_FIXTURE_QUALIFICATION_SCHEMA,
+        "scope": "range-fixture-qualification",
+        "run_id": run_id,
+        "created_at": _now(),
+        "updated_at": _now(),
+        "inputs": _redact(config),
+        "scenario_manifest_binding": _scenario_manifest_binding(manifest),
+        "callback_expectation": callback_expectation,
+        "task_baseline": None,
+        "callback_task_observation": None,
+        "callback_baseline": None,
+        "fresh_callback": None,
+        "phases": [
+            {"name": name, "status": "pending", "action_binding": action_bindings[name],
+             "started_at": None, "finished_at": None, "result_summary": None, "error": None}
+            for name in RANGE_FIXTURE_QUALIFICATION_PHASES
+        ],
+        "terminal": {"state": "in_progress", "reason": None},
+    }
+
+
+def _validate_range_fixture_checkpoint(checkpoint: Any, path: Path) -> dict[str, Any]:
+    keys = {"schema", "scope", "run_id", "created_at", "updated_at", "inputs", "scenario_manifest_binding",
+            "callback_expectation", "task_baseline", "callback_task_observation", "callback_baseline", "fresh_callback", "phases", "terminal"}
+    if not isinstance(checkpoint, dict) or set(checkpoint) != keys or checkpoint.get("schema") != RANGE_FIXTURE_QUALIFICATION_SCHEMA or checkpoint.get("scope") != "range-fixture-qualification":
+        _raise_invalid(path, "fixture qualification checkpoint schema is invalid")
+    if not isinstance(checkpoint.get("run_id"), str) or not checkpoint["run_id"].strip():
+        _raise_invalid(path, "fixture qualification run_id is invalid")
+    for key in ("created_at", "updated_at"):
+        if _aware_time(checkpoint.get(key)) is None:
+            _raise_invalid(path, f"fixture qualification {key} is invalid")
+    _validate_inputs(checkpoint["inputs"], path, require_live_qualified=False)
+    try:
+        _validate_scenario_manifest_binding(checkpoint["scenario_manifest_binding"])
+        _fixture_callback_expectation(checkpoint["callback_expectation"])
+    except ResetError as exc:
+        _raise_invalid(path, str(exc))
+    phases = checkpoint.get("phases")
+    if not isinstance(phases, list) or [item.get("name") if isinstance(item, dict) else None for item in phases] != list(RANGE_FIXTURE_QUALIFICATION_PHASES):
+        _raise_invalid(path, "fixture qualification phases are invalid")
+    first_incomplete = None
+    for index, phase in enumerate(phases):
+        if not isinstance(phase, dict) or set(phase) != {"name", "status", "action_binding", "started_at", "finished_at", "result_summary", "error"}:
+            _raise_invalid(path, f"fixture qualification phase {index} is invalid")
+        status = phase["status"]
+        if status not in PHASE_STATUSES:
+            _raise_invalid(path, f"fixture qualification phase {index} has invalid status")
+        try:
+            action_binding = _fixture_action_binding(
+                phase["action_binding"], checkpoint["inputs"],
+                label=f"phases[{index}].action_binding",
+            )
+        except ResetError as exc:
+            _raise_invalid(path, str(exc))
+        if status == "completed":
+            if _aware_time(phase["started_at"]) is None or _aware_time(phase["finished_at"]) is None or phase["error"] is not None:
+                _raise_invalid(path, f"fixture qualification phase {index} completion is invalid")
+            _validate_fixture_completed_result(
+                phase["name"], phase["result_summary"], path,
+                label=f"phases[{index}].result_summary",
+                action_binding=action_binding,
+            )
+        elif status == "pending":
+            if any(phase[key] is not None for key in ("started_at", "finished_at", "result_summary", "error")):
+                _raise_invalid(path, f"fixture qualification pending phase {index} carries result data")
+        elif status == "running":
+            if _aware_time(phase["started_at"]) is None or any(phase[key] is not None for key in ("finished_at", "result_summary", "error")):
+                _raise_invalid(path, f"fixture qualification running phase {index} is invalid")
+        elif status == "failed":
+            if _aware_time(phase["started_at"]) is None or _aware_time(phase["finished_at"]) is None or not isinstance(phase["error"], str) or not phase["error"]:
+                _raise_invalid(path, f"fixture qualification failed phase {index} is invalid")
+        else:
+            _raise_invalid(path, "fixture qualification only permits pending, completed, or failed phases")
+        if status != "completed" and first_incomplete is None:
+            first_incomplete = index
+        elif status == "completed" and first_incomplete is not None:
+            _raise_invalid(path, "fixture qualification completed phases must form a prefix")
+        elif first_incomplete is not None and status not in {"pending", "completed"}:
+            _raise_invalid(path, "fixture qualification has multiple active phases")
+    baseline = checkpoint["task_baseline"]
+    if baseline is not None:
+        _validate_observation(baseline, path, label="fixture task baseline", include_phase=False)
+    callback_tasks = checkpoint["callback_task_observation"]
+    if callback_tasks is not None:
+        _validate_observation(
+            callback_tasks,
+            path,
+            label="fixture callback task observation",
+            include_phase=False,
+        )
+        if baseline is None:
+            _raise_invalid(path, "fixture callback task observation lacks baseline")
+        drifted = False
+        for key in (
+            "scope", "operation_id", "operator_id", "operator_username",
+            "count", "max_task_id",
+        ):
+            if callback_tasks[key] != baseline[key]:
+                drifted = True
+        if _aware_time(callback_tasks["observed_at"]) < _aware_time(baseline["observed_at"]):
+            drifted = True
+        fresh_phase = phases[RANGE_FIXTURE_QUALIFICATION_PHASES.index("fresh-callback-selection")]
+        if drifted and fresh_phase["status"] != "failed":
+            _raise_invalid(path, "fixture callback task observation drifted")
+        if _aware_time(callback_tasks["observed_at"]) < _aware_time(baseline["observed_at"]) and fresh_phase["status"] != "failed":
+            _raise_invalid(path, "fixture callback task observation reverses time")
+    callback_baseline = checkpoint["callback_baseline"]
+    if callback_baseline is not None:
+        if not isinstance(callback_baseline, dict) or set(callback_baseline) != {"observed_at", "callback_ids"} or _aware_time(callback_baseline.get("observed_at")) is None or not isinstance(callback_baseline.get("callback_ids"), list) or any(not _is_int(value) or value <= 0 for value in callback_baseline["callback_ids"]) or len(set(callback_baseline["callback_ids"])) != len(callback_baseline["callback_ids"]):
+            _raise_invalid(path, "fixture callback baseline is invalid")
+    fresh = checkpoint["fresh_callback"]
+    if fresh is not None:
+        try:
+            fresh_row = _fixture_callback_row(fresh)
+            expectation = _fixture_callback_expectation(checkpoint["callback_expectation"])
+        except ResetError as exc:
+            _raise_invalid(path, str(exc))
+        if callback_baseline is None or callback_tasks is None:
+            _raise_invalid(path, "fixture fresh callback lacks prerequisite observations")
+        if fresh_row["display_id"] in callback_baseline["callback_ids"]:
+            _raise_invalid(path, "fixture fresh callback was present at baseline")
+        if _aware_time(fresh_row["observed_at"]) <= _aware_time(callback_baseline["observed_at"]):
+            _raise_invalid(path, "fixture fresh callback predates baseline boundary")
+        if any(fresh_row[key] != expectation[key] for key in expectation):
+            _raise_invalid(path, "fixture fresh callback does not match expectation")
+        if fresh_row["operation_id"] != baseline["operation_id"]:
+            _raise_invalid(path, "fixture fresh callback does not match task operation")
+    terminal = checkpoint["terminal"]
+    if not isinstance(terminal, dict) or set(terminal) != {"state", "reason"} or terminal.get("state") not in {"in_progress", "blocked", "complete"}:
+        _raise_invalid(path, "fixture qualification terminal is invalid")
+    if terminal["state"] == "complete" and (first_incomplete is not None or baseline is None or callback_tasks is None or callback_baseline is None or fresh is None):
+        _raise_invalid(path, "fixture qualification complete checkpoint lacks required observations")
+    if terminal["state"] == "complete":
+        results = {phase["name"]: phase["result_summary"]["output"] for phase in phases}
+        inventory_profile = results["wait-range-ips"]["inventory"].get("range_profile")
+        if (
+            not isinstance(inventory_profile, dict)
+            or inventory_profile.get("id") != checkpoint["inputs"]["range_profile_id"]
+        ):
+            _raise_invalid(path, "fixture inventory profile does not match checkpoint inputs")
+        if results["capture-task-and-callback-baseline"]["task_count"] != baseline["count"] or results["capture-task-and-callback-baseline"]["callback_count"] != len(callback_baseline["callback_ids"]):
+            _raise_invalid(path, "fixture capture result does not match baseline observations")
+        if results["fresh-callback-selection"]["callback_id"] != fresh["display_id"]:
+            _raise_invalid(path, "fixture callback selection result does not match callback")
+        if results["final-start-readiness"]["callback_id"] != fresh["display_id"]:
+            _raise_invalid(path, "fixture final endpoint does not match callback")
+    return checkpoint
+
+
+def run_range_fixture_qualification(
+    config: dict[str, Any], *, manifest: Any, run_id: str, checkpoint_path: Path,
+    callback_expectation: Any, action_bindings: Any,
+    phase_runner: Callable[[str, dict[str, str], dict[str, Any]], dict[str, Any]],
+    task_observer: Callable[[dict[str, Any]], dict[str, Any]], callback_observer: Callable[[dict[str, Any]], list[dict[str, Any]]],
+) -> dict[str, Any]:
+    """Run only range-local fixture reset phases with injected operator actions.
+
+    This producer records an observation-only checkpoint and never grants readiness.
+    """
+    if checkpoint_path.exists():
+        raise ResetError(f"checkpoint already exists; refuse to overwrite: {checkpoint_path}")
+    if not isinstance(manifest, dict):
+        raise ResetError("fixture qualification manifest must be an object")
+    _fixture_manifest_and_inputs(manifest, config)
+    expectation = _fixture_callback_expectation(callback_expectation)
+    bindings = _fixture_action_bindings(action_bindings, config)
+    checkpoint = _new_range_fixture_checkpoint(
+        config, run_id, manifest=manifest,
+        callback_expectation=expectation, action_bindings=bindings,
+    )
+
+    def write() -> None:
+        checkpoint["updated_at"] = _now()
+        _validate_range_fixture_checkpoint(checkpoint, checkpoint_path)
+        _atomic_write(checkpoint_path, checkpoint)
+
+    write()
+    for phase in checkpoint["phases"]:
+        name = phase["name"]
+        phase["status"] = "running"
+        phase["started_at"] = _now()
+        write()
+        try:
+            if name == "capture-task-and-callback-baseline":
+                baseline = dict(task_observer(config))
+                _validate_observation(baseline, checkpoint_path, label="fixture task baseline", include_phase=False)
+                callbacks = [
+                    _fixture_callback_row(item, require_active=False)
+                    for item in callback_observer(config)
+                ]
+                ids = [item["display_id"] for item in callbacks]
+                if len(ids) != len(set(ids)):
+                    raise ResetError("fixture callback baseline has duplicate IDs")
+                checkpoint["task_baseline"] = baseline
+                checkpoint["callback_baseline"] = {"observed_at": _now(), "callback_ids": ids}
+                output = {"ok": True, "task_count": baseline["count"], "callback_count": len(ids)}
+            elif name == "fresh-callback-selection":
+                baseline = checkpoint["task_baseline"]
+                if not isinstance(baseline, dict):
+                    raise ResetError("fixture task baseline is missing")
+                now_tasks = dict(task_observer(config))
+                _validate_observation(now_tasks, checkpoint_path, label="fixture callback task observation", include_phase=False)
+                checkpoint["callback_task_observation"] = now_tasks
+                for key in ("scope", "operation_id", "operator_id", "operator_username", "count", "max_task_id"):
+                    if now_tasks[key] != baseline[key]:
+                        raise ResetError("fixture task baseline changed before callback selection")
+                if expectation["operation_id"] != baseline["operation_id"]:
+                    raise ResetError("fixture callback expectation does not match task operation")
+                callback_baseline = checkpoint["callback_baseline"]
+                if not isinstance(callback_baseline, dict):
+                    raise ResetError("fixture callback baseline is missing")
+                floor = _aware_time(callback_baseline["observed_at"])
+                candidates = []
+                for item in callback_observer(config):
+                    # Baseline rows can be inactive historical callbacks.  A
+                    # candidate still must match the active=true expectation.
+                    row = _fixture_callback_row(item, require_active=False)
+                    if row["display_id"] in callback_baseline["callback_ids"] or _aware_time(row["observed_at"]) <= floor:
+                        continue
+                    if all(row[key] == expectation[key] for key in expectation):
+                        candidates.append(row)
+                if len(candidates) != 1:
+                    raise ResetError("fixture callback selection requires exactly one fresh matching callback")
+                checkpoint["fresh_callback"] = candidates[0]
+                output = {"ok": True, "callback_id": candidates[0]["display_id"]}
+            elif name == "final-start-readiness":
+                fresh = checkpoint["fresh_callback"]
+                if not isinstance(fresh, dict):
+                    raise ResetError("fixture final endpoint lacks fresh callback")
+                output = _fixture_phase_output(
+                    name,
+                    phase_runner(name, phase["action_binding"], config),
+                    action_binding=phase["action_binding"],
+                    error=_raise_reset,
+                )
+                if output["callback_id"] != fresh["display_id"]:
+                    raise ResetError("fixture final endpoint does not match fresh callback")
+            else:
+                output = _fixture_phase_output(
+                    name,
+                    phase_runner(name, phase["action_binding"], config),
+                    action_binding=phase["action_binding"],
+                    error=_raise_reset,
+                )
+            phase["result_summary"] = _completed_result(name, output)
+            phase["status"] = "completed"
+            phase["finished_at"] = _now()
+            phase["error"] = None
+            if name == RANGE_FIXTURE_QUALIFICATION_PHASES[-1]:
+                checkpoint["terminal"] = {"state": "complete", "reason": None}
+            write()
+        except Exception as exc:
+            reason = _failure_reason(exc)
+            phase["status"] = "failed"
+            phase["finished_at"] = _now()
+            phase["error"] = reason
+            checkpoint["terminal"] = {"state": "blocked", "reason": reason}
+            write()
+            raise ResetError(reason) from exc
+    return {"checkpoint": checkpoint, "live_ready": False, "observation_only": True}
+
+
+def validate_range_fixture_qualification(
+    manifest: Any, checkpoint: Any, path: Path, *, expected_run_id: str, not_before: str,
+    expected_range_id: str, expected_ludus_mcp_server: str,
+) -> dict[str, Any]:
+    if not isinstance(expected_run_id, str) or not expected_run_id.strip() or _aware_time(not_before) is None:
+        raise ResetError("fixture qualification run ID and not-before timestamp are required")
+    for value, label in ((expected_range_id, "range ID"), (expected_ludus_mcp_server, "Ludus MCP server")):
+        if not isinstance(value, str) or not value.strip():
+            raise ResetError(f"fixture qualification expected {label} must be non-empty")
+    if not isinstance(manifest, dict):
+        raise ResetError("fixture qualification manifest must be an object")
+    if not isinstance(checkpoint, dict):
+        raise ResetError("fixture qualification checkpoint must be an object")
+    parsed = _validate_range_fixture_checkpoint(checkpoint, path)
+    _fixture_manifest_and_inputs(manifest, parsed["inputs"])
+    if parsed["run_id"] != expected_run_id or _aware_time(parsed["created_at"]) < _aware_time(not_before):
+        raise ResetError("fixture qualification run binding does not match")
+    if parsed["inputs"]["ludus_range_id"] != expected_range_id.strip() or parsed["inputs"]["ludus_mcp_server"] != expected_ludus_mcp_server.strip():
+        raise ResetError("fixture qualification selector does not match")
+    if parsed["scenario_manifest_binding"] != _scenario_manifest_binding(manifest):
+        raise ResetError("fixture qualification manifest binding does not match")
+    if parsed["terminal"]["state"] != "complete":
+        raise ResetError("fixture qualification checkpoint is incomplete")
+    return {"checkpoint": parsed, "live_ready": False, "observation_only": True}
+
+
 def _load_checkpoint(path: Path) -> dict[str, Any]:
     try:
         checkpoint = json.loads(path.read_text(encoding="utf-8"))
@@ -1230,7 +1905,11 @@ class ResetOrchestrator:
         checkpoint["task_observations"].append(observation)
 
     def start(
-        self, config: dict[str, Any], *, run_id: str | None = None
+        self,
+        config: dict[str, Any],
+        *,
+        run_id: str | None = None,
+        scenario_manifest_binding: dict[str, str] | None = None,
     ) -> tuple[int, dict[str, Any]]:
         if self.path.exists():
             raise ResetError(
@@ -1240,6 +1919,7 @@ class ResetOrchestrator:
             config,
             run_id
             or f"reset-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid4().hex[:8]}",
+            scenario_manifest_binding=scenario_manifest_binding,
         )
         self._write(checkpoint)
         return self._advance(checkpoint)
@@ -1429,6 +2109,8 @@ class ResetOrchestrator:
 def _add_start_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--snapshot", required=True)
     parser.add_argument("--range-profile", default="goad-trust-walker")
+    parser.add_argument("--scenario-manifest")
+    parser.add_argument("--external-source-dir")
     parser.add_argument("--ludus-range-id", default=os.environ.get("SAGE_LUDUS_RANGE_ID") or "")
     parser.add_argument("--ludus-mcp-server", default=os.environ.get("SAGE_LUDUS_MCP_SERVER") or "")
     parser.add_argument(
@@ -1488,6 +2170,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = subparsers.add_parser("status")
     status.add_argument("--checkpoint", required=True)
+
+    validate_manifest = subparsers.add_parser("validate-scenario-manifest")
+    validate_manifest.add_argument("--manifest", required=True)
+    validate_manifest.add_argument("--checkpoint", required=True)
+    validate_manifest.add_argument("--expected-run-id", required=True)
+    validate_manifest.add_argument("--not-before", required=True)
+    validate_manifest.add_argument("--expected-range-id")
+    validate_manifest.add_argument("--expected-ludus-mcp-server")
+    validate_manifest.add_argument("--external-source-dir")
+
+    validate_fixture = subparsers.add_parser("validate-range-fixture-qualification")
+    validate_fixture.add_argument("--manifest", required=True)
+    validate_fixture.add_argument("--checkpoint", required=True)
+    validate_fixture.add_argument("--expected-run-id", required=True)
+    validate_fixture.add_argument("--not-before", required=True)
+    validate_fixture.add_argument("--expected-range-id", required=True)
+    validate_fixture.add_argument("--expected-ludus-mcp-server", required=True)
     return parser
 
 
@@ -1505,24 +2204,73 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             return 0
+        if args.command == "validate-scenario-manifest":
+            manifest_path = Path(args.manifest).expanduser()
+            checkpoint_path = Path(args.checkpoint).expanduser()
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ResetError(f"unable to load offline validation input: {exc}") from exc
+            validated = validate_scenario_reset_binding(
+                manifest,
+                checkpoint,
+                checkpoint_path,
+                expected_run_id=args.expected_run_id,
+                not_before=args.not_before,
+                expected_range_id=args.expected_range_id,
+                expected_ludus_mcp_server=args.expected_ludus_mcp_server,
+                external_source_dir=args.external_source_dir,
+            )
+            print(json.dumps({
+                "ok": True,
+                "run_id": validated["run_id"],
+                "live_activity_performed": False,
+            }, indent=2, sort_keys=True))
+            return 0
+        if args.command == "validate-range-fixture-qualification":
+            manifest_path = Path(args.manifest).expanduser()
+            checkpoint_path = Path(args.checkpoint).expanduser()
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ResetError(f"unable to load offline validation input: {exc}") from exc
+            validated = validate_range_fixture_qualification(
+                manifest, checkpoint, checkpoint_path,
+                expected_run_id=args.expected_run_id,
+                not_before=args.not_before,
+                expected_range_id=args.expected_range_id,
+                expected_ludus_mcp_server=args.expected_ludus_mcp_server,
+            )
+            print(json.dumps({
+                "ok": True,
+                "run_id": validated["checkpoint"]["run_id"],
+                "live_ready": False,
+                "observation_only": True,
+                "live_activity_performed": False,
+            }, indent=2, sort_keys=True))
+            return 0
         if args.command == "plan":
             config = _config_from_args(args)
+            scenario_manifest_binding = _scenario_manifest_capture(args, config)
+            plan = {
+                "schema": SCHEMA,
+                "inputs": _redact(config),
+                "phases": [
+                    {
+                        "name": name,
+                        "command": _redact(command),
+                    }
+                    for name, command in _phase_commands(config).items()
+                ],
+                "live_activity_performed": False,
+            }
+            if scenario_manifest_binding is not None:
+                plan["scenario_manifest_binding"] = scenario_manifest_binding
             print(
                 json.dumps(
-                    {
-                        "schema": SCHEMA,
-                        "inputs": _redact(config),
-                        "phases": [
-                            {
-                                "name": name,
-                                "command": _redact(command),
-                            }
-                            for name, command in _phase_commands(
-                                config
-                            ).items()
-                        ],
-                        "live_activity_performed": False,
-                    },
+                    plan,
                     indent=2,
                     sort_keys=True,
                 )
@@ -1534,6 +2282,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.command == "start":
             config = _config_from_args(args)
+            scenario_manifest_binding = _scenario_manifest_capture(args, config)
             profile_module = _load_module("sage_reset_range_profile_start", RANGE_PROFILE)
             try:
                 profile_module.require_live_qualified(
@@ -1550,7 +2299,7 @@ def main(argv: list[str] | None = None) -> int:
                 else DEFAULT_CHECKPOINT_DIR / f"{run_id}.json"
             )
             code, checkpoint = ResetOrchestrator(path).start(
-                config, run_id=run_id
+                config, run_id=run_id, scenario_manifest_binding=scenario_manifest_binding
             )
         else:
             path = Path(args.checkpoint).expanduser()

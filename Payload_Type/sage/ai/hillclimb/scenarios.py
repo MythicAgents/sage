@@ -5,6 +5,9 @@ engagement to read, the domain roles (child/parent/objective), and which milesto
 prove. Domains are the GOAD defaults; the `engagement_id` (the Mythic operation / ledger key)
 is operator-configurable per lab.
 """
+from dataclasses import dataclass
+from typing import Any
+
 try:  # package import
     from . import probes as probes_mod
     from . import laps_family_transfer_holdout as laps_contract
@@ -37,6 +40,238 @@ _REPLICATION_PURPOSE_RANGE_DOMAINS = {
     "parent": REPLICATION_PURPOSE_RANGE_DOMAIN,
     "objective": REPLICATION_PURPOSE_RANGE_DOMAIN,
 }
+
+SCENARIO_RESET_MANIFEST_SCHEMA = "sage-scenario-reset-manifest-v2"
+UNALLOCATED_SNAPSHOT = "unallocated"
+
+
+@dataclass(frozen=True)
+class StructuralScenarioManifest:
+    """Offline declaration; this is neither a runnable scenario nor a receipt."""
+
+    scenario_id: str
+    profile_id: str
+    source_path: str
+    source_sha256: str
+    available_capabilities: tuple[str, ...]
+    required_capabilities: tuple[str, ...]
+    required_routes: tuple[tuple[str, ...], ...]
+    required_route_coverage: str
+    oracle_dependencies: tuple[str, ...]
+    snapshot_id: str = UNALLOCATED_SNAPSHOT
+    reset_checkpoint_schema: str = "sage-goad-reset-orchestration-v2"
+
+    def as_mapping(self) -> dict[str, Any]:
+        return {
+            "schema": SCENARIO_RESET_MANIFEST_SCHEMA,
+            "scenario_id": self.scenario_id,
+            "profile_id": self.profile_id,
+            "source_path": self.source_path,
+            "source_sha256": self.source_sha256,
+            "available_capabilities": list(self.available_capabilities),
+            "required_capabilities": list(self.required_capabilities),
+            "required_routes": [list(route) for route in self.required_routes],
+            "required_route_coverage": self.required_route_coverage,
+            "oracle_dependencies": list(self.oracle_dependencies),
+            "snapshot_id": self.snapshot_id,
+            "reset_checkpoint_schema": self.reset_checkpoint_schema,
+        }
+
+
+_STRUCTURAL_SCENARIO_MANIFESTS = (
+    StructuralScenarioManifest(
+        scenario_id="cross-forest-objective",
+        profile_id="goad-trust-walker",
+        source_path="operator-supplied/goad",
+        source_sha256="cb2273dbbb9c6a1c660ff3595a94d74eae9dff967acc2b040b5bd9042bc24fd8",
+        available_capabilities=(
+            "collect-directory-graph",
+            "abuse-controlled-gpo",
+            "replicate-child-domain-secrets",
+            "forge-cross-realm-kerberos-context",
+            "abuse-sql-login-impersonation",
+            "traverse-cross-forest-sql-link",
+            "read-objective-managed-local-admin-secret",
+            "abuse-objective-certificate-services",
+            "establish-or-use-authority-across-independent-forest-boundary",
+            "obtain-fresh-objective-domain-krbtgt-material",
+        ),
+        required_capabilities=(
+            "establish-or-use-authority-across-independent-forest-boundary",
+            "obtain-fresh-objective-domain-krbtgt-material",
+        ),
+        required_routes=(
+            (
+                "collect-directory-graph",
+                "abuse-controlled-gpo",
+                "replicate-child-domain-secrets",
+                "forge-cross-realm-kerberos-context",
+                "establish-or-use-authority-across-independent-forest-boundary",
+                "obtain-fresh-objective-domain-krbtgt-material",
+            ),
+            (
+                "abuse-sql-login-impersonation",
+                "traverse-cross-forest-sql-link",
+                "establish-or-use-authority-across-independent-forest-boundary",
+                "obtain-fresh-objective-domain-krbtgt-material",
+            ),
+            (
+                "read-objective-managed-local-admin-secret",
+                "abuse-objective-certificate-services",
+                "establish-or-use-authority-across-independent-forest-boundary",
+                "obtain-fresh-objective-domain-krbtgt-material",
+            ),
+        ),
+        required_route_coverage="complete",
+        oracle_dependencies=(
+            "mythic-credential-store-or-task-output",
+            "fresh-objective-domain-krbtgt-material",
+            "cross-forest-start-and-objective-binding",
+            "pre-attempt-operation-task-baseline",
+            "reset-checkpoint-task-baseline",
+        ),
+        snapshot_id="sage-seed-apollo-v252-mythic4-20260829",
+    ),
+    StructuralScenarioManifest(
+        scenario_id="bsl-certificate-domain-control",
+        profile_id="bsl-ad-elastic",
+        source_path="ludus/bsl-ad-elastic",
+        source_sha256="1bca1f8b3aa657a7690f6720b89d119dda0e5e4cd366d3881d06faf1c1d5f390",
+        available_capabilities=(
+            "enroll-certificate-for-admin-authentication",
+            "use-ca-signing-key-to-issue-admin-certificate",
+            "certificate-based-domain-admin-authentication",
+            "privileged-directory-access-differential",
+        ),
+        required_capabilities=(
+            "certificate-based-domain-admin-authentication",
+            "privileged-directory-access-differential",
+        ),
+        required_routes=(
+            (
+                "enroll-certificate-for-admin-authentication",
+                "certificate-based-domain-admin-authentication",
+                "privileged-directory-access-differential",
+            ),
+            (
+                "use-ca-signing-key-to-issue-admin-certificate",
+                "certificate-based-domain-admin-authentication",
+                "privileged-directory-access-differential",
+            ),
+        ),
+        required_route_coverage="complete",
+        oracle_dependencies=(
+            "mythic-task-output-or-artifact",
+            "domain-admin-differential",
+            "pre-attempt-operation-task-baseline",
+            "reset-checkpoint-task-baseline",
+        ),
+        reset_checkpoint_schema="sage-range-fixture-qualification-v1",
+    ),
+    StructuralScenarioManifest(
+        scenario_id="replication-purpose-range-visible-cost",
+        profile_id="sage-replication-range",
+        source_path="ludus/sage-purpose-ranges/blueprints/sage-replication-range",
+        source_sha256="b0bd640c975ca15cb5f12f527c830c9b9f22c4e72cf428c8dc5ea652e4b7c4bb",
+        available_capabilities=(
+            "collect-directory-graph",
+            "abuse-controlled-gpo",
+            "obtain-fresh-objective-domain-krbtgt-material",
+        ),
+        required_capabilities=(
+            "obtain-fresh-objective-domain-krbtgt-material",
+        ),
+        required_routes=(
+            (
+                "collect-directory-graph",
+                "abuse-controlled-gpo",
+                "obtain-fresh-objective-domain-krbtgt-material",
+            ),
+            ("obtain-fresh-objective-domain-krbtgt-material",),
+        ),
+        required_route_coverage="complete",
+        oracle_dependencies=(
+            "mythic-credential-store-or-task-output",
+            "fresh-objective-domain-krbtgt-material",
+            "pre-attempt-operation-task-baseline",
+            "reset-checkpoint-task-baseline",
+        ),
+        snapshot_id="sage-replication-range-apollo-staged-v1",
+    ),
+    StructuralScenarioManifest(
+        scenario_id="structural-a-frontier",
+        profile_id="sage-structural-a",
+        source_path="ludus/sage-purpose-ranges/blueprints/sage-structural-a",
+        source_sha256="cb378dc9465cfabc439b5f50b67dfb3eda716cfee71dca86b4311bc0d3dbe684",
+        available_capabilities=(
+            "collect-directory-graph",
+            "abuse-controlled-gpo",
+            "replicate-directory-secrets",
+            "abuse-certificate-services",
+            "cross-forest-authentication",
+        ),
+        required_capabilities=(
+            "collect-directory-graph",
+        ),
+        required_routes=(
+            (
+                "collect-directory-graph",
+                "abuse-controlled-gpo",
+                "replicate-directory-secrets",
+            ),
+            (
+                "collect-directory-graph",
+                "abuse-certificate-services",
+                "cross-forest-authentication",
+            ),
+        ),
+        required_route_coverage="incomplete",
+        oracle_dependencies=(
+            "mythic-task-output-or-artifact",
+            "objective-proof-artifact",
+            "reset-checkpoint-task-baseline",
+        ),
+    ),
+    StructuralScenarioManifest(
+        scenario_id="structural-b-frontier",
+        profile_id="sage-structural-b",
+        source_path="ludus/sage-purpose-ranges/blueprints/sage-structural-b",
+        source_sha256="8ae71ac1cf68491ef069e369455924b05912151ed4270cb7d1424a3ad00e9ed0",
+        available_capabilities=(
+            "collect-directory-graph",
+            "read-managed-local-admin-secret",
+            "abuse-certificate-services",
+            "replicate-directory-secrets",
+            "cross-forest-authentication",
+        ),
+        required_capabilities=(
+            "collect-directory-graph",
+        ),
+        required_routes=(
+            (
+                "collect-directory-graph",
+                "read-managed-local-admin-secret",
+                "abuse-certificate-services",
+                "cross-forest-authentication",
+            ),
+            (
+                "collect-directory-graph",
+                "replicate-directory-secrets",
+            ),
+        ),
+        required_route_coverage="incomplete",
+        oracle_dependencies=(
+            "mythic-task-output-or-artifact",
+            "objective-proof-artifact",
+            "reset-checkpoint-task-baseline",
+        ),
+    ),
+)
+
+
+def structural_scenario_manifests() -> tuple[StructuralScenarioManifest, ...]:
+    """Return declared structural cases without adding them to runnable scenarios."""
+    return _STRUCTURAL_SCENARIO_MANIFESTS
 
 
 def _graph_probe():

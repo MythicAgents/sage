@@ -1,0 +1,29 @@
+{
+  "upstream": {
+    "url": "https://github.com/badsectorlabs/ludus-source-bsl",
+    "commit": "1d2b5744ebb33343ce99715ab9c9fe12fc3d3061",
+    "blueprint": "ad-elastic-range",
+    "license": "AGPL-3.0-or-later"
+  },
+  "definition_sha256": {
+    "blueprints/ad-elastic-range/range-config.yml": "793e44d6cc2d731263c7749a51632ffcc8b0b238f69cf2baea97e6328c21185c",
+    "blueprints/ad-elastic-range/requirements.yml": "fcd6ca02aa4d89c440d1f985a76213d3803d4b9a89e765682d3debb5aa1765fd",
+    "blueprints/ad-elastic-range/blueprint.yml": "f8d0554df4a787a27789c2e0af9e9f523a8206a111f2789a2c5add7a32f89722"
+  },
+  "gitlink_dependencies": [
+    {"name": "badsectorlabs.ludus_adcs", "url": "https://github.com/badsectorlabs/ludus_adcs", "commit": "2e23b1e8f4b7661f161f4d6dec46aa79762d8339"},
+    {"name": "badsectorlabs.ludus_mssql", "url": "https://github.com/badsectorlabs/ludus_mssql", "commit": "a60e7d6c070ca2e801877b417569c0a816022e71"},
+    {"name": "badsectorlabs.ludus_elastic_container", "url": "https://github.com/badsectorlabs/ludus_elastic_container", "commit": "e22865342ba73bb83bb0c82fc2d7f248e14632db"},
+    {"name": "badsectorlabs.ludus_elastic_agent", "url": "https://github.com/badsectorlabs/ludus_elastic_agent", "commit": "4ff4929ed00357a76aeae161c911335911b5524a"},
+    {"name": "badsectorlabs.ludus_windows_utils", "url": "https://github.com/badsectorlabs/ludus_windows_utils", "commit": "37bd0ea6b492d2976da293cc3ca56bdd01403cb2"}
+  ],
+  "unresolved_external_dependencies": {
+    "ludus_version": null,
+    "ansible_version": null,
+    "galaxy_artifact_versions_and_hashes": ["ansible.windows", "community.windows", "community.general", "microsoft.ad", "geerlingguy.docker"],
+    "declared_docker_role_version": "7.1.0",
+    "template_provenance_and_disk_sizes": ["debian-12-x64-server-template", "win2022-server-x64-template", "kali-x64-desktop-template"]
+  },
+  "configured_guest_resources": {"vms": 6, "ram_gb": 30, "vcpus": 20, "disk_gb": null, "includes_router": false},
+  "status": "source_pins_only_not_deployment_qualification"
+}
