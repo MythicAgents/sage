@@ -1394,32 +1394,36 @@ async def wait_for_request(
     client: Any,
     request_id: int,
     *,
-    timeout_seconds: int = 1800,
+    timeout_seconds: float | None = 1800,
     poll_interval_seconds: float = 5.0,
     progress_sink: Any | None = None,
     heartbeat_interval_seconds: float = 60.0,
     stop_on_input_requested: bool = False,
 ) -> dict[str, Any]:
     started_at = time.monotonic()
-    deadline = started_at + timeout_seconds
+    deadline = started_at + timeout_seconds if timeout_seconds is not None else None
     last: dict[str, Any] | None = None
     last_snapshot: dict[str, Any] | None = None
     last_progress_signature: tuple[Any, ...] | None = None
     last_progress_emit_at = started_at
-    while time.monotonic() < deadline:
+    while deadline is None or time.monotonic() < deadline:
         try:
             snapshot = await asyncio.wait_for(
                 fetch_request_snapshot(client, request_id),
-                timeout=max(0.0, deadline - time.monotonic()),
+                timeout=max(0.0, deadline - time.monotonic()) if deadline is not None else 60.0,
             )
         except TimeoutError:
+            if deadline is None:
+                raise RuntimeError("unbounded chat lost a timely control-plane snapshot")
             break
         except RuntimeError:
+            if deadline is None:
+                raise
             snapshot = None
         if snapshot is not None:
             last_snapshot = snapshot
             last = snapshot["request"]
-            if time.monotonic() >= deadline:
+            if deadline is not None and time.monotonic() >= deadline:
                 break
             status = str(last.get("status") or "").casefold()
             messages = snapshot["messages"]
@@ -1437,7 +1441,7 @@ async def wait_for_request(
             )
             now = time.monotonic()
             elapsed_seconds = max(0, int(now - started_at))
-            remaining_seconds = max(0, int(deadline - now))
+            remaining_seconds = max(0, int(deadline - now)) if deadline is not None else None
             emit_event = None
             if signature != last_progress_signature:
                 emit_event = "request_progress"
@@ -1470,10 +1474,10 @@ async def wait_for_request(
                     "messages": messages,
                     "halt_reason": "operator_input_requested",
                 }
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        remaining = deadline - time.monotonic() if deadline is not None else None
+        if remaining is not None and remaining <= 0:
             break
-        await asyncio.sleep(min(poll_interval_seconds, remaining))
+        await asyncio.sleep(min(poll_interval_seconds, remaining) if remaining is not None else poll_interval_seconds)
     if progress_sink is not None:
         progress_sink({
             "event": "request_wait_timeout",
@@ -1850,7 +1854,7 @@ async def run_native_chat_turn(
     client: Any,
     prompt: str,
     *,
-    timeout_seconds: int = 1800,
+    timeout_seconds: float | None = 1800,
     poll_interval_seconds: float = 5.0,
     channel_name: str | None = None,
     api_token_id: int | None = None,

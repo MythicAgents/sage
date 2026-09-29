@@ -313,7 +313,7 @@ def certificate_admin_candidate(
 
 
 def classify_terminal_snapshot(snapshot: object) -> OutcomeDisposition:
-    """Classify proof of independently observable attainment by the arm deadline.
+    """Classify proof of independently observable attainment by the arm cutoff.
 
     A complete operation-scoped snapshot with no admitted positive is a measured failure of that
     claim.  Missing observers, unfinished tasks, and ambiguous lineage remain unmeasured.  This does
@@ -330,12 +330,25 @@ def classify_terminal_snapshot(snapshot: object) -> OutcomeDisposition:
     if snapshot.get("proof_contract") != PROOF_CONTRACT:
         return _invalid("outcome proof contract mismatch")
     started_at = _timestamp(snapshot.get("arm_started_at"))
-    deadline_at = _timestamp(snapshot.get("arm_deadline_at"))
     observed_at = _timestamp(snapshot.get("observed_at"))
-    if not started_at or not deadline_at or not observed_at or deadline_at <= started_at or observed_at < started_at:
-        return _invalid("arm timing evidence is malformed")
-    if abs((deadline_at - started_at).total_seconds() - 2700) > 0.01:
-        return _invalid("arm deadline does not encode the fixed 45-minute window")
+    policy = snapshot.get("measurement_policy")
+    if policy == "unbounded-until-terminal":
+        # The measured window closes when the producer stops, not after a fixed
+        # duration.  Requiring the stop timestamp prevents an open-ended proof
+        # window when an arm crashes or its stop evidence is lost.
+        if snapshot.get("arm_deadline_at") not in {None, ""}:
+            return _invalid("unbounded arm must not carry a fixed deadline")
+        deadline_at = _timestamp(snapshot.get("arm_stopped_at"))
+        if not started_at or not deadline_at or not observed_at or deadline_at <= started_at or observed_at < deadline_at:
+            return _invalid("unbounded arm stop timing evidence is malformed")
+    elif policy is None:
+        deadline_at = _timestamp(snapshot.get("arm_deadline_at"))
+        if not started_at or not deadline_at or not observed_at or deadline_at <= started_at or observed_at < started_at:
+            return _invalid("arm timing evidence is malformed")
+        if abs((deadline_at - started_at).total_seconds() - 2700) > 0.01:
+            return _invalid("arm deadline does not encode the fixed 45-minute window")
+    else:
+        return _invalid("outcome measurement policy is unsupported")
     completeness = snapshot.get("observer_complete")
     if not isinstance(completeness, Mapping) or any(
         type(completeness.get(lane)) is not bool for lane in COMPLETE_LANES
@@ -385,20 +398,39 @@ def classify_terminal_snapshot(snapshot: object) -> OutcomeDisposition:
             and command_name not in OBJECTIVE_INERT_UNFINISHED_COMMANDS
         )
     accounting = snapshot.get("task_accounting")
-    if not isinstance(accounting, Mapping) or accounting.get("limit") != 100:
-        return _invalid("payload task accounting is missing")
-    reservations = accounting.get("reservations")
-    confirmed_task_ids = accounting.get("confirmed_task_ids")
-    if (
-        type(reservations) is not int
-        or reservations < 0
-        or reservations > 100
-        or not isinstance(confirmed_task_ids, list)
-        or set(confirmed_task_ids) != task_ids
-        or len(confirmed_task_ids) != len(task_ids)
-        or len(confirmed_task_ids) > reservations
-    ):
-        return _invalid("confirmed payload task identities do not reconcile with Mythic reservations")
+    if policy == "unbounded-until-terminal":
+        # Without a task admission budget, Mythic's operation-scoped census is
+        # authoritative.  Optional accounting may add reservations, but may
+        # not contradict the census or silently impose a numeric ceiling.
+        if not isinstance(accounting, Mapping) or accounting.get("limit") is not None:
+            return _invalid("unbounded payload task accounting is malformed")
+        reservations = accounting.get("reservations")
+        confirmed_task_ids = accounting.get("confirmed_task_ids")
+        if reservations is None and confirmed_task_ids is None:
+            pass
+        elif (
+            type(reservations) is not int or reservations < 0
+            or not isinstance(confirmed_task_ids, list)
+            or set(confirmed_task_ids) != task_ids
+            or len(confirmed_task_ids) != len(task_ids)
+            or len(confirmed_task_ids) > reservations
+        ):
+            return _invalid("confirmed payload task identities do not reconcile with Mythic reservations")
+    else:
+        if not isinstance(accounting, Mapping) or accounting.get("limit") != 100:
+            return _invalid("payload task accounting is missing")
+        reservations = accounting.get("reservations")
+        confirmed_task_ids = accounting.get("confirmed_task_ids")
+        if (
+            type(reservations) is not int
+            or reservations < 0
+            or reservations > 100
+            or not isinstance(confirmed_task_ids, list)
+            or set(confirmed_task_ids) != task_ids
+            or len(confirmed_task_ids) != len(task_ids)
+            or len(confirmed_task_ids) > reservations
+        ):
+            return _invalid("confirmed payload task identities do not reconcile with Mythic reservations")
 
     raw_candidates = snapshot.get("proof_candidates")
     if not isinstance(raw_candidates, list) or any(not isinstance(item, Mapping) for item in raw_candidates):

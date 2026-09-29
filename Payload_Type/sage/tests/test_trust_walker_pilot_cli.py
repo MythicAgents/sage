@@ -25,6 +25,168 @@ assert SPEC and SPEC.loader
 SPEC.loader.exec_module(cli)
 
 
+def test_matrix_cli_default_path_and_route_preflight(tmp_path, monkeypatch, capsys):
+    contract_file = tmp_path / "matrix.json"
+    contract_file.write_text(json.dumps({
+        "schema": "sage-trust-walker-model-matrix-v1",
+        "routes": [{
+            "route_id": "qwen-openrouter",
+            "provider": "openai",
+            "model": "qwen/qwen3-32b",
+            "api_endpoint": "https://openrouter.ai/api/v1",
+        }],
+    }))
+    monkeypatch.setattr(cli, "DEFAULT_MATRIX_CONTRACT", contract_file)
+    parser = cli.build_parser()
+    assert parser.parse_args(["matrix-plan"]).contract_file == contract_file
+
+    secret = "synthetic-secret-do-not-print"
+    profile = {
+        "provider": "openai", "model": "qwen/qwen3-32b",
+        "API_ENDPOINT": "https://openrouter.ai/api/v1", "API_KEY": secret,
+    }
+    monkeypatch.setattr(cli, "_orchestrate", lambda: SimpleNamespace(
+        _load_sage_model_environment=lambda: profile,
+    ))
+    assert cli.main(["matrix-preflight", "--contract-file", str(contract_file),
+                     "--route-id", "qwen-openrouter"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["ready"] is True
+    assert result["credential_present"] is True
+    assert result["provider_calls"] == result["range_actions"] == 0
+    assert secret not in json.dumps(result)
+
+    profile["model"] = "wrong-model"
+    assert cli.main(["matrix-preflight", "--contract-file", str(contract_file),
+                     "--route-id", "qwen-openrouter"]) == 1
+    rejected = json.loads(capsys.readouterr().out)
+    assert rejected["ready"] is False
+    assert secret not in json.dumps(rejected)
+
+
+def test_matrix_live_authority_binds_catalog_route_start_and_snapshot(tmp_path):
+    matrix = pilot.MatrixContract(schema=pilot.MATRIX_SCHEMA, routes=(
+        pilot.MatrixRoute("qwen", "openai", "qwen/qwen3-32b", "https://openrouter.ai/api/v1"),
+    ))
+    pair = pilot.MatrixPairContract.for_route(matrix, "qwen", start_case="samwell-castelblack")
+    protocol = tmp_path / "protocol.md"
+    protocol.write_text("synthetic prospective protocol\n")
+    record = {
+        "schema": cli.MATRIX_LIVE_AUTHORITY_SCHEMA,
+        "status": "active", "revoked_at": None,
+        "authority_id": "synthetic-authority", "authorization_source": "synthetic test grant",
+        "matrix_identity": matrix.identity,
+        "pair_contract_identity": pair.identity,
+        "protocol_binding": {"file": protocol.name, "sha256": hashlib.sha256(protocol.read_bytes()).hexdigest()},
+        "allowed_route_ids": ["qwen"],
+        "allowed_start_cases": ["samwell-castelblack"],
+        "snapshot_bindings": {"samwell-castelblack": cli.SNAPSHOT},
+        "no_numeric_arm_ceilings": True,
+        "environment_binding": {
+            "range_profile": cli.RANGE_PROFILE,
+            "target_domain": "essos.local",
+            "target_io": "Mythic payload tasks only",
+            "reset": "full reset before each arm",
+        },
+        "allowed_commands": ["run-pair"],
+        "scope": {
+            "pair_order": "shipping-first", "provider": pair.provider, "model": pair.model,
+            "api_endpoint": pair.route.api_endpoint, "objective": pair.objective,
+            "provider_request_timeout_seconds": 900, "automatic_replacement_arms": 0,
+            "response_to_refusal": "retain as observed outcome; do not change Sage or add a replacement arm",
+            "safety_stops": [
+                "authority or target boundary violation", "wrong model or route",
+                "corrupt start", "uncontrolled activity", "loss of interpretable evidence",
+            ],
+            "cleanup": "settle and archive each arm before the next reset; retain the final Mythic state after the batch",
+        },
+    }
+    path = tmp_path / "authority.json"
+    args = SimpleNamespace(command="run-pair", live_authority_file=str(path), live_authority_id=None)
+    path.write_text(json.dumps(record))
+    receipt = cli._resolve_live_authority(args, pair)
+    assert receipt["contract_binding_sha256"] == pair.identity
+    assert receipt["expected_endpoint_identity"] == pair.route.endpoint_identity
+
+    record["pair_contract_identity"] = "0" * 64
+    path.write_text(json.dumps(record))
+    with pytest.raises(cli.PilotError, match="exact pair contract"):
+        cli._resolve_live_authority(args, pair)
+    record["pair_contract_identity"] = pair.identity
+
+    protocol.write_text("changed protocol\n")
+    path.write_text(json.dumps(record))
+    with pytest.raises(cli.PilotError, match="protocol bytes have changed"):
+        cli._resolve_live_authority(args, pair)
+    protocol.write_text("synthetic prospective protocol\n")
+
+    record["snapshot_bindings"]["samwell-castelblack"] = "wrong-snapshot"
+    path.write_text(json.dumps(record))
+    with pytest.raises(cli.PilotError, match="does not bind"):
+        cli._resolve_live_authority(args, pair)
+
+
+def test_matrix_raw_model_uses_selected_route_without_arm_deadline(monkeypatch):
+    selected = pilot.MatrixRoute("qwen", "openai", "qwen/qwen3-32b", "https://openrouter.ai/api/v1")
+    runtime = object.__new__(cli.RuntimePilot)
+    runtime.selected_route = selected
+    runtime.route = {
+        "provider": selected.provider, "model": selected.model,
+        "api_endpoint": selected.api_endpoint, "api_key": "synthetic-secret",
+    }
+    captured = {}
+
+    def make_model(provider, model, **kwargs):
+        captured.update(provider=provider, model=model, **kwargs)
+        return lambda *_args: {"final": "STUCK"}
+
+    monkeypatch.setattr(cli.live_seams, "make_model_fn", make_model)
+    result = runtime._deadline_model(None)("system", [], [])
+    assert result == {"final": "STUCK"}
+    assert captured["provider"] == "openai"
+    assert captured["model"] == "qwen/qwen3-32b"
+    assert captured["base_url"] == selected.api_endpoint
+    assert captured["request_timeout"] == 900.0
+
+
+def test_matrix_sage_arm_uses_selected_route_and_distinct_channel(tmp_path):
+    selected = pilot.MatrixRoute("qwen", "openai", "qwen/qwen3-32b", "https://openrouter.ai/api/v1")
+    runtime = object.__new__(cli.RuntimePilot)
+    runtime.current_client = object()
+    runtime.current_operation_id = 8
+    runtime.selected_route = selected
+    runtime.route = {
+        "provider": selected.provider, "model": selected.model,
+        "api_endpoint": selected.api_endpoint, "api_key": "synthetic-secret",
+    }
+    runtime.artifact_dir = tmp_path / "pair-01"
+    runtime.measurement_metadata = {}
+    captured = {}
+
+    async def run_turn(_client, _prompt, **kwargs):
+        captured.update(kwargs)
+        kwargs["progress_sink"]({"event": "request_started", "chat_channel_id": 3, "chat_request_id": 4})
+        return {"status": "completed"}
+
+    runtime.native = SimpleNamespace(
+        default_ai_metadata=lambda: {"config": {}},
+        _chat_runtime_identity_from_metadata=lambda _metadata: {"route": "route-a"},
+        run_native_chat_turn=run_turn,
+        RequestWaitTimeout=TimeoutError,
+    )
+    result = runtime.run_arm("shipping-sage", {}, lambda _event: None)
+    assert result["arm_deadline_at"] is None
+    assert isinstance(result["arm_stopped_at"], str)
+    assert captured["timeout_seconds"] is None
+    assert captured["metadata"]["config"]["model"] == selected.model
+    assert "SAGE_EVAL_ARM_DEADLINE_EPOCH" not in captured["metadata"]["config"]
+    assert selected.route_id in captured["channel_name"]
+    assert captured["channel_name"] != cli.RuntimePilot._channel_name(
+        SimpleNamespace(selected_route=selected, artifact_dir=tmp_path / "pair-02"),
+        "shipping-sage",
+    )
+
+
 def retained_native_pair(tmp_path, monkeypatch, contract=None, measurement_metadata=None, improvement_metric=False):
     """Exercise the real pair/observer producer with synthetic control-plane responses."""
     contract = contract or cli.PilotContract()
@@ -34,12 +196,26 @@ def retained_native_pair(tmp_path, monkeypatch, contract=None, measurement_metad
     runtime.artifact_dir = tmp_path
     runtime.current_client = object()
     runtime.current_operation_id = 8
+    runtime.selected_route = contract.route if isinstance(contract, cli.MatrixPairContract) else None
 
     def reset(arm, _env):
         runtime.current_arm = arm
         runtime.current_started_at = datetime(2026, 9, 13, 12 + contract.arm_order.index(arm), tzinfo=UTC)
-        runtime.current_deadline_at = runtime.current_started_at + timedelta(seconds=contract.wall_seconds)
+        runtime.current_deadline_at = (
+            None if isinstance(contract, cli.MatrixPairContract)
+            else runtime.current_started_at + timedelta(seconds=contract.wall_seconds)
+        )
+        runtime.current_stopped_at = (
+            runtime.current_started_at + timedelta(seconds=20)
+            if isinstance(contract, cli.MatrixPairContract) else None
+        )
         start = setup_start()
+        if isinstance(contract, cli.MatrixPairContract):
+            start["route"] = {
+                "provider": contract.provider,
+                "model": contract.model,
+                "endpoint_identity": contract.route.endpoint_identity,
+            }
         if isinstance(contract, cli.ImprovementContract):
             start["source_identity"] = contract.source_identity_for_arm(arm)
         elif contract.alternate_start:
@@ -102,12 +278,19 @@ def retained_native_pair(tmp_path, monkeypatch, contract=None, measurement_metad
         task_count = 6 if improvement_metric and runtime.current_arm == "baseline-sage" else 5 if improvement_metric else 1
         return {
             "arm_started_at": runtime.current_started_at.isoformat(),
-            "arm_deadline_at": runtime.current_deadline_at.isoformat(),
+            "arm_deadline_at": runtime.current_deadline_at.isoformat() if runtime.current_deadline_at else None,
+            **({"arm_stopped_at": runtime.current_stopped_at.isoformat()}
+               if runtime.current_stopped_at else {}),
             "termination": "done", "protocol_error": False, "resource_complete": True,
             "cost": {"model_calls": 1, "total_tokens": 10, "payload_tasks": task_count},
-            "response_records": [{"response_index": 1, "effective_backend": cli.EXPECTED_BACKEND, "total_tokens": 10}],
-            "task_budget": {"limit": 100, "reservations": task_count,
-                            "confirmed_task_ids": list(range(1, task_count + 1))},
+            "response_records": [{"response_index": 1, "effective_backend": (
+                f"{contract.provider}:{contract.model}" if isinstance(contract, cli.MatrixPairContract)
+                else cli.EXPECTED_BACKEND), "total_tokens": 10}],
+            "task_budget": (
+                None if isinstance(contract, cli.MatrixPairContract)
+                else {"limit": 100, "reservations": task_count,
+                      "confirmed_task_ids": list(range(1, task_count + 1))}
+            ),
             **({"measurement_metadata": measurement_metadata(runtime.current_arm)
                 if callable(measurement_metadata) else measurement_metadata}
                if measurement_metadata is not None else {}),
@@ -124,7 +307,7 @@ def retained_native_pair(tmp_path, monkeypatch, contract=None, measurement_metad
     return cli.read_records(tmp_path / "pilot.jsonl")
 
 
-@pytest.mark.parametrize("kind", ["default", "reverse", "alternate", "improvement"])
+@pytest.mark.parametrize("kind", ["default", "reverse", "alternate", "improvement", "matrix"])
 def test_offline_replay_reconstructs_produced_pair_without_live_dependencies(tmp_path, monkeypatch, capsys, kind):
     contract = cli.PilotContract()
     if kind == "reverse":
@@ -134,6 +317,13 @@ def test_offline_replay_reconstructs_produced_pair_without_live_dependencies(tmp
         contract = cli.PilotContract(alternate_start=cli._load_alternate_start(descriptor))
     elif kind == "improvement":
         contract = cli.ImprovementContract(baseline_source_identity="a" * 64, candidate_source_identity="b" * 64)
+    elif kind == "matrix":
+        matrix = pilot.MatrixContract(schema=pilot.MATRIX_SCHEMA, routes=(
+            pilot.MatrixRoute("qwen", "openai", "qwen/qwen3-32b", "https://openrouter.ai/api/v1"),
+        ))
+        contract = pilot.MatrixPairContract.for_route(
+            matrix, "qwen", start_case="samwell-castelblack",
+        )
     records = retained_native_pair(tmp_path, monkeypatch, contract)
     before = (tmp_path / "pilot.jsonl").read_bytes()
 
@@ -663,6 +853,42 @@ def test_setup_rehearsal_runs_two_compatible_starts_without_model_arm(tmp_path, 
     assert result["measured_arms_started"] == 0
     assert runtime.resets == ["setup-rehearsal-1", "setup-rehearsal-2"]
     assert runtime.cleanups == runtime.resets
+
+
+def test_matrix_setup_rehearsal_matches_selected_route_across_starts(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "validate_artifact_dir", lambda _path: tmp_path)
+    matrix = pilot.MatrixContract(schema=pilot.MATRIX_SCHEMA, routes=(
+        pilot.MatrixRoute("qwen", "openai", "qwen/qwen3-32b", "https://openrouter.ai/api/v1"),
+    ))
+    contract = pilot.MatrixPairContract.for_route(matrix, "qwen", start_case="samwell-castelblack")
+
+    class Runtime:
+        current_reset_started = False
+        live_authority_id = "synthetic-matrix-authority"
+
+        def preflight(self, _contract):
+            return {"ready": True}
+
+        def reset(self, _rehearsal_id, _env):
+            self.current_reset_started = True
+            return setup_start(route={
+                "provider": contract.provider,
+                "model": contract.model,
+                "endpoint_identity": contract.route.endpoint_identity,
+            })
+
+        def runtime_identity(self):
+            return {"operation_id": 8, "callback_id": 4}
+
+        def teardown(self, _rehearsal_id, _start):
+            self.current_reset_started = False
+            return {"complete": True}
+
+    result = cli.run_setup_rehearsals(Runtime(), contract, tmp_path)
+    assert result["complete"] is True
+    assert result["attempts"] == 2
+    assert result["support_limit_seconds"] is None
+    assert result["model_inference_calls"] == 0
 
 
 def test_setup_rehearsal_recovers_one_mutated_reset_failure_within_bound(tmp_path, monkeypatch):

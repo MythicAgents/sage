@@ -803,6 +803,55 @@ def test_budget_meter_failure_fails_closed():
     assert r.status == ac.STATUS_BUDGET, r.to_dict()
 
 
+def test_explicit_unbounded_config_passes_numeric_ceilings_and_keeps_semantic_stop():
+    w = World()
+
+    def frontier(state):
+        if "first" not in state.achieved_effects():
+            return [FakeAction("first", effects=["first"])]
+        return [FakeAction("second", effects=["complete"])]
+
+    def execute(action):
+        w.effects.update(action.effects)
+        return {"ok": True}
+
+    common = dict(
+        observe=w.observe,
+        execute=execute,
+        frontier_fn=frontier,
+        objective_met=lambda state: "complete" in state.achieved_effects(),
+        tokens_spent=lambda: 10,
+        clock=lambda: 10,
+    )
+    bounded = run(ac.AutonomousController(**common, config=ac.ControllerConfig(
+        max_cycles=1, token_budget=10, wall_clock_budget_s=10,
+    )))
+    assert bounded.status == ac.STATUS_BUDGET
+    assert w.effects == set()
+
+    unbounded = run(ac.AutonomousController(**common, config=ac.ControllerConfig(
+        max_cycles=None, token_budget=None, wall_clock_budget_s=None,
+    )))
+    assert unbounded.status == ac.STATUS_COMPLETE, unbounded.to_dict()
+    assert unbounded.cycle_count == 2
+
+
+def test_unbounded_config_still_times_out_a_hung_seam():
+    async def slow_observe():
+        await asyncio.sleep(1)
+
+    controller = ac.AutonomousController(
+        observe=slow_observe,
+        execute=lambda action: {"ok": True},
+        config=ac.ControllerConfig(
+            max_cycles=None, token_budget=None, wall_clock_budget_s=None, seam_timeout_s=0.01,
+        ),
+    )
+    result = run(controller)
+    assert result.status == ac.STATUS_NO_ACTION
+    assert "seam_timeout_s" in str(result.blocker)
+
+
 def test_route_candidate_with_no_preconditions_rejected():
     """Forge NEW-1: an LLM route candidate with empty/missing preconditions is rejected (all([]) is vacuously
     true), so an unconditional ad-hoc action cannot be admitted and start a loop."""

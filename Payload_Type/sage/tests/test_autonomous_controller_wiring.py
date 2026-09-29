@@ -26,6 +26,7 @@ async def _nosleep(*_a, **_k):
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ai.langgraph import model  # noqa: E402
+from ai.langgraph import autonomous_controller as controller  # noqa: E402
 from ai.langgraph import capabilities  # noqa: E402
 from ai.langgraph import engagement_state as es  # noqa: E402
 from ai.langgraph import mythic_tools as mt  # noqa: E402
@@ -191,6 +192,38 @@ def test_observe_none_halts_cleanly_without_crash():
     report = asyncio.run(m._run_autonomous_controller("obtain administrative control of essos.local"))
     assert "halted_no_action" in report, report
     assert calls == []  # never executed anything without a state
+
+
+@pytest.mark.parametrize(
+    ("flag", "mode", "unbounded"),
+    [("1", "auto", True), ("true", "auto", False), ("1", "supervised", False), ("0", "auto", False)],
+)
+def test_eval_unbounded_flag_reaches_assembled_controller_only_for_exact_auto_mode(
+    monkeypatch, flag, mode, unbounded,
+):
+    monkeypatch.setenv("SAGE_EVAL_UNBOUNDED_ARM", flag)
+    monkeypatch.setenv("SAGE_CONTROLLER_WALL_S", "1")
+    monkeypatch.setenv("SAGE_CONTROLLER_TOKEN_BUDGET", "1")
+    monkeypatch.setenv("SAGE_CONTROLLER_MAX_CYCLES", "1")
+    monkeypatch.delenv("SAGE_EVAL_PAYLOAD_TASK_BUDGET", raising=False)
+    captured = []
+    original = controller.AutonomousController
+
+    def construct(*args, **kwargs):
+        captured.append(kwargs["config"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(controller, "AutonomousController", construct)
+    m = _bare_model(json.dumps({"ok": True}), None, [])
+    m.mode = mode
+    report = asyncio.run(m._run_autonomous_controller("test objective"))
+
+    assert "halted_no_action" in report
+    assert len(captured) == 1
+    cfg = captured[0]
+    expected = None if unbounded else 1
+    assert (cfg.wall_clock_budget_s, cfg.token_budget, cfg.max_cycles) == (expected, expected, expected)
+    assert cfg.seam_timeout_s is not None
 
 
 def test_controller_missing_policy_mode_uses_hybrid_product_default_without_model_call():
@@ -431,6 +464,27 @@ def test_controller_token_ceiling_prevents_another_model_request(monkeypatch):
         "_policy_model_response_observed": False,
     }
     assert m._policy_model_calls == 3
+
+
+def test_unbounded_auto_eval_keeps_policy_calls_after_old_token_ceiling(monkeypatch):
+    m = object.__new__(model.Model)
+    m.mode = "auto"
+    m._policy_model_calls = 3
+    m._controller_refresh_runtime_policy_telemetry = lambda: {"total_tokens": 250_000}
+    monkeypatch.setenv("SAGE_EVAL_UNBOUNDED_ARM", "1")
+    monkeypatch.setenv("SAGE_EVAL_MODEL_TOKEN_BUDGET", "250000")
+    calls = []
+
+    class FakeLLM:
+        async def ainvoke(self, messages):
+            calls.append(messages)
+            return "provider-response"
+
+    m.llm = FakeLLM()
+    response = asyncio.run(m._controller_llm_policy_decide({}))
+    assert response == "provider-response"
+    assert len(calls) == 1
+    assert m._policy_model_calls == 4
 
 
 def test_controller_crossing_response_cannot_execute_selected_capability(monkeypatch):

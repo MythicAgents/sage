@@ -46,7 +46,8 @@ from ai.hillclimb.trust_walker_pilot import (
     ALTERNATE_START_SCHEMA, AlternateStartBinding,
     RECOVERY_CLEANUP_ATTEMPT_LIMIT, TASK_SETTLEMENT_SECONDS,
     SETUP_REHEARSAL_ATTEMPT_LIMIT, SETUP_REHEARSAL_SUCCESSES,
-    ImprovementContract, PilotContract, PilotDependencies, PilotError,
+    ImprovementContract, MatrixPairContract, MatrixRoute, PilotContract, PilotDependencies, PilotError,
+    load_matrix_contract,
     append_record, arm_environment, assert_rejected_kernel_absent,
     compare_start_manifests, matched_start_identity, read_records, retained_alternate_start_binding, run_pair,
     summarize_pair,
@@ -56,6 +57,7 @@ from ai.hillclimb.trust_walker_pilot import (
 
 SCENARIO = "cross-forest-objective"
 RANGE_PROFILE = "goad-trust-walker"
+DEFAULT_MATRIX_CONTRACT = ROOT / ".sage_history" / "evaluations" / "matrix-contract.json"
 NETBIOS_MAP = '{"NORTH":"north.sevenkingdoms.local","SEVENKINGDOMS":"sevenkingdoms.local","ESSOS":"essos.local"}'
 EXPECTED_BACKEND = f"{PROVIDER}:{MODEL}"
 STAGED_FOOTHOLD_LAUNCHER = "skills/sage-mythic-payload-deploy/scripts/launch_apollo_foothold.sh"
@@ -91,6 +93,7 @@ BLOODHOUND_ENV_KEYS = (
     "BLOODHOUND_TOKEN_KEY",
 )
 STANDING_LIVE_AUTHORITY_SCHEMA = "sage-standing-live-authority-v1"
+MATRIX_LIVE_AUTHORITY_SCHEMA = "sage-matrix-live-authority-v1"
 STANDING_LIVE_AUTHORITY_SCOPE = "sage-goad-trust-walker-evaluation-recovery"
 STANDING_LIVE_COMMANDS = frozenset({
     "rehearse-setup", "continue-setup", "run-pair", "run-improvement-pair",
@@ -268,6 +271,19 @@ def _write_private(path: Path, value: Any) -> dict[str, str]:
     temporary.replace(path)
     path.chmod(0o600)
     return {"path": str(path), "sha256": _sha256(path)}
+
+
+def _retain_matrix_catalog(artifact_dir: str | Path, matrix) -> dict[str, str]:
+    path = validate_artifact_dir(artifact_dir) / "matrix-contract.json"
+    record = matrix.to_record()
+    if path.exists():
+        try:
+            if json.loads(path.read_text(encoding="utf-8")) != record:
+                raise PilotError("retained matrix catalog differs from selected contract")
+        except json.JSONDecodeError as exc:
+            raise PilotError("retained matrix catalog is malformed") from exc
+        return {"path": str(path), "sha256": _sha256(path)}
+    return _write_private(path, record)
 
 
 def _retain_native_observation(path: Path, observed: Mapping[str, Any]) -> dict[str, str]:
@@ -531,7 +547,21 @@ def _load_alternate_start(path: str | Path) -> AlternateStartBinding:
     return binding
 
 
-def _route(orchestrate) -> dict[str, str]:
+def _route(orchestrate, selected: MatrixRoute | None = None) -> dict[str, str]:
+    if selected is not None:
+        resolved = orchestrate._load_sage_model_environment()
+        route = {
+            "provider": str(resolved.get("provider") or ""),
+            "model": str(resolved.get("model") or ""),
+            "api_endpoint": str(resolved.get("API_ENDPOINT") or ""),
+            "api_key": str(resolved.get("API_KEY") or ""),
+        }
+        for field in ("provider", "model", "api_endpoint"):
+            if route[field] != getattr(selected, field):
+                raise PilotError(f"matrix route {selected.route_id}: configured {field} differs from contract")
+        if not route["api_key"]:
+            raise PilotError("active Sage route has no API key")
+        return route
     route = orchestrate.load_treatment_route(
         orchestrate.DEFAULT_ROUTE_ENV,
         "sonnet",
@@ -556,7 +586,12 @@ def _safe_route_identity(route: Mapping[str, str]) -> dict[str, str]:
     }
 
 
-def _validate_route_smoke(path: Path, route: Mapping[str, str]) -> dict[str, Any]:
+def _validate_route_smoke(
+    path: Path, route: Mapping[str, str], selected: MatrixRoute | None = None,
+) -> dict[str, Any]:
+    expected_provider = selected.provider if selected is not None else PROVIDER
+    expected_model = selected.model if selected is not None else MODEL
+    expected_backend = f"{expected_provider}:{expected_model}"
     try:
         smoke = json.loads(path.read_text(encoding="utf-8"))
         detail = smoke["detail"]
@@ -566,24 +601,26 @@ def _validate_route_smoke(path: Path, route: Mapping[str, str]) -> dict[str, Any
         raise PilotError("route smoke evidence is missing or malformed") from exc
     if (
         smoke.get("ok") is not True
-        or detail.get("configured_provider") != PROVIDER
-        or detail.get("configured_model") != MODEL
-        or backend.get("effective_backend") != EXPECTED_BACKEND
-        or backend.get("observed_provider") != PROVIDER
-        or backend.get("observed_model") != MODEL
+        or detail.get("configured_provider") != expected_provider
+        or detail.get("configured_model") != expected_model
+        or backend.get("effective_backend") != expected_backend
+        or backend.get("observed_provider") != expected_provider
+        or backend.get("observed_model") != expected_model
         or type(usage.get("total_tokens")) is not int
         or usage["total_tokens"] <= 0
     ):
         raise PilotError("route smoke does not attest the authorized effective backend")
-    probe_path = path.with_name("sonnet-runtime-route-probe.json")
+    probe_path = path.with_name(
+        "matrix-runtime-route-probe.json" if selected is not None else "sonnet-runtime-route-probe.json"
+    )
     try:
         probe = json.loads(probe_path.read_text(encoding="utf-8"))
     except Exception as exc:
         raise PilotError("route catalog probe is missing or malformed") from exc
     endpoint = urlparse(route["api_endpoint"])
     if (
-        probe.get("provider") != PROVIDER
-        or probe.get("model") != MODEL
+        probe.get("provider") != expected_provider
+        or probe.get("model") != expected_model
         or probe.get("endpoint_host") != endpoint.hostname
         or probe.get("endpoint_port") != (endpoint.port or (443 if endpoint.scheme == "https" else 80))
         or str(probe.get("endpoint_path") or "") != str(endpoint.path or "")
@@ -595,7 +632,7 @@ def _validate_route_smoke(path: Path, route: Mapping[str, str]) -> dict[str, Any
     return {
         "sha256": _sha256(path),
         "usage": usage,
-        "effective_backend": EXPECTED_BACKEND,
+        "effective_backend": expected_backend,
         "endpoint_identity": _safe_route_identity(route)["endpoint_identity"],
         "route_probe_sha256": _sha256(probe_path),
         "binding": "configured endpoint probe plus response-derived backend smoke",
@@ -773,10 +810,102 @@ def _load_standing_live_authority(
 
 def _resolve_live_authority(
     args: argparse.Namespace,
-    contract: PilotContract | ImprovementContract,
+    contract: PilotContract | ImprovementContract | MatrixPairContract,
 ) -> dict[str, Any]:
     authority_id = str(getattr(args, "live_authority_id", "") or "").strip()
     authority_file = str(getattr(args, "live_authority_file", "") or "").strip()
+    if isinstance(contract, MatrixPairContract):
+        if not authority_file:
+            raise PilotError("matrix live pair requires --live-authority-file bound to this matrix")
+        try:
+            raw = Path(authority_file).expanduser().resolve().read_text(encoding="utf-8")
+            record = json.loads(raw)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise PilotError("matrix live authority is missing or malformed") from exc
+        expected_environment = {
+            "range_profile": RANGE_PROFILE,
+            "target_domain": "essos.local",
+            "target_io": "Mythic payload tasks only",
+            "reset": "full reset before each arm",
+        }
+        allowed_routes = record.get("allowed_route_ids") if isinstance(record, Mapping) else None
+        allowed_starts = record.get("allowed_start_cases") if isinstance(record, Mapping) else None
+        allowed_commands = record.get("allowed_commands") if isinstance(record, Mapping) else None
+        snapshots = record.get("snapshot_bindings") if isinstance(record, Mapping) else None
+        expected_snapshot = (
+            contract.alternate_start.snapshot if contract.alternate_start is not None else SNAPSHOT
+        )
+        if (
+            not isinstance(record, Mapping)
+            or record.get("schema") != MATRIX_LIVE_AUTHORITY_SCHEMA
+            or record.get("status") != "active"
+            or record.get("revoked_at") is not None
+            or not str(record.get("authority_id") or "").strip()
+            or not str(record.get("authorization_source") or "").strip()
+            or record.get("matrix_identity") != contract.matrix_identity
+            or not isinstance(allowed_routes, list)
+            or any(not isinstance(value, str) for value in allowed_routes)
+            or contract.route.route_id not in allowed_routes
+            or not isinstance(allowed_starts, list)
+            or any(not isinstance(value, str) for value in allowed_starts)
+            or contract.start_case not in allowed_starts
+            or not isinstance(snapshots, Mapping)
+            or snapshots.get(contract.start_case) != expected_snapshot
+            or record.get("no_numeric_arm_ceilings") is not True
+            or record.get("environment_binding") != expected_environment
+            or not isinstance(allowed_commands, list)
+            or any(not isinstance(value, str) for value in allowed_commands)
+            or str(args.command) not in allowed_commands
+        ):
+            raise PilotError("matrix live authority does not bind this route, start and protocol")
+        if record.get("pair_contract_identity") != contract.identity:
+            raise PilotError("matrix live authority does not bind the exact pair contract")
+        scope = record.get("scope")
+        expected_order = "shipping-first" if contract.arm_order == ARM_ORDER else "raw-first"
+        expected_scope = {
+            "pair_order": expected_order,
+            "provider": contract.provider,
+            "model": contract.model,
+            "api_endpoint": contract.route.api_endpoint,
+            "objective": contract.objective,
+            "provider_request_timeout_seconds": 900,
+            "automatic_replacement_arms": 0,
+            "response_to_refusal": "retain as observed outcome; do not change Sage or add a replacement arm",
+            "safety_stops": [
+                "authority or target boundary violation", "wrong model or route",
+                "corrupt start", "uncontrolled activity", "loss of interpretable evidence",
+            ],
+            "cleanup": "settle and archive each arm before the next reset; retain the final Mythic state after the batch",
+        }
+        if not isinstance(scope, Mapping) or any(scope.get(key) != value for key, value in expected_scope.items()):
+            raise PilotError("matrix live authority scope differs from the pair protocol")
+        protocol_binding = record.get("protocol_binding")
+        if not isinstance(protocol_binding, Mapping):
+            raise PilotError("matrix live authority lacks a frozen protocol binding")
+        protocol_name = protocol_binding.get("file")
+        protocol_hash = protocol_binding.get("sha256")
+        if (
+            not isinstance(protocol_name, str) or not protocol_name
+            or not isinstance(protocol_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", protocol_hash)
+        ):
+            raise PilotError("matrix live authority protocol binding is malformed")
+        protocol_path = (Path(authority_file).expanduser().resolve().parent / protocol_name).resolve()
+        try:
+            if _sha256(protocol_path) != protocol_hash:
+                raise PilotError("matrix live authority protocol bytes have changed")
+        except OSError as exc:
+            raise PilotError("matrix live authority protocol file is missing") from exc
+        if authority_id and authority_id != record["authority_id"]:
+            raise PilotError("caller authority ID does not match matrix live authority")
+        return {
+            "mode": "matrix-standing",
+            "schema": MATRIX_LIVE_AUTHORITY_SCHEMA,
+            "authority_id": record["authority_id"],
+            "authority_sha256": hashlib.sha256(raw.encode()).hexdigest(),
+            "contract_binding_sha256": contract.identity,
+            "expected_endpoint_identity": contract.route.endpoint_identity,
+            "command": str(args.command),
+        }
     if isinstance(contract, PilotContract) and contract.alternate_start is not None and authority_file:
         raise PilotError("standing live authority cannot authorize the alternate Jorah/MEEREEN case")
     if authority_file:
@@ -822,6 +951,17 @@ def _authority_preflight_receipt(
     preflight: Mapping[str, Any],
 ) -> dict[str, Any]:
     safe = dict(receipt)
+    if receipt.get("mode") == "matrix-standing":
+        route = preflight.get("route")
+        if (
+            not isinstance(route, Mapping)
+            or route.get("endpoint_identity") != receipt.get("expected_endpoint_identity")
+            or preflight.get("contract", {}).get("schema") != "sage-trust-walker-model-matrix-pair-v1"
+            or _json_hash(preflight.get("contract")) != receipt.get("contract_binding_sha256")
+        ):
+            raise PilotError("matrix live authority does not match runtime route or contract")
+        safe["runtime_binding_verified"] = True
+        return safe
     if receipt.get("mode") != "standing":
         return safe
     route = preflight.get("route")
@@ -1415,8 +1555,11 @@ def _tool_contract() -> str:
 
 
 def _inspect_response_records(
-    records: object, *, model_calls: object,
+    records: object, *, model_calls: object, selected: MatrixRoute | None = None,
 ) -> tuple[int | None, list[dict[str, Any]], bool]:
+    expected_provider = selected.provider if selected is not None else PROVIDER
+    expected_model = selected.model if selected is not None else MODEL
+    expected_backend = f"{expected_provider}:{expected_model}"
     if type(model_calls) is not int or model_calls < 0 or not isinstance(records, list) or len(records) != model_calls:
         raise PilotError("model response accounting is incomplete")
     total = 0
@@ -1428,9 +1571,9 @@ def _inspect_response_records(
         observed_provider = record.get("observed_provider") or record.get("effective_model_provider")
         observed_model = record.get("observed_model") or record.get("effective_model_id")
         if (
-            record.get("effective_backend") != EXPECTED_BACKEND
-            or observed_provider != PROVIDER
-            or observed_model != MODEL
+            record.get("effective_backend") != expected_backend
+            or observed_provider != expected_provider
+            or observed_model != expected_model
         ):
             raise PilotError("response-derived model route mismatch")
         usage = record.get("token_usage") if isinstance(record.get("token_usage"), Mapping) else record
@@ -1450,14 +1593,18 @@ def _inspect_response_records(
             total += value
         safe.append({
             "response_index": index,
-            "effective_backend": EXPECTED_BACKEND,
+            "effective_backend": expected_backend,
             "total_tokens": value,
         })
     return total if usage_complete else None, safe, usage_complete
 
 
-def _validate_response_records(records: object, *, model_calls: object) -> tuple[int, list[dict[str, Any]]]:
-    total, safe, usage_complete = _inspect_response_records(records, model_calls=model_calls)
+def _validate_response_records(
+    records: object, *, model_calls: object, selected: MatrixRoute | None = None,
+) -> tuple[int, list[dict[str, Any]]]:
+    total, safe, usage_complete = _inspect_response_records(
+        records, model_calls=model_calls, selected=selected,
+    )
     if not usage_complete or total is None:
         raise PilotError("model response usage is incomplete")
     return total, safe
@@ -1493,6 +1640,7 @@ def _first_response_prefix_satisfying(
 
 def _shipping_response_accounting(
     telemetry: Mapping[str, Any],
+    selected: MatrixRoute | None = None,
 ) -> tuple[int, int, int | None, list[dict[str, Any]], str | None, str | None]:
     """Separate sent shipping requests from completed, usage-bearing responses."""
     attempts = telemetry.get("model_calls")
@@ -1504,7 +1652,7 @@ def _shipping_response_accounting(
     completed_usage = False
     try:
         completed_total, safe_records, completed_usage = _inspect_response_records(
-            records, model_calls=completed,
+            records, model_calls=completed, selected=selected,
         )
     except PilotError as exc:
         route_error = str(exc)
@@ -1652,6 +1800,7 @@ class RuntimePilot:
         source_identities: Mapping[str, str] | None = None,
         alternate_start: AlternateStartBinding | None = None,
         measurement_metadata: Mapping[str, Any] | None = None,
+        selected_route: MatrixRoute | None = None,
     ):
         self.artifact_dir = artifact_dir
         self.protected_manifest = protected_manifest
@@ -1662,11 +1811,12 @@ class RuntimePilot:
         }
         self.source_identities = dict(source_identities or {})
         self.alternate_start = alternate_start
+        self.selected_route = selected_route
         initial_root = next(iter(self.source_roots.values()), ROOT)
         self.source_root = initial_root
         self.orchestrate = _orchestrate(initial_root)
         self.native = _native_chat(initial_root)
-        self.route = _route(self.orchestrate)
+        self.route = self._configured_route()
         self.safe_route = _safe_route_identity(self.route)
         self.current_client = None
         self.current_operation_id = None
@@ -1677,6 +1827,7 @@ class RuntimePilot:
         self.current_deadline_monotonic = None
         self.current_started_at = None
         self.current_deadline_at = None
+        self.current_stopped_at = None
         self.current_budget = None
         self.current_execution = None
         self._settled_operation_snapshot = None
@@ -1684,6 +1835,10 @@ class RuntimePilot:
         self.live_authority_id = ""
         self.live_authority_receipt: dict[str, Any] = {}
         self.measurement_metadata = dict(measurement_metadata or {})
+
+    def _configured_route(self) -> dict[str, str]:
+        selected = getattr(self, "selected_route", None)
+        return _route(self.orchestrate, selected) if selected is not None else _route(self.orchestrate)
 
     def _source_runtime_preflight(self, arm: str, source_root: Path, expected: str) -> dict[str, Any]:
         required = (
@@ -1720,7 +1875,7 @@ class RuntimePilot:
         self.source_root = source_root
         self.orchestrate = _orchestrate(source_root)
         self.native = _native_chat(source_root)
-        self.route = _route(self.orchestrate)
+        self.route = self._configured_route()
         self.safe_route = _safe_route_identity(self.route)
 
     def _engagement_id(self, arm: str) -> str:
@@ -1732,6 +1887,13 @@ class RuntimePilot:
         safe_attempt = _ENGAGEMENT_FILENAME_SAFE.sub("_", self.artifact_dir.name)[:48]
         identity = hashlib.sha256(str(relative).encode()).hexdigest()[:12]
         return f"trust-walker-pilot-{safe_attempt}-{arm}-{identity}"
+
+    def _channel_name(self, arm: str) -> str:
+        if getattr(self, "selected_route", None) is None:
+            return "Trust Walker matched pilot — shipping Sage"
+        label = _ENGAGEMENT_FILENAME_SAFE.sub("_", self.artifact_dir.name)[:40]
+        identity = hashlib.sha256(str(self.artifact_dir.resolve()).encode()).hexdigest()[:10]
+        return f"Trust Walker {self.selected_route.route_id} {label} {arm} {identity}"
 
     def _engagement_state_path(self, arm: str) -> Path:
         source_root = getattr(self, "source_roots", {}).get(arm, getattr(self, "source_root", ROOT))
@@ -1815,6 +1977,7 @@ class RuntimePilot:
         obj.current_deadline_monotonic = None
         obj.current_started_at = None
         obj.current_deadline_at = None
+        obj.current_stopped_at = None
         obj.current_budget = None
         obj.current_execution = None
         obj._settled_operation_snapshot = None
@@ -1903,6 +2066,7 @@ class RuntimePilot:
         obj.current_deadline_monotonic = None
         obj.current_started_at = None
         obj.current_deadline_at = None
+        obj.current_stopped_at = None
         obj.current_budget = None
         obj.current_execution = None
         obj._settled_operation_snapshot = None
@@ -1915,11 +2079,16 @@ class RuntimePilot:
         execution = dict(arm_results[-1].get("execution") or {}) if arm_results else {}
         return obj, dict(last.get("start_identity") or {}) if last else None, execution
 
-    def preflight(self, contract: PilotContract | ImprovementContract) -> Mapping[str, Any]:
+    def preflight(self, contract: PilotContract | ImprovementContract | MatrixPairContract) -> Mapping[str, Any]:
         if isinstance(contract, ImprovementContract) and self.alternate_start is not None:
             raise PilotError("improvement pair cannot select an alternate start")
         if isinstance(contract, PilotContract) and contract.alternate_start != self.alternate_start:
             raise PilotError("runtime case binding does not match the pilot contract")
+        if isinstance(contract, MatrixPairContract) and (
+            contract.alternate_start != self.alternate_start
+            or self.selected_route != contract.route
+        ):
+            raise PilotError("runtime matrix route or case differs from selected contract")
         source_bindings = {}
         if isinstance(contract, ImprovementContract):
             if set(self.source_roots) != set(IMPROVEMENT_ARM_ORDER):
@@ -1933,13 +2102,13 @@ class RuntimePilot:
                     contract.source_identity_for_arm(arm),
                 )
             self._activate_source(contract.arm_order[0])
-        self.route = _route(self.orchestrate)
+        self.route = self._configured_route()
         self.safe_route = _safe_route_identity(self.route)
         fixture = _fixture_at(self.source_root, self.alternate_start)
         foothold = self._staged_interactive_foothold()
         protected = _validate_protected_at(self.protected_manifest, self.source_root)
         paths = _validate_external_paths()
-        smoke = _validate_route_smoke(self.route_smoke, self.route)
+        smoke = _validate_route_smoke(self.route_smoke, self.route, getattr(self, "selected_route", None))
         bloodhound = self._bloodhound_service_preflight()
         engagement_state = self._fresh_engagement_state(contract.arm_order)
         assert_rejected_kernel_absent()
@@ -1966,6 +2135,8 @@ class RuntimePilot:
             },
             "live_authority_id": self.live_authority_id or None,
         }
+        if getattr(self, "matrix_catalog_receipt", None) is not None:
+            result["matrix_catalog_receipt"] = dict(self.matrix_catalog_receipt)
         result["live_authority"] = _authority_preflight_receipt(
             self.live_authority_receipt, result,
         )
@@ -2339,7 +2510,7 @@ class RuntimePilot:
         if principal.casefold() != expected_principal.casefold() or str(callback.get("host") or "").casefold() != expected_host.casefold():
             raise SetupInvariantError("post-reset callback does not match the selected foothold principal and host")
         try:
-            self.route = _route(self.orchestrate)
+            self.route = self._configured_route()
         except PilotError as exc:
             raise SetupInvariantError(str(exc)) from exc
         self.safe_route = _safe_route_identity(self.route)
@@ -2359,6 +2530,7 @@ class RuntimePilot:
         self.current_deadline_monotonic = None
         self.current_started_at = None
         self.current_deadline_at = None
+        self.current_stopped_at = None
         self.current_budget = None
         self.current_execution = None
         start = {
@@ -2425,21 +2597,24 @@ class RuntimePilot:
 
         return asyncio.run(deactivate())
 
-    def _deadline_model(self, deadline: float):
+    def _deadline_model(self, deadline: float | None):
         def invoke(system, tools, history):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            remaining = deadline - time.monotonic() if deadline is not None else None
+            if remaining is not None and remaining <= 0:
                 raise TimeoutError("arm wall deadline reached before model request")
             model = live_seams.make_model_fn(
-                PROVIDER,
-                MODEL,
+                self.route["provider"],
+                self.route["model"],
                 api_key=self.route["api_key"],
                 base_url=self.route["api_endpoint"],
                 objective=OBJECTIVE,
-                request_timeout=remaining,
+                request_timeout=remaining if remaining is not None else 900.0,
                 max_retries=0,
             )
-            return _call_before_deadline(deadline, model, system, tools, history)
+            return (
+                _call_before_deadline(deadline, model, system, tools, history)
+                if deadline is not None else model(system, tools, history)
+            )
 
         return invoke
 
@@ -2447,11 +2622,10 @@ class RuntimePilot:
     def _shipping_arm(arm: str) -> bool:
         return arm in {"shipping-sage", "baseline-sage", "candidate-sage"}
 
-    @staticmethod
-    def _validate_one_raw_response(record: dict[str, Any]) -> None:
-        _validate_response_records([record], model_calls=1)
+    def _validate_one_raw_response(self, record: dict[str, Any]) -> None:
+        _validate_response_records([record], model_calls=1, selected=getattr(self, "selected_route", None))
 
-    def _raw_runner(self, deadline: float, progress):
+    def _raw_runner(self, deadline: float | None, progress):
         bh_specs, bh_registry, upload = bare_bloodhound.load_bloodhound_mcp_surface()
         mythic_dispatch = bare_mythic_tools.make_mythic_dispatcher(
             self.current_client,
@@ -2462,16 +2636,16 @@ class RuntimePilot:
 
         def dispatch(call):
             selected = mythic_dispatch if call.get("tool") in mythic_names else bh_dispatch
-            return _call_before_deadline(deadline, selected, call)
+            return _call_before_deadline(deadline, selected, call) if deadline is not None else selected(call)
 
         return BareModelRunner(
             self._deadline_model(deadline),
             dispatch,
             tools_spec=[*bare_mythic_tools.bare_tool_specs(), *bh_specs],
             max_steps=0,
-            timeout=max(0.0, deadline - time.monotonic()),
+            timeout=max(0.0, deadline - time.monotonic()) if deadline is not None else None,
             logger=make_stdout_logger(),
-            token_ceiling=1_000_000,
+            token_ceiling=None if deadline is None else 1_000_000,
             require_complete_usage=True,
             event_sink=progress,
             response_validator=self._validate_one_raw_response,
@@ -2480,16 +2654,19 @@ class RuntimePilot:
     def run_arm(self, arm: str, _start: Mapping[str, Any], progress) -> Mapping[str, Any]:
         if self.current_client is None or self.current_operation_id is None:
             raise PilotError("arm runtime has no bound Mythic operation")
+        route = getattr(self, "route", {"provider": PROVIDER, "model": MODEL})
+        matrix_arm = getattr(self, "selected_route", None) is not None
         started_at = datetime.now(UTC)
-        deadline_at = started_at + timedelta(seconds=2700)
-        deadline = time.monotonic() + 2700
+        deadline_at = None if matrix_arm else started_at + timedelta(seconds=2700)
+        deadline = None if matrix_arm else time.monotonic() + 2700
         self.current_started_at = started_at
         self.current_deadline_at = deadline_at
+        self.current_stopped_at = None
         self.current_deadline_monotonic = deadline
         progress({
             "event": "execution_started",
             "arm_started_at": started_at.isoformat(),
-            "arm_deadline_at": deadline_at.isoformat(),
+            "arm_deadline_at": deadline_at.isoformat() if deadline_at is not None else None,
         })
         declared_metadata = getattr(self, "measurement_metadata", {})
         if self._shipping_arm(arm):
@@ -2501,37 +2678,38 @@ class RuntimePilot:
             metadata = self.native.default_ai_metadata()
             config = metadata.setdefault("config", {})
             config.update({
-                "provider": PROVIDER,
-                "model": MODEL,
+                "provider": route["provider"],
+                "model": route["model"],
                 "API_ENDPOINT": self.route["api_endpoint"],
                 "API_KEY": self.route["api_key"],
                 "mode": "auto",
                 "autonomous_solve": True,
                 "max_steps": 0,
-                "SAGE_EVAL_ARM_DEADLINE_EPOCH": str(deadline_at.timestamp()),
             })
+            if deadline_at is not None:
+                config["SAGE_EVAL_ARM_DEADLINE_EPOCH"] = str(deadline_at.timestamp())
+            else:
+                config.pop("SAGE_EVAL_ARM_DEADLINE_EPOCH", None)
             metadata_fields = _assembled_measurement_metadata(declared_metadata, arm=arm, config=config)
             try:
                 async def execute_shipping():
-                    remaining = max(0.001, deadline - time.monotonic())
-                    return await asyncio.wait_for(
-                        self.native.run_native_chat_turn(
+                    remaining = max(0.001, deadline - time.monotonic()) if deadline is not None else None
+                    turn = self.native.run_native_chat_turn(
                             self.current_client,
                             OBJECTIVE,
                             timeout_seconds=remaining,
-                            poll_interval_seconds=min(5, remaining),
-                            channel_name="Trust Walker matched pilot — shipping Sage",
+                            poll_interval_seconds=min(5, remaining) if remaining is not None else 5,
+                            channel_name=self._channel_name(arm),
                             metadata=metadata,
                             use_prepared_channel=False,
                             progress_sink=shipping_progress,
                             expected_runtime_identity={
-                                "provider": PROVIDER,
-                                "model": MODEL,
+                                "provider": route["provider"],
+                                "model": route["model"],
                                 "route": self.native._chat_runtime_identity_from_metadata(metadata)["route"],
                             },
-                        ),
-                        timeout=remaining,
                     )
+                    return await asyncio.wait_for(turn, timeout=remaining) if remaining is not None else await turn
 
                 result = asyncio.run(execute_shipping())
                 termination = str(result.get("status") or "unknown")
@@ -2544,26 +2722,33 @@ class RuntimePilot:
             execution = {
                 "termination": termination,
                 "arm_started_at": started_at.isoformat(),
-                "arm_deadline_at": deadline_at.isoformat(),
+                "arm_deadline_at": deadline_at.isoformat() if deadline_at is not None else None,
                 "pending_finalization": True,
                 "resource_complete": False,
                 "measurement_metadata": metadata_fields,
             }
+            if matrix_arm:
+                self.current_stopped_at = datetime.now(UTC)
+                execution["arm_stopped_at"] = self.current_stopped_at.isoformat()
             self.current_execution = {**execution, "_shipping_result": result}
             return execution
         if arm != "raw-mythic-bloodhound":
             raise PilotError("unexpected pilot arm")
         metadata_fields = _assembled_measurement_metadata(declared_metadata, arm=arm, config={
-            "provider": PROVIDER, "model": MODEL, "mode": "auto", "max_steps": 0,
+            "provider": route["provider"], "model": route["model"], "mode": "auto", "max_steps": 0,
             "max_retries": 0, "max_output_tokens": None,
-            "request_timeout_policy": "remaining_arm_wall_seconds",
+            "request_timeout_policy": "per_request_900_seconds" if matrix_arm else "remaining_arm_wall_seconds",
         })
-        budget = task_budget.TaskBudget(100, deadline, event_sink=progress)
+        budget = None if matrix_arm else task_budget.TaskBudget(100, deadline, event_sink=progress)
         self.current_budget = budget
         runner = self._raw_runner(deadline, progress)
-        with task_budget.task_budget_scope(budget):
+        if budget is None:
             result = runner.run(OBJECTIVE)
-        budget_snapshot = budget.snapshot()
+            budget_snapshot = None
+        else:
+            with task_budget.task_budget_scope(budget):
+                result = runner.run(OBJECTIVE)
+            budget_snapshot = budget.snapshot()
         transcript = _write_private(self.artifact_dir / "raw-mythic-bloodhound-transcript.json", {
             "objective": result.objective,
             "events": result.transcript,
@@ -2577,6 +2762,7 @@ class RuntimePilot:
         try:
             inspected_total, safe_records, inspected_usage_complete = _inspect_response_records(
                 result.model_response_records, model_calls=result.model_calls,
+                selected=getattr(self, "selected_route", None),
             )
         except PilotError as exc:
             inspected_total = None
@@ -2588,7 +2774,7 @@ class RuntimePilot:
         elif result.token_usage_complete is not True or not inspected_usage_complete:
             cost_error = "completed provider response has incomplete authoritative usage"
         total_tokens = inspected_total if route_error is None and cost_error is None else None
-        if (
+        if not matrix_arm and (
             not isinstance(budget_snapshot, Mapping)
             or budget_snapshot.get("limit") != 100
             or type(budget_snapshot.get("reservations")) is not int
@@ -2602,7 +2788,7 @@ class RuntimePilot:
             "transcript": transcript,
             "response_records": safe_records,
             "arm_started_at": started_at.isoformat(),
-            "arm_deadline_at": deadline_at.isoformat(),
+            "arm_deadline_at": deadline_at.isoformat() if deadline_at is not None else None,
             "task_budget": budget_snapshot,
             "protocol_error": route_error is not None,
             "route_error": route_error,
@@ -2613,14 +2799,18 @@ class RuntimePilot:
                 "model_attempts": result.model_attempts,
                 "model_calls": result.model_calls,
                 "total_tokens": total_tokens,
-                "payload_tasks": budget_snapshot.get("reservations"),
+                "payload_tasks": budget_snapshot.get("reservations") if budget_snapshot is not None else None,
                 "wall_seconds": result.wall_seconds,
                 "token_overshoot": (
-                    result.token_budget_overshoot if type(total_tokens) is int else None
+                    None if matrix_arm else result.token_budget_overshoot
+                    if type(total_tokens) is int else None
                 ),
             },
             "measurement_metadata": metadata_fields,
         }
+        if matrix_arm:
+            self.current_stopped_at = datetime.now(UTC)
+            execution["arm_stopped_at"] = self.current_stopped_at.isoformat()
         self.current_execution = execution
         return execution
 
@@ -2680,9 +2870,10 @@ class RuntimePilot:
                     safe_records,
                     route_error,
                     cost_error,
-                ) = _shipping_response_accounting(telemetry)
+                ) = _shipping_response_accounting(telemetry, getattr(self, "selected_route", None))
                 task_state = telemetry.get("task_budget")
-                task_valid = bool(
+                matrix_arm = getattr(self, "selected_route", None) is not None
+                task_valid = matrix_arm or bool(
                     isinstance(task_state, Mapping)
                     and task_state.get("limit") == 100
                     and type(task_state.get("reservations")) is int
@@ -2709,9 +2900,14 @@ class RuntimePilot:
                         "wall_seconds": (
                             min(2700.0, max(0.0, time.monotonic() - self.current_deadline_monotonic + 2700))
                             if isinstance(self.current_deadline_monotonic, (int, float))
+                            else max(0.0, (datetime.now(UTC) - self.current_started_at).total_seconds())
+                            if isinstance(self.current_started_at, datetime)
                             else (finalized.get("cost") or {}).get("wall_seconds")
                         ),
-                        "token_overshoot": total_tokens > 1_000_000 if type(total_tokens) is int else None,
+                        "token_overshoot": (
+                            None if matrix_arm else total_tokens > 1_000_000
+                            if type(total_tokens) is int else None
+                        ),
                     },
                 })
 
@@ -2737,6 +2933,10 @@ class RuntimePilot:
                 break
             time.sleep(min(5, max(0.0, settle_deadline - time.monotonic())))
         rows = operation_snapshot.get("task") if isinstance(operation_snapshot, Mapping) else None
+        if getattr(self, "selected_route", None) is not None and isinstance(rows, list):
+            cost = finalized.get("cost")
+            if isinstance(cost, Mapping):
+                finalized["cost"] = {**cost, "payload_tasks": len(rows)}
         quiescent = bool(isinstance(rows, list) and all(
             isinstance(row, Mapping) and row.get("completed") is True for row in rows
         ))
@@ -3038,6 +3238,10 @@ class RuntimePilot:
             "proof_contract": PROOF_CONTRACT,
             "arm_started_at": self.current_started_at.isoformat() if self.current_started_at else None,
             "arm_deadline_at": self.current_deadline_at.isoformat() if self.current_deadline_at else None,
+            **({"arm_stopped_at": self.current_stopped_at.isoformat()}
+               if getattr(self, "current_stopped_at", None) else {}),
+            **({"measurement_policy": "unbounded-until-terminal"}
+               if getattr(self, "selected_route", None) is not None else {}),
             "observed_at": observed_at or datetime.now(UTC).isoformat(),
             "observer_complete": complete,
             "tasks": task_states,
@@ -3095,6 +3299,7 @@ class RuntimePilot:
         self.current_deadline_monotonic = None
         self.current_started_at = None
         self.current_deadline_at = None
+        self.current_stopped_at = None
         self.current_budget = None
         self.current_execution = None
         self.current_reset_started = False
@@ -3246,11 +3451,15 @@ def run_setup_rehearsals(
         invariant_error: Exception | None = None
         if reset_error is None:
             try:
-                identity = matched_start_identity(start, contract.alternate_start)
+                identity = matched_start_identity(
+                    start, contract.alternate_start,
+                    matrix_pair=contract if isinstance(contract, MatrixPairContract) else None,
+                )
                 runtime_identity = validate_runtime_identity(runtime.runtime_identity())
                 if expected_start is not None:
                     matched, differences = compare_start_manifests(
                         expected_start, identity, alternate_start=contract.alternate_start,
+                        matrix_pair=contract if isinstance(contract, MatrixPairContract) else None,
                     )
                     if not matched:
                         raise SetupInvariantError(
@@ -3339,7 +3548,9 @@ def run_setup_rehearsals(
         "required_consecutive_successes": SETUP_REHEARSAL_SUCCESSES,
         "consecutive_successes": consecutive_successes,
         "setup_cleanup_elapsed_seconds": support_elapsed,
-        "support_limit_seconds": contract.setup_cleanup_seconds,
+        "support_limit_seconds": (
+            None if isinstance(contract, MatrixPairContract) else contract.setup_cleanup_seconds
+        ),
         "support_budget_exhausted": support_elapsed > contract.setup_cleanup_seconds,
         "hard_stop": hard_stop,
         "model_inference_calls": 0,
@@ -3353,7 +3564,7 @@ def run_setup_rehearsals(
 
 def _runtime(
     args,
-    contract: PilotContract | ImprovementContract | None = None,
+    contract: PilotContract | ImprovementContract | MatrixPairContract | None = None,
 ) -> RuntimePilot:
     contract = contract or PilotContract()
     source_roots = None
@@ -3373,8 +3584,12 @@ def _runtime(
         Path(args.route_smoke).expanduser().resolve(),
         source_roots=source_roots,
         source_identities=source_identities,
-        alternate_start=(contract.alternate_start if isinstance(contract, PilotContract) else None),
+        alternate_start=(
+            contract.alternate_start
+            if isinstance(contract, (PilotContract, MatrixPairContract)) else None
+        ),
         measurement_metadata=_measurement_metadata(getattr(args, "measurement_metadata", None)),
+        selected_route=(contract.route if isinstance(contract, MatrixPairContract) else None),
     )
 
 
@@ -3490,7 +3705,7 @@ def _retained_pair(path: str | Path) -> tuple[dict[str, Any], dict[str, Any]]:
     return dict(contracts[0]), dict(comparisons[0])
 
 
-def _replay_contract(records: list[dict[str, Any]]) -> PilotContract | ImprovementContract:
+def _replay_contract(records: list[dict[str, Any]]) -> PilotContract | ImprovementContract | MatrixPairContract:
     retained = [row.get("contract") for row in records if row.get("record_type") == "contract"]
     if len(retained) != 1 or not isinstance(retained[0], Mapping):
         raise PilotError("replay requires one retained contract")
@@ -3508,6 +3723,27 @@ def _replay_contract(records: list[dict[str, Any]]) -> PilotContract | Improveme
             candidate_source_identity=str(value.get("candidate_source_identity") or ""),
             arm_order=tuple(order),
         )
+    elif value.get("schema") == "sage-trust-walker-model-matrix-pair-v1":
+        route = value.get("route")
+        alternate = value.get("alternate_start")
+        if not isinstance(route, Mapping):
+            raise PilotError("retained matrix route is malformed")
+        try:
+            selected = MatrixRoute(**route)
+            alternate_start = AlternateStartBinding.from_record(alternate) if alternate is not None else None
+            contract = MatrixPairContract(
+                matrix_identity=str(value.get("matrix_identity") or ""),
+                route=selected,
+                start_case=str(value.get("start_case") or ""),
+                objective=str(value.get("objective") or ""),
+                arm_order=tuple(order),
+                source_identity=value.get("source_identity"),
+                tool_contract=value.get("tool_contract"),
+                dependency_identity=value.get("dependency_identity"),
+                alternate_start=alternate_start,
+            )
+        except (TypeError, ValueError) as exc:
+            raise PilotError("retained matrix pair contract is malformed") from exc
     else:
         raise PilotError("retained protocol version is not supported for replay")
     contract.validate()
@@ -3622,16 +3858,39 @@ def replay_pair(artifact_dir: str | Path, native_evidence_manifest: str | Path |
         # Bypass RuntimePilot construction: replay needs no credentials, fixtures, or live adapters.
         projector = object.__new__(RuntimePilot)
         projector.current_operation_id = operation_id
-        for key in ("arm_started_at", "arm_deadline_at"):
-            if not isinstance(snapshot.get(key), str) or snapshot[key] != execution.get(key):
-                raise PilotError("terminal observation and execution windows disagree")
-        projector.current_started_at = datetime.fromisoformat(snapshot["arm_started_at"])
-        projector.current_deadline_at = datetime.fromisoformat(snapshot["arm_deadline_at"])
-        if (
-            projector.current_started_at.tzinfo is None or projector.current_deadline_at.tzinfo is None
-            or (projector.current_deadline_at - projector.current_started_at).total_seconds() != contract.wall_seconds
-        ):
-            raise PilotError("retained execution window differs from the fixed contract")
+        projector.selected_route = contract.route if isinstance(contract, MatrixPairContract) else None
+        if isinstance(contract, MatrixPairContract):
+            if (
+                snapshot.get("arm_deadline_at") is not None
+                or execution.get("arm_deadline_at") is not None
+                or snapshot.get("measurement_policy") != "unbounded-until-terminal"
+                or not isinstance(snapshot.get("arm_started_at"), str)
+                or not isinstance(snapshot.get("arm_stopped_at"), str)
+                or snapshot["arm_started_at"] != execution.get("arm_started_at")
+                or snapshot["arm_stopped_at"] != execution.get("arm_stopped_at")
+            ):
+                raise PilotError("retained matrix execution window disagrees with native evidence")
+            projector.current_started_at = datetime.fromisoformat(snapshot["arm_started_at"])
+            projector.current_stopped_at = datetime.fromisoformat(snapshot["arm_stopped_at"])
+            projector.current_deadline_at = None
+            if (
+                projector.current_started_at.tzinfo is None
+                or projector.current_stopped_at.tzinfo is None
+                or projector.current_stopped_at <= projector.current_started_at
+            ):
+                raise PilotError("retained matrix stop time is invalid")
+        else:
+            for key in ("arm_started_at", "arm_deadline_at"):
+                if not isinstance(snapshot.get(key), str) or snapshot[key] != execution.get(key):
+                    raise PilotError("terminal observation and execution windows disagree")
+            projector.current_started_at = datetime.fromisoformat(snapshot["arm_started_at"])
+            projector.current_deadline_at = datetime.fromisoformat(snapshot["arm_deadline_at"])
+            projector.current_stopped_at = None
+            if (
+                projector.current_started_at.tzinfo is None or projector.current_deadline_at.tzinfo is None
+                or (projector.current_deadline_at - projector.current_started_at).total_seconds() != contract.wall_seconds
+            ):
+                raise PilotError("retained execution window differs from the fixed contract")
         projected = projector._terminal_snapshot_from_observation(
             arm, observed, execution, bh_count=snapshot.get("bloodhound_domain_count"),
             observed_at=snapshot.get("observed_at"),
@@ -3975,6 +4234,11 @@ def summarize_improvement_comparisons(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
+    for name in ("matrix-plan", "matrix-preflight"):
+        matrix = sub.add_parser(name, help="Read-only model-matrix contract inspection.")
+        matrix.add_argument("--contract-file", type=Path, default=DEFAULT_MATRIX_CONTRACT)
+        if name == "matrix-preflight":
+            matrix.add_argument("--route-id", required=True)
     plan = sub.add_parser("plan")
     plan.add_argument("--case-descriptor")
     improvement_plan = sub.add_parser("improvement-plan")
@@ -3987,6 +4251,8 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--protected-manifest", required=True)
         command.add_argument("--route-smoke", required=True)
         command.add_argument("--case-descriptor")
+        command.add_argument("--route-id", help="Select a model-matrix route; absent means legacy Sonnet v4.")
+        command.add_argument("--contract-file", type=Path, default=DEFAULT_MATRIX_CONTRACT)
         if name in {"rehearse-setup", "continue-setup", "run-pair"}:
             _add_live_authority_args(command)
         if name == "run-pair":
@@ -4026,6 +4292,42 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command in {"matrix-plan", "matrix-preflight"}:
+        try:
+            matrix = load_matrix_contract(args.contract_file)
+            result: dict[str, Any] = {
+                "ready": True,
+                "scope": "contract and configured route only",
+                "measured_pair_ready": False,
+                "measured_pair_blocker": (
+                    "catalog check does not establish route smoke, live authority, or range readiness"
+                ),
+                "contract_file": str(Path(args.contract_file).expanduser().resolve()),
+                "contract_identity": matrix.identity,
+                "contract": matrix.to_record(),
+            }
+            if args.command == "matrix-preflight":
+                resolved = _orchestrate()._load_sage_model_environment()
+                selected = matrix.validate_resolved_route(args.route_id, {
+                    "provider": resolved.get("provider"),
+                    "model": resolved.get("model"),
+                    "api_endpoint": resolved.get("API_ENDPOINT"),
+                })
+                if not resolved.get("API_KEY"):
+                    raise PilotError("active Sage route has no API key")
+                result["selected_route_id"] = selected.route_id
+                result["credential_present"] = True
+                result["provider_calls"] = 0
+                result["range_actions"] = 0
+        except (PilotError, OSError, ValueError, RuntimeError, SystemExit) as exc:
+            print(json.dumps({
+                "ready": False,
+                "error_type": type(exc).__name__,
+                "reason": str(exc),
+            }, indent=2, sort_keys=True))
+            return 1
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
     if args.command == "replay-pair":
         try:
             replayed = replay_pair(args.artifact_dir, args.native_evidence_manifest)
@@ -4051,7 +4353,17 @@ def main(argv: list[str] | None = None) -> int:
                 if getattr(args, "case_descriptor", None)
                 else None
             )
-            contract = PilotContract(arm_order=arm_order, alternate_start=alternate_start)
+            if getattr(args, "route_id", None):
+                matrix = load_matrix_contract(args.contract_file)
+                contract = MatrixPairContract.for_route(
+                    matrix, args.route_id,
+                    start_case="jorah-meereen" if alternate_start is not None else "samwell-castelblack",
+                    alternate_start=alternate_start,
+                    arm_order=arm_order,
+                    source_identity=_source_identity_at(ROOT),
+                )
+            else:
+                contract = PilotContract(arm_order=arm_order, alternate_start=alternate_start)
         contract.validate()
     except (PilotError, OSError) as exc:
         print(json.dumps({"ready": False, "error_type": type(exc).__name__, "reason": str(exc)}, indent=2, sort_keys=True))
@@ -4210,13 +4522,18 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "run-improvement-pair":
             prepared = _prepared_improvement_dependencies(args, contract)
             _bind_authority_to_preledger(authority_receipt, prepared)
+        matrix_catalog_receipt = (
+            _retain_matrix_catalog(args.artifact_dir, matrix)
+            if isinstance(contract, MatrixPairContract) else None
+        )
         runtime = (
             _runtime(args, contract)
-            if isinstance(contract, ImprovementContract) or contract.alternate_start is not None
+            if isinstance(contract, (ImprovementContract, MatrixPairContract)) or contract.alternate_start is not None
             else _runtime(args)
         )
         runtime.live_authority_id = str(authority_receipt.get("authority_id") or "")
         runtime.live_authority_receipt = dict(authority_receipt)
+        runtime.matrix_catalog_receipt = matrix_catalog_receipt
         if args.command == "preflight":
             result = dict(runtime.preflight(contract))
             retained = _write_private(

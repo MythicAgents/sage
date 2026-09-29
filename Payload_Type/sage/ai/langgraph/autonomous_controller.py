@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import itertools
 import json
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -56,12 +57,11 @@ except ImportError:  # flat-import runtimes (mirrors the codebase's relative-the
 # ---------------------------------------------------------------------------------------------------------
 @dataclass
 class ControllerConfig:
-    """Hard runtime stop-losses. The point is that a run NEVER 2-hour-timeouts: it halts cleanly with a
-    precise blocker. Every ceiling is enforced in the loop, not aspirational."""
-    max_cycles: int = 60                 # absolute backstop on loop iterations
+    """Runtime stop-losses; numeric ceilings may be absent for an explicit evaluation arm."""
+    max_cycles: int | None = 60          # None only for an explicit unbounded evaluation arm
     max_no_effect_cycles: int = 4        # consecutive verified-no-new-effect cycles -> halt
-    token_budget: int = 3_000_000        # cumulative output/observed tokens -> halt
-    wall_clock_budget_s: float = 2700.0  # 45 min -> halt
+    token_budget: int | None = 3_000_000        # cumulative output/observed tokens -> halt
+    wall_clock_budget_s: float | None = 2700.0  # 45 min -> halt
     max_collections: int | None = None   # optional emergency global cap; policy is per-request, not global
     max_collection_attempts_per_request: int = 2  # retry one failed request once, then halt diagnostically
     seam_timeout_s: float | None = None  # per-seam await deadline (None in tests; runtime sets it so a hung
@@ -473,15 +473,14 @@ class AutonomousController:
         return (status, value)
 
     async def _budget_exceeded(self) -> str:
-        # FAIL CLOSED: budgets are the last-resort guard against a runaway run, so a meter that errors/times out
-        # halts the run rather than silently disabling the ceiling (Forge NEW-5).
-        if self._tokens_spent is not None:
+        # When configured, a meter that errors/times out halts rather than silently disabling its ceiling.
+        if self.config.token_budget is not None and self._tokens_spent is not None:
             st, v = await self._seam(lambda: self._tokens_spent(), "tokens_spent")
             if st != "ok":
                 return f"token meter unavailable ({st}); failing closed"
             if int(v) >= self.config.token_budget:
                 return "token budget exhausted"
-        if self._clock is not None:
+        if self.config.wall_clock_budget_s is not None and self._clock is not None:
             st, v = await self._seam(lambda: self._clock(), "clock")
             if st != "ok":
                 return f"clock unavailable ({st}); failing closed"
@@ -525,6 +524,7 @@ class AutonomousController:
         """
         self._absolute_deadline = (
             asyncio.get_running_loop().time() + float(self.config.wall_clock_budget_s)
+            if self.config.wall_clock_budget_s is not None else None
         )
         with _tracing.kernel_span(
             "sage.kernel.episode",
@@ -578,7 +578,11 @@ class AutonomousController:
             return done(STATUS_NO_ACTION, "could not observe engagement state")
         achieved = self._achieved(state)
 
-        for cycle in range(1, self.config.max_cycles + 1):
+        cycle_numbers = (
+            range(1, self.config.max_cycles + 1)
+            if self.config.max_cycles is not None else itertools.count(1)
+        )
+        for cycle in cycle_numbers:
             # One span per controller cycle. The seams below nest beneath it, and because the
             # LangChain instrumentor falls back to ambient context for a parentless run, the
             # policy model call and MCP tool calls land under the cycle that caused them.

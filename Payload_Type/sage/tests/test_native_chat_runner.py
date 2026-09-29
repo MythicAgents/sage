@@ -620,6 +620,36 @@ def test_build_demo_manifest_fails_closed_on_missing_artifact(tmp_path):
         )
 
 
+def test_wait_for_request_accepts_unbounded_arm_until_terminal(monkeypatch):
+    calls = 0
+
+    async def fetch(_client, _request_id):
+        nonlocal calls
+        calls += 1
+        return {
+            "request": {"status": "completed" if calls == 2 else "processing"},
+            "messages": [],
+        }
+
+    monkeypatch.setattr(native_chat, "fetch_request_snapshot", fetch)
+    result = asyncio.run(native_chat.wait_for_request(
+        object(), 7, timeout_seconds=None, poll_interval_seconds=0,
+    ))
+    assert calls == 2
+    assert result["request"]["status"] == "completed"
+
+
+def test_unbounded_chat_stops_when_control_plane_evidence_is_lost(monkeypatch):
+    async def fetch(_client, _request_id):
+        raise RuntimeError("snapshot unavailable")
+
+    monkeypatch.setattr(native_chat, "fetch_request_snapshot", fetch)
+    with pytest.raises(RuntimeError, match="snapshot unavailable"):
+        asyncio.run(native_chat.wait_for_request(
+            object(), 7, timeout_seconds=None, poll_interval_seconds=0,
+        ))
+
+
 def test_wait_for_request_bounds_stalled_query_without_claiming_remote_stop(monkeypatch):
     cancelled = []
     events = []

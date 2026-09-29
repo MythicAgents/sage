@@ -8,9 +8,11 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import sys
 import time
 from typing import Any, Callable, Mapping
+from urllib.parse import urlsplit
 
 from .trust_walker_outcome import (
     OBJECTIVE_INERT_UNFINISHED_COMMANDS,
@@ -19,6 +21,8 @@ from .trust_walker_outcome import (
 
 
 PILOT_SCHEMA = "sage-trust-walker-matched-pilot-v4"
+MATRIX_SCHEMA = "sage-trust-walker-model-matrix-v1"
+MATRIX_PAIR_SCHEMA = "sage-trust-walker-model-matrix-pair-v1"
 IMPROVEMENT_SCHEMA = "sage-trust-walker-isc8-improvement-pair-v1"
 OBJECTIVE = "From the current foothold, achieve administrative control of essos.local."
 ARM_ORDER = ("shipping-sage", "raw-mythic-bloodhound")
@@ -46,6 +50,221 @@ ALTERNATE_START_IP = "10.4.10.12"
 
 class PilotError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class MatrixRoute:
+    """Non-secret identity of one model route in a comparison matrix."""
+
+    route_id: str
+    provider: str
+    model: str
+    api_endpoint: str
+
+    def validate(self) -> None:
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", self.route_id):
+            raise PilotError("matrix route_id must be a lowercase identifier")
+        if not self.provider or self.provider != self.provider.strip() or any(c.isspace() for c in self.provider):
+            raise PilotError(f"matrix route {self.route_id}: provider is malformed")
+        if not self.model or self.model != self.model.strip() or any(c.isspace() for c in self.model):
+            raise PilotError(f"matrix route {self.route_id}: model is malformed")
+        endpoint = self.api_endpoint
+        if not endpoint or endpoint != endpoint.strip() or any(c.isspace() for c in endpoint):
+            raise PilotError(f"matrix route {self.route_id}: api_endpoint is malformed")
+        try:
+            parsed = urlsplit(endpoint)
+            valid_port = parsed.port is None or parsed.port > 0
+        except ValueError as exc:
+            raise PilotError(f"matrix route {self.route_id}: api_endpoint is malformed") from exc
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or not valid_port
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise PilotError(f"matrix route {self.route_id}: api_endpoint must be a plain HTTP(S) base URL")
+
+    def to_record(self) -> dict[str, str]:
+        self.validate()
+        return asdict(self)
+
+    @property
+    def endpoint_identity(self) -> str:
+        self.validate()
+        endpoint = urlsplit(self.api_endpoint)
+        return hashlib.sha256(
+            f"{endpoint.scheme}://{endpoint.hostname}:{endpoint.port or ''}{endpoint.path}".encode()
+        ).hexdigest()
+
+
+@dataclass(frozen=True)
+class MatrixContract:
+    """Versioned route catalog; the caller selects a route_id for each pair."""
+
+    schema: str
+    routes: tuple[MatrixRoute, ...]
+
+    def validate(self) -> None:
+        if self.schema != MATRIX_SCHEMA or not self.routes:
+            raise PilotError("matrix schema is unsupported or routes are empty")
+        route_ids: set[str] = set()
+        for route in self.routes:
+            route.validate()
+            if route.route_id in route_ids:
+                raise PilotError(f"duplicate matrix route_id: {route.route_id}")
+            route_ids.add(route.route_id)
+
+    def route_for(self, route_id: str) -> MatrixRoute:
+        self.validate()
+        for route in self.routes:
+            if route.route_id == route_id:
+                return route
+        raise PilotError(f"unknown matrix route_id: {route_id}")
+
+    def validate_resolved_route(self, route_id: str, resolved: Mapping[str, object]) -> MatrixRoute:
+        """Require exact active route identity; never inspect or retain api_key."""
+        route = self.route_for(route_id)
+        for field in ("provider", "model", "api_endpoint"):
+            if resolved.get(field) != getattr(route, field):
+                raise PilotError(f"matrix route {route_id}: configured {field} differs from contract")
+        return route
+
+    def to_record(self) -> dict[str, Any]:
+        self.validate()
+        return {"schema": self.schema, "routes": [route.to_record() for route in self.routes]}
+
+    @property
+    def identity(self) -> str:
+        return hashlib.sha256(
+            json.dumps(self.to_record(), sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+
+def load_matrix_contract(path: str | Path) -> MatrixContract:
+    """Load a strict, non-secret matrix JSON without a campaign-specific path."""
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise PilotError(f"cannot read matrix contract: {exc}") from exc
+    if not isinstance(value, dict) or set(value) != {"schema", "routes"}:
+        raise PilotError("matrix contract must contain exactly schema and routes")
+    rows = value["routes"]
+    if not isinstance(value["schema"], str) or not isinstance(rows, list):
+        raise PilotError("matrix schema or routes are malformed")
+    route_keys = {"route_id", "provider", "model", "api_endpoint"}
+    routes: list[MatrixRoute] = []
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != route_keys:
+            raise PilotError("matrix route must contain exactly route_id, provider, model, api_endpoint")
+        if any(not isinstance(row[key], str) for key in route_keys):
+            raise PilotError("matrix route fields must be strings")
+        routes.append(MatrixRoute(**row))
+    contract = MatrixContract(schema=value["schema"], routes=tuple(routes))
+    contract.validate()
+    return contract
+
+
+@dataclass(frozen=True)
+class MatrixPairContract:
+    """One measured pair selected from a non-secret model route catalog."""
+
+    matrix_identity: str
+    route: MatrixRoute
+    start_case: str
+    objective: str = OBJECTIVE
+    arm_order: tuple[str, str] = ARM_ORDER
+    source_identity: str | None = None
+    tool_contract: str | None = None
+    dependency_identity: str | None = None
+    alternate_start: AlternateStartBinding | None = None
+
+    @classmethod
+    def for_route(
+        cls, matrix: MatrixContract, route_id: str, *, start_case: str,
+        source_identity: str | None = None, tool_contract: str | None = None,
+        dependency_identity: str | None = None,
+        alternate_start: AlternateStartBinding | None = None,
+        arm_order: tuple[str, str] = ARM_ORDER,
+    ) -> "MatrixPairContract":
+        contract = cls(
+            matrix_identity=matrix.identity, route=matrix.route_for(route_id),
+            start_case=start_case, source_identity=source_identity,
+            tool_contract=tool_contract, dependency_identity=dependency_identity,
+            alternate_start=alternate_start, arm_order=arm_order,
+        )
+        contract.validate(matrix)
+        return contract
+
+    def validate(self, matrix: MatrixContract | None = None) -> None:
+        self.route.validate()
+        if not re.fullmatch(r"[0-9a-f]{64}", self.matrix_identity):
+            raise PilotError("matrix pair catalog identity is malformed")
+        if matrix is not None and (matrix.identity != self.matrix_identity or matrix.route_for(self.route.route_id) != self.route):
+            raise PilotError("matrix pair route differs from the selected catalog")
+        if self.objective != OBJECTIVE:
+            raise PilotError("matrix pair objective differs from the GOAD objective")
+        if self.arm_order not in (ARM_ORDER, tuple(reversed(ARM_ORDER))):
+            raise PilotError("matrix pair arm order is unsupported")
+        if self.start_case not in {"samwell-castelblack", ALTERNATE_START_CASE}:
+            raise PilotError("matrix pair start case is unsupported")
+        if self.start_case == ALTERNATE_START_CASE:
+            if self.alternate_start is None:
+                raise PilotError("matrix pair Jorah start requires the retained binding")
+            self.alternate_start.validate()
+        elif self.alternate_start is not None:
+            raise PilotError("matrix pair Samwell start must not have an alternate binding")
+        for name in ("source_identity", "tool_contract", "dependency_identity"):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, str) or not value.strip() or value != value.strip()):
+                raise PilotError(f"matrix pair {name} is malformed")
+
+    def to_record(self) -> dict[str, Any]:
+        self.validate()
+        record: dict[str, Any] = {
+            "schema": MATRIX_PAIR_SCHEMA,
+            "matrix_identity": self.matrix_identity,
+            "route": self.route.to_record(),
+            "start_case": self.start_case,
+            "objective": self.objective,
+            "objective_sha256": hashlib.sha256(self.objective.encode()).hexdigest(),
+            "arm_order": list(self.arm_order),
+            "source_identity": self.source_identity,
+            "tool_contract": self.tool_contract,
+            "dependency_identity": self.dependency_identity,
+            "termination_policy": {
+                "numeric_wall_token_task_ceilings": None,
+                "terminal_conditions": ["verified_objective", "model_terminal", "model_refusal"],
+                "safety_stops": [
+                    "authority_violation", "wrong_target_route_or_model", "corrupt_start",
+                    "uncontrolled_activity", "loss_of_interpretable_evidence",
+                ],
+                "refusal_policy": "record as observed outcome; do not replace arm or change Sage",
+            },
+        }
+        if self.alternate_start is not None:
+            record["alternate_start"] = self.alternate_start.to_record()
+            record["case_identity"] = self.alternate_start.identity
+        return record
+
+    @property
+    def identity(self) -> str:
+        return hashlib.sha256(_canonical_json(self.to_record()).encode()).hexdigest()
+
+    @property
+    def setup_cleanup_seconds(self) -> float:
+        """Compatibility with the v4 coordinator; this is never serialized as a limit."""
+        return math.inf
+
+    @property
+    def provider(self) -> str:
+        return self.route.provider
+
+    @property
+    def model(self) -> str:
+        return self.route.model
 
 
 @dataclass(frozen=True)
@@ -305,8 +524,19 @@ def assert_rejected_kernel_absent() -> None:
         raise PilotError("rejected development-row kernel is loaded")
 
 
-def arm_environment(contract: PilotContract | ImprovementContract) -> dict[str, str]:
+def arm_environment(contract: PilotContract | ImprovementContract | MatrixPairContract) -> dict[str, str]:
     contract.validate()
+    if isinstance(contract, MatrixPairContract):
+        return {
+            "SAGE_EVAL_UNBOUNDED_ARM": "1",
+            "SAGE_EVAL_MODEL_TOKEN_BUDGET": "0",
+            "SAGE_EVAL_PAYLOAD_TASK_BUDGET": "",
+            "SAGE_AUTONOMOUS_CONTROLLER": "1",
+            "SAGE_POLICY_MODE": "llm",
+            "SAGE_EVAL_CAPTURE_POLICY_DECISION_PACKETS": "1",
+            "SAGE_EVAL_EXPECTED_RESPONSE_PROVIDER": contract.route.provider,
+            "SAGE_EVAL_EXPECTED_RESPONSE_MODEL": contract.route.model,
+        }
     return {
         "SAGE_CONTROLLER_WALL_S": str(contract.wall_seconds),
         "SAGE_EVAL_MODEL_TOKEN_BUDGET": str(contract.token_ceiling),
@@ -381,7 +611,11 @@ def validate_runtime_identity(value: object) -> dict[str, Any]:
 def matched_start_identity(
     start: object,
     alternate_start: AlternateStartBinding | None = None,
+    *, matrix_pair: MatrixPairContract | None = None,
 ) -> dict[str, Any]:
+    if matrix_pair is not None:
+        matrix_pair.validate()
+        alternate_start = matrix_pair.alternate_start
     alternate_keys = _MATCH_KEYS | {"case_identity"} if alternate_start is not None else _MATCH_KEYS
     if not isinstance(start, Mapping) or set(start) != alternate_keys:
         raise PilotError("start manifest does not contain the exact matching fields")
@@ -410,14 +644,24 @@ def matched_start_identity(
     if str(foothold.get("payload_type") or "").casefold() != "apollo":
         raise PilotError("foothold payload type mismatch")
     route = start.get("route")
+    expected_provider = matrix_pair.route.provider if matrix_pair is not None else PROVIDER
+    expected_model = matrix_pair.route.model if matrix_pair is not None else MODEL
     if not isinstance(route, Mapping) or (
-        route.get("provider") != PROVIDER or route.get("model") != MODEL
+        route.get("provider") != expected_provider or route.get("model") != expected_model
     ):
         raise PilotError("configured model route mismatch")
     if not str(route.get("endpoint_identity") or "").strip():
         raise PilotError("configured model endpoint identity is missing")
-    if start.get("objective_sha256") != PilotContract().to_record()["objective_sha256"]:
+    if matrix_pair is not None and route.get("endpoint_identity") != matrix_pair.route.endpoint_identity:
+        raise PilotError("configured model endpoint identity mismatch")
+    expected_objective = (matrix_pair.to_record() if matrix_pair is not None else PilotContract().to_record())["objective_sha256"]
+    if start.get("objective_sha256") != expected_objective:
         raise PilotError("objective identity mismatch")
+    if matrix_pair is not None:
+        for key in ("source_identity", "tool_contract", "dependency_identity"):
+            expected = getattr(matrix_pair, key)
+            if expected is not None and start.get(key) != expected:
+                raise PilotError(f"matrix pair {key} mismatch")
     if alternate_start is not None and start.get("case_identity") != alternate_start.identity:
         raise PilotError("alternate start case identity mismatch")
     return json.loads(json.dumps(dict(start), sort_keys=True, default=str))
@@ -429,9 +673,12 @@ def compare_start_manifests(
     *,
     ignore: frozenset[str] = frozenset(),
     alternate_start: AlternateStartBinding | None = None,
+    matrix_pair: MatrixPairContract | None = None,
 ) -> tuple[bool, list[str]]:
-    left = matched_start_identity(first, alternate_start)
-    right = matched_start_identity(second, alternate_start)
+    if matrix_pair is not None:
+        alternate_start = matrix_pair.alternate_start
+    left = matched_start_identity(first, alternate_start, matrix_pair=matrix_pair)
+    right = matched_start_identity(second, alternate_start, matrix_pair=matrix_pair)
     match_keys = _MATCH_KEYS | {"case_identity"} if alternate_start is not None else _MATCH_KEYS
     differences = [
         key for key in sorted(match_keys - ignore) if left.get(key) != right.get(key)
@@ -496,7 +743,7 @@ _RESULT_METADATA_KEYS = frozenset({
 })
 
 
-def _terminal_verifier_cost(value: object, *, observed_wall_seconds: float | None, wall_limit_seconds: float) -> dict[str, Any]:
+def _terminal_verifier_cost(value: object, *, observed_wall_seconds: float | None, wall_limit_seconds: float | None) -> dict[str, Any]:
     """Normalize an observer's actual measurement without guessing missing reads."""
     supplied = dict(value) if isinstance(value, Mapping) else {}
     reads = supplied.get("control_plane_read_count")
@@ -521,14 +768,18 @@ def _terminal_verifier_cost(value: object, *, observed_wall_seconds: float | Non
         "monetary_cost_status": "unavailable",
         "price_provenance": None,
         "wall_limit_seconds": wall_limit_seconds,
-        "limit_disposition": "unavailable" if wall is None else "exceeded" if wall > wall_limit_seconds else "within",
+        "limit_disposition": (
+            "unbounded" if wall_limit_seconds is None else
+            "unavailable" if wall is None else "exceeded" if wall > wall_limit_seconds else "within"
+        ),
         "complete": complete,
         "incomplete_reason": "" if complete else str(supplied.get("incomplete_reason") or "observer read count unavailable"),
     }
 
 
 def _measurement_identity(
-    contract: PilotContract | ImprovementContract, arm: str, start: Mapping[str, Any], execution: Mapping[str, Any],
+    contract: PilotContract | ImprovementContract | MatrixPairContract,
+    arm: str, start: Mapping[str, Any], execution: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Build the existing 14-label shape; unknown source facts stay unknown."""
     metadata = execution.get("measurement_metadata")
@@ -612,7 +863,7 @@ def _validate_result_lifecycle(records: list[Mapping[str, Any]], contract: Pilot
 
 def summarize_pair(
     records: list[Mapping[str, Any]],
-    contract: PilotContract | ImprovementContract | None = None,
+    contract: PilotContract | ImprovementContract | MatrixPairContract | None = None,
 ) -> dict[str, Any]:
     if contract is None:
         alternate = retained_alternate_start_binding(records)
@@ -646,6 +897,7 @@ def summarize_pair(
                     starts[0].get("start_identity"),
                     starts[1].get("start_identity"),
                     alternate_start=contract.alternate_start,
+                    matrix_pair=contract if isinstance(contract, MatrixPairContract) else None,
                 )
             except PilotError:
                 pair_compatible = False
@@ -654,6 +906,7 @@ def summarize_pair(
                 pair_compatible, _ = compare_start_manifests(
                     starts[0].get("start_identity"),
                     starts[1].get("start_identity"),
+                    matrix_pair=contract if isinstance(contract, MatrixPairContract) else None,
                 )
             except PilotError:
                 pair_compatible = False
@@ -689,7 +942,7 @@ def summarize_pair(
         verifier_cost = _terminal_verifier_cost(
             result.get("terminal_verifier_cost") if isinstance(result, Mapping) else None,
             observed_wall_seconds=None,
-            wall_limit_seconds=float(contract.setup_cleanup_seconds),
+            wall_limit_seconds=None if isinstance(contract, MatrixPairContract) else float(contract.setup_cleanup_seconds),
         )
         identity = result.get("measurement_identity") if isinstance(result, Mapping) else None
         identity = dict(identity) if isinstance(identity, Mapping) else None
@@ -775,7 +1028,10 @@ def summarize_pair(
         and all(row["measurement_identity_complete"] for row in arm_reports)
     )
     summary = {
-        "schema": IMPROVEMENT_SCHEMA if isinstance(contract, ImprovementContract) else PILOT_SCHEMA,
+        "schema": (
+            IMPROVEMENT_SCHEMA if isinstance(contract, ImprovementContract) else
+            MATRIX_PAIR_SCHEMA if isinstance(contract, MatrixPairContract) else PILOT_SCHEMA
+        ),
         "protocol_valid": protocol_valid,
         "pair_compatible": pair_compatible,
         "comparison_ready": comparison_ready,
@@ -788,7 +1044,10 @@ def summarize_pair(
             "control_plane_read_count": sum(verifier_reads) if all(type(item) is int for item in verifier_reads) else None,
             "monetary_cost_usd": None,
             "monetary_cost_status": "unavailable",
-            "within_support_budget": total_verifier_wall <= contract.setup_cleanup_seconds if total_verifier_wall is not None else None,
+            "within_support_budget": (
+                None if isinstance(contract, MatrixPairContract) else
+                total_verifier_wall <= contract.setup_cleanup_seconds if total_verifier_wall is not None else None
+            ),
         },
         "measurement_labels": labels,
         "performance_assertion_allowed": measurement_complete,
@@ -808,7 +1067,7 @@ def summarize_pair(
 
 
 def run_pair(
-    contract: PilotContract | ImprovementContract,
+    contract: PilotContract | ImprovementContract | MatrixPairContract,
     artifact_dir: str | Path,
     dependencies: PilotDependencies,
 ) -> dict[str, Any]:
@@ -849,8 +1108,11 @@ def run_pair(
                 support_elapsed += max(0.0, time.monotonic() - phase_started)
             if support_elapsed > contract.setup_cleanup_seconds:
                 raise PilotError("two-hour setup/cleanup admission budget was exceeded during reset")
-            alternate_start = contract.alternate_start if isinstance(contract, PilotContract) else None
-            identity = matched_start_identity(start, alternate_start)
+            alternate_start = contract.alternate_start if isinstance(contract, (PilotContract, MatrixPairContract)) else None
+            identity = matched_start_identity(
+                start, alternate_start,
+                matrix_pair=contract if isinstance(contract, MatrixPairContract) else None,
+            )
             if isinstance(contract, ImprovementContract):
                 wanted_source = contract.source_identity_for_arm(arm)
                 if identity.get("source_identity") != wanted_source:
@@ -874,6 +1136,7 @@ def run_pair(
                         else frozenset()
                     ),
                     alternate_start=alternate_start,
+                    matrix_pair=contract if isinstance(contract, MatrixPairContract) else None,
                 )
                 if not matched:
                     append_record(ledger, {
@@ -945,7 +1208,7 @@ def run_pair(
             verifier_cost = _terminal_verifier_cost(
                 supplied_verifier_cost,
                 observed_wall_seconds=observed_wall_seconds,
-                wall_limit_seconds=float(contract.setup_cleanup_seconds),
+                wall_limit_seconds=None if isinstance(contract, MatrixPairContract) else float(contract.setup_cleanup_seconds),
             )
             execution = {
                 **execution,

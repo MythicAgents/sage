@@ -138,6 +138,11 @@ def _env_positive_int(name: str, default: int) -> int:
     return value if value >= 1 else default
 
 
+def _eval_unbounded_auto_arm(mode: str) -> bool:
+    """Disable numeric controller ceilings only for an explicitly selected auto eval arm."""
+    return mode == "auto" and os.environ.get("SAGE_EVAL_UNBOUNDED_ARM", "").strip() == "1"
+
+
 def _controller_flag_enabled() -> bool:
     """Use deterministic control by default for autonomous solves, with an explicit legacy-path rollback."""
     value = os.environ.get("SAGE_AUTONOMOUS_CONTROLLER")
@@ -9433,6 +9438,8 @@ class Model:
             token_ceiling = int(os.environ.get("SAGE_EVAL_MODEL_TOKEN_BUDGET") or 0)
         except (TypeError, ValueError):
             token_ceiling = 0
+        if (_eval_unbounded_auto_arm(getattr(self, "mode", ""))):
+            token_ceiling = 0
         if token_ceiling > 0 and int(telemetry.get("total_tokens", 0) or 0) >= token_ceiling:
             return {
                 "disposition": "stop",
@@ -9804,6 +9811,8 @@ class Model:
             token_ceiling = int(os.environ.get("SAGE_EVAL_MODEL_TOKEN_BUDGET") or 0)
         except (TypeError, ValueError):
             token_ceiling = 0
+        if _eval_unbounded_auto_arm(getattr(self, "mode", "")):
+            token_ceiling = 0
         try:
             model_context_limit = int(os.environ.get("SAGE_EVAL_MODEL_CONTEXT_LIMIT") or 0)
         except (TypeError, ValueError):
@@ -9902,7 +9911,7 @@ class Model:
             MCP_EXECUTION_CONTEXT_OFFENSIVE_RUNTIME
         )
         try:
-            budget = task_budget.configured_budget(
+            budget = None if _eval_unbounded_auto_arm(getattr(self, "mode", "")) else task_budget.configured_budget(
                 _env_positive_int("SAGE_CONTROLLER_WALL_S", 2700),
                 deadline_epoch=getattr(self, "_eval_arm_deadline_epoch", None),
             )
@@ -10241,6 +10250,7 @@ class Model:
             evaluation_token_ceiling = 0
         if evaluation_token_ceiling < 0:
             evaluation_token_ceiling = 0
+        unbounded_eval_arm = _eval_unbounded_auto_arm(getattr(self, "mode", ""))
         configured_wall_seconds = float(_env_positive_int("SAGE_CONTROLLER_WALL_S", 2700))
         eval_arm_deadline_epoch = getattr(self, "_eval_arm_deadline_epoch", None)
         if eval_arm_deadline_epoch is not None:
@@ -10250,12 +10260,14 @@ class Model:
             )
         cfg = _ctrl.ControllerConfig(
             seam_timeout_s=float(_env_positive_int("SAGE_CONTROLLER_SEAM_TIMEOUT_S", 900)),
-            wall_clock_budget_s=configured_wall_seconds,
+            wall_clock_budget_s=None if unbounded_eval_arm else configured_wall_seconds,
             token_budget=(
-                evaluation_token_ceiling
-                or _env_positive_int("SAGE_CONTROLLER_TOKEN_BUDGET", 3_000_000)
+                None if unbounded_eval_arm else (
+                    evaluation_token_ceiling
+                    or _env_positive_int("SAGE_CONTROLLER_TOKEN_BUDGET", 3_000_000)
+                )
             ),
-            max_cycles=_env_positive_int("SAGE_CONTROLLER_MAX_CYCLES", 60),
+            max_cycles=None if unbounded_eval_arm else _env_positive_int("SAGE_CONTROLLER_MAX_CYCLES", 60),
             max_collection_attempts_per_request=1 if supervised_collection_lane else 2,
         )
 

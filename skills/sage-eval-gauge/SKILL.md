@@ -33,6 +33,42 @@ No historical command or allocation below is current live authority. A private a
 current only while its CLI validation succeeds. Inspect the selected producer/consumer path before reusing it; a
 legacy recipe may constrain the endpoint or resource semantics.
 
+### Model matrix contract
+
+The non-secret route catalog defaults to `.sage_history/evaluations/matrix-contract.json`; this stable path is
+relative to the Sage repository, not the campaign date. `--contract-file <path>` selects a different catalog.
+Each route has a unique lowercase `route_id` and exact `provider`, `model`, and `api_endpoint` strings. An operator
+may edit the private catalog or supply another file; keep the schema `sage-trust-walker-model-matrix-v1`, make a
+new version when changing a route after measured work begins, and retain the selected contract identity with each
+pair. The catalog contains no API keys. Set the active route and key in the ignored
+`Payload_Type/sage/.env.local`; the runner requires the configured provider, model, and endpoint to match the
+selected catalog entry exactly.
+
+These local-only commands inspect the catalog and check one active route without provider calls or range actions:
+
+```bash
+.venv/bin/python skills/sage-eval-gauge/scripts/run_trust_walker_pilot.py matrix-plan
+.venv/bin/python skills/sage-eval-gauge/scripts/run_trust_walker_pilot.py matrix-preflight --route-id <route-id>
+```
+
+Add `--contract-file <path>` to either command when selecting another catalog. A successful preflight verifies
+that a key is present without printing it. It does not establish route quality, live readiness, or live authority.
+
+For a measured matrix pair, pass `--route-id` to `run-pair`; omit it only for the historical fixed Sonnet v4
+path. The runner selects the exact route once for both the Sage autonomous and minimal raw-tool arms, records the
+contract identity, gives the Sage channel a distinct route/pair name, and resets the range between arms. Matrix
+arms have no numeric wall, token, or task ceiling; request timeouts, operator stop, and evidence/safety stops still
+apply. Keep every arm's Phoenix, Mythic, and outcome evidence before the next reset.
+
+```bash
+.venv/bin/python skills/sage-eval-gauge/scripts/run_trust_walker_pilot.py run-pair --route-id <route-id> --artifact-dir <private-pair-dir> --protected-manifest <manifest.json> --route-smoke <smoke.json> --live-authority-file <matching-private-authority.json>
+```
+
+`--contract-file <path>` also overrides the catalog for `run-pair`. Before live use, complete the runner's full
+preflight and route smoke, and provide live authority that covers this matrix route, start, reset, provider use,
+and cleanup. The command example is not authority or a claim that the range is ready. Keys stay in the ignored
+Sage `.env.local` and are never contract fields.
+
 ### Maintained Trust Walker matched pilot
 
 `scripts/run_trust_walker_pilot.py` is the maintained whole-harness versus minimal raw Mythic/BloodHound
