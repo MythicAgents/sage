@@ -439,19 +439,28 @@ def _source_identity(source_root: Path = ROOT) -> str:
     head = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=source_root, text=True, capture_output=True, check=True,
     ).stdout.strip()
-    status = subprocess.run(
-        ["git", "status", "--porcelain=v1", "-z"], cwd=source_root, capture_output=True, check=True,
+    changed = subprocess.run(
+        ["git", "diff", "--name-only", "--no-renames", "-z", "HEAD"],
+        cwd=source_root, capture_output=True, check=True,
     ).stdout
-    digest = hashlib.sha256(head.encode() + b"\0" + status)
-    for raw in status.split(b"\0"):
-        if not raw:
-            continue
-        relative = raw[3:].decode(errors="surrogateescape")
-        if " -> " in relative:
-            relative = relative.split(" -> ", 1)[1]
+    untracked = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+        cwd=source_root, capture_output=True, check=True,
+    ).stdout
+    paths = sorted(set(changed.split(b"\0") + untracked.split(b"\0")) - {b""})
+    digest = hashlib.sha256(head.encode() + b"\0")
+    for raw in paths:
+        relative = raw.decode(errors="surrogateescape")
         path = source_root / relative
-        if path.is_file() and ".sage_history" not in path.parts and "__pycache__" not in path.parts:
-            digest.update(relative.encode(errors="surrogateescape") + b"\0" + path.read_bytes())
+        if ".sage_history" in path.parts or "__pycache__" in path.parts:
+            continue
+        digest.update(raw + b"\0")
+        if path.is_symlink():
+            digest.update(b"symlink\0" + os.readlink(path).encode(errors="surrogateescape"))
+        elif path.is_file():
+            digest.update(b"file\0" + str(path.stat().st_mode & 0o111).encode() + b"\0" + path.read_bytes())
+        else:
+            digest.update(b"absent\0")
     return digest.hexdigest()
 
 
@@ -3917,14 +3926,21 @@ def replay_pair(artifact_dir: str | Path, native_evidence_manifest: str | Path |
             raise PilotError("retained response accounting is incomplete or has a different route")
         usage_complete = all(type(row.get("total_tokens")) is int for row in responses)
         tokens = sum(row["total_tokens"] for row in responses) if usage_complete else None
-        if tokens != cost.get("total_tokens") or (execution.get("resource_complete") is True and not usage_complete):
-            raise PilotError("response-derived usage disagrees with retained cost")
+        if execution.get("resource_complete") is True:
+            if not usage_complete or tokens != cost.get("total_tokens"):
+                raise PilotError("response-derived usage disagrees with retained cost")
+        elif execution.get("resource_complete") is False:
+            if cost.get("total_tokens") is not None or not execution.get("cost_error"):
+                raise PilotError("incomplete provider usage has an inconsistent retained cost")
+        else:
+            raise PilotError("retained resource completeness is missing")
         result.update(terminal_snapshot=projected, outcome=outcome)
         reports.append({
             "arm": arm, "binding": binding, "native_sha256": native["sha256"],
             "operation_id": operation_id, "native_tasks": len(observed["task"]),
             "native_responses": sum(len(row["responses"]) for row in observed["task"]),
-            "outcome": outcome, "model_calls": cost.get("model_calls"), "total_tokens": tokens,
+            "outcome": outcome, "model_calls": cost.get("model_calls"),
+            "total_tokens": cost.get("total_tokens"),
             "source_identity": (start.get("start_identity") or {}).get("source_identity"),
             "measurement_identity": result.get("measurement_identity"),
         })
@@ -4255,13 +4271,14 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--contract-file", type=Path, default=DEFAULT_MATRIX_CONTRACT)
         if name in {"rehearse-setup", "continue-setup", "run-pair"}:
             _add_live_authority_args(command)
-        if name == "run-pair":
+        if name in {"preflight", "rehearse-setup", "continue-setup", "run-pair"}:
             command.add_argument(
                 "--arm-order",
                 choices=("shipping-first", "raw-first"),
                 default="shipping-first",
-                help="Prospectively select one of the two fixed matched-pair arm orders.",
+                help="Prospectively select the matched-pair arm order for setup or execution.",
             )
+        if name == "run-pair":
             command.add_argument("--measurement-metadata", help="Non-secret JSON producer metadata for M1 labels.")
     cleanup = sub.add_parser("cleanup")
     cleanup.add_argument("--artifact-dir", required=True)

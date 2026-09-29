@@ -115,10 +115,16 @@ fi
 # 1) Clear the snapshot's local console user before opening Samwell's RDP session. Retry while WinRM
 #    finishes booting, but never log off any other account.
 LOGOFF_LOG=/tmp/sage_localuser_logoff.log
+LOGOFF_ARGS=()
+# CASTELBLACK autologs localuser on after WinRM first responds. An empty
+# census during boot is not proof that its interactive slot was freed.
+if [ "$TARGET_HOST" != "CASTELBLACK" ]; then
+  LOGOFF_ARGS+=(--allow-already-absent)
+fi
 for attempt in $(seq 1 30); do
   if "$REPO/.venv/bin/python" "$HERE/deploy_payload_via_ludus.py" logoff-user \
       --target-host "$TARGET_HOST" --target-ip "$TARGET_IP" --username localuser \
-      --allow-already-absent >"$LOGOFF_LOG" 2>&1; then
+      "${LOGOFF_ARGS[@]}" >"$LOGOFF_LOG" 2>&1; then
     echo "Apollo foothold: localuser session cleared"
     break
   fi

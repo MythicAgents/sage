@@ -126,6 +126,31 @@ def test_matrix_live_authority_binds_catalog_route_start_and_snapshot(tmp_path):
         cli._resolve_live_authority(args, pair)
 
 
+def test_source_identity_tracks_working_bytes_without_index_staging(tmp_path):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    source = tmp_path / "source.py"
+    source.write_text("value = 1\n")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "source.py"], check=True)
+    subprocess.run([
+        "git", "-C", str(tmp_path), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+        "commit", "--quiet", "-m", "initial",
+    ], check=True)
+
+    source.write_text("value = 2\n")
+    unstaged = cli._source_identity(tmp_path)
+    subprocess.run(["git", "-C", str(tmp_path), "add", "source.py"], check=True)
+    assert cli._source_identity(tmp_path) == unstaged
+
+    extra = tmp_path / "extra.py"
+    extra.write_text("extra = 1\n")
+    untracked = cli._source_identity(tmp_path)
+    assert untracked != unstaged
+    subprocess.run(["git", "-C", str(tmp_path), "add", "extra.py"], check=True)
+    assert cli._source_identity(tmp_path) == untracked
+    extra.write_text("extra = 2\n")
+    assert cli._source_identity(tmp_path) != untracked
+
+
 def test_matrix_raw_model_uses_selected_route_without_arm_deadline(monkeypatch):
     selected = pilot.MatrixRoute("qwen", "openai", "qwen/qwen3-32b", "https://openrouter.ai/api/v1")
     runtime = object.__new__(cli.RuntimePilot)
@@ -345,6 +370,31 @@ def test_offline_replay_reconstructs_produced_pair_without_live_dependencies(tmp
     assert "synthetic-native-body-do-not-print" not in output
     assert (tmp_path / "pilot.jsonl").read_bytes() == before
     assert len([row for row in records if row["record_type"] == "arm_result"]) == 2
+
+
+def test_offline_replay_preserves_unknown_total_after_failed_provider_attempt(tmp_path, monkeypatch):
+    matrix = pilot.MatrixContract(schema=pilot.MATRIX_SCHEMA, routes=(
+        pilot.MatrixRoute("qwen", "openai", "qwen/qwen3-32b", "https://openrouter.ai/api/v1"),
+    ))
+    contract = pilot.MatrixPairContract.for_route(matrix, "qwen", start_case="samwell-castelblack")
+    records = retained_native_pair(tmp_path, monkeypatch, contract)
+    arm = next(row for row in records if row["record_type"] == "arm_result")
+    execution = arm["execution"]
+    execution["cost"].update(model_attempts=2, model_calls=1, total_tokens=None)
+    execution.update(
+        cost_error="provider request has no authoritative response usage",
+        resource_complete=False,
+        in_flight_model_responses=1,
+    )
+    comparison = next(row for row in records if row["record_type"] == "comparison")
+    comparison.update(cli.summarize_pair(records, contract))
+    (tmp_path / "pilot.jsonl").write_text("\n".join(json.dumps(row) for row in records) + "\n")
+
+    replay = cli.replay_pair(tmp_path)
+
+    assert replay["reproduced"] is True
+    assert replay["arms"][0]["total_tokens"] is None
+    assert replay["comparison"]["resources_complete"] is False
 
 
 @pytest.mark.parametrize("mutation", [
@@ -1891,6 +1941,34 @@ def test_run_pair_passes_prospectively_selected_raw_first_contract(monkeypatch, 
 
     assert code == 0
     assert captured["arm_order"] == tuple(reversed(cli.ARM_ORDER))
+
+
+def test_setup_rehearsal_passes_prospectively_selected_raw_first_contract(monkeypatch, tmp_path):
+    class FakeRuntime:
+        live_authority_id = ""
+        live_authority_receipt = {}
+        matrix_catalog_receipt = None
+
+    captured = {}
+    monkeypatch.setattr(cli, "_runtime", lambda _args: FakeRuntime())
+
+    def fake_rehearsal(_runtime, contract, _artifact_dir, *, resume):
+        captured["arm_order"] = contract.arm_order
+        captured["resume"] = resume
+        return {"complete": True}
+
+    monkeypatch.setattr(cli, "run_setup_rehearsals", fake_rehearsal)
+    code = cli.main([
+        "rehearse-setup",
+        "--artifact-dir", str(tmp_path),
+        "--protected-manifest", str(tmp_path / "protected.json"),
+        "--route-smoke", str(tmp_path / "smoke.json"),
+        "--live-authority-id", "authorized-test",
+        "--arm-order", "raw-first",
+    ])
+
+    assert code == 0
+    assert captured == {"arm_order": tuple(reversed(cli.ARM_ORDER)), "resume": False}
 
 
 def test_protected_manifest_requires_canonical_path_set(tmp_path, monkeypatch):

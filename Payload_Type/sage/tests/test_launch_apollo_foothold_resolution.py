@@ -55,10 +55,87 @@ def test_interactive_launcher_uses_existing_skill_local_password(tmp_path):
     assert result.returncode == 0, result.stderr
     invoked = calls.read_text().splitlines()
     assert "deploy_payload_via_ludus.py logoff-user " in invoked[0]
-    assert "--allow-already-absent" in invoked[0]
+    assert "--allow-already-absent" not in invoked[0]
     assert "deploy_payload_via_ludus.py launch-existing " in invoked[1]
     assert "fixture-only-secret" not in result.stdout + result.stderr
     assert "mythic-fixture-secret" not in result.stdout + result.stderr
+
+
+def test_castelblack_launcher_waits_for_real_localuser_logoff_before_rdp(tmp_path):
+    repo = tmp_path / "sage"
+    launcher = repo / "skills/sage-mythic-payload-deploy/scripts/launch_apollo_foothold.sh"
+    launcher.parent.mkdir(parents=True)
+    shutil.copy2(SCRIPT, launcher)
+    fake_python = repo / ".venv/bin/python"
+    fake_python.parent.mkdir(parents=True)
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$*" >> "$CALLS"\n'
+        'case "$*" in *--allow-already-absent*) exit 0;; esac\n'
+        'exit 1\n'
+    )
+    fake_python.chmod(0o755)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    for name in ("python3", "sleep"):
+        stub = fake_bin / name
+        stub.write_text(f"#!/bin/sh\nprintf '{name}\\n' >> \"$CALLS\"\n")
+        stub.chmod(0o755)
+    calls = tmp_path / "calls.txt"
+    mythic_env = tmp_path / "mythic.env"
+    mythic_env.write_text("MYTHIC_ADMIN_PASSWORD=fixture-only-secret\n")
+    env = dict(os.environ)
+    env.update(
+        PATH=f"{fake_bin}:/usr/bin:/bin", SAGE_RDP_DISPLAY=":42",
+        SAGE_RUN_AS_PASSWORD="fixture-only-password", MYTHIC_ENV_PATH=str(mythic_env),
+        CALLS=str(calls),
+    )
+    result = subprocess.run(
+        ["/bin/bash", str(launcher), "10.4.10.22", r"NORTH\samwell.tarly"],
+        cwd=repo, env=env, capture_output=True, text=True, timeout=10, check=False,
+    )
+    invoked = calls.read_text().splitlines()
+    assert result.returncode == 2
+    assert len([line for line in invoked if " logoff-user " in line]) == 30
+    assert all("--allow-already-absent" not in line for line in invoked)
+    assert "python3" not in invoked
+    assert "launch-existing" not in " ".join(invoked)
+
+
+def test_non_castelblack_launcher_accepts_verified_absence(tmp_path):
+    repo = tmp_path / "sage"
+    launcher = repo / "skills/sage-mythic-payload-deploy/scripts/launch_apollo_foothold.sh"
+    launcher.parent.mkdir(parents=True)
+    shutil.copy2(SCRIPT, launcher)
+    fake_python = repo / ".venv/bin/python"
+    fake_python.parent.mkdir(parents=True)
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$*" >> "$CALLS"\n'
+    )
+    fake_python.chmod(0o755)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_python3 = fake_bin / "python3"
+    fake_python3.write_text("#!/bin/sh\nexit 0\n")
+    fake_python3.chmod(0o755)
+    calls = tmp_path / "calls.txt"
+    mythic_env = tmp_path / "mythic.env"
+    mythic_env.write_text("MYTHIC_ADMIN_PASSWORD=fixture-only-secret\n")
+    env = dict(os.environ)
+    env.update(
+        PATH=f"{fake_bin}:/usr/bin:/bin", SAGE_RDP_DISPLAY=":42",
+        SAGE_RUN_AS_PASSWORD="fixture-only-password", MYTHIC_ENV_PATH=str(mythic_env),
+        CALLS=str(calls),
+    )
+    result = subprocess.run(
+        ["/bin/bash", str(launcher), "10.4.10.12", r"ESSOS\jorah.mormont",
+         "--", "--target-host", "MEEREEN"],
+        cwd=repo, env=env, capture_output=True, text=True, timeout=10, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    invoked = calls.read_text().splitlines()
+    assert "--allow-already-absent" in invoked[0]
 
 
 def test_interactive_launcher_rejects_unusable_mythic_env_before_helpers(tmp_path):
