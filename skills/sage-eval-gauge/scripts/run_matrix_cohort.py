@@ -49,6 +49,10 @@ RESET_STAGE_NAMES = frozenset({
     "foothold-launch", "readiness", "callback-discovery", "reset-orchestration",
 })
 RESET_STAGE_ERRORS = frozenset({"SystemExit", "KeyboardInterrupt", "TimeoutExpired", "UnexpectedError"})
+RESET_DIAGNOSTIC_CODES = frozenset({
+    "unclassified", "postgres_config_missing", "postgres_remove_failed", "disk_full", "port_conflict",
+    "docker_unavailable", "dependency_unhealthy", "services_not_ready", "startup_timeout",
+})
 
 
 class DriverError(RuntimeError):
@@ -493,6 +497,9 @@ def _reset_stage_diagnostic(artifact_dir: Path) -> str | None:
             timeout_seconds = row.get("timeout_seconds")
             if type(timeout_seconds) in (int, float) and 0 < timeout_seconds <= 86400:
                 detail += f" timeout_seconds={timeout_seconds:g}"
+            diagnostic_code = row.get("diagnostic_code")
+            if isinstance(diagnostic_code, str) and diagnostic_code in RESET_DIAGNOSTIC_CODES:
+                detail += f" diagnostic_code={diagnostic_code}"
         return detail
     return None
 

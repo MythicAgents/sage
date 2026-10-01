@@ -337,10 +337,14 @@ class _CaptureHandler:
 _SETUP_STAGES=frozenset({"stop-sage","archive-dbs","reset-mythic","ludus-rollback","ludus-poweron",
     "range-boot","clock-reachability","sync-range-time","wipe-bloodhound","bloodhound-empty",
     "restart-sage","bootstrap-foothold","foothold-power","foothold-launch","readiness","callback-discovery"})
+_RESET_DIAGNOSTIC_CODES=frozenset({"unclassified","postgres_config_missing","postgres_remove_failed",
+    "disk_full","port_conflict","docker_unavailable","dependency_unhealthy","services_not_ready",
+    "startup_timeout"})
 
 
 def _capture_setup_stage(records:list[dict[str,Any]],states:dict[str,str],event:Mapping[str,Any])->None:
-    if (not isinstance(event,Mapping) or set(event)!={"stage","status","error_class","exit_code","timeout_seconds"}
+    base_fields={"stage","status","error_class","exit_code","timeout_seconds"}
+    if (not isinstance(event,Mapping) or set(event) not in (base_fields,base_fields|{"diagnostic_code"})
             or event.get("stage") not in _SETUP_STAGES or event.get("status") not in {"started","passed","failed"}
             or event.get("error_class") not in {None,"SystemExit","TimeoutExpired","UnexpectedError"}
             or event.get("exit_code") is not None and (type(event["exit_code"]) is not int
@@ -349,6 +353,10 @@ def _capture_setup_stage(records:list[dict[str,Any]],states:dict[str,str],event:
                 or isinstance(event["timeout_seconds"],bool) or not math.isfinite(event["timeout_seconds"])
                 or event["timeout_seconds"]<=0)):
         raise CaptureEpisodeError("capture setup diagnostic is malformed")
+    code=event.get("diagnostic_code")
+    if (code is not None and (not isinstance(code,str) or code not in _RESET_DIAGNOSTIC_CODES
+            or event["stage"]!="reset-mythic" or event["status"]!="failed")):
+        raise CaptureEpisodeError("capture setup diagnostic is malformed")
     prior=states.get(event["stage"])
     if ((event["status"]=="started" and prior is not None) or
             (event["status"] in {"passed","failed"} and prior!="started") or
@@ -356,7 +364,10 @@ def _capture_setup_stage(records:list[dict[str,Any]],states:dict[str,str],event:
             (event["status"]=="passed" and any(event[k] is not None for k in ("error_class","exit_code","timeout_seconds"))) or
             (event["status"]=="failed" and event["error_class"] is None)):
         raise CaptureEpisodeError("capture setup diagnostic is malformed")
-    states[event["stage"]]=event["status"];records.append(dict(event))
+    states[event["stage"]]=event["status"]
+    row=dict(event)
+    if code is None:row.pop("diagnostic_code",None)
+    records.append(row)
 
 
 class _Pump:

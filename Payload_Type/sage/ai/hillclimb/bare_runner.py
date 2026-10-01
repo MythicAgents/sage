@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import tempfile
 import time
 from dataclasses import asdict, dataclass, field
@@ -100,6 +101,54 @@ class BareRunnerRecoveryError(RuntimeError):
     """The saved arm cannot safely continue without changing its evidence."""
 
 
+_MODEL_ERROR_TYPES = frozenset({
+    "APIConnectionError", "APITimeoutError", "APIStatusError", "BadRequestError",
+    "AuthenticationError", "PermissionDeniedError", "NotFoundError",
+    "ConflictError", "UnprocessableEntityError", "RateLimitError",
+    "InternalServerError", "TimeoutError", "ConnectError", "ReadTimeout",
+    "ProviderResponseBoundaryError", "ResourceHTTPError", "ValueError", "TypeError",
+    "JSONDecodeError", "ValidationError", "APIResponseValidationError",
+})
+_MODEL_ERROR_CODES = frozenset({
+    "context_length_exceeded", "context_window_exceeded", "max_context_length_exceeded",
+    "prompt_too_long", "rate_limit_exceeded", "rate_limit_error", "too_many_requests",
+    "slow_down", "insufficient_quota", "quota_exceeded", "billing_hard_limit_reached",
+    "server_error", "service_unavailable", "overloaded_error", "server_is_overloaded", "invalid_api_key",
+    "authentication_error", "permission_denied", "invalid_request_error", "model_not_found",
+})
+
+
+def _safe_model_error_diagnostic(value: object) -> dict[str, object]:
+    """Validate even completed checkpoints before returning their provider metadata."""
+    candidate = value if isinstance(value, dict) else {}
+    error_type = candidate.get("error_type")
+    result: dict[str, object] = {
+        "error_type": error_type if isinstance(error_type, str) and error_type in _MODEL_ERROR_TYPES else "OtherError",
+    }
+    code = candidate.get("provider_code")
+    if isinstance(code, str) and code in _MODEL_ERROR_CODES:
+        result["provider_code"] = code
+    status = candidate.get("http_status")
+    if type(status) is int and 100 <= status <= 599:
+        result["http_status"] = status
+    request_id = candidate.get("request_id")
+    if (isinstance(request_id, str)
+            and re.fullmatch(r"req[-_][A-Za-z0-9]{8,96}", request_id)
+            and not request_id.casefold().startswith(("req_sk", "req_bearer"))):
+        result["request_id"] = request_id
+    seconds = candidate.get("retry_after_seconds")
+    if type(seconds) in (int, float) and math.isfinite(seconds) and 0 <= seconds <= 3600:
+        result["retry_after_seconds"] = float(seconds)
+    return result
+
+
+def _diagnostic_from_model_error(exc: BaseException) -> dict[str, object]:
+    value = getattr(exc, "diagnostic", None)
+    if isinstance(value, dict):
+        return _safe_model_error_diagnostic(value)
+    return _safe_model_error_diagnostic({"error_type": type(exc).__name__})
+
+
 def _checkpoint_write(path: Path, value: dict) -> None:
     """Replace one private JSON snapshot durably; never expose a partial snapshot."""
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -143,6 +192,7 @@ class BareModelResult:
         "cause": "other_declared_boundary",
         "subtype": "unknown",
     })
+    model_error_diagnostic: dict[str, object] | None = None
 
 
 def terminal_cause(stopped: object, final_text: object = "", error: BaseException | None = None) -> dict[str, str]:
@@ -298,6 +348,7 @@ class BareModelRunner:
         objective_recognized = False
         recoverable_tool_errors: list[dict[str, object]] = []
         model_error: BaseException | None = None
+        model_error_diagnostic: dict[str, object] | None = None
         token_budget = TokenBudget(ceiling=self.token_ceiling or (2**63 - 1))
         phase = "ready"
         saved_decision = None
@@ -342,6 +393,10 @@ class BareModelRunner:
                     raise BareRunnerRecoveryError("checkpoint binding differs from this arm")
                 phase = saved["phase"]
                 if phase == "completed":
+                    if saved["result"].get("model_error_diagnostic") is not None:
+                        saved["result"]["model_error_diagnostic"] = _safe_model_error_diagnostic(
+                            saved["result"]["model_error_diagnostic"]
+                        )
                     return BareModelResult(**saved["result"])
                 if phase == "model_inflight":
                     raise BareRunnerRecoveryError(
@@ -450,12 +505,20 @@ class BareModelRunner:
                     stopped = "timeout" if self.provider_timeout_is_wall or (
                         self.timeout is not None and elapsed() >= self.timeout) else "error"
                     model_error = exc
+                    model_error_diagnostic = _diagnostic_from_model_error(exc)
+                    if self.event_sink is not None:
+                        self.event_sink({"event": "model_request_failed", "model_attempt": model_attempts,
+                                         "diagnostic": dict(model_error_diagnostic)})
                     log(f"⏱ model request stopped at step {step}: {type(exc).__name__}")
                     break
                 except Exception as exc:
                     stopped = "error"
                     model_error = exc
-                    log(f"✗ step {step} model error: {type(exc).__name__}: {exc}")
+                    model_error_diagnostic = _diagnostic_from_model_error(exc)
+                    if self.event_sink is not None:
+                        self.event_sink({"event": "model_request_failed", "model_attempt": model_attempts,
+                                         "diagnostic": dict(model_error_diagnostic)})
+                    log(f"✗ step {step} model error: {model_error_diagnostic['error_type']}")
                     break
             if phase == "response_saved":
                 decision = saved_decision
@@ -574,6 +637,7 @@ class BareModelRunner:
             token_budget_exhausted=bool(self.token_ceiling is not None and token_budget.exhausted),
             token_budget_overshoot=bool(self.token_ceiling is not None and token_budget.overshoot),
             recoverable_tool_errors=recoverable_tool_errors,
+            model_error_diagnostic=model_error_diagnostic,
             termination=terminal_cause(stopped, final_txt, model_error),
         )
         if self.checkpoint_path is not None:

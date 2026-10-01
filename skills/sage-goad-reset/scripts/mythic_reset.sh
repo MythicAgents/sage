@@ -110,6 +110,17 @@ add_required_service() {
   REQUIRED_SERVICES+=("$service")
 }
 
+remove_stopped_postgres_container() {
+  # Mythic's postgres image moves pg_hba.conf from its container filesystem into
+  # the bind-mounted database on first boot. Wiping the database and restarting
+  # that same container leaves the source file missing. Compose recreates only
+  # this service on the next start; omitting --volumes preserves other data.
+  mythic_docker compose rm --force mythic_postgres || {
+    echo "ERR: unable to remove stopped Mythic postgres container" >&2
+    return 1
+  }
+}
+
 if [[ "${SAGE_RESET_METERED_DOCKER:-0}" == "1" ]]; then
   [[ -n "${SAGE_RESOURCE_BUDGET_CONFIG:-}" && -f "$SAGE_RESOURCE_BUDGET_CONFIG" \
     && -n "${SAGE_RESOURCE_BUDGET_LEDGER:-}" && -f "$SAGE_RESOURCE_BUDGET_LEDGER" ]] || {
@@ -184,6 +195,7 @@ except Exception:
   }
   RESET_MUTATION_STARTED=1
   mythic_docker compose stop
+  remove_stopped_postgres_container
   mythic_docker run --rm --pull never \
     -v "$MYTHIC_DIR/postgres-docker/database:/db" \
     alpine sh -c 'rm -rf /db/* /db/.[!.]* /db/..?*'
@@ -204,6 +216,7 @@ else
   RESET_MUTATION_STARTED=1
   mythic_cli stop
   if [[ -d "$MYTHIC_DIR/postgres-docker/database" ]]; then
+    remove_stopped_postgres_container
     docker run --rm \
       -v "$MYTHIC_DIR/postgres-docker/database:/db" \
       alpine sh -c 'rm -rf /db/* /db/.[!.]* /db/..?*'

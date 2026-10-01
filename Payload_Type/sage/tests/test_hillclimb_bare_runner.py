@@ -130,7 +130,12 @@ def test_provider_timeout_retains_attempt_and_marks_cost_incomplete():
     assert result.model_response_records == []
     assert result.total_tokens == 0
     assert result.token_usage_complete is False
-    assert events == [{"event": "model_request_started", "model_attempt": 1}]
+    assert result.model_error_diagnostic == {"error_type": "TimeoutError"}
+    assert events == [
+        {"event": "model_request_started", "model_attempt": 1},
+        {"event": "model_request_failed", "model_attempt": 1,
+         "diagnostic": {"error_type": "TimeoutError"}},
+    ]
 
 
 def test_response_is_durably_emitted_before_validation_and_cannot_dispatch():

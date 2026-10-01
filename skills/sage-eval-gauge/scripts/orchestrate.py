@@ -23,6 +23,7 @@ import json
 import math
 import os
 import re
+import selectors
 import signal
 import subprocess
 import sys
@@ -738,12 +739,84 @@ def _phase8_goad_regression_eval_env(
 def _run(name, argv, cwd, timeout, env: dict[str, str] | None = None,
          deadline: "_ResetDeadline | None" = None):
     print(f"\n=== {name} ===\n$ (cd {cwd}) {' '.join(argv)}", flush=True)
-    proc = (subprocess.run(argv, cwd=str(cwd), timeout=timeout, text=True, env=env)
-            if deadline is None else deadline.run(argv, cwd=cwd, cap=timeout, env=env))
+    if name == "reset mythic":
+        proc = _run_mythic_reset_bounded(argv, cwd=cwd, timeout=timeout, env=env, deadline=deadline)
+    else:
+        proc = (subprocess.run(argv, cwd=str(cwd), timeout=timeout, text=True, env=env)
+                if deadline is None else deadline.run(argv, cwd=cwd, cap=timeout, env=env))
     if proc.returncode != 0:
         error=SystemExit(f"ABORT: step '{name}' failed (exit {proc.returncode}) — not running the gauge on a bad range.")
         error.setup_exit_code=proc.returncode
+        if name == "reset mythic":
+            error.setup_diagnostic_code = proc.setup_diagnostic_code
         raise error
+
+
+def _mythic_reset_diagnostic(output: bytes) -> str:
+    """Map untrusted reset output to a fixed, nonsecret diagnostic code."""
+    lower = output.lower()
+    if b"pg_hba.conf" in lower and any(word in lower for word in (
+        b"no such file", b"cannot stat", b"missing", b"not found")):
+        return "postgres_config_missing"
+    if b"unable to remove stopped mythic postgres container" in lower:
+        return "postgres_remove_failed"
+    if b"no space left on device" in lower:
+        return "disk_full"
+    if b"port is already allocated" in lower or b"address already in use" in lower:
+        return "port_conflict"
+    if b"cannot connect to the docker daemon" in lower:
+        return "docker_unavailable"
+    if b"dependency failed to start" in lower or b"dependency is unhealthy" in lower:
+        return "dependency_unhealthy"
+    if b"configured mythic services are not ready" in lower:
+        return "services_not_ready"
+    if b"context deadline exceeded" in lower or b"timed out" in lower:
+        return "startup_timeout"
+    return "unclassified"
+
+
+def _run_mythic_reset_bounded(argv, *, cwd, timeout, env, deadline):
+    """Drain the reset child while keeping only a bounded tail for classification."""
+    owner = deadline or _ResetDeadline(timeout)
+    limit = owner.remaining(timeout)
+    expires = time.monotonic() + limit
+    process = subprocess.Popen(argv, cwd=str(cwd), env=env, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, start_new_session=True)
+    diagnostic = "unclassified"
+    overlap = b""
+    priority = {"unclassified": 0, "startup_timeout": 1, "services_not_ready": 2,
+                "dependency_unhealthy": 3, "docker_unavailable": 4, "port_conflict": 4,
+                "disk_full": 5, "postgres_remove_failed": 6, "postgres_config_missing": 6}
+    try:
+        assert process.stdout is not None
+        with selectors.DefaultSelector() as selected:
+            selected.register(process.stdout, selectors.EVENT_READ)
+            while selected.get_map() or process.poll() is None:
+                remaining = expires - time.monotonic()
+                if remaining <= 0:
+                    error = SystemExit("ABORT: Mythic reset child exceeded its timeout")
+                    error.setup_timeout_seconds = limit
+                    error.setup_diagnostic_code = "startup_timeout"
+                    raise error
+                for key, _events in selected.select(timeout=min(remaining, 0.5)):
+                    chunk = os.read(key.fileobj.fileno(), 65536)
+                    if chunk:
+                        observed = _mythic_reset_diagnostic(overlap + chunk)
+                        if priority[observed] > priority[diagnostic]:
+                            diagnostic = observed
+                        overlap = (overlap + chunk)[-128:]
+                    else:
+                        selected.unregister(key.fileobj)
+        process.wait()
+        result = subprocess.CompletedProcess(argv, process.returncode, None, None)
+        result.setup_diagnostic_code = diagnostic
+        return result
+    except BaseException:
+        owner.terminate(process)
+        raise
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
 
 
 class _ResetDeadline:
@@ -1193,7 +1266,8 @@ def full_reset_and_ready(
                     "TimeoutExpired" if isinstance(error,subprocess.TimeoutExpired) else
                     "KeyboardInterrupt" if isinstance(error,KeyboardInterrupt) else "UnexpectedError"),
                 "exit_code":getattr(error,"setup_exit_code",None),
-                "timeout_seconds":getattr(error,"setup_timeout_seconds",getattr(error,"timeout",None))})
+                "timeout_seconds":getattr(error,"setup_timeout_seconds",getattr(error,"timeout",None)),
+                "diagnostic_code":getattr(error,"setup_diagnostic_code",None)})
             raise
         if setup_stage_callback is not None:setup_stage_callback({"stage":name,"status":"passed",
             "error_class":None,"exit_code":None,"timeout_seconds":None})

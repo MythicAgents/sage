@@ -92,6 +92,10 @@ RESET_STAGE_NAMES = frozenset({
     "foothold-launch", "readiness", "callback-discovery", "reset-orchestration",
 })
 RESET_STAGE_ERRORS = frozenset({"SystemExit", "KeyboardInterrupt", "TimeoutExpired", "UnexpectedError"})
+RESET_DIAGNOSTIC_CODES = frozenset({
+    "unclassified", "postgres_config_missing", "postgres_remove_failed", "disk_full", "port_conflict",
+    "docker_unavailable", "dependency_unhealthy", "services_not_ready", "startup_timeout",
+})
 MYTHIC_ENV_KEYS = ("MYTHIC_ADMIN_PASSWORD", "RABBITMQ_PASSWORD")
 BLOODHOUND_ENV_KEYS = (
     "BLOODHOUND_SCHEME",
@@ -2578,11 +2582,15 @@ class RuntimePilot:
             timeout_seconds = event.get("timeout_seconds")
             if type(timeout_seconds) not in (int, float) or not 0 < timeout_seconds <= 86400:
                 timeout_seconds = None
+            diagnostic_code = event.get("diagnostic_code")
+            if not isinstance(diagnostic_code, str) or diagnostic_code not in RESET_DIAGNOSTIC_CODES:
+                diagnostic_code = None
             append_record(stage_path, {
                 "record_type": "reset_stage", "arm": arm, "stage": stage, "status": status,
                 "error_class": error_class if status == "failed" else None,
                 "exit_code": exit_code if status == "failed" else None,
                 "timeout_seconds": timeout_seconds if status == "failed" else None,
+                "diagnostic_code": diagnostic_code if status == "failed" else None,
             })
             last_stage_status = status
 
@@ -3110,6 +3118,8 @@ class RuntimePilot:
                             else result.termination),
             "response_records": result.model_response_records,
             "recoverable_tool_errors": result.recoverable_tool_errors,
+            **({"model_error_diagnostic": result.model_error_diagnostic}
+               if getattr(result, "model_error_diagnostic", None) is not None else {}),
         })
         route_error = None
         inspected_usage_complete = False
@@ -3143,6 +3153,8 @@ class RuntimePilot:
                             else result.termination),
             "transcript": transcript,
             "response_records": safe_records,
+            **({"model_error_diagnostic": result.model_error_diagnostic}
+               if getattr(result, "model_error_diagnostic", None) is not None else {}),
             "arm_started_at": started_at.isoformat(),
             "arm_deadline_at": deadline_at.isoformat() if deadline_at is not None else None,
             "task_budget": budget_snapshot,

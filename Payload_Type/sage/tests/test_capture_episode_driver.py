@@ -267,6 +267,26 @@ def test_actual_reset_stage_failure_is_retained_with_cleanup_without_child_secre
     assert "PLANTED-RESET-CHILD-SECRET" not in retained.read_text()
 
 
+def test_capture_setup_stage_accepts_only_fixed_mythic_reset_diagnostic():
+    records=[];states={}
+    started={"stage":"reset-mythic","status":"started","error_class":None,
+        "exit_code":None,"timeout_seconds":None,"diagnostic_code":None}
+    driver._capture_setup_stage(records,states,started)
+    assert "diagnostic_code" not in records[0]
+    failed={**started,"status":"failed","error_class":"SystemExit","exit_code":1,
+        "diagnostic_code":"postgres_remove_failed"}
+    driver._capture_setup_stage(records,states,failed)
+    assert records[-1]["diagnostic_code"]=="postgres_remove_failed"
+
+    for invalid in ("PLANTED-SECRET", ["postgres_remove_failed"]):
+        with pytest.raises(driver.CaptureEpisodeError):
+            driver._capture_setup_stage([], {"reset-mythic":"started"},
+                {**failed,"diagnostic_code":invalid})
+    with pytest.raises(driver.CaptureEpisodeError):
+        driver._capture_setup_stage([], {"archive-dbs":"started"},
+            {**failed,"stage":"archive-dbs"})
+
+
 def test_child_preflight_failure_is_retained_before_reset_without_output_secret(monkeypatch,tmp_path):
     frozen,config,ledger,_receiver,source,approved=_frozen(tmp_path)
     monkeypatch.setattr(driver,"_validate",lambda *_a,**_k:{"approved":approved,"source_binding":source,

@@ -122,6 +122,57 @@ def test_full_reset_reports_owned_child_timeout_without_raw_output(monkeypatch,t
     assert 0<events[-1]["timeout_seconds"]<=.1 and "PLANTED" not in str(events)
 
 
+def test_mythic_reset_failure_classifies_streamed_output_without_retaining_secret(monkeypatch, tmp_path):
+    script = tmp_path / "failed_reset.py"
+    script.write_text(
+        "import os,time\n"
+        "os.write(2,b'pg_hba.')\n"
+        "time.sleep(.05)\n"
+        "os.write(2,b'conf: No such file or directory\\n')\n"
+        "os.write(1,b'PLANTED-SECRET-'*20000)\n"
+        "raise SystemExit(17)\n"
+    )
+    monkeypatch.setattr(orchestrate, "_range_env", lambda *_a, **_k: {})
+    monkeypatch.setattr(orchestrate, "RESET_STEPS", [
+        ("reset mythic", [sys.executable, str(script)], tmp_path, 10),
+    ])
+    events = []
+    with pytest.raises(SystemExit) as captured:
+        orchestrate.full_reset_and_ready(setup_stage_callback=events.append)
+    assert captured.value.setup_exit_code == 17
+    assert captured.value.setup_diagnostic_code == "postgres_config_missing"
+    assert events[-1]["diagnostic_code"] == "postgres_config_missing"
+    assert "PLANTED-SECRET" not in str(events)
+    assert "PLANTED-SECRET" not in str(captured.value)
+
+
+@pytest.mark.parametrize("message, expected", [
+    (b"ERR: unable to remove stopped Mythic postgres container", "postgres_remove_failed"),
+    (b"dependency failed to start: container unhealthy", "dependency_unhealthy"),
+    (b"secret=PLANTED-SECRET and unknown error", "unclassified"),
+])
+def test_mythic_reset_diagnostic_is_fixed_code(message, expected):
+    assert orchestrate._mythic_reset_diagnostic(message) == expected
+
+
+def test_mythic_reset_timeout_kills_process_group_and_records_code(monkeypatch, tmp_path):
+    marker = tmp_path / "escaped"
+    script = tmp_path / "sleeper.sh"
+    script.write_text(f"#!/bin/bash\n(sleep 0.4; : > {marker}) &\nwait\n")
+    script.chmod(0o700)
+    monkeypatch.setattr(orchestrate, "_range_env", lambda *_a, **_k: {})
+    monkeypatch.setattr(orchestrate, "RESET_STEPS", [
+        ("reset mythic", [str(script)], tmp_path, 5),
+    ])
+    events = []
+    with pytest.raises(SystemExit):
+        orchestrate.full_reset_and_ready(capture_total_timeout=.05, setup_stage_callback=events.append)
+    time.sleep(.5)
+    assert not marker.exists()
+    assert events[-1]["status"] == "failed"
+    assert events[-1]["diagnostic_code"] == "startup_timeout"
+
+
 def test_poll_failure_exposes_only_numeric_signed_returncode(monkeypatch,tmp_path):
     monkeypatch.setattr(orchestrate.subprocess,"run",lambda *_a,**_k:
         subprocess.CompletedProcess([], -9, "", "PLANTED-POLL-SECRET"))

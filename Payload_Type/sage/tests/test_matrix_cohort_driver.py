@@ -292,6 +292,7 @@ def test_failed_reset_stage_is_reported_without_child_text(tmp_path, monkeypatch
         write_row(artifact / "reset-stages.jsonl", {
             "record_type": "reset_stage", "arm": "shipping-sage", "stage": "archive-dbs",
             "status": "failed", "error_class": "SystemExit", "exit_code": -15,
+            "diagnostic_code": "dependency_unhealthy",
             "stderr": secret,
         })
         return 1, None
@@ -299,10 +300,10 @@ def test_failed_reset_stage_is_reported_without_child_text(tmp_path, monkeypatch
     monkeypatch.setattr(driver, "_invoke", invoke)
     assert driver.main(["run", "--plan", str(path), "--work-dir", str(work)]) == 1
     visible = capsys.readouterr().err
-    assert "reset-stage=archive-dbs status=failed error_class=SystemExit exit_code=-15" in visible
+    assert "reset-stage=archive-dbs status=failed error_class=SystemExit exit_code=-15 diagnostic_code=dependency_unhealthy" in visible
     assert secret not in visible
     log = (work / "driver.log").read_text()
-    assert "reset-stage=archive-dbs status=failed error_class=SystemExit exit_code=-15" in log
+    assert "reset-stage=archive-dbs status=failed error_class=SystemExit exit_code=-15 diagnostic_code=dependency_unhealthy" in log
     assert secret not in log
     assert driver._phase_state(work / "slot-001-attempt-001") == "pair_interrupted"
 
@@ -312,7 +313,7 @@ def test_reset_stage_reader_rejects_untrusted_labels(tmp_path):
     secret = "PLANTED-RESET-CHILD-SECRET"
     write_row(artifact / "reset-stages.jsonl", {
         "record_type": "reset_stage", "stage": secret, "status": "failed",
-        "error_class": secret, "exit_code": secret,
+        "error_class": secret, "exit_code": secret, "diagnostic_code": secret,
     })
     write_row(artifact / "reset-stages.jsonl", {
         "record_type": "reset_stage", "stage": [secret], "status": {"secret": secret},

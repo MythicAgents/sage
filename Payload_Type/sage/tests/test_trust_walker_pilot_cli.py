@@ -1637,6 +1637,7 @@ def test_reset_retains_bounded_stage_failure_without_child_output(
         setup_stage_callback({
             "stage": "archive-dbs", "status": "failed", "error_class": error_class,
             "exit_code": exit_code, "timeout_seconds": timeout_seconds,
+            "diagnostic_code": "dependency_unhealthy",
             "stderr": secret,
         })
         raise SystemExit(secret)
@@ -1667,6 +1668,7 @@ def test_reset_retains_bounded_stage_failure_without_child_output(
     assert rows[-1]["error_class"] == error_class
     assert rows[-1]["exit_code"] == exit_code
     assert rows[-1]["timeout_seconds"] == timeout_seconds
+    assert rows[-1]["diagnostic_code"] == "dependency_unhealthy"
     assert secret not in (runtime.artifact_dir / "reset-stages.jsonl").read_text()
     assert runtime.current_reset_started is True
 
@@ -2255,6 +2257,8 @@ def test_raw_provider_timeout_is_protocol_error_with_unknown_token_cost(tmp_path
         termination={"cause": "wall_time", "subtype": "wrapper_timeout"},
         model_response_records=[],
         recoverable_tool_errors=[],
+        model_error_diagnostic={"error_type": "RateLimitError", "http_status": 429,
+                                "provider_code": "rate_limit_exceeded", "request_id": "req_abc12345"},
         model_attempts=1,
         model_calls=0,
         total_tokens=0,
@@ -2273,6 +2277,9 @@ def test_raw_provider_timeout_is_protocol_error_with_unknown_token_cost(tmp_path
     assert execution["cost"]["model_attempts"] == 1
     assert execution["cost"]["model_calls"] == 0
     assert execution["cost"]["total_tokens"] is None
+    assert execution["model_error_diagnostic"] == result.model_error_diagnostic
+    transcript = json.loads((tmp_path / "raw-mythic-bloodhound-transcript.json").read_text())
+    assert transcript["model_error_diagnostic"] == result.model_error_diagnostic
 
 
 def test_raw_completed_response_with_incomplete_usage_retains_record_and_unknown_cost(tmp_path):

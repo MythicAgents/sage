@@ -25,6 +25,7 @@ def _mythic_reset_env(
     cli_start_failure=False,
     sage_running_on_start=False,
     enforce_deployment=False,
+    simulate_postgres_init=False,
 ):
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -42,6 +43,10 @@ def _mythic_reset_env(
         'if [[ "$1" == "start" && "${SAGE_RUNNING_ON_START-0}" == "1" ]]; then : > "$SAGE_RUNNING_FILE"; fi\n'
         'if [[ "$1" == "stop" ]]; then rm -f "$SAGE_RUNNING_FILE"; fi\n'
         'if [[ "$1" == "start" && "${CLI_START_FAILURE-0}" == "1" ]]; then exit 7; fi\n'
+        'if [[ "$1" == "start" && "${SIMULATE_POSTGRES_INIT-0}" == "1" ]]; then\n'
+        '  [[ -f "$POSTGRES_INIT_SOURCE" ]] || { echo "missing pg_hba.conf" >&2; exit 8; }\n'
+        '  rm "$POSTGRES_INIT_SOURCE"\n'
+        'fi\n'
         'if [[ "$1" == "start" && "$#" -gt 1 '
         '&& "${RECOVER_ON_TARGETED_START-0}" == "1" ]]; then\n'
         '  : > "$RECOVERED_FILE"\n'
@@ -59,6 +64,12 @@ def _mythic_reset_env(
         '  printf "%s\\n" "$SERVICES"\n'
         "  exit 0\n"
         "fi\n"
+        'if [[ "$1 ${2-} ${3-} ${4-}" == "compose rm --force mythic_postgres" ]]; then\n'
+        '  [[ "${DOCKER_FAILURE-}" == "rm" ]] && exit 9\n'
+        '  [[ "${SIMULATE_POSTGRES_INIT-0}" == "1" ]] && : > "$POSTGRES_INIT_SOURCE"\n'
+        '  exit 0\n'
+        'fi\n'
+        'if [[ "$1" == "run" ]]; then exit 0; fi\n'
         'if [[ "$1 ${2-}" == "ps --filter" ]]; then\n'
         '  [[ -f "$SAGE_RUNNING_FILE" ]] && printf "sage\\n"\n'
         "  exit 0\n"
@@ -106,6 +117,8 @@ def _mythic_reset_env(
         "RECOVER_ON_TARGETED_START": "1" if recover_on_targeted_start else "0",
         "CLI_START_MESSAGE": cli_start_message,
         "CLI_START_FAILURE": "1" if cli_start_failure else "0",
+        "SIMULATE_POSTGRES_INIT": "1" if simulate_postgres_init else "0",
+        "POSTGRES_INIT_SOURCE": str(tmp_path / "container-pg_hba.conf"),
         "SAGE_RUNNING_ON_START": "1" if sage_running_on_start else "0",
         "RABBITMQ_HOST": "127.0.0.1",
         "MYTHIC_SERVER_HOST": "127.0.0.1",
@@ -117,7 +130,10 @@ def _mythic_reset_env(
     return env, log
 
 
-def _metered_reset_env(tmp_path, *, initial_rows, recovered_rows=None, recover=False, missing_image=""):
+def _metered_reset_env(
+    tmp_path, *, initial_rows, recovered_rows=None, recover=False, missing_image="",
+    simulate_postgres_init=False, remove_failure=False,
+):
     fake_bin = tmp_path / "metered-bin"; fake_bin.mkdir()
     log, recovered, up_count = tmp_path / "metered.log", tmp_path / "recovered", tmp_path / "up-count"
     cli = tmp_path / "mythic-cli"; cli.write_text("#!/usr/bin/env bash\nprintf 'cli|%s\\n' \"$*\" >> \"$CALL_LOG\"\n"); cli.chmod(0o755)
@@ -135,9 +151,19 @@ def _metered_reset_env(tmp_path, *, initial_rows, recovered_rows=None, recover=F
         'printf "docker|%s|%s|%s|%s\\n" "$*" "${DOCKER_HOST-unset}" "${COMPOSE_FILE-unset}" "${COMPOSE_PROJECT_NAME-unset}" >> "$CALL_LOG"\n'
         'if [[ "$1 ${2-} ${3-}" == "compose config --format" && "${4-}" == "json" ]]; then printf "%s\\n" "$COMPOSE_JSON"; exit 0; fi\n'
         'if [[ "$1" == "image" && "$2" == "inspect" ]]; then [[ "${5-}" == "$MISSING_IMAGE" ]] && exit 9; printf "sha256:installed\\n"; exit 0; fi\n'
+        'if [[ "$1 ${2-} ${3-} ${4-}" == "compose rm --force mythic_postgres" ]]; then\n'
+        '  [[ "$REMOVE_FAILURE" == "1" ]] && exit 9\n'
+        '  [[ "$SIMULATE_POSTGRES_INIT" == "1" ]] && : > "$POSTGRES_INIT_SOURCE"\n'
+        '  exit 0\n'
+        'fi\n'
         'if [[ "$1 ${2-} ${3-} ${4-}" == "compose ps --all --quiet" ]]; then printf "id-postgres\\nid-apollo\\nid-http\\nid-sage\\n"; exit 0; fi\n'
         'if [[ "$1" == "inspect" ]]; then if [[ -f "$RECOVERED_FILE" ]]; then printf "%s\\n" "$RECOVERED_ROWS"; else printf "%s\\n" "$INITIAL_ROWS"; fi; exit 0; fi\n'
-        'if [[ "$1 ${2-} ${3-}" == "compose up -d" ]]; then count=0; [[ -f "$UP_COUNT" ]] && count=$(<"$UP_COUNT"); count=$((count+1)); printf "%s" "$count" > "$UP_COUNT"; [[ "$count" == 2 && "$RECOVER" == 1 ]] && : > "$RECOVERED_FILE"; exit 0; fi\n'
+        'if [[ "$1 ${2-} ${3-}" == "compose up -d" ]]; then\n'
+        '  if [[ "$SIMULATE_POSTGRES_INIT" == "1" ]]; then\n'
+        '    [[ -f "$POSTGRES_INIT_SOURCE" ]] || { echo "missing pg_hba.conf" >&2; exit 8; }\n'
+        '    rm "$POSTGRES_INIT_SOURCE"\n'
+        '  fi\n'
+        '  count=0; [[ -f "$UP_COUNT" ]] && count=$(<"$UP_COUNT"); count=$((count+1)); printf "%s" "$count" > "$UP_COUNT"; [[ "$count" == 2 && "$RECOVER" == 1 ]] && : > "$RECOVERED_FILE"; exit 0; fi\n'
         'if [[ "$1 ${2-}" == "compose stop" || "$1" == "run" ]]; then exit 0; fi\nexit 98\n'
     ); docker.chmod(0o755)
     timeout = fake_bin / "timeout"; timeout.write_text("#!/usr/bin/env bash\nshift 3\nexec \"$@\"\n"); timeout.chmod(0o755)
@@ -149,6 +175,9 @@ def _metered_reset_env(tmp_path, *, initial_rows, recovered_rows=None, recover=F
            "CALL_LOG": str(log), "COMPOSE_JSON": json.dumps(config), "INITIAL_ROWS": initial_rows,
            "RECOVERED_ROWS": recovered_rows or initial_rows, "RECOVERED_FILE": str(recovered),
            "UP_COUNT": str(up_count), "RECOVER": "1" if recover else "0", "MISSING_IMAGE": missing_image,
+           "SIMULATE_POSTGRES_INIT": "1" if simulate_postgres_init else "0",
+           "POSTGRES_INIT_SOURCE": str(tmp_path / "container-pg_hba.conf"),
+           "REMOVE_FAILURE": "1" if remove_failure else "0",
            "SAGE_RESET_METERED_DOCKER": "1", "SAGE_RESOURCE_BUDGET_CONFIG": str(budget_config),
            "SAGE_RESOURCE_BUDGET_LEDGER": str(budget_ledger), "DOCKER_HOST": f"unix://{proxy_path}",
            "SAGE_RESET_SKIP_DEPLOYMENT_ENFORCE": "1", "RABBITMQ_HOST": "container-only",
@@ -288,6 +317,44 @@ def test_mythic_reset_drops_container_only_host_overrides(tmp_path):
     docker_calls = [line for line in log.read_text().splitlines() if line.startswith("docker|")]
     assert len(docker_calls) == 3
     assert all(line.endswith(f"|unset|unset|{tmp_path}") for line in docker_calls)
+
+
+def test_mythic_reset_recreates_postgres_image_files_on_repeated_wipes(tmp_path):
+    rows = "mythic_postgres|true|healthy\napollo|true|none\nhttp|true|none\nsage|true|none"
+    env, log = _mythic_reset_env(tmp_path, initial_rows=rows, simulate_postgres_init=True)
+    (tmp_path / "postgres-docker/database").mkdir(parents=True)
+
+    for _ in range(2):
+        result = subprocess.run(
+            ["/bin/bash", str(MYTHIC_RESET), "--yes"], cwd=ROOT, env=env,
+            text=True, capture_output=True, timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        assert not (tmp_path / "container-pg_hba.conf").exists()
+
+    calls = log.read_text().splitlines()
+    removes = [i for i, call in enumerate(calls) if "docker|compose rm --force mythic_postgres|" in call]
+    starts = [i for i, call in enumerate(calls) if call.startswith("cli|start ")]
+    assert len(removes) == len(starts) == 2
+    assert all(remove < start for remove, start in zip(removes, starts))
+    assert not any("compose rm" in call and "--volumes" in call for call in calls)
+
+
+def test_mythic_reset_stops_before_wipe_when_postgres_removal_fails(tmp_path):
+    rows = "mythic_postgres|true|healthy\napollo|true|none\nhttp|true|none\nsage|true|none"
+    env, log = _mythic_reset_env(tmp_path, initial_rows=rows, docker_failure="rm")
+    (tmp_path / "postgres-docker/database").mkdir(parents=True)
+
+    result = subprocess.run(
+        ["/bin/bash", str(MYTHIC_RESET), "--yes"], cwd=ROOT, env=env,
+        text=True, capture_output=True, timeout=10,
+    )
+
+    assert result.returncode == 1
+    assert "unable to remove stopped Mythic postgres container" in result.stderr
+    calls = log.read_text().splitlines()
+    assert any(call.startswith("cli|stop|") for call in calls)
+    assert not any(call.startswith("docker|run ") or call.startswith("cli|start ") for call in calls)
 
 
 def test_local_reset_stops_unexpected_sage_container_after_start_failure(tmp_path):
@@ -498,6 +565,46 @@ def test_metered_docker_reset_preflights_images_before_stop_and_never_calls_cli(
     assert any("run --rm --pull never" in value for value in docker)
     assert sum("compose up -d --no-build --pull never mythic_postgres apollo http" in value for value in docker) == 1
     assert all(f"unix://{tmp_path / 'docker-meter.sock'}|unset|unset" in value for value in docker)
+
+
+def test_metered_reset_recreates_postgres_without_rebuilding_or_removing_volumes(tmp_path):
+    rows = "mythic_postgres|true|healthy\napollo|true|none\nhttp|true|none\nsage|true|none"
+    env, log, proxy = _metered_reset_env(tmp_path, initial_rows=rows, simulate_postgres_init=True)
+    try:
+        for _ in range(2):
+            result = subprocess.run(
+                ["/bin/bash", str(MYTHIC_RESET), "--yes"], cwd=ROOT, env=env,
+                text=True, capture_output=True, timeout=10,
+            )
+            assert result.returncode == 0, result.stderr
+            assert not (tmp_path / "container-pg_hba.conf").exists()
+    finally:
+        proxy.close()
+
+    calls = log.read_text().splitlines()
+    removes = [i for i, call in enumerate(calls) if "docker|compose rm --force mythic_postgres|" in call]
+    starts = [i for i, call in enumerate(calls) if "docker|compose up -d --no-build --pull never" in call]
+    assert len(removes) == len(starts) == 2
+    assert all(remove < start for remove, start in zip(removes, starts))
+    assert not any("compose rm" in call and "--volumes" in call for call in calls)
+
+
+def test_metered_reset_stops_before_wipe_when_postgres_removal_fails(tmp_path):
+    rows = "mythic_postgres|true|healthy\napollo|true|none\nhttp|true|none\nsage|true|none"
+    env, log, proxy = _metered_reset_env(tmp_path, initial_rows=rows, remove_failure=True)
+    try:
+        result = subprocess.run(
+            ["/bin/bash", str(MYTHIC_RESET), "--yes"], cwd=ROOT, env=env,
+            text=True, capture_output=True, timeout=10,
+        )
+    finally:
+        proxy.close()
+
+    assert result.returncode == 1
+    assert "unable to remove stopped Mythic postgres container" in result.stderr
+    calls = log.read_text().splitlines()
+    assert any("compose stop" in call for call in calls)
+    assert not any("docker|run " in call or "compose up" in call for call in calls)
 
 
 def test_metered_container_mode_keeps_sage_service(tmp_path):

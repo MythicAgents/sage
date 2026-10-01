@@ -44,6 +44,51 @@ _CONTEXT_LIMIT_CODES = frozenset({
     "max_context_length_exceeded",
     "prompt_too_long",
 })
+_DIAGNOSTIC_PROVIDER_CODES = _CONTEXT_LIMIT_CODES | frozenset({
+    "rate_limit_exceeded", "rate_limit_error", "too_many_requests", "slow_down",
+    "insufficient_quota", "quota_exceeded", "billing_hard_limit_reached",
+    "server_error", "service_unavailable", "overloaded_error", "server_is_overloaded",
+    "invalid_api_key", "authentication_error", "permission_denied",
+    "invalid_request_error", "model_not_found",
+})
+_DIAGNOSTIC_ERROR_TYPES = frozenset({
+    "APIConnectionError", "APITimeoutError", "APIStatusError", "BadRequestError",
+    "AuthenticationError", "PermissionDeniedError", "NotFoundError",
+    "ConflictError", "UnprocessableEntityError", "RateLimitError",
+    "InternalServerError", "TimeoutError", "ConnectError", "ReadTimeout",
+    "ProviderResponseBoundaryError", "ResourceHTTPError", "ValueError", "TypeError",
+    "JSONDecodeError", "ValidationError", "APIResponseValidationError",
+})
+
+
+def _request_error_diagnostic(exc: BaseException, provider_code: str | None) -> dict[str, object]:
+    """Keep only bounded SDK metadata; provider prose and headers stay outside artifacts."""
+    error_type = type(exc).__name__
+    result: dict[str, object] = {
+        "error_type": error_type if error_type in _DIAGNOSTIC_ERROR_TYPES else "OtherError",
+    }
+    if provider_code in _DIAGNOSTIC_PROVIDER_CODES:
+        result["provider_code"] = provider_code
+    status = getattr(exc, "status_code", None)
+    response = getattr(exc, "response", None)
+    if type(status) is not int and response is not None:
+        status = getattr(response, "status_code", None)
+    if type(status) is int and 100 <= status <= 599:
+        result["http_status"] = status
+    request_id = getattr(exc, "request_id", None)
+    headers = getattr(response, "headers", None)
+    if request_id is None and isinstance(headers, Mapping):
+        request_id = headers.get("x-request-id")
+    if (isinstance(request_id, str)
+            and re.fullmatch(r"req[-_][A-Za-z0-9]{8,96}", request_id)
+            and not request_id.casefold().startswith(("req_sk", "req_bearer"))):
+        result["request_id"] = request_id
+    retry_after = headers.get("retry-after") if isinstance(headers, Mapping) else None
+    if isinstance(retry_after, str) and re.fullmatch(r"\d{1,4}(?:\.\d{1,3})?", retry_after):
+        seconds = float(retry_after)
+        if 0 <= seconds <= 3600:
+            result["retry_after_seconds"] = seconds
+    return result
 
 
 def _eval_temperature() -> float | None:
@@ -63,14 +108,16 @@ class ModelRequestBoundaryError(RuntimeError):
     """Sanitized typed provider failure used only for terminal-boundary reporting."""
 
     def __init__(self, *, error_type: str, provider_code: str | None,
+                 diagnostic: dict[str, object] | None = None,
                  completed_response_boundary: tuple[str, str] | None = None):
-        self.provider_code = provider_code
+        self.provider_code = provider_code if provider_code in _DIAGNOSTIC_PROVIDER_CODES else None
+        self.diagnostic = diagnostic or {"error_type": "OtherError"}
         if completed_response_boundary is not None:
             self.termination_cause, self.termination_subtype = completed_response_boundary
         else:
             self.termination_cause = (
                 "per_request_context_limit"
-                if provider_code in _CONTEXT_LIMIT_CODES
+                if self.provider_code in _CONTEXT_LIMIT_CODES
                 else "other_declared_boundary"
             )
             self.termination_subtype = (
@@ -78,7 +125,7 @@ class ModelRequestBoundaryError(RuntimeError):
                 if self.termination_cause == "per_request_context_limit"
                 else "model_error"
             )
-        suffix = f", typed_code={provider_code}" if provider_code else ""
+        suffix = f", typed_code={self.provider_code}" if self.provider_code else ""
         super().__init__(f"model request failed ({error_type}{suffix})")
 
 
@@ -288,9 +335,12 @@ def make_model_fn(
         try:
             message = bound.invoke(messages)
         except Exception as exc:
+            provider_code = _typed_provider_error_code(exc)
+            diagnostic = _request_error_diagnostic(exc, provider_code)
             raise ModelRequestBoundaryError(
-                error_type=type(exc).__name__,
-                provider_code=_typed_provider_error_code(exc),
+                error_type=str(diagnostic["error_type"]),
+                provider_code=provider_code,
+                diagnostic=diagnostic,
                 completed_response_boundary=_completed_response_boundary(exc),
             ) from exc
         decision = parse_model_decision(message)

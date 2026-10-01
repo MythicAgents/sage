@@ -125,6 +125,11 @@ During pair resets, `pair/reset-stages.jsonl` records each stage as it starts,
 passes, or fails. Driver progress and failure messages include the last stage,
 error class, exit code, and timeout when available. These records contain only
 allowlisted diagnostic metadata, not raw subprocess output or command arguments.
+For the Mythic reset step, a fixed `diagnostic_code` classifies recognized startup
+output (such as a missing Postgres configuration file or unhealthy dependency),
+or reports `unclassified`. The code is a troubleshooting clue from the reset
+output, not proof of the final root cause; inspect current service state before
+deciding how to recover.
 They do not establish a completed reset or authorize an automatic reset retry.
 
 `prepare` writes files only. Service lifecycle changes start when the operator
@@ -352,6 +357,14 @@ was achieved. The final `complete` JSON means the cohort lifecycle finished;
 inspect the replay and outcome evidence for objective results. Stdout retains
 the command's JSON summaries. A nonzero exit and the final log entry identify
 the phase needing attention. Give that directory to Codex for diagnosis.
+
+Raw model failures retain `model_error_diagnostic` in the completed checkpoint,
+transcript, and pilot execution record, plus a `model_request_failed` progress
+event. Available fields include a recognized error type, HTTP status, provider
+code, request ID, and numeric retry delay. Unsupported values and provider error
+prose are omitted. These diagnostics do not enable retries or establish that a
+generic `model_error` was a refusal. Historical results without these fields
+cannot be backfilled from a later run.
 
 ## Resume
 
