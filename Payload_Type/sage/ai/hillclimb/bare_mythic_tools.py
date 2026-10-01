@@ -44,6 +44,7 @@ except ImportError:  # direct module import in focused tests
 
 BARE_TOOL_PROFILE = "naive-raw-mythic-bloodhound-v2"
 _MYTHIC_SDK_OVERRIDE: ContextVar[Any | None] = ContextVar("raw_mythic_sdk_override", default=None)
+_TASK_SUBMITTED_SINK: ContextVar[Callable[[int], None] | None] = ContextVar("raw_task_submitted_sink", default=None)
 
 
 def _mythic_sdk() -> Any:
@@ -416,6 +417,9 @@ async def _issue_command(client, callback_display_id: int, command: str, paramet
     task_id = task.get("display_id") if isinstance(task, dict) else None
     if type(task_id) is not int or task_id <= 0:
         raise RuntimeError("Mythic task submission omitted a positive display_id")
+    sink = _TASK_SUBMITTED_SINK.get()
+    if sink is not None:
+        sink(task_id)
     task_budget.record_task_id(task_id)
     remaining = task_budget.current_remaining_seconds()
     wait_timeout = min(float(timeout), remaining) if remaining is not None else float(timeout)
@@ -1078,15 +1082,22 @@ def make_mythic_dispatcher(
     client: Any,
     *,
     collection_ingestor: CollectionIngestor | None = None,
+    task_submitted_sink: Callable[[int], None] | None = None,
 ) -> Callable[[dict], str]:
     """A bare-runner tool_executor: dispatch {"tool": name, "args": {...}} to the stripped impl.
     Mirrors live_seams.make_tool_executor's reuse-client-across-asyncio.run pattern."""
     def tool_executor(call: dict) -> str:
+        from ai.hillclimb.bare_runner import BareRunnerRecoveryError
+        token = _TASK_SUBMITTED_SINK.set(task_submitted_sink)
         try:
             return asyncio.run(_execute_mythic_call(
                 client, call, collection_ingestor=collection_ingestor,
             ))
+        except BareRunnerRecoveryError:
+            raise
         except Exception as exc:
             return f"[tool error] {call.get('tool', '')}: {type(exc).__name__}: {exc}"
+        finally:
+            _TASK_SUBMITTED_SINK.reset(token)
 
     return tool_executor

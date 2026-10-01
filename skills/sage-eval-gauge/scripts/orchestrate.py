@@ -923,7 +923,9 @@ def _poll(
             if predicate(proc.stdout):
                 return proc.stdout
             time.sleep(interval)
-        raise SystemExit(f"ABORT: '{name}' not ready within {timeout}s — fix the lab before running the gauge.")
+        error=SystemExit(f"ABORT: '{name}' not ready within {timeout}s — fix the lab before running the gauge.")
+        error.setup_timeout_seconds=timeout
+        raise error
 
     poll_deadline = min(deadline.expires, deadline._now() + timeout)
     while deadline._now() < poll_deadline:
@@ -944,7 +946,9 @@ def _poll(
         deadline.wait(min(interval, poll_remaining))
     if deadline._now() >= deadline.expires:
         deadline.remaining()
-    raise SystemExit(f"ABORT: '{name}' not ready within {timeout}s — fix the lab before running the gauge.")
+    error=SystemExit(f"ABORT: '{name}' not ready within {timeout}s — fix the lab before running the gauge.")
+    error.setup_timeout_seconds=timeout
+    raise error
 
 
 def _readiness_ok(out: str) -> bool:
@@ -1186,7 +1190,8 @@ def full_reset_and_ready(
         except BaseException as error:
             if setup_stage_callback is not None:setup_stage_callback({"stage":name,"status":"failed",
                 "error_class":("SystemExit" if isinstance(error,SystemExit) else
-                    "TimeoutExpired" if isinstance(error,subprocess.TimeoutExpired) else "UnexpectedError"),
+                    "TimeoutExpired" if isinstance(error,subprocess.TimeoutExpired) else
+                    "KeyboardInterrupt" if isinstance(error,KeyboardInterrupt) else "UnexpectedError"),
                 "exit_code":getattr(error,"setup_exit_code",None),
                 "timeout_seconds":getattr(error,"setup_timeout_seconds",getattr(error,"timeout",None))})
             raise

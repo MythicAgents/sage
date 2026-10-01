@@ -28,6 +28,7 @@ from typing import Any, Callable
 
 from ssl_bootstrap import configure_sage_ssl_cert_file
 from ai import observation_channel, resource_budget, resource_http
+from ai.model_refusal import refusal_from_message
 
 DirectProbe = Callable[[], bool]
 
@@ -160,6 +161,9 @@ def extract_literals(resp: Any) -> list:
 def parse_model_decision(message: Any) -> dict:
     """A LangChain AIMessage -> the bare-runner decision shape.
     Tool call -> {"tool": name, "args": {...}}; otherwise -> {"final": text}."""
+    refusal = refusal_from_message(message)
+    if refusal is not None:
+        return {"final": refusal[1], "_refusal": {"source": refusal[0]}}
     tool_calls = getattr(message, "tool_calls", None) or []
     if tool_calls:
         first = tool_calls[0]

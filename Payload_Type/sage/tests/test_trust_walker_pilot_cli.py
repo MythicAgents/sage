@@ -212,7 +212,66 @@ def test_matrix_sage_arm_uses_selected_route_and_distinct_channel(tmp_path):
     )
 
 
-def retained_native_pair(tmp_path, monkeypatch, contract=None, measurement_metadata=None, improvement_metric=False):
+def test_native_completed_chat_retains_controller_refusal_through_settlement(tmp_path):
+    selected = pilot.MatrixRoute("test", "openai", "test-model", "https://example.invalid/v1")
+    runtime = object.__new__(cli.RuntimePilot)
+    runtime.current_client = object()
+    runtime.current_operation_id = 8
+    runtime.selected_route = selected
+    runtime.matrix_wall_seconds = None
+    runtime.route = {"provider": selected.provider, "model": selected.model,
+                     "api_endpoint": selected.api_endpoint, "api_key": "synthetic-key"}
+    runtime.artifact_dir = tmp_path
+    runtime.measurement_metadata = {}
+    runtime.current_budget = None
+    runtime._channel_name = lambda _: "synthetic-channel"
+    telemetry = {
+        "controller_status": "halted_refusal", "controller_terminal_reason": "model refused capability selection",
+        "model_calls": 1, "token_usage_complete": True,
+        "effective_backend_requests": [{
+            "effective_backend": "openai:test-model",
+            "effective_model_provider": "openai", "effective_model_id": "test-model",
+            "token_usage": {"input_tokens": 7, "output_tokens": 5, "total_tokens": 12},
+        }],
+        "decisions": [{"disposition": "refusal", "raw_response": "I cannot assist with that request."}],
+    }
+    result = {"status": "complete", "runtime_telemetry": telemetry}
+    calls = []
+
+    async def run_turn(_client, _objective, **kwargs):
+        calls.append("model")
+        kwargs["progress_sink"]({"event": "request_started", "chat_channel_id": 3, "chat_request_id": 4})
+        return result
+
+    async def fetch_snapshot(_client, _request_id):
+        return {"request": {"status": "complete"}}
+
+    runtime.native = SimpleNamespace(
+        default_ai_metadata=lambda: {"config": {}},
+        _chat_runtime_identity_from_metadata=lambda _: {"route": "synthetic"},
+        run_native_chat_turn=run_turn,
+        fetch_request_snapshot=fetch_snapshot,
+        request_snapshot_result=lambda _: result,
+        TERMINAL_STATUSES={"complete"},
+        RequestWaitTimeout=type("NativeWaitTimeout", (TimeoutError,), {}),
+    )
+    runtime._operation_snapshot = lambda *_args, **_kwargs: {"task": [], "credential": [], "callback": []}
+    execution = runtime.run_arm("shipping-sage", {}, lambda _: None)
+    assert execution["termination"] == "halted_refusal"
+    settlement = runtime.stop_and_settle("shipping-sage", {}, execution)
+    final = settlement["execution"]
+    assert settlement["complete"] is True
+    assert final["termination"] == "halted_refusal"
+    assert final["resource_complete"] is True
+    assert final["cost"]["model_calls"] == 1
+    assert final["cost"]["total_tokens"] == 12
+    assert calls == ["model"]
+    transcript = json.loads(Path(final["transcript"]["path"]).read_text())
+    assert transcript["runtime_telemetry"]["decisions"][0]["raw_response"] == "I cannot assist with that request."
+
+
+def retained_native_pair(tmp_path, monkeypatch, contract=None, measurement_metadata=None,
+                         improvement_metric=False, timeout_first_arm=False, refusal_first_arm=False):
     """Exercise the real pair/observer producer with synthetic control-plane responses."""
     contract = contract or cli.PilotContract()
     monkeypatch.setattr(pilot, "_history_root", lambda: tmp_path)
@@ -222,16 +281,19 @@ def retained_native_pair(tmp_path, monkeypatch, contract=None, measurement_metad
     runtime.current_client = object()
     runtime.current_operation_id = 8
     runtime.selected_route = contract.route if isinstance(contract, cli.MatrixPairContract) else None
+    runtime.matrix_wall_seconds = contract.wall_seconds if isinstance(contract, cli.MatrixPairContract) else None
 
     def reset(arm, _env):
         runtime.current_arm = arm
         runtime.current_started_at = datetime(2026, 9, 13, 12 + contract.arm_order.index(arm), tzinfo=UTC)
         runtime.current_deadline_at = (
-            None if isinstance(contract, cli.MatrixPairContract)
-            else runtime.current_started_at + timedelta(seconds=contract.wall_seconds)
+            runtime.current_started_at + timedelta(seconds=contract.wall_seconds)
+            if not isinstance(contract, cli.MatrixPairContract) or contract.wall_seconds is not None
+            else None
         )
         runtime.current_stopped_at = (
-            runtime.current_started_at + timedelta(seconds=20)
+            (runtime.current_deadline_at if timeout_first_arm and arm == contract.arm_order[0]
+             else runtime.current_started_at + timedelta(seconds=20))
             if isinstance(contract, cli.MatrixPairContract) else None
         )
         start = setup_start()
@@ -277,8 +339,7 @@ def retained_native_pair(tmp_path, monkeypatch, contract=None, measurement_metad
                                 "credential_text": "synthetic-credential-do-not-print"}],
                 "callback": [{"operation_id": 8, "display_id": 4}],
             }
-        return {
-            "task": [{
+        tasks = [{
                 "operation_id": 8, "display_id": 1, "command_name": "whoami",
                 "display_params": "", "original_params": "", "completed": True, "status": "completed",
                 "timestamp": timestamp, "status_timestamp_preprocessing": timestamp,
@@ -288,12 +349,25 @@ def retained_native_pair(tmp_path, monkeypatch, contract=None, measurement_metad
                     "id": 2, "sequence_number": 1, "timestamp": timestamp,
                     "response_text": base64.b64encode(b"synthetic-native-body-do-not-print").decode(),
                 }],
-            }],
+            }]
+        if (timeout_first_arm or refusal_first_arm) and runtime.current_arm == contract.arm_order[0]:
+            tasks.append({
+                "operation_id": 8, "display_id": 13, "command_name": "jump_wmi",
+                "display_params": "", "original_params": "", "completed": False,
+                "status": "processing", "timestamp": timestamp,
+                "status_timestamp_preprocessing": timestamp,
+                "status_timestamp_submitted": timestamp,
+                "status_timestamp_processing": timestamp,
+                "status_timestamp_processed": None,
+                "callback": {"domain": "ESSOS"}, "responses": [],
+            })
+        return {
+            "task": tasks,
             "credential": [{
                 "operation_id": 8, "id": 3, "task_id": 1, "timestamp": timestamp,
                 "account": "krbtgt", "realm": "essos.local",
                 "credential_text": "synthetic-credential-do-not-print",
-            }] if runtime.current_arm == contract.arm_order[0] else [],
+            }] if runtime.current_arm == contract.arm_order[0] and not refusal_first_arm else [],
             "callback": [{"operation_id": 8, "display_id": 4}],
         }
 
@@ -306,7 +380,11 @@ def retained_native_pair(tmp_path, monkeypatch, contract=None, measurement_metad
             "arm_deadline_at": runtime.current_deadline_at.isoformat() if runtime.current_deadline_at else None,
             **({"arm_stopped_at": runtime.current_stopped_at.isoformat()}
                if runtime.current_stopped_at else {}),
-            "termination": "done", "protocol_error": False, "resource_complete": True,
+            "termination": (
+                "time_limit" if timeout_first_arm and runtime.current_arm == contract.arm_order[0]
+                else "halted_refusal" if refusal_first_arm and runtime.current_arm == contract.arm_order[0]
+                else "done"
+            ), "protocol_error": False, "resource_complete": True,
             "cost": {"model_calls": 1, "total_tokens": 10, "payload_tasks": task_count},
             "response_records": [{"response_index": 1, "effective_backend": (
                 f"{contract.provider}:{contract.model}" if isinstance(contract, cli.MatrixPairContract)
@@ -324,7 +402,12 @@ def retained_native_pair(tmp_path, monkeypatch, contract=None, measurement_metad
     dependencies = cli.PilotDependencies(
         preflight=lambda *_: {"ready": True}, reset=reset,
         runtime_identity=lambda: {"operation_id": 8, "callback_id": 4}, run_arm=run_arm,
-        stop_and_settle=lambda _a, _s, execution: {"complete": True, "execution": execution},
+        stop_and_settle=lambda arm, _s, execution: (
+            {"complete": False, "producer_terminal": True, "objective_effect_quiescent": False,
+             "outstanding_task_ids": [13], "execution": execution}
+            if (timeout_first_arm or refusal_first_arm) and arm == contract.arm_order[0]
+            else {"complete": True, "execution": execution}
+        ),
         observe=runtime.observe, teardown=lambda *_: {"complete": True},
         attest_preserved_state=lambda *_: {"complete": False},
     )
@@ -395,6 +478,61 @@ def test_offline_replay_preserves_unknown_total_after_failed_provider_attempt(tm
     assert replay["reproduced"] is True
     assert replay["arms"][0]["total_tokens"] is None
     assert replay["comparison"]["resources_complete"] is False
+
+
+def test_offline_replay_preserves_native_receipt_for_timeout_continuation(tmp_path, monkeypatch):
+    matrix = pilot.MatrixContract(schema=pilot.MATRIX_SCHEMA, routes=(
+        pilot.MatrixRoute("qwen", "openai", "qwen/qwen3-32b", "https://openrouter.ai/api/v1"),
+    ))
+    contract = pilot.MatrixPairContract.for_route(
+        matrix, "qwen", start_case="samwell-castelblack", wall_seconds=3600,
+        continue_after_time_limit=True,
+    )
+    records = retained_native_pair(tmp_path, monkeypatch, contract, timeout_first_arm=True)
+    retained = next(row for row in records if row["record_type"] == "comparison")
+    assert retained["lifecycle_complete"] is False
+    assert retained["lifecycle_continuation_complete"] is True
+    assert retained["run_complete"] is True
+
+    replay = cli.replay_pair(tmp_path)
+
+    assert replay["reproduced"] is True
+    assert replay["comparison"]["lifecycle_continuation_complete"] is True
+    assert replay["comparison"]["run_complete"] is True
+    assert replay["arms"][0]["native_sha256"] == next(
+        row for row in records if row.get("record_type") == "arm_result"
+    )["terminal_snapshot"]["native_evidence"]["sha256"]
+
+
+def test_offline_replay_preserves_refusal_continuation_and_rechecks_native_receipt(tmp_path, monkeypatch, capsys):
+    matrix = pilot.MatrixContract(schema=pilot.MATRIX_SCHEMA, routes=(
+        pilot.MatrixRoute("qwen", "openai", "qwen/qwen3-32b", "https://openrouter.ai/api/v1"),
+    ))
+    contract = pilot.MatrixPairContract.for_route(
+        matrix, "qwen", start_case="samwell-castelblack", wall_seconds=3600,
+        continue_after_refusal=True,
+    )
+    records = retained_native_pair(tmp_path, monkeypatch, contract, refusal_first_arm=True)
+    retained = next(row for row in records if row["record_type"] == "comparison")
+    assert retained["run_complete"] is True
+    assert retained["comparison_ready"] is False
+    assert retained["lifecycle_complete"] is False
+    assert retained["lifecycle_continuation_complete"] is True
+    first = next(row for row in records if row["record_type"] == "arm_result")
+    assert first["refusal_continuation_eligible"] is True
+    assert first["outcome"]["disposition"] == "unmeasured"
+
+    before = (tmp_path / "pilot.jsonl").read_bytes()
+    assert cli.main(["replay-pair", "--artifact-dir", str(tmp_path)]) == 0
+    replay = json.loads(capsys.readouterr().out)
+    assert replay["reproduced"] is True
+    assert replay["comparison"]["run_complete"] is True
+    assert replay["arms"][0]["native_sha256"] == first["terminal_snapshot"]["native_evidence"]["sha256"]
+    assert (tmp_path / "pilot.jsonl").read_bytes() == before
+
+    Path(first["terminal_snapshot"]["native_evidence"]["path"]).write_text("{}")
+    assert cli.main(["replay-pair", "--artifact-dir", str(tmp_path)]) == 1
+    assert json.loads(capsys.readouterr().out)["reproduced"] is False
 
 
 @pytest.mark.parametrize("mutation", [
@@ -1336,7 +1474,8 @@ def test_bloodhound_service_preflight_retains_only_readiness_metadata():
 def test_reset_propagates_attempt_scoped_engagement_id_to_sage_restart(monkeypatch, tmp_path):
     captured = {}
 
-    def full_reset_and_ready(*, restart_env, snapshot, retained_callback_config, foothold):
+    def full_reset_and_ready(*, restart_env, snapshot, retained_callback_config, foothold,
+                             setup_stage_callback):
         captured.update(restart_env)
         return {}, 2
 
@@ -1410,6 +1549,55 @@ def test_reset_propagates_attempt_scoped_engagement_id_to_sage_restart(monkeypat
     assert start["mythic_clean"] is True
 
 
+@pytest.mark.parametrize("error_class,exit_code,timeout_seconds", [
+    ("SystemExit", -15, None), ("TimeoutExpired", None, 600),
+])
+def test_reset_retains_bounded_stage_failure_without_child_output(
+    monkeypatch, tmp_path, error_class, exit_code, timeout_seconds,
+):
+    secret = "PLANTED-RESET-CHILD-SECRET"
+
+    def fail_reset(*, setup_stage_callback, **_kwargs):
+        setup_stage_callback({"stage": "stop-sage", "status": "started"})
+        setup_stage_callback({"stage": "stop-sage", "status": "passed"})
+        setup_stage_callback({"stage": "archive-dbs", "status": "started"})
+        setup_stage_callback({
+            "stage": "archive-dbs", "status": "failed", "error_class": error_class,
+            "exit_code": exit_code, "timeout_seconds": timeout_seconds,
+            "stderr": secret,
+        })
+        raise SystemExit(secret)
+
+    runtime = object.__new__(cli.RuntimePilot)
+    runtime.artifact_dir = tmp_path / "pair"
+    runtime.source_root = tmp_path
+    runtime.protected_manifest = tmp_path / "protected.json"
+    runtime.orchestrate = SimpleNamespace(full_reset_and_ready=fail_reset)
+    runtime.alternate_start = None
+    runtime.recovery_enabled = False
+    runtime._activate_source = lambda _arm: None
+    runtime._staged_interactive_foothold = lambda: object()
+    runtime._fresh_engagement_state = lambda _arms: None
+    runtime._engagement_id = lambda _arm: "engagement"
+    monkeypatch.setattr(cli, "_fixture_at", lambda *_args: {})
+    monkeypatch.setattr(cli, "_validate_protected_at", lambda *_args: None)
+    monkeypatch.setattr(cli, "assert_rejected_kernel_absent", lambda: None)
+    monkeypatch.setenv("SAGE_BLOODHOUND_MCP_DIR", str(tmp_path))
+
+    with pytest.raises(SystemExit):
+        runtime.reset("shipping-sage", {})
+    rows = cli.read_records(runtime.artifact_dir / "reset-stages.jsonl")
+    assert [(row["stage"], row["status"]) for row in rows] == [
+        ("stop-sage", "started"), ("stop-sage", "passed"),
+        ("archive-dbs", "started"), ("archive-dbs", "failed"),
+    ]
+    assert rows[-1]["error_class"] == error_class
+    assert rows[-1]["exit_code"] == exit_code
+    assert rows[-1]["timeout_seconds"] == timeout_seconds
+    assert secret not in (runtime.artifact_dir / "reset-stages.jsonl").read_text()
+    assert runtime.current_reset_started is True
+
+
 def test_alternate_reset_threads_fixture_through_launcher_and_both_readiness_consumers(monkeypatch, tmp_path):
     descriptor, config = write_alternate_descriptor(tmp_path)
     binding = cli._load_alternate_start(descriptor)
@@ -1433,7 +1621,8 @@ def test_alternate_reset_threads_fixture_through_launcher_and_both_readiness_con
             captured["reset_readiness"] = (self.callback_host, self.callback_user)
             return ["readiness"]
 
-    def full_reset_and_ready(*, restart_env, snapshot, retained_callback_config, foothold):
+    def full_reset_and_ready(*, restart_env, snapshot, retained_callback_config, foothold,
+                             setup_stage_callback):
         captured.update({
             "snapshot": snapshot,
             "retained_callback_config": retained_callback_config,
@@ -2084,8 +2273,9 @@ def test_recovery_cleanup_retains_prior_and_failed_phase_elapsed(tmp_path, monke
     assert cli.main(["cleanup", "--artifact-dir", str(tmp_path)]) == 1
     records = cli.read_records(tmp_path / "pilot.jsonl")
     recovery = next(row for row in records if row["record_type"] == "recovery_cleanup")
-    assert recovery["setup_cleanup_elapsed_seconds"] == 7_204.0
+    assert recovery["setup_cleanup_elapsed_seconds"] == 7_201.0
     assert recovery["support_budget_exhausted"] is True
+    assert recovery["teardown"]["complete"] is False
     assert any(row["record_type"] == "support_budget_exhausted" for row in records)
     assert '"complete": false' in capsys.readouterr().out
 
@@ -2104,6 +2294,72 @@ def test_recovery_cleanup_refuses_a_second_mutating_attempt(tmp_path, monkeypatc
 
     assert cli.main(["cleanup", "--artifact-dir", str(tmp_path)]) == 1
     assert "attempt limit is exhausted" in capsys.readouterr().out
+
+
+def test_cleanup_source_drift_reason_retains_native_census_before_teardown(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "validate_artifact_dir", lambda _path: tmp_path)
+    order = []
+    binding = {"original_source_identity": "before", "cleanup_source_identity": "after",
+               "reason": "operator interrupted; evaluator source changed", "callback_lineage_verified": True}
+
+    class Runtime:
+        artifact_dir = tmp_path
+        current_arm = "raw-mythic-bloodhound"
+        prior_support_elapsed_seconds = 0
+        cleanup_source_binding = binding
+
+        def stop_and_settle(self, _arm, _start, _execution):
+            order.append("settle")
+            self._settled_operation_snapshot = {"task": [{"display_id": 78, "completed": False}]}
+            return {"complete": True, "execution": {"termination": "interrupted"}}
+
+        def teardown(self, _arm, _start):
+            assert (tmp_path / "recovery-cleanup-native-observation.json").exists()
+            order.append("teardown")
+            return {"complete": True}
+
+    def recover(_cls, _path, *, cleanup_source_drift_reason=None):
+        assert cleanup_source_drift_reason == binding["reason"]
+        return Runtime(), {}, {}
+
+    monkeypatch.setattr(cli.RuntimePilot, "for_recovery", classmethod(recover))
+    assert cli.main(["cleanup", "--artifact-dir", str(tmp_path),
+                     "--allow-source-drift-for-cleanup", binding["reason"]]) == 0
+    assert order == ["settle", "teardown"]
+    record = next(row for row in cli.read_records(tmp_path / "pilot.jsonl")
+                  if row["record_type"] == "recovery_cleanup")
+    assert record["cleanup_source_binding"] == binding
+    assert record["native_census"]["complete"] is True
+    assert record["native_census"]["sha256"] == cli._sha256(
+        tmp_path / "recovery-cleanup-native-observation.json")
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["run-pair", "--allow-source-drift-for-cleanup", "reason"])
+
+
+def test_cleanup_preserves_range_when_native_census_cannot_be_retained(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "validate_artifact_dir", lambda _path: tmp_path)
+
+    class Runtime:
+        artifact_dir = tmp_path
+        current_arm = "raw-mythic-bloodhound"
+        prior_support_elapsed_seconds = 0
+
+        def stop_and_settle(self, _arm, _start, _execution):
+            self._settled_operation_snapshot = {"task": []}
+            return {"complete": True}
+
+        def teardown(self, _arm, _start):
+            pytest.fail("teardown must not discard an unretained native census")
+
+    monkeypatch.setattr(cli.RuntimePilot, "for_recovery",
+                        classmethod(lambda _cls, _path: (Runtime(), {}, {})))
+    monkeypatch.setattr(cli, "_retain_native_observation",
+                        lambda *_args: (_ for _ in ()).throw(OSError("disk unavailable")))
+    assert cli.main(["cleanup", "--artifact-dir", str(tmp_path)]) == 1
+    recovery = next(row for row in cli.read_records(tmp_path / "pilot.jsonl")
+                    if row["record_type"] == "recovery_cleanup")
+    assert recovery["native_census"]["complete"] is False
+    assert recovery["teardown"]["complete"] is False
 
 
 def test_task_settlement_window_is_bounded_and_retains_outstanding_ids(monkeypatch):

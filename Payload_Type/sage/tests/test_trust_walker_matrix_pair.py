@@ -66,6 +66,22 @@ def test_selected_route_contract_is_nonsecret_and_stable(matrix):
     assert "SAGE_CONTROLLER_WALL_S" not in pilot.arm_environment(contract)
 
 
+def test_bounded_matrix_contract_keeps_token_and_task_uncapped(matrix):
+    legacy = _contract(matrix)
+    bounded = replace(legacy, wall_seconds=3600)
+    assert bounded.identity != legacy.identity
+    assert bounded.to_record()["termination_policy"]["terminal_conditions"][-1] == "time_limit"
+    assert bounded.to_record()["termination_policy"]["numeric_wall_token_task_ceilings"] == {
+        "wall_seconds": 3600, "token_ceiling": None, "payload_task_limit": None}
+    environment = pilot.arm_environment(bounded)
+    assert environment["SAGE_CONTROLLER_WALL_S"] == "3600"
+    assert environment["SAGE_EVAL_MODEL_TOKEN_BUDGET"] == "0"
+    assert environment["SAGE_EVAL_PAYLOAD_TASK_BUDGET"] == ""
+    for invalid in (0, -1, True, 1.5):
+        with pytest.raises(pilot.PilotError, match="wall_seconds"):
+            replace(legacy, wall_seconds=invalid).validate()
+
+
 def test_matrix_route_and_start_binding_reject_wrong_identity(matrix):
     contract = _contract(matrix)
     assert pilot.matched_start_identity(_start(contract), matrix_pair=contract)["route"]["model"] == contract.model

@@ -56,6 +56,21 @@ def test_proof_after_matrix_arm_stop_is_rejected():
     assert result.rejected_proofs[0]["reason"] == "effect_outside_measured_window"
 
 
+def test_bounded_matrix_proof_ends_at_one_hour_even_when_observed_later():
+    row = _snapshot(
+        measurement_policy="bounded-matrix-wall",
+        arm_deadline_at="2026-09-13T13:00:00+00:00",
+        arm_stopped_at="2026-09-13T13:00:02+00:00",
+        observed_at="2026-09-13T13:05:00+00:00",
+        effect_at="2026-09-13T13:01:00+00:00",
+    )
+    result = classify_terminal_snapshot(row)
+    assert result.disposition == "disproven"
+    assert result.rejected_proofs[0]["reason"] == "effect_outside_measured_window"
+    row["proof_candidates"][0]["effect_at"] = "2026-09-13T12:59:00+00:00"
+    assert classify_terminal_snapshot(row).disposition == "proven"
+
+
 def test_matrix_stop_time_is_required_and_must_precede_observation():
     for stopped_at in (None, "garbage", "2026-09-13T11:59:00+00:00", "2026-09-13T13:13:00+00:00"):
         result = classify_terminal_snapshot(_snapshot(arm_stopped_at=stopped_at))

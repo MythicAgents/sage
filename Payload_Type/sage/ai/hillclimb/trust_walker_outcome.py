@@ -341,6 +341,13 @@ def classify_terminal_snapshot(snapshot: object) -> OutcomeDisposition:
         deadline_at = _timestamp(snapshot.get("arm_stopped_at"))
         if not started_at or not deadline_at or not observed_at or deadline_at <= started_at or observed_at < deadline_at:
             return _invalid("unbounded arm stop timing evidence is malformed")
+    elif policy == "bounded-matrix-wall":
+        fixed_deadline = _timestamp(snapshot.get("arm_deadline_at"))
+        stopped_at = _timestamp(snapshot.get("arm_stopped_at"))
+        if (not started_at or not fixed_deadline or not stopped_at or not observed_at
+                or fixed_deadline <= started_at or stopped_at <= started_at or observed_at < stopped_at):
+            return _invalid("bounded matrix arm timing evidence is malformed")
+        deadline_at = min(fixed_deadline, stopped_at)
     elif policy is None:
         deadline_at = _timestamp(snapshot.get("arm_deadline_at"))
         if not started_at or not deadline_at or not observed_at or deadline_at <= started_at or observed_at < started_at:
@@ -398,7 +405,7 @@ def classify_terminal_snapshot(snapshot: object) -> OutcomeDisposition:
             and command_name not in OBJECTIVE_INERT_UNFINISHED_COMMANDS
         )
     accounting = snapshot.get("task_accounting")
-    if policy == "unbounded-until-terminal":
+    if policy in {"unbounded-until-terminal", "bounded-matrix-wall"}:
         # Without a task admission budget, Mythic's operation-scoped census is
         # authoritative.  Optional accounting may add reservations, but may
         # not contradict the census or silently impose a numeric ceiling.

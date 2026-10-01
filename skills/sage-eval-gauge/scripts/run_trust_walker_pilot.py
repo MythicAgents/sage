@@ -32,7 +32,7 @@ if str(PAYLOAD) not in sys.path:
 from ai import task_budget
 from ai.hillclimb import bare_bloodhound, bare_mythic_tools, effect_registry, live_seams
 from ai.hillclimb import operator_replay_benchmark
-from ai.hillclimb.bare_runner import BareModelRunner, make_stdout_logger
+from ai.hillclimb.bare_runner import BareModelRunner, BareRunnerRecoveryError, make_stdout_logger
 from ai.hillclimb.range_state import Milestone
 from ai.hillclimb.trust_walker_outcome import (
     OBJECTIVE_INERT_UNFINISHED_COMMANDS,
@@ -46,7 +46,7 @@ from ai.hillclimb.trust_walker_pilot import (
     ALTERNATE_START_SCHEMA, AlternateStartBinding,
     RECOVERY_CLEANUP_ATTEMPT_LIMIT, TASK_SETTLEMENT_SECONDS,
     SETUP_REHEARSAL_ATTEMPT_LIMIT, SETUP_REHEARSAL_SUCCESSES,
-    ImprovementContract, MatrixPairContract, MatrixRoute, PilotContract, PilotDependencies, PilotError,
+    ImprovementContract, MatrixPairContract, MatrixRoute, PilotContract, PilotDependencies, PilotError, PairRecoveryBlocked,
     load_matrix_contract,
     append_record, arm_environment, assert_rejected_kernel_absent,
     compare_start_manifests, matched_start_identity, read_records, retained_alternate_start_binding, run_pair,
@@ -84,6 +84,13 @@ TRUST_WALKER_REQUIRED_RUNTIME_TOOLS = ("SharpHound.exe",)
 SAGE_TLS_BOOTSTRAP = "Payload_Type/sage/ssl_bootstrap.py"
 SAGE_TLS_CA_BUNDLE = "Payload_Type/sage/certs/bundle.pem"
 HOST_EXECUTABLES = ("git", "uv", "tmux", "pgrep", "python3", "xfreerdp3", "docker")
+RESET_STAGE_NAMES = frozenset({
+    "stop-sage", "archive-dbs", "reset-mythic", "ludus-rollback", "ludus-poweron",
+    "range-boot", "clock-reachability", "sync-range-time", "wipe-bloodhound",
+    "bloodhound-empty", "restart-sage", "bootstrap-foothold", "foothold-power",
+    "foothold-launch", "readiness", "callback-discovery", "reset-orchestration",
+})
+RESET_STAGE_ERRORS = frozenset({"SystemExit", "KeyboardInterrupt", "TimeoutExpired", "UnexpectedError"})
 MYTHIC_ENV_KEYS = ("MYTHIC_ADMIN_PASSWORD", "RABBITMQ_PASSWORD")
 BLOODHOUND_ENV_KEYS = (
     "BLOODHOUND_SCHEME",
@@ -265,11 +272,21 @@ def _json_hash(value: Any) -> str:
 
 def _write_private(path: Path, value: Any) -> dict[str, str]:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
-    temporary.chmod(0o600)
-    temporary.replace(path)
-    path.chmod(0o600)
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(value, indent=2, sort_keys=True, default=str) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
     return {"path": str(path), "sha256": _sha256(path)}
 
 
@@ -419,14 +436,24 @@ def _call_before_deadline(deadline: float, fn, *args):
         return fn(*args)
     previous_handler = signal.getsignal(signal.SIGALRM)
     previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    deadline_fired = False
 
     def expired(_signum, _frame):
+        nonlocal deadline_fired
+        deadline_fired = True
         raise TimeoutError("arm wall deadline reached inside blocking adapter")
 
     signal.signal(signal.SIGALRM, expired)
     signal.setitimer(signal.ITIMER_REAL, remaining)
     try:
-        return fn(*args)
+        result = fn(*args)
+        if deadline_fired:
+            raise TimeoutError("arm wall deadline reached inside blocking adapter")
+        return result
+    except Exception as exc:
+        if deadline_fired and not isinstance(exc, TimeoutError):
+            raise TimeoutError("arm wall deadline reached inside blocking adapter") from exc
+        raise
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous_handler)
@@ -860,7 +887,9 @@ def _resolve_live_authority(
             or contract.start_case not in allowed_starts
             or not isinstance(snapshots, Mapping)
             or snapshots.get(contract.start_case) != expected_snapshot
-            or record.get("no_numeric_arm_ceilings") is not True
+            or (record.get("no_numeric_arm_ceilings") is not True if contract.wall_seconds is None
+                else record.get("arm_wall_seconds") != contract.wall_seconds
+                or "no_numeric_arm_ceilings" in record)
             or record.get("environment_binding") != expected_environment
             or not isinstance(allowed_commands, list)
             or any(not isinstance(value, str) for value in allowed_commands)
@@ -886,8 +915,24 @@ def _resolve_live_authority(
             ],
             "cleanup": "settle and archive each arm before the next reset; retain the final Mythic state after the batch",
         }
+        if contract.wall_seconds is not None:
+            expected_scope["arm_wall_seconds"] = contract.wall_seconds
+        if contract.continue_after_time_limit:
+            expected_scope["continue_after_time_limit"] = True
+        if contract.continue_after_refusal:
+            expected_scope["continue_after_refusal"] = True
         if not isinstance(scope, Mapping) or any(scope.get(key) != value for key, value in expected_scope.items()):
             raise PilotError("matrix live authority scope differs from the pair protocol")
+        if not contract.continue_after_time_limit and scope.get("continue_after_time_limit") is True:
+            raise PilotError("matrix live authority continuation policy differs from the pair protocol")
+        if not contract.continue_after_refusal and scope.get("continue_after_refusal") is True:
+            raise PilotError("matrix live authority refusal policy differs from the pair protocol")
+        if getattr(args, "resumable", False) or getattr(args, "resume", False):
+            if scope.get("same_arm_recovery") != {
+                "enabled": True, "ambiguous_submission": "stop",
+                "model_request_without_response": "stop",
+            }:
+                raise PilotError("matrix authority must prospectively enable same_arm_recovery with ambiguous submissions and missing model responses stopped")
         protocol_binding = record.get("protocol_binding")
         if not isinstance(protocol_binding, Mapping):
             raise PilotError("matrix live authority lacks a frozen protocol binding")
@@ -1810,6 +1855,7 @@ class RuntimePilot:
         alternate_start: AlternateStartBinding | None = None,
         measurement_metadata: Mapping[str, Any] | None = None,
         selected_route: MatrixRoute | None = None,
+        matrix_wall_seconds: int | None = None,
     ):
         self.artifact_dir = artifact_dir
         self.protected_manifest = protected_manifest
@@ -1821,6 +1867,7 @@ class RuntimePilot:
         self.source_identities = dict(source_identities or {})
         self.alternate_start = alternate_start
         self.selected_route = selected_route
+        self.matrix_wall_seconds = matrix_wall_seconds
         initial_root = next(iter(self.source_roots.values()), ROOT)
         self.source_root = initial_root
         self.orchestrate = _orchestrate(initial_root)
@@ -1933,7 +1980,9 @@ class RuntimePilot:
         return state
 
     @classmethod
-    def for_recovery(cls, artifact_dir: Path) -> tuple["RuntimePilot", Mapping[str, Any], Mapping[str, Any]]:
+    def for_recovery(
+        cls, artifact_dir: Path, *, cleanup_source_drift_reason: str | None = None,
+    ) -> tuple["RuntimePilot", Mapping[str, Any], Mapping[str, Any]]:
         root = validate_artifact_dir(artifact_dir)
         ledger = root / "pilot.jsonl"
         records = read_records(ledger)
@@ -1954,8 +2003,17 @@ class RuntimePilot:
         obj.route_smoke = None
         recorded_source_root = Path(str(runtime_identity.get("source_root") or ROOT)).resolve()
         expected_source_identity = str((last.get("start_identity") or {}).get("source_identity") or "")
-        if expected_source_identity and _source_identity_at(recorded_source_root) != expected_source_identity:
+        current_source_identity = _source_identity_at(recorded_source_root)
+        source_drift = bool(expected_source_identity and current_source_identity != expected_source_identity)
+        if source_drift and cleanup_source_drift_reason is None:
             raise PilotError("recovery source root no longer matches the bound arm identity")
+        if cleanup_source_drift_reason is not None:
+            if not isinstance(cleanup_source_drift_reason, str) or not cleanup_source_drift_reason.strip() or cleanup_source_drift_reason != cleanup_source_drift_reason.strip():
+                raise PilotError("cleanup source drift reason must be nonempty and trimmed")
+            if not source_drift:
+                raise PilotError("cleanup source drift exception requires a recorded source mismatch")
+            if not expected_source_identity:
+                raise PilotError("cleanup source drift exception requires a bound original source identity")
         obj.source_root = recorded_source_root
         obj.source_roots = {str(last.get("arm") or ""): recorded_source_root}
         obj.source_identities = {str(last.get("arm") or ""): expected_source_identity}
@@ -1973,6 +2031,24 @@ class RuntimePilot:
             raise PilotError("recovery login resolved a different Mythic operation")
         obj.current_operation_id = operation_id
         obj.current_callback_id = callback_id
+        obj.cleanup_source_binding = None
+        if source_drift:
+            retained_callback = runtime_identity.get("resume_callback")
+            if (
+                not isinstance(retained_callback, Mapping)
+                or retained_callback.get("operation_id") != operation_id
+                or retained_callback.get("display_id") != callback_id
+                or not retained_callback.get("agent_callback_id")
+                or not retained_callback.get("init_callback")
+                or obj._resume_callback_identity() != dict(retained_callback)
+            ):
+                raise PilotError("cleanup source drift exception requires the original operation and callback UUID lineage")
+            obj.cleanup_source_binding = {
+                "original_source_identity": expected_source_identity,
+                "cleanup_source_identity": current_source_identity,
+                "reason": cleanup_source_drift_reason,
+                "callback_lineage_verified": True,
+            }
         obj.current_arm = str(last.get("arm") or "")
         obj.current_chat_channel_id = None
         obj.current_chat_request_id = None
@@ -2119,7 +2195,12 @@ class RuntimePilot:
         paths = _validate_external_paths()
         smoke = _validate_route_smoke(self.route_smoke, self.route, getattr(self, "selected_route", None))
         bloodhound = self._bloodhound_service_preflight()
-        engagement_state = self._fresh_engagement_state(contract.arm_order)
+        engagement_state = (
+            {arm: {"engagement_id": self._engagement_id(arm), "resume": True}
+             for arm in contract.arm_order}
+            if getattr(self, "resuming_pair", False)
+            else self._fresh_engagement_state(contract.arm_order)
+        )
         assert_rejected_kernel_absent()
         result = {
             "ready": True,
@@ -2462,17 +2543,61 @@ class RuntimePilot:
             "SAGE_ENGAGEMENT_NETBIOS_MAP": NETBIOS_MAP,
             "SAGE_ENGAGEMENT_ID": engagement_id,
         }
+        if getattr(self, "recovery_enabled", False):
+            restart_env["SAGE_AUTO_CONTROLLER_RECOVERY"] = "1"
         self.current_reset_started = True
-        _unused, callback_id = self.orchestrate.full_reset_and_ready(
-            restart_env=restart_env,
-            snapshot=alternate_start.snapshot if alternate_start is not None else SNAPSHOT,
-            retained_callback_config=(
-                Path(alternate_start.retained_config_path)
-                if alternate_start is not None
-                else self.source_root / "skills" / "sage-callback-bootstrap" / "apollo_callback_config.json"
-            ),
-            foothold=foothold,
-        )
+        stage_path = self.artifact_dir / "reset-stages.jsonl"
+        last_stage_status = None
+
+        def retain_reset_stage(event: Mapping[str, Any]) -> None:
+            nonlocal last_stage_status
+            stage = event.get("stage")
+            status = event.get("status")
+            if (not isinstance(stage, str) or stage not in RESET_STAGE_NAMES
+                    or not isinstance(status, str) or status not in {"started", "passed", "failed"}):
+                raise PilotError("reset emitted an unknown stage event")
+            error_class = event.get("error_class")
+            if not isinstance(error_class, str) or error_class not in RESET_STAGE_ERRORS:
+                error_class = None
+            exit_code = event.get("exit_code")
+            if type(exit_code) is not int:
+                exit_code = None
+            timeout_seconds = event.get("timeout_seconds")
+            if type(timeout_seconds) not in (int, float) or not 0 < timeout_seconds <= 86400:
+                timeout_seconds = None
+            append_record(stage_path, {
+                "record_type": "reset_stage", "arm": arm, "stage": stage, "status": status,
+                "error_class": error_class if status == "failed" else None,
+                "exit_code": exit_code if status == "failed" else None,
+                "timeout_seconds": timeout_seconds if status == "failed" else None,
+            })
+            last_stage_status = status
+
+        try:
+            _unused, callback_id = self.orchestrate.full_reset_and_ready(
+                restart_env=restart_env,
+                snapshot=alternate_start.snapshot if alternate_start is not None else SNAPSHOT,
+                retained_callback_config=(
+                    Path(alternate_start.retained_config_path)
+                    if alternate_start is not None
+                    else self.source_root / "skills" / "sage-callback-bootstrap" / "apollo_callback_config.json"
+                ),
+                foothold=foothold,
+                setup_stage_callback=retain_reset_stage,
+            )
+        except BaseException as exc:
+            if last_stage_status != "failed":
+                retain_reset_stage({
+                    "stage": "reset-orchestration", "status": "failed",
+                    "error_class": (
+                        "TimeoutExpired" if isinstance(exc, subprocess.TimeoutExpired)
+                        else "SystemExit" if isinstance(exc, SystemExit)
+                        else "KeyboardInterrupt" if isinstance(exc, KeyboardInterrupt) else "UnexpectedError"
+                    ),
+                    "exit_code": getattr(exc, "setup_exit_code", None),
+                    "timeout_seconds": getattr(exc, "setup_timeout_seconds", getattr(exc, "timeout", None)),
+                })
+            raise
         client = self.native.login
         logged_in = asyncio.run(client())
         readiness = self._post_reset_readiness(logged_in)
@@ -2542,6 +2667,7 @@ class RuntimePilot:
         self.current_stopped_at = None
         self.current_budget = None
         self.current_execution = None
+        self._resume_arm_active = False
         start = {
             "snapshot": alternate_start.snapshot if alternate_start is not None else SNAPSHOT,
             "range_profile": observed_profile.get("id"),
@@ -2566,7 +2692,7 @@ class RuntimePilot:
         return start
 
     def runtime_identity(self) -> Mapping[str, Any]:
-        return {
+        result = {
             "operation_id": self.current_operation_id,
             "callback_id": self.current_callback_id,
             "arm": self.current_arm,
@@ -2575,6 +2701,112 @@ class RuntimePilot:
             ),
             "source_root": str(self.source_root),
         }
+        if getattr(self, "recovery_enabled", False):
+            result["resume_callback"] = self._resume_callback_identity()
+        return result
+
+    def _resume_callback_identity(self) -> dict[str, Any]:
+        from mythic import mythic
+        result = asyncio.run(mythic.execute_custom_query(
+            self.current_client,
+            "query ResumeCallback($operation: Int!, $callback: Int!) { callback(where: {operation_id: {_eq: $operation}, display_id: {_eq: $callback}}) { operation_id display_id agent_callback_id init_callback } }",
+            variables={"operation": self.current_operation_id, "callback": self.current_callback_id},
+        ))
+        rows = result.get("callback") if isinstance(result, Mapping) else None
+        if not isinstance(rows, list) or len(rows) != 1 or not rows[0].get("agent_callback_id") or not rows[0].get("init_callback"):
+            raise PilotError("recovery requires the original callback UUID and creation identity")
+        return dict(rows[0])
+
+    def restore_runtime(self, arm, start, runtime_identity, records):
+        self._activate_source(arm)
+        if str(Path(runtime_identity.get("source_root", "")).resolve()) != str(self.source_root.resolve()) or start.get("source_identity") != _source_identity_at(self.source_root):
+            raise PilotError("resume source differs from the original arm")
+        self.current_client = asyncio.run(self.native.login())
+        operation = runtime_identity.get("operation_id")
+        if getattr(self.current_client, "current_operation_id", None) != operation:
+            raise PilotError("resume login resolved a different Mythic operation")
+        self.current_operation_id = operation
+        self.current_callback_id = runtime_identity.get("callback_id")
+        self.current_arm = arm
+        if runtime_identity.get("engagement_id") != self._engagement_id(arm):
+            raise PilotError("resume engagement identity differs from the original arm")
+        if self._resume_callback_identity() != runtime_identity.get("resume_callback"):
+            raise PilotError("resume callback changed or range was reset")
+        self.current_reset_started = True
+        self._resume_records = list(records)
+        self._resume_arm_active = any(row.get("record_type") == "producer_intent" and row.get("arm") == arm for row in records)
+        for row in records:
+            if row.get("record_type") != "progress" or row.get("arm") != arm:
+                continue
+            event = row.get("event") or {}
+            if event.get("event") == "request_started":
+                self.current_chat_channel_id = event.get("chat_channel_id")
+                self.current_chat_request_id = event.get("chat_request_id")
+                self.current_original_chat_request_id = self.current_chat_request_id
+            if event.get("event") == "resume_request_started":
+                self.current_chat_request_id = event.get("chat_request_id")
+            if event.get("event") == "execution_started":
+                self.current_started_at = datetime.fromisoformat(event["arm_started_at"])
+                self.current_deadline_at = datetime.fromisoformat(event["arm_deadline_at"]) if event.get("arm_deadline_at") else None
+        return self.runtime_identity()
+
+    def resume_arm(self, arm, start, progress, records):
+        if not getattr(self, "_resume_arm_active", False):
+            raise PilotError("resume runtime has not been rebound")
+        try:
+            return self.run_arm(arm, start, progress)
+        except BareRunnerRecoveryError as exc:
+            raise PairRecoveryBlocked(str(exc)) from exc
+
+    async def _sage_resume_ready(self):
+        from mythic import mythic
+        result = await mythic.execute_custom_query(
+            self.current_client,
+            "query ResumeSageService { consuming_container(where: {name: {_eq: \"sage\"}, type: {_eq: \"chat\"}, deleted: {_eq: false}}) { container_running } }",
+        )
+        rows = result.get("consuming_container", [])
+        return len(rows) == 1 and rows[0].get("container_running") is True
+
+    async def _resume_shipping_request(self, progress, deadline: float | None = None):
+        """Attach to a live controller or request a validated clean-boundary restore."""
+        from ai.langgraph.controller_recovery import ControllerRecoveryStore
+        if type(self.current_chat_request_id) is not int or type(self.current_chat_channel_id) is not int:
+            raise PairRecoveryBlocked("interrupted Sage request creation has no durable identity")
+        original = getattr(self, "current_original_chat_request_id", self.current_chat_request_id)
+        snapshot = await self.native.fetch_request_snapshot(self.current_client, self.current_chat_request_id)
+        if self.current_chat_request_id == original and str((snapshot.get("request") or {}).get("status", "")).casefold() in self.native.TERMINAL_STATUSES:
+            return self.native.request_snapshot_result(snapshot)
+        store = ControllerRecoveryStore(self.current_operation_id, self.current_chat_channel_id,
+                                        db_path=str(self.source_root / "Payload_Type/sage/sage.db"))
+        status = store.inspect()
+        if not status.get("exists") or str(status.get("original_request_id")) != f"chat:{self.current_chat_channel_id}:request:{original}":
+            raise PairRecoveryBlocked("Sage controller checkpoint is missing or belongs to another request")
+        if not status.get("active"):
+            if status.get("phase") not in {"clean", "terminal"}:
+                raise PairRecoveryBlocked(f"Sage controller recovery blocked at {status.get('phase')} boundary; inspect retained Mythic tasks")
+            events = [row.get("event") or {} for row in getattr(self, "_resume_records", [])
+                      if row.get("record_type") == "progress" and row.get("arm") == self.current_arm]
+            intents = sum(event.get("event") == "resume_request_intent" for event in events)
+            receipts = sum(event.get("event") == "resume_request_started" for event in events)
+            if intents != receipts:
+                raise PairRecoveryBlocked("resume message submission has no saved receipt; inspect native chat before retrying")
+            if not await self._sage_resume_ready():
+                raise PairRecoveryBlocked("Sage chat is not ready; restore local Sage with SAGE_AUTO_CONTROLLER_RECOVERY=1 and the original engagement environment, then resume")
+            progress({"event": "resume_request_intent", "original_request_id": original})
+            created = await self.native.create_message(self.current_client, self.current_chat_channel_id,
+                                                        f"SAGE_RESUME_CONTROLLER {original}")
+            self.current_chat_request_id = created["chat_request_id"]
+            progress({"event": "resume_request_started", "original_request_id": original,
+                      "chat_channel_id": self.current_chat_channel_id,
+                      "chat_request_id": self.current_chat_request_id})
+        remaining = max(0.001, deadline - time.monotonic()) if deadline is not None else None
+        result = await self.native.wait_for_request(
+            self.current_client, self.current_chat_request_id, timeout_seconds=remaining,
+            poll_interval_seconds=5, progress_sink=progress,
+        )
+        if store.inspect().get("phase") != "terminal":
+            raise PairRecoveryBlocked("Sage request ended without a terminal controller checkpoint; inspect native chat and resume configuration")
+        return self.native.request_snapshot_result(result)
 
     def _deactivate_active_callbacks(self) -> dict[str, Any]:
         """Mark every active callback in the freshly reset pilot operation inactive."""
@@ -2617,7 +2849,7 @@ class RuntimePilot:
                 api_key=self.route["api_key"],
                 base_url=self.route["api_endpoint"],
                 objective=OBJECTIVE,
-                request_timeout=remaining if remaining is not None else 900.0,
+                request_timeout=min(900.0, remaining) if remaining is not None else 900.0,
                 max_retries=0,
             )
             return (
@@ -2639,6 +2871,9 @@ class RuntimePilot:
         mythic_dispatch = bare_mythic_tools.make_mythic_dispatcher(
             self.current_client,
             collection_ingestor=bare_bloodhound.make_collection_ingestor(upload),
+            task_submitted_sink=(
+                lambda task_id: runner.record_pending_task_id(task_id)
+            ) if getattr(self, "recovery_enabled", False) else None,
         )
         bh_dispatch = bare_bloodhound.make_bloodhound_dispatcher(bh_registry)
         mythic_names = {spec["function"]["name"] for spec in bare_mythic_tools.bare_tool_specs()}
@@ -2647,36 +2882,88 @@ class RuntimePilot:
             selected = mythic_dispatch if call.get("tool") in mythic_names else bh_dispatch
             return _call_before_deadline(deadline, selected, call) if deadline is not None else selected(call)
 
-        return BareModelRunner(
+        def reconcile(call):
+            task_id = runner.pending_task_id
+            if call.get("tool") != "issue_command" or type(task_id) is not int:
+                raise BareRunnerRecoveryError("pending tool lacks an unambiguous saved Mythic task ID")
+            from mythic import mythic
+            async def wait_existing():
+                rows = await mythic.execute_custom_query(
+                    self.current_client,
+                    "query ResumeTask($operation: Int!, $task: Int!) { task(where: {operation_id: {_eq: $operation}, display_id: {_eq: $task}}) { display_id command_name original_params callback { display_id } } }",
+                    variables={"operation": self.current_operation_id, "task": task_id},
+                )
+                tasks = rows.get("task", [])
+                args = call.get("args") or {}
+                callback_id = int(args.get("callback_display_id"))
+                if len(tasks) != 1 or tasks[0].get("command_name") != args.get("command") or (tasks[0].get("callback") or {}).get("display_id") != callback_id:
+                    raise BareRunnerRecoveryError("saved task no longer matches the pending command and callback")
+                params = args.get("parameters", "")
+                expected = params if isinstance(params, str) else json.dumps(params) if params else ""
+                if tasks[0].get("original_params") != expected:
+                    raise BareRunnerRecoveryError("saved task parameters differ from the pending command")
+                return await mythic.waitfor_for_task_output(self.current_client, task_display_id=task_id, timeout=int(args.get("timeout", 300)))
+            output = (_call_before_deadline(deadline, lambda: asyncio.run(wait_existing()))
+                      if deadline is not None else asyncio.run(wait_existing()))
+            progress({"event": "recovered_task_observation", "task_id": task_id})
+            return output.decode(errors="replace") if isinstance(output, (bytes, bytearray)) else str(output)
+
+        recovery = {}
+        if getattr(self, "recovery_enabled", False):
+            recovery = {
+                "checkpoint_path": self.artifact_dir / "raw-runner-checkpoint.json",
+                "checkpoint_binding": {"runtime": self.runtime_identity(), "route": self.safe_route,
+                                       "source": _source_identity_at(self.source_root),
+                                       "authority": self.live_authority_receipt},
+                "resume": bool(getattr(self, "_resume_arm_active", False)),
+                "reconcile_pending_tool": reconcile,
+            }
+        runner = BareModelRunner(
             self._deadline_model(deadline),
             dispatch,
             tools_spec=[*bare_mythic_tools.bare_tool_specs(), *bh_specs],
             max_steps=0,
-            timeout=max(0.0, deadline - time.monotonic()) if deadline is not None else None,
+            timeout=getattr(self, "matrix_wall_seconds", None) if getattr(self, "matrix_wall_seconds", None) is not None else (
+                max(0.0, deadline - time.monotonic()) if deadline is not None else None),
             logger=make_stdout_logger(),
-            token_ceiling=None if deadline is None else 1_000_000,
+            token_ceiling=None if getattr(self, "selected_route", None) is not None else 1_000_000,
+            elapsed_floor_seconds=(
+                max(0.0, (datetime.now(UTC) - self.current_started_at).total_seconds())
+                if getattr(self, "matrix_wall_seconds", None) is not None else 0.0
+            ),
+            provider_timeout_is_wall=getattr(self, "matrix_wall_seconds", None) is None,
             require_complete_usage=True,
             event_sink=progress,
             response_validator=self._validate_one_raw_response,
+            **recovery,
         )
+        return runner
 
     def run_arm(self, arm: str, _start: Mapping[str, Any], progress) -> Mapping[str, Any]:
         if self.current_client is None or self.current_operation_id is None:
             raise PilotError("arm runtime has no bound Mythic operation")
         route = getattr(self, "route", {"provider": PROVIDER, "model": MODEL})
         matrix_arm = getattr(self, "selected_route", None) is not None
-        started_at = datetime.now(UTC)
-        deadline_at = None if matrix_arm else started_at + timedelta(seconds=2700)
-        deadline = None if matrix_arm else time.monotonic() + 2700
+        resuming = bool(getattr(self, "_resume_arm_active", False))
+        started_at = self.current_started_at if resuming else datetime.now(UTC)
+        if resuming and (not matrix_arm or not isinstance(started_at, datetime)):
+            raise PilotError("same-arm recovery requires a matrix arm and its original start time")
+        wall_seconds = getattr(self, "matrix_wall_seconds", None) if matrix_arm else 2700
+        deadline_at = started_at + timedelta(seconds=wall_seconds) if wall_seconds is not None else None
+        deadline = (time.monotonic() + max(0.0, (deadline_at - datetime.now(UTC)).total_seconds())
+                    if deadline_at is not None else None)
         self.current_started_at = started_at
         self.current_deadline_at = deadline_at
         self.current_stopped_at = None
         self.current_deadline_monotonic = deadline
-        progress({
-            "event": "execution_started",
-            "arm_started_at": started_at.isoformat(),
-            "arm_deadline_at": deadline_at.isoformat() if deadline_at is not None else None,
-        })
+        if not resuming:
+            progress({
+                "event": "execution_started",
+                "arm_started_at": started_at.isoformat(),
+                "arm_deadline_at": deadline_at.isoformat() if deadline_at is not None else None,
+            })
+        else:
+            progress({"event": "execution_resumed", "original_arm_started_at": started_at.isoformat()})
         declared_metadata = getattr(self, "measurement_metadata", {})
         if self._shipping_arm(arm):
             def shipping_progress(event):
@@ -2702,7 +2989,17 @@ class RuntimePilot:
             metadata_fields = _assembled_measurement_metadata(declared_metadata, arm=arm, config=config)
             try:
                 async def execute_shipping():
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise TimeoutError("arm wall deadline reached before Sage request")
                     remaining = max(0.001, deadline - time.monotonic()) if deadline is not None else None
+                    if resuming:
+                        if type(self.current_chat_request_id) is not int or type(self.current_chat_channel_id) is not int:
+                            raise PilotError("interrupted Sage request creation has no durable request identity; refusing a new submission")
+                        identity = await self.native.fetch_channel_runtime_identity(self.current_client, self.current_chat_channel_id)
+                        expected = self.native._chat_runtime_identity_from_metadata(metadata)
+                        if any(identity.get(key) != expected.get(key) for key in ("provider", "model", "route")):
+                            raise PilotError("resumed Sage channel route differs from the original route")
+                        return await self._resume_shipping_request(shipping_progress, deadline)
                     turn = self.native.run_native_chat_turn(
                             self.current_client,
                             OBJECTIVE,
@@ -2718,16 +3015,35 @@ class RuntimePilot:
                                 "route": self.native._chat_runtime_identity_from_metadata(metadata)["route"],
                             },
                     )
-                    return await asyncio.wait_for(turn, timeout=remaining) if remaining is not None else await turn
+                    return await turn
 
-                result = asyncio.run(execute_shipping())
+                async def bounded_shipping():
+                    if deadline is None:
+                        return await execute_shipping()
+                    return await asyncio.wait_for(
+                        execute_shipping(), timeout=max(0.0, deadline - time.monotonic())
+                    )
+
+                result = asyncio.run(bounded_shipping())
                 termination = str(result.get("status") or "unknown")
+                telemetry = result.get("runtime_telemetry") or {}
+                if termination == "complete" and isinstance(telemetry, Mapping) and telemetry.get("controller_status") == "halted_refusal":
+                    termination = "halted_refusal"
+                if (
+                    wall_seconds is not None
+                    and ((isinstance(telemetry, Mapping)
+                          and telemetry.get("controller_status") == "halted_budget"
+                          and telemetry.get("controller_terminal_reason") == "wall-clock budget exhausted")
+                         or (deadline is not None and time.monotonic() >= deadline
+                             and telemetry.get("controller_status") != "complete"))
+                ):
+                    termination = "time_limit"
             except self.native.RequestWaitTimeout as exc:
                 result = self.native.request_snapshot_result(exc.last_snapshot or {})
-                termination = "timeout"
+                termination = "time_limit" if deadline is not None and time.monotonic() >= deadline else "provider_timeout"
             except TimeoutError:
                 result = {}
-                termination = "timeout"
+                termination = "time_limit" if deadline is not None and time.monotonic() >= deadline else "provider_timeout"
             execution = {
                 "termination": termination,
                 "arm_started_at": started_at.isoformat(),
@@ -2746,23 +3062,28 @@ class RuntimePilot:
         metadata_fields = _assembled_measurement_metadata(declared_metadata, arm=arm, config={
             "provider": route["provider"], "model": route["model"], "mode": "auto", "max_steps": 0,
             "max_retries": 0, "max_output_tokens": None,
-            "request_timeout_policy": "per_request_900_seconds" if matrix_arm else "remaining_arm_wall_seconds",
+            "request_timeout_policy": "min(900_seconds,remaining_arm_wall_seconds)" if wall_seconds is not None else "per_request_900_seconds",
         })
         budget = None if matrix_arm else task_budget.TaskBudget(100, deadline, event_sink=progress)
         self.current_budget = budget
         runner = self._raw_runner(deadline, progress)
-        if budget is None:
-            result = runner.run(OBJECTIVE)
-            budget_snapshot = None
-        else:
-            with task_budget.task_budget_scope(budget):
+        try:
+            if budget is None:
                 result = runner.run(OBJECTIVE)
-            budget_snapshot = budget.snapshot()
+                budget_snapshot = None
+            else:
+                with task_budget.task_budget_scope(budget):
+                    result = runner.run(OBJECTIVE)
+                budget_snapshot = budget.snapshot()
+        except BareRunnerRecoveryError as exc:
+            raise PairRecoveryBlocked(str(exc)) from exc
         transcript = _write_private(self.artifact_dir / "raw-mythic-bloodhound-transcript.json", {
             "objective": result.objective,
             "events": result.transcript,
             "final": result.final_text,
-            "termination": result.termination,
+            "termination": ({"cause": "wall_time", "subtype": "time_limit"}
+                            if result.termination.get("cause") == "wall_time" and matrix_arm and wall_seconds is not None
+                            else result.termination),
             "response_records": result.model_response_records,
             "recoverable_tool_errors": result.recoverable_tool_errors,
         })
@@ -2793,7 +3114,9 @@ class RuntimePilot:
         ):
             raise PilotError("raw task-budget accounting is missing or invalid")
         execution = {
-            "termination": result.termination,
+            "termination": ({"cause": "wall_time", "subtype": "time_limit"}
+                            if result.termination.get("cause") == "wall_time" and matrix_arm and wall_seconds is not None
+                            else result.termination),
             "transcript": transcript,
             "response_records": safe_records,
             "arm_started_at": started_at.isoformat(),
@@ -2891,7 +3214,11 @@ class RuntimePilot:
                     and len(task_state.get("confirmed_task_ids")) <= task_state.get("reservations")
                 )
                 finalized.update({
-                    "termination": str(shipping_result.get("status") or finalized.get("termination") or "unknown"),
+                    "termination": (finalized.get("termination") if finalized.get("termination") == "time_limit"
+                                    else "halted_refusal" if str(shipping_result.get("status") or "") == "complete"
+                                    and isinstance(telemetry, Mapping)
+                                    and telemetry.get("controller_status") == "halted_refusal"
+                                    else str(shipping_result.get("status") or finalized.get("termination") or "unknown")),
                     "pending_finalization": False,
                     "transcript": transcript,
                     "response_records": safe_records,
@@ -2907,7 +3234,8 @@ class RuntimePilot:
                         "total_tokens": total_tokens,
                         "payload_tasks": task_state.get("reservations") if isinstance(task_state, Mapping) else None,
                         "wall_seconds": (
-                            min(2700.0, max(0.0, time.monotonic() - self.current_deadline_monotonic + 2700))
+                            min(float(getattr(self, "matrix_wall_seconds", None) or 2700), max(0.0,
+                                time.monotonic() - self.current_deadline_monotonic + float(getattr(self, "matrix_wall_seconds", None) or 2700)))
                             if isinstance(self.current_deadline_monotonic, (int, float))
                             else max(0.0, (datetime.now(UTC) - self.current_started_at).total_seconds())
                             if isinstance(self.current_started_at, datetime)
@@ -3249,7 +3577,8 @@ class RuntimePilot:
             "arm_deadline_at": self.current_deadline_at.isoformat() if self.current_deadline_at else None,
             **({"arm_stopped_at": self.current_stopped_at.isoformat()}
                if getattr(self, "current_stopped_at", None) else {}),
-            **({"measurement_policy": "unbounded-until-terminal"}
+            **({"measurement_policy": (
+                "bounded-matrix-wall" if getattr(self, "matrix_wall_seconds", None) is not None else "unbounded-until-terminal")}
                if getattr(self, "selected_route", None) is not None else {}),
             "observed_at": observed_at or datetime.now(UTC).isoformat(),
             "observer_complete": complete,
@@ -3599,6 +3928,7 @@ def _runtime(
         ),
         measurement_metadata=_measurement_metadata(getattr(args, "measurement_metadata", None)),
         selected_route=(contract.route if isinstance(contract, MatrixPairContract) else None),
+        matrix_wall_seconds=(contract.wall_seconds if isinstance(contract, MatrixPairContract) else None),
     )
 
 
@@ -3750,6 +4080,9 @@ def _replay_contract(records: list[dict[str, Any]]) -> PilotContract | Improveme
                 tool_contract=value.get("tool_contract"),
                 dependency_identity=value.get("dependency_identity"),
                 alternate_start=alternate_start,
+                wall_seconds=value.get("wall_seconds"),
+                continue_after_time_limit=value.get("continue_after_time_limit", False),
+                continue_after_refusal=value.get("continue_after_refusal", False),
             )
         except (TypeError, ValueError) as exc:
             raise PilotError("retained matrix pair contract is malformed") from exc
@@ -3868,11 +4201,11 @@ def replay_pair(artifact_dir: str | Path, native_evidence_manifest: str | Path |
         projector = object.__new__(RuntimePilot)
         projector.current_operation_id = operation_id
         projector.selected_route = contract.route if isinstance(contract, MatrixPairContract) else None
+        projector.matrix_wall_seconds = contract.wall_seconds if isinstance(contract, MatrixPairContract) else None
         if isinstance(contract, MatrixPairContract):
             if (
-                snapshot.get("arm_deadline_at") is not None
-                or execution.get("arm_deadline_at") is not None
-                or snapshot.get("measurement_policy") != "unbounded-until-terminal"
+                snapshot.get("measurement_policy") != (
+                    "bounded-matrix-wall" if contract.wall_seconds is not None else "unbounded-until-terminal")
                 or not isinstance(snapshot.get("arm_started_at"), str)
                 or not isinstance(snapshot.get("arm_stopped_at"), str)
                 or snapshot["arm_started_at"] != execution.get("arm_started_at")
@@ -3881,11 +4214,16 @@ def replay_pair(artifact_dir: str | Path, native_evidence_manifest: str | Path |
                 raise PilotError("retained matrix execution window disagrees with native evidence")
             projector.current_started_at = datetime.fromisoformat(snapshot["arm_started_at"])
             projector.current_stopped_at = datetime.fromisoformat(snapshot["arm_stopped_at"])
-            projector.current_deadline_at = None
+            projector.current_deadline_at = (datetime.fromisoformat(snapshot["arm_deadline_at"])
+                                             if contract.wall_seconds is not None else None)
             if (
                 projector.current_started_at.tzinfo is None
                 or projector.current_stopped_at.tzinfo is None
                 or projector.current_stopped_at <= projector.current_started_at
+                or (snapshot.get("arm_deadline_at") is not None if contract.wall_seconds is None else
+                    snapshot.get("arm_deadline_at") != execution.get("arm_deadline_at")
+                    or projector.current_deadline_at.tzinfo is None
+                    or (projector.current_deadline_at - projector.current_started_at).total_seconds() != contract.wall_seconds)
             ):
                 raise PilotError("retained matrix stop time is invalid")
         else:
@@ -3934,7 +4272,10 @@ def replay_pair(artifact_dir: str | Path, native_evidence_manifest: str | Path |
                 raise PilotError("incomplete provider usage has an inconsistent retained cost")
         else:
             raise PilotError("retained resource completeness is missing")
-        result.update(terminal_snapshot=projected, outcome=outcome)
+        # The native receipt was already checked against its file and the
+        # projected observation above. Keep it for the comparison reducer's
+        # independent timeout-continuation evidence check.
+        result.update(terminal_snapshot=dict(snapshot), outcome=outcome)
         reports.append({
             "arm": arm, "binding": binding, "native_sha256": native["sha256"],
             "operation_id": operation_id, "native_tasks": len(observed["task"]),
@@ -3944,7 +4285,7 @@ def replay_pair(artifact_dir: str | Path, native_evidence_manifest: str | Path |
             "source_identity": (start.get("start_identity") or {}).get("source_identity"),
             "measurement_identity": result.get("measurement_identity"),
         })
-    summary = summarize_pair(replayed_records, contract)
+    summary = summarize_pair(replayed_records, contract, artifact_dir=root)
     comparisons = [row for row in records if row.get("record_type") == "comparison"]
     retained_comparison = {
         key: value for key, value in comparisons[0].items() if key not in {"record_type", "recorded_at"}
@@ -4269,6 +4610,12 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--case-descriptor")
         command.add_argument("--route-id", help="Select a model-matrix route; absent means legacy Sonnet v4.")
         command.add_argument("--contract-file", type=Path, default=DEFAULT_MATRIX_CONTRACT)
+        command.add_argument("--arm-wall-seconds", type=int,
+                             help="Prospective matrix arm wall limit in seconds; absent keeps legacy matrix arms uncapped.")
+        command.add_argument("--continue-after-time-limit", action="store_true",
+                             help="Prospectively bind continuation after a valid, cleaned time-limit outcome.")
+        command.add_argument("--continue-after-refusal", action="store_true",
+                             help="Prospectively bind continuation after a valid, cleaned refusal outcome.")
         if name in {"rehearse-setup", "continue-setup", "run-pair"}:
             _add_live_authority_args(command)
         if name in {"preflight", "rehearse-setup", "continue-setup", "run-pair"}:
@@ -4280,8 +4627,12 @@ def build_parser() -> argparse.ArgumentParser:
             )
         if name == "run-pair":
             command.add_argument("--measurement-metadata", help="Non-secret JSON producer metadata for M1 labels.")
+            command.add_argument("--resumable", action="store_true", help="Prospectively enable durable same-arm recovery for a matrix pair.")
+            command.add_argument("--resume", action="store_true", help="Continue a previously opted-in matrix pair using retained state.")
     cleanup = sub.add_parser("cleanup")
     cleanup.add_argument("--artifact-dir", required=True)
+    cleanup.add_argument("--allow-source-drift-for-cleanup", metavar="REASON",
+                         help="Cleanup only: allow a changed source after exact operation/callback lineage verification; requires a nonempty reason.")
     inspect_preserved = sub.add_parser("inspect-preserved")
     inspect_preserved.add_argument("--artifact-dir", required=True)
     improvement = sub.add_parser("run-improvement-pair")
@@ -4378,10 +4729,15 @@ def main(argv: list[str] | None = None) -> int:
                     alternate_start=alternate_start,
                     arm_order=arm_order,
                     source_identity=_source_identity_at(ROOT),
+                    wall_seconds=args.arm_wall_seconds,
+                    continue_after_time_limit=args.continue_after_time_limit,
+                    continue_after_refusal=args.continue_after_refusal,
                 )
             else:
                 contract = PilotContract(arm_order=arm_order, alternate_start=alternate_start)
         contract.validate()
+        if (getattr(args, "resumable", False) or getattr(args, "resume", False)) and not isinstance(contract, MatrixPairContract):
+            raise PilotError("same-arm recovery is supported only for explicitly bound matrix pairs")
     except (PilotError, OSError) as exc:
         print(json.dumps({"ready": False, "error_type": type(exc).__name__, "reason": str(exc)}, indent=2, sort_keys=True))
         return 1
@@ -4467,7 +4823,9 @@ def main(argv: list[str] | None = None) -> int:
             if prior_recoveries >= RECOVERY_CLEANUP_ATTEMPT_LIMIT:
                 raise PilotError("bounded recovery cleanup attempt limit is exhausted")
             runtime, start, execution = RuntimePilot.for_recovery(
-                Path(args.artifact_dir).expanduser().resolve()
+                Path(args.artifact_dir).expanduser().resolve(),
+                **({"cleanup_source_drift_reason": args.allow_source_drift_for_cleanup}
+                   if args.allow_source_drift_for_cleanup is not None else {}),
             )
             recovery_elapsed = 0.0
             settlement = {"complete": False, "reason": "recovery settlement did not run"}
@@ -4479,22 +4837,40 @@ def main(argv: list[str] | None = None) -> int:
                 settlement = {"complete": False, "error_type": type(exc).__name__, "reason": str(exc)}
             finally:
                 recovery_elapsed += max(0.0, time.monotonic() - settlement_started)
-            teardown_started = time.monotonic()
+            native_census = {"complete": False, "reason": "recovery native census was not retained"}
             try:
-                teardown = dict(runtime.teardown(runtime.current_arm, start))
+                observed = getattr(runtime, "_settled_operation_snapshot", None)
+                if not isinstance(observed, Mapping):
+                    observed = runtime._operation_snapshot(runtime.current_client, runtime.current_operation_id)
+                receipt = _retain_native_observation(
+                    runtime.artifact_dir / "recovery-cleanup-native-observation.json", observed,
+                )
+                native_census = {"complete": True, **receipt}
             except BaseException as exc:
-                teardown = {"complete": False, "error_type": type(exc).__name__, "reason": str(exc)}
-            finally:
-                recovery_elapsed += max(0.0, time.monotonic() - teardown_started)
+                native_census = {"complete": False, "error_type": type(exc).__name__, "reason": str(exc)}
+            teardown_started = time.monotonic()
+            if native_census["complete"] is True:
+                try:
+                    teardown = dict(runtime.teardown(runtime.current_arm, start))
+                except BaseException as exc:
+                    teardown = {"complete": False, "error_type": type(exc).__name__, "reason": str(exc)}
+                finally:
+                    recovery_elapsed += max(0.0, time.monotonic() - teardown_started)
+            else:
+                teardown = {"complete": False, "reason": "native census retention failed; preserved range for inspection"}
             total_support_elapsed = runtime.prior_support_elapsed_seconds + recovery_elapsed
             result = {
-                "complete": settlement.get("complete") is True and teardown.get("complete") is True,
+                "complete": (settlement.get("complete") is True and teardown.get("complete") is True
+                             and native_census["complete"] is True),
                 "settlement": {key: value for key, value in settlement.items() if key != "execution"},
+                "native_census": native_census,
                 "teardown": teardown,
                 "recovery_elapsed_seconds": recovery_elapsed,
                 "setup_cleanup_elapsed_seconds": total_support_elapsed,
                 "support_budget_exhausted": total_support_elapsed > contract.setup_cleanup_seconds,
             }
+            if getattr(runtime, "cleanup_source_binding", None) is not None:
+                result["cleanup_source_binding"] = runtime.cleanup_source_binding
             append_record(recovery_ledger, {
                 "record_type": "recovery_cleanup", **result,
             })
@@ -4551,6 +4927,8 @@ def main(argv: list[str] | None = None) -> int:
         runtime.live_authority_id = str(authority_receipt.get("authority_id") or "")
         runtime.live_authority_receipt = dict(authority_receipt)
         runtime.matrix_catalog_receipt = matrix_catalog_receipt
+        runtime.recovery_enabled = bool(getattr(args, "resumable", False) or getattr(args, "resume", False))
+        runtime.resuming_pair = bool(getattr(args, "resume", False))
         if args.command == "preflight":
             result = dict(runtime.preflight(contract))
             retained = _write_private(
@@ -4581,8 +4959,14 @@ def main(argv: list[str] | None = None) -> int:
                 runtime.observe,
                 runtime.teardown,
                 runtime.attest_preserved_state,
+                restore_runtime=runtime.restore_runtime if runtime.recovery_enabled else None,
+                resume_arm=runtime.resume_arm if runtime.recovery_enabled else None,
             )
-            result = run_pair(contract, args.artifact_dir, dependencies)
+            result = (
+                run_pair(contract, args.artifact_dir, dependencies,
+                         resumable=True, resume=runtime.resuming_pair)
+                if runtime.recovery_enabled else run_pair(contract, args.artifact_dir, dependencies)
+            )
     except (PilotError, SystemExit, KeyError, OSError) as exc:
         print(json.dumps({"ready": False, "error_type": type(exc).__name__, "reason": str(exc)}, indent=2, sort_keys=True))
         return 1

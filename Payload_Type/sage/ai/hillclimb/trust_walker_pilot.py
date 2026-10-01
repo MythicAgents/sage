@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
+import fcntl
 import hashlib
 import json
 import math
@@ -10,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import tempfile
 import time
 from typing import Any, Callable, Mapping
 from urllib.parse import urlsplit
@@ -50,6 +52,10 @@ ALTERNATE_START_IP = "10.4.10.12"
 
 class PilotError(RuntimeError):
     pass
+
+
+class PairRecoveryBlocked(PilotError):
+    """A checkpoint or injected recovery seam needs operator reconciliation."""
 
 
 @dataclass(frozen=True)
@@ -180,6 +186,9 @@ class MatrixPairContract:
     tool_contract: str | None = None
     dependency_identity: str | None = None
     alternate_start: AlternateStartBinding | None = None
+    wall_seconds: int | None = None
+    continue_after_time_limit: bool = False
+    continue_after_refusal: bool = False
 
     @classmethod
     def for_route(
@@ -188,17 +197,29 @@ class MatrixPairContract:
         dependency_identity: str | None = None,
         alternate_start: AlternateStartBinding | None = None,
         arm_order: tuple[str, str] = ARM_ORDER,
+        wall_seconds: int | None = None,
+        continue_after_time_limit: bool = False,
+        continue_after_refusal: bool = False,
     ) -> "MatrixPairContract":
         contract = cls(
             matrix_identity=matrix.identity, route=matrix.route_for(route_id),
             start_case=start_case, source_identity=source_identity,
             tool_contract=tool_contract, dependency_identity=dependency_identity,
             alternate_start=alternate_start, arm_order=arm_order,
+            wall_seconds=wall_seconds,
+            continue_after_time_limit=continue_after_time_limit,
+            continue_after_refusal=continue_after_refusal,
         )
         contract.validate(matrix)
         return contract
 
     def validate(self, matrix: MatrixContract | None = None) -> None:
+        if self.wall_seconds is not None and (type(self.wall_seconds) is not int or self.wall_seconds <= 0):
+            raise PilotError("matrix pair wall_seconds must be a positive integer or absent")
+        if type(self.continue_after_time_limit) is not bool or (self.continue_after_time_limit and self.wall_seconds is None):
+            raise PilotError("continue_after_time_limit requires a bounded matrix arm")
+        if type(self.continue_after_refusal) is not bool:
+            raise PilotError("continue_after_refusal must be boolean")
         self.route.validate()
         if not re.fullmatch(r"[0-9a-f]{64}", self.matrix_identity):
             raise PilotError("matrix pair catalog identity is malformed")
@@ -235,8 +256,12 @@ class MatrixPairContract:
             "tool_contract": self.tool_contract,
             "dependency_identity": self.dependency_identity,
             "termination_policy": {
-                "numeric_wall_token_task_ceilings": None,
-                "terminal_conditions": ["verified_objective", "model_terminal", "model_refusal"],
+                "numeric_wall_token_task_ceilings": None if self.wall_seconds is None else {
+                    "wall_seconds": self.wall_seconds, "token_ceiling": None,
+                    "payload_task_limit": None,
+                },
+                "terminal_conditions": ["verified_objective", "model_terminal", "model_refusal"] + (
+                    ["time_limit"] if self.wall_seconds is not None else []),
                 "safety_stops": [
                     "authority_violation", "wrong_target_route_or_model", "corrupt_start",
                     "uncontrolled_activity", "loss_of_interpretable_evidence",
@@ -247,6 +272,12 @@ class MatrixPairContract:
         if self.alternate_start is not None:
             record["alternate_start"] = self.alternate_start.to_record()
             record["case_identity"] = self.alternate_start.identity
+        if self.wall_seconds is not None:
+            record["wall_seconds"] = self.wall_seconds
+        if self.continue_after_time_limit:
+            record["continue_after_time_limit"] = True
+        if self.continue_after_refusal:
+            record["continue_after_refusal"] = True
         return record
 
     @property
@@ -509,6 +540,8 @@ class PilotDependencies:
         [str, Mapping[str, Any] | None, Mapping[str, Any], Mapping[str, Any]],
         Mapping[str, Any],
     ]
+    restore_runtime: Callable[[str, Mapping[str, Any], Mapping[str, Any], list[Mapping[str, Any]]], None] | None = None
+    resume_arm: Callable[[str, Mapping[str, Any], Callable[[Mapping[str, Any]], None], list[Mapping[str, Any]]], Mapping[str, Any]] | None = None
 
 
 def utc_now() -> str:
@@ -527,7 +560,7 @@ def assert_rejected_kernel_absent() -> None:
 def arm_environment(contract: PilotContract | ImprovementContract | MatrixPairContract) -> dict[str, str]:
     contract.validate()
     if isinstance(contract, MatrixPairContract):
-        return {
+        environment = {
             "SAGE_EVAL_UNBOUNDED_ARM": "1",
             "SAGE_EVAL_MODEL_TOKEN_BUDGET": "0",
             "SAGE_EVAL_PAYLOAD_TASK_BUDGET": "",
@@ -537,6 +570,9 @@ def arm_environment(contract: PilotContract | ImprovementContract | MatrixPairCo
             "SAGE_EVAL_EXPECTED_RESPONSE_PROVIDER": contract.route.provider,
             "SAGE_EVAL_EXPECTED_RESPONSE_MODEL": contract.route.model,
         }
+        if contract.wall_seconds is not None:
+            environment["SAGE_CONTROLLER_WALL_S"] = str(contract.wall_seconds)
+        return environment
     return {
         "SAGE_CONTROLLER_WALL_S": str(contract.wall_seconds),
         "SAGE_EVAL_MODEL_TOKEN_BUDGET": str(contract.token_ceiling),
@@ -564,12 +600,15 @@ def validate_artifact_dir(path: str | Path) -> Path:
 
 
 def append_record(path: Path, record: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {**dict(record), "recorded_at": utc_now()}
-    with path.open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps(payload, sort_keys=True, default=str) + "\n")
-        stream.flush()
-        os.fsync(stream.fileno())
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {**dict(record), "recorded_at": utc_now()}
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(payload, sort_keys=True, default=str) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+    except (OSError, TypeError, ValueError) as exc:
+        raise PairRecoveryBlocked(f"pilot checkpoint could not be persisted: {type(exc).__name__}") from exc
 
 
 def read_records(path: Path) -> list[dict[str, Any]]:
@@ -721,16 +760,41 @@ def retained_alternate_start_binding(
     records: list[Mapping[str, Any]],
 ) -> AlternateStartBinding | None:
     retained = [row.get("contract") for row in records if row.get("record_type") == "contract"]
-    alternate = retained[0].get("alternate_start") if len(retained) == 1 and isinstance(retained[0], Mapping) else None
+    if not retained:
+        return None
+    if len(retained) != 1 or not isinstance(retained[0], Mapping):
+        raise PilotError("retained alternate pilot contract is ambiguous or malformed")
+    record = retained[0]
+    alternate = record.get("alternate_start")
     if alternate is None:
         return None
     binding = AlternateStartBinding.from_record(alternate)
-    order = retained[0].get("arm_order")
-    reconstructed = PilotContract(
-        arm_order=tuple(order) if isinstance(order, list) else ARM_ORDER,
-        alternate_start=binding,
-    )
-    if reconstructed.to_record() != retained[0]:
+    order = record.get("arm_order")
+    try:
+        if record.get("schema") == MATRIX_PAIR_SCHEMA:
+            reconstructed = MatrixPairContract(
+                matrix_identity=record.get("matrix_identity"),
+                route=MatrixRoute(**record.get("route", {})),
+                start_case=record.get("start_case"),
+                objective=record.get("objective"),
+                arm_order=tuple(order) if isinstance(order, list) else ARM_ORDER,
+                source_identity=record.get("source_identity"),
+                tool_contract=record.get("tool_contract"),
+                dependency_identity=record.get("dependency_identity"),
+                alternate_start=binding,
+                wall_seconds=record.get("wall_seconds"),
+                continue_after_time_limit=record.get("continue_after_time_limit", False),
+                continue_after_refusal=record.get("continue_after_refusal", False),
+            )
+        else:
+            reconstructed = PilotContract(
+                arm_order=tuple(order) if isinstance(order, list) else ARM_ORDER,
+                alternate_start=binding,
+            )
+        canonical = reconstructed.to_record()
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise PilotError("retained alternate pilot contract is malformed or changed") from exc
+    if canonical != record:
         raise PilotError("retained alternate pilot contract is malformed or changed")
     return binding
 
@@ -861,9 +925,107 @@ def _validate_result_lifecycle(records: list[Mapping[str, Any]], contract: Pilot
         raise PilotError("terminal result has no started arm")
 
 
+def _time_limit_continuation_eligible(
+    contract: PilotContract | ImprovementContract | MatrixPairContract,
+    arm: str,
+    root: Path,
+    runtime_identity: Mapping[str, Any],
+    execution: Mapping[str, Any],
+    settlement: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+    outcome: Mapping[str, Any],
+) -> bool:
+    if not isinstance(contract, MatrixPairContract) or not contract.continue_after_time_limit:
+        return False
+    termination = execution.get("termination")
+    timed_out = termination == "time_limit" or termination == {"cause": "wall_time", "subtype": "time_limit"}
+    if (not timed_out or execution.get("protocol_error") is True or execution.get("error_type")
+            or settlement.get("complete") is not False):
+        return False
+    return _terminal_continuation_evidence_eligible(
+        arm, root, runtime_identity, settlement, snapshot, outcome,
+    )
+
+
+def _refusal_continuation_eligible(
+    contract: PilotContract | ImprovementContract | MatrixPairContract,
+    arm: str,
+    root: Path,
+    runtime_identity: Mapping[str, Any],
+    execution: Mapping[str, Any],
+    settlement: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+    outcome: Mapping[str, Any],
+) -> bool:
+    if not isinstance(contract, MatrixPairContract) or not contract.continue_after_refusal:
+        return False
+    termination = execution.get("termination")
+    refused = termination == "halted_refusal" or termination == {
+        "cause": "explicit_terminal_decision", "subtype": "refusal",
+    }
+    if not refused or execution.get("protocol_error") is True or execution.get("error_type"):
+        return False
+    return _terminal_continuation_evidence_eligible(
+        arm, root, runtime_identity, settlement, snapshot, outcome,
+    )
+
+
+def _terminal_continuation_evidence_eligible(
+    arm: str,
+    root: Path,
+    runtime_identity: Mapping[str, Any],
+    settlement: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+    outcome: Mapping[str, Any],
+) -> bool:
+    if (settlement.get("producer_terminal") is not True or settlement.get("error_type")
+            or type(settlement.get("complete")) is not bool
+            or (settlement.get("complete") is False
+                and settlement.get("objective_effect_quiescent") is not False)):
+        return False
+    if snapshot.get("observer_error_type") or outcome.get("disposition") not in {"proven", "disproven", "unmeasured"}:
+        return False
+    coverage = snapshot.get("observer_complete")
+    if not isinstance(coverage, Mapping) or any(coverage.get(key) is not True for key in ("tasks", "credentials", "callbacks", "bloodhound")):
+        return False
+    operation_id = runtime_identity.get("operation_id")
+    receipt = snapshot.get("native_evidence")
+    if (type(operation_id) is not int or not isinstance(receipt, Mapping)
+            or receipt.get("arm") != arm or receipt.get("operation_id") != operation_id
+            or snapshot.get("operation_id") != operation_id
+            or not isinstance(receipt.get("path"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", str(receipt.get("sha256")))):
+        return False
+    native_path = Path(receipt["path"]).expanduser().resolve()
+    if native_path != (root / f"{arm}-native-observation.json").resolve():
+        return False
+    try:
+        native_bytes = native_path.read_bytes()
+        observed = json.loads(native_bytes)
+    except (OSError, UnicodeError, ValueError):
+        return False
+    if hashlib.sha256(native_bytes).hexdigest() != receipt["sha256"] or not isinstance(observed, Mapping):
+        return False
+    for key, id_key in (("task", "display_id"), ("credential", "id"), ("callback", "display_id")):
+        rows = observed.get(key)
+        if not isinstance(rows, list) or any(
+            not isinstance(row, Mapping) or row.get("operation_id") != operation_id
+            or type(row.get(id_key)) is not int for row in rows
+        ):
+            return False
+    outstanding = settlement.get("outstanding_task_ids")
+    if (not isinstance(outstanding, list)
+            or (settlement.get("complete") is False and not outstanding)
+            or any(type(task_id) is not int for task_id in outstanding)
+            or not set(outstanding) <= {row["display_id"] for row in observed["task"]}):
+        return False
+    return True
+
+
 def summarize_pair(
     records: list[Mapping[str, Any]],
     contract: PilotContract | ImprovementContract | MatrixPairContract | None = None,
+    *, artifact_dir: Path | None = None,
 ) -> dict[str, Any]:
     if contract is None:
         alternate = retained_alternate_start_binding(records)
@@ -1007,6 +1169,39 @@ def summarize_pair(
     lifecycle_complete = bool(
         len(settlements) == 2 and all(row.get("complete") is True for row in settlements)
     )
+    lifecycle_continuation_complete = bool(
+        isinstance(contract, MatrixPairContract)
+        and (contract.continue_after_time_limit or contract.continue_after_refusal)
+        and len(settlements) == 2 and len(results) == 2
+        and all(
+            (settlement_by_arm.get(arm, {}).get("complete") is True
+             and result_by_arm.get(arm, {}).get("outcome", {}).get("disposition") in {"proven", "disproven"})
+            or (
+                artifact_dir is not None
+                and (
+                    (result_by_arm.get(arm, {}).get("time_limit_continuation_eligible") is True
+                     and _time_limit_continuation_eligible(
+                         contract, arm, artifact_dir,
+                         start_by_arm.get(arm, {}).get("runtime_identity") or {},
+                         result_by_arm.get(arm, {}).get("execution") or {},
+                         settlement_by_arm.get(arm, {}),
+                         result_by_arm.get(arm, {}).get("terminal_snapshot") or {},
+                         result_by_arm.get(arm, {}).get("outcome") or {},
+                     ))
+                    or (result_by_arm.get(arm, {}).get("refusal_continuation_eligible") is True
+                        and _refusal_continuation_eligible(
+                            contract, arm, artifact_dir,
+                            start_by_arm.get(arm, {}).get("runtime_identity") or {},
+                            result_by_arm.get(arm, {}).get("execution") or {},
+                            settlement_by_arm.get(arm, {}),
+                            result_by_arm.get(arm, {}).get("terminal_snapshot") or {},
+                            result_by_arm.get(arm, {}).get("outcome") or {},
+                        ))
+                )
+            )
+            for arm in contract.arm_order
+        )
+    )
     isolation_complete = bool(
         len(cleanups) == 2
         and all(row.get("complete") is True for row in cleanups)
@@ -1051,7 +1246,12 @@ def summarize_pair(
         },
         "measurement_labels": labels,
         "performance_assertion_allowed": measurement_complete,
-        "run_complete": bool(comparison_ready and lifecycle_complete and isolation_complete),
+        "run_complete": bool(
+            isolation_complete and (
+                (comparison_ready and lifecycle_complete)
+                or (protocol_valid and lifecycle_continuation_complete)
+            )
+        ),
         "arms": arm_reports,
         "hypothesis": (
             "isc8_control_proof_first_certificate_auth"
@@ -1061,24 +1261,86 @@ def summarize_pair(
     }
     if isinstance(contract, ImprovementContract):
         summary["primary_metric"] = _primary_metric_report(arm_reports)
+    if isinstance(contract, MatrixPairContract) and (contract.continue_after_time_limit or contract.continue_after_refusal):
+        summary["lifecycle_continuation_complete"] = lifecycle_continuation_complete
     for row in arm_reports:
         row.pop("terminal_snapshot", None)
     return summary
+
+
+def _pair_lock_path(root: Path) -> Path:
+    """Use one private temporary lock identity for a validated pair directory."""
+    lock_dir = Path(tempfile.gettempdir()) / f"sage-pair-locks-{os.getuid()}"
+    lock_dir.mkdir(mode=0o700, exist_ok=True)
+    stat = lock_dir.stat()
+    if lock_dir.is_symlink() or stat.st_uid != os.getuid() or stat.st_mode & 0o077:
+        raise PairRecoveryBlocked("pair lock directory is not owned by the current user")
+    return lock_dir / (hashlib.sha256(str(root.resolve()).encode()).hexdigest() + ".lock")
 
 
 def run_pair(
     contract: PilotContract | ImprovementContract | MatrixPairContract,
     artifact_dir: str | Path,
     dependencies: PilotDependencies,
+    *,
+    resumable: bool = False,
+    resume: bool = False,
+) -> dict[str, Any]:
+    if not (resumable or resume):
+        return _run_pair(contract, artifact_dir, dependencies)
+    root = validate_artifact_dir(artifact_dir)
+    lock_path = _pair_lock_path(root)
+    try:
+        descriptor = os.open(
+            lock_path,
+            os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+    except OSError as exc:
+        raise PairRecoveryBlocked("pair lock could not be opened") from exc
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise PairRecoveryBlocked("pair already has an active producer or resume") from exc
+        return _run_pair(contract, root, dependencies, resumable=resumable, resume=resume)
+    finally:
+        os.close(descriptor)
+
+
+def _run_pair(
+    contract: PilotContract | ImprovementContract | MatrixPairContract,
+    artifact_dir: str | Path,
+    dependencies: PilotDependencies,
+    *,
+    resumable: bool = False,
+    resume: bool = False,
 ) -> dict[str, Any]:
     contract.validate()
+    resumable = resumable or resume
     assert_rejected_kernel_absent()
     root = validate_artifact_dir(artifact_dir)
     ledger = root / "pilot.jsonl"
     existing = read_records(ledger)
-    if any(row.get("record_type") == "attempted_start" for row in existing):
-        raise PilotError("retry-zero pilot already contains an attempted start")
-    append_record(ledger, {"record_type": "contract", "contract": contract.to_record()})
+    if resume:
+        origins = [row for row in existing if row.get("record_type") == "resumable_origin"]
+        if not origins:
+            raise PilotError("pilot was not started with resumable checkpoints")
+        if len(origins) != 1 or len(existing) < 2 or existing[1] != origins[0] or origins[0].get("schema") != "sage-pair-checkpoint-v1":
+            raise PilotError("resumable origin marker is malformed or misplaced")
+        retained = [row for row in existing if row.get("record_type") == "contract"]
+        if len(retained) != 1 or retained[0].get("contract") != contract.to_record():
+            raise PilotError("resume contract differs from retained contract")
+        if any(row.get("record_type") == "comparison" for row in existing):
+            raise PilotError("pilot already has a final comparison")
+    else:
+        if any(row.get("record_type") == "attempted_start" for row in existing):
+            raise PilotError("retry-zero pilot already contains an attempted start")
+        if resumable and existing:
+            raise PilotError("pilot ledger already contains records")
+        append_record(ledger, {"record_type": "contract", "contract": contract.to_record()})
+        if resumable:
+            append_record(ledger, {"record_type": "resumable_origin", "schema": "sage-pair-checkpoint-v1"})
     preflight = dict(dependencies.preflight(contract))
     append_record(ledger, {"record_type": "preflight", **preflight})
     if preflight.get("ready") is not True:
@@ -1086,11 +1348,73 @@ def run_pair(
 
     expected_start: dict[str, Any] | None = None
     support_elapsed = 0.0
+    if resume:
+        for row in existing:
+            elapsed = row.get("setup_cleanup_elapsed_seconds")
+            if type(elapsed) in (int, float) and math.isfinite(elapsed):
+                support_elapsed = max(support_elapsed, float(elapsed))
+            if row.get("record_type") == "arm_started" and expected_start is None:
+                expected_start = dict(row["start_identity"])
+        if any(row.get("record_type") in {"arm_error", "preserved_state", "support_budget_exhausted"} for row in existing):
+            raise PilotError("retained arm stopped; resume cannot replace its outcome")
     for arm_index, arm in enumerate(contract.arm_order):
         assert_rejected_kernel_absent()
-        append_record(ledger, {
-            "record_type": "attempted_start", "arm": arm, "arm_index": arm_index,
-        })
+        arm_records = [row for row in existing if row.get("arm") == arm] if resume else []
+        def retained(kind: str) -> Mapping[str, Any] | None:
+            rows = [row for row in arm_records if row.get("record_type") == kind]
+            if len(rows) > 1:
+                raise PilotError(f"duplicate {kind} checkpoint for {arm}")
+            return rows[0] if rows else None
+        resuming_arm = bool(retained("attempted_start"))
+        if resume:
+            for intent, completed in (
+                ("reset_intent", "reset_completed"),
+                ("producer_intent", "execution_returned"),
+                ("settlement_intent", "settlement"),
+                ("observation_intent", "observation_completed"),
+                ("teardown_intent", "cleanup"),
+            ):
+                if retained(completed) is not None and retained(intent) is None:
+                    raise PilotError(f"{completed} has no retained {intent}")
+        if resume and retained("cleanup") is not None:
+            if (retained("cleanup") or {}).get("complete") is not True or retained("arm_result") is None:
+                raise PilotError("retained arm cleanup or result is incomplete")
+            started = retained("arm_started")
+            if started is None:
+                raise PilotError("cleaned arm has no retained start identity")
+            retained_identity = matched_start_identity(
+                started.get("start_identity"),
+                contract.alternate_start if isinstance(contract, (PilotContract, MatrixPairContract)) else None,
+                matrix_pair=contract if isinstance(contract, MatrixPairContract) else None,
+            )
+            if isinstance(contract, ImprovementContract) and retained_identity.get("source_identity") != contract.source_identity_for_arm(arm):
+                raise PilotError("retained cleaned arm source differs from contract")
+            continue
+        if resume and arm_index and not any(row.get("record_type") == "cleanup" and row.get("arm") == contract.arm_order[0] and row.get("complete") is True for row in read_records(ledger)):
+            raise PilotError("prior arm was not cleaned")
+        if resume:
+            if retained("attempted_start") and retained("reset_completed") is None:
+                raise PilotError("reset outcome is uncertain; refusing to reset again")
+            if retained("producer_intent") and retained("arm_started") is None:
+                raise PilotError("producer intent has no retained runtime start identity")
+            if retained("settlement_intent") and retained("settlement") is None:
+                raise PilotError("settlement outcome is uncertain; refusing to repeat it")
+            if retained("observation_intent") and retained("observation_completed") is None:
+                raise PilotError("terminal observation is uncertain; refusing to repeat it")
+            if retained("teardown_intent") and retained("cleanup") is None:
+                raise PilotError("cleanup outcome is uncertain; refusing to repeat it")
+            if retained("settlement") and retained("execution_returned") is None:
+                raise PilotError("settlement has no retained execution")
+            if retained("arm_result") and retained("observation_completed") is None:
+                raise PilotError("result has no retained observation checkpoint")
+            if resuming_arm and dependencies.restore_runtime is None:
+                raise PilotError("restore_runtime dependency is required for active arm resume")
+            if resuming_arm and retained("producer_intent") and retained("execution_returned") is None and dependencies.resume_arm is None:
+                raise PilotError("resume_arm dependency is required for active producer resume")
+        if not retained("attempted_start"):
+            append_record(ledger, {
+                "record_type": "attempted_start", "arm": arm, "arm_index": arm_index,
+            })
         start: Mapping[str, Any] | None = None
         execution: Mapping[str, Any] = {}
         settlement: Mapping[str, Any] = {}
@@ -1101,11 +1425,27 @@ def run_pair(
         try:
             if support_elapsed >= contract.setup_cleanup_seconds:
                 raise PilotError("two-hour setup/cleanup admission budget is exhausted")
-            phase_started = time.monotonic()
-            try:
-                start = dependencies.reset(arm, arm_environment(contract))
-            finally:
-                support_elapsed += max(0.0, time.monotonic() - phase_started)
+            if resume and retained("reset_completed") is not None:
+                reset_row = retained("reset_completed") or {}
+                start = reset_row.get("start")
+                if not isinstance(start, Mapping):
+                    raise PilotError("retained reset start is malformed")
+                support_elapsed = max(support_elapsed, float(reset_row.get("setup_cleanup_elapsed_seconds", 0)))
+            else:
+                if resumable:
+                    append_record(ledger, {"record_type": "reset_intent", "arm": arm, "arm_index": arm_index})
+                phase_started = time.monotonic()
+                try:
+                    start = dependencies.reset(arm, arm_environment(contract))
+                finally:
+                    support_elapsed += max(0.0, time.monotonic() - phase_started)
+                if resumable:
+                    reset_runtime_identity = validate_runtime_identity(dependencies.runtime_identity())
+                    append_record(ledger, {
+                        "record_type": "reset_completed", "arm": arm, "arm_index": arm_index,
+                        "start": start, "runtime_identity": reset_runtime_identity,
+                        "setup_cleanup_elapsed_seconds": support_elapsed,
+                    })
             if support_elapsed > contract.setup_cleanup_seconds:
                 raise PilotError("two-hour setup/cleanup admission budget was exceeded during reset")
             alternate_start = contract.alternate_start if isinstance(contract, (PilotContract, MatrixPairContract)) else None
@@ -1123,7 +1463,19 @@ def run_pair(
                         "observed_source_identity": identity.get("source_identity"),
                     })
                     raise PilotError("arm start source identity does not match the frozen contract")
-            runtime_identity = validate_runtime_identity(dependencies.runtime_identity())
+            retained_started = retained("arm_started")
+            if retained_started is not None:
+                if retained_started.get("start_identity") != identity:
+                    raise PilotError("retained start identity differs from reset checkpoint")
+                runtime_identity = validate_runtime_identity(retained_started.get("runtime_identity"))
+                if runtime_identity != validate_runtime_identity((retained("reset_completed") or {}).get("runtime_identity")):
+                    raise PilotError("retained runtime identity differs from reset checkpoint")
+            elif resuming_arm:
+                runtime_identity = validate_runtime_identity((retained("reset_completed") or {}).get("runtime_identity"))
+            elif resumable:
+                runtime_identity = reset_runtime_identity
+            else:
+                runtime_identity = validate_runtime_identity(dependencies.runtime_identity())
             if expected_start is None:
                 expected_start = identity
             else:
@@ -1144,67 +1496,124 @@ def run_pair(
                         "reason": "matched start mismatch", "differences": differences,
                     })
                     raise PilotError("second arm start does not match the first arm")
-            append_record(ledger, {
-                "record_type": "arm_started", "arm": arm, "arm_index": arm_index,
-                "start_identity": identity, "runtime_identity": runtime_identity,
-            })
+            if retained_started is None:
+                append_record(ledger, {
+                    "record_type": "arm_started", "arm": arm, "arm_index": arm_index,
+                    "start_identity": identity, "runtime_identity": runtime_identity,
+                })
+            if resuming_arm:
+                assert dependencies.restore_runtime is not None
+                try:
+                    dependencies.restore_runtime(arm, start, runtime_identity, arm_records)
+                except Exception as exc:
+                    raise PairRecoveryBlocked(f"restore_runtime blocked {arm}: {exc}") from exc
             progress = lambda event, selected=arm: append_record(ledger, {
                 "record_type": "progress", "arm": selected, "event": dict(event),
             })
             producer_started = True
-            try:
-                execution = dict(dependencies.run_arm(arm, start, progress))
-            except BaseException as exc:
-                execution = {
-                    "termination": "runner_exception",
-                    "error_type": type(exc).__name__,
-                    "cost": None,
-                    "protocol_error": True,
-                }
-                abnormal = {
-                    "stage": "producer",
-                    "error_type": type(exc).__name__,
-                    "reason": str(exc),
-                }
-            try:
-                phase_started = time.monotonic()
+            returned = retained("execution_returned")
+            if returned is not None:
+                execution = dict(returned["execution"])
+            else:
+                resume_producer = resuming_arm and retained("producer_intent") is not None
+                if resumable and not resume_producer:
+                    append_record(ledger, {"record_type": "producer_intent", "arm": arm, "arm_index": arm_index})
                 try:
-                    settlement = dict(dependencies.stop_and_settle(arm, start, execution))
-                finally:
-                    support_elapsed += max(0.0, time.monotonic() - phase_started)
-            except BaseException as exc:
+                    producer = dependencies.resume_arm if resume_producer else dependencies.run_arm
+                    execution = dict(producer(arm, start, progress, arm_records) if resume_producer else producer(arm, start, progress))
+                except BaseException as exc:
+                    if resumable and not isinstance(exc, Exception):
+                        raise
+                    if resume_producer:
+                        raise PairRecoveryBlocked(f"resume_arm blocked {arm}: {exc}") from exc
+                    if isinstance(exc, PairRecoveryBlocked):
+                        raise
+                    execution = {
+                        "termination": "runner_exception",
+                        "error_type": type(exc).__name__,
+                        "cost": None,
+                        "protocol_error": True,
+                    }
+                    abnormal = {
+                        "stage": "producer", "error_type": type(exc).__name__, "reason": str(exc),
+                    }
+                if resumable:
+                    append_record(ledger, {
+                        "record_type": "execution_returned", "arm": arm, "arm_index": arm_index,
+                        "execution": execution,
+                    })
+            retained_settlement = retained("settlement")
+            if retained_settlement is not None:
                 settlement = {
-                    "complete": False,
-                    "error_type": type(exc).__name__,
-                    "reason": str(exc),
+                    key: value for key, value in retained_settlement.items()
+                    if key not in {"record_type", "recorded_at", "arm", "arm_index", "setup_cleanup_elapsed_seconds"}
                 }
+                support_elapsed = max(support_elapsed, float(retained_settlement.get("setup_cleanup_elapsed_seconds", 0)))
+            else:
+                if resumable:
+                    append_record(ledger, {"record_type": "settlement_intent", "arm": arm, "arm_index": arm_index})
+                try:
+                    phase_started = time.monotonic()
+                    try:
+                        settlement = dict(dependencies.stop_and_settle(arm, start, execution))
+                    finally:
+                        support_elapsed += max(0.0, time.monotonic() - phase_started)
+                except BaseException as exc:
+                    if isinstance(exc, PairRecoveryBlocked):
+                        raise
+                    if resumable and not isinstance(exc, Exception):
+                        raise
+                    settlement = {
+                        "complete": False, "error_type": type(exc).__name__, "reason": str(exc),
+                    }
             if isinstance(settlement.get("execution"), Mapping):
                 execution = dict(settlement["execution"])
-            append_record(ledger, {
-                "record_type": "settlement", "arm": arm, "arm_index": arm_index,
-                "setup_cleanup_elapsed_seconds": support_elapsed,
-                **{key: value for key, value in settlement.items() if key != "execution"},
-            })
-            try:
-                observe_started = time.monotonic()
-                supplied_verifier_cost: object = None
+            if retained_settlement is None:
+                append_record(ledger, {
+                    "record_type": "settlement", "arm": arm, "arm_index": arm_index,
+                    "setup_cleanup_elapsed_seconds": support_elapsed,
+                    **(settlement if resumable else {key: value for key, value in settlement.items() if key != "execution"}),
+                })
+            observed = retained("observation_completed")
+            if observed is not None:
+                terminal_snapshot = dict(observed["terminal_snapshot"])
+                outcome = dict(observed["outcome"])
+                supplied_verifier_cost = observed.get("supplied_verifier_cost")
+                observed_wall_seconds = float(observed["observed_wall_seconds"])
+                support_elapsed = max(support_elapsed, float(observed.get("setup_cleanup_elapsed_seconds", 0)))
+            else:
+                if resumable:
+                    append_record(ledger, {"record_type": "observation_intent", "arm": arm, "arm_index": arm_index})
                 try:
-                    terminal_snapshot = dict(dependencies.observe(arm, start, execution, settlement))
-                    supplied_verifier_cost = terminal_snapshot.pop("_terminal_verifier_cost", None)
-                    outcome = classify_terminal_snapshot(terminal_snapshot).to_record()
-                finally:
+                    observe_started = time.monotonic()
+                    supplied_verifier_cost: object = None
+                    try:
+                        terminal_snapshot = dict(dependencies.observe(arm, start, execution, settlement))
+                        supplied_verifier_cost = terminal_snapshot.pop("_terminal_verifier_cost", None)
+                        outcome = classify_terminal_snapshot(terminal_snapshot).to_record()
+                    finally:
+                        observed_wall_seconds = max(0.0, time.monotonic() - observe_started)
+                        support_elapsed += observed_wall_seconds
+                except BaseException as exc:
+                    if isinstance(exc, PairRecoveryBlocked):
+                        raise
+                    if resumable and not isinstance(exc, Exception):
+                        raise
                     observed_wall_seconds = max(0.0, time.monotonic() - observe_started)
-                    support_elapsed += observed_wall_seconds
-            except BaseException as exc:
-                observed_wall_seconds = max(0.0, time.monotonic() - observe_started)
-                terminal_snapshot = {"observer_error_type": type(exc).__name__}
-                outcome = {
-                    "disposition": "unmeasured",
-                    "reason": "terminal observer failed",
-                    "accepted_proof": None,
-                    "rejected_proofs": [],
-                }
-                supplied_verifier_cost = {"complete": False, "incomplete_reason": "terminal observer failed"}
+                    terminal_snapshot = {"observer_error_type": type(exc).__name__}
+                    outcome = {
+                        "disposition": "unmeasured", "reason": "terminal observer failed",
+                        "accepted_proof": None, "rejected_proofs": [],
+                    }
+                    supplied_verifier_cost = {"complete": False, "incomplete_reason": "terminal observer failed"}
+                if resumable:
+                    append_record(ledger, {
+                        "record_type": "observation_completed", "arm": arm, "arm_index": arm_index,
+                        "terminal_snapshot": terminal_snapshot, "outcome": outcome,
+                        "supplied_verifier_cost": supplied_verifier_cost,
+                        "observed_wall_seconds": observed_wall_seconds,
+                        "setup_cleanup_elapsed_seconds": support_elapsed,
+                    })
             verifier_cost = _terminal_verifier_cost(
                 supplied_verifier_cost,
                 observed_wall_seconds=observed_wall_seconds,
@@ -1216,16 +1625,28 @@ def run_pair(
                     f"{root.resolve()}:{_canonical_json(contract.to_record())}".encode()
                 ).hexdigest(),
             }
-            append_record(ledger, {
-                "record_type": "arm_result", "arm": arm, "arm_index": arm_index,
-                "execution": execution, "outcome": outcome,
-                "terminal_snapshot": terminal_snapshot,
-                "terminal_verifier_cost": verifier_cost,
-                "measurement_identity": _measurement_identity(contract, arm, {
-                    "start_identity": identity, "runtime_identity": runtime_identity,
-                }, execution),
-            })
-            if abnormal is None and settlement.get("complete") is not True:
+            time_limit_continuation_eligible = _time_limit_continuation_eligible(
+                contract, arm, root, runtime_identity, execution, settlement, terminal_snapshot, outcome,
+            )
+            refusal_continuation_eligible = _refusal_continuation_eligible(
+                contract, arm, root, runtime_identity, execution, settlement, terminal_snapshot, outcome,
+            )
+            continuation_eligible = time_limit_continuation_eligible or refusal_continuation_eligible
+            if retained("arm_result") is None:
+                append_record(ledger, {
+                    "record_type": "arm_result", "arm": arm, "arm_index": arm_index,
+                    "execution": execution, "outcome": outcome,
+                    "terminal_snapshot": terminal_snapshot,
+                    "terminal_verifier_cost": verifier_cost,
+                    "measurement_identity": _measurement_identity(contract, arm, {
+                        "start_identity": identity, "runtime_identity": runtime_identity,
+                    }, execution),
+                    **({"time_limit_continuation_eligible": time_limit_continuation_eligible}
+                       if isinstance(contract, MatrixPairContract) and contract.continue_after_time_limit else {}),
+                    **({"refusal_continuation_eligible": refusal_continuation_eligible}
+                       if isinstance(contract, MatrixPairContract) and contract.continue_after_refusal else {}),
+                })
+            if abnormal is None and settlement.get("complete") is not True and not continuation_eligible:
                 abnormal = {
                     "stage": "settlement",
                     "error_type": settlement.get("error_type") or "PilotError",
@@ -1237,7 +1658,7 @@ def run_pair(
                     "error_type": "PilotError",
                     "reason": "execution protocol error",
                 }
-            if abnormal is None and outcome.get("disposition") not in {"proven", "disproven"}:
+            if abnormal is None and outcome.get("disposition") not in {"proven", "disproven"} and not continuation_eligible:
                 abnormal = {
                     "stage": "observer",
                     "error_type": terminal_snapshot.get("observer_error_type") or "PilotError",
@@ -1250,6 +1671,10 @@ def run_pair(
                     "reason": "two-hour setup/cleanup admission budget was exceeded",
                 }
         except BaseException as exc:
+            if isinstance(exc, PairRecoveryBlocked):
+                raise
+            if resumable and not isinstance(exc, Exception):
+                raise
             if abnormal is None:
                 abnormal = {
                     "stage": "started_arm" if start is not None else "start_or_reset",
@@ -1264,12 +1689,18 @@ def run_pair(
         if abnormal is None:
             try:
                 teardown_attempted = True
+                if resumable:
+                    append_record(ledger, {"record_type": "teardown_intent", "arm": arm, "arm_index": arm_index})
                 phase_started = time.monotonic()
                 try:
                     cleanup = dict(dependencies.teardown(arm, start))
                 finally:
                     support_elapsed += max(0.0, time.monotonic() - phase_started)
             except BaseException as exc:
+                if isinstance(exc, PairRecoveryBlocked):
+                    raise
+                if resumable and not isinstance(exc, Exception):
+                    raise
                 cleanup = {"complete": False, "error_type": type(exc).__name__, "reason": str(exc)}
             append_record(ledger, {
                 "record_type": "cleanup", "arm": arm,
@@ -1294,6 +1725,10 @@ def run_pair(
                     },
                 ))
             except BaseException as exc:
+                if isinstance(exc, PairRecoveryBlocked):
+                    raise
+                if resumable and not isinstance(exc, Exception):
+                    raise
                 attestation = {
                     "schema": "sage-trust-walker-preserved-state-v1",
                     "complete": False,
@@ -1325,7 +1760,7 @@ def run_pair(
             break
 
     records = read_records(ledger)
-    summary = summarize_pair(records, contract)
+    summary = summarize_pair(records, contract, artifact_dir=root)
     append_record(ledger, {"record_type": "comparison", **summary})
     assert_rejected_kernel_absent()
     return {**summary, "ledger": str(ledger)}

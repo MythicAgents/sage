@@ -18,8 +18,11 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Callable
 
 
@@ -93,6 +96,30 @@ def recoverable_tool_error_category(observation: object) -> str | None:
     )
 
 
+class BareRunnerRecoveryError(RuntimeError):
+    """The saved arm cannot safely continue without changing its evidence."""
+
+
+def _checkpoint_write(path: Path, value: dict) -> None:
+    """Replace one private JSON snapshot durably; never expose a partial snapshot."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, sort_keys=True, allow_nan=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 @dataclass
 class BareModelResult:
     objective: str
@@ -127,6 +154,8 @@ def terminal_cause(stopped: object, final_text: object = "", error: BaseExceptio
         return {"cause": "cumulative_token_ceiling", "subtype": "overshoot"}
     if state == "timeout":
         return {"cause": "wall_time", "subtype": "wrapper_timeout"}
+    if state == "refusal":
+        return {"cause": "explicit_terminal_decision", "subtype": "refusal"}
     if state == "done":
         final = str(final_text or "").strip().casefold()
         subtype = "objective_met" if final == "objective_met" else "stuck" if final == "stuck" else "other_final"
@@ -166,6 +195,12 @@ class BareModelRunner:
         require_complete_usage: bool = False,
         event_sink: Callable[[dict], None] | None = None,
         response_validator: Callable[[dict], None] | None = None,
+        checkpoint_path: str | Path | None = None,
+        checkpoint_binding: dict | None = None,
+        resume: bool = False,
+        reconcile_pending_tool: Callable[[dict], str | None] | None = None,
+        elapsed_floor_seconds: float = 0.0,
+        provider_timeout_is_wall: bool = True,
     ):
         if token_ceiling is not None and (type(token_ceiling) is not int or token_ceiling <= 0):
             raise ValueError("token ceiling must be a positive integer or None")
@@ -184,6 +219,39 @@ class BareModelRunner:
         self.require_complete_usage = bool(require_complete_usage)
         self.event_sink = event_sink
         self.response_validator = response_validator
+        if resume and checkpoint_path is None:
+            raise ValueError("resume requires checkpoint_path")
+        if checkpoint_path is not None and not isinstance(checkpoint_binding, dict):
+            raise ValueError("checkpoint_binding must be an exact JSON object")
+        self.checkpoint_path = Path(checkpoint_path) if checkpoint_path is not None else None
+        self.checkpoint_binding = checkpoint_binding
+        self.resume = resume
+        self.reconcile_pending_tool = reconcile_pending_tool
+        if not math.isfinite(elapsed_floor_seconds) or elapsed_floor_seconds < 0:
+            raise ValueError("elapsed_floor_seconds must be finite and nonnegative")
+        self.elapsed_floor_seconds = elapsed_floor_seconds
+        self.provider_timeout_is_wall = provider_timeout_is_wall
+        self.pending_task_id: int | None = None
+
+    def record_pending_task_id(self, task_id: int) -> None:
+        """Journal a submitted Mythic task before the dispatcher waits for its output."""
+        if self.checkpoint_path is None:
+            return
+        if type(task_id) is not int or task_id <= 0:
+            raise BareRunnerRecoveryError("pending task ID must be a positive integer")
+        try:
+            snapshot = json.loads(self.checkpoint_path.read_text(encoding="utf-8"))
+            if snapshot.get("phase") != "tool_pending":
+                raise BareRunnerRecoveryError("task ID can only be recorded during pending tool dispatch")
+            if snapshot.get("pending_task_id") not in (None, task_id):
+                raise BareRunnerRecoveryError("pending tool already has a different task ID")
+            snapshot["pending_task_id"] = task_id
+            _checkpoint_write(self.checkpoint_path, snapshot)
+        except BareRunnerRecoveryError:
+            raise
+        except Exception as exc:
+            raise BareRunnerRecoveryError("cannot durably record pending task ID") from exc
+        self.pending_task_id = task_id
 
     def _tool_names(self) -> str:
         names = []
@@ -196,6 +264,25 @@ class BareModelRunner:
 
     def run(self, objective: str) -> BareModelResult:
         system = self.system_template.format(objective=objective, tools=self._tool_names())
+        binding = {
+            "objective": objective,
+            "system": system,
+            "tools_spec": self.tools_spec,
+            "max_steps": self.max_steps,
+            "timeout": self.timeout,
+            "token_ceiling": self.token_ceiling,
+            "require_complete_usage": self.require_complete_usage,
+            "caller": self.checkpoint_binding,
+        }
+        if not self.provider_timeout_is_wall:
+            binding["provider_timeout_is_wall"] = False
+        if self.checkpoint_path is not None:
+            try:
+                binding_json = json.dumps(binding, sort_keys=True, allow_nan=False)
+                if json.loads(binding_json) != binding:
+                    raise ValueError("binding must contain JSON values")
+            except (TypeError, ValueError) as exc:
+                raise ValueError("checkpoint binding must be exact JSON") from exc
         history: list = []
         stopped = "budget"
         log = self.logger or (lambda _m: None)
@@ -212,40 +299,169 @@ class BareModelRunner:
         recoverable_tool_errors: list[dict[str, object]] = []
         model_error: BaseException | None = None
         token_budget = TokenBudget(ceiling=self.token_ceiling or (2**63 - 1))
+        phase = "ready"
+        saved_decision = None
+        pending_call = None
+        pending_observation = None
+        elapsed_before = self.elapsed_floor_seconds
+
+        def elapsed() -> float:
+            return elapsed_before + max(0.0, time.monotonic() - start)
+
+        def save() -> None:
+            if self.checkpoint_path is None:
+                return
+            snapshot = {
+                "version": 1, "binding": binding, "phase": phase,
+                "history": history, "step": step,
+                "model_attempts": model_attempts, "model_calls": model_calls,
+                "total_tokens": total_tokens, "backend_requests": backend_requests,
+                "response_records": response_records,
+                "action_response_ids": action_response_ids,
+                "final_text": final_txt, "objective_recognized": objective_recognized,
+                "recoverable_tool_errors": recoverable_tool_errors,
+                "usage_records": token_budget.records,
+                "elapsed_seconds": elapsed(), "saved_decision": saved_decision,
+                "pending_call": pending_call, "pending_observation": pending_observation,
+                "pending_task_id": self.pending_task_id,
+            }
+            try:
+                _checkpoint_write(self.checkpoint_path, snapshot)
+            except Exception as exc:
+                raise BareRunnerRecoveryError("cannot durably save bare runner checkpoint") from exc
+
+        if self.checkpoint_path is not None:
+            if self.resume:
+                try:
+                    saved = json.loads(self.checkpoint_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError) as exc:
+                    raise BareRunnerRecoveryError("checkpoint unavailable or invalid") from exc
+                if saved.get("version") != 1 or json.dumps(
+                    saved.get("binding"), sort_keys=True, allow_nan=False,
+                ) != binding_json:
+                    raise BareRunnerRecoveryError("checkpoint binding differs from this arm")
+                phase = saved["phase"]
+                if phase == "completed":
+                    return BareModelResult(**saved["result"])
+                if phase == "model_inflight":
+                    raise BareRunnerRecoveryError(
+                        "model request has no saved response; usage is unknown and cannot be retried"
+                    )
+                if phase not in {"ready", "response_saved", "decision_ready", "tool_pending", "tool_observed"}:
+                    raise BareRunnerRecoveryError("checkpoint phase is invalid")
+                history = saved["history"]
+                step = saved["step"]
+                model_attempts = saved["model_attempts"]
+                model_calls = saved["model_calls"]
+                total_tokens = saved["total_tokens"]
+                backend_requests = saved["backend_requests"]
+                response_records = saved["response_records"]
+                action_response_ids = saved["action_response_ids"]
+                final_txt = saved["final_text"]
+                objective_recognized = saved["objective_recognized"]
+                recoverable_tool_errors = saved["recoverable_tool_errors"]
+                token_budget.records = saved["usage_records"]
+                elapsed_before = max(saved["elapsed_seconds"], self.elapsed_floor_seconds)
+                saved_decision = saved["saved_decision"]
+                pending_call = saved["pending_call"]
+                pending_observation = saved["pending_observation"]
+                self.pending_task_id = saved.get("pending_task_id")
+                start = time.monotonic()
+            elif self.checkpoint_path.exists():
+                raise BareRunnerRecoveryError("checkpoint already exists; resume explicitly")
+            else:
+                save()
         log(f"▶ BARE START — objective: {objective}")
         while True:
-            if self.token_ceiling is not None and token_budget.exhausted:
+            if phase == "tool_pending":
+                if self.timeout is not None and elapsed() >= self.timeout:
+                    stopped = "timeout"
+                    break
+                if self.reconcile_pending_tool is None:
+                    raise BareRunnerRecoveryError("pending tool requires reconciliation; dispatch is forbidden")
+                try:
+                    pending_observation = self.reconcile_pending_tool(dict(pending_call))
+                except Exception as exc:
+                    if self.timeout is not None and elapsed() >= self.timeout:
+                        stopped = "timeout"
+                        break
+                    raise BareRunnerRecoveryError("pending tool reconciliation failed") from exc
+                if not isinstance(pending_observation, str):
+                    raise BareRunnerRecoveryError("pending tool has no known completed observation")
+                phase = "tool_observed"
+                save()
+            if phase == "tool_observed":
+                decision = pending_call
+                obs = pending_observation
+                error_category = recoverable_tool_error_category(obs)
+                if error_category is not None:
+                    recoverable_tool_errors.append({
+                        "step": len(history) + 1,
+                        "tool": str(decision.get("tool") or ""),
+                        "category": error_category,
+                    })
+                    log(f"⚠ recoverable {error_category} tool error; continuing within the frozen budget")
+                log(f"🔧 step {step} OBSERVATION: {str(obs)[:500]}")
+                history.append({"response_id": action_response_ids[-1], "call": decision, "obs": obs})
+                pending_call = None
+                pending_observation = None
+                self.pending_task_id = None
+                saved_decision = None
+                phase = "ready"
+                save()
+                if self.event_sink is not None:
+                    self.event_sink({
+                        "event": "tool_result_retained", "step": step,
+                        "tool": str(decision.get("tool") or ""),
+                        "response_id": action_response_ids[-1],
+                        "recoverable_error_category": error_category,
+                    })
+                continue
+            if phase == "ready" and self.token_ceiling is not None and token_budget.exhausted:
                 stopped = "token_budget_overshoot" if token_budget.overshoot else "token_budget_exhausted"
                 break
-            if self.max_steps and step >= self.max_steps:
+            if phase == "ready" and self.max_steps and step >= self.max_steps:
                 stopped = "budget"
                 break
-            if self.timeout is not None and (time.monotonic() - start) >= self.timeout:
+            if phase == "ready" and self.timeout is not None and elapsed() >= self.timeout:
                 stopped = "timeout"
                 log(f"⏱ wall-clock timeout after {step} steps")
                 break
-            step += 1
-            model_attempts += 1
-            if self.event_sink is not None:
-                self.event_sink({"event": "model_request_started", "model_attempt": model_attempts})
-            try:
-                decision = self.model_fn(system, self.tools_spec, history)
-                model_calls += 1
-            except KeyboardInterrupt:
-                stopped = "interrupted"
-                log("⎈ interrupted by operator — stopping; the range will still be scored")
-                break
-            except TimeoutError as exc:
-                stopped = "timeout"
-                model_error = exc
-                log(f"⏱ model request crossed the wall deadline at step {step}")
-                break
-            except Exception as exc:
-                stopped = "error"
-                model_error = exc
-                log(f"✗ step {step} model error: {type(exc).__name__}: {exc}")
-                break
-            if isinstance(decision, dict):
+            if phase == "ready":
+                step += 1
+                model_attempts += 1
+                phase = "model_inflight"
+                save()
+                if self.event_sink is not None:
+                    self.event_sink({"event": "model_request_started", "model_attempt": model_attempts})
+                try:
+                    decision = self.model_fn(system, self.tools_spec, history)
+                    model_calls += 1
+                    saved_decision = decision
+                    phase = "response_saved"
+                    save()
+                except KeyboardInterrupt:
+                    stopped = "interrupted"
+                    log("⎈ interrupted by operator — stopping; the range will still be scored")
+                    break
+                except BareRunnerRecoveryError:
+                    raise
+                except TimeoutError as exc:
+                    stopped = "timeout" if self.provider_timeout_is_wall or (
+                        self.timeout is not None and elapsed() >= self.timeout) else "error"
+                    model_error = exc
+                    log(f"⏱ model request stopped at step {step}: {type(exc).__name__}")
+                    break
+                except Exception as exc:
+                    stopped = "error"
+                    model_error = exc
+                    log(f"✗ step {step} model error: {type(exc).__name__}: {exc}")
+                    break
+            if phase == "response_saved":
+                decision = saved_decision
+            if phase == "decision_ready":
+                decision = saved_decision
+            if phase == "response_saved" and isinstance(decision, dict):
                 decision = dict(decision)
                 usage = decision.pop("_usage", {})
                 usage = usage if isinstance(usage, dict) else {}
@@ -291,14 +507,18 @@ class BareModelRunner:
                     )
                     log(f"■ completed model call reached token boundary at step {step}")
                     break
+            if phase == "response_saved":
+                saved_decision = decision
+                phase = "decision_ready"
+                save()
             # A provider request may itself cross the wall deadline. Preserve its cost evidence,
             # but never interpret or dispatch a tool call that arrived after the fixed ceiling.
-            if self.timeout is not None and (time.monotonic() - start) >= self.timeout:
+            if self.timeout is not None and elapsed() >= self.timeout:
                 stopped = "timeout"
                 log(f"⏱ wall-clock timeout after model response at step {step}")
                 break
             if not isinstance(decision, dict) or "final" in decision:
-                stopped = "done"
+                stopped = "refusal" if isinstance(decision, dict) and isinstance(decision.get("_refusal"), dict) else "done"
                 final_txt = str(decision.get("final", "")) if isinstance(decision, dict) else ""
                 objective_recognized = final_txt.strip().casefold() == "objective_met"
                 log(f"■ FINAL after {len(history)} steps: {final_txt[:300]}")
@@ -306,12 +526,16 @@ class BareModelRunner:
             log(f"🛠️ step {step} ACTION: {decision.get('tool')}  args={json.dumps(decision.get('args', {}))[:300]}")
             # This is the target-action boundary. Recheck after formatting/logging so ordinary
             # scheduling delay cannot turn an on-time model response into an after-deadline task.
-            if self.timeout is not None and (time.monotonic() - start) >= self.timeout:
+            if self.timeout is not None and elapsed() >= self.timeout:
                 stopped = "timeout"
                 log(f"⏱ wall-clock timeout before tool dispatch at step {step}")
                 break
+            action_response_ids.append(str(response_records[-1]["response_id"]))
+            pending_call = decision
+            self.pending_task_id = None
+            phase = "tool_pending"
+            save()
             try:
-                action_response_ids.append(str(response_records[-1]["response_id"]))
                 if self.event_sink is not None:
                     self.event_sink({
                         "event": "tool_dispatch_started",
@@ -324,34 +548,15 @@ class BareModelRunner:
                 stopped = "interrupted"
                 log("⎈ interrupted by operator — stopping; the range will still be scored")
                 break
+            except BareRunnerRecoveryError:
+                raise
             except Exception as exc:
                 obs = f"[tool error] {type(exc).__name__}: {exc}"
-            error_category = recoverable_tool_error_category(obs)
-            if error_category is not None:
-                recoverable_tool_errors.append({
-                    "step": len(history) + 1,
-                    "tool": str(decision.get("tool") or ""),
-                    "category": error_category,
-                })
-                log(
-                    f"⚠ recoverable {error_category} tool error; continuing within the frozen budget"
-                )
-            log(f"🔧 step {step} OBSERVATION: {str(obs)[:500]}")
-            history.append({
-                "response_id": action_response_ids[-1],
-                "call": decision,
-                "obs": obs,
-            })
-            if self.event_sink is not None:
-                self.event_sink({
-                    "event": "tool_result_retained",
-                    "step": step,
-                    "tool": str(decision.get("tool") or ""),
-                    "response_id": action_response_ids[-1],
-                    "recoverable_error_category": error_category,
-                })
+            pending_observation = obs
+            phase = "tool_observed"
+            save()
         log(f"● BARE END — stopped={stopped} steps={len(history)}")
-        return BareModelResult(
+        result = BareModelResult(
             objective=objective,
             steps=len(history),
             transcript=history,
@@ -361,7 +566,7 @@ class BareModelRunner:
             model_attempts=model_attempts,
             model_calls=model_calls,
             total_tokens=total_tokens,
-            wall_seconds=max(0.0, time.monotonic() - start),
+            wall_seconds=elapsed(),
             effective_backend_requests=backend_requests,
             model_response_records=response_records,
             action_response_ids=action_response_ids,
@@ -371,6 +576,11 @@ class BareModelRunner:
             recoverable_tool_errors=recoverable_tool_errors,
             termination=terminal_cause(stopped, final_txt, model_error),
         )
+        if self.checkpoint_path is not None:
+            _checkpoint_write(self.checkpoint_path, {
+                "version": 1, "binding": binding, "phase": "completed", "result": asdict(result),
+            })
+        return result
 
 
 def score_from_probes(
