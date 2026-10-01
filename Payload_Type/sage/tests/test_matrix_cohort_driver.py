@@ -85,10 +85,40 @@ def test_raw_reasoning_effort_is_frozen_and_forwarded_only_when_selected(tmp_pat
         driver.load_plan(path)
 
 
+def test_matched_reasoning_effort_requires_both_values_and_freezes_resume(tmp_path):
+    path, work = plan_file(tmp_path)
+    legacy = driver.load_plan(path)
+    raw = json.loads(path.read_text())
+    raw["raw_reasoning_effort"] = raw["sage_reasoning_effort"] = "none"
+    path.write_text(json.dumps(raw))
+    matched = driver.load_plan(path)
+    slot = matched["slots"][0]
+    command = driver._cli("run-pair", matched, slot, slot["attempts"][0], work / "pair")
+    assert command[-4:] == ["--raw-reasoning-effort", "none", "--reasoning-effort", "none"]
+    with pytest.raises(driver.DriverError, match="Sage reasoning effort changed|raw reasoning effort changed"):
+        driver._check_amendment(legacy, matched, work)
+    raw["raw_reasoning_effort"] = "high"
+    path.write_text(json.dumps(raw))
+    with pytest.raises(driver.DriverError, match="same raw and Sage"):
+        driver.load_plan(path)
+    raw["raw_reasoning_effort"] = "none"
+    raw["sage_reasoning_effort"] = "high"
+    path.write_text(json.dumps(raw))
+    with pytest.raises(driver.DriverError, match="same raw and Sage"):
+        driver.load_plan(path)
+
+
 def test_raw_reasoning_effort_override_rejected_outside_prepare(tmp_path):
     path, work = plan_file(tmp_path)
     assert driver.main(["resume", "--plan", str(path), "--work-dir", str(work),
                         "--raw-reasoning-effort", "none"]) == 1
+    assert not work.exists()
+
+
+def test_matched_reasoning_effort_override_rejected_outside_prepare(tmp_path):
+    path, work = plan_file(tmp_path)
+    assert driver.main(["resume", "--plan", str(path), "--work-dir", str(work),
+                        "--reasoning-effort", "none"]) == 1
     assert not work.exists()
 
 

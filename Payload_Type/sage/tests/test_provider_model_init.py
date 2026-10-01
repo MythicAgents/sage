@@ -105,3 +105,27 @@ def test_missing_configurable_section_still_fails_closed(monkeypatch):
     )
 
     assert instance._get_base_chat_model() is None
+
+
+@pytest.mark.parametrize("effort", ["none", "minimal", "low", "medium", "high", "xhigh", "max"])
+def test_explicit_openai_reasoning_effort_reaches_model_constructor(monkeypatch, effort):
+    calls = []
+    monkeypatch.setattr(model_module, "init_chat_model", lambda **kwargs: calls.append(kwargs) or _FakeLLM())
+    monkeypatch.setattr(model_module, "_patch_model_for_bedrock", lambda llm: llm)
+
+    assert isinstance(_model("openai", {"reasoning_effort": effort})._get_base_chat_model(), _FakeLLM)
+    assert calls == [{"model_provider": "openai", "model": "test-model", "reasoning_effort": effort}]
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "bedrock", "ollama"])
+def test_explicit_reasoning_effort_rejected_for_other_provider(monkeypatch, provider):
+    monkeypatch.setattr(model_module, "init_chat_model", lambda **kwargs: pytest.fail(f"model initialized: {kwargs}"))
+    with pytest.raises(ValueError, match="SAGE_REASONING_EFFORT requires"):
+        _model(provider, {"reasoning_effort": "none"})._get_base_chat_model()
+
+
+@pytest.mark.parametrize("effort", ["NONE", "unsupported"])
+def test_invalid_direct_reasoning_effort_rejected_before_model_construction(monkeypatch, effort):
+    monkeypatch.setattr(model_module, "init_chat_model", lambda **kwargs: pytest.fail(f"model initialized: {kwargs}"))
+    with pytest.raises(ValueError, match="SAGE_REASONING_EFFORT must be"):
+        _model("openai", {"reasoning_effort": effort})._get_base_chat_model()

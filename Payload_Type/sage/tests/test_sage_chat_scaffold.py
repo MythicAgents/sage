@@ -3989,7 +3989,7 @@ def test_operation_change_cannot_reuse_old_model_state():
 # verbose view), so there is no operator verbose toggle.
 _EXPECTED_CONFIG_OPTIONS = {
     "provider", "model", "mode", "autonomous_solve", "policy_mode", "max_steps",
-    "system_prompt", "API_ENDPOINT", "API_KEY",
+    "system_prompt", "API_ENDPOINT", "API_KEY", "SAGE_REASONING_EFFORT",
     "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_DEFAULT_REGION",
     # BloodHound MCP connection (added 2026-07-30). Kept in this exact-equality inventory rather
     # than relaxing the assertion to a subset: the point of the set is that every option Mythic
@@ -4170,6 +4170,63 @@ def test_environment_profile_is_the_shipping_fallback_without_empty_shadowing(mo
     assert kwargs["provider"] == profile.provider
     assert kwargs["model"] == profile.model
     assert kwargs["config"]["configurable"] == profile.configurable()
+
+
+def test_reasoning_effort_resolves_from_channel_then_environment_and_binds_signature(monkeypatch):
+    from sage_chat.service import _model_config_signature
+
+    monkeypatch.setenv("SAGE_REASONING_EFFORT", "high")
+    environment = build_model_kwargs(build_chat_request("hi"))
+    assert environment["config"]["configurable"]["reasoning_effort"] == "high"
+    assert build_model_kwargs(build_chat_request("hi", config={"SAGE_REASONING_EFFORT": ""})) == environment
+
+    explicit = build_model_kwargs(build_chat_request("hi", config={"SAGE_REASONING_EFFORT": "none"}))
+    assert explicit["config"]["configurable"]["reasoning_effort"] == "none"
+    assert _model_config_signature(explicit) != _model_config_signature(environment)
+
+    monkeypatch.delenv("SAGE_REASONING_EFFORT")
+    default = build_model_kwargs(build_chat_request("hi"))
+    assert "reasoning_effort" not in default["config"]["configurable"]
+    assert _model_config_signature(default) != _model_config_signature(explicit)
+
+
+@pytest.mark.parametrize("value", ["NONE", "nonsense"])
+def test_invalid_reasoning_effort_fails_before_model_construction(value, monkeypatch):
+    monkeypatch.delenv("SAGE_REASONING_EFFORT", raising=False)
+    with pytest.raises(ValueError, match="SAGE_REASONING_EFFORT must be"):
+        build_model_kwargs(build_chat_request("hi", config={"SAGE_REASONING_EFFORT": value}))
+
+
+def test_reasoning_effort_rejects_non_openai_profile_and_watcher_ignores_it(monkeypatch):
+    from sage_chat.config import resolve_watcher_llm_profile
+
+    monkeypatch.setenv("SAGE_REASONING_EFFORT", "none")
+    with pytest.raises(ValueError, match="SAGE_REASONING_EFFORT requires"):
+        build_model_kwargs(build_chat_request("hi", config={"provider": "anthropic"}))
+    watcher = resolve_watcher_llm_profile(build_chat_request("hi"))
+    assert "reasoning_effort" not in watcher.init_chat_model_kwargs()
+
+
+def test_channel_reasoning_override_precedes_invalid_environment_fallback(monkeypatch):
+    monkeypatch.setenv("provider", "anthropic")
+    monkeypatch.setenv("SAGE_REASONING_EFFORT", "invalid")
+    selected = build_model_kwargs(build_chat_request("hi", config={
+        "provider": "openai", "SAGE_REASONING_EFFORT": "none",
+    }))
+    assert selected["provider"] == "openai"
+    assert selected["config"]["configurable"]["reasoning_effort"] == "none"
+    with pytest.raises(ValueError, match="SAGE_REASONING_EFFORT must be"):
+        resolve_environment_llm_profile()
+
+
+def test_channel_provider_override_precedes_environment_provider_validation(monkeypatch):
+    monkeypatch.setenv("provider", "anthropic")
+    monkeypatch.setenv("SAGE_REASONING_EFFORT", "none")
+    selected = build_model_kwargs(build_chat_request("hi", config={"provider": "openai"}))
+    assert selected["provider"] == "openai"
+    assert selected["config"]["configurable"]["reasoning_effort"] == "none"
+    with pytest.raises(ValueError, match="SAGE_REASONING_EFFORT requires"):
+        resolve_environment_llm_profile()
 
 
 def test_bedrock_aws_quad_resolves_from_config():

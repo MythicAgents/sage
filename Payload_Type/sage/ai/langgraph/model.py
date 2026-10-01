@@ -6000,6 +6000,12 @@ class Model:
         if cfg is None:
             logger.error("Model configuration is missing 'configurable' settings.")
             return None
+        reasoning_effort = str(cfg.get("reasoning_effort") or "").strip()
+        if reasoning_effort:
+            if reasoning_effort not in {"none", "minimal", "low", "medium", "high", "xhigh", "max"}:
+                raise ValueError("SAGE_REASONING_EFFORT must be one of none, minimal, low, medium, high, xhigh, max")
+            if self.provider.lower() != "openai":
+                raise ValueError("SAGE_REASONING_EFFORT requires the openai model provider")
 
         llm = None
         eval_max_output_tokens = 0
@@ -6039,6 +6045,8 @@ class Model:
             llm = init_chat_model(model_provider=self.provider, model=self.model, region=region, aws_access_key_id=aws_access_key_id, aws_secret_access_key=aws_secret_access_key, aws_session_token=aws_session_token, **bedrock_kwargs)
         else:
             model_kwargs: dict[str, Any] = {}
+            if reasoning_effort:
+                model_kwargs["reasoning_effort"] = reasoning_effort
             if cfg.get("api_key"):
                 model_kwargs["api_key"] = cfg["api_key"]
             if cfg.get("base_url"):

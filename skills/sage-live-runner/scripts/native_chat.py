@@ -401,6 +401,7 @@ def default_ai_metadata(extra: dict[str, Any] | None = None) -> dict[str, Any]:
     for key in (
         "API_ENDPOINT",
         "API_KEY",
+        "SAGE_REASONING_EFFORT",
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
         "AWS_SESSION_TOKEN",

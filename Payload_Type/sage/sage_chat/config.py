@@ -103,6 +103,7 @@ SAGE_LLM_KEY_MAP = MappingProxyType(
         "aws_secret_access_key": "AWS_SECRET_ACCESS_KEY",
         "aws_session_token": "AWS_SESSION_TOKEN",
         "region": "AWS_DEFAULT_REGION",
+        "reasoning_effort": "SAGE_REASONING_EFFORT",
     }
 )
 WATCHER_LLM_KEY_MAP = MappingProxyType(
@@ -140,6 +141,7 @@ class ResolvedLLMProfile:
     aws_session_token: str = ""
     region: str = ""
     sources: tuple[tuple[str, str], ...] = ()
+    reasoning_effort: str = ""
 
     def configurable(self) -> dict[str, str]:
         if self.provider == "bedrock":
@@ -153,6 +155,7 @@ class ResolvedLLMProfile:
             values = {
                 "api_key": self.api_key,
                 "base_url": self.api_endpoint,
+                "reasoning_effort": self.reasoning_effort,
             }
         return {key: value for key, value in values.items() if value}
 
@@ -175,11 +178,20 @@ def _nonblank(value: Any) -> str:
 def _normalized_llm_profile(
     values: Mapping[str, str],
     sources: list[tuple[str, str]],
+    *,
+    validate_reasoning_effort: bool = True,
 ) -> ResolvedLLMProfile:
     normalized = dict(values)
     normalized["provider"] = normalized["provider"].strip().casefold() or "openai"
     normalized["model"] = normalized["model"].strip()
     normalized["api_endpoint"] = normalized["api_endpoint"].strip()
+    effort = normalized.get("reasoning_effort", "").strip()
+    if validate_reasoning_effort:
+        if effort and effort not in {"none", "minimal", "low", "medium", "high", "xhigh", "max"}:
+            raise ValueError("SAGE_REASONING_EFFORT must be one of none, minimal, low, medium, high, xhigh, max")
+        if effort and normalized["provider"] != "openai":
+            raise ValueError("SAGE_REASONING_EFFORT requires the openai model provider")
+    normalized["reasoning_effort"] = effort
     return ResolvedLLMProfile(**normalized, sources=tuple(sources))
 
 
@@ -187,6 +199,7 @@ def resolve_environment_llm_profile(
     environ: Mapping[str, str] | None = None,
     *,
     key_map: Mapping[str, str] = SAGE_LLM_KEY_MAP,
+    validate_reasoning_effort: bool = True,
 ) -> ResolvedLLMProfile:
     """Resolve the process-only projection used by shipping and evaluation paths.
 
@@ -205,7 +218,9 @@ def resolve_environment_llm_profile(
         else:
             resolved[logical_field] = "openai" if logical_field == "provider" else ""
             sources.append((logical_field, "default"))
-    return _normalized_llm_profile(resolved, sources)
+    return _normalized_llm_profile(
+        resolved, sources, validate_reasoning_effort=validate_reasoning_effort
+    )
 
 
 def _resolve_with_source(
@@ -243,7 +258,9 @@ def resolve_llm_profile(
 
     config = ChatConfigView.from_request(request)
     secrets = ChatSecretView.from_request(request)
-    environment_profile = resolve_environment_llm_profile(key_map=key_map)
+    environment_profile = resolve_environment_llm_profile(
+        key_map=key_map, validate_reasoning_effort=False
+    )
     resolved: dict[str, str] = {}
     sources: list[tuple[str, str]] = []
     for logical_field, key in key_map.items():

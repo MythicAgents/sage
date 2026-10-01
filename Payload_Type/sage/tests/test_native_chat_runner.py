@@ -264,6 +264,13 @@ def test_default_ai_metadata_is_autonomous(monkeypatch, tmp_path):
     assert metadata["channel_metadata_display"] == {"display": "expanded; max=15"}
 
 
+def test_default_ai_metadata_carries_explicit_reasoning_effort(monkeypatch):
+    monkeypatch.setattr(native_chat, "_read_env_defaults", lambda: {
+        "provider": "openai", "model": "test-model", "SAGE_REASONING_EFFORT": "none",
+    })
+    assert native_chat.default_ai_metadata()["config"]["SAGE_REASONING_EFFORT"] == "none"
+
+
 def test_ai_metadata_preserves_explicit_display_override():
     display_override = {"display": "compact; max=3"}
 

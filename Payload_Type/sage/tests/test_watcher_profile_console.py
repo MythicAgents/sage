@@ -155,7 +155,7 @@ def test_watcher_blank_fallthrough_and_declared_secret_boundary(monkeypatch, log
 
 @pytest.mark.parametrize(
     "logical,ordinary_key",
-    SAGE_LLM_KEY_MAP.items(),
+    [(logical, key) for logical, key in SAGE_LLM_KEY_MAP.items() if logical in WATCHER_LLM_KEY_MAP],
 )
 def test_watcher_never_falls_back_to_unprefixed_sage_keys(
     monkeypatch, logical, ordinary_key

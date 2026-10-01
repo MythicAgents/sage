@@ -214,12 +214,32 @@ def test_matrix_pair_raw_reasoning_effort_changes_identity_and_replays_exactly()
             matrix, "qwen", start_case="samwell-castelblack", raw_reasoning_effort="NONE",
         )
 
+    matched = pilot.MatrixPairContract.for_route(
+        matrix, "qwen", start_case="samwell-castelblack",
+        raw_reasoning_effort="none", sage_reasoning_effort="none",
+    )
+    assert matched.identity not in (legacy.identity, selected.identity)
+    assert cli._replay_contract([{"record_type": "contract", "contract": matched.to_record()}]) == matched
+    with pytest.raises(pilot.PilotError, match="same raw and Sage"):
+        pilot.MatrixPairContract.for_route(
+            matrix, "qwen", start_case="samwell-castelblack",
+            raw_reasoning_effort="high", sage_reasoning_effort="none",
+        )
+
 
 def test_raw_reasoning_effort_requires_matrix_route_before_runtime(capsys):
     assert cli.main(["run-pair", "--artifact-dir", "/unused",
                      "--protected-manifest", "/unused", "--route-smoke", "/unused",
                      "--raw-reasoning-effort", "none"]) == 1
     assert "requires a selected matrix route" in capsys.readouterr().out
+
+
+def test_direct_pair_rejects_conflicting_reasoning_flags_before_live(capsys):
+    assert cli.main(["run-pair", "--artifact-dir", "/unused",
+                     "--protected-manifest", "/unused", "--route-smoke", "/unused",
+                     "--route-id", "synthetic-route", "--reasoning-effort", "none",
+                     "--raw-reasoning-effort", "high"]) == 1
+    assert "conflict" in capsys.readouterr().out
 
 
 def test_matrix_sage_arm_uses_selected_route_and_distinct_channel(tmp_path):
@@ -258,6 +278,11 @@ def test_matrix_sage_arm_uses_selected_route_and_distinct_channel(tmp_path):
         SimpleNamespace(selected_route=selected, artifact_dir=tmp_path / "pair-02"),
         "shipping-sage",
     )
+
+    runtime.sage_reasoning_effort = "none"
+    matched_execution = runtime.run_arm("shipping-sage", {}, lambda _event: None)
+    assert captured["metadata"]["config"]["SAGE_REASONING_EFFORT"] == "none"
+    assert matched_execution["measurement_metadata"]["generation_config"]["reasoning_effort"] == "none"
 
 
 def test_native_completed_chat_retains_controller_refusal_through_settlement(tmp_path):

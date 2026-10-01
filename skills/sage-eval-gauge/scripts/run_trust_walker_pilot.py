@@ -924,6 +924,8 @@ def _resolve_live_authority(
             expected_scope["continue_after_refusal"] = True
         if contract.raw_reasoning_effort is not None:
             expected_scope["raw_reasoning_effort"] = contract.raw_reasoning_effort
+        if contract.sage_reasoning_effort is not None:
+            expected_scope["sage_reasoning_effort"] = contract.sage_reasoning_effort
         if not isinstance(scope, Mapping) or any(scope.get(key) != value for key, value in expected_scope.items()):
             raise PilotError("matrix live authority scope differs from the pair protocol")
         if not contract.continue_after_time_limit and scope.get("continue_after_time_limit") is True:
@@ -932,6 +934,8 @@ def _resolve_live_authority(
             raise PilotError("matrix live authority refusal policy differs from the pair protocol")
         if contract.raw_reasoning_effort is None and "raw_reasoning_effort" in scope:
             raise PilotError("matrix live authority raw reasoning effort differs from the pair protocol")
+        if contract.sage_reasoning_effort is None and "sage_reasoning_effort" in scope:
+            raise PilotError("matrix live authority Sage reasoning effort differs from the pair protocol")
         if getattr(args, "resumable", False) or getattr(args, "resume", False):
             if scope.get("same_arm_recovery") != {
                 "enabled": True, "ambiguous_submission": "stop",
@@ -1862,6 +1866,7 @@ class RuntimePilot:
         selected_route: MatrixRoute | None = None,
         matrix_wall_seconds: int | None = None,
         raw_reasoning_effort: str | None = None,
+        sage_reasoning_effort: str | None = None,
     ):
         self.artifact_dir = artifact_dir
         self.protected_manifest = protected_manifest
@@ -1875,6 +1880,7 @@ class RuntimePilot:
         self.selected_route = selected_route
         self.matrix_wall_seconds = matrix_wall_seconds
         self.raw_reasoning_effort = raw_reasoning_effort
+        self.sage_reasoning_effort = sage_reasoning_effort
         initial_root = next(iter(self.source_roots.values()), ROOT)
         self.source_root = initial_root
         self.orchestrate = _orchestrate(initial_root)
@@ -2995,6 +3001,8 @@ class RuntimePilot:
                 "autonomous_solve": True,
                 "max_steps": 0,
             })
+            if getattr(self, "sage_reasoning_effort", None) is not None:
+                config["SAGE_REASONING_EFFORT"] = self.sage_reasoning_effort
             if deadline_at is not None:
                 config["SAGE_EVAL_ARM_DEADLINE_EPOCH"] = str(deadline_at.timestamp())
             else:
@@ -3946,6 +3954,7 @@ def _runtime(
         selected_route=(contract.route if isinstance(contract, MatrixPairContract) else None),
         matrix_wall_seconds=(contract.wall_seconds if isinstance(contract, MatrixPairContract) else None),
         raw_reasoning_effort=(contract.raw_reasoning_effort if isinstance(contract, MatrixPairContract) else None),
+        sage_reasoning_effort=(contract.sage_reasoning_effort if isinstance(contract, MatrixPairContract) else None),
     )
 
 
@@ -3986,6 +3995,8 @@ def _assembled_measurement_metadata(declared: Mapping[str, Any], *, arm: str,
                    "top_p", "max_tokens", "max_output_tokens", "reasoning_effort", "max_retries",
                    "request_timeout_policy"}
     actual = {key: value for key, value in config.items() if key in safe_fields}
+    if "SAGE_REASONING_EFFORT" in config:
+        actual["reasoning_effort"] = config["SAGE_REASONING_EFFORT"]
     requested = declared.get("generation_config", {})
     if not isinstance(requested, Mapping) or any(key not in actual or actual[key] != value
                                                for key, value in requested.items()):
@@ -4101,6 +4112,7 @@ def _replay_contract(records: list[dict[str, Any]]) -> PilotContract | Improveme
                 continue_after_time_limit=value.get("continue_after_time_limit", False),
                 continue_after_refusal=value.get("continue_after_refusal", False),
                 raw_reasoning_effort=value.get("raw_reasoning_effort"),
+                sage_reasoning_effort=value.get("sage_reasoning_effort"),
             )
         except (TypeError, ValueError) as exc:
             raise PilotError("retained matrix pair contract is malformed") from exc
@@ -4636,6 +4648,8 @@ def build_parser() -> argparse.ArgumentParser:
                              help="Prospectively bind continuation after a valid, cleaned refusal outcome.")
         command.add_argument("--raw-reasoning-effort", choices=sorted(RAW_REASONING_EFFORTS),
                              help="Optional raw-arm reasoning effort; omitted uses the provider default.")
+        command.add_argument("--reasoning-effort", choices=sorted(RAW_REASONING_EFFORTS),
+                             help="Optional matched reasoning effort for Sage and raw arms.")
         if name in {"rehearse-setup", "continue-setup", "run-pair"}:
             _add_live_authority_args(command)
         if name in {"preflight", "rehearse-setup", "continue-setup", "run-pair"}:
@@ -4742,6 +4756,8 @@ def main(argv: list[str] | None = None) -> int:
                 else None
             )
             if getattr(args, "route_id", None):
+                if args.reasoning_effort is not None and args.raw_reasoning_effort not in (None, args.reasoning_effort):
+                    raise PilotError("--reasoning-effort and --raw-reasoning-effort conflict")
                 matrix = load_matrix_contract(args.contract_file)
                 contract = MatrixPairContract.for_route(
                     matrix, args.route_id,
@@ -4752,11 +4768,14 @@ def main(argv: list[str] | None = None) -> int:
                     wall_seconds=args.arm_wall_seconds,
                     continue_after_time_limit=args.continue_after_time_limit,
                     continue_after_refusal=args.continue_after_refusal,
-                    raw_reasoning_effort=args.raw_reasoning_effort,
+                    raw_reasoning_effort=args.reasoning_effort or args.raw_reasoning_effort,
+                    sage_reasoning_effort=args.reasoning_effort,
                 )
             else:
                 if getattr(args, "raw_reasoning_effort", None) is not None:
                     raise PilotError("--raw-reasoning-effort requires a selected matrix route")
+                if getattr(args, "reasoning_effort", None) is not None:
+                    raise PilotError("--reasoning-effort requires a selected matrix route")
                 contract = PilotContract(arm_order=arm_order, alternate_start=alternate_start)
         contract.validate()
         if (getattr(args, "resumable", False) or getattr(args, "resume", False)) and not isinstance(contract, MatrixPairContract):

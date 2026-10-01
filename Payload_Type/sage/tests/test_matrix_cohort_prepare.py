@@ -91,6 +91,37 @@ def test_active_prepare_binds_each_pair_to_real_producer_validator(tmp_path, mon
     assert driver.main(argv) == 1  # no prospective overwrite
 
 
+def test_matched_effort_prepare_binds_both_arms_and_active_authority(tmp_path, monkeypatch):
+    pair, catalog, _smoke, output, argv = inputs(tmp_path, monkeypatch)
+    assert driver.main(argv + ["--reasoning-effort", "none", "--activate-authority",
+                               "--authorization-source", "Operator authorized this test."]) == 0
+    plan = driver.load_plan(output / "cohort-plan.json")
+    assert plan["sage_reasoning_effort"] == plan["raw_reasoning_effort"] == "none"
+    assert "Both arms request reasoning_effort=none" in (output / "protocol.md").read_text()
+    matrix = pair.load_matrix_contract(catalog)
+    contract = pair.MatrixPairContract.for_route(
+        matrix, "test-route", start_case="samwell-castelblack",
+        source_identity=pair._source_identity_at(ROOT), wall_seconds=3600,
+        continue_after_time_limit=True, continue_after_refusal=True,
+        raw_reasoning_effort="none", sage_reasoning_effort="none",
+    )
+    slot = plan["slots"][0]
+    authority = slot["attempts"][0]["live_authority_file"]
+    receipt = pair._resolve_live_authority(SimpleNamespace(
+        command="run-pair", live_authority_file=authority,
+        live_authority_id=None, resumable=False, resume=False), contract)
+    assert receipt["contract_binding_sha256"] == contract.identity
+    command = driver._cli("run-pair", plan, slot, slot["attempts"][0], output / "pair")
+    parsed = pair.build_parser().parse_args(command[2:])
+    assert parsed.reasoning_effort == parsed.raw_reasoning_effort == "none"
+
+
+def test_contradictory_effort_flags_fail_before_preparation(tmp_path, monkeypatch):
+    _pair, _catalog, _smoke, output, argv = inputs(tmp_path, monkeypatch)
+    assert driver.main(argv + ["--reasoning-effort", "none", "--raw-reasoning-effort", "high"]) == 1
+    assert not output.exists()
+
+
 def test_prepare_can_disable_refusal_continuation(tmp_path, monkeypatch):
     pair, catalog, smoke, output, argv = inputs(tmp_path, monkeypatch)
     assert driver.main(argv + ["--no-continue-after-refusal"]) == 0

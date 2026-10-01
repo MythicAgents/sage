@@ -81,7 +81,24 @@ and cleanup failures still stop the batch. `--no-continue-after-refusal` at prep
 time preserves normal settlement requirements. Existing plans without this field
 keep their original behavior; the policy cannot be changed during run or resume.
 
-## Optional raw-arm reasoning effort
+## Optional reasoning effort
+
+Add `--reasoning-effort none` to a new cohort's `prepare` command to request the
+same reasoning effort for both Sage autonomous and the minimal raw model loop.
+The choice is frozen in the cohort plan, pair contract, authority scope, protocol,
+and recovery bindings. The driver passes it through the native Sage channel's
+`SAGE_REASONING_EFFORT` configuration and the raw OpenAI-compatible adapter.
+Omitting the flag retains each arm's configured or provider default behavior.
+The direct pair CLI also accepts `--reasoning-effort` for matrix routes. Run and
+resume consume the frozen plan and reject overrides.
+
+`--raw-reasoning-effort` remains available for deliberately asymmetric comparisons.
+If both options are supplied, their values must agree. The protocol calls out the
+raw-only asymmetry; the shipping arm's assembled measurement metadata records any
+explicit effort inherited from the Sage environment. Neither option adds a
+Responses API requirement or changes effort after a provider error.
+
+### Legacy raw-only option
 
 Add `--raw-reasoning-effort none` to a new cohort's `prepare` command to disable
 reasoning explicitly for the minimal raw model loop. Other accepted values are
@@ -89,7 +106,7 @@ reasoning explicitly for the minimal raw model loop. Other accepted values are
 endpoint must support the requested value. This option uses the OpenAI-compatible
 adapter and does not change Sage's model configuration.
 
-Omitting the option preserves provider defaults: the raw request contains no
+Omitting the option leaves the raw request without an explicit
 `reasoning_effort` parameter. The literal value `none` is an explicit request, not
 an omitted setting. No error triggers an automatic change of reasoning effort.
 
