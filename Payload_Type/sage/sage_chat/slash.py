@@ -800,6 +800,12 @@ async def _handle_sandbox(model: Any, request: ChatRequest, arg: str) -> str:
 
 async def _handle_stop(request: ChatRequest, model: Any = None) -> str:
     try:
+        from ai.langgraph.controller_recovery import ControllerRecoveryStore, enabled as recovery_enabled
+    except ImportError:  # pragma: no cover
+        from ..ai.langgraph.controller_recovery import ControllerRecoveryStore, enabled as recovery_enabled
+    if recovery_enabled():
+        ControllerRecoveryStore(request.OperationID, request.ChannelID).revoke()
+    try:
         from ai.langgraph.model import request_stop_for_sessions
     except ImportError:  # pragma: no cover
         from ..ai.langgraph.model import request_stop_for_sessions  # type: ignore

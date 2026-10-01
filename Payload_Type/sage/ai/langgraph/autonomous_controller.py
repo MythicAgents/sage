@@ -76,6 +76,7 @@ STATUS_NO_PROGRESS = "halted_no_progress"     # max_no_effect_cycles with no new
 STATUS_BUDGET = "halted_budget"               # token or wall-clock budget exhausted
 STATUS_MAX_CYCLES = "halted_max_cycles"       # absolute cycle backstop
 STATUS_ABORTED = "halted_aborted"             # operator stop requested between cycles (cooperative kill switch)
+STATUS_REFUSAL = "halted_refusal"             # completed model response refused the request
 
 
 @dataclass
@@ -318,7 +319,11 @@ class AutonomousController:
                  objective: str = "",
                  episode_id: str = "",
                  config: ControllerConfig | None = None,
-                 logger: Callable[[str], None] | None = None):
+                 logger: Callable[[str], None] | None = None,
+                 recovery_store: Any | None = None,
+                 recovery_binding: dict[str, Any] | None = None,
+                 recovery_state: dict[str, Any] | None = None,
+                 recovery_resources: Callable[[], dict[str, Any]] | None = None):
         self._observe = observe
         self._execute = execute
         self._objective_met = objective_met
@@ -339,6 +344,18 @@ class AutonomousController:
         self._collections = 0
         self._collection_attempts: dict[str, int] = {}
         self._no_effect = 0
+        self._recovery_store = recovery_store
+        self._recovery_binding = recovery_binding
+        self._recovery_state = recovery_state
+        self._recovery_resources = recovery_resources
+        self._recovery_snapshot: dict[str, Any] = {}
+
+    def _recovery_write(self, phase: str) -> None:
+        if self._recovery_store is not None:
+            payload = dict(self._recovery_snapshot)
+            if self._recovery_resources is not None:
+                payload["resources"] = self._recovery_resources()
+            self._recovery_store.write(self._recovery_binding, phase, payload)
 
     @staticmethod
     def _annotate_policy_span(span: Any, status: str, decision: Any) -> None:
@@ -440,6 +457,8 @@ class AutonomousController:
             f"sage.kernel.seam.{name}",
             **{"sage.seam.name": name, "sage.cycle.index": getattr(self, "_current_cycle", 0)},
         ) as span:
+            if name in {"policy_select", "rank_ties", "route_discovery", "execute", "collect"}:
+                self._recovery_write(f"pending_{name}")
             try:
                 remaining_wall = None
                 absolute_deadline = getattr(self, "_absolute_deadline", None)
@@ -556,7 +575,43 @@ class AutonomousController:
         blocker: dict | None = None
         achieved: set[str] = set()
 
+        if self._recovery_state is not None:
+            saved = self._recovery_state
+            self._episode_id = str(saved["episode_id"])
+            cycles = [CycleRecord(**item) for item in saved["cycles"]]
+            try:
+                from .policy import PolicyDecision
+            except ImportError:
+                from policy import PolicyDecision
+            decisions = [PolicyDecision(**item) for item in saved["decisions"]]
+            transactions = list(saved["transactions"])
+            achieved = set(saved["achieved_effects"])
+            self._collections = int(saved["collections"])
+            self._collection_attempts = dict(saved["collection_attempts"])
+            self._no_effect = int(saved["no_effect"])
+            self._loop.progress_epoch = int(saved["loop_progress_epoch"])
+            self._loop.last_turn_key = str(saved["loop_last_turn_key"])
+            self._loop.outcomes = [wo.WorkerOutcome.from_dict(item) for item in saved["loop_outcomes"]]
+
+        def snapshot() -> dict[str, Any]:
+            return {
+                "episode_id": self._episode_id,
+                "cycles": [vars(item) for item in cycles],
+                "decisions": [d.to_dict() if hasattr(d, "to_dict") else dict(d) for d in decisions],
+                "transactions": list(transactions),
+                "achieved_effects": sorted(achieved),
+                "collections": self._collections,
+                "collection_attempts": dict(self._collection_attempts),
+                "no_effect": self._no_effect,
+                "loop_progress_epoch": self._loop.progress_epoch,
+                "loop_last_turn_key": self._loop.last_turn_key,
+                "loop_outcomes": [item.to_dict() for item in self._loop.outcomes],
+            }
+
         def done(status: str, reason: str) -> ControllerResult:
+            self._recovery_snapshot.update(snapshot())
+            self._recovery_snapshot.update({"terminal_status": status, "terminal_reason": reason})
+            self._recovery_write("terminal_pending")
             return ControllerResult(status=status, reason=reason, blocker=blocker,
                                     cycle_count=len(cycles), cycles=cycles,
                                     achieved_effects=sorted(achieved),
@@ -577,10 +632,18 @@ class AutonomousController:
             blocker = {"reason": f"observe unavailable: {state if st != 'ok' else 'None state'}"}
             return done(STATUS_NO_ACTION, "could not observe engagement state")
         achieved = self._achieved(state)
+        if self._recovery_state is not None and achieved != set(self._recovery_state["achieved_effects"]):
+            try:
+                from .controller_recovery import RecoveryBlocked
+            except ImportError:
+                from controller_recovery import RecoveryBlocked
+            raise RecoveryBlocked("verified engagement effects changed since clean controller boundary")
+        self._recovery_snapshot.update(snapshot())
+        self._recovery_write("clean")
 
         cycle_numbers = (
-            range(1, self.config.max_cycles + 1)
-            if self.config.max_cycles is not None else itertools.count(1)
+            range(len(cycles) + 1, self.config.max_cycles + 1)
+            if self.config.max_cycles is not None else itertools.count(len(cycles) + 1)
         )
         for cycle in cycle_numbers:
             # One span per controller cycle. The seams below nest beneath it, and because the
@@ -647,6 +710,8 @@ class AutonomousController:
                                 decision_id=str(getattr(decision, "decision_id", "") or ""),
                                 policy_mode=str(getattr(decision, "policy_mode", "") or ""),
                             ))
+                            if getattr(decision, "disposition", "") == "refusal":
+                                return done(STATUS_REFUSAL, "model refused graph collection")
                             return done(STATUS_NO_ACTION, "policy declined graph collection")
                         if selected is collect_candidate:
                             request_key = _collection_request_key(need) or "__anonymous_collection_request__"
@@ -700,6 +765,8 @@ class AutonomousController:
                                 blocker = {"reason": f"observe unavailable after collect: {state}"}
                                 return done(STATUS_NO_ACTION, "could not observe after collection")
                             achieved = self._achieved(state)
+                            self._recovery_snapshot.update(snapshot())
+                            self._recovery_write("clean")
                             continue
                         action = selected
                         phase = "execute"
@@ -756,6 +823,8 @@ class AutonomousController:
                             decision_id=str(getattr(decision, "decision_id", "") or ""),
                             policy_mode=str(getattr(decision, "policy_mode", "") or ""),
                         ))
+                        if getattr(decision, "disposition", "") == "refusal":
+                            return done(STATUS_REFUSAL, "model refused capability selection")
                         return done(STATUS_NO_ACTION, "policy selected no offensive capability")
                     phase = "execute"
 
@@ -828,6 +897,9 @@ class AutonomousController:
                                    "achieved": sorted(achieved)}
                         return done(STATUS_NO_PROGRESS,
                                     f"{self._no_effect} consecutive cycles produced no new verified effect")
+
+                self._recovery_snapshot.update(snapshot())
+                self._recovery_write("clean")
 
         return done(STATUS_MAX_CYCLES, f"reached max_cycles={self.config.max_cycles}")
 

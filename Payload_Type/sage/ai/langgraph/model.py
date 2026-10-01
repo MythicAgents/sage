@@ -9905,6 +9905,18 @@ class Model:
     async def _run_autonomous_controller(self, prompt: str) -> str:
         """Run the controller under the fail-closed offensive MCP execution boundary."""
         from ai import task_budget
+        try:
+            from .controller_recovery import RecoveryBlocked, enabled as recovery_enabled
+        except ImportError:
+            from controller_recovery import RecoveryBlocked, enabled as recovery_enabled
+
+        if (
+            recovery_enabled()
+            and self.mode == "auto"
+            and self.channel_id is not None
+            and not _eval_unbounded_auto_arm(self.mode)
+        ):
+            raise RecoveryBlocked("controller recovery requires the explicitly unbounded evaluation arm")
 
         self.set_active_agent("Controller")
         execution_context_token = MCPManager.set_execution_context(
@@ -9920,6 +9932,27 @@ class Model:
         finally:
             MCPManager.reset_execution_context(execution_context_token)
 
+    async def resume_autonomous_controller(self) -> str:
+        """Resume a verified clean cycle directly, bypassing fresh-turn preflights."""
+        saved = getattr(self, "_controller_resume_state", None)
+        contract = getattr(self, "_request_contract", None)
+        if not isinstance(saved, dict) or contract is None:
+            raise RuntimeError("controller recovery state or request contract unavailable")
+        if contract.digest != saved.get("request_contract_digest"):
+            raise RuntimeError("controller recovery request contract changed")
+        authority = authority_from_request_contract(contract)
+        if not authority.is_autonomous_objective or self.mode != "auto":
+            raise RuntimeError("controller recovery requires autonomous request authority")
+        self._install_turn_authority(authority)
+        objective = str(saved["objective"])
+        self._seed_autonomous_objective(objective)
+        if self.mythic_client is not None:
+            self.mythic_client.begin_operator_turn(
+                objective, objective_contract=authority.objective_contract,
+            )
+        self._register_running_task(asyncio.current_task())
+        return await self._run_autonomous_controller(objective)
+
     async def _run_autonomous_controller_kernel(self, prompt: str) -> str:
         """Run the policy-selected AutonomousController execution kernel.
 
@@ -9933,14 +9966,18 @@ class Model:
         """
         try:
             from . import autonomous_controller as _ctrl
+            from . import controller_recovery as _recovery
             from . import capabilities as _cap
             from . import engagement_state as _es
             from . import policy as _policy
         except ImportError:
             import autonomous_controller as _ctrl
+            import controller_recovery as _recovery
             import capabilities as _cap
             import engagement_state as _es
             import policy as _policy
+
+        recovery_state = getattr(self, "_controller_resume_state", None)
 
         if self._controller_hitl_enabled():
             self._controller_hitl_objective = str(prompt or "")
@@ -10253,14 +10290,15 @@ class Model:
         unbounded_eval_arm = _eval_unbounded_auto_arm(getattr(self, "mode", ""))
         configured_wall_seconds = float(_env_positive_int("SAGE_CONTROLLER_WALL_S", 2700))
         eval_arm_deadline_epoch = getattr(self, "_eval_arm_deadline_epoch", None)
-        if eval_arm_deadline_epoch is not None:
+        if eval_arm_deadline_epoch is not None and not unbounded_eval_arm:
             configured_wall_seconds = min(
                 configured_wall_seconds,
                 max(0.001, eval_arm_deadline_epoch - time.time()),
             )
         cfg = _ctrl.ControllerConfig(
             seam_timeout_s=float(_env_positive_int("SAGE_CONTROLLER_SEAM_TIMEOUT_S", 900)),
-            wall_clock_budget_s=None if unbounded_eval_arm else configured_wall_seconds,
+            wall_clock_budget_s=(None if unbounded_eval_arm and eval_arm_deadline_epoch is None
+                                 else configured_wall_seconds),
             token_budget=(
                 None if unbounded_eval_arm else (
                     evaluation_token_ceiling
@@ -10270,9 +10308,27 @@ class Model:
             max_cycles=None if unbounded_eval_arm else _env_positive_int("SAGE_CONTROLLER_MAX_CYCLES", 60),
             max_collection_attempts_per_request=1 if supervised_collection_lane else 2,
         )
+        original_controller_config = dict(vars(cfg))
+        if recovery_state is not None:
+            if recovery_state.get("controller_config") != original_controller_config:
+                raise _recovery.RecoveryBlocked("controller resource configuration changed")
+            started_at_epoch = float(recovery_state["started_at_epoch"])
+            if cfg.wall_clock_budget_s is not None:
+                cfg.wall_clock_budget_s = max(
+                    0.0, started_at_epoch + float(cfg.wall_clock_budget_s) - time.time()
+                )
+        if unbounded_eval_arm and eval_arm_deadline_epoch is not None:
+            # Preserve a stable declared config across recovery, while the
+            # active controller receives only the original arm's remaining time.
+            cfg.wall_clock_budget_s = min(
+                float(cfg.wall_clock_budget_s),
+                max(0.0, eval_arm_deadline_epoch - time.time()),
+            )
 
         objective_text = str(prompt or "").strip()
-        continuing_episode = resumed_after_approval and bool(getattr(self, "_policy_episode_id", ""))
+        if recovery_state is not None:
+            self._policy_episode_id = str(recovery_state["episode_id"])
+        continuing_episode = (resumed_after_approval or recovery_state is not None) and bool(getattr(self, "_policy_episode_id", ""))
         if not continuing_episode:
             self._policy_episode_id = _policy.new_episode_id()
             self._policy_model_calls = 0
@@ -10467,12 +10523,62 @@ class Model:
             config=cfg,
             logger=fire,
         )
+        recovery_store = None
+        if _recovery.enabled() and self.mode == "auto" and self.channel_id is not None:
+            contract = getattr(self, "_request_contract", None)
+            if contract is None:
+                raise _recovery.RecoveryBlocked("controller request contract unavailable")
+            recovery_binding = _recovery.binding_for_model(self, contract)
+            recovery_store = _recovery.ControllerRecoveryStore(self.operation_id, self.channel_id)
+            recovery_store.acquire()
+            try:
+                if recovery_state is None:
+                    if recovery_store.load() is not None:
+                        raise _recovery.RecoveryBlocked("channel already has a controller recovery record")
+                    original_request_id = contract.request_id
+                    controller._recovery_snapshot.update({
+                        "original_request_id": original_request_id,
+                        "objective": objective_text,
+                        "controller_config": original_controller_config,
+                        "started_at_epoch": time.time(),
+                        "binding": recovery_binding,
+                        "request_contract_payload": contract.to_payload(),
+                        "request_contract_digest": contract.digest,
+                    })
+                    recovery_store.write(recovery_binding, "starting", controller._recovery_snapshot)
+                else:
+                    original_request_id = str(recovery_state["original_request_id"])
+                    recovered = recovery_store.require_clean(recovery_binding, original_request_id)
+                    if recovered != recovery_state:
+                        raise _recovery.RecoveryBlocked("controller recovery state changed during resume")
+                    controller._recovery_snapshot.update(recovered)
+                    controller._recovery_state = recovered
+                    resources = recovered.get("resources") or {}
+                    self._policy_model_calls = int(resources.get("policy_model_calls", 0))
+                    self._controller_observed_decisions = list(resources.get("observed_decisions") or [])
+                    self._controller_observed_transactions = list(resources.get("observed_transactions") or [])
+                    self._policy_episode_id = str(recovered["episode_id"])
+                    controller._episode_id = self._policy_episode_id
+                controller._recovery_store = recovery_store
+                controller._recovery_binding = recovery_binding
+                controller._recovery_resources = lambda: {
+                    "policy_model_calls": int(self._policy_model_calls),
+                    "observed_decisions": list(self._controller_observed_decisions),
+                    "observed_transactions": list(self._controller_observed_transactions),
+                    "runtime_telemetry": dict(self._controller_runtime_telemetry),
+                }
+            except BaseException:
+                recovery_store.release()
+                raise
         try:
             result = await controller.run()
         except _ControllerHitlPause:
             self._controller_refresh_runtime_policy_telemetry()
             await self._flush_controller_verbose_events()
             return ""
+        finally:
+            if recovery_store is not None:
+                recovery_store.release()
         result_data = result.to_dict()
         for decision in result_data["decisions"]:
             self._controller_record_policy_decision(decision)
@@ -10554,6 +10660,14 @@ class Model:
             self._controller_hitl_approved_pending = None
             self._controller_hitl_objective = ""
             self._supervised_objective_active = False
+        if recovery_store is not None:
+            recovery_store.acquire()
+            try:
+                controller._recovery_snapshot["terminal_report"] = report
+                controller._recovery_snapshot["terminal_telemetry"] = self.controller_runtime_telemetry()
+                controller._recovery_write("terminal")
+            finally:
+                recovery_store.release()
         return report
 
     def _controller_terminal_report(self, result) -> str:
@@ -12082,6 +12196,13 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         invoke() task so long-running tool awaits cannot survive after Mythic marks the run stopped.
         """
         logger.info(f"🛑 Stop requested for session task_id={self.task_id}")
+        if reason == STOP_REASON_OPERATOR and getattr(self, "channel_id", None) is not None:
+            try:
+                from .controller_recovery import ControllerRecoveryStore, enabled as recovery_enabled
+            except ImportError:
+                from controller_recovery import ControllerRecoveryStore, enabled as recovery_enabled
+            if recovery_enabled():
+                ControllerRecoveryStore(self.operation_id, self.channel_id).revoke()
         self._stop_requested = True
         self._stop_reason = str(reason or STOP_REASON_UNSPECIFIED)
         try:

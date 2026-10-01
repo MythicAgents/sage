@@ -20,7 +20,10 @@ from contextlib import suppress
 import hashlib
 import json
 import os
+import re
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from mythic_container.ChatBase import (
@@ -789,6 +792,11 @@ class SageChat(Chat):
             await self._chat_watcher(request)
             return
         prompt = request.Prompt or ""
+        resume_match = (
+            re.fullmatch(r"SAGE_RESUME_CONTROLLER ([1-9][0-9]*)", prompt.strip())
+            if os.environ.get("SAGE_AUTO_CONTROLLER_RECOVERY") == "1" else None
+        )
+        resume_request_id = resume_match.group(1) if resume_match else ""
         assessment_finding_id = assess_finding_id(prompt)
 
         async def _serialized_handler(turn) -> dict[str, Any] | None:
@@ -803,10 +811,92 @@ class SageChat(Chat):
             first_channel_claim = await claim_channel_marker(request)
             channel_identity = (int(request.OperationID), int(request.ChannelID))
             slash_only_new_channel = channel_identity in _NEW_CHANNEL_WITHOUT_SESSION
+            recovery_state = None
+            if resume_request_id:
+                try:
+                    from ai.langgraph.controller_recovery import ControllerRecoveryStore, RecoveryBlocked
+                except ImportError:  # pragma: no cover
+                    from ..ai.langgraph.controller_recovery import ControllerRecoveryStore, RecoveryBlocked
+                recovery_store = ControllerRecoveryStore(*channel_identity)
+                recovery_info = recovery_store.inspect()
+                if os.environ.get("SAGE_EVAL_UNBOUNDED_ARM", "").strip() != "1":
+                    recovery_error = "controller recovery requires the explicitly unbounded evaluation arm"
+                elif existing_at_entry is not None or recovery_info["active"]:
+                    recovery_error = "autonomous controller is already active"
+                elif recovery_info["phase"] not in {"clean", "terminal"}:
+                    recovery_error = f"controller recovery blocked at {recovery_info['phase'] or 'missing'} boundary"
+                else:
+                    record = recovery_store.load()
+                    recovery_state = record["payload"] if record else None
+                    recovery_error = (
+                        "controller recovery request identity changed"
+                        if not recovery_state or recovery_state.get("original_request_id") !=
+                        f"chat:{request.ChannelID}:request:{resume_request_id}"
+                        else ""
+                    )
+                    if not recovery_error:
+                        try:
+                            from ai.langgraph.controller_recovery import binding_digest
+                        except ImportError:  # pragma: no cover
+                            from ..ai.langgraph.controller_recovery import binding_digest
+                        saved_binding = recovery_state.get("binding") or {}
+                        resolved_kwargs = build_model_kwargs(request)
+                        resolved_signature = _model_config_signature(
+                            resolved_kwargs, build_bloodhound_env(request)
+                        )
+                        original_contract = replace(
+                            _build_request_contract(
+                                request,
+                                SimpleNamespace(
+                                    mode=resolved_kwargs["mode"],
+                                    _autonomous_solve=resolved_kwargs["autonomous_solve"],
+                                ),
+                                has_input_response=False,
+                            ),
+                            request_id=str(recovery_state["original_request_id"]),
+                        )
+                        if (
+                            not isinstance(saved_binding, dict)
+                            or binding_digest(saved_binding) != record["binding_digest"]
+                            or int(saved_binding.get("apitoken_id", -1)) != int(request.APITokenID)
+                            or saved_binding.get("config_signature") != resolved_signature
+                            or saved_binding.get("provider") != resolved_kwargs["provider"]
+                            or saved_binding.get("model") != resolved_kwargs["model"]
+                            or saved_binding.get("mode") != "auto"
+                            or saved_binding.get("request_contract_digest") != original_contract.digest
+                        ):
+                            recovery_error = "authenticated run binding changed"
+                if recovery_error:
+                    await self.send_complete(
+                        request, turn.response_key,
+                        content=f"Sage recovery blocked: {recovery_error}. No controller action was issued.",
+                        complete_request=True,
+                    )
+                    return None
+                if recovery_info["phase"] == "terminal":
+                    await self.send_complete(
+                        request, turn.response_key,
+                        metadata={
+                            "channel_id": request.ChannelID,
+                            "runtime_telemetry": recovery_state.get("terminal_telemetry")
+                            or (recovery_state.get("resources") or {}).get("runtime_telemetry")
+                            or {},
+                        },
+                        content=recovery_state.get("terminal_report") or (
+                            "Saved Sage controller terminal: "
+                            f"{recovery_state.get('terminal_status', 'unknown')} — "
+                            f"{recovery_state.get('terminal_reason', '')}. "
+                            f"Cycles: {len(recovery_state.get('cycles') or [])}; "
+                            f"verified effects: {len(recovery_state.get('achieved_effects') or [])}. "
+                            "No controller action was issued."
+                        ),
+                        complete_request=True,
+                    )
+                    return None
             if existing_at_entry is None and (
                 (not first_channel_claim and not slash_only_new_channel)
                 or (first_channel_claim and _channel_has_prior_context(request))
-            ):
+            ) and recovery_state is None:
                 await self.send_complete(
                     request,
                     turn.response_key,
@@ -889,6 +979,27 @@ class SageChat(Chat):
                 model,
                 has_input_response=has_input_response,
             )
+            if recovery_state is not None:
+                try:
+                    from ai.langgraph.controller_recovery import binding_for_model, binding_digest
+                except ImportError:  # pragma: no cover
+                    from ..ai.langgraph.controller_recovery import binding_for_model, binding_digest
+                original_request_id = str(recovery_state["original_request_id"])
+                request_contract = replace(request_contract, request_id=original_request_id)
+                recovered_binding = binding_for_model(model, request_contract)
+                if (
+                    request_contract.digest != recovery_state.get("request_contract_digest")
+                    or binding_digest(recovered_binding) != recovery_store.load()["binding_digest"]
+                    or str(getattr(model, "mode", "")) != "auto"
+                ):
+                    await drop_channel_session(request, expected_model=model)
+                    await self.send_complete(
+                        request, turn.response_key,
+                        content="Sage recovery blocked: authenticated run binding changed. No controller action was issued.",
+                        complete_request=True,
+                    )
+                    return None
+                model._controller_resume_state = recovery_state
             begin_visibility = getattr(model, "begin_visibility_turn", None)
             if callable(begin_visibility):
                 scope = f"chat:{request.ChannelID}:request:{request.RequestID}"
@@ -1112,7 +1223,11 @@ class SageChat(Chat):
                         )
                     else:
                         native_response_text = _nonempty_native_response_text(
-                            await model.invoke(prompt, is_interactive=preexisted)
+                            await (
+                                model.resume_autonomous_controller()
+                                if recovery_state is not None
+                                else model.invoke(prompt, is_interactive=preexisted)
+                            )
                         )
                 finally:
                     if approval_installed:

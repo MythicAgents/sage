@@ -151,6 +151,95 @@ def test_restarted_native_channel_with_empty_context_refuses_by_persisted_marker
     assert "prior scope and evidence are not restored" in resumed_chat.terminal_emissions[0]["content"]
 
 
+def test_explicit_auto_recovery_marker_restores_original_objective_and_contract(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    import sage_chat.service as service
+    from ai.langgraph import controller_recovery as recovery
+
+    class FixedStore(recovery.ControllerRecoveryStore):
+        def __init__(self, operation_id, channel_id):
+            super().__init__(operation_id, channel_id, db_path=str(tmp_path / "sage.db"))
+
+    class RecoveryModel(_FakeModel):
+        def __init__(self, request, kwargs, signature):
+            super().__init__(stream=(), return_value="resumed")
+            self.provider = kwargs["provider"]
+            self.model = kwargs["model"]
+            self.mode = "auto"
+            self._autonomous_solve = True
+            self.policy_mode = kwargs["policy_mode"]
+            self.operation_id = request.OperationID
+            self.channel_id = request.ChannelID
+            self.apitoken_id = request.APITokenID
+            self._chat_request_config_signature = signature
+            self.mythic_client = SimpleNamespace(_eng_key=lambda: "engagement:fixture")
+
+        async def resume_autonomous_controller(self):
+            return await self.invoke(self._controller_resume_state["objective"], is_interactive=False)
+
+    monkeypatch.setenv("SAGE_AUTO_CONTROLLER_RECOVERY", "1")
+    monkeypatch.setenv("SAGE_EVAL_UNBOUNDED_ARM", "1")
+    monkeypatch.setattr(recovery, "ControllerRecoveryStore", FixedStore)
+
+    async def prior_channel(_request):
+        return False
+
+    monkeypatch.setattr(service, "claim_channel_marker", prior_channel)
+    original = build_chat_request("original objective", channel_id=90670, request_id=71,
+                                  config={"mode": "auto"})
+    kwargs = build_model_kwargs(original)
+    signature = service._model_config_signature(kwargs, service.build_bloodhound_env(original))
+    model = RecoveryModel(original, kwargs, signature)
+    contract = service._build_request_contract(original, model, has_input_response=False)
+    binding = recovery.binding_for_model(model, contract)
+    saved = {
+        "original_request_id": contract.request_id,
+        "objective": original.Prompt,
+        "binding": binding,
+        "request_contract_digest": contract.digest,
+    }
+    store = FixedStore(original.OperationID, original.ChannelID)
+    store.acquire()
+    store.write(binding, "clean", saved)
+    store.release()
+
+    resumed = build_chat_request("SAGE_RESUME_CONTROLLER 71", channel_id=90670,
+                                 request_id=72, config={"mode": "auto"})
+    chat = _DriverChat(model)
+    _run(chat.chat(resumed))
+
+    assert model.invoked_with == ("original objective", False)
+    assert model.installed_request_contracts[-1].digest == contract.digest
+    assert model._controller_resume_state == saved
+    assert chat.terminal_emissions[-1]["content"] == "resumed"
+
+
+def test_explicit_auto_recovery_rejects_changed_identity_before_model(monkeypatch, tmp_path):
+    import sage_chat.service as service
+    from ai.langgraph import controller_recovery as recovery
+
+    class FixedStore(recovery.ControllerRecoveryStore):
+        def __init__(self, operation_id, channel_id):
+            super().__init__(operation_id, channel_id, db_path=str(tmp_path / "sage.db"))
+
+    monkeypatch.setenv("SAGE_AUTO_CONTROLLER_RECOVERY", "1")
+    monkeypatch.setenv("SAGE_EVAL_UNBOUNDED_ARM", "1")
+    monkeypatch.setattr(recovery, "ControllerRecoveryStore", FixedStore)
+    store = FixedStore(1, 90671)
+    store.acquire()
+    store.write({"identity": "original"}, "clean", {
+        "original_request_id": "chat:90671:request:71", "objective": "original objective",
+        "binding": {"identity": "original"},
+    })
+    store.release()
+    model = _FakeModel()
+    chat = _DriverChat(model)
+    _run(chat.chat(build_chat_request("SAGE_RESUME_CONTROLLER 71", channel_id=90671,
+                                      request_id=72, config={"mode": "auto"})))
+    assert model.invoked_with is None
+    assert "binding changed" in chat.terminal_emissions[-1]["content"]
+
+
 def test_channel_marker_is_operation_scoped_and_claim_is_atomic():
     from sage_chat.session import claim_channel_marker
 

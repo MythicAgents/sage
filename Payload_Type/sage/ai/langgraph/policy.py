@@ -11,6 +11,11 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
+try:
+    from ai.model_refusal import refusal_from_message
+except ImportError:  # flat-import runtime
+    from model_refusal import refusal_from_message
+
 
 POLICY_LLM = "llm"
 POLICY_SYMBOLIC = "symbolic"
@@ -873,6 +878,7 @@ class LLMPolicy:
 
         raw_response = _response_text(response)
         provenance = _response_backend_provenance(response)
+        refusal = refusal_from_message(response)
         parsed = self._response_dict(response)
         trusted_policy_control = response if isinstance(response, dict) else {}
         disposition = str(parsed.get("disposition") or "").strip().casefold()
@@ -950,6 +956,33 @@ class LLMPolicy:
                     decision_packet=decision_packet,
                     decision_packet_hash=decision_packet_hash,
                 )
+        if refusal is not None:
+            # The provider's completed refusal is a terminal policy decision. Route and
+            # authoritative usage checks above must still run before accepting it.
+            return PolicyDecision(
+                episode_id=episode_id,
+                decision_id=f"decision-{uuid4().hex}",
+                policy_mode=self.mode,
+                candidate_hash=c_hash,
+                disposition="refusal",
+                rationale=refusal[1],
+                model_provider=self.provider,
+                model_id=self.model_id,
+                candidate_count=len(candidates),
+                raw_response=raw_response or refusal[1],
+                raw_disposition="refusal",
+                raw_rationale=refusal[1],
+                model_response_observed=model_response_observed,
+                decision_packet=decision_packet,
+                decision_packet_hash=decision_packet_hash,
+                request_schema_hash=request_schema_hash,
+                **_decision_identity_fields(
+                    mode=self.mode, selection_contract=self.selection_contract,
+                    candidates=candidates, selected_index=None,
+                    decision_owner=decision_owner,
+                ),
+                **provenance,
+            )
         if disposition in {"stop", "ask"}:
             return PolicyDecision(
                 episode_id=episode_id,

@@ -15,6 +15,7 @@ import itertools
 import json
 import re
 import sys
+import time
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -224,6 +225,27 @@ def test_eval_unbounded_flag_reaches_assembled_controller_only_for_exact_auto_mo
     expected = None if unbounded else 1
     assert (cfg.wall_clock_budget_s, cfg.token_budget, cfg.max_cycles) == (expected, expected, expected)
     assert cfg.seam_timeout_s is not None
+
+
+def test_eval_wall_deadline_bounds_controller_without_token_or_cycle_ceiling(monkeypatch):
+    monkeypatch.setenv("SAGE_EVAL_UNBOUNDED_ARM", "1")
+    monkeypatch.setenv("SAGE_CONTROLLER_WALL_S", "3600")
+    captured = []
+    original = controller.AutonomousController
+
+    def construct(*args, **kwargs):
+        captured.append(kwargs["config"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(controller, "AutonomousController", construct)
+    m = _bare_model(json.dumps({"ok": True}), None, [])
+    m.mode = "auto"
+    m._eval_arm_deadline_epoch = time.time() + 3600
+    asyncio.run(m._run_autonomous_controller("test objective"))
+    assert len(captured) == 1
+    cfg = captured[0]
+    assert 3500 < cfg.wall_clock_budget_s <= 3600
+    assert cfg.token_budget is None and cfg.max_cycles is None
 
 
 def test_controller_missing_policy_mode_uses_hybrid_product_default_without_model_call():
