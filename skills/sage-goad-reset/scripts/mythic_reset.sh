@@ -20,6 +20,31 @@ MYTHIC_CLI="${MYTHIC_CLI:-}"
 MYTHIC_DIR="$(cd "$(dirname "$MYTHIC_CLI")" && pwd)"
 cd "$MYTHIC_DIR"
 
+SAGE_DEPLOYMENT_MODE="${SAGE_DEPLOYMENT_MODE:-local}"
+case "$SAGE_DEPLOYMENT_MODE" in
+  local|container) ;;
+  *) echo "ERR: unknown SAGE_DEPLOYMENT_MODE: $SAGE_DEPLOYMENT_MODE" >&2; exit 1 ;;
+esac
+
+RESET_MUTATION_STARTED=0
+enforce_deployment_on_exit() {
+  local result=$?
+  trap - EXIT
+  # A partial local startup must not leave a second Sage registered, even when a later
+  # service fails. Container mode keeps its existing successful-reset enforcement.
+  if [[ "$RESET_MUTATION_STARTED" == "1" \
+    && ( "$SAGE_DEPLOYMENT_MODE" == "local" || "$result" == "0" ) ]]; then
+    if [[ "${SAGE_RESET_SKIP_DEPLOYMENT_ENFORCE:-0}" == "1" ]]; then
+      echo "▶ deployment enforcement SKIPPED (SAGE_RESET_SKIP_DEPLOYMENT_ENFORCE=1) — tests only" >&2
+    elif ! "$REPO_ROOT/.venv/bin/python" "$HERE/sage_deployment.py" enforce --conflict-only; then
+      echo "ERR: Sage deployment conflict could not be resolved" >&2
+      result=1
+    fi
+  fi
+  exit "$result"
+}
+trap enforce_deployment_on_exit EXIT
+
 # Sage's .env uses Docker service hostnames that are valid inside the chat container but poison
 # mythic-cli when inherited by this host-side reset script.
 mythic_cli() {
@@ -79,6 +104,12 @@ inspect_started_services() {
   ((${#FAILED_SERVICES[@]} == 0))
 }
 
+add_required_service() {
+  local service="$1"
+  [[ "$SAGE_DEPLOYMENT_MODE" == "local" && "$service" == "sage" ]] && return 0
+  REQUIRED_SERVICES+=("$service")
+}
+
 if [[ "${SAGE_RESET_METERED_DOCKER:-0}" == "1" ]]; then
   [[ -n "${SAGE_RESOURCE_BUDGET_CONFIG:-}" && -f "$SAGE_RESOURCE_BUDGET_CONFIG" \
     && -n "${SAGE_RESOURCE_BUDGET_LEDGER:-}" && -f "$SAGE_RESOURCE_BUDGET_LEDGER" ]] || {
@@ -122,6 +153,9 @@ except Exception:
       echo "ERR: ambiguous Mythic compose service image" >&2
       exit 1
     }
+    if [[ "$SAGE_DEPLOYMENT_MODE" == "local" && "$service" == "sage" ]]; then
+      continue
+    fi
     image_id="$(mythic_docker image inspect --format '{{.Id}}' "$image")" || {
       echo "ERR: a configured Mythic service image is not installed" >&2
       exit 1
@@ -130,7 +164,7 @@ except Exception:
       echo "ERR: a configured Mythic service image has no installed ID" >&2
       exit 1
     }
-    REQUIRED_SERVICES+=("$service")
+    add_required_service "$service"
   done <<< "$service_images_output"
   [[ ${#REQUIRED_SERVICES[@]} -gt 0 ]] || {
     echo "ERR: Mythic compose configuration has no services" >&2
@@ -148,12 +182,26 @@ except Exception:
     echo "ERR: Mythic postgres database directory is unavailable" >&2
     exit 1
   }
+  RESET_MUTATION_STARTED=1
   mythic_docker compose stop
   mythic_docker run --rm --pull never \
     -v "$MYTHIC_DIR/postgres-docker/database:/db" \
     alpine sh -c 'rm -rf /db/* /db/.[!.]* /db/..?*'
   metered_docker_start compose up -d --no-build --pull never "${REQUIRED_SERVICES[@]}"
 else
+  required_services_output="$(mythic_docker compose config --services)" || {
+    echo "ERR: unable to enumerate configured Mythic services" >&2
+    exit 1
+  }
+  REQUIRED_SERVICES=()
+  while IFS= read -r service; do
+    [[ -n "$service" ]] && add_required_service "$service"
+  done <<< "$required_services_output"
+  [[ ${#REQUIRED_SERVICES[@]} -gt 0 ]] || {
+    echo "ERR: Mythic compose configuration has no services for the selected deployment mode" >&2
+    exit 1
+  }
+  RESET_MUTATION_STARTED=1
   mythic_cli stop
   if [[ -d "$MYTHIC_DIR/postgres-docker/database" ]]; then
     docker run --rm \
@@ -162,15 +210,10 @@ else
   else
     mythic_cli database reset -f
   fi
-  mythic_cli start
-  required_services_output="$(mythic_docker compose config --services)" || {
-    echo "ERR: unable to enumerate configured Mythic services" >&2
-    exit 1
-  }
-  mapfile -t REQUIRED_SERVICES <<< "$required_services_output"
-  if [[ ${#REQUIRED_SERVICES[@]} -eq 0 || -z "${REQUIRED_SERVICES[0]}" ]]; then
-    echo "ERR: Mythic compose configuration has no services" >&2
-    exit 1
+  if [[ "$SAGE_DEPLOYMENT_MODE" == "local" ]]; then
+    mythic_cli start "${REQUIRED_SERVICES[@]}"
+  else
+    mythic_cli start
   fi
 fi
 if inspect_started_services; then
@@ -192,31 +235,4 @@ else
   fi
 fi
 
-# `mythic_cli start` above starts EVERY registered service, including the Sage container. Which
-# Sage should actually serve Mythic is a deployment decision, not a side effect of a reset: this
-# repo's workflow runs Sage locally in the `sage` tmux session, so the container must come back
-# down. Left running, both register as `sage`, one wins the RabbitMQ queue, and requests are
-# answered by whichever won — on 2026-08-01 that was the container, using its baked image instead
-# of the working tree and with no BloodHound MCP directory.
-#
-# Override with SAGE_DEPLOYMENT_MODE=container to keep the container and stop the local process
-# instead. Failing here is deliberate: a reset that leaves two Sages registered is worse than one
-# that stops.
-#
-# `--conflict-only`: Sage itself is restarted later in the reset order, so only the unintended
-# side must be down here, not the intended one up.
-#
-# SAGE_RESET_SKIP_DEPLOYMENT_ENFORCE exists for ONE caller: a test exercising this script's
-# environment handling, which fakes `mythic-cli` but cannot fake `docker`. Without it such a test
-# reads whatever Sage happens to be running on the developer's machine and fails or passes on that
-# alone. Declaring the deployment check out of scope is not the same as declaring a mode: setting
-# SAGE_DEPLOYMENT_MODE=container instead would make enforce stop the "unintended" LOCAL Sage by
-# running sage_stop.sh for real, so a test run would kill a teammate's tmux session.
-#
-# NEVER set this for an operational reset. The split-brain guard is the entire point of the step:
-# two Sages registered as `sage` means one silently wins the RabbitMQ queue.
-if [[ "${SAGE_RESET_SKIP_DEPLOYMENT_ENFORCE:-0}" == "1" ]]; then
-  echo "▶ deployment enforcement SKIPPED (SAGE_RESET_SKIP_DEPLOYMENT_ENFORCE=1) — tests only" >&2
-else
-  "$REPO_ROOT/.venv/bin/python" "$HERE/sage_deployment.py" enforce --conflict-only
-fi
+# The exit trap checks deployment after a successful reset and after any partial local reset.

@@ -22,11 +22,15 @@ def _mythic_reset_env(
     timeout_failure="",
     recover_on_targeted_start=False,
     cli_start_message="",
+    cli_start_failure=False,
+    sage_running_on_start=False,
+    enforce_deployment=False,
 ):
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     log = tmp_path / "calls.log"
     recovered = tmp_path / "recovered"
+    sage_running = tmp_path / "sage-running"
     cli = tmp_path / "mythic-cli"
     cli.write_text(
         "#!/usr/bin/env bash\n"
@@ -35,6 +39,9 @@ def _mythic_reset_env(
         '"${MYTHIC_SERVER_HOST-unset}" "${NGINX_HOST-unset}" '
         '"${COMPOSE_FILE-unset}" "${COMPOSE_PROJECT_NAME-unset}" >> "$CALL_LOG"\n'
         'if [[ "$1" == "start" ]]; then printf "%s\\n" "${CLI_START_MESSAGE-}"; fi\n'
+        'if [[ "$1" == "start" && "${SAGE_RUNNING_ON_START-0}" == "1" ]]; then : > "$SAGE_RUNNING_FILE"; fi\n'
+        'if [[ "$1" == "stop" ]]; then rm -f "$SAGE_RUNNING_FILE"; fi\n'
+        'if [[ "$1" == "start" && "${CLI_START_FAILURE-0}" == "1" ]]; then exit 7; fi\n'
         'if [[ "$1" == "start" && "$#" -gt 1 '
         '&& "${RECOVER_ON_TARGETED_START-0}" == "1" ]]; then\n'
         '  : > "$RECOVERED_FILE"\n'
@@ -50,6 +57,10 @@ def _mythic_reset_env(
         'if [[ "$1 ${2-} ${3-}" == "compose config --services" ]]; then\n'
         '  [[ "${DOCKER_FAILURE-}" == "config" ]] && exit 9\n'
         '  printf "%s\\n" "$SERVICES"\n'
+        "  exit 0\n"
+        "fi\n"
+        'if [[ "$1 ${2-}" == "ps --filter" ]]; then\n'
+        '  [[ -f "$SAGE_RUNNING_FILE" ]] && printf "sage\\n"\n'
         "  exit 0\n"
         "fi\n"
         'if [[ "$1 ${2-} ${3-} ${4-}" == "compose ps --all --quiet" ]]; then\n'
@@ -85,6 +96,7 @@ def _mythic_reset_env(
         "MYTHIC_CLI": str(cli),
         "CALL_LOG": str(log),
         "RECOVERED_FILE": str(recovered),
+        "SAGE_RUNNING_FILE": str(sage_running),
         "INITIAL_ROWS": initial_rows,
         "RECOVERED_ROWS": recovered_rows if recovered_rows is not None else initial_rows,
         "SERVICES": services,
@@ -93,12 +105,14 @@ def _mythic_reset_env(
         "TIMEOUT_FAILURE": timeout_failure,
         "RECOVER_ON_TARGETED_START": "1" if recover_on_targeted_start else "0",
         "CLI_START_MESSAGE": cli_start_message,
+        "CLI_START_FAILURE": "1" if cli_start_failure else "0",
+        "SAGE_RUNNING_ON_START": "1" if sage_running_on_start else "0",
         "RABBITMQ_HOST": "127.0.0.1",
         "MYTHIC_SERVER_HOST": "127.0.0.1",
         "NGINX_HOST": "127.0.0.1",
         "COMPOSE_FILE": "/tmp/not-the-mythic-compose.yml",
         "COMPOSE_PROJECT_NAME": "not-mythic",
-        "SAGE_RESET_SKIP_DEPLOYMENT_ENFORCE": "1",
+        "SAGE_RESET_SKIP_DEPLOYMENT_ENFORCE": "0" if enforce_deployment else "1",
     }
     return env, log
 
@@ -269,11 +283,61 @@ def test_mythic_reset_drops_container_only_host_overrides(tmp_path):
     assert cli_calls == [
         "cli|stop|unset|unset|unset|unset|unset",
         "cli|database reset -f|unset|unset|unset|unset|unset",
-        "cli|start|unset|unset|unset|unset|unset",
+        "cli|start mythic_postgres apollo http|unset|unset|unset|unset|unset",
     ]
     docker_calls = [line for line in log.read_text().splitlines() if line.startswith("docker|")]
     assert len(docker_calls) == 3
     assert all(line.endswith(f"|unset|unset|{tmp_path}") for line in docker_calls)
+
+
+def test_local_reset_stops_unexpected_sage_container_after_start_failure(tmp_path):
+    env, log = _mythic_reset_env(
+        tmp_path,
+        initial_rows="mythic_postgres|true|healthy\napollo|true|none\nhttp|true|none\nsage|true|none",
+        cli_start_failure=True,
+        sage_running_on_start=True,
+        enforce_deployment=True,
+    )
+
+    result = subprocess.run(
+        ["/bin/bash", str(MYTHIC_RESET), "--yes"], cwd=ROOT, env=env,
+        text=True, capture_output=True, timeout=10,
+    )
+
+    assert result.returncode == 7, result.stderr
+    calls = log.read_text().splitlines()
+    assert any(line.startswith("cli|start mythic_postgres apollo http|") for line in calls)
+    assert any(line.startswith("cli|stop sage|") for line in calls)
+    assert not (tmp_path / "sage-running").exists()
+
+
+def test_container_mode_retains_sage_in_full_start(tmp_path):
+    env, log = _mythic_reset_env(
+        tmp_path,
+        initial_rows="mythic_postgres|true|healthy\napollo|true|none\nhttp|true|none\nsage|true|none",
+    )
+    env["SAGE_DEPLOYMENT_MODE"] = "container"
+
+    result = subprocess.run(
+        ["/bin/bash", str(MYTHIC_RESET), "--yes"], cwd=ROOT, env=env,
+        text=True, capture_output=True, timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert any(line.startswith("cli|start|") for line in log.read_text().splitlines())
+
+
+def test_local_reset_rejects_sage_only_compose_before_mutation(tmp_path):
+    env, log = _mythic_reset_env(tmp_path, initial_rows="sage|true|none", services="sage")
+
+    result = subprocess.run(
+        ["/bin/bash", str(MYTHIC_RESET), "--yes"], cwd=ROOT, env=env,
+        text=True, capture_output=True, timeout=10,
+    )
+
+    assert result.returncode == 1
+    assert "no services for the selected deployment mode" in result.stderr
+    assert not any(line.startswith("cli|") for line in log.read_text().splitlines())
 
 
 def test_mythic_reset_fails_closed_when_cli_start_hides_failed_services(tmp_path):
@@ -295,7 +359,7 @@ def test_mythic_reset_fails_closed_when_cli_start_hides_failed_services(tmp_path
     assert result.returncode == 1
     assert log.read_text().count(
         "cli|start mythic_postgres apollo http|unset|unset|unset|unset|unset"
-    ) == 1
+    ) == 2
     assert "not ready after targeted recovery" in result.stderr
 
 
@@ -369,7 +433,7 @@ def test_mythic_reset_fails_closed_when_container_inspection_fails(tmp_path):
 
     assert result.returncode != 0
     assert "unable to inspect" in result.stderr
-    assert not any("cli|start " in line for line in log.read_text().splitlines())
+    assert sum(line.startswith("cli|start ") for line in log.read_text().splitlines()) == 1
 
 
 def test_mythic_reset_fails_closed_when_bounded_docker_call_times_out(tmp_path):
@@ -390,7 +454,7 @@ def test_mythic_reset_fails_closed_when_bounded_docker_call_times_out(tmp_path):
 
     assert result.returncode == 1
     assert "unable to enumerate configured" in result.stderr
-    assert not any("cli|start " in line for line in log.read_text().splitlines())
+    assert not any(line.startswith("cli|start ") for line in log.read_text().splitlines())
 
 
 def test_mythic_reset_fails_closed_when_targeted_start_times_out(tmp_path):
@@ -414,7 +478,7 @@ def test_mythic_reset_fails_closed_when_targeted_start_times_out(tmp_path):
 
     assert result.returncode == 124
     assert log.read_text().count("timeout|-k 5s 180s ") == 1
-    assert not any("cli|start " in line for line in log.read_text().splitlines())
+    assert sum(line.startswith("cli|start ") for line in log.read_text().splitlines()) == 1
 
 
 def test_metered_docker_reset_preflights_images_before_stop_and_never_calls_cli(tmp_path):
@@ -429,11 +493,28 @@ def test_metered_docker_reset_preflights_images_before_stop_and_never_calls_cli(
     calls = log.read_text().splitlines()
     assert not any(value.startswith("cli|") for value in calls)
     docker = [value for value in calls if value.startswith("docker|")]
-    assert sum("image inspect" in value for value in docker) == 5
+    assert sum("image inspect" in value for value in docker) == 4
     assert any("compose stop" in value for value in docker)
     assert any("run --rm --pull never" in value for value in docker)
-    assert sum("compose up -d --no-build --pull never mythic_postgres apollo http sage" in value for value in docker) == 1
+    assert sum("compose up -d --no-build --pull never mythic_postgres apollo http" in value for value in docker) == 1
     assert all(f"unix://{tmp_path / 'docker-meter.sock'}|unset|unset" in value for value in docker)
+
+
+def test_metered_container_mode_keeps_sage_service(tmp_path):
+    rows = "mythic_postgres|true|healthy\napollo|true|none\nhttp|true|none\nsage|true|none"
+    env, log, proxy = _metered_reset_env(tmp_path, initial_rows=rows)
+    env["SAGE_DEPLOYMENT_MODE"] = "container"
+    try:
+        result = subprocess.run(["/bin/bash", str(MYTHIC_RESET), "--yes"], cwd=ROOT, env=env,
+                                text=True, capture_output=True, timeout=10)
+    finally:
+        proxy.close()
+
+    assert result.returncode == 0, result.stderr
+    calls = log.read_text().splitlines()
+    assert sum("image inspect" in value for value in calls) == 5
+    assert any("compose up -d --no-build --pull never mythic_postgres apollo http sage" in value
+               for value in calls)
 
 
 def test_metered_docker_reset_missing_image_refuses_before_stop(tmp_path):
