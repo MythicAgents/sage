@@ -129,6 +129,29 @@ def test_bare_model_factory_applies_shared_max_output_tokens(monkeypatch):
     }]
 
 
+@pytest.mark.parametrize("effort", ("none", "high"))
+def test_bare_model_factory_sends_explicit_reasoning_effort_only_when_selected(monkeypatch, effort):
+    import langchain.chat_models
+
+    calls = []
+    monkeypatch.setattr(ls, "configure_sage_ssl_cert_file", lambda: "")
+    monkeypatch.setattr(langchain.chat_models, "init_chat_model", lambda **kwargs: calls.append(kwargs) or object())
+    ls.make_model_fn("openai", "model")
+    ls.make_model_fn("openai", "model", reasoning_effort=effort)
+    assert "reasoning_effort" not in calls[0]
+    assert calls[1]["reasoning_effort"] == effort
+
+
+@pytest.mark.parametrize(("provider", "effort"), (("openai", "NONE"), ("anthropic", "none")))
+def test_bare_model_factory_rejects_invalid_reasoning_effort_before_init(monkeypatch, provider, effort):
+    import langchain.chat_models
+
+    monkeypatch.setattr(ls, "configure_sage_ssl_cert_file", lambda: "")
+    monkeypatch.setattr(langchain.chat_models, "init_chat_model", lambda **_kwargs: pytest.fail("model initialized"))
+    with pytest.raises(ValueError, match="reasoning_effort"):
+        ls.make_model_fn(provider, "model", reasoning_effort=effort)
+
+
 def test_bare_model_factory_uses_opt_in_temperature_and_invalid_refuses_init(monkeypatch):
     import langchain.chat_models
 

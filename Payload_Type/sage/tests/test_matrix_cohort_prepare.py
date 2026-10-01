@@ -54,7 +54,7 @@ def inputs(tmp_path, monkeypatch):
 
 def test_active_prepare_binds_each_pair_to_real_producer_validator(tmp_path, monkeypatch):
     pair, catalog, smoke, output, argv = inputs(tmp_path, monkeypatch)
-    argv += ["--same-arm-recovery", "--activate-authority", "--authorization-source",
+    argv += ["--raw-reasoning-effort", "none", "--same-arm-recovery", "--activate-authority", "--authorization-source",
              "Operator authorized this two-pair test in the active session."]
     assert driver.main(argv) == 0
     plan = driver.load_plan(output / "cohort-plan.json")
@@ -64,7 +64,9 @@ def test_active_prepare_binds_each_pair_to_real_producer_validator(tmp_path, mon
     assert plan["continue_after_time_limit"] is True
     assert plan["continue_after_refusal"] is True
     assert plan["rehearsal_policy"] == "once-per-cohort"
+    assert plan["raw_reasoning_effort"] == "none"
     assert "Setup rehearsal policy: once-per-cohort." in (output / "protocol.md").read_text()
+    assert "explicit configuration asymmetry" in (output / "protocol.md").read_text()
     assert driver.main(["plan", "--plan", str(output / "cohort-plan.json")]) == 0
     assert pair._validate_protected(output / "protected-source-manifest.json", ROOT)["count"] == 7
     matrix = pair.load_matrix_contract(catalog)
@@ -73,12 +75,16 @@ def test_active_prepare_binds_each_pair_to_real_producer_validator(tmp_path, mon
         contract = pair.MatrixPairContract.for_route(
             matrix, "test-route", start_case="samwell-castelblack", arm_order=order,
             source_identity=pair._source_identity_at(ROOT), wall_seconds=3600,
-            continue_after_time_limit=True, continue_after_refusal=True)
+            continue_after_time_limit=True, continue_after_refusal=True,
+            raw_reasoning_effort="none")
         authority = slot["attempts"][0]["live_authority_file"]
         receipt = pair._resolve_live_authority(SimpleNamespace(
             command="run-pair", live_authority_file=authority,
             live_authority_id=None, resumable=True, resume=False), contract)
         assert receipt["contract_binding_sha256"] == contract.identity
+        command = driver._cli("run-pair", plan, slot, slot["attempts"][0], output / "pair")
+        parsed = pair.build_parser().parse_args(command[2:])
+        assert parsed.raw_reasoning_effort == "none"
         assert contract.to_record()["termination_policy"]["numeric_wall_token_task_ceilings"] == {
             "wall_seconds": 3600, "token_ceiling": None, "payload_task_limit": None}
     assert "private-test-key" not in "".join(path.read_text() for path in output.iterdir())

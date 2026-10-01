@@ -81,6 +81,27 @@ and cleanup failures still stop the batch. `--no-continue-after-refusal` at prep
 time preserves normal settlement requirements. Existing plans without this field
 keep their original behavior; the policy cannot be changed during run or resume.
 
+## Optional raw-arm reasoning effort
+
+Add `--raw-reasoning-effort none` to a new cohort's `prepare` command to disable
+reasoning explicitly for the minimal raw model loop. Other accepted values are
+`minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; the selected model and
+endpoint must support the requested value. This option uses the OpenAI-compatible
+adapter and does not change Sage's model configuration.
+
+Omitting the option preserves provider defaults: the raw request contains no
+`reasoning_effort` parameter. The literal value `none` is an explicit request, not
+an omitted setting. No error triggers an automatic change of reasoning effort.
+
+The prepared plan, protocol, and pair bindings retain the selection. Subsequent
+`run` and `resume` commands read it from the plan; changing it requires a fresh
+cohort. The direct pair CLI also accepts `--raw-reasoning-effort` for matrix runs.
+
+This is a raw-only override. A cohort with `none` compares Sage using its existing
+reasoning configuration with raw using reasoning disabled. Report that difference
+alongside results; it is not a comparison at matched reasoning effort. The route
+smoke's text response alone does not establish native tool-call compatibility.
+
 ## High-level execution sequence
 
 During pair resets, `pair/reset-stages.jsonl` records each stage as it starts,

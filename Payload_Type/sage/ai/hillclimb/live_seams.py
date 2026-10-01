@@ -237,6 +237,7 @@ def make_model_fn(
     max_output_tokens: int | None = None,
     request_timeout: float | None = None,
     max_retries: int | None = None,
+    reasoning_effort: str | None = None,
 ) -> Callable[[str, list, list], dict]:
     """The bare LLM (same model Sage uses) with tool-calling, NO scaffolding.
     Grounded: model.py:1331 `init_chat_model(model_provider=..., model=...)`."""
@@ -248,6 +249,12 @@ def make_model_fn(
         kwargs["api_key"] = api_key
     if base_url:
         kwargs["base_url"] = base_url
+    if reasoning_effort is not None:
+        if provider != "openai":
+            raise ValueError("reasoning_effort requires the OpenAI-compatible provider adapter")
+        if reasoning_effort not in {"none", "minimal", "low", "medium", "high", "xhigh", "max"}:
+            raise ValueError("unsupported reasoning_effort")
+        kwargs["reasoning_effort"] = reasoning_effort
     if max_output_tokens is not None:
         kwargs["max_tokens"] = int(max_output_tokens)
     if request_timeout is not None:

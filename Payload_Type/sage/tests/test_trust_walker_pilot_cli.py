@@ -108,6 +108,25 @@ def test_matrix_live_authority_binds_catalog_route_start_and_snapshot(tmp_path):
     assert receipt["contract_binding_sha256"] == pair.identity
     assert receipt["expected_endpoint_identity"] == pair.route.endpoint_identity
 
+    record["scope"]["raw_reasoning_effort"] = "none"
+    path.write_text(json.dumps(record))
+    with pytest.raises(cli.PilotError, match="raw reasoning effort"):
+        cli._resolve_live_authority(args, pair)
+    del record["scope"]["raw_reasoning_effort"]
+
+    selected = pilot.MatrixPairContract.for_route(
+        matrix, "qwen", start_case="samwell-castelblack", raw_reasoning_effort="none",
+    )
+    record["pair_contract_identity"] = selected.identity
+    path.write_text(json.dumps(record))
+    with pytest.raises(cli.PilotError, match="scope differs"):
+        cli._resolve_live_authority(args, selected)
+    record["scope"]["raw_reasoning_effort"] = "none"
+    path.write_text(json.dumps(record))
+    assert cli._resolve_live_authority(args, selected)["contract_binding_sha256"] == selected.identity
+    del record["scope"]["raw_reasoning_effort"]
+    record["pair_contract_identity"] = pair.identity
+
     record["pair_contract_identity"] = "0" * 64
     path.write_text(json.dumps(record))
     with pytest.raises(cli.PilotError, match="exact pair contract"):
@@ -172,6 +191,35 @@ def test_matrix_raw_model_uses_selected_route_without_arm_deadline(monkeypatch):
     assert captured["model"] == "qwen/qwen3-32b"
     assert captured["base_url"] == selected.api_endpoint
     assert captured["request_timeout"] == 900.0
+    assert "reasoning_effort" not in captured
+    runtime.raw_reasoning_effort = "none"
+    runtime._deadline_model(None)("system", [], [])
+    assert captured["reasoning_effort"] == "none"
+
+
+def test_matrix_pair_raw_reasoning_effort_changes_identity_and_replays_exactly():
+    matrix = pilot.MatrixContract(schema=pilot.MATRIX_SCHEMA, routes=(
+        pilot.MatrixRoute("qwen", "openai", "qwen/qwen3-32b", "https://openrouter.ai/api/v1"),
+    ))
+    legacy = pilot.MatrixPairContract.for_route(matrix, "qwen", start_case="samwell-castelblack")
+    selected = pilot.MatrixPairContract.for_route(
+        matrix, "qwen", start_case="samwell-castelblack", raw_reasoning_effort="none",
+    )
+    assert "raw_reasoning_effort" not in legacy.to_record()
+    assert selected.to_record()["raw_reasoning_effort"] == "none"
+    assert selected.identity != legacy.identity
+    assert cli._replay_contract([{"record_type": "contract", "contract": selected.to_record()}]) == selected
+    with pytest.raises(pilot.PilotError, match="raw_reasoning_effort"):
+        pilot.MatrixPairContract.for_route(
+            matrix, "qwen", start_case="samwell-castelblack", raw_reasoning_effort="NONE",
+        )
+
+
+def test_raw_reasoning_effort_requires_matrix_route_before_runtime(capsys):
+    assert cli.main(["run-pair", "--artifact-dir", "/unused",
+                     "--protected-manifest", "/unused", "--route-smoke", "/unused",
+                     "--raw-reasoning-effort", "none"]) == 1
+    assert "requires a selected matrix route" in capsys.readouterr().out
 
 
 def test_matrix_sage_arm_uses_selected_route_and_distinct_channel(tmp_path):

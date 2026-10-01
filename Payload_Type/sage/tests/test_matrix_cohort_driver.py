@@ -62,6 +62,36 @@ def test_refusal_policy_is_bound_and_cannot_change_on_resume(tmp_path):
         driver.load_plan(path)
 
 
+def test_raw_reasoning_effort_is_frozen_and_forwarded_only_when_selected(tmp_path):
+    path, work = plan_file(tmp_path)
+    legacy = driver.load_plan(path)
+    slot = legacy["slots"][0]
+    assert "--raw-reasoning-effort" not in driver._cli(
+        "run-pair", legacy, slot, slot["attempts"][0], work / "pair"
+    )
+    raw = json.loads(path.read_text())
+    raw["raw_reasoning_effort"] = "none"
+    path.write_text(json.dumps(raw))
+    selected = driver.load_plan(path)
+    slot = selected["slots"][0]
+    for phase in ("rehearse-setup", "continue-setup", "run-pair"):
+        command = driver._cli(phase, selected, slot, slot["attempts"][0], work / "pair")
+        assert command[-2:] == ["--raw-reasoning-effort", "none"]
+    with pytest.raises(driver.DriverError, match="raw reasoning effort changed"):
+        driver._check_amendment(legacy, selected, work)
+    raw["raw_reasoning_effort"] = "NONE"
+    path.write_text(json.dumps(raw))
+    with pytest.raises(driver.DriverError, match="raw_reasoning_effort is unsupported"):
+        driver.load_plan(path)
+
+
+def test_raw_reasoning_effort_override_rejected_outside_prepare(tmp_path):
+    path, work = plan_file(tmp_path)
+    assert driver.main(["resume", "--plan", str(path), "--work-dir", str(work),
+                        "--raw-reasoning-effort", "none"]) == 1
+    assert not work.exists()
+
+
 def test_refusal_override_rejected_outside_prepare(tmp_path):
     path, work = plan_file(tmp_path)
     assert driver.main(["run", "--plan", str(path), "--work-dir", str(work),

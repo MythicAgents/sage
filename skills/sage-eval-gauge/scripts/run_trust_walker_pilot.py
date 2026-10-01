@@ -47,6 +47,7 @@ from ai.hillclimb.trust_walker_pilot import (
     RECOVERY_CLEANUP_ATTEMPT_LIMIT, TASK_SETTLEMENT_SECONDS,
     SETUP_REHEARSAL_ATTEMPT_LIMIT, SETUP_REHEARSAL_SUCCESSES,
     ImprovementContract, MatrixPairContract, MatrixRoute, PilotContract, PilotDependencies, PilotError, PairRecoveryBlocked,
+    RAW_REASONING_EFFORTS,
     load_matrix_contract,
     append_record, arm_environment, assert_rejected_kernel_absent,
     compare_start_manifests, matched_start_identity, read_records, retained_alternate_start_binding, run_pair,
@@ -921,12 +922,16 @@ def _resolve_live_authority(
             expected_scope["continue_after_time_limit"] = True
         if contract.continue_after_refusal:
             expected_scope["continue_after_refusal"] = True
+        if contract.raw_reasoning_effort is not None:
+            expected_scope["raw_reasoning_effort"] = contract.raw_reasoning_effort
         if not isinstance(scope, Mapping) or any(scope.get(key) != value for key, value in expected_scope.items()):
             raise PilotError("matrix live authority scope differs from the pair protocol")
         if not contract.continue_after_time_limit and scope.get("continue_after_time_limit") is True:
             raise PilotError("matrix live authority continuation policy differs from the pair protocol")
         if not contract.continue_after_refusal and scope.get("continue_after_refusal") is True:
             raise PilotError("matrix live authority refusal policy differs from the pair protocol")
+        if contract.raw_reasoning_effort is None and "raw_reasoning_effort" in scope:
+            raise PilotError("matrix live authority raw reasoning effort differs from the pair protocol")
         if getattr(args, "resumable", False) or getattr(args, "resume", False):
             if scope.get("same_arm_recovery") != {
                 "enabled": True, "ambiguous_submission": "stop",
@@ -1856,6 +1861,7 @@ class RuntimePilot:
         measurement_metadata: Mapping[str, Any] | None = None,
         selected_route: MatrixRoute | None = None,
         matrix_wall_seconds: int | None = None,
+        raw_reasoning_effort: str | None = None,
     ):
         self.artifact_dir = artifact_dir
         self.protected_manifest = protected_manifest
@@ -1868,6 +1874,7 @@ class RuntimePilot:
         self.alternate_start = alternate_start
         self.selected_route = selected_route
         self.matrix_wall_seconds = matrix_wall_seconds
+        self.raw_reasoning_effort = raw_reasoning_effort
         initial_root = next(iter(self.source_roots.values()), ROOT)
         self.source_root = initial_root
         self.orchestrate = _orchestrate(initial_root)
@@ -2843,6 +2850,9 @@ class RuntimePilot:
             remaining = deadline - time.monotonic() if deadline is not None else None
             if remaining is not None and remaining <= 0:
                 raise TimeoutError("arm wall deadline reached before model request")
+            model_kwargs = {}
+            if getattr(self, "raw_reasoning_effort", None) is not None:
+                model_kwargs["reasoning_effort"] = self.raw_reasoning_effort
             model = live_seams.make_model_fn(
                 self.route["provider"],
                 self.route["model"],
@@ -2851,6 +2861,7 @@ class RuntimePilot:
                 objective=OBJECTIVE,
                 request_timeout=min(900.0, remaining) if remaining is not None else 900.0,
                 max_retries=0,
+                **model_kwargs,
             )
             return (
                 _call_before_deadline(deadline, model, system, tools, history)
@@ -2914,7 +2925,9 @@ class RuntimePilot:
                 "checkpoint_path": self.artifact_dir / "raw-runner-checkpoint.json",
                 "checkpoint_binding": {"runtime": self.runtime_identity(), "route": self.safe_route,
                                        "source": _source_identity_at(self.source_root),
-                                       "authority": self.live_authority_receipt},
+                                       "authority": self.live_authority_receipt,
+                                       **({"raw_reasoning_effort": self.raw_reasoning_effort}
+                                          if getattr(self, "raw_reasoning_effort", None) is not None else {})},
                 "resume": bool(getattr(self, "_resume_arm_active", False)),
                 "reconcile_pending_tool": reconcile,
             }
@@ -3059,11 +3072,14 @@ class RuntimePilot:
             return execution
         if arm != "raw-mythic-bloodhound":
             raise PilotError("unexpected pilot arm")
-        metadata_fields = _assembled_measurement_metadata(declared_metadata, arm=arm, config={
+        raw_config = {
             "provider": route["provider"], "model": route["model"], "mode": "auto", "max_steps": 0,
             "max_retries": 0, "max_output_tokens": None,
             "request_timeout_policy": "min(900_seconds,remaining_arm_wall_seconds)" if wall_seconds is not None else "per_request_900_seconds",
-        })
+        }
+        if getattr(self, "raw_reasoning_effort", None) is not None:
+            raw_config["reasoning_effort"] = self.raw_reasoning_effort
+        metadata_fields = _assembled_measurement_metadata(declared_metadata, arm=arm, config=raw_config)
         budget = None if matrix_arm else task_budget.TaskBudget(100, deadline, event_sink=progress)
         self.current_budget = budget
         runner = self._raw_runner(deadline, progress)
@@ -3929,6 +3945,7 @@ def _runtime(
         measurement_metadata=_measurement_metadata(getattr(args, "measurement_metadata", None)),
         selected_route=(contract.route if isinstance(contract, MatrixPairContract) else None),
         matrix_wall_seconds=(contract.wall_seconds if isinstance(contract, MatrixPairContract) else None),
+        raw_reasoning_effort=(contract.raw_reasoning_effort if isinstance(contract, MatrixPairContract) else None),
     )
 
 
@@ -4083,6 +4100,7 @@ def _replay_contract(records: list[dict[str, Any]]) -> PilotContract | Improveme
                 wall_seconds=value.get("wall_seconds"),
                 continue_after_time_limit=value.get("continue_after_time_limit", False),
                 continue_after_refusal=value.get("continue_after_refusal", False),
+                raw_reasoning_effort=value.get("raw_reasoning_effort"),
             )
         except (TypeError, ValueError) as exc:
             raise PilotError("retained matrix pair contract is malformed") from exc
@@ -4616,6 +4634,8 @@ def build_parser() -> argparse.ArgumentParser:
                              help="Prospectively bind continuation after a valid, cleaned time-limit outcome.")
         command.add_argument("--continue-after-refusal", action="store_true",
                              help="Prospectively bind continuation after a valid, cleaned refusal outcome.")
+        command.add_argument("--raw-reasoning-effort", choices=sorted(RAW_REASONING_EFFORTS),
+                             help="Optional raw-arm reasoning effort; omitted uses the provider default.")
         if name in {"rehearse-setup", "continue-setup", "run-pair"}:
             _add_live_authority_args(command)
         if name in {"preflight", "rehearse-setup", "continue-setup", "run-pair"}:
@@ -4732,8 +4752,11 @@ def main(argv: list[str] | None = None) -> int:
                     wall_seconds=args.arm_wall_seconds,
                     continue_after_time_limit=args.continue_after_time_limit,
                     continue_after_refusal=args.continue_after_refusal,
+                    raw_reasoning_effort=args.raw_reasoning_effort,
                 )
             else:
+                if getattr(args, "raw_reasoning_effort", None) is not None:
+                    raise PilotError("--raw-reasoning-effort requires a selected matrix route")
                 contract = PilotContract(arm_order=arm_order, alternate_start=alternate_start)
         contract.validate()
         if (getattr(args, "resumable", False) or getattr(args, "resume", False)) and not isinstance(contract, MatrixPairContract):

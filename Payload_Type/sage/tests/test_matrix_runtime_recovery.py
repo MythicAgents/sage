@@ -70,6 +70,20 @@ def test_bounded_raw_runner_uses_original_arm_start_even_after_setup_delay(tmp_p
     assert result.model_attempts == 0
 
 
+def test_raw_recovery_checkpoint_binds_explicit_reasoning_effort(tmp_path, monkeypatch):
+    model = lambda *_: {"final": "STUCK", "_usage": USAGE}
+    first = _runtime(tmp_path, monkeypatch, model)
+    first.raw_reasoning_effort = "none"
+    first._raw_runner(None, lambda _: None).run("objective")
+    saved = json.loads((tmp_path / "raw-runner-checkpoint.json").read_text())
+    assert saved["binding"]["caller"]["raw_reasoning_effort"] == "none"
+
+    changed = _runtime(tmp_path, monkeypatch, model, resume=True)
+    changed.raw_reasoning_effort = "high"
+    with pytest.raises(BareRunnerRecoveryError, match="checkpoint binding differs"):
+        changed._raw_runner(None, lambda _: None).run("objective")
+
+
 def test_wrapped_adapter_deadline_stays_wall_time_and_early_error_does_not():
     def sdk_wraps_timeout():
         try:
