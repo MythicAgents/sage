@@ -251,6 +251,7 @@ class BareModelRunner:
         reconcile_pending_tool: Callable[[dict], str | None] | None = None,
         elapsed_floor_seconds: float = 0.0,
         provider_timeout_is_wall: bool = True,
+        elapsed_seconds_fn: Callable[[], float] | None = None,
     ):
         if token_ceiling is not None and (type(token_ceiling) is not int or token_ceiling <= 0):
             raise ValueError("token ceiling must be a positive integer or None")
@@ -281,6 +282,7 @@ class BareModelRunner:
             raise ValueError("elapsed_floor_seconds must be finite and nonnegative")
         self.elapsed_floor_seconds = elapsed_floor_seconds
         self.provider_timeout_is_wall = provider_timeout_is_wall
+        self.elapsed_seconds_fn = elapsed_seconds_fn
         self.pending_task_id: int | None = None
 
     def record_pending_task_id(self, task_id: int) -> None:
@@ -357,6 +359,11 @@ class BareModelRunner:
         elapsed_before = self.elapsed_floor_seconds
 
         def elapsed() -> float:
+            if self.elapsed_seconds_fn is not None:
+                observed = float(self.elapsed_seconds_fn())
+                if not math.isfinite(observed) or observed < 0:
+                    raise BareRunnerRecoveryError("arm clock is invalid")
+                return observed
             return elapsed_before + max(0.0, time.monotonic() - start)
 
         def save() -> None:

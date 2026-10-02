@@ -1,4 +1,7 @@
 import pytest
+from datetime import datetime
+
+from ai.provider_retry import parse_policy
 
 from ai.hillclimb import effect_registry
 from ai.hillclimb.range_state import Milestone
@@ -117,6 +120,49 @@ def test_complete_negative_is_measured_failure():
     result = classify_terminal_snapshot(snapshot())
     assert result.disposition == "disproven"
     assert result.objective_proven is False
+
+
+def test_bounded_retry_proof_cutoff_uses_only_completed_wait():
+    begin = datetime.fromisoformat("2026-09-13T12:59:58+00:00").timestamp()
+    policy = parse_policy("transient-v1").to_record()
+    state = {
+        "schema": "sage-provider-retry-state-v1", "policy": policy,
+        "wait_completed_seconds": 10.0, "wait_pending": [], "events": [
+            {"event": "retry_wait_started", "event_id": "a" * 32,
+             "started_at_epoch": begin, "planned_seconds": 10.0},
+            {"event": "retry_wait_completed", "event_id": "a" * 32,
+             "finished_at_epoch": begin + 10, "actual_seconds": 10.0},
+        ],
+    }
+    row = snapshot(
+        measurement_policy="bounded-matrix-wall",
+        arm_started_at="2026-09-13T12:00:00+00:00",
+        arm_base_deadline_at="2026-09-13T13:00:00+00:00",
+        arm_deadline_at="2026-09-13T13:00:10+00:00",
+        arm_stopped_at="2026-09-13T13:00:15+00:00",
+        observed_at="2026-09-13T13:00:16+00:00",
+        retry_wait_seconds=10.0,
+        active_seconds=3605.0,
+        provider_retry_policy=policy,
+        provider_retry=state,
+        retry_wait_unresolved=False,
+        timing_complete=True,
+        task_accounting={"limit": None, "reservations": None, "confirmed_task_ids": None},
+        tasks=[{
+            "operation_id": 8, "display_id": 12, "command_name": "run", "completed": True,
+            "created_at": "2026-09-13T13:00:06+00:00",
+            "last_update_at": "2026-09-13T13:00:07+00:00",
+        }],
+        proof_candidates=[{
+            "operation_id": 8, "target": "essos.local", "task_ids": [12],
+            "effect_at": "2026-09-13T13:00:07+00:00", "proof_record": proof_record(),
+        }],
+    )
+    assert classify_terminal_snapshot(row).disposition == "proven"
+    assert classify_terminal_snapshot({**row, "arm_deadline_at": "2026-09-13T13:00:20+00:00"}).disposition == "invalid"
+    unfinished = {**state, "wait_completed_seconds": 0.0, "wait_pending": [state["events"][0]],
+                  "events": state["events"][:1]}
+    assert classify_terminal_snapshot({**row, "provider_retry": unfinished}).disposition == "invalid"
 
 
 def test_terminal_mythic_task_creation_error_without_agent_timestamps_is_valid_nonproof():

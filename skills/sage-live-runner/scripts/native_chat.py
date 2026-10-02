@@ -1400,22 +1400,48 @@ async def wait_for_request(
     progress_sink: Any | None = None,
     heartbeat_interval_seconds: float = 60.0,
     stop_on_input_requested: bool = False,
+    retry_clock: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     started_at = time.monotonic()
     deadline = started_at + timeout_seconds if timeout_seconds is not None else None
+    if retry_clock is not None:
+        from ai.provider_retry import RetryState, parse_policy
+        policy = parse_policy(retry_clock.get("policy"))
+        if policy is None:
+            raise ValueError("retry clock requires a provider retry policy")
+        arm_start = float(retry_clock["started_at_epoch"])
+        active_limit = float(retry_clock["active_seconds"])
+        hard_deadline_epoch = arm_start + active_limit + policy.max_wait_seconds_per_arm
+        deadline = time.monotonic() + max(0.0, hard_deadline_epoch - time.time())
+    latest_retry_state = None
+
+    def active_remaining_seconds() -> float | None:
+        if retry_clock is None:
+            return None
+        credit = (RetryState.from_snapshot(policy, latest_retry_state, allow_pending=True).credited_wait_seconds()
+                  if latest_retry_state is not None else 0.0)
+        return max(0.0, active_limit - (time.time() - arm_start - credit))
     last: dict[str, Any] | None = None
     last_snapshot: dict[str, Any] | None = None
     last_progress_signature: tuple[Any, ...] | None = None
     last_progress_emit_at = started_at
+    active_expired_polls = 0
     while deadline is None or time.monotonic() < deadline:
         try:
+            fetch_cap = 5.0 if retry_clock is not None and active_remaining_seconds() <= 0 else 60.0
             snapshot = await asyncio.wait_for(
                 fetch_request_snapshot(client, request_id),
-                timeout=max(0.0, deadline - time.monotonic()) if deadline is not None else 60.0,
+                timeout=min(fetch_cap, max(0.0, deadline - time.monotonic())) if deadline is not None else 60.0,
             )
         except TimeoutError:
             if deadline is None:
                 raise RuntimeError("unbounded chat lost a timely control-plane snapshot")
+            if retry_clock is not None and active_remaining_seconds() <= 0:
+                active_expired_polls += 1
+                if active_expired_polls >= 1:
+                    break
+            if time.monotonic() < deadline:
+                continue
             break
         except RuntimeError:
             if deadline is None:
@@ -1424,12 +1450,21 @@ async def wait_for_request(
         if snapshot is not None:
             last_snapshot = snapshot
             last = snapshot["request"]
-            if deadline is not None and time.monotonic() >= deadline:
-                break
             status = str(last.get("status") or "").casefold()
             messages = snapshot["messages"]
             progress_metadata = _extract_progress_metadata(messages)
             runtime_telemetry = extract_runtime_telemetry(messages)
+            if retry_clock is not None and isinstance(runtime_telemetry.get("provider_retry"), dict):
+                latest_retry_state = runtime_telemetry["provider_retry"]
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            if retry_clock is not None and status not in TERMINAL_STATUSES:
+                if active_remaining_seconds() <= 0:
+                    active_expired_polls += 1
+                    if active_expired_polls >= 2:
+                        break
+                else:
+                    active_expired_polls = 0
             task_budget = runtime_telemetry.get("task_budget")
             signature = (
                 status,
@@ -1438,11 +1473,17 @@ async def wait_for_request(
                 progress_metadata.get("tool_name"),
                 progress_metadata.get("retry_count"),
                 runtime_telemetry.get("model_calls"),
+                (runtime_telemetry.get("provider_retry") or {}).get("wait_completed_seconds")
+                if isinstance(runtime_telemetry.get("provider_retry"), dict) else None,
+                len((runtime_telemetry.get("provider_retry") or {}).get("events") or [])
+                if isinstance(runtime_telemetry.get("provider_retry"), dict) else None,
                 (task_budget or {}).get("submissions") if isinstance(task_budget, dict) else None,
             )
             now = time.monotonic()
             elapsed_seconds = max(0, int(now - started_at))
-            remaining_seconds = max(0, int(deadline - now)) if deadline is not None else None
+            active_remaining = active_remaining_seconds()
+            remaining_seconds = (max(0, int(active_remaining)) if active_remaining is not None else
+                                 max(0, int(deadline - now)) if deadline is not None else None)
             emit_event = None
             if signature != last_progress_signature:
                 emit_event = "request_progress"
@@ -1457,6 +1498,9 @@ async def wait_for_request(
                     "updated_at": last.get("updated_at"),
                     "elapsed_seconds": elapsed_seconds,
                     "remaining_seconds": remaining_seconds,
+                    **({"provider_retry": runtime_telemetry["provider_retry"]}
+                       if retry_clock is not None and isinstance(runtime_telemetry.get("provider_retry"), dict)
+                       else {}),
                     "runtime_cost": {
                         "model_calls": runtime_telemetry.get("model_calls"),
                         "model_response_records": runtime_telemetry.get("model_response_records")
@@ -1867,6 +1911,7 @@ async def run_native_chat_turn(
     runtime_dbs_archived: bool = False,
     stop_on_input_requested: bool = False,
     expected_runtime_identity: dict[str, str] | None = None,
+    retry_clock: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if manifest_path and not runtime_dbs_archived:
         raise RuntimeError("--manifest-path requires --runtime-dbs-archived.")
@@ -1932,6 +1977,7 @@ async def run_native_chat_turn(
         poll_interval_seconds=poll_interval_seconds,
         progress_sink=progress_sink,
         stop_on_input_requested=stop_on_input_requested,
+        retry_clock=retry_clock,
     )
     request = completed["request"]
     messages = completed["messages"]

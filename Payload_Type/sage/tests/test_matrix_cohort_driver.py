@@ -122,6 +122,35 @@ def test_matched_reasoning_effort_override_rejected_outside_prepare(tmp_path):
     assert not work.exists()
 
 
+def test_retry_policy_is_frozen_and_forwarded_for_all_phases(tmp_path):
+    path, work = plan_file(tmp_path)
+    raw = json.loads(path.read_text())
+    raw["arm_wall_seconds"] = 3600
+    path.write_text(json.dumps(raw))
+    legacy = driver.load_plan(path)
+    policy = driver._retry_policy_record("transient-v1")
+    raw["provider_retry_policy"] = policy
+    path.write_text(json.dumps(raw))
+    selected = driver.load_plan(path)
+    slot = selected["slots"][0]
+    for phase in ("rehearse-setup", "continue-setup", "run-pair"):
+        command = driver._cli(phase, selected, slot, slot["attempts"][0], work / "pair")
+        assert command[-2:] == ["--provider-retry-policy", "transient-v1"]
+    with pytest.raises(driver.DriverError, match="provider retry policy changed"):
+        driver._check_amendment(legacy, selected, work)
+    raw["provider_retry_policy"]["max_wait_seconds_per_arm"] = 1000
+    path.write_text(json.dumps(raw))
+    with pytest.raises(driver.DriverError, match="provider_retry_policy"):
+        driver.load_plan(path)
+
+
+def test_retry_override_rejected_on_resume(tmp_path):
+    path, work = plan_file(tmp_path)
+    assert driver.main(["resume", "--plan", str(path), "--work-dir", str(work),
+                        "--provider-retry-policy", "transient-v1"]) == 1
+    assert not work.exists()
+
+
 def test_refusal_override_rejected_outside_prepare(tmp_path):
     path, work = plan_file(tmp_path)
     assert driver.main(["run", "--plan", str(path), "--work-dir", str(work),
@@ -474,6 +503,18 @@ def test_terminal_reports_safe_ledger_stage_and_phase_completion(tmp_path, monke
     assert driver._ledger_stage("run-pair", ledger.parent) == "measured-arm-running"
     assert "secret-output" not in captured.err
     assert "objective result" in captured.err
+
+
+def test_retry_wait_has_safe_terminal_progress(tmp_path):
+    ledger = tmp_path / "pilot.jsonl"
+    write_row(ledger, {"record_type": "progress", "arm": "shipping-sage", "event": {
+        "provider_retry": {"wait_pending": [{"secret": "never-render-this"}]},
+    }})
+    assert driver._ledger_stage("run-pair", tmp_path) == "sage-provider-retry-wait"
+    write_row(ledger, {"record_type": "progress", "arm": "shipping-sage", "event": {
+        "provider_retry": {"wait_pending": []},
+    }})
+    assert driver._ledger_stage("run-pair", tmp_path) == "sage-measured-arm-running"
 
 
 @pytest.mark.parametrize("error,expected", [(FileNotFoundError(2, "secret detail"), 1), (KeyboardInterrupt(), 130)])

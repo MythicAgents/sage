@@ -81,6 +81,34 @@ and cleanup failures still stop the batch. `--no-continue-after-refusal` at prep
 time preserves normal settlement requirements. Existing plans without this field
 keep their original behavior; the policy cannot be changed during run or resume.
 
+## Optional provider retries and the arm clock
+
+Add `--provider-retry-policy transient-v1` when preparing a **new** cohort to
+enable the same provider retry policy for Sage and the raw arm. It is frozen in
+the plan, pair contract, protocol and authority; `run` and `resume` use that
+record without accepting overrides. Existing cohorts retain their old policy.
+
+The preset permits up to three retries of one provider request, at most 300
+seconds of retry sleep per request, and 900 seconds per arm. It honors
+`Retry-After`; otherwise it uses exponential backoff with jitter. It retries
+confirmed temporary HTTP 429 and 503 responses, excluding quota/billing errors.
+Refusals, invalid requests, authentication errors, ambiguous timeouts, partial
+responses and Mythic tasks are not retried. Hidden SDK retries are disabled when
+this policy is selected. This implementation supports the OpenAI-compatible
+adapter, including compatible proxies; an enabled unsupported adapter is rejected.
+
+**Actual recorded retry sleep does not count toward the one-hour arm limit.**
+Provider request execution, tool execution and recovery downtime still count.
+The result retains elapsed time, retry sleep and active time separately. With
+the default limit an arm can take at most 75 minutes elapsed; setup, settlement
+and cleanup remain separate. The objective evidence window extends by the
+recorded retry sleep, so previously issued tasks may finish during that time.
+This makes it a new prospective protocol, not a reinterpretation of past runs.
+
+Ordinary Sage can select the preset with `SAGE_PROVIDER_RETRY_POLICY=transient-v1`.
+An omitted setting retains its existing provider behavior. For a matched eval,
+use the prepare flag so the setting is explicitly bound to both arms.
+
 ## Optional reasoning effort
 
 Add `--reasoning-effort none` to a new cohort's `prepare` command to request the
@@ -277,6 +305,9 @@ stopped, native operation evidence is retained, authorized teardown completes,
 and offline replay agrees. Unfinished effect-capable tasks leave settlement
 incomplete and the objective unknown; the cohort can still finish its planned
 arms. `comparison_ready` remains false when that objective is unknown.
+
+With the optional provider retry policy above, this is an **active-time** limit:
+subtract only recorded retry sleep from elapsed time since the original start.
 Use `--no-continue-after-time-limit` during `prepare` to opt out. Older plans
 without this field keep their original stop behavior:
 

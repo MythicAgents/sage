@@ -28,6 +28,7 @@ from typing import Any, Callable
 
 from ssl_bootstrap import configure_sage_ssl_cert_file
 from ai import observation_channel, resource_budget, resource_http
+from ai import provider_retry
 from ai.model_refusal import refusal_from_message
 
 DirectProbe = Callable[[], bool]
@@ -285,6 +286,7 @@ def make_model_fn(
     request_timeout: float | None = None,
     max_retries: int | None = None,
     reasoning_effort: str | None = None,
+    retry_state: provider_retry.RetryState | None = None,
 ) -> Callable[[str, list, list], dict]:
     """The bare LLM (same model Sage uses) with tool-calling, NO scaffolding.
     Grounded: model.py:1331 `init_chat_model(model_provider=..., model=...)`."""
@@ -310,6 +312,10 @@ def make_model_fn(
     if temperature is not None:
         kwargs["temperature"] = temperature
     shared_ledger = resource_budget.configured_ledger()
+    if retry_state is not None and provider.strip().casefold() != "openai":
+        raise ValueError("provider retry requires the OpenAI-compatible provider adapter")
+    if retry_state is not None and max_retries not in (None, 0):
+        raise ValueError("provider retry requires SDK max_retries=0")
     if shared_ledger is not None:
         if provider.strip().casefold() != "openai":
             raise resource_http.ResourceHTTPError(
@@ -319,12 +325,20 @@ def make_model_fn(
             raise resource_http.ResourceHTTPError("the metered model path requires max_retries=0")
         kwargs["max_retries"] = 0
         import httpx
-        kwargs["http_client"] = httpx.Client(
-            transport=resource_http.MeteredHTTPTransport("provider", ledger=shared_ledger)
-        )
-        kwargs["http_async_client"] = httpx.AsyncClient(
-            transport=resource_http.MeteredAsyncHTTPTransport("provider", ledger=shared_ledger)
-        )
+        sync_transport = resource_http.MeteredHTTPTransport("provider", ledger=shared_ledger)
+        async_transport = resource_http.MeteredAsyncHTTPTransport("provider", ledger=shared_ledger)
+        if retry_state is not None:
+            sync_transport = provider_retry.RetryingHTTPTransport(sync_transport, retry_state)
+            async_transport = provider_retry.RetryingAsyncHTTPTransport(async_transport, retry_state)
+        kwargs["http_client"] = httpx.Client(transport=sync_transport)
+        kwargs["http_async_client"] = httpx.AsyncClient(transport=async_transport)
+    elif retry_state is not None:
+        import httpx
+        kwargs["max_retries"] = 0
+        kwargs["http_client"] = httpx.Client(transport=provider_retry.RetryingHTTPTransport(
+            httpx.HTTPTransport(), retry_state))
+        kwargs["http_async_client"] = httpx.AsyncClient(transport=provider_retry.RetryingAsyncHTTPTransport(
+            httpx.AsyncHTTPTransport(), retry_state))
     elif max_retries is not None:
         kwargs["max_retries"] = int(max_retries)
     llm = init_chat_model(**kwargs)

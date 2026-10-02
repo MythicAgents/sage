@@ -82,6 +82,22 @@ def test_bounded_matrix_contract_keeps_token_and_task_uncapped(matrix):
             replace(legacy, wall_seconds=invalid).validate()
 
 
+def test_retry_contract_changes_identity_and_requires_a_bounded_arm(matrix):
+    from ai.provider_retry import parse_policy
+    legacy = _contract(matrix)
+    policy = parse_policy("transient-v1").to_record()
+    with pytest.raises(pilot.PilotError, match="bounded"):
+        replace(legacy, provider_retry_policy=policy).validate()
+    selected = replace(legacy, wall_seconds=3600, provider_retry_policy=policy)
+    assert selected.identity != replace(legacy, wall_seconds=3600).identity
+    assert "provider_retry_policy" not in legacy.to_record()
+    assert pilot.arm_environment(selected)["SAGE_PROVIDER_RETRY_POLICY"] == "transient-v1"
+    assert pilot.arm_environment(legacy)["SAGE_PROVIDER_RETRY_POLICY"] == "off"
+    altered = dict(policy, max_retries_per_request=4)
+    with pytest.raises(pilot.PilotError, match="provider_retry_policy"):
+        replace(selected, provider_retry_policy=altered).validate()
+
+
 def test_matrix_route_and_start_binding_reject_wrong_identity(matrix):
     contract = _contract(matrix)
     assert pilot.matched_start_identity(_start(contract), matrix_pair=contract)["route"]["model"] == contract.model

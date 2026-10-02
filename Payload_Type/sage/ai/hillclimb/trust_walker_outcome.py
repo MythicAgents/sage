@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 import hashlib
+import math
 from typing import Any, Mapping
 
 from . import effect_registry
@@ -348,6 +349,37 @@ def classify_terminal_snapshot(snapshot: object) -> OutcomeDisposition:
                 or fixed_deadline <= started_at or stopped_at <= started_at or observed_at < stopped_at):
             return _invalid("bounded matrix arm timing evidence is malformed")
         deadline_at = min(fixed_deadline, stopped_at)
+        retry_policy = snapshot.get("provider_retry_policy")
+        if retry_policy is None and any(key in snapshot for key in (
+            "provider_retry", "retry_wait_seconds", "arm_base_deadline_at", "active_seconds",
+            "retry_wait_unresolved", "timing_complete",
+        )):
+            return _invalid("bounded arm has undeclared provider retry timing")
+        if retry_policy is not None:
+            from ai.provider_retry import RetryState, parse_policy
+            try:
+                frozen_policy = parse_policy(retry_policy)
+                if frozen_policy is None or frozen_policy.to_record() != retry_policy:
+                    raise ValueError("policy differs")
+                state = RetryState.from_snapshot(
+                    frozen_policy, snapshot.get("provider_retry"), allow_pending=True)
+                credited = state.completed_wait_seconds(
+                    stopped_at.timestamp(), started_epoch=started_at.timestamp())
+                base_deadline = _timestamp(snapshot.get("arm_base_deadline_at"))
+                stated_wait = float(snapshot.get("retry_wait_seconds"))
+                stated_active = float(snapshot.get("active_seconds"))
+            except (TypeError, ValueError, AttributeError):
+                return _invalid("bounded provider retry timing evidence is malformed")
+            wall = (stopped_at - started_at).total_seconds()
+            if (base_deadline is None or base_deadline <= started_at
+                    or not math.isfinite(stated_wait) or not math.isfinite(stated_active)
+                    or snapshot.get("retry_wait_unresolved") is not bool(state.snapshot()["wait_pending"])
+                    or snapshot.get("timing_complete") is not (not bool(state.snapshot()["wait_pending"]))
+                    or not 0 <= credited <= frozen_policy.max_wait_seconds_per_arm
+                    or abs((fixed_deadline - base_deadline).total_seconds() - credited) > 0.02
+                    or abs(stated_wait - credited) > 0.02
+                    or abs(stated_active - max(0.0, wall - credited)) > 0.02):
+                return _invalid("bounded provider retry cutoff differs from retained waits")
     elif policy is None:
         deadline_at = _timestamp(snapshot.get("arm_deadline_at"))
         if not started_at or not deadline_at or not observed_at or deadline_at <= started_at or observed_at < started_at:

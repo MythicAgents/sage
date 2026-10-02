@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the fixed, retry-zero two-arm Trust Walker matched pilot."""
+"""Run the two-arm Trust Walker pilot with no automatic replacement arms."""
 from __future__ import annotations
 
 import argparse
@@ -29,7 +29,7 @@ PYTHON = str(ROOT / ".venv" / "bin" / "python")
 if str(PAYLOAD) not in sys.path:
     sys.path.insert(0, str(PAYLOAD))
 
-from ai import task_budget
+from ai import provider_retry, task_budget
 from ai.hillclimb import bare_bloodhound, bare_mythic_tools, effect_registry, live_seams
 from ai.hillclimb import operator_replay_benchmark
 from ai.hillclimb.bare_runner import BareModelRunner, BareRunnerRecoveryError, make_stdout_logger
@@ -930,6 +930,8 @@ def _resolve_live_authority(
             expected_scope["raw_reasoning_effort"] = contract.raw_reasoning_effort
         if contract.sage_reasoning_effort is not None:
             expected_scope["sage_reasoning_effort"] = contract.sage_reasoning_effort
+        if contract.provider_retry_policy is not None:
+            expected_scope["provider_retry_policy"] = contract.provider_retry_policy
         if not isinstance(scope, Mapping) or any(scope.get(key) != value for key, value in expected_scope.items()):
             raise PilotError("matrix live authority scope differs from the pair protocol")
         if not contract.continue_after_time_limit and scope.get("continue_after_time_limit") is True:
@@ -938,6 +940,8 @@ def _resolve_live_authority(
             raise PilotError("matrix live authority refusal policy differs from the pair protocol")
         if contract.raw_reasoning_effort is None and "raw_reasoning_effort" in scope:
             raise PilotError("matrix live authority raw reasoning effort differs from the pair protocol")
+        if contract.provider_retry_policy is None and "provider_retry_policy" in scope:
+            raise PilotError("matrix live authority provider retry policy differs from the pair protocol")
         if contract.sage_reasoning_effort is None and "sage_reasoning_effort" in scope:
             raise PilotError("matrix live authority Sage reasoning effort differs from the pair protocol")
         if getattr(args, "resumable", False) or getattr(args, "resume", False):
@@ -1871,6 +1875,7 @@ class RuntimePilot:
         matrix_wall_seconds: int | None = None,
         raw_reasoning_effort: str | None = None,
         sage_reasoning_effort: str | None = None,
+        provider_retry_policy: Mapping[str, Any] | None = None,
     ):
         self.artifact_dir = artifact_dir
         self.protected_manifest = protected_manifest
@@ -1885,6 +1890,9 @@ class RuntimePilot:
         self.matrix_wall_seconds = matrix_wall_seconds
         self.raw_reasoning_effort = raw_reasoning_effort
         self.sage_reasoning_effort = sage_reasoning_effort
+        self.provider_retry_policy = provider_retry.parse_policy(provider_retry_policy)
+        self.current_retry_state = None
+        self._raw_active_adapter_timer = False
         initial_root = next(iter(self.source_roots.values()), ROOT)
         self.source_root = initial_root
         self.orchestrate = _orchestrate(initial_root)
@@ -2079,6 +2087,7 @@ class RuntimePilot:
         obj.current_deadline_monotonic = None
         obj.current_started_at = None
         obj.current_deadline_at = None
+        obj.current_base_deadline_at = None
         obj.current_stopped_at = None
         obj.current_budget = None
         obj.current_execution = None
@@ -2099,6 +2108,30 @@ class RuntimePilot:
             + [0.0]
         )
         obj.live_authority_id = "recovery-from-ledger"
+        retained_contract = (_replay_contract(records)
+                             if any(row.get("record_type") == "contract" for row in records)
+                             else None)
+        obj.selected_route = (retained_contract.route
+                              if isinstance(retained_contract, MatrixPairContract) else None)
+        obj.matrix_wall_seconds = (retained_contract.wall_seconds
+                                   if isinstance(retained_contract, MatrixPairContract) else None)
+        obj.provider_retry_policy = provider_retry.parse_policy(
+            retained_contract.provider_retry_policy
+            if isinstance(retained_contract, MatrixPairContract) else None)
+        for row in records:
+            if row.get("record_type") != "progress" or row.get("arm") != obj.current_arm:
+                continue
+            event = row.get("event") or {}
+            if event.get("event") == "execution_started":
+                obj.current_started_at = datetime.fromisoformat(event["arm_started_at"])
+                obj.current_base_deadline_at = (
+                    datetime.fromisoformat(event["arm_deadline_at"])
+                    if event.get("arm_deadline_at") else None)
+                obj.current_deadline_at = obj.current_base_deadline_at
+        if obj.provider_retry_policy is not None and (
+            obj.current_started_at is None or obj.current_base_deadline_at is None
+        ):
+            raise PilotError("recovery lacks the original bounded provider retry clock")
         arm_results = [
             row for row in records
             if row.get("record_type") == "arm_result" and row.get("arm") == obj.current_arm
@@ -2788,7 +2821,8 @@ class RuntimePilot:
         rows = result.get("consuming_container", [])
         return len(rows) == 1 and rows[0].get("container_running") is True
 
-    async def _resume_shipping_request(self, progress, deadline: float | None = None):
+    async def _resume_shipping_request(self, progress, deadline: float | None = None,
+                                       retry_clock: dict[str, Any] | None = None):
         """Attach to a live controller or request a validated clean-boundary restore."""
         from ai.langgraph.controller_recovery import ControllerRecoveryStore
         if type(self.current_chat_request_id) is not int or type(self.current_chat_channel_id) is not int:
@@ -2823,7 +2857,7 @@ class RuntimePilot:
         remaining = max(0.001, deadline - time.monotonic()) if deadline is not None else None
         result = await self.native.wait_for_request(
             self.current_client, self.current_chat_request_id, timeout_seconds=remaining,
-            poll_interval_seconds=5, progress_sink=progress,
+            poll_interval_seconds=5, progress_sink=progress, retry_clock=retry_clock,
         )
         if store.inspect().get("phase") != "terminal":
             raise PairRecoveryBlocked("Sage request ended without a terminal controller checkpoint; inspect native chat and resume configuration")
@@ -2861,7 +2895,8 @@ class RuntimePilot:
 
     def _deadline_model(self, deadline: float | None):
         def invoke(system, tools, history):
-            remaining = deadline - time.monotonic() if deadline is not None else None
+            selected_deadline = self._raw_adapter_deadline(deadline)
+            remaining = selected_deadline - time.monotonic() if selected_deadline is not None else None
             if remaining is not None and remaining <= 0:
                 raise TimeoutError("arm wall deadline reached before model request")
             model_kwargs = {}
@@ -2875,14 +2910,62 @@ class RuntimePilot:
                 objective=OBJECTIVE,
                 request_timeout=min(900.0, remaining) if remaining is not None else 900.0,
                 max_retries=0,
+                retry_state=getattr(self, "current_retry_state", None),
                 **model_kwargs,
             )
-            return (
-                _call_before_deadline(deadline, model, system, tools, history)
-                if deadline is not None else model(system, tools, history)
-            )
+            return self._call_raw_adapter(deadline, model, system, tools, history)
 
         return invoke
+
+    def _raw_adapter_deadline(self, hard_deadline: float | None) -> float | None:
+        state = getattr(self, "current_retry_state", None)
+        if state is None:
+            return hard_deadline
+        active_remaining = max(0.0, self.matrix_wall_seconds - state.active_elapsed_seconds(
+            self.current_started_at.timestamp()))
+        active_deadline = time.monotonic() + active_remaining
+        return min(active_deadline, hard_deadline) if hard_deadline is not None else active_deadline
+
+    def _call_raw_adapter(self, hard_deadline: float | None, fn, *args):
+        selected_deadline = self._raw_adapter_deadline(hard_deadline)
+        if selected_deadline is None:
+            return fn(*args)
+        self._raw_active_adapter_timer = True
+        try:
+            return _call_before_deadline(selected_deadline, fn, *args)
+        finally:
+            self._raw_active_adapter_timer = False
+
+    def _raw_retry_state(self, progress):
+        policy = self.provider_retry_policy
+        if policy is None:
+            return None
+        state_path = self.artifact_dir / "raw-provider-retry-state.json"
+        saved = None
+        if getattr(self, "_resume_arm_active", False):
+            if not state_path.exists():
+                raise PairRecoveryBlocked("raw provider retry state is missing")
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+        elif state_path.exists():
+            raise PilotError("raw provider retry state already exists; resume explicitly")
+
+        state = None
+        def retain(event):
+            activated = event.get("event") == "retry_wait_activated"
+            if not activated:
+                _write_private(state_path, event.get("provider_retry") or state.snapshot())
+                progress(event)
+            if getattr(self, "_raw_active_adapter_timer", False):
+                remaining = max(0.0, self.matrix_wall_seconds - state.active_elapsed_seconds(
+                    self.current_started_at.timestamp()))
+                if activated:
+                    remaining += float(event["planned_seconds"])
+                signal.setitimer(signal.ITIMER_REAL, max(0.001, remaining))
+
+        state = provider_retry.RetryState(policy, event_sink=retain, snapshot=saved)
+        if saved is None:
+            _write_private(state_path, state.snapshot())
+        return state
 
     @staticmethod
     def _shipping_arm(arm: str) -> bool:
@@ -2905,7 +2988,7 @@ class RuntimePilot:
 
         def dispatch(call):
             selected = mythic_dispatch if call.get("tool") in mythic_names else bh_dispatch
-            return _call_before_deadline(deadline, selected, call) if deadline is not None else selected(call)
+            return self._call_raw_adapter(deadline, selected, call)
 
         def reconcile(call):
             task_id = runner.pending_task_id
@@ -2928,8 +3011,7 @@ class RuntimePilot:
                 if tasks[0].get("original_params") != expected:
                     raise BareRunnerRecoveryError("saved task parameters differ from the pending command")
                 return await mythic.waitfor_for_task_output(self.current_client, task_display_id=task_id, timeout=int(args.get("timeout", 300)))
-            output = (_call_before_deadline(deadline, lambda: asyncio.run(wait_existing()))
-                      if deadline is not None else asyncio.run(wait_existing()))
+            output = self._call_raw_adapter(deadline, lambda: asyncio.run(wait_existing()))
             progress({"event": "recovered_task_observation", "task_id": task_id})
             return output.decode(errors="replace") if isinstance(output, (bytes, bytearray)) else str(output)
 
@@ -2941,7 +3023,9 @@ class RuntimePilot:
                                        "source": _source_identity_at(self.source_root),
                                        "authority": self.live_authority_receipt,
                                        **({"raw_reasoning_effort": self.raw_reasoning_effort}
-                                          if getattr(self, "raw_reasoning_effort", None) is not None else {})},
+                                          if getattr(self, "raw_reasoning_effort", None) is not None else {}),
+                                       **({"provider_retry_policy": self.provider_retry_policy.to_record()}
+                                          if getattr(self, "provider_retry_policy", None) is not None else {})},
                 "resume": bool(getattr(self, "_resume_arm_active", False)),
                 "reconcile_pending_tool": reconcile,
             }
@@ -2959,6 +3043,10 @@ class RuntimePilot:
                 if getattr(self, "matrix_wall_seconds", None) is not None else 0.0
             ),
             provider_timeout_is_wall=getattr(self, "matrix_wall_seconds", None) is None,
+            elapsed_seconds_fn=(
+                (lambda: self.current_retry_state.active_elapsed_seconds(self.current_started_at.timestamp()))
+                if getattr(self, "current_retry_state", None) is not None else None
+            ),
             require_complete_usage=True,
             event_sink=progress,
             response_validator=self._validate_one_raw_response,
@@ -2976,11 +3064,17 @@ class RuntimePilot:
         if resuming and (not matrix_arm or not isinstance(started_at, datetime)):
             raise PilotError("same-arm recovery requires a matrix arm and its original start time")
         wall_seconds = getattr(self, "matrix_wall_seconds", None) if matrix_arm else 2700
+        policy = getattr(self, "provider_retry_policy", None) if matrix_arm else None
+        if policy is not None and wall_seconds is None:
+            raise PilotError("provider retry requires a bounded matrix arm")
         deadline_at = started_at + timedelta(seconds=wall_seconds) if wall_seconds is not None else None
-        deadline = (time.monotonic() + max(0.0, (deadline_at - datetime.now(UTC)).total_seconds())
-                    if deadline_at is not None else None)
+        hard_deadline_at = (deadline_at + timedelta(seconds=policy.max_wait_seconds_per_arm)
+                            if deadline_at is not None and policy is not None else deadline_at)
+        deadline = (time.monotonic() + max(0.0, (hard_deadline_at - datetime.now(UTC)).total_seconds())
+                    if hard_deadline_at is not None else None)
         self.current_started_at = started_at
         self.current_deadline_at = deadline_at
+        self.current_base_deadline_at = deadline_at
         self.current_stopped_at = None
         self.current_deadline_monotonic = deadline
         if not resuming:
@@ -2988,16 +3082,23 @@ class RuntimePilot:
                 "event": "execution_started",
                 "arm_started_at": started_at.isoformat(),
                 "arm_deadline_at": deadline_at.isoformat() if deadline_at is not None else None,
+                **({"provider_retry_policy": policy.to_record()} if policy is not None else {}),
             })
         else:
             progress({"event": "execution_resumed", "original_arm_started_at": started_at.isoformat()})
         declared_metadata = getattr(self, "measurement_metadata", {})
         if self._shipping_arm(arm):
+            last_retry_snapshot = None
             def shipping_progress(event):
+                nonlocal last_retry_snapshot
                 if isinstance(event, Mapping) and event.get("event") == "request_started":
                     self.current_chat_channel_id = event.get("chat_channel_id")
                     self.current_chat_request_id = event.get("chat_request_id")
+                if isinstance(event, Mapping) and isinstance(event.get("provider_retry"), Mapping):
+                    last_retry_snapshot = dict(event["provider_retry"])
                 progress(event)
+            retry_clock = ({"policy": policy.to_record(), "started_at_epoch": started_at.timestamp(),
+                            "active_seconds": wall_seconds} if policy is not None else None)
             metadata = self.native.default_ai_metadata()
             config = metadata.setdefault("config", {})
             config.update({
@@ -3011,6 +3112,7 @@ class RuntimePilot:
             })
             if getattr(self, "sage_reasoning_effort", None) is not None:
                 config["SAGE_REASONING_EFFORT"] = self.sage_reasoning_effort
+            config["SAGE_PROVIDER_RETRY_POLICY"] = policy.name if policy is not None else "off"
             if deadline_at is not None:
                 config["SAGE_EVAL_ARM_DEADLINE_EPOCH"] = str(deadline_at.timestamp())
             else:
@@ -3028,7 +3130,7 @@ class RuntimePilot:
                         expected = self.native._chat_runtime_identity_from_metadata(metadata)
                         if any(identity.get(key) != expected.get(key) for key in ("provider", "model", "route")):
                             raise PilotError("resumed Sage channel route differs from the original route")
-                        return await self._resume_shipping_request(shipping_progress, deadline)
+                        return await self._resume_shipping_request(shipping_progress, deadline, retry_clock)
                     turn = self.native.run_native_chat_turn(
                             self.current_client,
                             OBJECTIVE,
@@ -3043,6 +3145,7 @@ class RuntimePilot:
                                 "model": route["model"],
                                 "route": self.native._chat_runtime_identity_from_metadata(metadata)["route"],
                             },
+                            retry_clock=retry_clock,
                     )
                     return await turn
 
@@ -3056,6 +3159,8 @@ class RuntimePilot:
                 result = asyncio.run(bounded_shipping())
                 termination = str(result.get("status") or "unknown")
                 telemetry = result.get("runtime_telemetry") or {}
+                if isinstance(telemetry, Mapping) and isinstance(telemetry.get("provider_retry"), Mapping):
+                    last_retry_snapshot = dict(telemetry["provider_retry"])
                 if termination == "complete" and isinstance(telemetry, Mapping) and telemetry.get("controller_status") == "halted_refusal":
                     termination = "halted_refusal"
                 if (
@@ -3069,20 +3174,41 @@ class RuntimePilot:
                     termination = "time_limit"
             except self.native.RequestWaitTimeout as exc:
                 result = self.native.request_snapshot_result(exc.last_snapshot or {})
+                telemetry = result.get("runtime_telemetry") or {}
+                if isinstance(telemetry, Mapping) and isinstance(telemetry.get("provider_retry"), Mapping):
+                    last_retry_snapshot = dict(telemetry["provider_retry"])
                 termination = "time_limit" if deadline is not None and time.monotonic() >= deadline else "provider_timeout"
             except TimeoutError:
                 result = {}
                 termination = "time_limit" if deadline is not None and time.monotonic() >= deadline else "provider_timeout"
+            finished_at = datetime.now(UTC)
+            if policy is not None and last_retry_snapshot is None:
+                last_retry_snapshot = provider_retry.RetryState(policy).snapshot()
+            retry_wait = (provider_retry.RetryState.from_snapshot(
+                policy, last_retry_snapshot, allow_pending=True).completed_wait_seconds(
+                finished_at.timestamp(), started_epoch=started_at.timestamp())
+                          if policy is not None else 0.0)
+            if policy is not None:
+                self.current_deadline_at = deadline_at + timedelta(seconds=retry_wait)
+            if (policy is not None and termination not in {"complete", "completed", "halted_refusal"}
+                    and (finished_at - started_at).total_seconds() - retry_wait >= wall_seconds):
+                termination = "time_limit"
             execution = {
                 "termination": termination,
                 "arm_started_at": started_at.isoformat(),
-                "arm_deadline_at": deadline_at.isoformat() if deadline_at is not None else None,
+                "arm_deadline_at": self.current_deadline_at.isoformat() if self.current_deadline_at is not None else None,
+                **({"arm_base_deadline_at": deadline_at.isoformat(), "retry_wait_seconds": retry_wait,
+                    "provider_retry": last_retry_snapshot,
+                    "retry_wait_unresolved": bool(last_retry_snapshot["wait_pending"]),
+                    "timing_complete": not bool(last_retry_snapshot["wait_pending"]),
+                    "active_seconds": max(0.0, (finished_at - started_at).total_seconds() - retry_wait)}
+                   if policy is not None else {}),
                 "pending_finalization": True,
                 "resource_complete": False,
                 "measurement_metadata": metadata_fields,
             }
             if matrix_arm:
-                self.current_stopped_at = datetime.now(UTC)
+                self.current_stopped_at = finished_at
                 execution["arm_stopped_at"] = self.current_stopped_at.isoformat()
             self.current_execution = {**execution, "_shipping_result": result}
             return execution
@@ -3091,13 +3217,22 @@ class RuntimePilot:
         raw_config = {
             "provider": route["provider"], "model": route["model"], "mode": "auto", "max_steps": 0,
             "max_retries": 0, "max_output_tokens": None,
-            "request_timeout_policy": "min(900_seconds,remaining_arm_wall_seconds)" if wall_seconds is not None else "per_request_900_seconds",
+            "request_timeout_policy": (
+                "min(900_seconds,remaining_arm_hard_wall_seconds)" if policy is not None
+                else "min(900_seconds,remaining_arm_wall_seconds)" if wall_seconds is not None
+                else "per_request_900_seconds"
+            ),
         }
         if getattr(self, "raw_reasoning_effort", None) is not None:
             raw_config["reasoning_effort"] = self.raw_reasoning_effort
+        if policy is not None:
+            raw_config["provider_retry_policy"] = policy.to_record()
         metadata_fields = _assembled_measurement_metadata(declared_metadata, arm=arm, config=raw_config)
         budget = None if matrix_arm else task_budget.TaskBudget(100, deadline, event_sink=progress)
         self.current_budget = budget
+        self.current_retry_state = self._raw_retry_state(progress) if policy is not None else None
+        if self.current_retry_state is not None:
+            self.current_retry_state.bind_active_deadline(deadline_at.timestamp())
         runner = self._raw_runner(deadline, progress)
         try:
             if budget is None:
@@ -3109,13 +3244,23 @@ class RuntimePilot:
                 budget_snapshot = budget.snapshot()
         except BareRunnerRecoveryError as exc:
             raise PairRecoveryBlocked(str(exc)) from exc
+        finished_at = datetime.now(UTC)
+        retry_wait = (self.current_retry_state.completed_wait_seconds(
+            finished_at.timestamp(), started_epoch=started_at.timestamp())
+                      if self.current_retry_state is not None else 0.0)
+        if policy is not None:
+            self.current_deadline_at = deadline_at + timedelta(seconds=retry_wait)
+        wall_elapsed = max(0.0, (finished_at - started_at).total_seconds())
+        raw_termination = ({"cause": "wall_time", "subtype": "time_limit"}
+                           if (matrix_arm and wall_seconds is not None and
+                               (result.termination.get("cause") == "wall_time" or
+                                (policy is not None and wall_elapsed - retry_wait >= wall_seconds)))
+                           else result.termination)
         transcript = _write_private(self.artifact_dir / "raw-mythic-bloodhound-transcript.json", {
             "objective": result.objective,
             "events": result.transcript,
             "final": result.final_text,
-            "termination": ({"cause": "wall_time", "subtype": "time_limit"}
-                            if result.termination.get("cause") == "wall_time" and matrix_arm and wall_seconds is not None
-                            else result.termination),
+            "termination": raw_termination,
             "response_records": result.model_response_records,
             "recoverable_tool_errors": result.recoverable_tool_errors,
             **({"model_error_diagnostic": result.model_error_diagnostic}
@@ -3133,10 +3278,18 @@ class RuntimePilot:
             safe_records = []
             route_error = str(exc)
         cost_error = None
+        retry_events = (self.current_retry_state.snapshot()["events"]
+                        if self.current_retry_state is not None else [])
+        observed_http_responses = [event for event in retry_events
+                                   if event.get("event") == "provider_response_observed"]
+        transient_responses = [event for event in observed_http_responses
+                               if event.get("status_code") in {429, 503}]
         if result.model_attempts != result.model_calls:
             cost_error = "provider request has no authoritative response usage"
         elif result.token_usage_complete is not True or not inspected_usage_complete:
             cost_error = "completed provider response has incomplete authoritative usage"
+        elif transient_responses:
+            cost_error = "transient provider responses have no authoritative token usage"
         total_tokens = inspected_total if route_error is None and cost_error is None else None
         if not matrix_arm and (
             not isinstance(budget_snapshot, Mapping)
@@ -3148,15 +3301,19 @@ class RuntimePilot:
         ):
             raise PilotError("raw task-budget accounting is missing or invalid")
         execution = {
-            "termination": ({"cause": "wall_time", "subtype": "time_limit"}
-                            if result.termination.get("cause") == "wall_time" and matrix_arm and wall_seconds is not None
-                            else result.termination),
+            "termination": raw_termination,
             "transcript": transcript,
             "response_records": safe_records,
             **({"model_error_diagnostic": result.model_error_diagnostic}
                if getattr(result, "model_error_diagnostic", None) is not None else {}),
             "arm_started_at": started_at.isoformat(),
-            "arm_deadline_at": deadline_at.isoformat() if deadline_at is not None else None,
+            "arm_deadline_at": self.current_deadline_at.isoformat() if self.current_deadline_at is not None else None,
+            **({"arm_base_deadline_at": deadline_at.isoformat(), "retry_wait_seconds": retry_wait,
+                "provider_retry": self.current_retry_state.snapshot(),
+                "retry_wait_unresolved": bool(self.current_retry_state.snapshot()["wait_pending"]),
+                "timing_complete": not bool(self.current_retry_state.snapshot()["wait_pending"]),
+                "active_seconds": max(0.0, wall_elapsed - retry_wait)}
+               if policy is not None else {}),
             "task_budget": budget_snapshot,
             "protocol_error": route_error is not None,
             "route_error": route_error,
@@ -3168,7 +3325,13 @@ class RuntimePilot:
                 "model_calls": result.model_calls,
                 "total_tokens": total_tokens,
                 "payload_tasks": budget_snapshot.get("reservations") if budget_snapshot is not None else None,
-                "wall_seconds": result.wall_seconds,
+                "wall_seconds": wall_elapsed if policy is not None else result.wall_seconds,
+                **({"active_seconds": max(0.0, wall_elapsed - retry_wait),
+                    "retry_wait_seconds": retry_wait,
+                    "provider_http_responses_observed": len(observed_http_responses),
+                    "transient_provider_responses": len(transient_responses),
+                    "known_response_tokens": inspected_total}
+                   if policy is not None else {}),
                 "token_overshoot": (
                     None if matrix_arm else result.token_budget_overshoot
                     if type(total_tokens) is int else None
@@ -3177,7 +3340,7 @@ class RuntimePilot:
             "measurement_metadata": metadata_fields,
         }
         if matrix_arm:
-            self.current_stopped_at = datetime.now(UTC)
+            self.current_stopped_at = finished_at
             execution["arm_stopped_at"] = self.current_stopped_at.isoformat()
         self.current_execution = execution
         return execution
@@ -3239,6 +3402,50 @@ class RuntimePilot:
                     route_error,
                     cost_error,
                 ) = _shipping_response_accounting(telemetry, getattr(self, "selected_route", None))
+                policy = getattr(self, "provider_retry_policy", None)
+                retry_cost = {}
+                retry_execution = {}
+                if policy is not None:
+                    retry_snapshot = (telemetry.get("provider_retry")
+                                      if isinstance(telemetry, Mapping) else None)
+                    if retry_snapshot is None:
+                        retry_snapshot = finalized.get("provider_retry")
+                    if retry_snapshot is None:
+                        retry_snapshot = provider_retry.RetryState(policy).snapshot()
+                    retry_state = provider_retry.RetryState.from_snapshot(
+                        policy, retry_snapshot, allow_pending=True)
+                    stopped_epoch = (self.current_stopped_at or datetime.now(UTC)).timestamp()
+                    retry_wait = retry_state.completed_wait_seconds(
+                        stopped_epoch, started_epoch=self.current_started_at.timestamp())
+                    wall_elapsed = max(0.0, stopped_epoch - self.current_started_at.timestamp())
+                    self.current_deadline_at = self.current_base_deadline_at + timedelta(seconds=retry_wait)
+                    retry_events = retry_snapshot["events"]
+                    observed_http_responses = [event for event in retry_events
+                                               if event.get("event") == "provider_response_observed"]
+                    transient_responses = [event for event in observed_http_responses
+                                           if event.get("status_code") in {429, 503}]
+                    if retry_snapshot["wait_pending"]:
+                        cost_error = cost_error or "provider retry wait has no completed boundary"
+                    elif transient_responses:
+                        cost_error = cost_error or "transient provider responses have no authoritative token usage"
+                    retry_execution = {
+                        "arm_deadline_at": self.current_deadline_at.isoformat(),
+                        "provider_retry": retry_snapshot,
+                        "retry_wait_seconds": retry_wait,
+                        "retry_wait_unresolved": bool(retry_snapshot["wait_pending"]),
+                        "timing_complete": not bool(retry_snapshot["wait_pending"]),
+                        "active_seconds": max(0.0, wall_elapsed - retry_wait),
+                    }
+                    retry_cost = {
+                        "wall_seconds": wall_elapsed,
+                        "active_seconds": max(0.0, wall_elapsed - retry_wait),
+                        "retry_wait_seconds": retry_wait,
+                        "provider_http_responses_observed": len(observed_http_responses),
+                        "transient_provider_responses": len(transient_responses),
+                        "known_response_tokens": total_tokens,
+                    }
+                    if cost_error is not None:
+                        total_tokens = None
                 task_state = telemetry.get("task_budget")
                 matrix_arm = getattr(self, "selected_route", None) is not None
                 task_valid = matrix_arm or bool(
@@ -3250,6 +3457,7 @@ class RuntimePilot:
                     and len(task_state.get("confirmed_task_ids")) <= task_state.get("reservations")
                 )
                 finalized.update({
+                    **retry_execution,
                     "termination": (finalized.get("termination") if finalized.get("termination") == "time_limit"
                                     else "halted_refusal" if str(shipping_result.get("status") or "") == "complete"
                                     and isinstance(telemetry, Mapping)
@@ -3277,6 +3485,7 @@ class RuntimePilot:
                             if isinstance(self.current_started_at, datetime)
                             else (finalized.get("cost") or {}).get("wall_seconds")
                         ),
+                        **retry_cost,
                         "token_overshoot": (
                             None if matrix_arm else total_tokens > 1_000_000
                             if type(total_tokens) is int else None
@@ -3611,6 +3820,14 @@ class RuntimePilot:
             "proof_contract": PROOF_CONTRACT,
             "arm_started_at": self.current_started_at.isoformat() if self.current_started_at else None,
             "arm_deadline_at": self.current_deadline_at.isoformat() if self.current_deadline_at else None,
+            **({"arm_base_deadline_at": execution.get("arm_base_deadline_at"),
+                "provider_retry_policy": self.provider_retry_policy.to_record(),
+                "provider_retry": execution.get("provider_retry"),
+                "retry_wait_seconds": execution.get("retry_wait_seconds"),
+                "retry_wait_unresolved": execution.get("retry_wait_unresolved"),
+                "timing_complete": execution.get("timing_complete"),
+                "active_seconds": execution.get("active_seconds")}
+               if getattr(self, "provider_retry_policy", None) is not None else {}),
             **({"arm_stopped_at": self.current_stopped_at.isoformat()}
                if getattr(self, "current_stopped_at", None) else {}),
             **({"measurement_policy": (
@@ -3967,6 +4184,7 @@ def _runtime(
         matrix_wall_seconds=(contract.wall_seconds if isinstance(contract, MatrixPairContract) else None),
         raw_reasoning_effort=(contract.raw_reasoning_effort if isinstance(contract, MatrixPairContract) else None),
         sage_reasoning_effort=(contract.sage_reasoning_effort if isinstance(contract, MatrixPairContract) else None),
+        provider_retry_policy=(contract.provider_retry_policy if isinstance(contract, MatrixPairContract) else None),
     )
 
 
@@ -4005,10 +4223,14 @@ def _assembled_measurement_metadata(declared: Mapping[str, Any], *, arm: str,
     """
     safe_fields = {"provider", "model", "mode", "autonomous_solve", "max_steps", "temperature",
                    "top_p", "max_tokens", "max_output_tokens", "reasoning_effort", "max_retries",
-                   "request_timeout_policy"}
+                   "request_timeout_policy", "provider_retry_policy"}
     actual = {key: value for key, value in config.items() if key in safe_fields}
     if "SAGE_REASONING_EFFORT" in config:
         actual["reasoning_effort"] = config["SAGE_REASONING_EFFORT"]
+        if config.get("SAGE_PROVIDER_RETRY_POLICY"):
+            policy = provider_retry.parse_policy(config["SAGE_PROVIDER_RETRY_POLICY"])
+            if policy is not None:
+                actual["provider_retry_policy"] = policy.to_record()
     requested = declared.get("generation_config", {})
     if not isinstance(requested, Mapping) or any(key not in actual or actual[key] != value
                                                for key, value in requested.items()):
@@ -4125,6 +4347,7 @@ def _replay_contract(records: list[dict[str, Any]]) -> PilotContract | Improveme
                 continue_after_refusal=value.get("continue_after_refusal", False),
                 raw_reasoning_effort=value.get("raw_reasoning_effort"),
                 sage_reasoning_effort=value.get("sage_reasoning_effort"),
+                provider_retry_policy=value.get("provider_retry_policy"),
             )
         except (TypeError, ValueError) as exc:
             raise PilotError("retained matrix pair contract is malformed") from exc
@@ -4244,6 +4467,8 @@ def replay_pair(artifact_dir: str | Path, native_evidence_manifest: str | Path |
         projector.current_operation_id = operation_id
         projector.selected_route = contract.route if isinstance(contract, MatrixPairContract) else None
         projector.matrix_wall_seconds = contract.wall_seconds if isinstance(contract, MatrixPairContract) else None
+        projector.provider_retry_policy = provider_retry.parse_policy(
+            contract.provider_retry_policy if isinstance(contract, MatrixPairContract) else None)
         if isinstance(contract, MatrixPairContract):
             if (
                 snapshot.get("measurement_policy") != (
@@ -4258,6 +4483,35 @@ def replay_pair(artifact_dir: str | Path, native_evidence_manifest: str | Path |
             projector.current_stopped_at = datetime.fromisoformat(snapshot["arm_stopped_at"])
             projector.current_deadline_at = (datetime.fromisoformat(snapshot["arm_deadline_at"])
                                              if contract.wall_seconds is not None else None)
+            expected_deadline_seconds = contract.wall_seconds
+            if contract.provider_retry_policy is not None:
+                retained_state = execution.get("provider_retry")
+                if (snapshot.get("provider_retry_policy") != contract.provider_retry_policy
+                        or snapshot.get("provider_retry") != retained_state
+                        or snapshot.get("arm_base_deadline_at") != execution.get("arm_base_deadline_at")
+                        or snapshot.get("retry_wait_seconds") != execution.get("retry_wait_seconds")
+                        or snapshot.get("retry_wait_unresolved") != execution.get("retry_wait_unresolved")
+                        or snapshot.get("timing_complete") != execution.get("timing_complete")
+                        or snapshot.get("active_seconds") != execution.get("active_seconds")):
+                    raise PilotError("retained provider retry timing differs from the pair contract")
+                try:
+                    state = provider_retry.RetryState.from_snapshot(
+                        projector.provider_retry_policy, retained_state, allow_pending=True)
+                    credited = state.completed_wait_seconds(
+                        projector.current_stopped_at.timestamp(),
+                        started_epoch=projector.current_started_at.timestamp())
+                except (TypeError, ValueError, AttributeError) as exc:
+                    raise PilotError("retained provider retry state is malformed") from exc
+                if (abs(float(execution.get("retry_wait_seconds")) - credited) > 0.02
+                        or execution.get("arm_base_deadline_at") != (
+                            projector.current_started_at + timedelta(seconds=contract.wall_seconds)
+                        ).isoformat()):
+                    raise PilotError("retained provider retry credit differs from verified waits")
+                expected_deadline_seconds += credited
+            elif any(key in snapshot or key in execution for key in (
+                "provider_retry", "provider_retry_policy", "retry_wait_seconds", "arm_base_deadline_at"
+            )):
+                raise PilotError("retained arm introduced an undeclared provider retry policy")
             if (
                 projector.current_started_at.tzinfo is None
                 or projector.current_stopped_at.tzinfo is None
@@ -4265,7 +4519,8 @@ def replay_pair(artifact_dir: str | Path, native_evidence_manifest: str | Path |
                 or (snapshot.get("arm_deadline_at") is not None if contract.wall_seconds is None else
                     snapshot.get("arm_deadline_at") != execution.get("arm_deadline_at")
                     or projector.current_deadline_at.tzinfo is None
-                    or (projector.current_deadline_at - projector.current_started_at).total_seconds() != contract.wall_seconds)
+                    or abs((projector.current_deadline_at - projector.current_started_at).total_seconds()
+                           - expected_deadline_seconds) > 0.02)
             ):
                 raise PilotError("retained matrix stop time is invalid")
         else:
@@ -4662,6 +4917,8 @@ def build_parser() -> argparse.ArgumentParser:
                              help="Optional raw-arm reasoning effort; omitted uses the provider default.")
         command.add_argument("--reasoning-effort", choices=sorted(RAW_REASONING_EFFORTS),
                              help="Optional matched reasoning effort for Sage and raw arms.")
+        command.add_argument("--provider-retry-policy", choices=("transient-v1",),
+                             help="Optional matched bounded retry policy for temporary provider responses.")
         if name in {"rehearse-setup", "continue-setup", "run-pair"}:
             _add_live_authority_args(command)
         if name in {"preflight", "rehearse-setup", "continue-setup", "run-pair"}:
@@ -4782,12 +5039,16 @@ def main(argv: list[str] | None = None) -> int:
                     continue_after_refusal=args.continue_after_refusal,
                     raw_reasoning_effort=args.reasoning_effort or args.raw_reasoning_effort,
                     sage_reasoning_effort=args.reasoning_effort,
+                    provider_retry_policy=(provider_retry.parse_policy(args.provider_retry_policy).to_record()
+                                           if args.provider_retry_policy is not None else None),
                 )
             else:
                 if getattr(args, "raw_reasoning_effort", None) is not None:
                     raise PilotError("--raw-reasoning-effort requires a selected matrix route")
                 if getattr(args, "reasoning_effort", None) is not None:
                     raise PilotError("--reasoning-effort requires a selected matrix route")
+                if getattr(args, "provider_retry_policy", None) is not None:
+                    raise PilotError("--provider-retry-policy requires a selected matrix route")
                 contract = PilotContract(arm_order=arm_order, alternate_start=alternate_start)
         contract.validate()
         if (getattr(args, "resumable", False) or getattr(args, "resume", False)) and not isinstance(contract, MatrixPairContract):

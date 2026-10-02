@@ -1,4 +1,4 @@
-"""Retry-zero coordinator for the two-arm GOAD Trust Walker matched pilot."""
+"""Two-arm GOAD Trust Walker coordinator with no automatic replacement arms."""
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
@@ -15,6 +15,8 @@ import tempfile
 import time
 from typing import Any, Callable, Mapping
 from urllib.parse import urlsplit
+
+from ai.provider_retry import parse_policy
 
 from .trust_walker_outcome import (
     OBJECTIVE_INERT_UNFINISHED_COMMANDS,
@@ -192,6 +194,7 @@ class MatrixPairContract:
     continue_after_refusal: bool = False
     raw_reasoning_effort: str | None = None
     sage_reasoning_effort: str | None = None
+    provider_retry_policy: dict[str, Any] | None = None
 
     @classmethod
     def for_route(
@@ -205,6 +208,7 @@ class MatrixPairContract:
         continue_after_refusal: bool = False,
         raw_reasoning_effort: str | None = None,
         sage_reasoning_effort: str | None = None,
+        provider_retry_policy: dict[str, Any] | None = None,
     ) -> "MatrixPairContract":
         contract = cls(
             matrix_identity=matrix.identity, route=matrix.route_for(route_id),
@@ -216,11 +220,21 @@ class MatrixPairContract:
             continue_after_refusal=continue_after_refusal,
             raw_reasoning_effort=raw_reasoning_effort,
             sage_reasoning_effort=sage_reasoning_effort,
+            provider_retry_policy=provider_retry_policy,
         )
         contract.validate(matrix)
         return contract
 
     def validate(self, matrix: MatrixContract | None = None) -> None:
+        if self.provider_retry_policy is not None:
+            try:
+                policy = parse_policy(self.provider_retry_policy)
+            except (ValueError, TypeError) as exc:
+                raise PilotError("provider_retry_policy is unsupported") from exc
+            if policy is None or policy.to_record() != self.provider_retry_policy:
+                raise PilotError("provider_retry_policy must be a canonical policy record")
+            if self.route.provider != "openai" or self.wall_seconds is None:
+                raise PilotError("provider retries require a bounded OpenAI-compatible matrix arm")
         if self.wall_seconds is not None and (type(self.wall_seconds) is not int or self.wall_seconds <= 0):
             raise PilotError("matrix pair wall_seconds must be a positive integer or absent")
         if type(self.continue_after_time_limit) is not bool or (self.continue_after_time_limit and self.wall_seconds is None):
@@ -301,6 +315,15 @@ class MatrixPairContract:
             record["raw_reasoning_effort"] = self.raw_reasoning_effort
         if self.sage_reasoning_effort is not None:
             record["sage_reasoning_effort"] = self.sage_reasoning_effort
+        if self.provider_retry_policy is not None:
+            record["provider_retry_policy"] = dict(self.provider_retry_policy)
+            record["termination_policy"]["time_accounting"] = {
+                "arm_limit": "elapsed time excluding recorded provider retry sleep",
+                "provider_retry_wait_excluded": True,
+                "max_retry_wait_seconds": 900,
+                "max_elapsed_seconds": self.wall_seconds + 900,
+                "objective_window": "original start through effective deadline or producer stop, whichever is earlier",
+            }
         return record
 
     @property
@@ -592,6 +615,7 @@ def arm_environment(contract: PilotContract | ImprovementContract | MatrixPairCo
             "SAGE_EVAL_CAPTURE_POLICY_DECISION_PACKETS": "1",
             "SAGE_EVAL_EXPECTED_RESPONSE_PROVIDER": contract.route.provider,
             "SAGE_EVAL_EXPECTED_RESPONSE_MODEL": contract.route.model,
+            "SAGE_PROVIDER_RETRY_POLICY": "transient-v1" if contract.provider_retry_policy else "off",
         }
         if contract.wall_seconds is not None:
             environment["SAGE_CONTROLLER_WALL_S"] = str(contract.wall_seconds)
@@ -810,6 +834,7 @@ def retained_alternate_start_binding(
                 continue_after_refusal=record.get("continue_after_refusal", False),
                 raw_reasoning_effort=record.get("raw_reasoning_effort"),
                 sage_reasoning_effort=record.get("sage_reasoning_effort"),
+                provider_retry_policy=record.get("provider_retry_policy"),
             )
         else:
             reconstructed = PilotContract(

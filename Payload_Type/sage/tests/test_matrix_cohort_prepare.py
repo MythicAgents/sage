@@ -122,6 +122,49 @@ def test_contradictory_effort_flags_fail_before_preparation(tmp_path, monkeypatc
     assert not output.exists()
 
 
+def test_retry_prepare_binds_clock_policy_to_plan_contract_and_authority(tmp_path, monkeypatch):
+    pair, catalog, _smoke, output, argv = inputs(tmp_path, monkeypatch)
+    assert driver.main(argv + ["--provider-retry-policy", "transient-v1", "--activate-authority",
+                               "--authorization-source", "Operator authorized this test."]) == 0
+    plan = driver.load_plan(output / "cohort-plan.json")
+    policy = driver._retry_policy_record("transient-v1")
+    assert plan["provider_retry_policy"] == policy
+    contract = pair.MatrixPairContract.for_route(
+        pair.load_matrix_contract(catalog), "test-route", start_case="samwell-castelblack",
+        source_identity=pair._source_identity_at(ROOT), wall_seconds=3600,
+        continue_after_time_limit=True, continue_after_refusal=True,
+        provider_retry_policy=policy,
+    )
+    saved = json.loads((output / "pair-contract-slot-001.json").read_text())
+    assert saved == contract.to_record()
+    assert saved["termination_policy"]["time_accounting"]["max_elapsed_seconds"] == 4500
+    authority = json.loads((output / "authority-slot-001.json").read_text())
+    assert authority["scope"]["provider_retry_policy"] == policy
+    assert "Only actual retry sleep is excluded" in (output / "protocol.md").read_text()
+    slot = plan["slots"][0]
+    command = driver._cli("run-pair", plan, slot, slot["attempts"][0], output / "pair")
+    assert pair.build_parser().parse_args(command[2:]).provider_retry_policy == "transient-v1"
+    # Exact producer authority validation already happened in prepare; an altered
+    # record cannot claim the original authority even with a valid preset name.
+    authority["scope"]["provider_retry_policy"]["max_wait_seconds_per_arm"] = 901
+    authority_path = output / "authority-slot-001.json"
+    authority_path.write_text(json.dumps(authority))
+    with pytest.raises(pair.PilotError, match="scope differs"):
+        pair._resolve_live_authority(SimpleNamespace(
+            command="run-pair", live_authority_file=authority_path,
+            live_authority_id=None, resumable=False, resume=False), contract)
+
+
+def test_retry_prepare_rejects_unsupported_adapter_before_writing(tmp_path, monkeypatch, capsys):
+    _pair, catalog, _smoke, output, argv = inputs(tmp_path, monkeypatch)
+    value = json.loads(catalog.read_text())
+    value["routes"][0]["provider"] = "anthropic"
+    catalog.write_text(json.dumps(value))
+    assert driver.main(argv + ["--provider-retry-policy", "transient-v1"]) == 1
+    assert "OpenAI-compatible provider adapter" in capsys.readouterr().err
+    assert not output.exists()
+
+
 def test_prepare_can_disable_refusal_continuation(tmp_path, monkeypatch):
     pair, catalog, smoke, output, argv = inputs(tmp_path, monkeypatch)
     assert driver.main(argv + ["--no-continue-after-refusal"]) == 0
