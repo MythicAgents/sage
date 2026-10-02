@@ -313,6 +313,7 @@ class AutonomousController:
                  route_discovery: Callable[[Any], Any] | None = None,
                  tokens_spent: Callable[[], int] | None = None,
                  clock: Callable[[], float] | None = None,
+                 dynamic_wall_clock: bool = False,
                  should_abort: Callable[[], bool] | None = None,
                  frontier_fn: Callable[[Any], list[Any]] | None = None,
                  policy_backend: Any | None = None,
@@ -333,6 +334,7 @@ class AutonomousController:
         self._route_discovery = route_discovery
         self._tokens_spent = tokens_spent
         self._clock = clock
+        self._dynamic_wall_clock = bool(dynamic_wall_clock)
         self._should_abort = should_abort
         self._frontier_fn = frontier_fn or cap.actions_from_state
         self._policy = policy_backend
@@ -468,15 +470,46 @@ class AutonomousController:
                         return ("timeout", f"{name} reached wall_clock_budget_s={self.config.wall_clock_budget_s}")
                 value = thunk()
                 if inspect.isawaitable(value):
-                    timeout_candidates = [
-                        float(candidate)
-                        for candidate in (self.config.seam_timeout_s, remaining_wall)
-                        if isinstance(candidate, (int, float)) and candidate > 0
-                    ]
-                    if timeout_candidates:
-                        value = await asyncio.wait_for(value, min(timeout_candidates))
+                    if self._dynamic_wall_clock and self._clock is not None and self.config.wall_clock_budget_s is not None:
+                        # A provider retry wait pauses the injected active clock. Recheck it while
+                        # the seam is in flight so an old fixed wall deadline cannot cancel a
+                        # legitimate retry, yet real model work still consumes the arm budget.
+                        began_active = float(self._clock())
+                        task = asyncio.ensure_future(value)
+                        try:
+                            while True:
+                                remaining_active = float(self.config.wall_clock_budget_s) - float(self._clock())
+                                remaining_seam = (
+                                    float(self.config.seam_timeout_s) - (float(self._clock()) - began_active)
+                                    if self.config.seam_timeout_s is not None else float("inf")
+                                )
+                                if remaining_active <= 0 or remaining_seam <= 0:
+                                    raise asyncio.TimeoutError
+                                done, _ = await asyncio.wait(
+                                    {task}, timeout=min(1.0, remaining_active, remaining_seam)
+                                )
+                                if done:
+                                    value = task.result()
+                                    break
+                        finally:
+                            if not task.done():
+                                task.cancel()
+                                try:
+                                    await task
+                                except BaseException:
+                                    # Preserve the original timeout/cancellation while ensuring
+                                    # provider wait cleanup settles before terminal telemetry.
+                                    pass
                     else:
-                        value = await value
+                        timeout_candidates = [
+                            float(candidate)
+                            for candidate in (self.config.seam_timeout_s, remaining_wall)
+                            if isinstance(candidate, (int, float)) and candidate > 0
+                        ]
+                        if timeout_candidates:
+                            value = await asyncio.wait_for(value, min(timeout_candidates))
+                        else:
+                            value = await value
             except asyncio.TimeoutError:
                 status = "timeout"
                 value = f"{name} exceeded seam_timeout_s={self.config.seam_timeout_s}"
@@ -543,7 +576,7 @@ class AutonomousController:
         """
         self._absolute_deadline = (
             asyncio.get_running_loop().time() + float(self.config.wall_clock_budget_s)
-            if self.config.wall_clock_budget_s is not None else None
+            if self.config.wall_clock_budget_s is not None and not self._dynamic_wall_clock else None
         )
         with _tracing.kernel_span(
             "sage.kernel.episode",

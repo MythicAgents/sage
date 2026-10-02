@@ -121,12 +121,13 @@ def provider_usage_total(body: bytes) -> int | None:
 
 class _MeteredBase:
     def __init__(self, kind: str, *, ledger: resource_budget.ResourceLedger,
-                 operation: str | None = None) -> None:
+                 operation: str | None = None, allow_non2xx: bool = False) -> None:
         if kind not in {"provider", "control"}:
             raise ResourceHTTPError("HTTP resource kind must be provider or control")
         self.kind = kind
         self.ledger = ledger
         self.operation = operation or (_PROVIDER_OPERATION if kind == "provider" else _CONTROL_OPERATION)
+        self.allow_non2xx = allow_non2xx
         self.provider_token_reservation = _provider_token_reservation() if kind == "provider" else None
 
     def _reserve(self) -> str:
@@ -172,6 +173,8 @@ class _MeteredBase:
         # counter must not replace actual completed-call usage.
         if self.kind != "provider" or not self._capture_enabled():
             return
+        if self.allow_non2xx and not 200 <= response.status_code < 300:
+            return
         actual = provider_usage_total(body) if 200 <= response.status_code < 300 else None
         if actual is None:
             raise ProviderResponseBoundaryError("usage_unavailable")
@@ -183,8 +186,9 @@ class MeteredHTTPTransport(_MeteredBase, httpx.BaseTransport):
     """Sync HTTPX transport charging every transport invocation."""
 
     def __init__(self, kind: str, *, ledger: resource_budget.ResourceLedger,
-                 transport: httpx.BaseTransport | None = None, operation: str | None = None) -> None:
-        _MeteredBase.__init__(self, kind, ledger=ledger, operation=operation)
+                 transport: httpx.BaseTransport | None = None, operation: str | None = None,
+                 allow_non2xx: bool = False) -> None:
+        _MeteredBase.__init__(self, kind, ledger=ledger, operation=operation, allow_non2xx=allow_non2xx)
         self.transport = transport or httpx.HTTPTransport()
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
@@ -227,8 +231,9 @@ class MeteredAsyncHTTPTransport(_MeteredBase, httpx.AsyncBaseTransport):
     """Async HTTPX transport charging every transport invocation."""
 
     def __init__(self, kind: str, *, ledger: resource_budget.ResourceLedger,
-                 transport: httpx.AsyncBaseTransport | None = None, operation: str | None = None) -> None:
-        _MeteredBase.__init__(self, kind, ledger=ledger, operation=operation)
+                 transport: httpx.AsyncBaseTransport | None = None, operation: str | None = None,
+                 allow_non2xx: bool = False) -> None:
+        _MeteredBase.__init__(self, kind, ledger=ledger, operation=operation, allow_non2xx=allow_non2xx)
         self.transport = transport or httpx.AsyncHTTPTransport()
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:

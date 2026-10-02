@@ -104,6 +104,7 @@ SAGE_LLM_KEY_MAP = MappingProxyType(
         "aws_session_token": "AWS_SESSION_TOKEN",
         "region": "AWS_DEFAULT_REGION",
         "reasoning_effort": "SAGE_REASONING_EFFORT",
+        "provider_retry_policy": "SAGE_PROVIDER_RETRY_POLICY",
     }
 )
 WATCHER_LLM_KEY_MAP = MappingProxyType(
@@ -142,6 +143,7 @@ class ResolvedLLMProfile:
     region: str = ""
     sources: tuple[tuple[str, str], ...] = ()
     reasoning_effort: str = ""
+    provider_retry_policy: str = ""
 
     def configurable(self) -> dict[str, str]:
         if self.provider == "bedrock":
@@ -156,6 +158,7 @@ class ResolvedLLMProfile:
                 "api_key": self.api_key,
                 "base_url": self.api_endpoint,
                 "reasoning_effort": self.reasoning_effort,
+                "provider_retry_policy": self.provider_retry_policy,
             }
         return {key: value for key, value in values.items() if value}
 
@@ -192,6 +195,13 @@ def _normalized_llm_profile(
         if effort and normalized["provider"] != "openai":
             raise ValueError("SAGE_REASONING_EFFORT requires the openai model provider")
     normalized["reasoning_effort"] = effort
+    retry_policy = normalized.get("provider_retry_policy", "").strip()
+    if retry_policy and retry_policy != "off":
+        from ai.provider_retry import parse_policy
+        parse_policy(retry_policy)
+        if normalized["provider"] != "openai":
+            raise ValueError("SAGE_PROVIDER_RETRY_POLICY requires the openai model provider")
+    normalized["provider_retry_policy"] = retry_policy
     return ResolvedLLMProfile(**normalized, sources=tuple(sources))
 
 

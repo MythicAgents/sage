@@ -88,6 +88,19 @@ _CONFIG_OPTIONS = [
         ],
     ),
     ChatModelConfigurationOption(
+        Name="SAGE_PROVIDER_RETRY_POLICY",
+        DisplayName="Provider Retry Policy",
+        Type=OptType.Choice,
+        Description="Optional OpenAI-compatible provider retry preset. Blank uses SAGE_PROVIDER_RETRY_POLICY from the environment if set. Off uses the provider SDK defaults. Transient v1 retries confirmed temporary 429 and 503 responses with bounded waits.",
+        Required=False,
+        DefaultValue="",
+        Choices=[
+            ChatModelConfigurationOptionChoice(Label="Use environment/default", Value=""),
+            ChatModelConfigurationOptionChoice(Label="Provider SDK default", Value="off"),
+            ChatModelConfigurationOptionChoice(Label="Transient v1", Value="transient-v1"),
+        ],
+    ),
+    ChatModelConfigurationOption(
         Name="mode",
         DisplayName="Mode",
         Type=OptType.Choice,

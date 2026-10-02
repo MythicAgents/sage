@@ -60,7 +60,7 @@ from .operator_error import operator_error_text
 from . import worker_outcome as _worker_outcome
 from . import prompt_context
 from ai.mcp import MCPManager, MCP_EXECUTION_CONTEXT_OFFENSIVE_RUNTIME
-from ai import observation_channel, resource_budget, resource_http
+from ai import observation_channel, provider_retry, resource_budget, resource_http
 
 # Import logging fix - handle both relative and absolute imports
 try:
@@ -4248,6 +4248,8 @@ class Model:
         self._policy_model_calls = 0
         self._policy_episode_id = ""
         self._controller_runtime_telemetry: dict[str, Any] = {}
+        self._provider_retry_state: provider_retry.RetryState | None = None
+        self._provider_retry_event_sink: Callable[[dict[str, Any]], None] | None = None
         self._controller_observed_decisions: list[dict[str, Any]] = []
         self._controller_observed_transactions: list[dict[str, Any]] = []
         self.graph = None
@@ -6001,6 +6003,18 @@ class Model:
             logger.error("Model configuration is missing 'configurable' settings.")
             return None
         reasoning_effort = str(cfg.get("reasoning_effort") or "").strip()
+        retry_policy = provider_retry.parse_policy(cfg.get("provider_retry_policy"))
+        if retry_policy is not None:
+            if self.provider.lower() != "openai":
+                raise ValueError("SAGE_PROVIDER_RETRY_POLICY requires the openai model provider")
+            if getattr(self, "_provider_retry_state", None) is None:
+                self._provider_retry_state = provider_retry.RetryState(
+                    retry_policy, event_sink=self._on_provider_retry_event
+                )
+            elif self._provider_retry_state.policy != retry_policy:
+                raise ValueError("provider retry policy changed in session")
+            if getattr(self, "_eval_arm_deadline_epoch", None) is not None:
+                self._provider_retry_state.bind_active_deadline(self._eval_arm_deadline_epoch)
         if reasoning_effort:
             if reasoning_effort not in {"none", "minimal", "low", "medium", "high", "xhigh", "max"}:
                 raise ValueError("SAGE_REASONING_EFFORT must be one of none, minimal, low, medium, high, xhigh, max")
@@ -6055,13 +6069,25 @@ class Model:
                 model_kwargs["max_tokens"] = eval_max_output_tokens
             if eval_temperature is not None:
                 model_kwargs["temperature"] = eval_temperature
-            if ledger is not None:
+            if ledger is not None or retry_policy is not None:
+                sync_transport: httpx.BaseTransport = (
+                    resource_http.MeteredHTTPTransport("provider", ledger=ledger, allow_non2xx=retry_policy is not None)
+                    if ledger is not None else httpx.HTTPTransport()
+                )
+                async_transport: httpx.AsyncBaseTransport = (
+                    resource_http.MeteredAsyncHTTPTransport("provider", ledger=ledger, allow_non2xx=retry_policy is not None)
+                    if ledger is not None else httpx.AsyncHTTPTransport()
+                )
+                if retry_policy is not None:
+                    assert self._provider_retry_state is not None
+                    sync_transport = provider_retry.RetryingHTTPTransport(sync_transport, self._provider_retry_state)
+                    async_transport = provider_retry.RetryingAsyncHTTPTransport(async_transport, self._provider_retry_state)
                 model_kwargs.update({
                     "http_client": httpx.Client(
-                        transport=resource_http.MeteredHTTPTransport("provider", ledger=ledger)
+                        transport=sync_transport
                     ),
                     "http_async_client": httpx.AsyncClient(
-                        transport=resource_http.MeteredAsyncHTTPTransport("provider", ledger=ledger)
+                        transport=async_transport
                     ),
                     "max_retries": 0,
                 })
@@ -6084,6 +6110,17 @@ class Model:
         if llm is not None:
             llm = _patch_model_for_bedrock(llm)
         return llm
+
+    def _on_provider_retry_event(self, event: dict[str, Any]) -> None:
+        """Keep the controller's in-flight retry clock visible to native Chat."""
+        state = getattr(self, "_provider_retry_state", None)
+        if state is not None:
+            if not hasattr(self, "_controller_runtime_telemetry"):
+                self._controller_runtime_telemetry = {}
+            self._controller_runtime_telemetry["provider_retry"] = state.snapshot()
+        sink = getattr(self, "_provider_retry_event_sink", None)
+        if callable(sink):
+            sink(event)
         
     async def _fetch_dynamic_data(self):
         """Fetch dynamic data from Mythic APIs for use in agent prompts."""
@@ -9902,6 +9939,9 @@ class Model:
         task_limit = task_budget.current_snapshot()
         if task_limit is not None:
             telemetry["task_budget"] = task_limit
+        retry_state = getattr(self, "_provider_retry_state", None)
+        if retry_state is not None:
+            telemetry["provider_retry"] = retry_state.snapshot()
         self._controller_runtime_telemetry = telemetry
         return telemetry
 
@@ -9986,6 +10026,14 @@ class Model:
             import policy as _policy
 
         recovery_state = getattr(self, "_controller_resume_state", None)
+        retry_state = getattr(self, "_provider_retry_state", None)
+        if retry_state is not None and recovery_state is not None:
+            saved_retry = ((recovery_state.get("resources") or {}).get("runtime_telemetry") or {}).get("provider_retry")
+            if not isinstance(saved_retry, dict):
+                raise _recovery.RecoveryBlocked("provider retry state missing from controller recovery")
+            if saved_retry.get("wait_pending"):
+                raise _recovery.RecoveryBlocked("provider retry wait unresolved in controller recovery")
+            retry_state.restore(saved_retry)
 
         if self._controller_hitl_enabled():
             self._controller_hitl_objective = str(prompt or "")
@@ -10285,8 +10333,11 @@ class Model:
                 return False
 
         start = asyncio.get_event_loop().time()
+        started_epoch = time.time()
 
         def clock():
+            if retry_state is not None:
+                return retry_state.active_elapsed_seconds(started_epoch)
             return asyncio.get_event_loop().time() - start
 
         try:
@@ -10323,14 +10374,18 @@ class Model:
             started_at_epoch = float(recovery_state["started_at_epoch"])
             if cfg.wall_clock_budget_s is not None:
                 cfg.wall_clock_budget_s = max(
-                    0.0, started_at_epoch + float(cfg.wall_clock_budget_s) - time.time()
+                    0.0, started_at_epoch + float(cfg.wall_clock_budget_s)
+                    + (retry_state.credited_wait_seconds(started_epoch=started_at_epoch) if retry_state is not None else 0.0)
+                    - time.time()
                 )
         if unbounded_eval_arm and eval_arm_deadline_epoch is not None:
             # Preserve a stable declared config across recovery, while the
             # active controller receives only the original arm's remaining time.
             cfg.wall_clock_budget_s = min(
                 float(cfg.wall_clock_budget_s),
-                max(0.0, eval_arm_deadline_epoch - time.time()),
+                max(0.0, eval_arm_deadline_epoch
+                    + (retry_state.credited_wait_seconds() if retry_state is not None else 0.0)
+                    - time.time()),
             )
 
         objective_text = str(prompt or "").strip()
@@ -10527,6 +10582,7 @@ class Model:
             objective=objective_text,
             episode_id=self._policy_episode_id,
             clock=clock,
+            dynamic_wall_clock=retry_state is not None,
             should_abort=lambda: bool(getattr(self, "_stop_requested", False)),  # operator kill switch between cycles
             config=cfg,
             logger=fire,

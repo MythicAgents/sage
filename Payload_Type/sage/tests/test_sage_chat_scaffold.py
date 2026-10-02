@@ -8,6 +8,7 @@ with a stubbed Model (no live LLM), per PRD Section 13.
 import asyncio
 import copy
 import json
+import httpx
 
 import pytest
 
@@ -1573,6 +1574,42 @@ def test_terminal_message_carries_observed_runtime_telemetry():
     assert terminal["response_key"] == "assistant:14:1"
     assert terminal["metadata"]["runtime_telemetry"]["policy_mode"] == "llm"
     assert terminal["metadata"]["runtime_telemetry"]["semantic_policy_coverage"] == 1.0
+
+
+def test_native_chat_publishes_retry_wait_metadata_before_sleep():
+    from ai.provider_retry import Policy, RetryState, RetryingAsyncHTTPTransport
+
+    class _RetryModel(_FakeModel):
+        def __init__(self):
+            super().__init__(stream=("finished",))
+            self._provider_retry_state = RetryState(Policy())
+
+        async def invoke(self, prompt, is_interactive=False):
+            responses = [
+                httpx.Response(429, headers={"retry-after": "0.001"},
+                               json={"error": {"code": "rate_limit_exceeded"}}),
+                httpx.Response(200, json={"ok": True}),
+            ]
+            transport = RetryingAsyncHTTPTransport(
+                httpx.MockTransport(lambda _request: responses.pop(0)),
+                self._provider_retry_state,
+            )
+            async with httpx.AsyncClient(transport=transport) as client:
+                assert (await client.get("https://unit.invalid")).status_code == 200
+            return await super().invoke(prompt, is_interactive=is_interactive)
+
+        def controller_runtime_telemetry(self):
+            return {"provider_retry": self._provider_retry_state.snapshot()}
+
+    chat = _DriverChat(_RetryModel())
+    _run(chat.chat(build_chat_request("offline", channel_id=5, request_id=140)))
+    progress = [e for e in chat.emissions if e["response_key"] == "provider_retry:140"]
+    assert len(progress) == 3
+    assert len(progress[0]["metadata"]["runtime_telemetry"]["provider_retry"]["wait_pending"]) == 1
+    assert progress[0]["metadata"]["runtime_telemetry"]["provider_retry"]["wait_pending"][0]["sleep_started_at_epoch"] is None
+    assert progress[1]["metadata"]["runtime_telemetry"]["provider_retry"]["wait_pending"][0]["sleep_started_at_epoch"] is not None
+    assert progress[2]["metadata"]["runtime_telemetry"]["provider_retry"]["wait_pending"] == []
+    assert len(chat.terminal_emissions) == 1
 
 
 def test_emit_tool_use_produces_tool_use_card():
@@ -3990,6 +4027,7 @@ def test_operation_change_cannot_reuse_old_model_state():
 _EXPECTED_CONFIG_OPTIONS = {
     "provider", "model", "mode", "autonomous_solve", "policy_mode", "max_steps",
     "system_prompt", "API_ENDPOINT", "API_KEY", "SAGE_REASONING_EFFORT",
+    "SAGE_PROVIDER_RETRY_POLICY",
     "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_DEFAULT_REGION",
     # BloodHound MCP connection (added 2026-07-30). Kept in this exact-equality inventory rather
     # than relaxing the assertion to a subset: the point of the set is that every option Mythic

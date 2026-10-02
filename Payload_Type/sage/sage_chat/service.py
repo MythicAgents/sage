@@ -942,6 +942,9 @@ class SageChat(Chat):
                 return None
             thread_id = bind_channel_thread_id(request, model)
             has_input_response = getattr(request, "InputResponse", None) is not None
+            retry_state = getattr(model, "_provider_retry_state", None)
+            if retry_state is not None and preexisted and recovery_state is None and not has_input_response:
+                retry_state.reset_for_new_request()
             controller_pending = isinstance(getattr(model, "_controller_hitl_pending", None), dict)
             hitl_pending = False
             hitl_probe_failed = False
@@ -1032,6 +1035,23 @@ class SageChat(Chat):
             # so we then return None and let run_chat_turn skip its own terminal completion.
             stream_emitter = ChatStreamEmitter(self, request)
             model._response_emitter = stream_emitter
+            retry_state = getattr(model, "_provider_retry_state", None)
+            if retry_state is not None:
+                async def publish_retry_event(event: dict[str, Any]) -> None:
+                    phase = event.get("event")
+                    await self.send_response(
+                        request,
+                        response_key=f"provider_retry:{request.RequestID}",
+                        content=("Provider retry wait finished." if phase == "retry_wait_completed"
+                                 else "Provider retry is waiting."),
+                        complete=False,
+                        complete_request=False,
+                        metadata={
+                            "runtime_telemetry": {"provider_retry": event["provider_retry"]},
+                            "provider_retry_event_id": event["event_id"],
+                        },
+                    )
+                retry_state.bind_async_event_sink(publish_retry_event, asyncio.get_running_loop())
             await self._notify_bloodhound_degraded_once(model, request)
 
             def approval_context() -> dict[str, str]:
