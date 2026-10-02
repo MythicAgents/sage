@@ -460,6 +460,37 @@ one new attempt to that stopped slot. The previous attempt remains retained.
 Recovery events are part of the evaluation evidence and should be reported
 alongside outcomes and resource completeness.
 
+### Recover a staged reset after a readiness failure
+
+`scripts/reset_recover.py` handles the narrow case where the first arm completed
+and was cleaned, and the second reset passed every mutation stage through foothold
+launch but failed its final readiness check. It does not recover earlier reset
+failures or an arm that has started model execution.
+
+Run the verifier separately from a measurement checkout whose source identity
+matches the retained contract exactly. It validates the original authority and
+requires an explicit operator recovery authorization. Its default is a read-only
+check; add `--execute` only to append the verified checkpoint:
+
+```bash
+.venv/bin/python skills/sage-eval-gauge/scripts/reset_recover.py --source-root <original-measurement-checkout> --artifact-dir <pair-directory> --protected-manifest <original-manifest> --route-smoke <original-smoke> --live-authority-file <original-authority> --authorization-source "<operator recovery authorization>"
+```
+
+Recovery checks the original stage sequence, source and case bindings, clean
+Mythic/BloodHound state, callback generation and current readiness. An active
+driver or pair blocks recovery. It retains a separate verifier audit and failed
+setup time; it does not start a model, repeat the reset, or replace prior results.
+After successful execution, launch the original cohort's `resume` command from
+the matching measurement checkout. Keep its configuration and source intact.
+Do not use generic `cleanup` for an interrupted second reset: its last measured
+runtime identity belongs to the already completed first arm.
+
+For an alternate start, include `--case-descriptor <original-case.json>`.
+The measurement checkout also needs its original operator configuration and a
+local Sage process running from that checkout. A source snapshot alone does not
+restore runtime readiness. The verifier reports failed checks without saving a
+reset checkpoint; repair the reported dependency before checking again.
+
 ### Close an interrupted attempt without continuing its model
 
 Use the pair runner's `cleanup --artifact-dir <interrupted-pair-directory>`
