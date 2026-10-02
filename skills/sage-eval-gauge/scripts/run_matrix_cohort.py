@@ -53,6 +53,12 @@ RESET_DIAGNOSTIC_CODES = frozenset({
     "unclassified", "postgres_config_missing", "postgres_remove_failed", "disk_full", "port_conflict",
     "docker_unavailable", "dependency_unhealthy", "services_not_ready", "startup_timeout",
 })
+SAFE_CHILD_FAILURES = {
+    ("PilotError", "matrix live authority does not bind the exact pair contract"):
+        "matrix live authority does not bind the exact pair contract",
+    ("PilotError", "matrix live authority does not bind this route, start and protocol"):
+        "matrix live authority does not bind this route, start and protocol",
+}
 
 
 class DriverError(RuntimeError):
@@ -627,6 +633,18 @@ def _invoke(argv: list[str], lock_fd: int, *,
     return code, parsed if isinstance(parsed, dict) else None
 
 
+def _safe_child_failure(result: dict[str, Any] | None) -> str | None:
+    """Translate only exact, fixed producer errors; never echo child prose."""
+    if not isinstance(result, dict) or result.get("ready") is not False:
+        return None
+    error_type = result.get("error_type")
+    reason = result.get("reason")
+    if type(error_type) is not str or type(reason) is not str:
+        return None
+    safe_reason = SAFE_CHILD_FAILURES.get((error_type, reason))
+    return f"{error_type}: {safe_reason}" if safe_reason is not None else None
+
+
 def _run_phase(journal: Journal, phase: str, plan: dict[str, Any], slot: dict[str, Any],
                attempt: dict[str, Any], attempt_dir: Path, number: int, lock_fd: int,
                *, resume_pair: bool = False) -> None:
@@ -639,7 +657,7 @@ def _run_phase(journal: Journal, phase: str, plan: dict[str, Any], slot: dict[st
     if resume_pair:
         command.append("--resume")
         journal.event("pair_resume_requested", slot=slot_id, attempt=number)
-    code, _ = _invoke(command, lock_fd, progress=lambda elapsed: _terminal_progress(
+    code, result = _invoke(command, lock_fd, progress=lambda elapsed: _terminal_progress(
         phase, slot_id, number, artifact_dir, elapsed))
     journal.event("phase_returned", slot=slot_id, attempt=number, phase=phase,
                   detail=f"exit={code} elapsed={int(time.monotonic() - started)}s")
@@ -650,7 +668,11 @@ def _run_phase(journal: Journal, phase: str, plan: dict[str, Any], slot: dict[st
         suffix = f"; {reset_detail}" if reset_detail is not None and state in {
             "setup_interrupted", "setup_stopped", "pair_interrupted", "pair_stopped"
         } else ""
-        raise DriverError(f"{phase} ended in {state}{suffix}; inspect {artifact_dir} before resuming")
+        diagnostic = _safe_child_failure(result) if code != 0 else None
+        failure = f"{phase} ended in {state} (exit={code}; {diagnostic or 'no safe child diagnostic'})"
+        journal.event("phase_failed", slot=slot_id, attempt=number, phase=phase,
+                      detail=f"state={state} exit={code} diagnostic={diagnostic or 'unavailable'}")
+        raise DriverError(f"{failure}{suffix}; inspect {artifact_dir} before resuming")
 
 
 def _replay(journal: Journal, slot: dict[str, Any], attempt_dir: Path,

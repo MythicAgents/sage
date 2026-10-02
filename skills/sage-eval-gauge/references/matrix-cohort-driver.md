@@ -388,6 +388,11 @@ was achieved. The final `complete` JSON means the cohort lifecycle finished;
 inspect the replay and outcome evidence for objective results. Stdout retains
 the command's JSON summaries. A nonzero exit and the final log entry identify
 the phase needing attention. Give that directory to Codex for diagnosis.
+For a failed setup or pair subprocess, `phase_failed` records the exit code,
+retained ledger state, and any recognized fixed authority diagnostic. The driver
+never copies arbitrary child output into its log; `diagnostic=unavailable` means
+the child supplied no recognized safe diagnosis. A pre-ledger failure may still
+show `needs_setup` because that state describes retained producer evidence.
 
 Raw model failures retain `model_error_diagnostic` in the completed checkpoint,
 transcript, and pilot execution record, plus a `model_request_failed` progress

@@ -480,6 +480,99 @@ def test_subprocess_wait_keeps_heartbeat_after_stdout_closes(tmp_path, monkeypat
     assert ticks and ticks[0] >= 0.05
 
 
+@pytest.mark.parametrize("error_type,reason,expected", [
+    ("PilotError", "matrix live authority does not bind the exact pair contract",
+     "PilotError: matrix live authority does not bind the exact pair contract"),
+    ("PilotError", "matrix live authority does not bind this route, start and protocol",
+     "PilotError: matrix live authority does not bind this route, start and protocol"),
+    ("OtherError", "matrix live authority does not bind the exact pair contract", None),
+    ("PilotError", "matrix live authority does not bind the exact pair contract!", None),
+    ("PilotError", "matrix live authority does not bind the exact pair contract SECRET", None),
+])
+def test_phase_failure_accepts_only_exact_fixed_child_diagnostic(
+    tmp_path, monkeypatch, capsys, error_type, reason, expected,
+):
+    path, work = plan_file(tmp_path)
+    monkeypatch.setattr(driver, "ROOT", tmp_path)
+    secret = "PLANTED-CHILD-SECRET"
+    result = json.dumps({"ready": False, "error_type": error_type, "reason": reason,
+                         "extra": secret})
+    script = "import sys; sys.stderr.write(sys.argv[2]); print(sys.argv[1]); sys.exit(1)"
+    monkeypatch.setattr(driver, "_cli", lambda *_: [sys.executable, "-c", script, result, secret])
+    attempt_dir = work / "slot-001-attempt-001"
+    attempt_dir.mkdir(parents=True)
+    fd = os.open(tmp_path / "lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        with pytest.raises(driver.DriverError) as failure:
+            plan = driver.load_plan(path)
+            slot = plan["slots"][0]
+            driver._run_phase(driver.Journal(work), "run-pair", plan, slot,
+                              slot["attempts"][0], attempt_dir, 1, fd)
+    finally:
+        os.close(fd)
+    visible = str(failure.value) + capsys.readouterr().err
+    log = (work / driver.LOG_NAME).read_text()
+    events = [json.loads(line) for line in (work / driver.EVENTS_NAME).read_text().splitlines()]
+    assert "run-pair ended in needs_setup (exit=1;" in visible
+    assert any(row["event"] == "phase_failed" and "state=needs_setup exit=1" in row["detail"]
+               for row in events)
+    if expected:
+        assert expected in visible
+        assert expected in log
+    else:
+        assert "no safe child diagnostic" in visible
+        assert "diagnostic=unavailable" in log
+    assert secret not in visible + log + json.dumps(events)
+
+
+@pytest.mark.parametrize("output", ["not JSON", "", "[]", '{"ready": false,'])
+def test_phase_failure_with_unstructured_child_output_names_exit_safely(
+    tmp_path, monkeypatch, capsys, output,
+):
+    path, work = plan_file(tmp_path)
+    monkeypatch.setattr(driver, "ROOT", tmp_path)
+    secret = "PLANTED-CHILD-SECRET"
+    script = "import sys; sys.stderr.write(sys.argv[2]); print(sys.argv[1]); sys.exit(7)"
+    monkeypatch.setattr(driver, "_cli", lambda *_: [sys.executable, "-c", script, output, secret])
+    attempt_dir = work / "slot-001-attempt-001"
+    attempt_dir.mkdir(parents=True)
+    fd = os.open(tmp_path / "lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        with pytest.raises(driver.DriverError, match="exit=7; no safe child diagnostic"):
+            plan = driver.load_plan(path)
+            slot = plan["slots"][0]
+            driver._run_phase(driver.Journal(work), "run-pair", plan, slot,
+                              slot["attempts"][0], attempt_dir, 1, fd)
+    finally:
+        os.close(fd)
+    assert "diagnostic=unavailable" in (work / driver.LOG_NAME).read_text()
+    assert secret not in (work / driver.LOG_NAME).read_text() + capsys.readouterr().err
+
+
+def test_successful_phase_keeps_existing_subprocess_state_boundary(tmp_path, monkeypatch):
+    path, work = plan_file(tmp_path)
+    monkeypatch.setattr(driver, "ROOT", tmp_path)
+    script = (
+        "import json, pathlib, sys; "
+        "p=pathlib.Path(sys.argv[1])/'setup-rehearsals.jsonl'; "
+        "p.write_text(json.dumps({'record_type':'setup_rehearsal_result','complete':True})+'\\n'); "
+        "print(json.dumps({'complete':True}))"
+    )
+    monkeypatch.setattr(driver, "_cli", lambda *args: [sys.executable, "-c", script, str(args[-1])])
+    attempt_dir = work / "slot-001-attempt-001"
+    attempt_dir.mkdir(parents=True)
+    fd = os.open(tmp_path / "lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        plan = driver.load_plan(path)
+        slot = plan["slots"][0]
+        driver._run_phase(driver.Journal(work), "rehearse-setup", plan, slot,
+                          slot["attempts"][0], attempt_dir, 1, fd)
+    finally:
+        os.close(fd)
+    assert driver._phase_state(attempt_dir) == "needs_pair"
+    assert "phase_failed" not in (work / driver.LOG_NAME).read_text()
+
+
 def test_terminal_reports_safe_ledger_stage_and_phase_completion(tmp_path, monkeypatch, capsys):
     path, work = plan_file(tmp_path)
     monkeypatch.setattr(driver, "ROOT", tmp_path)
