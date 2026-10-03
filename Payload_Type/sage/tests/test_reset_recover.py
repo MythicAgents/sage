@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import fcntl
 import os
 from pathlib import Path
 import subprocess
@@ -247,6 +248,166 @@ def test_readiness_diagnostic_uses_only_known_section_names():
     labels = recover._readiness_failure_labels(readiness, {"returncode": 0, "domain_count": 0})
     assert labels == "bloodhound_api, runtime_identity"
     assert "secret" not in labels
+
+
+def pre_arm_rows():
+    contract = SimpleNamespace(source_identity="source-a", alternate_start=None,
+                               arm_order=("raw-mythic-bloodhound", "shipping-sage"))
+    records = [
+        {"record_type": "contract"},
+        {"record_type": "resumable_origin", "schema": "sage-pair-checkpoint-v1"},
+        {"record_type": "preflight", "ready": True},
+        {"record_type": "attempted_start", "arm": contract.arm_order[0], "arm_index": 0},
+        {"record_type": "reset_intent", "arm": contract.arm_order[0], "arm_index": 0,
+         "recorded_at": "2026-10-02T13:00:00+00:00"},
+    ]
+    stages = [{"record_type": "reset_stage", "arm": contract.arm_order[0],
+               "stage": stage, "status": status}
+              for stage in recover.PRE_ARM_PREFIX for status in ("started", "passed")]
+    stages.extend([
+        {"record_type": "reset_stage", "arm": contract.arm_order[0],
+         "stage": "foothold-launch", "status": "started"},
+        {"record_type": "reset_stage", "arm": contract.arm_order[0],
+         "stage": "foothold-launch", "status": "failed", "error_class": "SystemExit",
+         "exit_code": 2, "recorded_at": "2026-10-02T13:04:00+00:00"},
+    ])
+    return contract, records, stages
+
+
+def validate_pre_arm(contract, records, stages, tmp_path):
+    def read_records(path):
+        return stages if path.name == "reset-stages.jsonl" else records
+    pair = SimpleNamespace(read_records=read_records, _replay_contract=lambda _: contract,
+                           _source_identity_at=lambda _: "source-a",
+                           MatrixPairContract=type(contract))
+    return recover._validate_pre_arm_ledger(pair, tmp_path, tmp_path, None)
+
+
+def test_pre_arm_cleanup_requires_exact_pre_producer_failure(tmp_path):
+    contract, records, stages = pre_arm_rows()
+    selected, _, _, failure = validate_pre_arm(contract, records, stages, tmp_path)
+    assert selected is contract and failure["exit_code"] == 2
+    for extra in ("arm_started", "producer_intent", "arm_result", "reset_completed",
+                  "comparison", "pre_arm_cleanup_intent", "recovery_cleanup"):
+        with pytest.raises(recover.RecoveryError, match="ledger"):
+            validate_pre_arm(contract, records + [{"record_type": extra}], stages, tmp_path)
+    with pytest.raises(recover.RecoveryError, match="stage sequence"):
+        validate_pre_arm(contract, records, stages[:-1], tmp_path)
+    with pytest.raises(recover.RecoveryError, match="recoverable failure"):
+        validate_pre_arm(contract, records, stages[:-1] + [{**stages[-1], "exit_code": 1}], tmp_path)
+    with pytest.raises(recover.RecoveryError, match="preflight"):
+        validate_pre_arm(contract, records[:2] + [{**records[2], "ready": False}] + records[3:], stages, tmp_path)
+
+
+@pytest.mark.parametrize("contamination", ["task", "credential", "request", "callback", "unknown_callback", "bloodhound", "range"])
+def test_pre_arm_attestation_rejects_nonempty_or_wrong_control_plane(tmp_path, monkeypatch, contamination):
+    async def login():
+        return SimpleNamespace(current_operation_id=8)
+    async def query(*_args, **_kwargs):
+        return {"chat_request": [{}] if contamination == "request" else []}
+    monkeypatch.setitem(sys.modules, "mythic", SimpleNamespace(mythic=SimpleNamespace(execute_custom_query=query)))
+    callback = {"display_id": 4, "active": False}
+    if contamination == "callback":
+        callback["active"] = True
+    if contamination == "unknown_callback":
+        del callback["active"]
+    snapshot = {"task": [{}] if contamination == "task" else [],
+                "credential": [{}] if contamination == "credential" else [], "callback": [callback]}
+    ludus = {"ready": True, "range_profile": {"id": "profile", "qualification": {"state": "live_qualified"},
+                                               "scenarios": ["scenario"]},
+             "vms": [{"canonical_name": "HOST"}]}
+    if contamination == "range":
+        ludus["ready"] = False
+    pair = SimpleNamespace(
+        _validate_protected_at=lambda *_: None, _fixture_at=lambda *_: {},
+        _validate_external_paths=lambda: {}, _validate_route_smoke=lambda *_: {},
+        _load=lambda *_: SimpleNamespace(probe_ludus_status=lambda **_: ludus),
+        live_seams=SimpleNamespace(bloodhound_empty_state_evidence=lambda: {
+            "returncode": 0, "domain_count": 1 if contamination == "bloodhound" else 0}),
+        RANGE_PROFILE="profile", SCENARIO="scenario", CANONICAL_INVENTORY=("HOST",))
+    runtime = SimpleNamespace(protected_manifest=tmp_path / "manifest", source_root=tmp_path,
+                              _staged_interactive_foothold=lambda: None,
+                              route_smoke=tmp_path / "smoke", _configured_route=lambda: {},
+                              native=SimpleNamespace(login=login),
+                              _operation_snapshot=lambda *_: snapshot)
+    contract = SimpleNamespace(route=SimpleNamespace(), alternate_start=None,
+                               arm_order=("raw-mythic-bloodhound", "shipping-sage"))
+    with pytest.raises(recover.RecoveryError):
+        recover._attest_pre_arm_cleanup(pair, runtime, contract)
+
+
+def test_pre_arm_cleanup_check_and_execute_write_order(tmp_path, monkeypatch):
+    root = tmp_path / "run/slot-001-attempt-001/pair"
+    root.mkdir(parents=True)
+    (tmp_path / "run/.driver.lock").touch()
+    lock_path = tmp_path / "pair.lock"
+    contract, records, _ = pre_arm_rows()
+    contract.setup_cleanup_seconds = float("inf")
+    records[2].update(live_authority={"authority_id": "a", "authority_sha256": "h"},
+                      protected_source={"manifest_sha256": "hash"}, route_smoke={"sha256": "hash"})
+    writes = []
+    events = []
+    runtime = SimpleNamespace(teardown=lambda _arm, _start: events.append("teardown") or
+                              {"complete": True, "steps": [{"name": "poweroff_range", "ok": True}]})
+    pair = SimpleNamespace(validate_artifact_dir=lambda _: root,
+                           pilot_core=SimpleNamespace(_pair_lock_path=lambda _: lock_path),
+                           _resolve_live_authority=lambda *_: {"authority_id": "a", "authority_sha256": "h"},
+                           _sha256=lambda _: "hash", _runtime=lambda *_: runtime,
+                           append_record=lambda _path, row: (writes.append(row), events.append(row["record_type"])))
+    monkeypatch.setattr(recover, "_load_snapshot", lambda _: pair)
+    monkeypatch.setattr(recover, "_validate_pre_arm_ledger", lambda *_: (
+        contract, records, records[-1], {"recorded_at": "2026-10-02T13:04:00+00:00"}))
+    monkeypatch.setattr(recover, "_attest_pre_arm_cleanup", lambda *_: {"operation_id": 8})
+    args = (tmp_path, root, tmp_path / "manifest", tmp_path / "smoke", tmp_path / "authority", "operator cleanup")
+    with (tmp_path / "run/.driver.lock").open("r+b") as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(recover.RecoveryError, match="driver is still active"):
+            recover.cleanup_pre_arm(*args, execute=True)
+    assert writes == [] and events == []
+    pair._resolve_live_authority = lambda *_: {"authority_id": "different", "authority_sha256": "h"}
+    with pytest.raises(recover.RecoveryError, match="authority differs"):
+        recover.cleanup_pre_arm(*args, execute=True)
+    assert writes == [] and events == []
+    pair._resolve_live_authority = lambda *_: {"authority_id": "a", "authority_sha256": "h"}
+    assert recover.cleanup_pre_arm(*args)["mode"] == "check"
+    assert writes == [] and events == []
+    result = recover.cleanup_pre_arm(*args, execute=True)
+    assert result["complete"] is True
+    assert [row["record_type"] for row in writes] == [
+        "pre_arm_cleanup_intent", "pre_arm_cleanup_audit", "recovery_cleanup"]
+    assert events == ["pre_arm_cleanup_intent", "pre_arm_cleanup_audit", "teardown", "recovery_cleanup"]
+    assert result["cleanup"]["failed_reset_elapsed_seconds"] == 240.0
+
+
+def test_pre_arm_cleanup_failure_retains_failed_receipt(tmp_path, monkeypatch):
+    root = tmp_path / "run/slot-001-attempt-001/pair"
+    root.mkdir(parents=True)
+    (tmp_path / "run/.driver.lock").touch()
+    contract, records, _ = pre_arm_rows()
+    contract.setup_cleanup_seconds = float("inf")
+    records[2].update(live_authority={"authority_id": "a", "authority_sha256": "h"},
+                      protected_source={"manifest_sha256": "hash"}, route_smoke={"sha256": "hash"})
+    writes = []
+    def failed_teardown(_arm, _start):
+        raise RuntimeError("private command output")
+    pair = SimpleNamespace(
+        validate_artifact_dir=lambda _: root,
+        pilot_core=SimpleNamespace(_pair_lock_path=lambda _: tmp_path / "pair.lock"),
+        _resolve_live_authority=lambda *_: {"authority_id": "a", "authority_sha256": "h"},
+        _sha256=lambda _: "hash",
+        _runtime=lambda *_: SimpleNamespace(teardown=failed_teardown),
+        append_record=lambda _path, row: writes.append(row))
+    monkeypatch.setattr(recover, "_load_snapshot", lambda _: pair)
+    monkeypatch.setattr(recover, "_validate_pre_arm_ledger", lambda *_: (
+        contract, records, records[-1], {"recorded_at": "2026-10-02T13:04:00+00:00"}))
+    monkeypatch.setattr(recover, "_attest_pre_arm_cleanup", lambda *_: {"operation_id": 8})
+    result = recover.cleanup_pre_arm(tmp_path, root, tmp_path / "manifest", tmp_path / "smoke",
+                                     tmp_path / "authority", "operator cleanup", execute=True)
+    assert result["complete"] is False
+    assert [row["record_type"] for row in writes] == [
+        "pre_arm_cleanup_intent", "pre_arm_cleanup_audit", "recovery_cleanup"]
+    assert writes[-1]["complete"] is False and writes[-1]["error_type"] == "RuntimeError"
+    assert "private command output" not in str(result)
 
 
 if __name__ == "__main__":

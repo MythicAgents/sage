@@ -29,6 +29,7 @@ PREFIX = (
     "wipe-bloodhound", "bloodhound-empty", "restart-sage",
     "bootstrap-foothold", "foothold-power", "foothold-launch",
 )
+PRE_ARM_PREFIX = PREFIX[:-1]
 READINESS_SECTIONS = (
     "authentication", "bloodhound_api", "bloodhound_mcp", "callbacks",
     "channel", "clock", "foothold", "ludus", "mythic_chat",
@@ -131,6 +132,100 @@ def _validate_ledger(pair, root: Path, source_root: Path, case_descriptor: Path 
     if any(row.get("record_type") in {"reset_recovery_intent", "reset_recovery_audit"} for row in records):
         raise RecoveryError("bounded reset recovery was already attempted")
     return contract, records, intent, current[-1]
+
+
+def _validate_pre_arm_ledger(pair, root: Path, source_root: Path,
+                             case_descriptor: Path | None):
+    """Admit only an untouched first arm whose launcher failed after staged reset."""
+    records = pair.read_records(root / "pilot.jsonl")
+    contract = pair._replay_contract(records)
+    if not isinstance(contract, pair.MatrixPairContract):
+        raise RecoveryError("pre-arm cleanup requires a retained matrix pair")
+    if contract.source_identity != pair._source_identity_at(source_root):
+        raise RecoveryError("measurement source differs from the retained pair contract")
+    if contract.alternate_start is not None:
+        if case_descriptor is None:
+            raise RecoveryError("alternate start requires the original case descriptor")
+        binding = pair._load_alternate_start(case_descriptor)
+        if binding.to_record() != contract.alternate_start.to_record():
+            raise RecoveryError("case descriptor differs from the retained alternate start")
+        contract = replace(contract, alternate_start=binding)
+    elif case_descriptor is not None:
+        raise RecoveryError("default start cannot use an alternate case descriptor")
+    expected_records = ["contract", "resumable_origin", "preflight", "attempted_start", "reset_intent"]
+    if [row.get("record_type") for row in records] != expected_records:
+        raise RecoveryError("pre-arm ledger has measured, terminal, or cleanup activity")
+    if records[1].get("schema") != "sage-pair-checkpoint-v1":
+        raise RecoveryError("resumable origin is malformed")
+    if records[2].get("ready") is not True:
+        raise RecoveryError("retained pair preflight is not ready")
+    arm = contract.arm_order[0]
+    if any(records[index].get("arm") != arm or records[index].get("arm_index") != 0
+           for index in (3, 4)):
+        raise RecoveryError("interrupted reset is not the first arm")
+    stages = pair.read_records(root / "reset-stages.jsonl")
+    expected_stages = [(stage, status) for stage in PRE_ARM_PREFIX
+                       for status in ("started", "passed")]
+    expected_stages += [("foothold-launch", "started"), ("foothold-launch", "failed")]
+    if ([(row.get("stage"), row.get("status")) for row in stages] != expected_stages or
+            any(row.get("arm") != arm or row.get("record_type") != "reset_stage" for row in stages)):
+        raise RecoveryError("reset stage sequence is not the known pre-arm foothold-launch failure")
+    failure = stages[-1]
+    if failure.get("error_class") != "SystemExit" or failure.get("exit_code") != 2:
+        raise RecoveryError("foothold-launch failure differs from the recoverable failure")
+    return contract, records, records[-1], failure
+
+
+def _attest_pre_arm_cleanup(pair, runtime, contract):
+    """Observe only control planes; no callback or measured start is expected."""
+    pair._validate_protected_at(runtime.protected_manifest, runtime.source_root)
+    pair._fixture_at(runtime.source_root, contract.alternate_start)
+    runtime._staged_interactive_foothold()
+    pair._validate_external_paths()
+    pair._validate_route_smoke(runtime.route_smoke, runtime._configured_route(), contract.route)
+    client = asyncio.run(runtime.native.login())
+    operation_id = getattr(client, "current_operation_id", None)
+    if type(operation_id) is not int or operation_id <= 0:
+        raise RecoveryError("Mythic operation identity is unavailable")
+    snapshot = runtime._operation_snapshot(client, operation_id)
+    if snapshot.get("task") != [] or snapshot.get("credential") != []:
+        raise RecoveryError("current Mythic operation contains tasks or credentials")
+    callbacks = snapshot.get("callback")
+    if not isinstance(callbacks, list) or any(not isinstance(row, Mapping) for row in callbacks):
+        raise RecoveryError("current Mythic callback census is malformed")
+    if any(row.get("active") is not False for row in callbacks):
+        raise RecoveryError("current Mythic operation has an active or unknown callback")
+    from mythic import mythic
+    async def requests():
+        return await asyncio.wait_for(mythic.execute_custom_query(
+            client,
+            "query PreArmCleanupRequests($operationId: Int!) { chat_request(where: {operation_id: {_eq: $operationId}}) { id status } }",
+            variables={"operationId": operation_id},
+        ), timeout=60)
+    request_census = asyncio.run(requests())
+    if not isinstance(request_census, Mapping) or request_census.get("chat_request") != []:
+        raise RecoveryError("current Mythic operation contains chat requests or request census is unavailable")
+    bh = pair.live_seams.bloodhound_empty_state_evidence()
+    if not isinstance(bh, Mapping) or bh.get("returncode") != 0 or bh.get("domain_count") != 0:
+        raise RecoveryError("BloodHound is not empty")
+    readiness = pair._load(
+        "pre_arm_cleanup_readiness", runtime.source_root / "skills/sage-goad-reset/scripts/readiness_contract.py")
+    ludus = readiness.probe_ludus_status(profile=pair.RANGE_PROFILE)
+    profile = ludus.get("range_profile") or {}
+    expected_inventory = sorted(str(value) for value in pair.CANONICAL_INVENTORY)
+    observed_inventory = sorted(str(row.get("canonical_name") or "") for row in ludus.get("vms") or [])
+    if (ludus.get("ready") is not True or profile.get("id") != pair.RANGE_PROFILE or
+            (profile.get("qualification") or {}).get("state") != "live_qualified" or
+            pair.SCENARIO not in (profile.get("scenarios") or []) or
+            observed_inventory != expected_inventory):
+        raise RecoveryError("current Ludus range is not the qualified bound inventory")
+    runtime.current_client = client
+    runtime.current_operation_id = operation_id
+    runtime.current_arm = contract.arm_order[0]
+    return {"operation_id": operation_id, "task_count": 0, "credential_count": 0,
+            "active_callback_count": 0, "chat_request_count": 0,
+            "bloodhound_domain_count": 0, "range_profile": profile.get("id"),
+            "range_inventory": observed_inventory}
 
 
 def _attest(pair, runtime, contract, prior_start: Mapping[str, Any],
@@ -338,6 +433,107 @@ def recover(source_root: Path, artifact_dir: Path, protected_manifest: Path, rou
             raise
 
 
+def cleanup_pre_arm(source_root: Path, artifact_dir: Path, protected_manifest: Path,
+                    route_smoke: Path, live_authority_file: Path, authorization_source: str,
+                    *, case_descriptor: Path | None = None, execute: bool = False) -> dict[str, Any]:
+    """Settle an interrupted first-arm reset after proving no producer ever began."""
+    pair = _load_snapshot(source_root)
+    root = pair.validate_artifact_dir(artifact_dir)
+    if root != artifact_dir.expanduser().resolve():
+        raise RecoveryError("artifact directory resolved unexpectedly")
+    lock_path = root.parent.parent / ".driver.lock"
+    if not lock_path.is_file():
+        raise RecoveryError("cohort driver lock file is missing")
+    with ExitStack() as stack:
+        lock = stack.enter_context(lock_path.open("r+b"))
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RecoveryError("cohort driver is still active") from exc
+        pair_lock = pair.pilot_core._pair_lock_path(root)
+        descriptor = os.open(pair_lock, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        stack.callback(os.close, descriptor)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RecoveryError("pair runner is still active") from exc
+        contract, records, reset_intent, failed_stage = _validate_pre_arm_ledger(
+            pair, root, source_root, case_descriptor)
+        if not isinstance(authorization_source, str) or not authorization_source.strip():
+            raise RecoveryError("explicit pre-arm cleanup authorization source is required")
+        authority = pair._resolve_live_authority(
+            argparse.Namespace(command="run-pair", live_authority_id=None, resume=True,
+                               live_authority_file=str(live_authority_file)), contract)
+        preflight = _single(records, "preflight")
+        retained_authority = preflight.get("live_authority") or {}
+        if (authority.get("authority_id") != retained_authority.get("authority_id") or
+                authority.get("authority_sha256") != retained_authority.get("authority_sha256")):
+            raise RecoveryError("current run-pair authority differs from the retained pair authority")
+        if (pair._sha256(protected_manifest) != (preflight.get("protected_source") or {}).get("manifest_sha256") or
+                pair._sha256(route_smoke) != (preflight.get("route_smoke") or {}).get("sha256")):
+            raise RecoveryError("protected source or route smoke differs from the retained pair preflight")
+        args = argparse.Namespace(artifact_dir=str(root), protected_manifest=str(protected_manifest),
+                                  route_smoke=str(route_smoke), measurement_metadata=None)
+        runtime = pair._runtime(args, contract)
+        runtime.recovery_enabled = True
+        runtime.resuming_pair = True
+        started = time.monotonic()
+        evidence = _attest_pre_arm_cleanup(pair, runtime, contract)
+        try:
+            failed_elapsed = max(0.0, (
+                datetime.fromisoformat(failed_stage["recorded_at"]) -
+                datetime.fromisoformat(reset_intent["recorded_at"])).total_seconds())
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RecoveryError("failed reset timing is malformed") from exc
+        prior_support = max((float(row.get("setup_cleanup_elapsed_seconds", 0.0))
+                             for row in records if isinstance(row.get("setup_cleanup_elapsed_seconds"), (int, float))),
+                            default=0.0)
+        support_elapsed = prior_support + failed_elapsed + max(0.0, time.monotonic() - started)
+        if support_elapsed > contract.setup_cleanup_seconds:
+            raise RecoveryError("setup and cleanup support allowance was exhausted")
+        if not execute:
+            return {"complete": True, "mode": "check", "artifact_dir": str(root),
+                    "evidence": evidence, "failed_reset_elapsed_seconds": failed_elapsed,
+                    "setup_cleanup_elapsed_seconds": support_elapsed,
+                    "next": "repeat with --execute to perform one bounded pre-arm cleanup"}
+        arm = contract.arm_order[0]
+        ledger = root / "pilot.jsonl"
+        pair.append_record(ledger, {"record_type": "pre_arm_cleanup_intent", "arm": arm,
+                                    "schema": "sage-pre-arm-cleanup-v1",
+                                    "verifier_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                                    "authorization_source": authorization_source.strip(),
+                                    "authority_id": authority.get("authority_id"),
+                                    "authority_sha256": authority.get("authority_sha256"),
+                                    "measurement_source_identity": contract.source_identity})
+        pair.append_record(ledger, {"record_type": "pre_arm_cleanup_audit", "arm": arm,
+                                    "schema": "sage-pre-arm-cleanup-v1", "evidence": evidence,
+                                    "failed_reset_elapsed_seconds": failed_elapsed,
+                                    "setup_cleanup_elapsed_seconds": support_elapsed})
+        cleanup_started = time.monotonic()
+        try:
+            teardown = dict(runtime.teardown(arm, None))
+        except BaseException as exc:
+            teardown = {"complete": False, "error_type": type(exc).__name__}
+        elapsed = support_elapsed + max(0.0, time.monotonic() - cleanup_started)
+        safe_steps = [{key: step[key] for key in ("name", "ok", "returncode", "timeout", "wall_seconds")
+                       if key in step} for step in teardown.get("steps", []) if isinstance(step, Mapping)]
+        result = {"record_type": "recovery_cleanup", "arm": arm,
+                  "schema": "sage-pre-arm-cleanup-v1",
+                  "complete": teardown.get("complete") is True and elapsed <= contract.setup_cleanup_seconds,
+                  "state": "pre_arm_reset_cleanup", "steps": safe_steps,
+                  "failed_reset_elapsed_seconds": failed_elapsed,
+                  "recovery_elapsed_seconds": max(0.0, time.monotonic() - cleanup_started),
+                  "setup_cleanup_elapsed_seconds": elapsed,
+                  "support_budget_exhausted": elapsed > contract.setup_cleanup_seconds}
+        if teardown.get("error_type"):
+            result["error_type"] = teardown["error_type"]
+        pair.append_record(ledger, result)
+        return {"complete": result["complete"], "mode": "execute", "artifact_dir": str(root),
+                "cleanup": result,
+                "next": ("prepare a new prospective cohort" if result["complete"]
+                         else "inspect the retained failed cleanup; no automatic retry")}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", required=True, type=Path)
@@ -347,12 +543,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--live-authority-file", required=True, type=Path)
     parser.add_argument("--case-descriptor", type=Path)
     parser.add_argument("--authorization-source", required=True)
-    parser.add_argument("--execute", action="store_true", help="Append one verified recovery checkpoint; default only checks.")
+    parser.add_argument("--execute", action="store_true",
+                        help="Save reset checkpoint, or perform verified pre-arm teardown in cleanup mode; default only checks.")
+    parser.add_argument("--cleanup-pre-arm", action="store_true",
+                        help="Verify and settle only an interrupted first-arm foothold-launch reset.")
     args = parser.parse_args(argv)
     try:
-        result = recover(args.source_root, args.artifact_dir, args.protected_manifest, args.route_smoke,
-                         args.live_authority_file, args.authorization_source,
-                         case_descriptor=args.case_descriptor, execute=args.execute)
+        selected = cleanup_pre_arm if args.cleanup_pre_arm else recover
+        result = selected(args.source_root, args.artifact_dir, args.protected_manifest, args.route_smoke,
+                          args.live_authority_file, args.authorization_source,
+                          case_descriptor=args.case_descriptor, execute=args.execute)
     except (RecoveryError, OSError, ValueError, RuntimeError) as exc:
         result = {"complete": False, "error_type": type(exc).__name__, "reason": str(exc)}
     print(json.dumps(result, indent=2, sort_keys=True))

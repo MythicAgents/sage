@@ -491,6 +491,25 @@ local Sage process running from that checkout. A source snapshot alone does not
 restore runtime readiness. The verifier reports failed checks without saving a
 reset checkpoint; repair the reported dependency before checking again.
 
+### Clean up a reset that failed before the first arm
+
+Add `--cleanup-pre-arm` to the same verifier command for a first-arm reset whose
+stages passed through foothold power-on but whose launcher exited with code 2.
+This mode requires no measured arm or producer start, no earlier cleanup attempt,
+the original source and authority, an empty Mythic operation with no active
+callbacks, and empty BloodHound. It also checks the configured range before cleanup.
+
+The default checks without changing the range. With `--execute`, it records cleanup
+intent and observations, then uses the existing teardown to stop local Sage,
+archive runtime databases, power off the range, deactivate callbacks, and wipe and
+verify BloodHound. A successful teardown records `recovery_cleanup`; it never
+creates an arm-start or reset-completed checkpoint. Failed or interrupted cleanup
+remains retained for inspection rather than permitting an automatic retry.
+
+After successful cleanup, prepare the unmeasured pairs in a fresh cohort, retaining
+the failed attempt and every completed pair. The failed attempt cannot be resumed
+as though its reset had completed.
+
 ### Close an interrupted attempt without continuing its model
 
 Use the pair runner's `cleanup --artifact-dir <interrupted-pair-directory>`
