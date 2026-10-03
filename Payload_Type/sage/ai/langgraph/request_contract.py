@@ -789,7 +789,11 @@ def build_request_contract(
     elif normalized_mode == "supervised":
         lane = RequestLane.SUPERVISED_WORKFLOW
         default_intent = RequestIntent.EXECUTE
-        stop_kind = StopConditionKind.ACTIONS_COMPLETE
+        # Objective pursuit changes termination, never the supervised approval lane.
+        stop_kind = (
+            StopConditionKind.OBJECTIVE_PROVED
+            if autonomous_solve else StopConditionKind.ACTIONS_COMPLETE
+        )
     elif normalized_mode == "conversation":
         lane = RequestLane.CONVERSATIONAL
         default_intent = RequestIntent.RESPOND

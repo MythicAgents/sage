@@ -735,6 +735,72 @@ def test_hybrid_singleton_is_kernel_owned_without_model_call():
     assert decision.model_response_observed is False
 
 
+def test_hybrid_supervised_redirect_consults_model_for_singleton():
+    requests = []
+
+    async def decide(request):
+        requests.append(request)
+        return {
+            "disposition": "select",
+            "candidate_id": request["candidates"][0]["candidate_id"],
+            "rationale": "operator steer considered",
+        }
+
+    decision = asyncio.run(policy.HybridPolicy(
+        decide, consult_model_for_singleton=True,
+    ).select(
+        episode_id="episode-hybrid-redirect",
+        objective="continue objective",
+        state=State(),
+        candidates=[Action("only", "a", "effect:a")],
+        history=[],
+    ))
+    assert len(requests) == 1
+    assert requests[0]["objective"] == "continue objective"
+    assert decision.disposition == "select"
+    assert decision.policy_mode == "hybrid"
+    assert decision.selection_contract == policy.SELECTION_CONTRACT_HYBRID
+    assert decision.model_response_observed is True
+    assert decision.kernel_singleton_count == 0
+
+
+@pytest.mark.parametrize("response", [
+    {"disposition": "stop", "rationale": "cannot comply"},
+    {"disposition": "ask", "rationale": "need clarification"},
+    {"disposition": "select", "candidate_id": "invalid"},
+])
+def test_hybrid_supervised_redirect_singleton_has_no_kernel_fallback(response):
+    async def decide(_request):
+        return response
+
+    decision = asyncio.run(policy.HybridPolicy(
+        decide, consult_model_for_singleton=True,
+    ).select(
+        episode_id="episode-hybrid-redirect-denied",
+        objective="continue objective",
+        state=State(),
+        candidates=[Action("only", "a", "effect:a")],
+        history=[],
+    ))
+    assert decision.disposition != "select"
+    assert decision.selected_index is None
+    assert decision.kernel_singleton_count == 0
+
+
+def test_hybrid_supervised_redirect_without_model_seam_stops_singleton():
+    decision = asyncio.run(policy.HybridPolicy(
+        None, consult_model_for_singleton=True,
+    ).select(
+        episode_id="episode-hybrid-redirect-no-model",
+        objective="continue objective",
+        state=State(),
+        candidates=[Action("only", "a", "effect:a")],
+        history=[],
+    ))
+    assert decision.disposition == "stop"
+    assert "no model decision seam" in decision.rationale
+
+
 def test_semantic_candidate_identity_is_permutation_stable_but_ordered_frontier_hash_is_not():
     first = Action("first", "a", "effect:a")
     first.preconditions = ["b", "a"]

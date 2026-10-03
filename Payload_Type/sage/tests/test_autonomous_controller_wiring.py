@@ -73,8 +73,12 @@ def _install_supervised_contract(
     m,
     request_id="request-supervised",
     callback_ids=("3",),
+    *,
+    actions_complete=True,
 ):
-    from ai.langgraph.request_contract import build_request_contract
+    from ai.langgraph.request_contract import (
+        StopCondition, StopConditionKind, build_request_contract,
+    )
 
     m.mode = "supervised"
     m.command_name = "chat"
@@ -93,14 +97,19 @@ def _install_supervised_contract(
     m._subgoal_evidence_records = set()
     m._request_event_ledger = None
     m.state = {"messages": [], "supervisor_messages": []}
-    m.install_request_contract(build_request_contract(
+    contract = build_request_contract(
         request_id=request_id,
         channel_id="channel-1",
         operation_id="operation-1",
         mode="supervised",
         autonomous_solve=True,
         callback_ids=callback_ids,
-    ))
+    )
+    if actions_complete:
+        contract = contract.amend(
+            stop_condition=StopCondition(StopConditionKind.ACTIONS_COMPLETE)
+        )
+    m.install_request_contract(contract)
     return m
 
 
@@ -462,11 +471,11 @@ def test_supervised_denied_pending_selection_keeps_backend_provenance_telemetry(
     assert telemetry["token_usage_complete"] is True
     assert telemetry["total_tokens"] == 22
 
-    assert asyncio.run(m.handle_controller_hitl_resume("deny")) == ""
+    report = asyncio.run(m.handle_controller_hitl_resume("deny"))
+    assert "not currently admissible" in report
     telemetry = m.controller_runtime_telemetry()
-    assert telemetry["controller_status"] == "halted_denied"
-    assert telemetry["controller_terminal_reason"] == "operator denied adcs-ca-private-key-export"
-    assert telemetry["model_calls"] == 1
+    assert telemetry["controller_status"] == "halted_no_action"
+    assert telemetry["model_calls"] == 2
     assert telemetry["effective_backends"] == ["runtime-provider:runtime-model"]
     assert telemetry["backend_provenance_complete"] is True
 
@@ -684,15 +693,19 @@ def test_non_verbose_controller_only_streams_terminal_report():
 
 
 def test_supervised_controller_deny_is_sage_owned_not_controller_prefixed():
-    """A denied controller-native approval is surfaced as Sage stopping, not as a second chat speaker."""
+    """A denied controller card is a Sage-owned replan without issuing its effect."""
     calls = []
     m = _bare_model(json.dumps({"ok": True}), _state_with_remote_exec(), calls)
     m.mode = "supervised"
     m.command_name = "chat"
     m._autonomous_solve = True
     m._controller_hitl_pending = {
+        "kind": "capability",
         "tool": "execute_capability",
-        "args": {},
+        "args": {
+            "action": {"name": "earlier-action", "target": "other-host", "intent": {}},
+            "inputs": {"callback_id": "3"},
+        },
         "objective": "obtain administrative control of essos.local",
         "key": "pending-key",
     }
@@ -708,11 +721,336 @@ def test_supervised_controller_deny_is_sage_owned_not_controller_prefixed():
 
     assert asyncio.run(m.handle_controller_hitl_resume("deny")) == ""
     assert calls == []
-    assert streamed == [
-        "**Execution stopped**\n"
-        "Operator denied `execute_capability`. Sage stopped before execution.\n"
-    ]
+    assert streamed[0].startswith("**Action denied**\nOperator denied `execute_capability`.")
+    assert any("Approval required" in item for item in streamed[1:])
+    assert m._controller_hitl_objective == "obtain administrative control of essos.local"
     assert "Autonomous_Controller" not in streamed[0]
+
+
+def test_supervised_controller_denial_replans_collection_with_fresh_card():
+    state = es.EngagementState(
+        objective="obtain administrative control of essos.local",
+        footholds=[_foothold("3", host="first"), _foothold("4", host="second")],
+        hops=[], graph_facts=[],
+    )
+    calls = []
+    m = _bare_model(json.dumps({"ok": True}), state, calls)
+    m.mode = "supervised"
+    m.command_name = "chat"
+    m._autonomous_solve = True
+    m.policy_mode = "symbolic"
+    m._controller_hitl_pending = None
+    m._controller_hitl_approved_key = ""
+    m._controller_hitl_approved_pending = None
+    m._controller_hitl_objective = ""
+
+    assert asyncio.run(m._run_autonomous_controller(state.objective)) == ""
+    first = dict(m._controller_hitl_pending)
+    assert first["kind"] == "collection"
+    assert asyncio.run(m.handle_controller_hitl_resume("deny")) == ""
+    second = m._controller_hitl_pending
+    assert second["kind"] == "collection"
+    assert first["args"]["callback_id"] != second["args"]["callback_id"]
+    assert calls == []
+    assert m._controller_hitl_objective == state.objective
+
+
+def test_supervised_controller_capability_denial_offers_alternative_card(monkeypatch):
+    state = _covered_remote_exec_state()
+    calls = []
+    m = _bare_model(json.dumps({"ok": True}), state, calls)
+    m.mode = "supervised"
+    m.command_name = "chat"
+    m._autonomous_solve = True
+    m.policy_mode = "hybrid"
+    m.provider = "test"
+    m.model = "selector"
+    m._controller_hitl_pending = None
+    m._controller_hitl_approved_key = ""
+    m._controller_hitl_approved_pending = None
+    m._controller_hitl_objective = ""
+    original_candidates = model._autonomous_policy_candidates
+
+    def two_candidates(actions):
+        candidates = original_candidates(actions)
+        return [*candidates, replace(candidates[0], target="alternate-host")]
+
+    monkeypatch.setattr(model, "_autonomous_policy_candidates", two_candidates)
+    requests = []
+
+    class ChooseFirst:
+        async def ainvoke(self, messages):
+            request = json.loads(messages[-1].content)
+            requests.append(request)
+            candidate = request["candidates"][0]
+            return type("Response", (), {"content": json.dumps({
+                "disposition": "select",
+                "candidate_id": candidate["candidate_id"],
+            })})()
+
+    m.llm = ChooseFirst()
+    assert asyncio.run(m._run_autonomous_controller(state.objective)) == ""
+    first = m._controller_hitl_pending
+    assert first["kind"] == "capability"
+    assert asyncio.run(m.handle_controller_hitl_resume(
+        "deny", operator_message="Use alternate-host for the next action",
+    )) == ""
+    second = m._controller_hitl_pending
+    assert second["kind"] == "capability"
+    assert second["args"]["action"]["target"] == "alternate-host"
+    assert second["args"]["action"]["target"] != first["args"]["action"]["target"]
+    assert len(requests) == 2
+    assert requests[1]["operator_steering"] == "Use alternate-host for the next action"
+    assert requests[1]["objective"] == state.objective
+    assert calls == []
+
+
+def test_objective_led_supervised_collection_requires_next_card_not_false_completion():
+    foothold_state = _state_with_remote_exec()
+    state = es.EngagementState(
+        objective=foothold_state.objective,
+        footholds=list(foothold_state.footholds),
+        hops=[], graph_facts=[],
+    )
+    current = {"state": state}
+    capability_calls = []
+    collection_calls = []
+    m = _install_supervised_contract(
+        _bare_model(json.dumps({"ok": True}), state, capability_calls),
+        request_id="request-objective-after-collection",
+        actions_complete=False,
+    )
+    assert m._request_contract.stop_condition.kind.value == "objective_proved"
+    m.policy_mode = "hybrid"
+    m.provider = "test"
+    m.model = "selector"
+    cards = []
+
+    async def observe():
+        return current["state"]
+
+    async def collect(_state, request=None):
+        collection_calls.append(request)
+        current["state"] = _covered_remote_exec_state()
+        return {"ok": True, "status": "ingested", "graph_verified": True}
+
+    class SelectAvailable:
+        async def ainvoke(self, messages):
+            request = json.loads(messages[-1].content)
+            candidates = request["candidates"]
+            selected = next(
+                (item for item in candidates if item["name"] == "collect-graph"),
+                candidates[0],
+            )
+            return type("Response", (), {"content": json.dumps({
+                "disposition": "select", "candidate_id": selected["candidate_id"],
+            })})()
+
+    async def emit(actions):
+        cards.append(actions)
+
+    m._build_current_engagement_state = observe
+    m._controller_collect = collect
+    m.llm = SelectAvailable()
+    m._hitl_card_emitter = emit
+    m._hitl_card_pending = False
+
+    assert asyncio.run(m._run_autonomous_controller(state.objective)) == ""
+    assert cards[0][0]["name"] == "collect_graph"
+    assert collection_calls == []
+    digest = _install_exact_card_claim(m, cards[0])
+    assert asyncio.run(m.handle_controller_hitl_resume(
+        "approve", expected_action_digest=digest,
+    )) == ""
+    assert len(collection_calls) == 1
+    assert len(cards) == 2
+    assert cards[1][0]["name"] == "execute_capability"
+    assert m._controller_hitl_pending["kind"] == "capability"
+    assert m._controller_hitl_pending["objective"] == state.objective
+    assert capability_calls == []
+    m.clear_approval_claim()
+    next_digest = _install_exact_card_claim(m, cards[1], "approval-after-collection")
+    asyncio.run(m.handle_controller_hitl_resume(
+        "approve", expected_action_digest=next_digest,
+    ))
+    assert len(collection_calls) == 1
+    assert len(capability_calls) == 1
+
+
+def test_supervised_two_capability_approvals_have_distinct_sink_transactions(monkeypatch):
+    objective = "Verify two declared offline checks from the current callback."
+    state = es.EngagementState(objective=objective, footholds=[
+        _foothold("3", agent="unsupported-test-agent"),
+    ], hops=[], graph_facts=[])
+    actions = [
+        capabilities.CapabilityAction(
+            name="offline-check", target=target,
+            effects=[f"checked:{target}"], intent={"callback_id": "3"},
+        )
+        for target in ("first", "second")
+    ]
+    effects = []
+    monkeypatch.setattr(capabilities, "actions_from_state", lambda _state: [
+        action for action in actions if action.target not in effects
+    ])
+    m = _install_supervised_contract(
+        _bare_model(json.dumps({"ok": True}), state, []),
+        request_id="request-two-capability-approvals",
+        actions_complete=False,
+    )
+    m.policy_mode = "symbolic"
+    m.mythic_client = mt.MythicTools(agent_task_id=1)
+    m.mythic_client.set_request_contract(m._request_contract)
+    cards = []
+    accepted = []
+
+    async def emit(actions_on_card):
+        cards.append(actions_on_card)
+
+    async def execute(action, inputs):
+        denial = m.mythic_client._require_request_contract_effect(
+            "execute_capability", {"action": action, "inputs": inputs},
+        )
+        assert denial is None
+        accepted.append((copy.deepcopy(action), copy.deepcopy(inputs)))
+        assert action["intent"]["transaction_id"] == inputs["transaction_id"]
+        assert inputs["transaction_id"] not in {
+            prior_inputs["transaction_id"] for _, prior_inputs in accepted[:-1]
+        }
+        effects.append(action["target"])
+        state.hops.append(es.Hop(
+            id=f"proof-{len(effects)}", technique="offline-observation",
+            target=action["target"], effect=action["effects"][0],
+            status="achieved", satisfied_effects=action["effects"],
+            evidence={"source": "inert test producer"}, preconditions=[],
+            source="test", timestamp="",
+        ))
+        return json.dumps({"ok": True, "verdict": "achieved"})
+
+    m._hitl_card_emitter = emit
+    m._hitl_card_pending = False
+    m.mythic_client.execute_capability = execute
+
+    assert asyncio.run(m._run_autonomous_controller(objective)) == ""
+    assert cards[0][0]["args"]["action"]["target"] == "first"
+    first_digest = _install_exact_card_claim(m, cards[0], "approval-first")
+    assert asyncio.run(m.handle_controller_hitl_resume(
+        "approve", expected_action_digest=first_digest,
+    )) == ""
+    assert effects == ["first"]
+    assert len(cards) == 2
+    assert cards[1][0]["args"]["action"]["target"] == "second"
+    first_tx = cards[0][0]["args"]["inputs"]["transaction_id"]
+    second_tx = cards[1][0]["args"]["inputs"]["transaction_id"]
+    assert first_tx != second_tx
+    assert cards[1][0]["args"]["inputs"]["policy_decision"]["selected_target"] == "second"
+    m.clear_approval_claim()
+    second_digest = _install_exact_card_claim(m, cards[1], "approval-second")
+    asyncio.run(m.handle_controller_hitl_resume(
+        "approve", expected_action_digest=second_digest,
+    ))
+    assert effects == ["first", "second"]
+    assert [item[1]["transaction_id"] for item in accepted] == [first_tx, second_tx]
+
+
+def test_controller_denial_identity_ignores_incidental_metadata_only():
+    m = object.__new__(model.Model)
+    capability = {
+        "kind": "capability",
+        "args": {
+            "action": {"name": "example", "target": "host", "intent": {
+                "route": "one", "policy_decision": {"decision_id": "one"},
+                "transaction_id": "transaction-one",
+            }},
+            "inputs": {"callback_id": "3", "transaction_id": "transaction-one"},
+        },
+    }
+    m._controller_hitl_denied_keys = {m._controller_hitl_semantic_key(capability)}
+    retry = copy.deepcopy(capability)
+    retry["args"]["action"]["intent"]["policy_decision"]["decision_id"] = "two"
+    retry["args"]["action"]["intent"]["transaction_id"] = "transaction-two"
+    retry["args"]["inputs"]["transaction_id"] = "transaction-two"
+    assert m._controller_hitl_denies(retry)
+    retry["args"]["action"]["intent"]["route"] = "two"
+    assert not m._controller_hitl_denies(retry)
+    retry["args"]["action"]["intent"]["route"] = "one"
+    retry["args"]["inputs"]["callback_id"] = "4"
+    assert not m._controller_hitl_denies(retry)
+
+    collection = {
+        "kind": "collection", "args": {
+            "collection_key": "collection:3", "scope_domain": "essos.local",
+            "callback_id": "3", "host": "first", "agent": "apollo", "identity": "user",
+            "reason": "baseline", "support": "first wording",
+            "policy_decision": {"decision_id": "one"},
+        },
+    }
+    m._controller_hitl_denied_keys = {m._controller_hitl_semantic_key(collection)}
+    retry = copy.deepcopy(collection)
+    retry["args"].update(reason="refresh", support="different wording")
+    retry["args"]["policy_decision"]["decision_id"] = "two"
+    assert m._controller_hitl_denies(retry)
+    retry["args"]["scope_domain"] = "westeros.local"
+    assert not m._controller_hitl_denies(retry)
+
+
+def test_controller_redirect_hands_back_when_symbolic_selection_skips_guidance():
+    state = es.EngagementState(
+        objective="obtain administrative control of essos.local",
+        footholds=[_foothold("3", host="first"), _foothold("4", host="second")],
+        hops=[], graph_facts=[],
+    )
+    m = _bare_model(json.dumps({"ok": True}), state, [])
+    m.mode = "supervised"
+    m.command_name = "chat"
+    m._autonomous_solve = True
+    m.policy_mode = "symbolic"
+    m._controller_hitl_pending = None
+    m._controller_hitl_approved_key = ""
+    m._controller_hitl_approved_pending = None
+    m._controller_hitl_objective = ""
+    messages = []
+
+    async def stream(text):
+        messages.append(text)
+        return True
+
+    m._stream_message_to_mythic = stream
+    assert asyncio.run(m._run_autonomous_controller(state.objective)) == ""
+    assert asyncio.run(m.handle_controller_hitl_resume(
+        "deny", operator_message="Use callback 4 instead",
+    )) == ""
+    assert m._controller_hitl_pending is None
+    assert "did not process your new instruction" in messages[-1]
+    assert m.controller_runtime_telemetry()["controller_status"] == "halted_no_action"
+
+
+def test_controller_respond_stop_does_not_replan_or_execute():
+    state = _state_with_remote_exec()
+    calls = []
+    m = _bare_model(json.dumps({"ok": True}), state, calls)
+    m.mode = "supervised"
+    m.command_name = "chat"
+    m.task_id = "offline-test"
+    m._autonomous_solve = True
+    m._controller_hitl_pending = {
+        "kind": "capability", "tool": "execute_capability",
+        "display_name": "example", "args": {
+            "action": {"name": "example", "target": "host", "intent": {}},
+            "inputs": {"callback_id": "3"},
+        },
+        "objective": state.objective,
+        "key": "pending-key",
+    }
+    m._controller_hitl_objective = state.objective
+    m._controller_runtime_telemetry = {"controller_status": "running"}
+    assert asyncio.run(m.handle_controller_hitl_resume(
+        "deny", operator_message="stop",
+    )) == ""
+    assert m._stop_requested is True
+    assert m._controller_hitl_pending is None
+    assert calls == []
+    assert m.controller_runtime_telemetry()["controller_status"] == "halted_aborted"
 
 
 def test_supervised_chat_controller_pauses_before_execute_capability():
@@ -745,7 +1083,9 @@ def test_supervised_chat_controller_pauses_before_execute_capability():
 
 
 def test_controller_exact_approval_reaches_real_final_sink_with_card_bytes_unchanged():
-    from ai.langgraph.request_contract import build_request_contract
+    from ai.langgraph.request_contract import (
+        StopCondition, StopConditionKind, build_request_contract,
+    )
     from sage_chat.hitl import (
         approval_action_digest,
         approval_action_fingerprint,
@@ -783,7 +1123,7 @@ def test_controller_exact_approval_reaches_real_final_sink_with_card_bytes_uncha
         mode="supervised",
         autonomous_solve=True,
         callback_ids=("3",),
-    ))
+    ).amend(stop_condition=StopCondition(StopConditionKind.ACTIONS_COMPLETE)))
     cards = []
     policy_requests = []
 

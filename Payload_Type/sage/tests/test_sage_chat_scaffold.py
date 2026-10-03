@@ -3068,9 +3068,12 @@ class _ControllerHitlModel(_HitlModel):
         super().__init__()
         self._controller_hitl_pending = {"tool": "execute_capability", "args": {"target": "DC01"}}
 
-    async def handle_controller_hitl_resume(self, decision, expected_action_digest=""):
+    async def handle_controller_hitl_resume(
+        self, decision, expected_action_digest="", operator_message="",
+    ):
         del expected_action_digest
         self.resumed_with = decision
+        self.resumed_operator_message = operator_message
         self._controller_hitl_pending = None
         await self._response_emitter(f"🤖> controller-resume:{decision}")
         return ""
@@ -3155,7 +3158,7 @@ def _install_pending_approval_context(
     return context
 
 
-def _input_response_for_context(action, context, choice=None):
+def _input_response_for_context(action, context, choice=None, response=""):
     card = build_approval_request(context["actions"])
     input_type = (
         "single_choice"
@@ -3190,6 +3193,8 @@ def _input_response_for_context(action, context, choice=None):
     }
     if action == "select":
         response_payload["choice"] = selected_choice
+    if response:
+        response_payload["response"] = response
     input_request = {
         "status": {
             "accept": "accepted",
@@ -3215,6 +3220,7 @@ def _input_response_for_context(action, context, choice=None):
     }
     return ChatInputResponse(
         action=action,
+        response=response,
         choice=selected_choice,
         input_request_message_id=input_request_message_id,
         input_request=input_request,
@@ -3465,6 +3471,22 @@ def test_controller_hitl_card_response_resumes_controller_pending_move():
     _run(chat.chat(req))
     assert model.resumed_with == "approve"
     assert model._controller_hitl_pending is None
+    assert len(chat.terminal_emissions) == 1
+
+
+def test_controller_hitl_respond_denies_pending_action_and_carries_steering():
+    model = _ControllerHitlModel()
+    chat = _HitlDriverChat(model)
+    request = build_chat_request("", channel_id=5, request_id=4)
+    context = _install_pending_approval_context(model, request)
+    request.InputResponse = _input_response_for_context(
+        "respond", context, response="Use the other callback for the next proposal",
+    )
+
+    _run(chat.chat(request))
+
+    assert model.resumed_with == "deny"
+    assert model.resumed_operator_message == "Use the other callback for the next proposal"
     assert len(chat.terminal_emissions) == 1
 
 

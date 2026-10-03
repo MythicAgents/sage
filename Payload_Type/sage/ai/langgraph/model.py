@@ -4825,6 +4825,9 @@ class Model:
                 # Request-scoped, like the subgoal itself: a new operator message is a new plan.
                 self._supervised_repeat_refusals = 0
                 self._denied_action_keys = set()
+                self._controller_hitl_denied_keys = set()
+                self._controller_hitl_operator_steer = ""
+                self._controller_hitl_steer_consulted = False
             state = getattr(self, "state", None)
             if isinstance(state, dict):
                 state["_request_id"] = contract.request_id
@@ -9147,6 +9150,35 @@ class Model:
             default=str,
         )
 
+    def _controller_hitl_semantic_key(self, pending: dict[str, Any]) -> str:
+        """Identify a denied move without one-off decision and transaction metadata."""
+        kind = str(pending.get("kind") or "")
+        args = copy.deepcopy(pending.get("args") or {})
+        if not isinstance(args, dict):
+            return ""
+        if kind == "capability":
+            action = args.get("action")
+            inputs = args.get("inputs")
+            if not isinstance(action, dict) or not isinstance(inputs, dict):
+                return ""
+            intent = action.get("intent")
+            if isinstance(intent, dict):
+                intent.pop("policy_decision", None)
+                intent.pop("transaction_id", None)
+            inputs.pop("policy_decision", None)
+            inputs.pop("transaction_id", None)
+        elif kind == "collection":
+            args.pop("policy_decision", None)
+            args.pop("reason", None)
+            args.pop("support", None)
+        else:
+            return ""
+        return self._controller_hitl_key(kind, args)
+
+    def _controller_hitl_denies(self, pending: dict[str, Any]) -> bool:
+        key = self._controller_hitl_semantic_key(pending)
+        return bool(key and key in (getattr(self, "_controller_hitl_denied_keys", None) or ()))
+
     def _controller_hitl_capability_request(
         self,
         payload: dict[str, Any],
@@ -9253,6 +9285,20 @@ class Model:
         """Consume one matching approval token or pause before the controller move executes."""
         if not self._controller_hitl_enabled():
             return
+        if self._controller_hitl_denies(pending):
+            self._controller_hitl_pending = None
+            self._controller_hitl_objective = ""
+            self._supervised_objective_active = False
+            self._controller_refresh_runtime_policy_telemetry(
+                status="halted_no_action",
+                reason="policy repeated an operator-denied guarded action",
+                objective_recognized=False,
+            )
+            await self._stream_message_to_mythic(
+                "**Execution stopped**\nSage repeated an action you denied. "
+                "No action was issued; submit a new instruction to continue."
+            )
+            raise _ControllerHitlPause()
         key = str(pending.get("key") or "")
         if key and getattr(self, "_controller_hitl_approved_key", "") == key:
             self._controller_hitl_approved_key = ""
@@ -9261,18 +9307,40 @@ class Model:
             logger.info(f"HITL controller approval consumed for {pending.get('tool', 'unknown')}")
             return
 
+        if (
+            getattr(self, "_controller_hitl_operator_steer", "")
+            and not getattr(self, "_controller_hitl_steer_consulted", False)
+        ):
+            self._controller_hitl_operator_steer = ""
+            self._controller_hitl_pending = None
+            self._controller_hitl_objective = ""
+            self._supervised_objective_active = False
+            self._controller_refresh_runtime_policy_telemetry(
+                status="halted_no_action",
+                reason="operator steering was not processed by policy selection",
+                objective_recognized=False,
+            )
+            await self._stream_message_to_mythic(
+                "**Execution stopped**\nThe pending action was denied. "
+                "The current policy did not process your new instruction, so Sage did not propose another action. "
+                "Submit the instruction as a new request to continue."
+            )
+            raise _ControllerHitlPause()
+
         # A stale approval must never authorize a different freshly-selected action.
         self._controller_hitl_approved_key = ""
         self._controller_hitl_approved_pending = None
         self._controller_hitl_pending = pending
         await self._flush_controller_verbose_events()
         await self._surface_controller_hitl_request(pending)
+        self._controller_hitl_operator_steer = ""
         raise _ControllerHitlPause()
 
     async def handle_controller_hitl_resume(
         self,
         response: str,
         expected_action_digest: str = "",
+        operator_message: str = "",
     ) -> str:
         """Resume or deny a controller-owned pending move with the existing default-deny semantics."""
         pending = getattr(self, "_controller_hitl_pending", None)
@@ -9296,23 +9364,51 @@ class Model:
         if not approved:
             self._controller_hitl_approved_key = ""
             self._controller_hitl_approved_pending = None
-            self._controller_hitl_objective = ""
-            self._supervised_objective_active = False
-            self._controller_refresh_runtime_policy_telemetry(
-                status="halted_denied",
-                reason=f"operator denied {display_name}",
-                objective_recognized=False,
-            )
+            self._controller_hitl_objective = objective
+            if getattr(self, "_stop_requested", False):
+                return ""
+            steer = str(operator_message or "").strip()
+            if steer.casefold() in {"stop", "/stop"}:
+                self.request_stop(reason=STOP_REASON_OPERATOR)
+                self._controller_hitl_objective = ""
+                self._supervised_objective_active = False
+                self._controller_refresh_runtime_policy_telemetry(
+                    status="halted_aborted",
+                    reason="operator stopped supervised objective at approval card",
+                    objective_recognized=False,
+                )
+                await self._stream_message_to_mythic(stop_notice_for(STOP_REASON_OPERATOR))
+                return ""
+            denied = getattr(self, "_controller_hitl_denied_keys", None)
+            if denied is None:
+                denied = set()
+                self._controller_hitl_denied_keys = denied
+            semantic_key = self._controller_hitl_semantic_key(pending)
+            if not semantic_key:
+                self._controller_hitl_objective = ""
+                self._supervised_objective_active = False
+                await self._stream_message_to_mythic(
+                    "**Execution stopped**\nThe pending guarded action lacked an auditable identity. "
+                    "No action was issued."
+                )
+                return ""
+            denied.add(semantic_key)
+            self._controller_hitl_operator_steer = steer
+            self._controller_hitl_steer_consulted = False
             msg = (
-                "**Execution stopped**\n"
-                f"Operator denied `{display_name}`. Sage stopped before execution.\n"
+                "**Action denied**\n"
+                f"Operator denied `{display_name}`. Sage will reconsider the objective before any further action.\n"
             )
             try:
                 await self._stream_message_to_mythic(msg)
             except Exception as e:
                 logger.warning(f"HITL: failed to stream controller deny result ({e})")
             logger.info(f"HITL controller resume: deny for {tool}")
-            return ""
+            self._controller_hitl_replanning = True
+            try:
+                return await self._run_autonomous_controller(objective)
+            finally:
+                self._controller_hitl_replanning = False
 
         self._controller_hitl_approved_key = key
         self._controller_hitl_approved_pending = pending
@@ -9507,10 +9603,16 @@ class Model:
                 "will reject proposals that are not currently admissible. Do not emit commands or additional "
                 "steps."
             )
-        return await self.llm.ainvoke([
+        steer = str(getattr(self, "_controller_hitl_operator_steer", "") or "").strip()
+        if steer and self._controller_hitl_enabled():
+            request = {**request, "operator_steering": steer}
+        answer = await self.llm.ainvoke([
             SystemMessage(content=instruction),
             HumanMessage(content=json.dumps(request, sort_keys=True)),
         ])
+        if steer:
+            self._controller_hitl_steer_consulted = True
+        return answer
 
     @staticmethod
     def _controller_effective_backend_requests(decisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -10086,12 +10188,21 @@ class Model:
         async def execute(action, decision=None):
             payload = _capability_action_payload(action)
             inputs = _autonomous_capability_inputs(action, snap["state"])
+            replay_matches = bool(
+                getattr(self, "_controller_hitl_approved_key", "")
+                and approved_pending.get("kind") == "capability"
+                and self._controller_hitl_semantic_key(approved_pending)
+                == self._controller_hitl_semantic_key({
+                    "kind": "capability",
+                    "args": {"action": payload, "inputs": inputs},
+                })
+            )
             decision_context = (
                 decision.to_dict() if hasattr(decision, "to_dict")
                 else dict(decision) if isinstance(decision, dict)
                 else {}
             )
-            if decision_context.get("model_response_observed") is False:
+            if replay_matches and decision_context.get("model_response_observed") is False:
                 approved_decision = self._controller_pending_policy_decision(approved_pending)
                 if approved_decision:
                     decision_context = approved_decision
@@ -10100,9 +10211,13 @@ class Model:
                 payload["intent"] = dict(payload.get("intent") or {})
                 payload["intent"]["policy_decision"] = decision_context
                 inputs["policy_decision"] = decision_context
+            # The replay token belongs only to the still-pending exact approved move.
+            # Once that move executes, this same controller run may select a successor;
+            # carrying the first transaction ID into its new card makes the second
+            # approval fail at the final sink as a duplicate transaction.
             approved_args = (
                 approved_pending.get("args")
-                if isinstance(approved_pending.get("args"), dict)
+                if replay_matches and isinstance(approved_pending.get("args"), dict)
                 else {}
             )
             approved_action = (
@@ -10197,11 +10312,23 @@ class Model:
                 )
 
         def policy_frontier(state):
-            return _eval_forced_capability_prefix_frontier(
+            frontier = _eval_forced_capability_prefix_frontier(
                 _autonomous_policy_candidates(_cap.actions_from_state(state)),
                 state,
                 raw_override=getattr(self, "_eval_force_capability_prefix_json", None),
             )
+            if not self._controller_hitl_enabled():
+                return frontier
+            return [
+                action for action in frontier
+                if not self._controller_hitl_denies(
+                    self._controller_hitl_capability_request(
+                        _capability_action_payload(action),
+                        _autonomous_capability_inputs(action, state),
+                        prompt,
+                    )
+                )
+            ]
 
         def needs_collection(state):
             # N2: signal collection ONLY when a SUPPORTED collector-profile foothold actually needs it — aligned with
@@ -10225,12 +10352,20 @@ class Model:
         async def collect(state, decision=None):
             request = snap.get("collection_request")
             snap["collection_request"] = None
+            collection_replay_matches = bool(
+                getattr(self, "_controller_hitl_approved_key", "")
+                and approved_pending.get("kind") == "collection"
+                and self._controller_hitl_semantic_key(approved_pending)
+                == self._controller_hitl_semantic_key(
+                    self._controller_hitl_collection_request(request, prompt)
+                )
+            )
             decision_context = (
                 decision.to_dict() if hasattr(decision, "to_dict")
                 else dict(decision) if isinstance(decision, dict)
                 else {}
             )
-            if decision_context.get("model_response_observed") is False:
+            if collection_replay_matches and decision_context.get("model_response_observed") is False:
                 approved_decision = self._controller_pending_policy_decision(approved_pending)
                 if approved_decision:
                     decision_context = approved_decision
@@ -10391,7 +10526,11 @@ class Model:
         objective_text = str(prompt or "").strip()
         if recovery_state is not None:
             self._policy_episode_id = str(recovery_state["episode_id"])
-        continuing_episode = (resumed_after_approval or recovery_state is not None) and bool(getattr(self, "_policy_episode_id", ""))
+        continuing_episode = (
+            resumed_after_approval
+            or recovery_state is not None
+            or getattr(self, "_controller_hitl_replanning", False)
+        ) and bool(getattr(self, "_policy_episode_id", ""))
         if not continuing_episode:
             self._policy_episode_id = _policy.new_episode_id()
             self._policy_model_calls = 0
@@ -10519,6 +10658,13 @@ class Model:
                 completed_call_token_ceiling=(evaluation_token_ceiling or None),
                 expected_response_provider=os.environ.get("SAGE_EVAL_EXPECTED_RESPONSE_PROVIDER", ""),
                 expected_response_model=os.environ.get("SAGE_EVAL_EXPECTED_RESPONSE_MODEL", ""),
+                **(
+                    {"consult_model_for_singleton": True}
+                    if policy_mode == _policy.POLICY_HYBRID
+                    and self._controller_hitl_enabled()
+                    and str(getattr(self, "_controller_hitl_operator_steer", "") or "").strip()
+                    else {}
+                ),
             )
         policy_backend = _EvalForcedInterventionPolicy(policy_backend)
         self._controller_runtime_telemetry = {
@@ -10876,13 +11022,18 @@ class Model:
             return None
 
         def request_for(foothold, *, scope_domain: str = "", reason: str, support: str):
-            return _ControllerCollectionRequest(
+            request = _ControllerCollectionRequest(
                 foothold=foothold,
                 scope_domain=scope_domain,
                 reason=reason,
                 collection_key=_es.collection_target_key(state, foothold, scope_domain),
                 support=support,
             )
+            if self._controller_hitl_enabled() and self._controller_hitl_denies(
+                self._controller_hitl_collection_request(request, getattr(state, "objective", ""))
+            ):
+                return None
+            return request
 
         # Initial coverage is not optional. Without one verified graph for this domain, there is no reliable
         # basis for capability selection or trust expansion.
@@ -10891,11 +11042,13 @@ class Model:
                 continue
             forest = str(getattr(candidate, "forest", "") or "").strip().casefold()
             if not _es.graph_domain_has_verified_collection(state, forest):
-                return request_for(
+                request = request_for(
                     candidate,
                     reason="baseline",
                     support=f"no verified collection exists for {forest or 'the foothold forest'}",
                 )
+                if request is not None:
+                    return request
 
         if self._controller_latest_capability_failure_is_retryable(state):
             return None
@@ -10918,12 +11071,14 @@ class Model:
                 continue
             for candidate in supported_footholds:
                 if not _es.graph_collection_covers_scope(state, candidate, scope_domain):
-                    return request_for(
+                    request = request_for(
                         candidate,
                         scope_domain=scope_domain,
                         reason="objective-scope-expansion",
                         support=f"objective domain {scope_domain} is trusted and uncollected",
                     )
+                    if request is not None:
+                        return request
 
         # A new authority epoch is only an optional collection reason while the objective still lacks verified
         # domain coverage. Once the objective domain is already collected, an empty frontier is a real blocker or
@@ -10934,31 +11089,37 @@ class Model:
                     continue
                 forest = str(getattr(candidate, "forest", "") or "").strip().casefold()
                 if _es.graph_domain_has_verified_collection(state, forest):
-                    return request_for(
+                    request = request_for(
                         candidate,
                         reason="authority-change",
                         support=f"new collection authority epoch is not covered for {forest or 'the foothold forest'}",
                     )
+                    if request is not None:
+                        return request
 
         for scope_domain in trusted_domains:
             if objective_scope(scope_domain):
                 continue
             for candidate in supported_footholds:
                 if not _es.graph_collection_covers_scope(state, candidate, scope_domain):
-                    return request_for(
+                    request = request_for(
                         candidate,
                         scope_domain=scope_domain,
                         reason="trusted-scope-expansion",
                         support=f"trusted domain {scope_domain} is visible and uncollected",
                     )
+                    if request is not None:
+                        return request
         if self._supervised_collection_proposal_enabled():
-            candidate = supported_footholds[0]
-            forest = str(getattr(candidate, "forest", "") or "").strip().casefold()
-            return request_for(
-                candidate,
-                reason="supervised-refresh",
-                support=f"operator approval may refresh graph observations for {forest or 'the foothold forest'}",
-            )
+            for candidate in supported_footholds:
+                forest = str(getattr(candidate, "forest", "") or "").strip().casefold()
+                request = request_for(
+                    candidate,
+                    reason="supervised-refresh",
+                    support=f"operator approval may refresh graph observations for {forest or 'the foothold forest'}",
+                )
+                if request is not None:
+                    return request
         return None
 
     async def _controller_collect(self, state, request=None) -> dict:

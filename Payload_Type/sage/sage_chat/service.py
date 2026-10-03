@@ -1220,6 +1220,7 @@ class SageChat(Chat):
                                 expected_action_digest=str(
                                     approval_claim_context.get("action_digest") or ""
                                 ),
+                                operator_message=resume_steer_message_for_request(request),
                             )
                         )
                     elif has_input_response and hitl_pending:

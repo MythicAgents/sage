@@ -195,6 +195,27 @@ def test_builder_has_no_prompt_or_classifier_authority_input():
         _contract(classifier_lane="autonomous_objective")
 
 
+@pytest.mark.parametrize("objective_led", [False, True])
+def test_supervised_objective_changes_termination_without_granting_approval(objective_led):
+    action = _action("guarded", name="issue_task")
+    contract = _contract(autonomous_solve=objective_led)
+    assert contract.lane == RequestLane.SUPERVISED_WORKFLOW
+    assert contract.stop_condition.kind == (
+        StopConditionKind.OBJECTIVE_PROVED
+        if objective_led else StopConditionKind.ACTIONS_COMPLETE
+    )
+    proposal = _proposal(contract, action)
+    assert not admit_action(contract, action, proposal=proposal).allowed
+    rejected = _approval(contract, proposal, action.action_id, decision="rejected")
+    assert not admit_action(contract, action, proposal=proposal, approval=rejected).allowed
+    accepted = _approval(contract, proposal, action.action_id)
+    admission = admit_action(contract, action, proposal=proposal, approval=accepted)
+    assert admission.allowed
+    assert not admit_action(
+        contract, action, proposal=proposal, approval=accepted, ledger=admission.ledger,
+    ).allowed
+
+
 def test_requested_and_prohibited_sets_are_distinct_and_subtractive():
     allowed = _action("allowed", name="list_callbacks")
     denied = _action("denied", name="issue_task")
