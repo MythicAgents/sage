@@ -1493,6 +1493,73 @@ def test_engagement_state_identity_is_scoped_to_attempt_and_arm():
     assert shipping != second._engagement_id("shipping-sage")
 
 
+def test_engagement_state_preflight_accepts_real_directory_and_new_directory(monkeypatch, tmp_path):
+    monkeypatch.delenv("SAGE_ENGAGEMENT_STATE_DIR", raising=False)
+    payload = tmp_path / "Payload_Type" / "sage"
+    payload.mkdir(parents=True)
+    state_dir = payload / ".sage_engagement"
+    assert cli._validate_engagement_state_dir(tmp_path) == state_dir
+    state_dir.mkdir()
+    assert cli._validate_engagement_state_dir(tmp_path) == state_dir
+
+
+def test_engagement_state_preflight_rejects_default_symlink_before_state_lookup(monkeypatch, tmp_path):
+    monkeypatch.delenv("SAGE_ENGAGEMENT_STATE_DIR", raising=False)
+    payload = tmp_path / "Payload_Type" / "sage"
+    payload.mkdir(parents=True)
+    real_dir = tmp_path / "real-state"
+    real_dir.mkdir()
+    (payload / ".sage_engagement").symlink_to(real_dir, target_is_directory=True)
+    runtime = object.__new__(cli.RuntimePilot)
+    runtime.source_root = tmp_path
+    runtime.artifact_dir = cli.ROOT / ".sage_history" / "evaluation" / "pilot" / "attempt-008"
+
+    with pytest.raises(cli.PilotError, match="engagement state directory must not be a symlink"):
+        runtime._fresh_engagement_state(("shipping-sage",))
+
+
+def test_engagement_state_preflight_checks_explicit_override(monkeypatch, tmp_path):
+    payload = tmp_path / "Payload_Type" / "sage"
+    payload.mkdir(parents=True)
+    real_dir = tmp_path / "real-state"
+    real_dir.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(real_dir, target_is_directory=True)
+    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(alias))
+    with pytest.raises(cli.PilotError, match="engagement state directory must not be a symlink"):
+        cli._validate_engagement_state_dir(tmp_path)
+    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(real_dir))
+    assert cli._validate_engagement_state_dir(tmp_path) == real_dir
+
+
+def test_engagement_state_preflight_resolves_relative_override_from_sage_cwd(monkeypatch, tmp_path):
+    payload = tmp_path / "Payload_Type" / "sage"
+    payload.mkdir(parents=True)
+    state_dir = payload / "private-state"
+    state_dir.mkdir()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", "private-state")
+
+    assert cli._validate_engagement_state_dir(Path(".")) == state_dir
+
+
+@pytest.mark.parametrize("kind", ["dangling-symlink", "regular-file"])
+def test_engagement_state_preflight_rejects_unsafe_override(monkeypatch, tmp_path, kind):
+    payload = tmp_path / "Payload_Type" / "sage"
+    payload.mkdir(parents=True)
+    state_dir = tmp_path / "state"
+    if kind == "dangling-symlink":
+        state_dir.symlink_to(tmp_path / "missing", target_is_directory=True)
+        message = "must not be a symlink"
+    else:
+        state_dir.write_text("not a directory", encoding="utf-8")
+        message = "is not a directory"
+    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(state_dir))
+
+    with pytest.raises(cli.PilotError, match=message):
+        cli._validate_engagement_state_dir(tmp_path)
+
+
 def test_engagement_state_preflight_rejects_attempt_scoped_stale_file(monkeypatch, tmp_path):
     runtime = object.__new__(cli.RuntimePilot)
     runtime.artifact_dir = cli.ROOT / ".sage_history" / "evaluation" / "pilot" / "attempt-007"
@@ -1617,6 +1684,7 @@ def test_reset_propagates_attempt_scoped_engagement_id_to_sage_restart(monkeypat
     expected = runtime._engagement_id("shipping-sage")
 
     assert captured["SAGE_ENGAGEMENT_ID"] == expected
+    assert captured["SAGE_ENGAGEMENT_STATE_DIR"] == str(tmp_path / "state")
     assert "attempt-007" in expected
     assert runtime.runtime_identity()["engagement_id"] == expected
     assert start["mythic_clean"] is True

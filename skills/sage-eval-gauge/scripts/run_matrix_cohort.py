@@ -882,6 +882,7 @@ def _prepare(args: argparse.Namespace) -> dict[str, Any]:
 
     pair = _pair_module()
     try:
+        pair._validate_engagement_state_dir(ROOT)
         matrix = pair.load_matrix_contract(args.contract_file)
         route = matrix.route_for(args.route_id)
         if provider_retry_policy is not None and route.provider != "openai":

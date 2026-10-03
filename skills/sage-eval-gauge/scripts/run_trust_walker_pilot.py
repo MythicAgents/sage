@@ -18,6 +18,7 @@ import tempfile
 import sys
 import time
 import signal
+import stat
 import threading
 from typing import Any, Callable, Mapping
 from urllib.parse import urlparse
@@ -1860,6 +1861,26 @@ def certificate_auth_primary_metric(rows: object) -> dict[str, Any]:
     }
 
 
+def _validate_engagement_state_dir(source_root: Path) -> Path:
+    """Check the state path Sage will use before any evaluation side effects."""
+    payload = Path(source_root).absolute() / "Payload_Type" / "sage"
+    state_root = Path(os.environ.get("SAGE_ENGAGEMENT_STATE_DIR", "").strip() or payload / ".sage_engagement")
+    if not state_root.is_absolute():
+        state_root = payload / state_root
+    try:
+        info = os.lstat(state_root)
+    except FileNotFoundError:
+        # Sage's artifact secret store creates the final directory on demand.
+        return state_root
+    except OSError as exc:
+        raise PilotError(f"cannot inspect Sage engagement state directory: {state_root}") from exc
+    if stat.S_ISLNK(info.st_mode):
+        raise PilotError(f"Sage engagement state directory must not be a symlink: {state_root}")
+    if not stat.S_ISDIR(info.st_mode):
+        raise PilotError(f"Sage engagement state path is not a directory: {state_root}")
+    return state_root
+
+
 class RuntimePilot:
     def __init__(
         self,
@@ -1978,13 +1999,7 @@ class RuntimePilot:
 
     def _engagement_state_path(self, arm: str) -> Path:
         source_root = getattr(self, "source_roots", {}).get(arm, getattr(self, "source_root", ROOT))
-        payload = source_root / "Payload_Type" / "sage"
-        state_root = Path(
-            os.environ.get("SAGE_ENGAGEMENT_STATE_DIR", "").strip()
-            or payload / ".sage_engagement"
-        )
-        if not state_root.is_absolute():
-            state_root = payload / state_root
+        state_root = _validate_engagement_state_dir(source_root)
         engagement_id = self._engagement_id(arm)
         safe_id = _ENGAGEMENT_FILENAME_SAFE.sub("_", engagement_id)[:128]
         return state_root / f"state_{safe_id}.json"
@@ -2244,6 +2259,9 @@ class RuntimePilot:
         protected = _validate_protected_at(self.protected_manifest, self.source_root)
         paths = _validate_external_paths()
         smoke = _validate_route_smoke(self.route_smoke, self.route, getattr(self, "selected_route", None))
+        for arm in contract.arm_order:
+            source_root = getattr(self, "source_roots", {}).get(arm, self.source_root)
+            _validate_engagement_state_dir(source_root)
         bloodhound = self._bloodhound_service_preflight()
         engagement_state = (
             {arm: {"engagement_id": self._engagement_id(arm), "resume": True}
@@ -2589,6 +2607,7 @@ class RuntimePilot:
         restart_env = {
             **dict(arm_env),
             "SAGE_ENGAGEMENT_GATE": "1",
+            "SAGE_ENGAGEMENT_STATE_DIR": str(_validate_engagement_state_dir(self.source_root)),
             "SAGE_BLOODHOUND_MCP_DIR": os.environ["SAGE_BLOODHOUND_MCP_DIR"],
             "SAGE_ENGAGEMENT_NETBIOS_MAP": NETBIOS_MAP,
             "SAGE_ENGAGEMENT_ID": engagement_id,

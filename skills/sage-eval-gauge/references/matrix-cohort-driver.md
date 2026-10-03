@@ -5,6 +5,15 @@ existing Trust Walker pair CLI. It needs no Codex session while running.
 The model still makes the measured decisions; scheduling and recovery use
 saved state and explicit checks.
 
+The Sage engagement state directory must be a real directory, not a symlink.
+This applies to the default `Payload_Type/sage/.sage_engagement` and to an
+explicit `SAGE_ENGAGEMENT_STATE_DIR` (relative overrides use Sage's runtime
+working directory). For a separate checkout, use its own real directory or
+explicitly configure the real shared path; do not link `.sage_engagement`.
+Sage's artifact-secret storage rejects symlinks even when ordinary engagement
+JSON can be read through them. Preparation and execution preflight check this
+boundary before range setup; a failure must be corrected before launching.
+
 ## Terms and supported run sizes
 
 - **Arm:** one measured execution using either Sage autonomous mode or the

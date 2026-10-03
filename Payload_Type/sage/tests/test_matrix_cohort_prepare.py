@@ -208,6 +208,19 @@ def test_route_mismatch_stops_before_any_files(tmp_path, monkeypatch):
     assert not output.exists()
 
 
+def test_prepare_rejects_symlinked_sage_state_before_writing_plan(tmp_path, monkeypatch, capsys):
+    _, _, _, output, argv = inputs(tmp_path, monkeypatch)
+    real_dir = tmp_path / "real-state"
+    real_dir.mkdir()
+    alias = tmp_path / "state-alias"
+    alias.symlink_to(real_dir, target_is_directory=True)
+    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(alias))
+
+    assert driver.main(argv) == 1
+    assert "engagement state directory must not be a symlink" in capsys.readouterr().err
+    assert not output.exists()
+
+
 def test_balanced_cases_bind_qualified_descriptor_without_copying_it(tmp_path, monkeypatch):
     pair, _, _, output, argv = inputs(tmp_path, monkeypatch)
     from ai.hillclimb import trust_walker_pilot as pilot
