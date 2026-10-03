@@ -3,12 +3,24 @@
 import hashlib
 import json
 from pathlib import Path
+import sys
 
 import pytest
 
 from ai.hillclimb import trust_walker_pilot as pilot
 from .test_trust_walker_matrix_pair import _start
 from .test_trust_walker_pilot import terminal_snapshot
+
+
+@pytest.fixture(autouse=True)
+def isolate_rejected_kernel_module():
+    names = [
+        name for name in tuple(sys.modules)
+        if name == "development_row_kernel" or name.endswith(".development_row_kernel")
+    ]
+    saved = {name: sys.modules.pop(name) for name in names}
+    yield
+    sys.modules.update(saved)
 
 
 def _pair(tmp_path, monkeypatch, *, policy=True, fault=None, artifact_root=None):

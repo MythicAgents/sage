@@ -1,13 +1,26 @@
 """Completed refusals terminate both arms and remain replayable outcomes."""
 import asyncio
 import json
+import sys
 from types import SimpleNamespace
 
 import langchain.chat_models
+import pytest
 
 from ai.hillclimb import bare_runner, live_seams, trust_walker_pilot as pilot
 from ai.langgraph import autonomous_controller as controller, policy
 from .test_matrix_timeout_continuation import _pair
+
+
+@pytest.fixture(autouse=True)
+def isolate_rejected_kernel_module():
+    names = [
+        name for name in tuple(sys.modules)
+        if name == "development_row_kernel" or name.endswith(".development_row_kernel")
+    ]
+    saved = {name: sys.modules.pop(name) for name in names}
+    yield
+    sys.modules.update(saved)
 
 
 def _message(content, *, refusal=None, tool_calls=None):
