@@ -1509,7 +1509,45 @@ class SageChat(Chat):
             key = channel_session_key(request)
             lock = _CHANNEL_TURN_LOCKS.setdefault(key, asyncio.Lock())
             async with lock:
-                return await _serialized_handler(turn)
+                try:
+                    return await _serialized_handler(turn)
+                except asyncio.CancelledError:
+                    # Cancellation can land after invoke() returns, while channel metadata
+                    # or the normal terminal response is still awaiting publication. That
+                    # bypasses the invoke-local cancellation handler above.
+                    model = await get_channel_session(request)
+                    emitter = getattr(model, "_response_emitter", None)
+                    ledger = getattr(model, "_request_event_ledger", None)
+                    terminal_events = (
+                        ledger.actual_events(kind="control_transition", phase="request_terminal")
+                        if callable(getattr(ledger, "actual_events", None)) else ()
+                    )
+                    if (
+                        model is not None
+                        and isinstance(emitter, ChatStreamEmitter)
+                        and emitter._request is request
+                        and not terminal_events
+                    ):
+                        async def finish_cancel() -> None:
+                            await self._stop_and_close_request_lifecycles(
+                                model, status="cancelled", reason="operator",
+                            )
+                            reconciler = getattr(model, "finalize_visibility_turn", None)
+                            if callable(reconciler):
+                                report = await reconciler(require_final=True)
+                                if not report.get("ok", False):
+                                    logger.error(
+                                        "Cancelled request lifecycle reconciliation failed: %s",
+                                        report,
+                                    )
+                            await drop_channel_session(request, expected_model=model)
+
+                        cleanup = asyncio.create_task(finish_cancel())
+                        try:
+                            await asyncio.shield(cleanup)
+                        except asyncio.CancelledError:
+                            await cleanup
+                    raise
 
         await self.run_chat_turn(
             request,

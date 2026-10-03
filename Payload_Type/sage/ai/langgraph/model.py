@@ -6518,6 +6518,14 @@ class Model:
             suffix = "" if len(summary["errors"]) <= 5 else (
                 f" (+{len(summary['errors']) - 5} more)"
             )
+            terminal_events = ledger.actual_events(
+                kind="control_transition", phase="request_terminal",
+            )
+            if any(dict(event.metadata).get("status") == "cancelled" for event in terminal_events):
+                # A failed cancellation projection may be retried with its stable event ID.
+                # A new streaming warning would reopen Mythic's cancelled request.
+                logger.warning("Cancelled request lifecycle reconciliation failed: %s%s", preview, suffix)
+                return summary
             try:
                 await self._stream_message_to_mythic(
                     "**Request lifecycle reconciliation failed**\n"
@@ -7154,6 +7162,7 @@ class Model:
                         event_id=final_event_id,
                         content=final_content,
                         control_transitions=self.request_control_transitions(),
+                        status=terminal_status,
                     )
                 else:
                     emitted = await self._stream_message_to_mythic(final_content)

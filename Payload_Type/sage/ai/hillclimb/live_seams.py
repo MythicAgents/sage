@@ -848,7 +848,11 @@ def make_native_chat_solver(
             }
             status = str((returned or {}).get("status") or "").casefold()
             settlement["original_status"] = status or None
-            if settlement["request_identity_bound"] and status in native_chat.TERMINAL_STATUSES:
+            if (
+                settlement["request_identity_bound"]
+                and status in native_chat.TERMINAL_STATUSES
+                and status not in {"cancelled", "canceled"}
+            ):
                 settlement["native_producer_terminal"] = True
                 settlement["remote_stop_confirmed"] = True
             elif settlement["request_identity_bound"]:
@@ -861,7 +865,10 @@ def make_native_chat_solver(
                             observed = native_chat.request_snapshot_result(latest_snapshot)
                             observed_status = str(observed.get("status") or "").casefold()
                             settlement["observed_status"] = observed_status or None
-                            if observed_status in native_chat.TERMINAL_STATUSES:
+                            if observed_status in native_chat.TERMINAL_STATUSES and (
+                                observed_status not in {"cancelled", "canceled"}
+                                or native_chat.request_cancellation_acknowledged(latest_snapshot)
+                            ):
                                 settlement["native_producer_terminal"] = True
                                 settlement["remote_stop_confirmed"] = True
                         except Exception as exc:

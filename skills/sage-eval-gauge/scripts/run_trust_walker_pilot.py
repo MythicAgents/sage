@@ -3387,7 +3387,10 @@ class RuntimePilot:
                     self.native.fetch_request_snapshot(self.current_client, self.current_chat_request_id)
                 )
                 status = str((snapshot.get("request") or {}).get("status") or "").casefold()
-                if status in self.native.TERMINAL_STATUSES:
+                if status in self.native.TERMINAL_STATUSES and (
+                    status not in {"cancelled", "canceled"}
+                    or self.native.request_cancellation_acknowledged(snapshot)
+                ):
                     stop_result = {
                         "remote_stop_confirmed": True,
                         "already_terminal": True,

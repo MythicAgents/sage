@@ -55,25 +55,40 @@ class ChatStreamEmitter:
         event_id: str,
         content: str,
         control_transitions: list[dict[str, str]] | None = None,
+        status: str = "",
     ) -> bool:
         """Project a lifecycle-owned terminal text block with its evidence ID."""
         if not event_id or not content:
             return False
         response_key = f"event:{event_id}"
         try:
-            await self._chat.send_text(
-                self._request,
-                response_key,
-                content=content,
-                metadata={
-                    "event_id": event_id,
-                    **(
-                        {"control_transitions": control_transitions}
-                        if control_transitions
-                        else {}
-                    ),
-                },
-            )
+            metadata = {
+                "event_id": event_id,
+                **(
+                    {"control_transitions": control_transitions}
+                    if control_transitions
+                    else {}
+                ),
+            }
+            if status == "cancelled":
+                # SDK send_text always marks the response streaming. A cancelled request may
+                # already be terminal in Mythic, so that status would reopen it.
+                await self._chat.send_response(
+                    self._request,
+                    response_key=response_key,
+                    content=content,
+                    status="cancelled",
+                    complete=True,
+                    complete_request=False,
+                    metadata=metadata,
+                )
+            else:
+                await self._chat.send_text(
+                    self._request,
+                    response_key,
+                    content=content,
+                    metadata=metadata,
+                )
             self.last_response_key = response_key
             self.last_content = content
             return True

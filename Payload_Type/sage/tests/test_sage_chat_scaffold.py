@@ -1324,6 +1324,47 @@ def test_cancel_reraises_and_cooperatively_stops():
     assert _run(get_channel_session(req)) is None
 
 
+def test_cancel_during_post_invoke_metadata_still_closes_request(monkeypatch):
+    import sage_chat.service as service
+
+    class _MetadataModel(_FakeModel):
+        def __init__(self):
+            super().__init__(stream=())
+            self._active_agent_label = ""
+            self.operator_stops = []
+
+        def set_active_agent(self, value):
+            self._active_agent_label = value
+
+        async def _emit_operator_stop(self, content, *, status):
+            self.operator_stops.append((content, status))
+
+        async def finalize_visibility_turn(self, *, require_final):
+            return {"ok": True}
+
+    class _MetadataChat(_DriverChat):
+        async def update_channel_metadata(self, request, metadata):
+            if metadata == {"agent": "Idle"}:
+                raise asyncio.CancelledError()
+            return await super().update_channel_metadata(request, metadata)
+
+    monkeypatch.setattr(service, "build_channel_metadata", lambda model: {
+        "agent": model._active_agent_label,
+    })
+    model = _MetadataModel()
+    chat = _MetadataChat(model, preexisted=True)
+    request = build_chat_request("run then cancel", channel_id=506, request_id=14)
+    _run(put_channel_session(request, model))
+    with pytest.raises(asyncio.CancelledError):
+        _run(chat.chat(request))
+
+    assert model.invoked_with is not None
+    assert model.stop_called is True
+    assert len(model.operator_stops) == 1
+    assert model.operator_stops[0][1] == "cancelled"
+    assert _run(get_channel_session(request)) is None
+
+
 def test_handler_exception_emits_one_error_terminal():
     model = _FakeModel(behavior="error")
     chat = _DriverChat(model)

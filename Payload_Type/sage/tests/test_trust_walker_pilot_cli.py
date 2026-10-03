@@ -343,6 +343,45 @@ def test_native_completed_chat_retains_controller_refusal_through_settlement(tmp
     assert transcript["runtime_telemetry"]["decisions"][0]["raw_response"] == "I cannot assist with that request."
 
 
+@pytest.mark.parametrize("status", ["cancelled", "canceled"])
+@pytest.mark.parametrize("acknowledged", [False, True])
+def test_native_cancelled_settlement_requires_sage_ack(tmp_path, status, acknowledged):
+    runtime = object.__new__(cli.RuntimePilot)
+    runtime.current_client = object()
+    runtime.current_operation_id = 8
+    runtime.current_chat_request_id = 4
+    runtime.current_chat_channel_id = 3
+    runtime.current_budget = None
+    runtime.current_started_at = None
+    runtime.current_deadline_monotonic = None
+    runtime.current_execution = None
+    runtime.artifact_dir = tmp_path
+    runtime._operation_snapshot = lambda *_args, **_kwargs: {"task": []}
+    snapshot = {"request": {"id": 4, "channel_id": 3, "status": status}, "messages": []}
+    stops = []
+
+    async def fetch(_client, request_id):
+        assert request_id == 4
+        return snapshot
+
+    async def stop(_client, *, channel_id, request_id, **_kwargs):
+        assert (channel_id, request_id) == (3, 4)
+        stops.append(True)
+        return {"remote_stop_confirmed": False}
+
+    runtime.native = SimpleNamespace(
+        fetch_request_snapshot=fetch,
+        request_cancellation_acknowledged=lambda observed: observed is snapshot and acknowledged,
+        stop_native_chat_request=stop,
+        request_snapshot_result=lambda _snapshot: {"status": status, "runtime_telemetry": {}},
+        TERMINAL_STATUSES={"cancelled", "canceled"},
+    )
+    result = runtime.stop_and_settle("shipping-sage", {}, {})
+    assert result["producer_terminal"] is acknowledged
+    assert result["task_quiescent"] is True
+    assert len(stops) == (0 if acknowledged else 1)
+
+
 def retained_native_pair(tmp_path, monkeypatch, contract=None, measurement_metadata=None,
                          improvement_metric=False, timeout_first_arm=False, refusal_first_arm=False):
     """Exercise the real pair/observer producer with synthetic control-plane responses."""
