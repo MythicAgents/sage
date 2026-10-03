@@ -136,6 +136,10 @@ _task_issuance_receipt_context: contextvars.ContextVar[dict | None] = contextvar
     "sage_mythic_task_issuance_receipt_context",
     default=None,
 )
+_collection_file_preflight_context: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "sage_collection_file_preflight_context",
+    default=None,
+)
 _POLICY_EVIDENCE_FIELDS = (
     "episode_id",
     "decision_id",
@@ -1352,6 +1356,20 @@ class _PrivateCollectionTransaction:
     def _current_step(self) -> dict[str, Any] | None:
         return self._steps[-1] if self._steps else None
 
+    def matches_runner_preflight(self, command: str, parameters: Any, callback_display_id: Any) -> bool:
+        """The registered-file prerequisite belongs only to the pending reserved runner."""
+        current = self._current_step()
+        return bool(
+            self._phase == "after_probe"
+            and current is not None
+            and current.get("kind") == "runner"
+            and not current.get("task_id")
+            and current.get("callback_id") == self.callback_id
+            and self._ascii_decimal(callback_display_id) == self.callback_id
+            and str(command or "") == current.get("command")
+            and self._canonical(parameters) == current.get("parameters")
+        )
+
     def _prior_step_blocker(self) -> str:
         current = self._current_step()
         if current is None:
@@ -2331,6 +2349,19 @@ class MythicTools:
                 )
             if tool_name == "ingest_collection":
                 return not transaction.reserve_ingest(actual_args, visibility_context)
+            if tool_name == "ensure_tool_uploaded":
+                binding = _collection_file_preflight_context.get() or {}
+                return bool(
+                    binding.get("client") is self
+                    and binding.get("transaction") is transaction
+                    and binding.get("step") is transaction._current_step()
+                    and binding.get("task") is asyncio.current_task()
+                    and str((visibility_context or {}).get("capability") or "") == "collect-graph"
+                    and actual_args.get("binary_filename") == binding.get("filename")
+                    and transaction.matches_runner_preflight(
+                        binding.get("command"), binding.get("parameters"), binding.get("callback_id"),
+                    )
+                )
             return False
         # This map is a ONE-HOP declaration, so it must carry the transitive closure of what a
         # root actually reaches — not just its direct callees. `ensure_tool_uploaded` is reached
@@ -8011,6 +8042,27 @@ class MythicTools:
         if self._registered_file_available_in_schema(schema, name):
             self._registered_file_checks.add(key)
             return
+        # collect_graph approves an ordered transaction, not an arbitrary tool filename.
+        # Carry this schema-selected prerequisite only across its exact runner preflight;
+        # a direct upload or another callback/step must not borrow that approval.
+        transaction = getattr(self, "_private_collection_transaction", None)
+        binding = None
+        if (
+            isinstance(transaction, _PrivateCollectionTransaction)
+            and transaction.active_for(self)
+            and transaction.matches_runner_preflight(command, parameters, callback_display_id)
+        ):
+            binding = {
+                "client": self,
+                "transaction": transaction,
+                "step": transaction._current_step(),
+                "task": asyncio.current_task(),
+                "command": command,
+                "parameters": transaction._canonical(parameters),
+                "callback_id": callback_display_id,
+                "filename": name,
+            }
+        context_token = _collection_file_preflight_context.set(binding)
         try:
             raw_upload = await self.ensure_tool_uploaded(name)
             up = json.loads(raw_upload) if isinstance(raw_upload, str) else raw_upload
@@ -8022,6 +8074,8 @@ class MythicTools:
             )
             logger.warning(blocker)
             return blocker
+        finally:
+            _collection_file_preflight_context.reset(context_token)
         if not isinstance(up, dict):
             blocker = (
                 f"{_REGISTERED_FILE_PREFLIGHT_PREFIX} could not register {name!r} before {command!r}: "
