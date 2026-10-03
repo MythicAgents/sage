@@ -339,9 +339,20 @@ Set `mode` when you create the channel, or switch it live with `/mode`:
 
 In supervised mode every **guarded** action — issuing a command, executing a capability, creating a payload,
 adding a credential — pauses as a native Mythic approval request before it runs. Approval is **default-deny**:
-only an explicit Accept lets it through. **One action, one card** — when the model proposes multiple guarded
-actions, Sage presents them one at a time. Accept runs the action; Reject denies it. After the action
-completes, the next guarded action is proposed. Read-only tools (`list_*`, `get_*`, downloads) never prompt.
+only an explicit Accept lets it through. In normal native supervised chat, simultaneous guarded tool
+proposals are narrowed to one; Sage must propose a later guarded action on a fresh card. An objective-led
+controller run also pauses before each proposed move. A card for `execute_capability` approves that exact
+capability action and its arguments; its adapter may issue several Mythic tasks while carrying it out. Inspect
+the displayed scope before accepting. Read-only tools (`list_*`, `get_*`, downloads) never prompt.
+
+With **Autonomous Solve** enabled in a supervised channel, the first prompt becomes a continuing objective
+for Sage's controller. Each controller move still pauses for a native approval card. With that option off,
+supervised chat uses the ordinary LangGraph consultation path and approval cards for guarded tools.
+Reject skips the proposed move and lets Sage consider an alternative with a fresh approval.
+Respond denies that move and carries your guidance into the next model selection. Hybrid consults the
+model for this guidance even when only one alternative remains. Symbolic policy cannot interpret Respond
+guidance and hands control back without issuing another action. Objective-led completion requires objective
+evidence; completing one collection does not prove the objective.
 
 Guarded tools are also **scope-preflighted**: each maps to a required Mythic bot-token scope (`callback.write`,
 `payload.write`, `credential.write`, `file.write`), and a tool whose scope your channel token lacks is disabled
@@ -699,8 +710,9 @@ ever baked into the image.
 `Payload_Type/sage/sage.db` stores LangGraph checkpoint state.
 `Payload_Type/sage/.phoenix/phoenix.db` stores observability history. Treat both as retained trajectory data.
 
-Each chat channel reuses one LangGraph session, checkpointed to `sage.db`, so a pending approval or an in-flight
-objective survives across turns and across a Sage restart rather than being lost.
+An active chat channel retains its session across ordinary turns, including pending approvals and objective
+context. After a Sage restart or session replacement, prior scope and evidence are not restored to native chat.
+Start a fresh channel and restate the current scope and evidence before continuing.
 
 Never delete runtime databases to obtain a clean run. Stop Sage and archive active databases first:
 
@@ -722,7 +734,7 @@ execution kernel — with no configuration, and nothing leaving the host.
 Sage has **two execution paths**, and they produce different traces. Knowing which one you ran is the difference
 between reading a trace and misreading it.
 
-| | Chat and supervised runs (LangGraph agent) | Autonomous runs (deterministic kernel) |
+| | Conversation and ordinary supervised chat (LangGraph agent) | Auto and supervised objective runs (deterministic kernel) |
 |---|---|---|
 | What runs | the agent graph: supervisor, sub-agents, middleware | the controller loop: observe, select, execute, verify |
 | Span tree | `Sage` → `Supervisor` → `model` / `tools` → tool spans | `sage.kernel.episode` → `sage.kernel.cycle` → `sage.kernel.seam.*` → tool spans |

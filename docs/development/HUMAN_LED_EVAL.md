@@ -177,6 +177,22 @@ For a later separately authorized human-operated Sage session, bind the exact pr
 
 The command creates no prompt or task. It must fail before channel creation when local configuration differs from the contract or the name is too generic or already used, and fail closed if Mythic stores a different name, route, mode, or nonempty history. Record the returned channel ID and name, then open that **name** in normal Mythic Chat and confirm it before sending the prompt. Mythic may hide the numeric ID until after the first turn. If the UI name differs, stop and preserve the setup result; do not make a second channel or prompt under a one-attempt contract. `native_chat.py prepare` still prepares an **Auto** channel and is not the human-led setup command.
 
+The default `prepare-supervised` channel has `mode=supervised` and `autonomous_solve=false`: it uses the
+ordinary LangGraph consultation path, with approval cards for guarded tools. For an objective that Sage
+should carry across successive decisions, append `--objective-led` to the same preparation command.
+This sets `mode=supervised` and `autonomous_solve=true`, selects the controller route, and verifies both
+stored values after channel creation. It does not submit an objective or accept any card. Send the declared
+objective as the first normal chat prompt. Each controller move still needs its own native approval.
+
+Use Hybrid or LLM policy for Respond guidance: Hybrid consults its model even for a singleton after
+redirection. Symbolic policy cannot interpret free text and hands control back without another action.
+Reject does not execute the proposal; an available alternative receives a fresh card. Objective completion
+requires evidence of the mission rather than success of one collection.
+
+In the first live examples, the operator chooses every card in Mythic. Agent-submitted decisions belong
+to a later workflow after the operator explicitly switches to it. Retain the decision-maker for each
+episode. An offline setup or scripted approval does not establish that Sage can complete the objective live.
+
 Sage records each new native channel in its existing runtime database. If Sage restarts or replaces that channel's in-memory session, a later request on the marked channel stops before model tools run; its previous scope and evidence are not restored. Start a fresh channel and restate the current scope and evidence before continuing. At deployment, also start fresh channels for conversations created before this marker existed: if Mythic supplies no earlier message context, Sage cannot distinguish one of those legacy channels from a new channel.
 
 Use the same evaluation questions without assuming that a particular command is the only valid answer. Write down the exact operator request and mode, the callback binding, and the first action card **before** choosing. Judge whether the proposed action is relevant and proportionate to the request. While the card is pending, capture the exact request and messages privately, before accepting, rejecting, responding, stopping, or cleaning up:

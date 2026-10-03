@@ -12,8 +12,9 @@ requests`):
 - **surface** — `build_approval_request` + `make_card_emitter`: emit the same normalized `input_requested`
   block as `send_approval_request`, with `complete_request=False`. That release (NOT a terminal `complete`)
   frees the channel while the graph waits on disk — so the chat handler returns None and adds no terminal.
-- **decision** — Accept approves all guarded actions in the batch; Reject denies all.
-  Default-deny: malformed and unknown responses are treated as reject.
+- **decision** — normal native supervised turns narrow simultaneous guarded proposals to one before
+  this card. If a batch reaches the approval emitter, Accept approves the whole displayed batch and
+  Reject denies it. Malformed and unknown responses deny by default.
 """
 
 from __future__ import annotations
@@ -232,8 +233,8 @@ def build_approval_request(action_requests: list[dict[str, Any]]) -> dict[str, A
 
     `data` is echoed back verbatim in `InputResponse.InputRequest`. ``make_card_emitter`` augments it with
     a generation/turn/action correlation key so a delayed response to an older card cannot approve the
-    current pending action. If several guarded calls interrupt at once, the card exposes a typed exact-one
-    action choice rather than a batch-wide approval.
+    current pending action. Normal native supervised turns narrow guarded proposals to one before
+    emission. The current approval emitter treats any remaining multi-action batch as one approval.
 
     Note on formatting: the Mythic input-request card renders `title`/`prompt`/`description` as PLAIN TEXT
     (not markdown — see `ChatInputRequestedEvent` in the React UI), so we format the args as a readable
