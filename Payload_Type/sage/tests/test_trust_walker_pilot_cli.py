@@ -2311,7 +2311,15 @@ def test_protected_manifest_requires_canonical_path_set(tmp_path, monkeypatch):
         cli._validate_protected(manifest)
 
 
-def test_raw_provider_timeout_is_protocol_error_with_unknown_token_cost(tmp_path):
+@pytest.mark.parametrize("diagnostic,termination", [
+    ({"error_type": "RateLimitError", "http_status": 429,
+      "provider_code": "rate_limit_exceeded", "request_id": "req_abc12345"},
+     {"cause": "wall_time", "subtype": "wrapper_timeout"}),
+    ({"error_type": "BadRequestError", "http_status": 400,
+      "provider_code": "cyber_policy", "request_id": "req_abc12345"},
+     {"cause": "other_declared_boundary", "subtype": "model_error"}),
+])
+def test_raw_provider_failure_retains_diagnostic_with_unknown_token_cost(tmp_path, diagnostic, termination):
     runtime = object.__new__(cli.RuntimePilot)
     runtime.current_client = object()
     runtime.current_operation_id = 8
@@ -2322,11 +2330,10 @@ def test_raw_provider_timeout_is_protocol_error_with_unknown_token_cost(tmp_path
         objective=cli.OBJECTIVE,
         transcript=[],
         final_text="",
-        termination={"cause": "wall_time", "subtype": "wrapper_timeout"},
+        termination=termination,
         model_response_records=[],
         recoverable_tool_errors=[],
-        model_error_diagnostic={"error_type": "RateLimitError", "http_status": 429,
-                                "provider_code": "rate_limit_exceeded", "request_id": "req_abc12345"},
+        model_error_diagnostic=diagnostic,
         model_attempts=1,
         model_calls=0,
         total_tokens=0,

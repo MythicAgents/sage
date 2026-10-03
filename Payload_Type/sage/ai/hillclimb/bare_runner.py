@@ -115,6 +115,7 @@ _MODEL_ERROR_CODES = frozenset({
     "slow_down", "insufficient_quota", "quota_exceeded", "billing_hard_limit_reached",
     "server_error", "service_unavailable", "overloaded_error", "server_is_overloaded", "invalid_api_key",
     "authentication_error", "permission_denied", "invalid_request_error", "model_not_found",
+    "cyber_policy",
 })
 
 

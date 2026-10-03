@@ -50,7 +50,7 @@ _DIAGNOSTIC_PROVIDER_CODES = _CONTEXT_LIMIT_CODES | frozenset({
     "insufficient_quota", "quota_exceeded", "billing_hard_limit_reached",
     "server_error", "service_unavailable", "overloaded_error", "server_is_overloaded",
     "invalid_api_key", "authentication_error", "permission_denied",
-    "invalid_request_error", "model_not_found",
+    "invalid_request_error", "model_not_found", "cyber_policy",
 })
 _DIAGNOSTIC_ERROR_TYPES = frozenset({
     "APIConnectionError", "APITimeoutError", "APIStatusError", "BadRequestError",

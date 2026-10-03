@@ -411,6 +411,14 @@ prose are omitted. These diagnostics do not enable retries or establish that a
 generic `model_error` was a refusal. Historical results without these fields
 cannot be backfilled from a later run.
 
+The recognized `cyber_policy` code is retained explicitly when returned by the
+provider, including with HTTP 400. HTTP 400 or `BadRequestError` alone does not
+establish a refusal: it can also indicate an invalid request. A retained
+`cyber_policy` identifies a provider policy block even when the generic terminal
+label is `model_error`. Diagnostic capture does not retry or rephrase the blocked
+request, alter provider access, or add replacement arms. Preserve the outcome
+and follow the cohort's existing settlement and cleanup rules.
+
 ## Resume
 
 Use the same plan and output directory:
