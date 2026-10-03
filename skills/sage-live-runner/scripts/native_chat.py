@@ -813,8 +813,9 @@ async def prepare_locked_channel(
 async def prepare_supervised_channel(
     client: Any, *, channel_name: str, max_steps: int,
     expect_provider: str, expect_model: str, expect_endpoint_sha256: str,
+    objective_led: bool = False,
 ) -> dict[str, Any]:
-    """Create one empty human-operated channel and verify Mythic's stored state."""
+    """Create one empty supervised channel and verify Mythic's stored route."""
     name = channel_name.strip()
     if len(name) < 12 or name.casefold() in {"sage", "supervised", "new channel"}:
         raise ValueError("--channel-name must be a nonempty distinctive visible name")
@@ -825,6 +826,7 @@ async def prepare_supervised_channel(
         raise ValueError("--expect-endpoint-sha256 must be 64 hexadecimal characters")
     metadata = canary_ai_metadata(max_steps=max_steps)
     config = metadata["config"]
+    config["autonomous_solve"] = objective_led
     endpoint = str(config.get("API_ENDPOINT") or "")
     actual_hash = hashlib.sha256(endpoint.encode("utf-8")).hexdigest() if endpoint else ""
     if (
@@ -873,7 +875,7 @@ async def prepare_supervised_channel(
             and stored_config.get("provider") == expect_provider
             and stored_config.get("model") == expect_model
             and stored_config.get("mode") == "supervised"
-            and stored_config.get("autonomous_solve") is False
+            and stored_config.get("autonomous_solve") is objective_led
             and type(stored_config.get("max_steps")) is int
             and stored_config["max_steps"] == max_steps
             and isinstance(stored_config.get("API_ENDPOINT"), str)
@@ -886,7 +888,7 @@ async def prepare_supervised_channel(
         "chat_channel_id": channel_id, "chat_channel_name": name,
         "provider": expect_provider, "model": expect_model,
         "endpoint_sha256": expected_hash, "mode": "supervised",
-        "autonomous_solve": False, "max_steps": max_steps, "empty": True,
+        "autonomous_solve": objective_led, "max_steps": max_steps, "empty": True,
     }
 
 
@@ -2071,6 +2073,7 @@ async def _run(args: argparse.Namespace) -> int:
             client, channel_name=args.channel_name, max_steps=args.max_steps,
             expect_provider=args.expect_provider, expect_model=args.expect_model,
             expect_endpoint_sha256=args.expect_endpoint_sha256,
+            objective_led=args.objective_led,
         )
     elif args.command == "demo-prepare":
         result = await prepare_bhusa_demo_channel(
@@ -2230,6 +2233,10 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_supervised = sub.add_parser("prepare-supervised")
     prepare_supervised.add_argument("--channel-name", required=True)
     prepare_supervised.add_argument("--max-steps", type=int, default=12)
+    prepare_supervised.add_argument(
+        "--objective-led", action="store_true",
+        help="Use the supervised controller for a continuing objective; each guarded move still requires approval.",
+    )
     prepare_supervised.add_argument("--expect-provider", required=True)
     prepare_supervised.add_argument("--expect-model", required=True)
     prepare_supervised.add_argument("--expect-endpoint-sha256", required=True)
