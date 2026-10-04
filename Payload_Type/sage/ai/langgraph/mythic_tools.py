@@ -136,6 +136,40 @@ _task_issuance_receipt_context: contextvars.ContextVar[dict | None] = contextvar
     "sage_mythic_task_issuance_receipt_context",
     default=None,
 )
+
+
+def _mythic_task_terminal_success(task_completed: Any, task_status: Any) -> bool:
+    return task_completed is True and str(task_status or "").strip().casefold() in {
+        "completed", "success",
+    }
+
+
+def _collection_task_receipt_failure(receipt: dict, callback_id: int, command: str) -> tuple[str, str]:
+    """Classify this collection child's own task receipt before consuming its output."""
+    task_id = receipt.get("task_id")
+    if type(task_id) is not int or task_id <= 0:
+        return "task_issue_failed", "no Mythic task was created"
+    if receipt.get("callback_id") != callback_id or receipt.get("command") != command:
+        return "task_issue_failed", "task receipt does not match command/callback"
+    status = str(receipt.get("task_status") or "").strip().casefold()
+    if not _mythic_task_terminal_success(receipt.get("task_completed"), status):
+        failed = receipt.get("task_completed") is True and status in {
+            "error", "failed", "cancelled", "canceled",
+        }
+        return ("task_failed" if failed else "task_nonterminal"), (
+            f"Mythic task {task_id} status={status or 'unknown'}"
+        )
+    if receipt.get("output_success") is not True:
+        return "task_failed", f"Mythic task {task_id} output did not classify as successful"
+    return "", ""
+
+
+class _CollectionProbeTaskError(RuntimeError):
+    def __init__(self, status: str, detail: str):
+        self.status = status
+        super().__init__(detail)
+
+
 _collection_schema_binding_context: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "sage_collection_schema_binding_context", default=None,
 )
@@ -4861,15 +4895,35 @@ class MythicTools:
         def profile_value(key: str, default):
             return config[key] if key in config else default
 
+        async def probe_task(command: str, parameters):
+            if not self._private_collection_transaction_active():
+                return await self.issue_task_and_waitfor_task_output(
+                    command, parameters, callback_display_id,
+                )
+            receipt: dict = {}
+            token = _task_issuance_receipt_context.set(receipt)
+            try:
+                try:
+                    output = await self.issue_task_and_waitfor_task_output(
+                        command, parameters, callback_display_id,
+                    )
+                except Exception as exc:
+                    status = "task_failed" if receipt.get("task_id") else "task_issue_failed"
+                    raise _CollectionProbeTaskError(status, f"{command}: {type(exc).__name__}: {exc}") from exc
+            finally:
+                _task_issuance_receipt_context.reset(token)
+            status, detail = _collection_task_receipt_failure(
+                receipt, callback_display_id, command,
+            )
+            if status:
+                raise _CollectionProbeTaskError(status, f"{command}: {detail}; output={str(output or '')[:600]}")
+            return output
+
         identity_command = str(profile_value("collection_identity_command", "whoami") or "").strip()
         identity_parameters = profile_value("collection_identity_parameters", "")
         if not identity_command:
             raise ValueError("collection identity probe has no command")
-        identity_output = await self.issue_task_and_waitfor_task_output(
-            identity_command,
-            identity_parameters,
-            callback_display_id,
-        )
+        identity_output = await probe_task(identity_command, identity_parameters)
         ticket_command = str(profile_value("collection_ticket_command", "ticket_cache_list") or "").strip()
         ticket_parameters = profile_value(
             "collection_ticket_parameters",
@@ -4877,11 +4931,7 @@ class MythicTools:
         )
         ticket_output = ""
         if ticket_command:
-            ticket_output = await self.issue_task_and_waitfor_task_output(
-                ticket_command,
-                ticket_parameters,
-                callback_display_id,
-            )
+            ticket_output = await probe_task(ticket_command, ticket_parameters)
         authorities = set(self._known_domain_authorities.get(str(callback_display_id), set()))
         authorities.update(
             str(item or "").strip()
@@ -5788,9 +5838,8 @@ class MythicTools:
                         issuance_receipt["output_success"] = (
                             result_class == command_builder.ResultClass.SUCCESS.value
                         )
-                    task_proved = (
-                        task_state.get("task_completed") is True
-                        and str(task_state.get("task_status") or "").strip().casefold() == "completed"
+                    task_proved = _mythic_task_terminal_success(
+                        task_state.get("task_completed"), task_state.get("task_status"),
                     )
                     if completion_evidence_required and not task_proved:
                         self._last_issued_task_terminal_status = (

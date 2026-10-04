@@ -11197,31 +11197,11 @@ class Model:
                 return None, outcome(False, stage_status, f"{stage}: {type(exc).__name__}: {exc}")
             finally:
                 _mt._task_issuance_receipt_context.reset(receipt_token)
-            task_id = receipt.get("task_id")
-            if type(task_id) is not int or task_id <= 0:
-                return None, outcome(False, "task_issue_failed", f"{stage}: {str(output or 'no Mythic task was created')[:600]}")
-            if (
-                receipt.get("callback_id") != cb_int
-                or receipt.get("command") != command
-            ):
-                return None, outcome(False, "task_issue_failed", f"{stage}: task receipt does not match command/callback")
-            task_status = str(receipt.get("task_status") or "").strip().casefold()
-            if (
-                receipt.get("task_completed") is not True
-                or task_status != "completed"
-            ):
-                failed_status = receipt.get("task_completed") is True and task_status in {
-                    "error", "failed", "cancelled", "canceled",
-                }
-                return None, outcome(
-                    False, "task_failed" if failed_status else "task_nonterminal",
-                    f"{stage}: Mythic task {task_id} status={task_status or 'unknown'}; "
-                    f"output={str(output or '')[:600]}",
-                )
-            if receipt.get("output_success") is not True:
-                return None, outcome(
-                    False, "task_failed", f"{stage}: Mythic task {task_id} output={str(output or '')[:600]}",
-                )
+            stage_status, detail = _mt._collection_task_receipt_failure(receipt, cb_int, command)
+            if stage_status:
+                if stage_status == "task_issue_failed" and not receipt.get("task_id"):
+                    detail = str(output or detail)[:600]
+                return None, outcome(False, stage_status, f"{stage}: {detail}; output={str(output or '')[:600]}")
             return output, None
 
         if foothold is None:
@@ -11281,6 +11261,8 @@ class Model:
                 adapter=adapter,
                 known_domain_authorities={forest} if forest else set(),
             )
+        except _mt._CollectionProbeTaskError as e:
+            return outcome(False, e.status, f"identity: {e}")
         except Exception as e:
             return outcome(False, "identity_probe_failed", f"{type(e).__name__}: {e}")
 
@@ -11296,13 +11278,17 @@ class Model:
             )
             try:
                 revert_command = _collection_profile_text(adapter, "collection_revert_command", "rev2self")
-                await self.mythic_client.issue_task_and_waitfor_task_output(revert_command, "", cb_int)
+                _, restore_failure = await collection_task("restore", revert_command, "")
+                if restore_failure is not None:
+                    return restore_failure
                 context = await self.mythic_client.probe_authentication_context(
                     cb_int,
                     host=host,
                     adapter=adapter,
                     known_domain_authorities={forest} if forest else set(),
                 )
+            except _mt._CollectionProbeTaskError as e:
+                return outcome(False, e.status, f"identity: {e}")
             except Exception as e:
                 return outcome(False, "identity_restore_failed", f"{type(e).__name__}: {e}")
             if not context.domain_capable:

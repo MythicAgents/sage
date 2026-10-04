@@ -263,6 +263,184 @@ def test_collection_binding_accepts_declared_aliases_for_listing_and_download(co
     assert "path" in steps[4]["parameters"] and "File" in steps[4]["resolved_parameters"]
 
 
+@pytest.mark.parametrize("success_at", ["whoami", "ticket_cache_list", "execute_assembly", "ls", "download", "all"])
+def test_mythic_success_terminal_state_completes_collection_with_real_aliases(collection, monkeypatch, success_at):
+    case = collection
+    _install_apollo_alias_schema(case, monkeypatch, other_aliases=True)
+    # Captured human-03 task 9 used completed=true/status=success.
+    # Only the command and display ID vary across subsequent tasks in this inert fixture.
+    actual_task_state = {"command_name": "whoami", "completed": True, "status": "success"}
+    monkeypatch.setattr(case.client, "_supervised_task_state", mt.MythicTools._supervised_task_state.__get__(case.client))
+
+    async def task_query(_client, _query, *, variables):
+        task_id = variables["id"]
+        command = case.tasks[task_id - 1]["command_name"]
+        row = dict(actual_task_state, display_id=task_id,
+                   command_name=command, callback={"display_id": 7})
+        row["status"] = "success" if success_at in {command, "all"} else "completed"
+        return {"task": [row]}
+
+    monkeypatch.setattr(mt.mythic, "execute_custom_query", task_query)
+    notifications = []
+    case.owner._queue_controller_verbose_event = lambda *args, **kwargs: notifications.append((args, kwargs))
+    result = asyncio.run(_collect(case))
+    assert result["ok"] is True, (result, case.events)
+    assert [command for kind, command in case.events if kind == "task"] == [
+        "whoami", "ticket_cache_list", "execute_assembly", "ls", "download",
+    ]
+    assert [kind for kind, _value in case.events if kind == "ingest"] == ["ingest", "ingest"]
+    assert set(case.tasks[2]["parameters"]) == {"Assembly", "Arguments"}
+    assert set(case.tasks[3]["parameters"]) == {"Path"}
+    assert set(case.tasks[4]["parameters"]) == {"File"}
+    assert all(step["terminal_success"] for step in case.client._private_collection_transaction._steps)
+    assert any("verified callback authentication context" in str(args) for args, _ in notifications)
+
+
+@pytest.mark.parametrize("probe_command", ["whoami", "ticket_cache_list"])
+@pytest.mark.parametrize("fault, expected", [
+    ("missing", "task_nonterminal"), ("pending", "task_nonterminal"),
+    ("failed", "task_failed"), ("partial", "task_nonterminal"),
+    ("wrong_callback", "task_nonterminal"), ("wrong_command", "task_nonterminal"),
+    ("unknown_status", "task_nonterminal"),
+])
+def test_collection_preparation_requires_proven_task_before_next_probe(
+    collection, monkeypatch, probe_command, fault, expected,
+):
+    case = collection
+    _install_apollo_alias_schema(case, monkeypatch, other_aliases=True)
+    monkeypatch.setattr(case.client, "_supervised_task_state", mt.MythicTools._supervised_task_state.__get__(case.client))
+    original_output = mt.mythic.waitfor_for_task_output
+
+    async def task_query(_client, _query, *, variables):
+        task_id = variables["id"]
+        command = case.tasks[task_id - 1]["command_name"]
+        row = {"display_id": task_id, "command_name": command,
+               "callback": {"display_id": 7}, "completed": True, "status": "success"}
+        if command == probe_command:
+            if fault == "missing":
+                return {"task": []}
+            if fault in {"pending", "partial"}:
+                row["completed"] = False
+            elif fault == "failed":
+                row["status"] = "error"
+            elif fault == "wrong_callback":
+                row["callback"] = {"display_id": 8}
+            elif fault == "wrong_command":
+                row["command_name"] = "other"
+            elif fault == "unknown_status":
+                row["status"] = "processed"
+        return {"task": [row]}
+
+    async def output(*args, **kwargs):
+        command = case.tasks[kwargs["task_display_id"] - 1]["command_name"]
+        if command == probe_command and fault == "partial":
+            # A plausible identity/ticket fragment can classify as success even
+            # though the Mythic task has not completed.
+            return "Local Identity: corp\\operator" if command == "whoami" else '[{"client_name":"operator"}]'
+        return await original_output(*args, **kwargs)
+
+    monkeypatch.setattr(mt.mythic, "execute_custom_query", task_query)
+    monkeypatch.setattr(mt.mythic, "waitfor_for_task_output", output)
+    notifications = []
+    case.owner._queue_controller_verbose_event = lambda *args, **kwargs: notifications.append((args, kwargs))
+    result = asyncio.run(_collect(case))
+    assert result["ok"] is False and result["status"] == expected, result
+    assert [command for kind, command in case.events if kind == "task"] == (
+        ["whoami"] if probe_command == "whoami" else ["whoami", "ticket_cache_list"]
+    )
+    assert case.registered == []
+    assert not any("verified callback authentication context" in str(args) for args, _ in notifications)
+    if expected == "task_nonterminal":
+        assert result["trajectory_repair"]["repair"]["retry_budget"] == 0
+
+
+@pytest.mark.parametrize("stage", ["execute_assembly", "ls", "download"])
+@pytest.mark.parametrize("fault, expected", [
+    ("pending", "task_nonterminal"), ("failed", "task_failed"),
+    ("partial", "task_nonterminal"), ("unknown_status", "task_nonterminal"),
+])
+def test_success_metadata_does_not_hide_collection_stage_failures(
+    collection, monkeypatch, stage, fault, expected,
+):
+    case = collection
+    _install_apollo_alias_schema(case, monkeypatch, other_aliases=True)
+    monkeypatch.setattr(case.client, "_supervised_task_state", mt.MythicTools._supervised_task_state.__get__(case.client))
+    original_output = mt.mythic.waitfor_for_task_output
+
+    async def task_query(_client, _query, *, variables):
+        task_id = variables["id"]
+        command = case.tasks[task_id - 1]["command_name"]
+        row = {"display_id": task_id, "command_name": command,
+               "callback": {"display_id": 7}, "completed": True, "status": "success"}
+        if command == stage:
+            if fault in {"pending", "partial"}:
+                row["completed"] = False
+            elif fault == "failed":
+                row["status"] = "error"
+            elif fault == "unknown_status":
+                row["status"] = "processed"
+        return {"task": [row]}
+
+    async def output(*args, **kwargs):
+        command = case.tasks[kwargs["task_display_id"] - 1]["command_name"]
+        if command == stage and fault == "partial":
+            # The SDK may return apparently successful output before terminal metadata.
+            return await original_output(*args, **kwargs)
+        return await original_output(*args, **kwargs)
+
+    monkeypatch.setattr(mt.mythic, "execute_custom_query", task_query)
+    monkeypatch.setattr(mt.mythic, "waitfor_for_task_output", output)
+    result = asyncio.run(_collect(case))
+    assert result["ok"] is False and result["status"] == expected, result
+    issued = [command for kind, command in case.events if kind == "task"]
+    assert issued[-1] == stage
+    assert not any(kind == "ingest" for kind, _value in case.events)
+    if stage == "execute_assembly":
+        assert "ls" not in issued and "download" not in issued
+    elif stage == "ls":
+        assert "download" not in issued
+
+
+@pytest.mark.parametrize("restore_status, expected", [
+    ("success", "ingested"), ("processing", "task_nonterminal"), ("error", "task_failed"),
+])
+def test_collection_identity_restore_requires_its_own_terminal_receipt(
+    collection, monkeypatch, restore_status, expected,
+):
+    case = collection
+    _install_apollo_alias_schema(case, monkeypatch, other_aliases=True)
+    monkeypatch.setattr(case.client, "_supervised_task_state", mt.MythicTools._supervised_task_state.__get__(case.client))
+    original_output = mt.mythic.waitfor_for_task_output
+
+    async def task_query(_client, _query, *, variables):
+        task_id = variables["id"]
+        command = case.tasks[task_id - 1]["command_name"]
+        return {"task": [{"display_id": task_id, "command_name": command,
+                          "callback": {"display_id": 7}, "completed": True,
+                          "status": restore_status if command == "rev2self" else "success"}]}
+
+    async def output(*args, **kwargs):
+        command = case.tasks[kwargs["task_display_id"] - 1]["command_name"]
+        if command == "whoami" and not any(task["command_name"] == "rev2self" for task in case.tasks):
+            return "Local Identity: workstation\\local\nImpersonation Identity: workstation\\local"
+        if command == "ticket_cache_list" and not any(task["command_name"] == "rev2self" for task in case.tasks):
+            return "[]"
+        return await original_output(*args, **kwargs)
+
+    monkeypatch.setattr(mt.mythic, "execute_custom_query", task_query)
+    monkeypatch.setattr(mt.mythic, "waitfor_for_task_output", output)
+    result = asyncio.run(_collect(case))
+    assert result["status"] == expected, (result, case.events)
+    issued = [command for kind, command in case.events if kind == "task"]
+    assert issued[:3] == ["whoami", "ticket_cache_list", "rev2self"]
+    if restore_status == "success":
+        assert result["ok"] is True and issued[3:] == [
+            "whoami", "ticket_cache_list", "execute_assembly", "ls", "download",
+        ]
+    else:
+        assert result["ok"] is False and len(issued) == 3
+
+
 @pytest.mark.parametrize("mutation", (
     "value", "added", "dropped", "ambiguous", "step_replaced",
     "stale_binding", "transaction_replaced",
