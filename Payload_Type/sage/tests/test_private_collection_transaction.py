@@ -208,6 +208,174 @@ def test_approved_collection_registers_reserved_runner_and_ingests_once(collecti
     assert case.client._active_approval_claim["approval_id"] == case.claim["approval_id"]
 
 
+def _apollo_alias_schema(case):
+    return [
+        {"name": "assembly_name", "cli_name": "Assembly", "type": "ChooseOne",
+         "required": True, "parameter_group_name": "Default", "choices": []},
+        {"name": "assembly_arguments", "cli_name": "Arguments", "type": "String",
+         "required": False, "parameter_group_name": "Default"},
+        {"name": "assembly_file", "cli_name": "assembly_file", "type": "File",
+         "required": True, "parameter_group_name": "New Assembly"},
+        {"name": "assembly_arguments", "cli_name": "Arguments", "type": "String",
+         "required": False, "parameter_group_name": "New Assembly"},
+    ]
+
+
+def _install_apollo_alias_schema(case, monkeypatch, *, replace_step=False, other_aliases=False):
+    original_schema = case.client._fetch_command_schema
+
+    async def schema(command, callback):
+        if other_aliases and command in {"ls", "download"}:
+            return [{"name": "path", "cli_name": "Path" if command == "ls" else "File",
+                     "type": "String", "required": True, "parameter_group_name": "Default"}]
+        if command != "execute_assembly":
+            return await original_schema(command, callback)
+        if replace_step:
+            tx = case.client._private_collection_transaction
+            tx._steps[-1] = dict(tx._steps[-1])
+        return _apollo_alias_schema(case)
+
+    monkeypatch.setattr(case.client, "_fetch_command_schema", schema)
+
+
+def test_real_apollo_cli_aliases_issue_exact_runner_and_ingest(collection, monkeypatch):
+    case = collection
+    _install_apollo_alias_schema(case, monkeypatch)
+    result = asyncio.run(_collect(case))
+    assert result["ok"] is True, (result, case.events)
+    assert case.tasks[2]["parameters"]["Assembly"] == "SharpHound.exe"
+    assert "bloodhound_" in case.tasks[2]["parameters"]["Arguments"]
+    assert set(case.tasks[2]["parameters"]) == {"Assembly", "Arguments"}
+    runner = case.client._private_collection_transaction._steps[2]
+    assert "assembly_name" in runner["parameters"]
+    assert "Assembly" in runner["resolved_parameters"]
+
+
+def test_collection_binding_accepts_declared_aliases_for_listing_and_download(collection, monkeypatch):
+    case = collection
+    _install_apollo_alias_schema(case, monkeypatch, other_aliases=True)
+    result = asyncio.run(_collect(case))
+    assert result["ok"] is True, (result, case.events)
+    assert set(case.tasks[3]["parameters"]) == {"Path"}
+    assert set(case.tasks[4]["parameters"]) == {"File"}
+    steps = case.client._private_collection_transaction._steps
+    assert "path" in steps[3]["parameters"] and "Path" in steps[3]["resolved_parameters"]
+    assert "path" in steps[4]["parameters"] and "File" in steps[4]["resolved_parameters"]
+
+
+@pytest.mark.parametrize("mutation", (
+    "value", "added", "dropped", "ambiguous", "step_replaced",
+    "stale_binding", "transaction_replaced",
+))
+def test_collection_alias_binding_rejects_changed_resolution(collection, monkeypatch, mutation):
+    case = collection
+    _install_apollo_alias_schema(case, monkeypatch, replace_step=mutation == "step_replaced")
+    if mutation == "ambiguous":
+        original_schema = case.client._fetch_command_schema
+
+        async def ambiguous_schema(command, callback):
+            rows = await original_schema(command, callback)
+            if command == "execute_assembly":
+                rows = [*rows, {"name": "assembly_name", "cli_name": "Other",
+                                "type": "String", "required": False,
+                                "parameter_group_name": "Default"}]
+            return rows
+
+        monkeypatch.setattr(case.client, "_fetch_command_schema", ambiguous_schema)
+    if mutation in {"stale_binding", "transaction_replaced"}:
+        original_bind = mt._PrivateCollectionTransaction.bind_schema_resolution
+
+        def tamper_binding(self, *args, **kwargs):
+            blocker = original_bind(self, *args, **kwargs)
+            if not blocker:
+                if mutation == "stale_binding":
+                    mt._collection_schema_binding_context.set(None)
+                else:
+                    case.client._private_collection_transaction = copy.copy(self)
+            return blocker
+
+        monkeypatch.setattr(mt._PrivateCollectionTransaction, "bind_schema_resolution", tamper_binding)
+    if mutation in {"value", "added", "dropped"}:
+        original_resolver = mt.command_builder.resolve_params
+
+        def altered(schema, supplied, *, command=""):
+            resolved = original_resolver(schema, supplied, command=command)
+            if command == "execute_assembly" and resolved.ok:
+                resolved.params = dict(resolved.params)
+                if mutation == "value":
+                    resolved.params["Arguments"] += " --changed"
+                elif mutation == "added":
+                    resolved.params["Unexpected"] = "default"
+                else:
+                    del resolved.params["Arguments"]
+            return resolved
+
+        monkeypatch.setattr(mt.command_builder, "resolve_params", altered)
+    result = asyncio.run(_collect(case))
+    assert result["status"] == "task_issue_failed", (result, case.events)
+    assert "schema resolution" in result["reason"] or mutation in {
+        "stale_binding", "transaction_replaced",
+    }, result
+    assert not any(event[0] == "task" and event[1] in ("execute_assembly", "ls", "download")
+                   for event in case.events)
+
+
+def test_collection_alias_binding_cannot_be_borrowed_by_sibling_task(collection, monkeypatch):
+    case = collection
+    _install_apollo_alias_schema(case, monkeypatch)
+    original_bind = mt._PrivateCollectionTransaction.bind_schema_resolution
+    foreign_reads = []
+    foreign_tasks = []
+
+    def observe_foreign(self, *args, **kwargs):
+        blocker = original_bind(self, *args, **kwargs)
+        if not blocker:
+            step = self._current_step()
+
+            async def foreign():
+                foreign_reads.append(self._issued_parameters(step))
+
+            foreign_tasks.append(asyncio.create_task(foreign()))
+        return blocker
+
+    monkeypatch.setattr(mt._PrivateCollectionTransaction, "bind_schema_resolution", observe_foreign)
+
+    async def run():
+        result = await _collect(case)
+        await asyncio.gather(*foreign_tasks)
+        return result
+
+    assert asyncio.run(run())["ok"] is True
+    assert foreign_reads
+    assert foreign_reads == [step["parameters"] for step in
+                           case.client._private_collection_transaction._steps if "resolved_parameters" in step]
+
+
+@pytest.mark.parametrize("state", (
+    {},
+    {"task_completed": False, "task_status": "processing"},
+    {"task_completed": True, "task_status": "error"},
+))
+def test_private_runner_requires_actual_terminal_success_before_listing(collection, monkeypatch, state):
+    case = collection
+    _install_apollo_alias_schema(case, monkeypatch)
+
+    async def task_state(_task_id, _callback_id, command):
+        if command == "execute_assembly":
+            return state
+        return {"task_completed": True, "task_status": "completed"}
+
+    monkeypatch.setattr(case.client, "_supervised_task_state", task_state)
+    result = asyncio.run(_collect(case))
+    assert result["status"] in {"task_nonterminal", "task_failed"}, result
+    tx = case.client._private_collection_transaction
+    runner = tx._steps[2]
+    assert runner["task_id"] == "3"
+    assert runner["terminal_success"] is False
+    assert tx._phase == "after_probe"
+    assert not any(event[0] == "task" and event[1] in ("ls", "download") for event in case.events)
+
+
 def test_collection_registration_uses_adapter_and_schema_selector_alias(collection):
     case = collection
     case.adapter.update({"dotnet_runner_command": "custom-runner", "dotnet_tool_param": "tool",

@@ -83,8 +83,11 @@ def test_partial_successful_output_does_not_prove_completion_and_binding_is_capt
     assert "Primary identity" in result
     assert len(events) == 2
     assert events[0]["status"] == "started"
-    assert events[1]["status"] == "completed"  # Existing output classifier; not completion proof.
+    # A successful-looking partial output cannot close a task Mythic still reports as processing.
+    assert events[1]["status"] == "error"
     assert events[1]["task_completed"] is False
+    assert events[1]["task_status"] == "processing"
+    assert events[1]["terminal_status"] == "processing"
     for event in events:
         assert event["request_id"] == "request-one"
         assert event["request_contract_digest"] == "contract-one"

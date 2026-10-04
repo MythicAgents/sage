@@ -11177,7 +11177,52 @@ class Model:
             }
             if reason:
                 result["reason"] = reason
+            if status in {"task_issue_failed", "task_nonterminal"}:
+                result["trajectory_repair"] = {
+                    "failure_label": "collection_task_issuance",
+                    "repair": {"kind": "stop_for_operator", "retry_budget": 0},
+                }
             return result
+
+        async def collection_task(stage: str, command: str, parameters: Any):
+            """Return this call's output only with its own completed Mythic task receipt."""
+            receipt: dict[str, Any] = {}
+            receipt_token = _mt._task_issuance_receipt_context.set(receipt)
+            try:
+                output = await self.mythic_client.issue_task_and_waitfor_task_output(
+                    command, parameters, cb_int,
+                )
+            except Exception as exc:
+                stage_status = "task_failed" if receipt.get("task_id") else "task_issue_failed"
+                return None, outcome(False, stage_status, f"{stage}: {type(exc).__name__}: {exc}")
+            finally:
+                _mt._task_issuance_receipt_context.reset(receipt_token)
+            task_id = receipt.get("task_id")
+            if type(task_id) is not int or task_id <= 0:
+                return None, outcome(False, "task_issue_failed", f"{stage}: {str(output or 'no Mythic task was created')[:600]}")
+            if (
+                receipt.get("callback_id") != cb_int
+                or receipt.get("command") != command
+            ):
+                return None, outcome(False, "task_issue_failed", f"{stage}: task receipt does not match command/callback")
+            task_status = str(receipt.get("task_status") or "").strip().casefold()
+            if (
+                receipt.get("task_completed") is not True
+                or task_status != "completed"
+            ):
+                failed_status = receipt.get("task_completed") is True and task_status in {
+                    "error", "failed", "cancelled", "canceled",
+                }
+                return None, outcome(
+                    False, "task_failed" if failed_status else "task_nonterminal",
+                    f"{stage}: Mythic task {task_id} status={task_status or 'unknown'}; "
+                    f"output={str(output or '')[:600]}",
+                )
+            if receipt.get("output_success") is not True:
+                return None, outcome(
+                    False, "task_failed", f"{stage}: Mythic task {task_id} output={str(output or '')[:600]}",
+                )
+            return output, None
 
         if foothold is None:
             # No supported foothold needs collection. (An unsupported-agent foothold that is missing
@@ -11303,37 +11348,40 @@ class Model:
         try:
             scope_note = f" scope={scope_domain}" if scope_domain else " scope=current-forest"
             reason_note = f" reason={collection_reason}" if collection_reason else ""
-            fire(
-                f"SharpHound {runner_command} on cb={cb_int}:{scope_note}{reason_note} {args}",
-                operator_message=(
-                    "**Collection started**\n"
-                    f"Sage started SharpHound collection on callback `{cb_int}` for "
-                    f"`{scope_domain or 'current forest'}`.\n"
-                    + (f"Reason: {collection_reason}\n" if collection_reason else "")
-                    + f"Arguments: `{args}`"
-                ),
-            )
-            runner_output = await self.mythic_client.issue_task_and_waitfor_task_output(
-                runner_command,
+            runner_output, runner_failure = await collection_task(
+                "runner", runner_command,
                 {runner_tool_param: "SharpHound.exe", runner_args_param: args},
-                cb_int,
             )
-            if str(runner_output or "").startswith(_mt._REGISTERED_FILE_PREFLIGHT_PREFIX):
+            if runner_failure is not None:
+                if str(runner_failure.get("reason") or "").startswith(
+                    f"runner: {_mt._REGISTERED_FILE_PREFLIGHT_PREFIX}"
+                ):
+                    runner_failure["status"] = "tool_preflight_failed"
                 fire(
-                    f"SharpHound tool preflight failed: {runner_output}",
+                    f"SharpHound runner failed: {runner_failure.get('reason')}",
                     operator_message=(
                         "**Collection failed**\n"
-                        "Sage could not start SharpHound because the tool preflight failed.\n"
-                        f"Result: {runner_output}"
+                        "Sage could not complete the SharpHound runner task.\n"
+                        f"Result: {runner_failure.get('reason')}"
                     ),
                 )
-                return outcome(False, "tool_preflight_failed", str(runner_output))
+                return runner_failure
+            fire(
+                f"SharpHound {runner_command} completed on cb={cb_int}:{scope_note}{reason_note} {args}",
+                operator_message=(
+                    "**Collection runner completed**\n"
+                    f"Sage completed the SharpHound runner task on callback `{cb_int}` for "
+                    f"`{scope_domain or 'current forest'}`."
+                ),
+            )
             # DISCOVER the real on-disk path (SharpHound prepends a timestamp; never predict the name). `ls` the
             # output dir, find the file carrying our token. Bounded retry for filesystem latency.
             real_path = ""
             for _attempt in range(4):
-                ls_out = await self.mythic_client.issue_task_and_waitfor_task_output(
-                    ls_command, {ls_path_param: out_dir}, cb_int)
+                ls_out, ls_failure = await collection_task(
+                    "listing", ls_command, {ls_path_param: out_dir})
+                if ls_failure is not None:
+                    return ls_failure
                 real_path = _find_token_zip_path(ls_out, token)
                 if real_path:
                     break
@@ -11355,9 +11403,10 @@ class Model:
                     f"Sage found the fresh collection artifact `{real_path}`."
                 ),
             )
-            await self.mythic_client.issue_task_and_waitfor_task_output(
-                download_command, {download_path_param: real_path}, cb_int,
-            )
+            _, download_failure = await collection_task(
+                "download", download_command, {download_path_param: real_path})
+            if download_failure is not None:
+                return download_failure
             # Resolve the Mythic download by our token -> file_uuid (bounded retry; completed-download filemeta is
             # not always visible immediately).
             row = None

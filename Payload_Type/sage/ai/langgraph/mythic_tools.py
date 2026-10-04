@@ -136,6 +136,9 @@ _task_issuance_receipt_context: contextvars.ContextVar[dict | None] = contextvar
     "sage_mythic_task_issuance_receipt_context",
     default=None,
 )
+_collection_schema_binding_context: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "sage_collection_schema_binding_context", default=None,
+)
 _collection_file_preflight_context: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "sage_collection_file_preflight_context",
     default=None,
@@ -1356,6 +1359,71 @@ class _PrivateCollectionTransaction:
     def _current_step(self) -> dict[str, Any] | None:
         return self._steps[-1] if self._steps else None
 
+    def bind_schema_resolution(
+        self, client: Any, command: str, original: dict[str, Any], resolved: dict[str, Any],
+        callback_display_id: Any, schema: list[dict[str, Any]], group: str | None,
+        reserved_step: dict[str, Any] | None,
+    ) -> str:
+        """Admit only a lossless name-to-CLI-alias rename of the reserved child."""
+        current = self._current_step()
+        if (
+            current is None or current is not reserved_step or current.get("task_id")
+            or current.get("resolved_parameters") is not None
+            or getattr(client, "_private_collection_transaction", None) is not self
+            or not self.active_for(client)
+            or current.get("command") != str(command or "")
+            or current.get("callback_id") != self._ascii_decimal(callback_display_id)
+            or current.get("parameters") != self._canonical(original)
+        ):
+            return "schema resolution has no exact active collection reservation"
+        if not isinstance(resolved, dict) or len(original) != len(resolved):
+            return "schema resolution changed collection parameter count"
+        selected = [row for row in schema if isinstance(row, dict)
+                    and str(row.get("parameter_group_name") or "Default") == str(group or "Default")]
+        mapped: dict[str, Any] = {}
+        for key, value in original.items():
+            matches = [row for row in selected
+                       if key in {str(row.get("name") or ""), str(row.get("cli_name") or "")}]
+            if len(matches) != 1:
+                return "schema resolution has an ambiguous or missing collection alias"
+            alias = str(matches[0].get("cli_name") or matches[0].get("name") or "")
+            if not alias or alias in mapped:
+                return "schema resolution has duplicate collection aliases"
+            mapped[alias] = value
+        if self._canonical(mapped) != self._canonical(resolved):
+            return "schema resolution changed collection parameter values"
+        current["resolved_parameters"] = self._canonical(resolved)
+        _collection_schema_binding_context.set({
+            "transaction": self, "step": current,
+            "original": current["parameters"], "resolved": current["resolved_parameters"],
+            "resolver_task": asyncio.current_task(), "issue_task": None,
+        })
+        return ""
+
+    def handoff_schema_resolution(self) -> None:
+        """Bind the copied context to the one wait_for child that reaches the issue seam."""
+        binding = _collection_schema_binding_context.get() or {}
+        if (
+            binding.get("transaction") is self
+            and binding.get("step") is self._current_step()
+            and binding.get("issue_task") is None
+        ):
+            binding["issue_task"] = asyncio.current_task()
+
+    def _issued_parameters(self, current: dict[str, Any]) -> str:
+        binding = _collection_schema_binding_context.get() or {}
+        if (
+            binding.get("transaction") is self
+            and binding.get("step") is current
+            and binding.get("original") == current.get("parameters")
+            and binding.get("resolved") == current.get("resolved_parameters")
+            and asyncio.current_task() is (
+                binding.get("issue_task") or binding.get("resolver_task")
+            )
+        ):
+            return str(current.get("resolved_parameters") or current.get("parameters") or "")
+        return str(current.get("parameters") or "")
+
     def matches_runner_preflight(self, command: str, parameters: Any, callback_display_id: Any) -> bool:
         """The registered-file prerequisite belongs only to the pending reserved runner."""
         current = self._current_step()
@@ -1445,7 +1513,7 @@ class _PrivateCollectionTransaction:
             current is not None
             and not current.get("task_id")
             and str(command or "") == current.get("command")
-            and self._canonical(parameters) == current.get("parameters")
+            and self._canonical(parameters) in {current.get("parameters"), self._issued_parameters(current)}
         ):
             checks = list(current.get("authority_checks") or [])
             next_check = "recheck" if recheck else "top"
@@ -1521,7 +1589,7 @@ class _PrivateCollectionTransaction:
             current.get("task_id")
             or str(command or "") != current.get("command")
             or self._ascii_decimal(callback_display_id) != self.callback_id
-            or self._canonical(parameters) != current.get("parameters")
+            or self._canonical(parameters) != self._issued_parameters(current)
         ):
             return "collection child final task bytes diverged from the reservation"
         return ""
@@ -1533,7 +1601,7 @@ class _PrivateCollectionTransaction:
         if (
             str(command or "") != current.get("command")
             or self._ascii_decimal(callback_display_id) != self.callback_id
-            or self._canonical(parameters) != current.get("parameters")
+            or self._canonical(parameters) != self._issued_parameters(current)
         ):
             return
         task_id = str(task_display_id or "").strip()
@@ -1557,7 +1625,7 @@ class _PrivateCollectionTransaction:
         if (
             str(command or "") != current.get("command")
             or self._ascii_decimal(callback_display_id) != self.callback_id
-            or self._canonical(parameters) != current.get("parameters")
+            or self._canonical(parameters) != self._issued_parameters(current)
             or str(task_display_id or "").strip() != current.get("task_id")
         ):
             return
@@ -5200,6 +5268,7 @@ class MythicTools:
         string using each parameter's cli_name (e.g. -path /etc/issue). token_id impersonates a tracked
         Windows token; timeout is in seconds.
         """
+        _collection_schema_binding_context.set(None)
         authority_blocker = self._turn_authority_issue_blocker(
             command,
             callback_display_id,
@@ -5354,6 +5423,12 @@ class MythicTools:
         # live schema, then keep the existing validator as the conservative hard stop.
         if isinstance(parameters, dict) and parameters:
             try:
+                transaction = getattr(self, "_private_collection_transaction", None)
+                reserved_step = (
+                    transaction._current_step()
+                    if isinstance(transaction, _PrivateCollectionTransaction) and transaction.active_for(self)
+                    else None
+                )
                 param_schema = await self._fetch_command_schema(command, callback_display_id)
                 if param_schema:
                     original_parameters = dict(parameters)
@@ -5367,6 +5442,19 @@ class MythicTools:
                             callback_display_id,
                             param_schema=param_schema,
                         )
+                        if (
+                            parameters != original_parameters
+                            and isinstance(transaction, _PrivateCollectionTransaction)
+                            and transaction.active_for(self)
+                        ):
+                            alias_blocker = transaction.bind_schema_resolution(
+                                self, command, original_parameters, parameters,
+                                callback_display_id, param_schema, resolved.group, reserved_step,
+                            )
+                            if alias_blocker:
+                                return self._note_effect_denial(
+                                    f"STOP — supervised collection denied: {alias_blocker}"
+                                )
                         if parameters != original_parameters:
                             logger.debug(
                                 f"🛡️ ARGRES command={command} group={resolved.group} "
@@ -5504,6 +5592,9 @@ class MythicTools:
 
                 async def _issue_and_wait():
                     nonlocal parameters
+                    transaction = getattr(self, "_private_collection_transaction", None)
+                    if isinstance(transaction, _PrivateCollectionTransaction) and transaction.active_for(self):
+                        transaction.handoff_schema_resolution()
                     authority_blocker = self._turn_authority_issue_blocker(
                         command,
                         callback_display_id,
@@ -5681,19 +5772,44 @@ class MythicTools:
                         if result_class == command_builder.ResultClass.SUCCESS.value
                         else "failed"
                     )
+                    # The SDK can return partial output after a subscription timeout.
+                    # Output classification alone therefore cannot prove completion.
+                    completion_evidence_required = bool(
+                        execution_approval_id
+                        or isinstance(issuance_receipt, dict)
+                        or self._private_collection_transaction_active()
+                    )
+                    task_state = (
+                        await self._supervised_task_state(tdid, callback_display_id, command)
+                        if completion_evidence_required else {}
+                    )
+                    if isinstance(issuance_receipt, dict):
+                        issuance_receipt.update(task_state)
+                        issuance_receipt["output_success"] = (
+                            result_class == command_builder.ResultClass.SUCCESS.value
+                        )
+                    task_proved = (
+                        task_state.get("task_completed") is True
+                        and str(task_state.get("task_status") or "").strip().casefold() == "completed"
+                    )
+                    if completion_evidence_required and not task_proved:
+                        self._last_issued_task_terminal_status = (
+                            str(task_state.get("task_status") or "unknown")[:80]
+                        )
                     self._record_contract_task_terminal(
                         command,
                         parameters,
                         callback_display_id,
                         tdid,
-                        success=result_class == command_builder.ResultClass.SUCCESS.value,
-                        status=self._last_issued_task_terminal_status,
-                    )
-                    # The SDK can return partial output after a subscription timeout.
-                    # Output classification alone therefore cannot prove completion.
-                    task_state = (
-                        await self._supervised_task_state(tdid, callback_display_id, command)
-                        if execution_approval_id else {}
+                        success=(
+                            result_class == command_builder.ResultClass.SUCCESS.value
+                            and (task_proved if completion_evidence_required else True)
+                        ),
+                        status=(
+                            str(task_state.get("task_status") or "unknown")
+                            if completion_evidence_required
+                            else self._last_issued_task_terminal_status
+                        ),
                     )
                     await self._notify_execution_observer({
                         **base_event,
@@ -5701,6 +5817,7 @@ class MythicTools:
                         "status": (
                             "completed"
                             if result_class == command_builder.ResultClass.SUCCESS.value
+                            and (task_proved if completion_evidence_required else True)
                             else "error"
                         ),
                         "terminal_status": self._last_issued_task_terminal_status,

@@ -2447,6 +2447,13 @@ class _CollectMythic:
 
     async def issue_task_and_waitfor_task_output(self, command, parameters, callback_display_id, **kw):
         self.calls.append((command, parameters, callback_display_id))
+        receipt = mt._task_issuance_receipt_context.get()
+        if isinstance(receipt, dict):
+            receipt.update({
+                "task_id": len(self.calls), "task_completed": True,
+                "task_status": "completed", "output_success": True,
+                "callback_id": callback_display_id, "command": command,
+            })
         if command == "whoami":
             return self._whoami_output
         if command == "rev2self":
@@ -2454,8 +2461,8 @@ class _CollectMythic:
         if command == "ticket_cache_list":
             return self._ticket_output
         if command == "execute_assembly":
-            mt = re.search(r"--ZipFilename\s+(\S+)", parameters.get("assembly_arguments", ""))
-            self._zipname = mt.group(1) if mt else None
+            zip_match = re.search(r"--ZipFilename\s+(\S+)", parameters.get("assembly_arguments", ""))
+            self._zipname = zip_match.group(1) if zip_match else None
             return "SharpHound enumeration completed"
         if command == "ls":
             files = [{"name": "apollo.exe", "full_name": "C:\\Users\\Public\\apollo.exe", "is_file": True}]
@@ -2514,13 +2521,20 @@ class _MerlinCollectMythic(_CollectMythic):
 
     async def issue_task_and_waitfor_task_output(self, command, parameters, callback_display_id, **kw):
         self.calls.append((command, parameters, callback_display_id))
+        receipt = mt._task_issuance_receipt_context.get()
+        if isinstance(receipt, dict):
+            receipt.update({
+                "task_id": len(self.calls), "task_completed": True,
+                "task_status": "completed", "output_success": True,
+                "callback_id": callback_display_id, "command": command,
+            })
         if command == "token":
             return next(self._whoami_outputs)
         if command == "rev2Self":
             return "Successfully reverted to self and dropped the impersonation token"
         if command == "execute-assembly":
-            mt = re.search(r"--ZipFilename\s+(\S+)", parameters.get("arguments", ""))
-            self._zipname = mt.group(1) if mt else None
+            zip_match = re.search(r"--ZipFilename\s+(\S+)", parameters.get("arguments", ""))
+            self._zipname = zip_match.group(1) if zip_match else None
             return "SharpHound enumeration completed"
         if command == "ls":
             on_disk = f"20260101000000_{self._zipname}" if self._ts else self._zipname
@@ -2621,7 +2635,7 @@ def test_collect_verbose_streams_progress_to_parent_task():
     result = asyncio.run(_run())
 
     assert result["ok"] is True, result
-    assert any("**Collection started**" in item and "SharpHound collection" in item for item in streamed), streamed
+    assert any("**Collection runner completed**" in item and "SharpHound runner task" in item for item in streamed), streamed
     assert any("**Collection artifact**" in item and "fresh collection artifact" in item for item in streamed), streamed
     assert any("**Collection verified**" in item and "graph_verified=true" in item for item in streamed), streamed
     assert all("Autonomous_Controller" not in item for item in streamed), streamed
@@ -2959,6 +2973,87 @@ def test_supervised_collection_failed_runner_receipt_stops_successors():
     assert len(m.mythic_client.started) == 1
     assert m.mythic_client.started[0]["identity"] == "north\\admin"
     assert not any(call[0] in ("ls", "download", "ingest_collection") for call in m.mythic_client.calls)
+
+
+@pytest.mark.parametrize("stage", ("execute_assembly", "ls", "download"))
+@pytest.mark.parametrize("fault, expected", (
+    ("missing", "task_issue_failed"),
+    ("failed", "task_failed"),
+    ("pending", "task_nonterminal"),
+    ("output_failure", "task_failed"),
+    ("wrong_command", "task_issue_failed"),
+    ("wrong_callback", "task_issue_failed"),
+))
+def test_collection_requires_own_successful_task_receipt_before_successors(stage, fault, expected):
+    class ReceiptFault(_CollectMythic):
+        async def issue_task_and_waitfor_task_output(self, command, parameters, callback_display_id, **kw):
+            output = await super().issue_task_and_waitfor_task_output(command, parameters, callback_display_id, **kw)
+            if command == stage:
+                receipt = mt._task_issuance_receipt_context.get()
+                assert isinstance(receipt, dict)
+                if fault == "missing":
+                    receipt.clear()
+                    return "STOP — request contract denied Mythic task issue"
+                if fault == "failed":
+                    receipt.update(task_completed=True, task_status="error")
+                elif fault == "pending":
+                    receipt.update(task_completed=False, task_status="processing")
+                elif fault == "output_failure":
+                    receipt["output_success"] = False
+                elif fault == "wrong_command":
+                    receipt["command"] = "other-command"
+                else:
+                    receipt["callback_id"] = callback_display_id + 1
+            return output
+
+    m = object.__new__(model.Model)
+    m.mythic_client = ReceiptFault({"status": "ingested", "graph_verified": True})
+    result = asyncio.run(m._controller_collect(_live_foothold_state("2")))
+    assert result["ok"] is False and result["status"] == expected, result
+    commands = [call[0] for call in m.mythic_client.calls]
+    assert "ingest_collection" not in commands
+    if stage == "execute_assembly":
+        assert "ls" not in commands and "download" not in commands
+    elif stage == "ls":
+        assert "download" not in commands
+    if fault in {"missing", "pending", "wrong_command", "wrong_callback"}:
+        assert result["trajectory_repair"]["repair"]["retry_budget"] == 0
+
+
+@pytest.mark.parametrize("fault", ("missing", "pending"))
+def test_collection_issuance_denial_halts_controller_before_another_collection(fault):
+    class MissingRunnerReceipt(_CollectMythic):
+        async def issue_task_and_waitfor_task_output(self, command, parameters, callback_display_id, **kw):
+            output = await super().issue_task_and_waitfor_task_output(command, parameters, callback_display_id, **kw)
+            if command == "execute_assembly":
+                receipt = mt._task_issuance_receipt_context.get()
+                if fault == "missing":
+                    receipt.clear()
+                    return "STOP — request contract denied Mythic task issue"
+                receipt.update(task_completed=False, task_status="processing")
+            return output
+
+    state = _live_foothold_state("2")
+    m = object.__new__(model.Model)
+    m.mythic_client = MissingRunnerReceipt({"status": "ingested", "graph_verified": True})
+    attempts = []
+
+    async def collect(observed):
+        attempts.append(1)
+        return await m._controller_collect(observed)
+
+    c = controller.AutonomousController(
+        observe=lambda: state,
+        execute=lambda _action: {"ok": True},
+        frontier_fn=lambda _state: [],
+        needs_collection=lambda _state: {"collection_key": "scope:test"},
+        collect=collect,
+    )
+    result = asyncio.run(c.run())
+    assert result.status == controller.STATUS_BLOCKED, result.to_dict()
+    assert attempts == [1]
+    assert [call[0] for call in m.mythic_client.calls].count("execute_assembly") == 1
+    assert result.blocker["trajectory_repair"]["retry_budget"] == 0
 
 
 def test_supervised_collection_terminal_projection_is_exactly_once():
