@@ -63,6 +63,34 @@ directory ships **empty** (only a `.keep`) — Sage bundles no binaries. An oper
 Certify, SharpHound, SharpGPOAbuse, SharpDPAPI, or Whisker; a binary placed there is staged into Mythic on
 demand, and `download_tool` fetches a pinned, sha256-verified binary from its TTP source into the same folder.
 
+## Payload adapters and command discovery
+
+Sage queries Mythic for commands and argument schemas, including parameter names, CLI aliases, groups and
+defaults. Automated capabilities also need a semantic mapping: which commands implement an operation, which
+authentication context they use, and how their output proves the intended effect. These mappings live in
+`Payload_Type/sage/ai/langgraph/mythic_capability_adapter.py`.
+
+The automated graph-collection controller currently selects only Apollo and Merlin profiles:
+
+| Payload type | Collection profile |
+|---|---|
+| Apollo | Uses the shared collection defaults: `execute_assembly` with `assembly_name` and `assembly_arguments`, plus `whoami` and `ticket_cache_list` for authentication checks. |
+| Merlin | Overrides the defaults: `execute-assembly` with `filename` and `arguments`, and `token` with `method: whoami` for identity. It does not use Apollo's ticket-cache command and has payload-specific transport and file-parameter mappings. |
+| Other payload types | No collection profile is selected. Command discovery may still be available, but the controller excludes these footholds from automated collection. |
+
+An adapter defines known execution semantics; the live schema supplies current argument syntax and validation.
+Adding another payload requires a suitable collection profile and verification of its assembled execution path.
+An existing profile does not imply support for every capability or live qualification. The beta's validated
+payload configuration is Apollo; see the [README limitations](../../README.md#limitations).
+
+Mythic parameters can have a native `name` and a different `cli_name`. For example, Apollo declares
+`assembly_name`/`assembly_arguments` with CLI aliases `Assembly`/`Arguments`. Sage's resolver translates
+these using the advertised schema. In an approved collection, Sage binds a lossless declared alias rename
+to the exact pending step and retains both representations. Changed values, added defaults, dropped fields
+and ambiguous aliases remain blocked by this boundary. Runner, listing and download steps require matching
+Mythic task receipts and successful completion evidence before collection advances. An issuance refusal or
+pending task prevents automatic reproposal of the collection approval.
+
 ## Generic capabilities (15)
 
 The capability layer represents actions as typed tuples with **preconditions**, **effects**, and structured

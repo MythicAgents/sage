@@ -414,9 +414,15 @@ Sage bundles no offensive binaries. Drop a binary in (for example `Rubeus.exe`, 
 demand instead of making you upload it by hand. `download_tool` can also fetch a pinned, sha256-verified binary
 from its TTP source straight into this folder.
 
-Capability mechanics bind to the **live payload's advertised command schema** at execution time
-(`mythic_capability_adapter.py`), so the same generic capability drives Apollo, Merlin, Poseidon, or any Mythic
-agent — Sage is not tied to one payload.
+Sage discovers commands and validates arguments against the **live payload's advertised command schema**.
+Automated workflows also use payload-specific profiles in `mythic_capability_adapter.py` to select commands
+and account for execution and authentication behavior. The automated graph-collection controller currently
+has profiles for **Apollo and Merlin**; it excludes payload types without a collection profile. Discovering
+a payload's commands does not establish support for every automated capability on that payload.
+
+See [payload adapters and command discovery](docs/reference/TOOLS_AND_CAPABILITIES.md#payload-adapters-and-command-discovery)
+for the profile mappings and approval/alias boundary. An implemented profile is separate from live validation;
+the beta-qualified payload remains Apollo in the exact configuration described under [Limitations](#limitations).
 
 The complete tool and capability reference is in
 [docs/reference/TOOLS_AND_CAPABILITIES.md](docs/reference/TOOLS_AND_CAPABILITIES.md). Because the exposed set is

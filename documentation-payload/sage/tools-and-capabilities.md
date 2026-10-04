@@ -32,8 +32,25 @@ example: collect graph → GPO-controlled SYSTEM execution → grant directory (
 forge a golden ticket → ADCS abuse. **Each step unlocks only from verified proof of the previous one**; nothing
 is recorded on assertion alone. These capabilities are range-agnostic by design — there is no GOAD path baked in.
 
-Capability mechanics bind to the **live payload's advertised command schema** at execution time, so the same
-generic capability drives Apollo, Merlin, Poseidon, or any Mythic agent. Sage is not tied to one payload.
+Sage discovers commands and validates arguments against the **live payload's advertised command schema**.
+Automated workflows also use payload-specific profiles to select commands and account for execution and
+authentication behavior. Command discovery alone does not establish support for every automated capability.
+
+### Payload adapters and collection support
+
+The automated graph-collection controller currently has profiles for **Apollo and Merlin**. Apollo uses
+the shared collection defaults, including `execute_assembly`, `whoami` and `ticket_cache_list`. Merlin
+overrides these mappings with `execute-assembly` and token-based identity checks, along with its own
+transport and file-parameter conventions. Payload types without a collection profile are excluded from
+automated collection. Profiles are defined in `mythic_capability_adapter.py`; an implemented profile is
+separate from live qualification, which remains limited to the beta's documented Apollo configuration.
+
+The live schema supplies parameter syntax, including native names and CLI aliases. Apollo's
+`assembly_name`/`assembly_arguments`, for example, have CLI aliases `Assembly`/`Arguments`. Sage resolves
+these names and binds a lossless alias rename to the exact approved collection step. Changed values or
+added defaults remain blocked by that boundary. Collection advances only after matching Mythic task
+receipts prove successful completion. An issuance refusal or pending task prevents automatic reproposal
+of the collection approval.
 
 ## Tradecraft references
 
