@@ -893,7 +893,13 @@ class SageChat(Chat):
                         complete_request=True,
                     )
                     return None
-            if existing_at_entry is None and (
+            slash = getattr(request, "SlashCommand", None)
+            read_only_state = (
+                slash is not None
+                and str(getattr(slash, "Name", "") or "").lower().lstrip("/") == "state"
+                and not str(getattr(slash, "Argument", "") or "").strip()
+            )
+            if existing_at_entry is None and not read_only_state and (
                 (not first_channel_claim and not slash_only_new_channel)
                 or (first_channel_claim and _channel_has_prior_context(request))
             ) and recovery_state is None:
@@ -913,7 +919,7 @@ class SageChat(Chat):
             # need a fresh Model.initialize(). A handled command sends its own terminal → return None.
             # Unknown structured slash commands also terminate locally; control input is never
             # reinterpreted as a model prompt.
-            if getattr(request, "SlashCommand", None) is not None:
+            if slash is not None:
                 existing = await get_channel_session(request)
                 existing = await self._rotate_auth_changed_session(request, existing)
                 if existing is not None:
