@@ -177,6 +177,15 @@ _collection_file_preflight_context: contextvars.ContextVar[dict | None] = contex
     "sage_collection_file_preflight_context",
     default=None,
 )
+_capability_execution_context: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "sage_capability_execution_context", default=None,
+)
+_capability_command_context: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "sage_capability_command_context", default=None,
+)
+_capability_file_preflight_context: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "sage_capability_file_preflight_context", default=None,
+)
 _POLICY_EVIDENCE_FIELDS = (
     "episode_id",
     "decision_id",
@@ -2510,6 +2519,35 @@ class MythicTools:
             return False
         root_callback = root_bindings.callback_id
         actual_callback = actual_bindings.callback_id
+        if tool_name == "ensure_tool_uploaded" and root_name == "execute_capability":
+            execution = _capability_execution_context.get() or {}
+            command = _capability_command_context.get() or {}
+            preflight = _capability_file_preflight_context.get() or {}
+            claim = getattr(self, "_active_approval_claim", None)
+            contract = getattr(self, "_request_contract", None)
+            return bool(
+                root_callback and root_bindings.capability
+                and execution.get("client") is self
+                and execution.get("task") is asyncio.current_task()
+                and execution.get("claim") is claim
+                and execution.get("contract") is contract
+                and execution.get("claim_id") == claim.get("approval_id")
+                and execution.get("request_id") == claim.get("request_id") == getattr(contract, "request_id", None)
+                and execution.get("contract_digest") == claim.get("request_contract_digest") == getattr(contract, "digest", None)
+                and execution.get("root_args") == root_args
+                and execution.get("callback_id") == root_callback
+                and execution.get("capability") == root_bindings.capability
+                and command.get("execution") is execution
+                and command.get("task") is asyncio.current_task()
+                and command.get("callback_id") == root_callback
+                and command.get("capability") == root_bindings.capability
+                and preflight.get("command") is command
+                and preflight.get("task") is asyncio.current_task()
+                and preflight.get("callback_id") == command.get("callback_id")
+                and preflight.get("filename") == actual_args.get("binary_filename")
+                and preflight.get("runner_command") == command.get("runner_command")
+                and preflight.get("runner_parameters") == command.get("runner_parameters")
+            )
         if tool_name == "ensure_tool_uploaded" and root_name != "execute_capability":
             # `ensure_tool_uploaded` registers a file in Mythic's operation-scoped filemeta and
             # takes no callback argument, so the generic callback binding below can never match a
@@ -2517,7 +2555,7 @@ class MythicTools:
             # to the approval instead: the child's binary_filename must be named verbatim in the
             # approved root's own parameters. That is strictly TIGHTER than a callback match — it
             # admits registering exactly the file the approved command runs, and nothing else.
-            # `execute_capability` keeps its existing capability-bound path below unchanged.
+            # Capability registration has its own immediate-command binding above.
             if not (root_callback or root_bindings.capability):
                 return False
             return self._registered_file_named_by_root(root_args, actual_args)
@@ -5331,6 +5369,18 @@ class MythicTools:
         if authority_blocker:
             self._pending_task_backed_transition = None
             return self._note_effect_denial(authority_blocker)
+        command_binding = _capability_command_context.get() or {}
+        if command_binding.get("task") is asyncio.current_task():
+            command_binding["entered_issue"] = False
+            command_binding.pop("runner_command", None)
+            command_binding.pop("runner_parameters", None)
+        if (
+            command_binding.get("task") is asyncio.current_task()
+            and command_binding.get("command") == command
+            and command_binding.get("parameters") == parameters
+            and command_binding.get("callback_id") == str(callback_display_id)
+        ):
+            command_binding["entered_issue"] = True
         deferral_blocker = self._deferred_task_issue_blocker(command, callback_display_id)
         if deferral_blocker:
             self._pending_task_backed_transition = None
@@ -5448,6 +5498,9 @@ class MythicTools:
         # Registered-file commands often expose a ChooseOne selector whose choices are populated from Mythic
         # filemeta. Satisfy that control-plane prerequisite before argument resolution; otherwise the resolver
         # can reject an unregistered tool name before Sage gets a chance to register it.
+        if command_binding.get("entered_issue") and command_binding.get("task") is asyncio.current_task():
+            command_binding["runner_command"] = command
+            command_binding["runner_parameters"] = copy.deepcopy(parameters)
         try:
             registered_file_blocker = await self._ensure_registered_file_available(
                 command,
@@ -8228,7 +8281,28 @@ class MythicTools:
                 "callback_id": callback_display_id,
                 "filename": name,
             }
+        command_binding = _capability_command_context.get() or {}
+        execution = command_binding.get("execution") or {}
+        capability_binding = None
+        if (
+            command_binding.get("task") is asyncio.current_task()
+            and execution.get("client") is self
+            and execution.get("task") is asyncio.current_task()
+            and command_binding.get("entered_issue") is True
+            and str(callback_display_id) == command_binding.get("callback_id")
+            and command == command_binding.get("runner_command")
+            and parameters == command_binding.get("runner_parameters")
+        ):
+            capability_binding = {
+                "command": command_binding,
+                "task": asyncio.current_task(),
+                "callback_id": str(callback_display_id),
+                "runner_command": command,
+                "runner_parameters": copy.deepcopy(parameters),
+                "filename": name,
+            }
         context_token = _collection_file_preflight_context.set(binding)
+        capability_token = _capability_file_preflight_context.set(capability_binding)
         try:
             raw_upload = await self.ensure_tool_uploaded(name)
             up = json.loads(raw_upload) if isinstance(raw_upload, str) else raw_upload
@@ -8241,6 +8315,7 @@ class MythicTools:
             logger.warning(blocker)
             return blocker
         finally:
+            _capability_file_preflight_context.reset(capability_token)
             _collection_file_preflight_context.reset(context_token)
         if not isinstance(up, dict):
             blocker = (
@@ -9830,10 +9905,55 @@ class MythicTools:
         replay a command list by hand. Currently materialization is implemented for
         `adcs-certificate-auth`; other builder-backed capabilities are executed from their adapter plan.
         """
-        self._require_request_contract_effect("execute_capability", {
-            "action": action,
-            "inputs": inputs,
-        })
+        args = {"action": action, "inputs": inputs}
+        self._require_request_contract_effect("execute_capability", args)
+        claim = getattr(self, "_active_approval_claim", None)
+        contract = getattr(self, "_request_contract", None)
+        execution = None
+        if isinstance(claim, dict):
+            approved = claim.get("approved_actions")
+            roots = []
+            if isinstance(approved, list):
+                for root in approved:
+                    if not isinstance(root, dict) or root.get("name") != "execute_capability":
+                        continue
+                    root_args = root.get("args")
+                    if not isinstance(root_args, dict):
+                        continue
+                    try:
+                        if self._effective_request_action_arguments(
+                            "execute_capability", root_args,
+                        ) == self._effective_request_action_arguments("execute_capability", args):
+                            roots.append(root_args)
+                    except (TypeError, ValueError):
+                        continue
+            if len(roots) == 1:
+                root_args = roots[0]
+                try:
+                    from .request_contract import action_binding_values
+                except ImportError:  # pragma: no cover
+                    from request_contract import action_binding_values  # type: ignore
+                bindings = action_binding_values(root_args)
+                execution = {
+                    "client": self, "task": asyncio.current_task(),
+                    "claim": claim, "contract": contract,
+                    "claim_id": claim.get("approval_id"),
+                    "request_id": claim.get("request_id"),
+                    "contract_digest": claim.get("request_contract_digest"),
+                    "root_args": copy.deepcopy(root_args),
+                    "callback_id": bindings.callback_id,
+                    "capability": bindings.capability,
+                }
+        token = _capability_execution_context.set(execution)
+        try:
+            return await self._execute_capability_impl(action, inputs)
+        finally:
+            _capability_execution_context.reset(token)
+
+    async def _execute_capability_impl(
+        self, action: dict | str, inputs: dict | str | None = None,
+    ) -> str:
+        """Run the implementation within the public tool's active execution binding."""
         try:
             if self.client is None:
                 return json.dumps({
@@ -11692,6 +11812,23 @@ class MythicTools:
                 "authorization": authorization,
                 "bounded_delayed_proof_poll": self._capability_executor_allows_repeated_probe(command_obj),
             })
+            execution = _capability_execution_context.get() or {}
+            command_binding = None
+            if (
+                execution.get("client") is self
+                and execution.get("task") is asyncio.current_task()
+                and execution.get("capability") == capability_name
+                and execution.get("callback_id") == str(callback_id)
+            ):
+                command_binding = {
+                    "execution": execution,
+                    "task": asyncio.current_task(),
+                    "callback_id": str(callback_id),
+                    "capability": capability_name,
+                    "command": command_name,
+                    "parameters": copy.deepcopy(parameters),
+                }
+            command_token = _capability_command_context.set(command_binding)
             try:
                 output = await self.issue_task_and_waitfor_task_output(
                     command_name,
@@ -11700,6 +11837,7 @@ class MythicTools:
                     timeout=timeout,
                 )
             finally:
+                _capability_command_context.reset(command_token)
                 _task_visibility_context.reset(visibility_token)
         except Exception as exc:
             await self._notify_capability_command_observer(

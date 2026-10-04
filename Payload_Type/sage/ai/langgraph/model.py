@@ -10286,6 +10286,8 @@ class Model:
             result = None
             activity_status = "finished"
             try:
+                # Only a denial produced by this accepted execution may stop this controller cycle.
+                self.mythic_client._last_effect_denial = None
                 fire(
                     f"execute {payload.get('name')} -> {payload.get('target')} cb={inputs.get('callback_id', '')}",
                     operator_message=(
@@ -10295,6 +10297,14 @@ class Model:
                     ),
                 )
                 result = await self.mythic_client.execute_capability(payload, inputs)
+                # A nested supervised effect can be denied after the root capability has been
+                # accepted. Consume that final-sink receipt here, before the controller can
+                # select and display the same action again.
+                if self._controller_hitl_enabled() and getattr(
+                    self.mythic_client, "_last_effect_denial", None
+                ):
+                    await self._handle_reproposal_after_denial()
+                    raise _ControllerHitlPause()
                 self._controller_refresh_transaction_proof_lineage(transaction["transaction_id"])
                 kind = type(result).__name__
                 size = len(result) if isinstance(result, str) else "n/a"
