@@ -2163,6 +2163,15 @@ def _runtime_engagement_scope(mythic_client) -> tuple[str, bool]:
         return "", False
 
 
+def _runtime_current_account_contexts(mythic_client) -> frozenset[tuple[str, str, str]]:
+    """Return transient current-process account proof without breaking lightweight clients."""
+    try:
+        projector = getattr(mythic_client, "_current_account_context_keys", None)
+        return frozenset(projector() or ()) if callable(projector) else frozenset()
+    except Exception:
+        return frozenset()
+
+
 # Imperative directive paired with the observed-state block. A bare status LIST is informational; the
 # operator can still favor an overlay checklist that lists an already-achieved hop. This makes the
 # instruction explicit ("ACHIEVED = DONE, do NOT re-issue"). Shared by the per-turn middleware injection
@@ -8503,6 +8512,7 @@ class Model:
                 hops=hops,
                 engagement_id=engagement_id,
                 runtime_scope=runtime_scope,
+                current_account_contexts=_runtime_current_account_contexts(mythic_client),
             )
         except Exception:
             return None
@@ -8536,6 +8546,7 @@ class Model:
             state = _es.EngagementState(
                 objective=objective, footholds=footholds, hops=hops, graph_facts=graph_facts,
                 engagement_id=engagement_id, runtime_scope=runtime_scope,
+                current_account_contexts=_runtime_current_account_contexts(mythic_client),
             )
             rendered = _es.render_engagement_state(state)
             if not rendered:
@@ -8579,6 +8590,7 @@ class Model:
                 graph_facts=list(getattr(mythic_client, "_engagement_graph_facts", []) or []),
                 engagement_id=engagement_id,
                 runtime_scope=runtime_scope,
+                current_account_contexts=_runtime_current_account_contexts(mythic_client),
             )
         except Exception:
             return None
@@ -14070,6 +14082,7 @@ def _deterministic_post_ingest_owner(mythic_client) -> _HandoffDirective | None:
             graph_facts=list(getattr(mythic_client, "_engagement_graph_facts", []) or []),
             engagement_id=engagement_id,
             runtime_scope=runtime_scope,
+            current_account_contexts=_runtime_current_account_contexts(mythic_client),
         )
         if capabilities.actions_from_state(snapshot):
             return None
@@ -15375,6 +15388,11 @@ def _autonomous_capability_inputs(action: Any, engagement_snapshot: Any) -> dict
     ):
         inputs["allow_proof_only"] = True
     action_name = str(getattr(action, "name", "") or "").strip().casefold()
+    if (
+        action_name == "ensure-account-kerberos-context"
+        and intent.get("force_revalidate") is True
+    ):
+        inputs["force_revalidate"] = True
     if action_name in {"gpo-controlled-system-exec", "grant-directory-rights"}:
         inputs["gpo_wait_seconds"] = _autonomous_gpo_wait_seconds(action)
     return inputs

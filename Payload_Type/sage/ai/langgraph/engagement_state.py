@@ -58,6 +58,9 @@ class EngagementState:
     probed_effect_prefixes: set[str] = field(default_factory=set)
     engagement_id: str = ""
     runtime_scope: bool = False
+    # Exact account contexts proven in this MythicTools process. Durable account-context
+    # effects survive restart, but these runtime keys deliberately do not.
+    current_account_contexts: frozenset[tuple[str, str, str]] = field(default_factory=frozenset)
 
     def achieved_effects(self) -> set[str]:
         """Return normalized effects from achieved hops."""
@@ -1192,6 +1195,9 @@ def record_effect_result(
         probed_effect_prefixes=set(getattr(state, "probed_effect_prefixes", set()) or set()),
         engagement_id=getattr(state, "engagement_id", ""),
         runtime_scope=bool(getattr(state, "runtime_scope", False)),
+        current_account_contexts=frozenset(
+            getattr(state, "current_account_contexts", frozenset()) or ()
+        ),
     )
 
 

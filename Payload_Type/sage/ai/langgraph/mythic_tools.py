@@ -11582,7 +11582,7 @@ class MythicTools:
         }
         if timeout is not None:
             context_inputs["timeout"] = timeout
-        raw = await self.execute_capability(context_action, context_inputs)
+        raw = await self.execute_capability(asdict(context_action), context_inputs)
         try:
             payload = json.loads(raw)
         except Exception:
@@ -16631,6 +16631,17 @@ class MythicTools:
             str(callback_display_id),
             self._capability_text(account).casefold(),
             self._capability_text(domain).casefold(),
+        )
+
+    def _current_account_context_keys(self) -> frozenset[tuple[str, str, str]]:
+        """Project only exact account contexts proven in this client process."""
+        logon = set(getattr(self, "_kerberos_logon_account_context_keys", set()) or set())
+        tickets = set(getattr(self, "_kerberos_account_context_keys", set()) or set())
+        return frozenset(
+            value for value in logon & tickets
+            if isinstance(value, tuple)
+            and len(value) == 3
+            and all(isinstance(item, str) and item for item in value)
         )
 
     def _callback_current_identity_matches_account_context(

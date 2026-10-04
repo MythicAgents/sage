@@ -216,6 +216,28 @@ def capability_catalog() -> list[dict[str, str]]:
     ]
 
 
+def _current_account_context_keys(state: Any) -> set[tuple[str, str, str]]:
+    values = getattr(state, "current_account_contexts", frozenset())
+    keys: set[tuple[str, str, str]] = set()
+    for value in values or ():
+        if not isinstance(value, (list, tuple)) or len(value) != 3:
+            continue
+        callback_id = _normalize_callback_id(value[0])
+        account = _normalize(value[1])
+        domain = _normalize(value[2])
+        if callback_id and account and domain:
+            keys.add((callback_id, account, domain))
+    # A live callback that already runs as the exact account is current proof;
+    # it does not need a make_token/TGT repair merely because this client has no
+    # process-local record for a context established outside the request.
+    for effect in _live_foothold_account_context_effects(state):
+        parsed = _parse_kerberos_account_context_effect(effect)
+        if parsed:
+            domain, account, callback_id = parsed
+            keys.add((callback_id, account, domain))
+    return keys
+
+
 def actions_from_state(state: Any) -> list[CapabilityAction]:
     """Return generic capability actions available from the observed state."""
     actions: list[CapabilityAction] = []
@@ -225,6 +247,7 @@ def actions_from_state(state: Any) -> list[CapabilityAction]:
     preferred_callback_id = _preferred_live_callback_id(state, live_callback_ids)
     achieved = _achieved_effects(state)
     available_account_contexts = achieved | _live_foothold_account_context_effects(state)
+    current_account_contexts = _current_account_context_keys(state)
     terminal_failed = _terminal_failed_effects(state)
     ca_key_blocked_targets = _adcs_ca_private_key_blocked_targets(state)
     explicit_replication_domains = set(_replication_right_domains(achieved | facts))
@@ -359,7 +382,25 @@ def actions_from_state(state: Any) -> list[CapabilityAction]:
             account,
         ):
             continue
-        if _live_account_kerberos_context_callbacks(available_account_contexts, live_callback_ids, domain, account):
+        account_context_callbacks = _live_account_kerberos_context_callbacks(
+            available_account_contexts, live_callback_ids, domain, account,
+        )
+        if account_context_callbacks:
+            if not getattr(state, "runtime_scope", False) or any(
+                (callback_id, account, domain) in current_account_contexts
+                for callback_id in account_context_callbacks
+            ):
+                continue
+            callback_id = _select_context_callback_id(
+                set(account_context_callbacks),
+                preferred_callback_id,
+                terminal_failed=terminal_failed,
+                effect_for_callback=lambda candidate: _kerberos_account_context_effect(domain, account, candidate),
+            )
+            if callback_id:
+                actions.append(_ensure_account_kerberos_context_action(
+                    domain, account, callback_id, force_revalidate=True,
+                ))
             continue
         callback_id = _select_context_callback_id(
             live_callback_ids,
@@ -409,6 +450,11 @@ def actions_from_state(state: Any) -> list[CapabilityAction]:
             account_domain,
             account,
         ):
+            if (
+                getattr(state, "runtime_scope", False)
+                and (callback_id, account, account_domain) not in current_account_contexts
+            ):
+                continue
             actions.append(_read_managed_local_admin_secret_action(
                 account_domain,
                 account,
@@ -5162,29 +5208,38 @@ def _dcsync_account_action(
     )
 
 
-def _ensure_account_kerberos_context_action(domain: str, account: str, callback_id: str) -> CapabilityAction:
+def _ensure_account_kerberos_context_action(
+    domain: str,
+    account: str,
+    callback_id: str,
+    *,
+    force_revalidate: bool = False,
+) -> CapabilityAction:
     domain = _normalize(domain)
     account = _normalize(account)
     callback_id = _normalize_callback_id(callback_id)
     effect = _kerberos_account_context_effect(domain, account, callback_id)
+    intent = {
+        "capability": "ensure-account-kerberos-context",
+        "domain": domain,
+        "account": account,
+        "callback_id": callback_id,
+        "steps": [
+            "probe the callback's current Kerberos ticket store for this account first",
+            "reuse stored account key material to request a TGT only if the current context lacks it",
+            "create or reuse an isolated logon context on the same callback",
+            "import the account TGT into that context without pass-the-ticket flags",
+            "record success only when the expected account ticket and service access are both proven",
+        ],
+    }
+    if force_revalidate:
+        intent["force_revalidate"] = True
     return CapabilityAction(
         name="ensure-account-kerberos-context",
         target=f"domain={domain};account={account};callback={callback_id}",
         preconditions=[f"creds:{account}@{domain}", f"live-callback:{callback_id}"],
         effects=[effect],
-        intent={
-            "capability": "ensure-account-kerberos-context",
-            "domain": domain,
-            "account": account,
-            "callback_id": callback_id,
-            "steps": [
-                "probe the callback's current Kerberos ticket store for this account first",
-                "reuse stored account key material to request a TGT only if the current context lacks it",
-                "create or reuse an isolated logon context on the same callback",
-                "import the account TGT into that context without pass-the-ticket flags",
-                "record success only when the expected account ticket and service access are both proven",
-            ],
-        },
+        intent=intent,
         verifier={
             "achieved_all": [
                 "logon_context_proven",
