@@ -48,6 +48,7 @@ SAGE_SLASH_COMMANDS = [
     _WATCHER_COMMAND,
     ChatSlashCommandDefinition(Name="state", Description="Show/edit Sage's engagement state (hop ledger): /state, /state reconcile|remove|set|objective|wipe."),
     ChatSlashCommandDefinition(Name="list", Description="List active Sage chat sessions."),
+    ChatSlashCommandDefinition(Name="tools", Description="List Sage's Mythic tool functions: /tools."),
     ChatSlashCommandDefinition(
         Name="mode",
         Description="Show or set the agent mode: /mode [conversation|supervised|auto].",
@@ -61,6 +62,65 @@ WATCHER_SLASH_COMMANDS = [_FINDINGS_COMMAND, _WATCHER_COMMAND, _STOP_COMMAND]
 SLASH_COMMANDS = SAGE_SLASH_COMMANDS
 
 _MCP_CALL_TIMEOUT_SECONDS = 60
+
+
+def looks_like_tool_inventory_prompt(prompt: str) -> bool:
+    """Accept only a complete request to describe Sage's Mythic tool surface."""
+    value = " ".join(str(prompt or "").strip().casefold().split()).rstrip(" ?!.,:;")
+    return value in {
+        "list your tools", "list your mythic tools", "list sage tools",
+        "show your tools", "show your mythic tools", "show sage tools",
+        "what tools do you have", "what mythic tools do you have",
+        "what tools does sage have", "what mythic tools does sage have",
+        "which tools do you have", "which mythic tools do you have",
+    }
+
+
+def render_tool_inventory(model: Any = None) -> str:
+    """Describe public shipped Mythic functions without building agents or contacting Mythic."""
+    try:
+        from ai.comparison_tool_surface import SHIPPING_MYTHIC_OPERATOR_TOOL_NAMES, SHIPPING_MYTHIC_PAYLOAD_TOOL_NAMES
+        from ai.langgraph.mythic_tools import MythicTools, TOOL_SAFETY_READ_ONLY, tool_safety_of
+        from ai.langgraph.prompt_loader import get_prompt_tools
+    except ImportError:  # pragma: no cover
+        from ..ai.comparison_tool_surface import SHIPPING_MYTHIC_OPERATOR_TOOL_NAMES, SHIPPING_MYTHIC_PAYLOAD_TOOL_NAMES  # type: ignore
+        from ..ai.langgraph.mythic_tools import MythicTools, TOOL_SAFETY_READ_ONLY, tool_safety_of  # type: ignore
+        from ..ai.langgraph.prompt_loader import get_prompt_tools  # type: ignore
+
+    client = getattr(model, "mythic_client", None) if model is not None else None
+    disabled = getattr(client, "disabled_tools", None) if client is not None else None
+    mode = str(getattr(model, "mode", "") or "") if model is not None else ""
+    rows = ["**Sage Mythic tools**", "", "These are Sage tool functions, not commands installed on a payload callback."]
+    if model is None:
+        rows.append("No active Sage session: token scope and live tool availability are unverified.")
+    elif disabled is None:
+        rows.append("Token scope availability has not been verified in this session.")
+    rows.extend(["", "| Agent | Tool | Access | Description |", "| --- | --- | --- | --- |"])
+    for agent, prompt_name, candidates in (
+        ("Mythic Operator", "mythic_operator", SHIPPING_MYTHIC_OPERATOR_TOOL_NAMES),
+        ("Mythic Payload", "mythic_payload", SHIPPING_MYTHIC_PAYLOAD_TOOL_NAMES),
+    ):
+        declared = set(get_prompt_tools(prompt_name))
+        for name in candidates:
+            if name not in declared:
+                continue
+            method = getattr(MythicTools, name, None)
+            if method is None:
+                continue
+            safety = tool_safety_of(name, MythicTools)
+            access = "read-only" if safety == TOOL_SAFETY_READ_ONLY else "guarded"
+            if disabled is not None and name in disabled:
+                access += "; unavailable to this token"
+            elif safety != TOOL_SAFETY_READ_ONLY and mode == "conversation":
+                access += "; unavailable in conversation mode"
+            elif safety != TOOL_SAFETY_READ_ONLY and mode == "supervised":
+                access += "; native approval required"
+            description = " ".join((method.__doc__ or "").strip().split()).split(". ", 1)[0].rstrip(".")
+            description = description.replace("|", "\\|")
+            rows.append(f"| {agent} | `{name}` | {access} | {description} |")
+    rows.extend(["", "For connected MCP tools, use `/mcp tools [server]`. "
+                 "For commands installed on a payload callback, ask Sage to query that payload type."])
+    return "\n".join(rows)
 
 
 def _handle_mode(model: Any, arg: str) -> str:
@@ -842,6 +902,8 @@ async def handle_slash(chat: Any, request: ChatRequest, model: Any, response_key
         text = await _handle_state(model, request, arg)
     elif name == "list":
         text = await _handle_list()
+    elif name == "tools":
+        text = render_tool_inventory(model) if not arg.strip() else "Usage: `/tools` — list Sage Mythic tool functions."
     elif name == "stop":
         text = await _handle_stop(request, model)
     elif name == "mcp":
@@ -853,7 +915,7 @@ async def handle_slash(chat: Any, request: ChatRequest, model: Any, response_key
     else:
         text = (
             "Unknown Sage slash command. Available commands: `/findings`, `/watcher`, `/state`, "
-            "`/list`, `/mode`, `/stop`, `/mcp`, `/bloodhound`, and `/sandbox`."
+            "`/list`, `/tools`, `/mode`, `/stop`, `/mcp`, `/bloodhound`, and `/sandbox`."
         )
     await chat.send_complete(request, response_key, content=text, complete_request=True)
     return True

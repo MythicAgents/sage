@@ -373,17 +373,24 @@ up front rather than failing mid-run.
 | `/state set <row> <status>` · `/state remove <row>` · `/state wipe` | Edit or clear ledger rows (you cannot hand-promote a row to `achieved` — that needs a real proof envelope) |
 | `/mode [conversation\|supervised\|auto]` | Show or switch the channel's mode |
 | `/list` | List active Sage chat sessions |
+| `/tools` | List Sage's public Mythic tool functions, descriptions, and access requirements |
 | `/stop` | Cooperatively stop the running agent on this channel |
 | `/bloodhound [force] [dir]` | Connect, report, or rebind the BloodHound MCP — see [BloodHound](#bloodhound) |
 | `/mcp <list\|tools\|call\|connect\|disconnect\|policy>` | Manage MCP servers — see [Connecting other MCP servers](#connecting-other-mcp-servers) |
 | `/sandbox [shell\|python] <code>` | Run an isolated local snippet (requires the `callback.write` scope) |
 
+`/tools` and simple questions such as “list your tools” use the same deterministic inventory without a
+model call. The inventory distinguishes read-only tools from guarded actions and reports known session
+restrictions. Before a session is initialized, live token availability is unverified. Use `/mcp tools` for
+connected MCP tools; payload callback commands are a separate inventory retrieved from Mythic.
+
 ## Tools and capabilities
 
-Sage exposes **37 classified Mythic tools** to its agents — **26 read-only** (enumerate callbacks, payloads,
-tasks, files, and credentials; retrieve tradecraft guidance; build capability plans) and **11
-guarded/offensive** (issue a command, execute a capability, create a payload, add a credential, ingest a
-collection, run in the sandbox). Every tool carries a `@tool_safety` decorator (`TOOL_SAFETY_READ_ONLY` or
+Sage classifies tools as **read-only** (enumerate callbacks, payloads, tasks, files, and credentials;
+retrieve tradecraft guidance; build capability plans) or **guarded/offensive** (issue a command, execute a
+capability, create a payload, add a credential, ingest a collection, run in the sandbox). The public Mythic
+tool inventory is available through `/tools`; internal helpers and callback payload commands are separate.
+Every tool carries a `@tool_safety` decorator (`TOOL_SAFETY_READ_ONLY` or
 `TOOL_SAFETY_GUARDED`) and CI enforces that no tool ships unclassified — an undecorated method defaults to
 guarded at runtime. The read-only/guarded split determines behavior across modes: guarded tools are
 approval-gated in supervised mode, denied in conversation mode, and only they can change target or Mythic state.

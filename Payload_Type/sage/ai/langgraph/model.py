@@ -222,6 +222,9 @@ def _looks_like_scoped_callback_inventory_prompt(prompt: Any) -> bool:
     text = re.sub(r"\s+", " ", _coerce_prompt_text(prompt).strip().casefold()).strip(" ?!.,:;")
     if not text:
         return False
+    # The public tool name is a complete request; compound instructions stay on the normal path.
+    if text == "list_callbacks":
+        return True
     words = re.findall(r"[a-z0-9_]+", text)
     if not words or ("callback" not in words and "callbacks" not in words):
         return False

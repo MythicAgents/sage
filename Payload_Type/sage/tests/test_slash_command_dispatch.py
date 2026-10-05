@@ -42,22 +42,31 @@ def fresh_channel(monkeypatch):
     monkeypatch.setattr(service, "claim_channel_marker", first_claim)
 
 
-@pytest.mark.parametrize("name,handler", [
+_DECLARED_DISPATCH_SCENARIOS = [
     ("findings", None),
     ("watcher", None),
     ("state", "_handle_state"),
     ("list", "_handle_list"),
+    ("tools", "render_tool_inventory"),
     ("mode", "_handle_mode"),
     ("stop", "_handle_stop"),
     ("mcp", "_handle_mcp"),
     ("bloodhound", "_handle_bloodhound"),
     ("sandbox", "_handle_sandbox"),
-])
+]
+
+
+def test_dispatch_scenarios_cover_every_declared_slash():
+    assert {name for name, _handler in _DECLARED_DISPATCH_SCENARIOS} == {
+        command.Name for command in slash.SAGE_SLASH_COMMANDS
+    }
+
+
+@pytest.mark.parametrize("name,handler", _DECLARED_DISPATCH_SCENARIOS)
 def test_every_declared_slash_routes_once_without_model(
     monkeypatch, fresh_channel, name, handler,
 ):
-    assert name in {command.Name for command in slash.SAGE_SLASH_COMMANDS}
-    if handler == "_handle_mode":
+    if handler in {"_handle_mode", "render_tool_inventory"}:
         monkeypatch.setattr(slash, handler, lambda *_args: f"routed:{name}")
     elif handler is not None:
         async def routed(*_args):

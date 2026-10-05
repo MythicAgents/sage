@@ -5,11 +5,16 @@
 > `GUARDED_TOOLS` in `mythic_tools.py` and the capability catalog in `capabilities.py`. When this page and the
 > code disagree, the code wins. Regenerate or amend this page when the tool surface changes.
 
-Sage exposes **32 Mythic tools** to its agents (22 read-only, 10 guarded/offensive) plus a **15-capability**
-generic attack-planning layer. BloodHound graph tools are **not** counted here — they come from the external
+This reference describes Sage's read-only and guarded tools, including the separate sandbox tool, plus its
+**15-capability** generic attack-planning layer. BloodHound graph tools come from the external
 [BloodHound MCP server](https://github.com/mwnickerson/bloodhound_mcp), not from Sage's own code.
 
-## Read-only tools (22)
+Use `/tools` or ask “list your tools” in ordinary Sage chat for the current shipped Mythic tool inventory,
+including descriptions and known session access restrictions. This is a deterministic response; it does
+not task a callback. `/mcp tools` lists connected MCP tools separately. Callback payload commands are
+discovered through Mythic's command metadata and are distinct from Sage's tool functions.
+
+## Read-only tools
 
 These never prompt for approval and cannot change target or Mythic state.
 
@@ -38,7 +43,7 @@ These never prompt for approval and cannot change target or Mythic state.
 | `get_ttp_full_reference` | Full reference section for a TTP |
 | `list_ttp_categories` | Sage's TTP library grouped by category |
 
-## Guarded / offensive tools (10)
+## Guarded / offensive tools
 
 These are approval-gated in supervised mode and each requires a specific Mythic bot-token scope; a tool whose
 scope the channel token lacks is disabled up front.

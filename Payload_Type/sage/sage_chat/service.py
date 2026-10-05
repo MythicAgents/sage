@@ -59,7 +59,7 @@ from .session import (
     get_channel_session,
     put_channel_session,
 )
-from .slash import handle_slash
+from .slash import handle_slash, looks_like_tool_inventory_prompt, render_tool_inventory
 from .streaming import ChatStreamEmitter
 from .watcher_control import WatcherControlBoundaryError
 from .watcher_graph import build_watcher_graph, render_watcher_explanation
@@ -899,7 +899,10 @@ class SageChat(Chat):
                 and str(getattr(slash, "Name", "") or "").lower().lstrip("/") == "state"
                 and not str(getattr(slash, "Argument", "") or "").strip()
             )
-            if existing_at_entry is None and not read_only_state and (
+            tool_discovery = (slash is not None and str(getattr(slash, "Name", "") or "").lower().lstrip("/") == "tools") or (
+                slash is None and looks_like_tool_inventory_prompt(prompt)
+            )
+            if existing_at_entry is None and not read_only_state and not tool_discovery and (
                 (not first_channel_claim and not slash_only_new_channel)
                 or (first_channel_claim and _channel_has_prior_context(request))
             ) and recovery_state is None:
@@ -914,6 +917,18 @@ class SageChat(Chat):
                     ),
                     complete_request=True,
                 )
+                return None
+            if slash is None and tool_discovery:
+                existing = await self._rotate_auth_changed_session(request, existing_at_entry)
+                if existing is not None:
+                    await self._refresh_auth_context(existing, request)
+                await self.send_complete(
+                    request, turn.response_key,
+                    content=render_tool_inventory(existing),
+                    complete_request=True,
+                )
+                if first_channel_claim and existing_at_entry is None:
+                    _NEW_CHANNEL_WITHOUT_SESSION.add(channel_identity)
                 return None
             # Slash commands dispatch first — they operate on the existing session (if any) and don't
             # need a fresh Model.initialize(). A handled command sends its own terminal → return None.
