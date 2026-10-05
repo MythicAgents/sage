@@ -43,6 +43,11 @@ These never prompt for approval and cannot change target or Mythic state.
 | `get_ttp_full_reference` | Full reference section for a TTP |
 | `list_ttp_categories` | Sage's TTP library grouped by category |
 
+`get_ttp_guidance` labels library requirements, examples, and agent instructions as reference material.
+Its `reference_scope` metadata does not attest that a callback meets those requirements. A resolved payload
+type identifies an agent; an MCP connection status describes connectivity, not graph contents. Establish
+target applicability from separate observations and keep unobserved prerequisites unknown.
+
 ## Guarded / offensive tools
 
 These are approval-gated in supervised mode and each requires a specific Mythic bot-token scope; a tool whose

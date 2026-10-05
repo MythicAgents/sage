@@ -406,6 +406,175 @@ def test_controller_resume_executes_exact_approved_action_without_second_model_d
         assert telemetry["model_calls"] == 0
 
 
+def test_hybrid_approved_singleton_reaches_model_for_successor_branch(monkeypatch):
+    objective = "Complete the declared offline checks."
+    state = es.EngagementState(objective=objective, footholds=[
+        _foothold("3", agent="unsupported-test-agent"),
+    ], hops=[], graph_facts=[])
+    first = capabilities.CapabilityAction(
+        name="offline-check", target="first", effects=["checked:first"],
+        intent={"callback_id": "3"},
+    )
+    successors = [
+        capabilities.CapabilityAction(
+            name="offline-check", target=target, effects=[f"checked:{target}"],
+            intent={"callback_id": "3"},
+        )
+        for target in ("second", "third")
+    ]
+    effects = []
+    monkeypatch.setattr(capabilities, "actions_from_state", lambda _state: successors if effects else [first])
+    m = _install_supervised_contract(
+        _bare_model(json.dumps({"ok": True}), state, []),
+        request_id="request-singleton-then-branch", actions_complete=False,
+    )
+    m.policy_mode = "hybrid"
+    m.provider = "test"
+    m.model = "selector"
+    cards = []
+    requests = []
+
+    class BranchLLM:
+        async def ainvoke(self, messages):
+            request = json.loads(messages[-1].content)
+            requests.append(request)
+            assert len(request["candidates"]) == 2
+            return type("Response", (), {
+                "content": json.dumps({
+                    "disposition": "select",
+                    "candidate_id": request["candidates"][0]["candidate_id"],
+                }),
+                "response_metadata": {"model_provider": "test", "model_name": "selector"},
+                "usage_metadata": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            })()
+
+    async def emit(action_requests):
+        cards.append(copy.deepcopy(action_requests))
+
+    async def execute(action, _inputs):
+        effects.append(action["target"])
+        return json.dumps({"ok": True, "verdict": "achieved", "effects": action["effects"]})
+
+    m.llm = BranchLLM()
+    m._hitl_card_emitter = emit
+    m._hitl_card_pending = False
+    m.mythic_client.execute_capability = execute
+
+    assert asyncio.run(m._run_autonomous_controller(objective)) == ""
+    assert [card[0]["args"]["action"]["target"] for card in cards] == ["first"]
+    assert requests == []
+    digest = _install_exact_card_claim(m, cards[0], "approval-first")
+    assert asyncio.run(m.handle_controller_hitl_resume("approve", expected_action_digest=digest)) == ""
+
+    assert effects == ["first"]
+    assert len(requests) == 1  # an actual configured backend invocation, not an owner label
+    assert [card[0]["args"]["action"]["target"] for card in cards] == ["first", "second"]
+    assert m._controller_hitl_pending["args"]["action"]["target"] == "second"
+    telemetry = m.controller_runtime_telemetry()
+    assert telemetry["model_calls"] == 1
+    assert telemetry["model_response_records"]
+    assert telemetry["model_response_records"][0]["effective_backend"] == "test:selector"
+
+
+def test_hybrid_active_approval_missing_from_changed_frontier_stops_before_model(monkeypatch):
+    objective = "Complete the declared offline checks."
+    state = es.EngagementState(objective=objective, footholds=[
+        _foothold("3", agent="unsupported-test-agent"),
+    ], hops=[], graph_facts=[])
+    actions = [
+        capabilities.CapabilityAction(
+            name="offline-check", target=target, effects=[f"checked:{target}"],
+            intent={"callback_id": "3"},
+        )
+        for target in ("second", "third")
+    ]
+    monkeypatch.setattr(capabilities, "actions_from_state", lambda _state: actions)
+    effects = []
+    m = _install_supervised_contract(
+        _bare_model(json.dumps({"ok": True}), state, effects),
+        request_id="request-changed-active-approval", actions_complete=False,
+    )
+    m.policy_mode = "hybrid"
+    m.provider = "test"
+    m.model = "selector"
+    model_calls = []
+
+    class ForbiddenLLM:
+        async def ainvoke(self, messages):
+            model_calls.append(messages)
+            raise AssertionError("changed active approval reached model")
+
+    m.llm = ForbiddenLLM()
+    old = capabilities.CapabilityAction(
+        name="offline-check", target="first", effects=["checked:first"],
+        intent={"callback_id": "3"},
+    )
+    pending = m._controller_hitl_capability_request(
+        model._capability_action_payload(old), model._autonomous_capability_inputs(old, state), objective,
+    )
+    m._controller_hitl_approved_pending = pending
+    m._controller_hitl_approved_key = pending["key"]
+
+    report = asyncio.run(m._run_autonomous_controller(objective))
+    assert "halted_no_action" in report
+    assert "operator-approved action is no longer admissible" in report
+    assert effects == []
+    assert model_calls == []
+
+
+def test_hybrid_changed_approval_key_requires_fresh_card_before_effect(monkeypatch):
+    objective = "Complete the declared offline checks."
+    state = es.EngagementState(objective=objective, footholds=[
+        _foothold("3", agent="unsupported-test-agent"),
+    ], hops=[], graph_facts=[])
+    actions = [
+        capabilities.CapabilityAction(
+            name="offline-check", target=target, effects=[f"checked:{target}"],
+            intent={"callback_id": "3"},
+        )
+        for target in ("first", "second")
+    ]
+    monkeypatch.setattr(capabilities, "actions_from_state", lambda _state: actions)
+    effects = []
+    m = _install_supervised_contract(
+        _bare_model(json.dumps({"ok": True}), state, effects),
+        request_id="request-changed-approval-binding", actions_complete=False,
+    )
+    m.policy_mode = "hybrid"
+    m.provider = "test"
+    m.model = "selector"
+    requests = []
+    cards = []
+
+    class BranchLLM:
+        async def ainvoke(self, messages):
+            request = json.loads(messages[-1].content)
+            requests.append(request)
+            return type("Response", (), {"content": json.dumps({
+                "disposition": "select",
+                "candidate_id": request["candidates"][0]["candidate_id"],
+            })})()
+
+    async def emit(action_requests):
+        cards.append(copy.deepcopy(action_requests))
+
+    m.llm = BranchLLM()
+    m._hitl_card_emitter = emit
+    m._hitl_card_pending = False
+    pending = m._controller_hitl_capability_request(
+        model._capability_action_payload(actions[0]),
+        model._autonomous_capability_inputs(actions[0], state), objective,
+    )
+    m._controller_hitl_approved_pending = pending
+    m._controller_hitl_approved_key = "changed-key"
+
+    assert asyncio.run(m._run_autonomous_controller(objective)) == ""
+    assert len(requests) == 1
+    assert len(cards) == 1
+    assert cards[0][0]["args"]["action"]["target"] == "first"
+    assert effects == []
+
+
 def test_supervised_denied_pending_selection_keeps_backend_provenance_telemetry():
     calls = []
     m = _bare_model(json.dumps({"ok": True}), _state_with_remote_exec(), calls)
@@ -4154,6 +4323,7 @@ def test_autonomous_agent_topology_excludes_generic_mcp_and_sandbox_handoffs(mon
     def build(autonomous):
         captured.clear()
         m = object.__new__(model.Model)
+        m.mode = "auto" if autonomous else "conversation"
         m._autonomous_solve = autonomous
         m.mythic_client = FakeMythic()
         m.state = {

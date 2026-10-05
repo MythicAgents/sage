@@ -414,6 +414,29 @@ def test_supervisor_can_reuse_one_worker_answer_verbatim_after_real_handoff():
     assert not getattr(harness.mythic, "issue_task", MagicMock()).called
 
 
+def test_supervised_graph_finishes_with_explicit_report_via_tool_runtime(monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "_RECURSION_LIMIT", 12)
+    report = "Task 3 reports two rights; elevation and group membership remain unverified."
+    finish = AIMessage(content="", tool_calls=[{
+        "name": "respond_to_user", "args": {"final_response": report},
+        "id": "supervised-explicit-final", "type": "tool_call",
+    }])
+
+    class SupervisedHarness(_Harness):
+        def _build(self, script):
+            instance = super()._build(script)
+            instance.mode = "supervised"
+            return instance
+
+    result = asyncio.run(SupervisedHarness([_handoff_call(),
+        AIMessage(content="Task 3 output shows two rights."), finish]).run(
+            "Summarize task 3 with evidence limits.", assisted=True))
+    finals = [message for message in result["messages"] if isinstance(message, AIMessage)
+              and message.additional_kwargs.get("_is_final_report")]
+    assert len(finals) == 1
+    assert finals[0].content == report
+
+
 def test_filtered_worker_answer_reuse_error_allows_supervisor_synthesis(monkeypatch):
     monkeypatch.setattr(sys.modules[__name__], "_RECURSION_LIMIT", 16)
     seen: list[list[Any]] = []

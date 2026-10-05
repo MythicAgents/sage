@@ -103,6 +103,21 @@ def test_explicit_synthesis_remains_available_after_multiple_workers():
     assert result.update["messages"][0].content == report
 
 
+def test_final_tool_offers_reuse_and_explicit_report():
+    tool = model._create_respond_to_user_tool()
+    schema = tool.tool_call_schema
+    assert set(schema.model_fields) == {"final_response", "reuse_latest_worker_answer"}
+    assert not schema.model_fields["final_response"].is_required()
+    reused = tool.func(SimpleNamespace(state=_valid_state(), tool_call_id="respond-test"),
+                       reuse_latest_worker_answer=True)
+    assert reused.update["messages"][0].content == _ANSWER
+    report = "Task 3 reports two rights; elevation remains unverified."
+    finished = tool.func(SimpleNamespace(state=_valid_state(), tool_call_id="respond-test"), report)
+    assert finished.goto == "__end__"
+    assert finished.update["messages"][0].content == report
+    assert finished.update["messages"][0].additional_kwargs["_is_final_report"] is True
+
+
 @pytest.mark.parametrize("response,reuse", [
     ("Competing summary", True), ("", False), ("   ", False),
 ])

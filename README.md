@@ -492,7 +492,7 @@ Model settings resolve through the chain above. The main settings are:
 | `API_ENDPOINT` | Optional endpoint override — point `openai` at any OpenAI-compatible server (see below) |
 | `API_KEY` | Provider API key when required |
 | `mode` | `conversation` (default), `supervised`, or `auto` — see [Modes](#modes) |
-| `autonomous_solve` | Force the autonomous execution kernel for the channel (equivalent to `mode: auto`) |
+| `autonomous_solve` | Enable objective-led controller execution; supervised mode still requires approval for each guarded action |
 | `policy_mode` | `hybrid` (default), `symbolic`, or `llm` capability selection |
 | `max_steps` | Model-step ceiling; unset defaults to `200`, `0` means unlimited |
 
@@ -512,6 +512,9 @@ constrain the admissible actions and lets the model pick among them — the inte
 a deterministic, model-free baseline, useful for reproducible debugging without LLM variance. `llm` lets the
 model choose from the full catalog: most latitude, weakest guardrails, mainly for research and eval comparisons.
 Choose `hybrid` unless you have a reason not to.
+This setting governs controller capability selection. Ordinary supervised chat with Autonomous Solve off
+uses the agent graph: read-only requests can run immediately, and guarded requests can be proposed for approval.
+Turning Autonomous Solve off does not remove the operator's ability to request an action.
 
 **Step budget.** `max_steps` bounds the number of model steps in a run. Left unset it defaults to 200; set it to
 `0` for unlimited. A small ceiling caps cost and stops runaway loops on scoped work. For a full autonomous
@@ -724,8 +727,10 @@ ever baked into the image.
 `Payload_Type/sage/.phoenix/phoenix.db` stores observability history. Treat both as retained trajectory data.
 
 An active chat channel retains its session across ordinary turns, including pending approvals and objective
-context. After a Sage restart or session replacement, prior scope and evidence are not restored to native chat.
-Start a fresh channel and restate the current scope and evidence before continuing.
+context. After a Sage restart or session replacement, ordinary Supervised chat does not restore its prior
+conversational scope and evidence. Read-only `/state` and tool discovery remain available. Start a fresh
+channel and restate scope and evidence before continuing model work; separately bound Auto-controller
+recovery does not restore the Supervised conversation.
 
 Never delete runtime databases to obtain a clean run. Stop Sage and archive active databases first:
 

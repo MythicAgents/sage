@@ -18866,6 +18866,11 @@ class MythicTools:
     ) -> str:
         """Match a plain-language goal to Sage's TTP library and return the tool's common_args/usage_examples + guidance, tailored to how the target callback's agent runs it. Consult this FIRST, before reaching for an offensive tool.
 
+        Library requirements and examples are reference material, not observed target state;
+        this lookup does not evaluate whether the callback meets technique prerequisites.
+        The resolved payload type identifies the agent only. An MCP connection status,
+        when returned, describes Sage's registry, not the contents of a graph.
+
         Caveat: progressive disclosure — rely on common_args/usage_examples; call
         get_ttp_full_reference(slug) only for an uncommon flag or exact output format.
         """
@@ -18895,6 +18900,22 @@ class MythicTools:
 
         result = {
             "slug": slug,
+            "reference_scope": {
+                "source": "local TTP and agent reference library",
+                "reference_fields": ["frontmatter", "guidance", "execution_on_agent"],
+                "prerequisites_evaluated": False,
+                "metadata_fields": {
+                    "payload_type": "Resolved callback agent type only.",
+                    "recommendation.connected": (
+                        "Sage MCP registry connection status, when present; graph contents are not queried."
+                    ),
+                },
+                "interpretation": (
+                    "Requirements and example identities describe the technique, not this callback. "
+                    "Establish applicability from separate observations; unobserved prerequisites remain unknown. "
+                    "A disconnected or unqueried data source does not establish that its contents are empty."
+                ),
+            },
             "alternatives": [s for s, _ in matches[1:]],
             "payload_type": payload_type,
             "frontmatter": frontmatter,

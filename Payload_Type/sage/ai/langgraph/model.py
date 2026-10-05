@@ -10586,7 +10586,15 @@ class Model:
 
             async def policy_decide(request: dict[str, Any]) -> Any:
                 nonlocal approved_selection_consumed
-                if approved_pending and not approved_selection_consumed:
+                # Hybrid can select an approved singleton without calling this backend. Its
+                # approval is consumed at the execution gate, so a later branch must get a
+                # fresh model decision instead of replaying that now-completed action.
+                approved_key = str(approved_pending.get("key") or "")
+                if (
+                    approved_key
+                    and not approved_selection_consumed
+                    and str(getattr(self, "_controller_hitl_approved_key", "") or "") == approved_key
+                ):
                     approved_selection_consumed = True
                     candidates = request.get("candidates") if isinstance(request.get("candidates"), list) else []
                     kind = str(approved_pending.get("kind") or "")
@@ -14262,6 +14270,26 @@ def _create_respond_to_user_tool():
     delegating and wants to deliver a user-facing final report. It may synthesize
     findings or reuse one complete specialist answer verbatim.
     """
+    def finish(runtime: ToolRuntime, final_response: str) -> Command:
+        if not final_response.strip():
+            raise ValueError("final_response must be complete")
+        # Create a final AI message with the response
+        response_message = AIMessage(
+            content=final_response,
+            name="Supervisor",
+            additional_kwargs={"_is_final_report": True},
+        )
+
+        update_state = {**runtime.state}
+        update_state["messages"] = [response_message]
+        update_state["supervisor_messages"] = [response_message]
+
+        return Command(
+            goto="__end__",  # Explicitly end the graph
+            update=update_state,
+            graph=Command.PARENT,
+        )
+
     @tool("respond_to_user")
     def respond_to_user(
         runtime: ToolRuntime,
@@ -14269,7 +14297,6 @@ def _create_respond_to_user_tool():
         reuse_latest_worker_answer: Annotated[bool, "Use the one current specialist's complete answer verbatim. Use only when that answer already fulfills the operator's request; leave final_response empty."] = False,
     ) -> Command | ToolMessage:
         """Finish with a complete synthesized report or one sufficient specialist answer verbatim. Do not delegate again after calling this."""
-
         if reuse_latest_worker_answer:
             if final_response.strip():
                 raise ValueError("worker answer reuse cannot be combined with final_response")
@@ -14287,25 +14314,7 @@ def _create_respond_to_user_tool():
                     tool_call_id=runtime.tool_call_id,
                     status="error",
                 )
-        elif not final_response.strip():
-            raise ValueError("final_response must be complete unless reusing a specialist answer")
-
-        # Create a final AI message with the response
-        response_message = AIMessage(
-            content=final_response,
-            name="Supervisor",
-            additional_kwargs={"_is_final_report": True},
-        )
-
-        update_state = {**runtime.state}
-        update_state["messages"] = [response_message]
-        update_state["supervisor_messages"] = [response_message]
-
-        return Command(
-            goto="__end__",  # Explicitly end the graph
-            update=update_state,
-            graph=Command.PARENT,
-        )
+        return finish(runtime, final_response)
 
     return respond_to_user
 
