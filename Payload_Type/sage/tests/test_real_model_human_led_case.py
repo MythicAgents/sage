@@ -1144,14 +1144,14 @@ def _recon_script(module, *, first_variant="normal", second_variant="normal",
         def first_supervisor(messages):
             if observations is not None:
                 observations.append(("first", messages))
-            if first_variant == "reuse":
+            if first_variant == "explicit_report":
                 return module.CASE.call("respond_to_user", {
-                    "reuse_latest_worker_answer": True}, 4)
+                    "final_response": "Inventory records received; share visibility is incomplete."}, 4)
             return AIMessage(content="" if first_variant in (
                 "empty", "empty_after_narration") else
                 "The historical inventory suggests shares to inspect; access is unknown.")
         script.append(first_supervisor)
-    if first_variant in ("normal", "reuse", "empty_after_narration"):
+    if first_variant in ("normal", "explicit_report", "empty_after_narration"):
         if second_variant == "read":
             script.extend([
                 module.CASE.call("transfer_to_Mythic_Operator", {
@@ -1199,7 +1199,7 @@ def _recon_script(module, *, first_variant="normal", second_variant="normal",
 
 @pytest.mark.parametrize("first_variant,second_variant,expected", [
     ("normal", "normal", "passed"),
-    ("reuse", "normal", "passed"),
+    ("explicit_report", "normal", "passed"),
     ("missing_read", "normal", "failed"),
     ("first_card", "normal", "unexpected_proposal"),
     ("empty", "normal", "failed"),
@@ -1229,7 +1229,7 @@ def test_recon_consultation_assembled_two_turn_boundary(
     assert result["protocol_invalid_reasons"] == []
     assert result["effect_calls"] == []
     assert result["provider_requests"] == []
-    if first_variant not in ("normal", "reuse"):
+    if first_variant not in ("normal", "explicit_report"):
         assert result.get("followup_sent") is not True
         if first_variant == "empty_after_narration":
             assert result["initial_emissions"][-1]["content"].strip() == "Completed."

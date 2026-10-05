@@ -157,6 +157,33 @@ Distinguish SDK message metadata from the actual provider payload when assessing
 specialist's answer reached the Supervisor. A scripted capture proves the recorder works; it does
 not recover the unrecorded inputs of an earlier paid run.
 
+## Operator requests and reporting diagnostics
+
+Three development helpers isolate different questions. None is a production reporting gate:
+
+| Helper under `skills/sage-focused-capability-tests/scripts/` | Boundary exercised | What its results do not establish |
+| --- | --- | --- |
+| `run_operator_prompt_matrix.py` | Native headless chat and the assembled Supervised graph with Hybrid policy, Autonomous Solve off, synthetic callback/task records, and inert accept/reject decisions | Live target effects, reproduction on another model/deployment, or factual quality from structural completion alone |
+| `compare_reporting_context.py` | Paired report-only model requests from a supplied plan, with full versus reduced context and shared observations | Unchanged production behavior, action safety, or a causal explanation for any one context component |
+| `verify_report_claims.py` | Experimental model judgments on supplied claims, deterministic source/quote/declared-scope checks, then dependent report repair | Automatic claim-extraction completeness, semantic truth from valid citations, or production-ready verification |
+
+The matrix includes discovery, guarded requests, accept/reject, explanation without execution, ambiguous
+targets and continuation after selection, stored observations, and recommendations. It captures model
+inputs/outputs and visible messages. Review useful answer content and unsupported claims separately from
+tool/card/effect counts; an expected rejection and a model refusal are different outcomes.
+
+The reporting helpers receive a JSON plan and offer no executable tools. Their default invocation validates
+inputs without inference. The matrix also defaults to inspection without network access. Paid execution
+requires explicit `--run`, configured provider credentials, exact model/endpoint bindings, and separately
+established resource authority. Retain plans, source identity, raw attempts, usage, and independent labels
+privately; these helpers are not secret-redaction services.
+
+The claim checker is an experimental diagnostic. A source ID and an exact quotation establish that text
+exists, not that it entails the claim. Malformed judgments block dependent repairs and remain recorded;
+do not count skipped reports as successful corrections. Assess retained positive facts, unsupported claims,
+recommendation premises, and unanswered requests independently. Any format-only diagnostic must preserve
+the original result and cannot silently convert a rejected attempt into an accepted one.
+
 ## Basic approval checks
 
 From the repository root, run one decision at a time:
@@ -193,7 +220,14 @@ In the first live examples, the operator chooses every card in Mythic. Agent-sub
 to a later workflow after the operator explicitly switches to it. Retain the decision-maker for each
 episode. An offline setup or scripted approval does not establish that Sage can complete the objective live.
 
-Sage records each new native channel in its existing runtime database. If Sage restarts or replaces that channel's in-memory session, a later request on the marked channel stops before model tools run; its previous scope and evidence are not restored. Start a fresh channel and restate the current scope and evidence before continuing. At deployment, also start fresh channels for conversations created before this marker existed: if Mythic supplies no earlier message context, Sage cannot distinguish one of those legacy channels from a new channel.
+Sage records each new native channel in its existing runtime database. For ordinary Supervised chat with
+Autonomous Solve off, losing the in-memory session does not restore previous conversational scope and
+evidence: a later model request on that marked channel stops before tools run. Read-only `/state` and
+tool discovery remain available without restoring the agent session. Start a fresh channel and restate
+scope and evidence before continuing model work. The separately bound Auto-controller recovery path is
+not restoration of this Supervised conversation. At deployment, also start fresh channels for conversations
+created before the channel marker existed: without earlier Mythic message context, Sage cannot distinguish
+one of those legacy channels from a new channel.
 
 Use the same evaluation questions without assuming that a particular command is the only valid answer. Write down the exact operator request and mode, the callback binding, and the first action card **before** choosing. Judge whether the proposed action is relevant and proportionate to the request. While the card is pending, capture the exact request and messages privately, before accepting, rejecting, responding, stopping, or cleaning up:
 
