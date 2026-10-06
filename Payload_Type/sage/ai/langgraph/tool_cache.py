@@ -11,6 +11,7 @@ import hashlib
 import aiosqlite
 from typing import Any, Optional
 from mythic_container.logging import logger
+from runtime_db import database_path
 
 # Import logging fix - handle both relative and absolute imports
 try:
@@ -33,13 +34,13 @@ class ToolCache:
     - Cache statistics and management
     """
 
-    def __init__(self, db_path: str = "sage.db"):
+    def __init__(self, db_path: str | None = None):
         """Initialize the ToolCache with a database path.
 
         Args:
             db_path: Path to the SQLite database file
         """
-        self.db_path = db_path
+        self.db_path = str(db_path if db_path is not None else database_path())
         self._initialized = False
 
     async def initialize(self):
@@ -55,7 +56,7 @@ class ToolCache:
         logger.info(f"🗄️  Initializing ToolCache with database: {self.db_path}")
         force_flush_all_handlers()
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=5) as db:
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS tool_cache (
                     tool_name TEXT NOT NULL,

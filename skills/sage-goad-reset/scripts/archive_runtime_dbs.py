@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+import os
 from pathlib import Path
 import re
+
+from dotenv import dotenv_values
 
 
 DB_SPECS = (
@@ -24,6 +27,7 @@ def archive_runtime_dbs(
     repo_root: Path,
     *,
     timestamp: str | None = None,
+    sage_database_path: Path | None = None,
 ) -> list[tuple[Path, Path]]:
     stamp = timestamp or datetime.now().astimezone().strftime("%Y%m%d-%H%M")
     if not STAMP_RE.fullmatch(stamp):
@@ -31,7 +35,10 @@ def archive_runtime_dbs(
 
     moves: list[tuple[Path, Path]] = []
     for relative_source, prefix in DB_SPECS:
-        source = repo_root / relative_source
+        source = (sage_database_path if prefix == "sage" and sage_database_path is not None
+                  else repo_root / relative_source)
+        if not source.is_absolute():
+            raise ValueError("application database path must be absolute")
         if source.exists():
             moves.append((source, source.with_name(f"{prefix}_{stamp}.db")))
 
@@ -55,6 +62,23 @@ def archive_runtime_dbs(
     return moves
 
 
+def configured_database_path(repo_root: Path) -> Path | None:
+    """Follow runtime environment precedence without exposing other config values."""
+    value = os.environ.get("SAGE_DATABASE_PATH")
+    if value is None:
+        runtime = repo_root / "Payload_Type" / "sage"
+        for name in (".env.local", ".env"):
+            value = dotenv_values(runtime / name).get("SAGE_DATABASE_PATH")
+            if value:
+                break
+    if not value or not value.strip():
+        return None
+    path = Path(value.strip()).expanduser()
+    if not path.is_absolute():
+        raise ValueError("SAGE_DATABASE_PATH must be an absolute path")
+    return path.resolve()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -66,9 +90,12 @@ def main() -> None:
         "--timestamp",
         help="Override the local timestamp for testing; format YYYYMMDD-HHMM.",
     )
+    parser.add_argument("--sage-db", type=Path, help="Explicit absolute application database path.")
     args = parser.parse_args()
 
-    moves = archive_runtime_dbs(args.repo_root.resolve(), timestamp=args.timestamp)
+    root = args.repo_root.resolve()
+    moves = archive_runtime_dbs(root, timestamp=args.timestamp,
+                               sage_database_path=args.sage_db or configured_database_path(root))
     if not moves:
         print("No active Sage or Phoenix runtime databases found.")
         return

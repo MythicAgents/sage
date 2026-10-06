@@ -1,5 +1,8 @@
 import importlib.util
 from pathlib import Path
+import os
+import subprocess
+import sys
 
 import pytest
 
@@ -96,3 +99,38 @@ def test_rejects_non_minute_timestamp(tmp_path):
             tmp_path,
             timestamp="20260618",
         )
+
+
+def test_custom_application_path_cli_archives_sidecars_and_legacy(tmp_path):
+    default, legacy, phoenix = make_runtime_dbs(tmp_path)
+    custom = tmp_path / "external" / "application.db"
+    custom.parent.mkdir()
+    custom.write_bytes(b"custom")
+    for suffix in ("-wal", "-shm"):
+        custom.with_name(custom.name + suffix).write_bytes(suffix.encode())
+    env = dict(os.environ, SAGE_DATABASE_PATH=str(custom))
+    result = subprocess.run([sys.executable, str(SCRIPT), "--repo-root", str(tmp_path),
+                             "--timestamp", "20260618-1231"], env=env,
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert default.exists() and not custom.exists()
+    archived = custom.with_name("sage_20260618-1231.db")
+    assert archived.read_bytes() == b"custom"
+    for suffix in ("-wal", "-shm"):
+        assert archived.with_name(archived.name + suffix).read_bytes() == suffix.encode()
+    assert not legacy.exists() and not phoenix.exists()
+
+
+def test_database_config_matches_runtime_precedence(tmp_path, monkeypatch):
+    runtime = tmp_path / "Payload_Type" / "sage"
+    runtime.mkdir(parents=True)
+    first, second, third = (tmp_path / name for name in ("first.db", "second.db", "third.db"))
+    (runtime / ".env.local").write_text(f"SAGE_DATABASE_PATH={first}\n")
+    (runtime / ".env").write_text(f"SAGE_DATABASE_PATH={second}\n")
+    monkeypatch.delenv("SAGE_DATABASE_PATH", raising=False)
+    assert archive_runtime_dbs.configured_database_path(tmp_path) == first
+    monkeypatch.setenv("SAGE_DATABASE_PATH", str(third))
+    assert archive_runtime_dbs.configured_database_path(tmp_path) == third
+    monkeypatch.setenv("SAGE_DATABASE_PATH", "relative.db")
+    with pytest.raises(ValueError, match="absolute"):
+        archive_runtime_dbs.configured_database_path(tmp_path)

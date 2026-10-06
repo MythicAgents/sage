@@ -43,6 +43,7 @@ from .mythic_tools import (
     _env_positive_int,
 )
 from .tool_cache import ToolCache
+from runtime_db import database_path, assert_legacy_migrated
 from ..comparison_tool_surface import (
     SHIPPING_BLOODHOUND_TOOL_NAMES,
     SHIPPING_MYTHIC_OPERATOR_TOOL_NAMES,
@@ -4357,7 +4358,8 @@ class Model:
         self._c2_profiles = None
         self._cached_commands = None
         self._dynamic_data_loaded = False
-        db_path = "sage.db"  # Path to your SQLite database
+        db_path = str(database_path())
+        assert_legacy_migrated(db_path)
         self.tool_cache = ToolCache(db_path)
         conn = aiosqlite.connect(db_path, check_same_thread=False)
         self.memory = AsyncSqliteSaver(conn)

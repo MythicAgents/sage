@@ -723,7 +723,20 @@ ever baked into the image.
 
 ## Runtime state and clean resets
 
-`Payload_Type/sage/sage.db` stores LangGraph checkpoint state.
+`Payload_Type/sage/sage.db` stores LangGraph checkpoints, tool cache, channel markers,
+controller recovery and operation-memory tables.
+These surfaces share a physical SQLite file but retain separate APIs and erasure lifecycles.
+The default path is independent of the process working directory; `SAGE_DATABASE_PATH` can
+select an explicit application database path. Multiple chats share SQLite's writer limit,
+so write transactions must remain short and database lock failures must remain visible.
+If a legacy `sage_operation_memory.db` exists, startup refuses to silently ignore it.
+Stop Sage, then import it with
+`.venv/bin/python skills/sage-goad-reset/scripts/migrate_operation_memory.py --sage-stopped`.
+The import preserves the original file, verifies schema and records, rejects destination
+conflicts, and records an idempotent migration receipt. A changed legacy source requires
+operator review. The archive helper also honors `SAGE_DATABASE_PATH` and preserves legacy
+files and SQLite sidecars. An operation-memory wipe erases its operation rows;
+it does not erase chat checkpoints in the same file.
 `Payload_Type/sage/.phoenix/phoenix.db` stores observability history. Treat both as retained trajectory data.
 
 An active chat channel retains its session across ordinary turns, including pending approvals and objective
