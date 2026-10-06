@@ -301,6 +301,73 @@ class SageChat(Chat):
         runtime = getattr(self, "_operation_memory_runtime", None)
         return runtime if runtime is not None else self._findings_watcher().runtime
 
+    async def _retain_report_collection(self, request: ChatRequest, model: Any) -> None:
+        """Admit only this native turn's paired task reads after checkpoint completion."""
+        if (getattr(model, "mode", None) not in {"conversation", "supervised"}
+                or not getattr(model, "_thread_id_override", None)):
+            return
+        getter = getattr(getattr(model, "graph", None), "aget_state", None)
+        collector = getattr(model, "native_report_collection", None)
+        if not callable(getter) or not callable(collector):
+            return
+        identity = f"chat:{request.ChannelID}:request:{request.RequestID}"
+        try:
+            snapshot = await getter(model._graph_run_config(model._session_thread_id()))
+            values = getattr(snapshot, "values", None)
+            if not isinstance(values, dict):
+                return
+            records = collector(values, identity)
+            if not records:
+                return
+            client = getattr(getattr(model, "mythic_client", None), "client", None)
+            from .report_identity import canonical_engagement_uuid
+            from .report_observations import admit_observations
+            engagement = await canonical_engagement_uuid(client, request.OperationID)
+            if engagement and engagement == getattr(model, "_report_engagement_at_turn", None):
+                await admit_observations(
+                    self._operation_memory().store, request.OperationID, engagement,
+                    channel_id=request.ChannelID, request_id=identity,
+                    checkpoint_thread=model._session_thread_id(), records=records)
+        except Exception as exc:
+            logger.warning("Retained report collection unavailable (%s)", type(exc).__name__)
+
+    async def handle_identity_report(self, request: ChatRequest, model: Any | None) -> str:
+        """Read the exact authenticated operation marker, then local retained sources."""
+        unavailable = (
+            "Retained task observations are unavailable. This report cannot establish identity or access."
+        )
+        mode = getattr(model, "mode", None)
+        if model is None:
+            try:
+                mode = build_model_kwargs(request)["mode"]
+            except Exception:
+                return unavailable
+        if mode not in {"conversation", "supervised"}:
+            return "`/report identity` is available only in conversation or supervised mode."
+        try:
+            client = getattr(getattr(model, "mythic_client", None), "client", None)
+            if client is None:
+                from ai.langgraph.mythic_tools import MythicTools
+                auth = MythicTools(operation_id=request.OperationID,
+                    channel_id=request.ChannelID, apitoken_id=request.APITokenID)
+                await auth.login()
+                client = auth.client
+            from .report_identity import canonical_engagement_uuid
+            from .report_observations import retained_observations
+            engagement = await canonical_engagement_uuid(client, request.OperationID)
+            if not engagement:
+                return unavailable
+            if model is not None and engagement != getattr(model, "_report_engagement_uuid", None):
+                return unavailable
+            records, omitted, capacity_reached = await retained_observations(
+                self._operation_memory().store, request.OperationID, engagement)
+            from ai.langgraph.assisted_reporting import render_identity_report
+            return render_identity_report(records, operation_scope=(request.OperationID, engagement),
+                                          omitted_sources=omitted, capacity_reached=capacity_reached)
+        except Exception as exc:
+            logger.warning("Identity report unavailable (%s)", type(exc).__name__)
+            return unavailable
+
     async def on_container_start(
         self, message: ContainerOnStartMessage
     ) -> ContainerOnStartMessageResponse:
@@ -899,10 +966,14 @@ class SageChat(Chat):
                 and str(getattr(slash, "Name", "") or "").lower().lstrip("/") == "state"
                 and not str(getattr(slash, "Argument", "") or "").strip()
             )
+            read_only_report = (
+                slash is not None
+                and str(getattr(slash, "Name", "") or "").lower().lstrip("/") == "report"
+            )
             tool_discovery = (slash is not None and str(getattr(slash, "Name", "") or "").lower().lstrip("/") == "tools") or (
                 slash is None and looks_like_tool_inventory_prompt(prompt)
             )
-            if existing_at_entry is None and not read_only_state and not tool_discovery and (
+            if existing_at_entry is None and not read_only_state and not read_only_report and not tool_discovery and (
                 (not first_channel_claim and not slash_only_new_channel)
                 or (first_channel_claim and _channel_has_prior_context(request))
             ) and recovery_state is None:
@@ -1047,6 +1118,18 @@ class SageChat(Chat):
                 # Compatibility for lightweight test/eval models. Production Model instances install
                 # the contract through the typed method above.
                 model._request_contract = request_contract
+            # Bind the engagement before the turn can read any target task output.
+            # A later marker change makes this turn's collection ineligible.
+            if getattr(model, "mode", None) in {"conversation", "supervised"}:
+                from .report_identity import canonical_engagement_uuid
+                current_engagement = await canonical_engagement_uuid(
+                    getattr(getattr(model, "mythic_client", None), "client", None),
+                    request.OperationID, create=True)
+                previous_engagement = getattr(model, "_report_engagement_uuid", None)
+                if previous_engagement is None:
+                    model._report_engagement_uuid = current_engagement
+                model._report_engagement_at_turn = (
+                    current_engagement if current_engagement == model._report_engagement_uuid else None)
             # Reassert on reused sessions too; older in-memory sessions created before this field was wired
             # should gain controller-native HITL without requiring a process restart.
             model.command_name = "chat"
@@ -1425,6 +1508,7 @@ class SageChat(Chat):
             # Refresh the header's live count chips (MCP servers/tools, rounds, BloodHound) now that the
             # turn's work is done. The publisher de-duplicates unchanged payloads.
             await publish_channel_metadata()
+            await self._retain_report_collection(request, model)
             if getattr(model, "_hitl_card_pending", False):
                 # A confirmation card already released this request (complete_request=False). Returning None
                 # tells run_chat_turn to send no terminal while the graph waits on disk.

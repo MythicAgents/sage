@@ -45,6 +45,7 @@ def fresh_channel(monkeypatch):
 _DECLARED_DISPATCH_SCENARIOS = [
     ("findings", None),
     ("watcher", None),
+    ("report", "_handle_report"),
     ("state", "_handle_state"),
     ("list", "_handle_list"),
     ("tools", "render_tool_inventory"),

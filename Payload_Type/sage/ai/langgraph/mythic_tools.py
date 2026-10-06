@@ -17161,7 +17161,7 @@ class MythicTools:
                 # Preserve source identity in the existing output read, including for historical
                 # tasks from another callback. Command parameters are deliberately not fetched.
                 custom_return_attributes=(
-                    "id timestamp response_text task { id display_id status completed "
+                    "id timestamp response_text task { id operation_id display_id status completed "
                     "agent_task_id command_name timestamp callback { display_id } }"
                 ),
             )

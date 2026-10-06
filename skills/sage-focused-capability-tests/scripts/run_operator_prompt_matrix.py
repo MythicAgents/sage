@@ -214,10 +214,12 @@ def observed(path: Path) -> bool:
     return path.exists() and json.loads(path.read_text(encoding="utf-8")).get("status") == "observed"
 
 
-async def run_case(case_id, prompt, decision, profile, output_dir, limits, tls_context, ips):
+async def run_case(case_id, prompt, decision, profile, output_dir, limits, tls_context, ips,
+                   *, report_source_metadata=False):
     path = output_dir / f"case_{case_id}.json"
     ledger = {"case_id": case_id, "prompt": prompt, "decision": decision,
-              "status": "started", "synthetic_fixture": "operator-matrix-v1",
+              "status": "started", "synthetic_fixture": (
+                  "operator-matrix-v2-report" if report_source_metadata else "operator-matrix-v1"),
               "source_sha256": hashlib.sha256((SAGE / "ai/langgraph/model.py").read_bytes()).hexdigest(),
               "prompt_sha256": {name: hashlib.sha256((SAGE / "prompts" / name).read_bytes()).hexdigest()
                                 for name in ("supervisor.md", "mythic_operator.md")},
@@ -244,6 +246,10 @@ async def run_case(case_id, prompt, decision, profile, output_dir, limits, tls_c
     ledger["model_calls"] = usage.calls
     ledger["transport_rejections"] = transport.rejections
     sink = MythicTools(agent_task_id="operator-matrix", operation_id=1, channel_id=1)
+    if report_source_metadata:
+        # Inert authenticated-client handle for the report fixture's mocked
+        # canonical marker read. No Mythic transport or RPC is constructed.
+        sink.client = object()
     task_outputs = {}
     task_history = []
     if case_id == "09_direct_evidence":
@@ -319,8 +325,21 @@ async def run_case(case_id, prompt, decision, profile, output_dir, limits, tls_c
                     raise ValueError("fixture task ID unavailable")
                 task = next((row for row in task_history if row["display_id"] == task_id), None)
                 output_row = {"task_id": task_id, "response_text": task_outputs[task_id]}
-                if task is not None:
+                if report_source_metadata:
+                    output_row.update({"id": task_id + 1000,
+                                       "timestamp": "2026-01-01T00:00:01Z"})
                     output_row["task"] = {
+                        "id": task_id + 10000, "operation_id": 1,
+                        "display_id": task_id,
+                        "agent_task_id": f"synthetic-task-{task_id}",
+                        "command_name": task["command_name"] if task else "hostinfo",
+                        "status": task["status"] if task else "completed",
+                        "completed": task["completed"] if task else True,
+                        "timestamp": task["timestamp"] if task else "2026-01-01T00:00:00Z",
+                        "callback": {"display_id": task["callback_display_id"] if task else 7},
+                    }
+                if task is not None:
+                    output_row["task"] = output_row.get("task") or {
                         "display_id": task_id, "command_name": task["command_name"],
                         "status": task["status"], "completed": task["completed"],
                         "timestamp": task["timestamp"],

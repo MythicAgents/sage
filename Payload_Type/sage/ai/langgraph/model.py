@@ -11,6 +11,7 @@ import httpx
 import threading
 import time
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from langgraph.graph import StateGraph, START, MessagesState, END
 from langgraph.graph.state import CompiledStateGraph
@@ -3313,7 +3314,7 @@ def _worker_task_output_references(
 def _worker_task_output_evidence(
     messages: list[AnyMessage], *, request_id: str, limit: int = 8,
     max_output_chars: int | None = None, max_total_chars: int | None = None,
-    supervised: bool = False,
+    supervised: bool = False, retain_source_identity: bool = False,
 ) -> list[dict]:
     """Copy bounded observed response text; never infer an exhaustive task result."""
     if max_output_chars is None:
@@ -3332,11 +3333,15 @@ def _worker_task_output_evidence(
         excerpts: list[str] = []
         truncated = False
         omitted_scoped = False
+        source_identity_complete = True
         source_metadata: dict[str, set[Any]] = {
             "callback_display_id": set(), "stored_command_name": set(),
             "task_timestamp": set(),
         }
+        if retain_source_identity:
+            source_metadata.update(task_internal_id=set(), task_operation_id=set(), agent_task_id=set())
         response_timestamps: list[str] = []
+        response_sources: list[dict[str, Any]] = []
         record_remaining = max_output_chars
         for row_index, row in enumerate(output):
             if row_index >= 16:
@@ -3355,6 +3360,16 @@ def _worker_task_output_evidence(
                 truncated = True
                 continue
             if isinstance(row_task, dict):
+                if retain_source_identity:
+                    internal_id = row_task.get("id")
+                    if type(internal_id) is int and internal_id > 0:
+                        source_metadata["task_internal_id"].add(internal_id)
+                    task_operation = row_task.get("operation_id")
+                    if type(task_operation) is int and task_operation > 0:
+                        source_metadata["task_operation_id"].add(task_operation)
+                    agent_task = row_task.get("agent_task_id")
+                    if isinstance(agent_task, str) and 0 < len(agent_task) <= 128:
+                        source_metadata["agent_task_id"].add(agent_task)
                 callback = row_task.get("callback")
                 callback_id = callback.get("display_id") if isinstance(callback, dict) else None
                 if type(callback_id) is int and callback_id >= 0:
@@ -3373,6 +3388,11 @@ def _worker_task_output_evidence(
             value = row["response_text"]
             if not value:
                 continue
+            if (not isinstance(row_task, dict)
+                    or type(row_task.get("id")) is not int or row_task["id"] <= 0
+                    or type(row_task.get("operation_id")) is not int
+                    or row_task["operation_id"] <= 0):
+                source_identity_complete = False
             if supervised and _strip_supervised_engagement_context(value) != value.strip():
                 omitted_scoped = True
                 continue
@@ -3383,6 +3403,11 @@ def _worker_task_output_evidence(
             excerpt = value[:allowance]
             if excerpt:
                 excerpts.append(excerpt)
+                response_sources.append({
+                    "response_id": row.get("id") if type(row.get("id")) is int else None,
+                    "response_timestamp": response_timestamp if isinstance(response_timestamp, str) else None,
+                    "excerpt_sha256": hashlib.sha256(excerpt.encode("utf-8")).hexdigest(),
+                })
                 remaining -= len(excerpt)
                 record_remaining -= len(excerpt)
             if len(excerpt) < len(value):
@@ -3398,6 +3423,9 @@ def _worker_task_output_evidence(
                 "truncated": truncated,
                 "scoped_content_omitted": omitted_scoped,
             }
+            if retain_source_identity:
+                record["source_identity_complete"] = source_identity_complete
+                record["response_sources"] = response_sources
             for field, values in source_metadata.items():
                 if len(values) == 1:
                     record[field] = next(iter(values))
@@ -3885,10 +3913,12 @@ class MessageCaptureCallback(AsyncCallbackHandler):
         activity_func=None,
         delegation_id: str | None = None,
         delegation_name: str | None = None,
+        observation_request_id: str = "",
     ):
         self.agent_name = agent_name
         self.delegation_id = delegation_id
         self.delegation_name = delegation_name
+        self._observation_request_id = observation_request_id
         self.captured_messages: list[AnyMessage] = []
         self._tool_call_to_name: dict[str, str] = {}  # Map tool_call_id to tool name
         self._tool_call_to_args: dict[str, Any] = {}  # Map tool_call_id to its request args (for the card)
@@ -4097,6 +4127,12 @@ class MessageCaptureCallback(AsyncCallbackHandler):
             # The output might be a ToolMessage or raw output
             if isinstance(output, ToolMessage):
                 output.name = output.name or self._tool_call_to_name.get(output.tool_call_id, "unknown_tool")
+                if (output.name == "get_all_task_output_by_task_id"
+                        and self._observation_request_id
+                        and output.tool_call_id in self._tool_call_to_name):
+                    # This is tool-bound collection metadata, never model-authored
+                    # evidence/status JSON. It survives in the existing transcript.
+                    output.additional_kwargs["_task_output_collection_request_id"] = self._observation_request_id
                 self.captured_messages.append(output)
                 logger.debug(f"📨 [Callback:{self.agent_name}] Captured ToolMessage: "
                            f"tool={output.name}, tool_call_id={output.tool_call_id}")
@@ -7402,6 +7438,91 @@ class Model:
 
         return new_messages
 
+    def _identity_report_observations(self, state: Mapping[str, Any]) -> list[dict]:
+        """Read only native tool-bound observations from this channel's checkpoint."""
+        channels = [state.get(key) or [] for key in (
+            "supervisor_messages", "mythic_operator_messages", "generalist_messages",
+            "mythic_payload_messages", "bloodhound_messages", "mcp_manager_messages",
+            "sandbox_messages",
+        )]
+        records: dict[str, dict] = {}
+        prefix = f"chat:{self.channel_id}:request:"
+        for messages in channels:
+            collection_ids = []
+            for message in messages:
+                if not isinstance(message, ToolMessage):
+                    continue
+                identity = message.additional_kwargs.get("_task_output_collection_request_id")
+                if (isinstance(identity, str) and identity.startswith(prefix)
+                        and identity[len(prefix):] and identity not in collection_ids):
+                    collection_ids.append(identity)
+            for identity in collection_ids[-8:]:
+                # Exclude unbound results even when their JSON claims valid provenance.
+                bound_messages = [message for message in messages
+                    if not isinstance(message, ToolMessage)
+                    or message.additional_kwargs.get("_task_output_collection_request_id") == identity]
+                for record in _worker_task_output_evidence(bound_messages, request_id=identity):
+                    key = json.dumps(record, sort_keys=True, ensure_ascii=False)
+                    records.pop(key, None)
+                    records[key] = record
+        return list(records.values())[-8:]
+
+    def native_report_collection(self, state: Mapping[str, Any], request_id: str) -> list[dict]:
+        """Select this request's paired, callback-tagged task reads from all channels."""
+        if not isinstance(request_id, str) or not request_id.startswith(
+                f"chat:{self.channel_id}:request:"):
+            return []
+        records: dict[str, dict] = {}
+        for key in ("supervisor_messages", "mythic_operator_messages", "generalist_messages",
+                    "mythic_payload_messages", "bloodhound_messages", "mcp_manager_messages",
+                    "sandbox_messages"):
+            messages = state.get(key) or []
+            if not isinstance(messages, list):
+                continue
+            bound = [message for message in messages
+                if not isinstance(message, ToolMessage)
+                or message.additional_kwargs.get("_task_output_collection_request_id") == request_id]
+            for record in _worker_task_output_evidence(
+                    bound, request_id=request_id, supervised=self.mode == "supervised",
+                    retain_source_identity=True):
+                if (type(record.get("task_operation_id")) is not int
+                        or record["task_operation_id"] != self.operation_id
+                        or type(record.get("task_internal_id")) is not int
+                        or record.get("source_identity_complete") is not True):
+                    continue
+                # A bound source with conflicting callback/command metadata is still
+                # a retained revision, not a supported fact. Dropping it would leave
+                # an older favorable revision unchallenged in operation memory.
+                records[json.dumps(record, sort_keys=True, ensure_ascii=False)] = record
+        return list(records.values())[:8]
+
+    async def identity_report(self) -> str:
+        """Render an explicitly requested report without model calls or live reads.
+
+        The native slash dispatcher selects this boundary. Ordinary conversation
+        is not a report request, and neither its narrative nor mutable seed state
+        supplies report facts. The exact session generation supplies the checkpoint.
+        """
+        if (getattr(self, "channel_id", None) is None
+                or getattr(self, "mode", None) not in {"conversation", "supervised"}
+                or not getattr(self, "_thread_id_override", None)):
+            return "Identity reports require an active conversation or supervised Sage chat session."
+        getter = getattr(getattr(self, "graph", None), "aget_state", None)
+        unavailable = "Retained task observations are unavailable. This report cannot establish identity or access."
+        if not callable(getter):
+            return unavailable
+        try:
+            snapshot = await getter(self._graph_run_config(self._session_thread_id()))
+        except Exception as exc:
+            logger.warning("Identity report checkpoint read failed (%s)", type(exc).__name__)
+            return unavailable
+        values = getattr(snapshot, "values", None)
+        if not isinstance(values, Mapping):
+            return unavailable
+        from .assisted_reporting import render_identity_report
+
+        return render_identity_report(self._identity_report_observations(values))
+
     def _format_message_for_streaming(self, message: BaseMessage, agent_name: str = None) -> str:
         """
         Format a single message for streaming output.
@@ -7467,7 +7588,7 @@ class Model:
             # Show text content with agent name in brackets (matches existing format)
             if text_content:
                 if getattr(self, "channel_id", None) is not None:
-                    output += f"{text_content}\n"
+                    output += text_content + "\n"
                 else:
                     output += f"🤖[{msg_agent_name}]> {text_content}\n"
 
@@ -7837,6 +7958,7 @@ class Model:
                 activity_func=self.set_active_agent,
                 delegation_id=delegation_id,
                 delegation_name=node_name if delegation_id is not None else None,
+                observation_request_id=str(getattr(getattr(self, "_request_contract", None), "request_id", "") or ""),
             )
 
             # Merge callback into config - handle both list and CallbackManager types

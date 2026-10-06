@@ -367,17 +367,34 @@ up front rather than failing mid-run.
 
 | Command | What it does |
 |---|---|
-| `/state` | Show the [engagement ledger](#the-engagement-ledger) — the hop table of proven effects for this channel |
+| `/state` | Show the [engagement ledger](#the-engagement-ledger) — the durable hop table of proven effects shared by chats in the current Mythic operation engagement |
 | `/state objective <text>` | Set the engagement objective |
 | `/state reconcile [task_id] [apply]` | Import verified effects and credentials from completed Mythic tasks — **dry-run unless `apply`** is given, because task output is attacker-influenceable |
 | `/state set <row> <status>` · `/state remove <row>` · `/state wipe` | Edit or clear ledger rows (you cannot hand-promote a row to `achieved` — that needs a real proof envelope) |
 | `/mode [conversation\|supervised\|auto]` | Show or switch the channel's mode |
 | `/list` | List active Sage chat sessions |
 | `/tools` | List Sage's public Mythic tool functions, descriptions, and access requirements |
+| `/report [identity]` | Show retained identity/membership observations shared across assisted chats in this operation engagement, unknown access prerequisites, and next checks; one identity metadata check, no model call or new task |
 | `/stop` | Cooperatively stop the running agent on this channel |
 | `/bloodhound [force] [dir]` | Connect, report, or rebind the BloodHound MCP — see [BloodHound](#bloodhound) |
 | `/mcp <list\|tools\|call\|connect\|disconnect\|policy>` | Manage MCP servers — see [Connecting other MCP servers](#connecting-other-mcp-servers) |
 | `/sandbox [shell\|python] <code>` | Run an isolated local snippet (requires the `callback.write` scope) |
+
+`/state` is available in conversation, supervised and auto modes. Its ledger is shared across
+chats in the same operation engagement and persists once written. A new engagement can show an
+empty ledger: viewing operation details or callbacks does not record an achieved effect, and
+reading `/state` alone does not create a ledger file.
+
+`/report` defaults to the identity report; `/report identity` remains supported.
+It is available in conversation and supervised chat, including a fresh chat
+without model initialization. It uses matched task observations Sage has collected in the same
+Mythic operation engagement, shared across chats and retained across Sage restarts. It performs
+a bounded read-only operation-marker check before reading local evidence; it does not scan
+Mythic task history. Original collection provenance remains visible, and missing or changed
+engagement identity makes sharing unavailable. Observations may be historical or incomplete. A reported identity
+or host membership does not prove current authentication or access. The report has authored
+next checks; general chat remains exploratory model prose. See the
+[bounded report contract](docs/architecture/SPECIALIST_HANDBACKS.md#bounded-identityaccess-report).
 
 `/tools` and simple questions such as “list your tools” use the same deterministic inventory without a
 model call. The inventory distinguishes read-only tools from guarded actions and reports known session
@@ -724,7 +741,7 @@ ever baked into the image.
 ## Runtime state and clean resets
 
 `Payload_Type/sage/sage.db` stores LangGraph checkpoints, tool cache, channel markers,
-controller recovery and operation-memory tables.
+controller recovery and operation-memory tables, including retained report observations.
 These surfaces share a physical SQLite file but retain separate APIs and erasure lifecycles.
 The default path is independent of the process working directory; `SAGE_DATABASE_PATH` can
 select an explicit application database path. Multiple chats share SQLite's writer limit,
@@ -735,13 +752,14 @@ Stop Sage, then import it with
 The import preserves the original file, verifies schema and records, rejects destination
 conflicts, and records an idempotent migration receipt. A changed legacy source requires
 operator review. The archive helper also honors `SAGE_DATABASE_PATH` and preserves legacy
-files and SQLite sidecars. An operation-memory wipe erases its operation rows;
-it does not erase chat checkpoints in the same file.
+files and SQLite sidecars. An operation-memory wipe erases its operation rows, including
+report observations; it does not erase chat checkpoints in the same file.
 `Payload_Type/sage/.phoenix/phoenix.db` stores observability history. Treat both as retained trajectory data.
 
 An active chat channel retains its session across ordinary turns, including pending approvals and objective
 context. After a Sage restart or session replacement, ordinary Supervised chat does not restore its prior
-conversational scope and evidence. Read-only `/state` and tool discovery remain available. Start a fresh
+conversational scope and evidence. Read-only `/state`, `/report` and tool discovery remain
+available. Shared report observations do not restore conversational scope or pending approvals. Start a fresh
 channel and restate scope and evidence before continuing model work; separately bound Auto-controller
 recovery does not restore the Supervised conversation.
 

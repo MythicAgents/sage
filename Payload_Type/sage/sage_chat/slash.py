@@ -46,6 +46,10 @@ _STOP_COMMAND = ChatSlashCommandDefinition(
 SAGE_SLASH_COMMANDS = [
     _FINDINGS_COMMAND,
     _WATCHER_COMMAND,
+    ChatSlashCommandDefinition(
+        Name="report",
+        Description="Show retained identity observations from this operation engagement: /report (or /report identity).",
+    ),
     ChatSlashCommandDefinition(Name="state", Description="Show/edit Sage's engagement state (hop ledger): /state, /state reconcile|remove|set|objective|wipe."),
     ChatSlashCommandDefinition(Name="list", Description="List active Sage chat sessions."),
     ChatSlashCommandDefinition(Name="tools", Description="List Sage's Mythic tool functions: /tools."),
@@ -157,6 +161,14 @@ def _handle_mode(model: Any, arg: str) -> str:
         f"Mode set to **{choice}** for this channel. Controller-owned objective turns use the new mode "
         "immediately; guarded-tool middleware is rebuilt on the next turn."
     )
+
+
+async def _handle_report(chat: Any, request: ChatRequest, model: Any, arg: str) -> str:
+    if arg.strip() not in {"", "identity"}:
+        return "Usage: `/report` or `/report identity` — show this operation engagement's retained identity report."
+    if model is not None and getattr(model, "mode", None) not in {"conversation", "supervised"}:
+        return "`/report` is available only in conversation or supervised mode."
+    return await chat.handle_identity_report(request, model)
 
 
 async def _handle_state(model: Any, request: ChatRequest, arg: str = "") -> str:
@@ -891,6 +903,8 @@ async def handle_slash(chat: Any, request: ChatRequest, model: Any, response_key
     arg = getattr(sc, "Argument", "") or ""
     if name == "mode":
         text = _handle_mode(model, arg)
+    elif name == "report":
+        text = await _handle_report(chat, request, model, arg)
     elif name in {"finding", "findings"}:
         if arg:
             text = "Usage: `/findings` — show this operation's current evidence-backed findings."
@@ -915,7 +929,7 @@ async def handle_slash(chat: Any, request: ChatRequest, model: Any, response_key
     else:
         text = (
             "Unknown Sage slash command. Available commands: `/findings`, `/watcher`, `/state`, "
-            "`/list`, `/tools`, `/mode`, `/stop`, `/mcp`, `/bloodhound`, and `/sandbox`."
+            "`/report [identity]`, `/list`, `/tools`, `/mode`, `/stop`, `/mcp`, `/bloodhound`, and `/sandbox`."
         )
     await chat.send_complete(request, response_key, content=text, complete_request=True)
     return True

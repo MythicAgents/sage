@@ -2263,7 +2263,7 @@ def _slash_req(name, argument="", channel_id=5, request_id=1):
 
 
 def test_slash_commands_declared():
-    assert {c.Name for c in SLASH_COMMANDS} == {"findings", "watcher", "state", "list", "tools", "mode", "stop", "mcp", "bloodhound", "sandbox"}
+    assert {c.Name for c in SLASH_COMMANDS} == {"findings", "watcher", "state", "list", "tools", "mode", "stop", "mcp", "bloodhound", "sandbox", "report"}
 
 
 def test_slash_findings_is_canonical_with_hidden_singular_alias():
