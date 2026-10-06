@@ -3429,6 +3429,51 @@ def _worker_task_evidence_message(
     )
 
 
+def _assisted_worker_observation_context(
+    supervisor_messages: list[AnyMessage], target_messages: list[AnyMessage],
+) -> list[AIMessage]:
+    """Select recent source-only envelopes for one assisted worker invocation.
+
+    Selection precedes target-channel deduplication, so a repeated handoff cannot
+    backfill older evidence merely because the latest observations are already present.
+    Keep whole envelopes and their original collection request identity.
+    """
+    def key(message: AnyMessage) -> tuple[str, str, str] | None:
+        if not isinstance(message, AIMessage) or getattr(message, "tool_calls", None):
+            return None
+        metadata = message.additional_kwargs
+        request_id = metadata.get("_request_id")
+        content = message.content
+        if (
+            metadata.get("_worker_task_evidence") is not True
+            or not isinstance(request_id, str) or not request_id
+            or not isinstance(message.name, str) or not message.name
+            or not isinstance(content, str)
+            or not content.startswith("<untrusted_mythic_task_observations>\n")
+            or not content.endswith("\n</untrusted_mythic_task_observations>")
+        ):
+            return None
+        return request_id, message.name, content
+
+    existing = {identity for message in target_messages
+                if (identity := key(message)) is not None}
+    selected: set[tuple[str, str, str]] = set()
+    copied: list[AIMessage] = []
+    remaining_chars = 96_000
+    for message in reversed(supervisor_messages):
+        identity = key(message)
+        if identity is None or identity in selected or len(selected) >= 8:
+            continue
+        if len(identity[2]) > remaining_chars:
+            continue
+        selected.add(identity)
+        remaining_chars -= len(identity[2])
+        if identity not in existing:
+            copied.append(message)
+    copied.reverse()
+    return copied
+
+
 def _handoff_task_output_evidence(
     source_model: Any, messages: list[AnyMessage], *, request_id: str,
     supervised: bool,
@@ -7806,6 +7851,24 @@ class Model:
 
             # Sanitize messages before invoking agent to prevent "multiple non-consecutive system messages" error
             sanitized_channel = self._sanitize_messages(channel)
+            if (
+                node_name != "Supervisor"
+                and isinstance(state, dict)
+                and state.get("_request_lane") in {"conversational", "supervised_workflow"}
+                and sanitized_channel
+                and isinstance(sanitized_channel[-1], HumanMessage)
+                and sanitized_channel[-1].additional_kwargs.get("_delegated_to") == node_name
+                and sanitized_channel[-1].content == _current_assisted_operator_input(state)
+            ):
+                # Handoff tools run inside a react subgraph with only its local
+                # `messages`; the full parent channels are available here, just
+                # before the worker provider invocation. Insert only source-only
+                # observations, without persisting duplicate operator.add updates.
+                observations = _assisted_worker_observation_context(
+                    list(state.get("supervisor_messages") or []), sanitized_channel,
+                )
+                if observations:
+                    sanitized_channel = sanitized_channel[:-1] + observations + sanitized_channel[-1:]
             initial_agent_input_length = len(sanitized_channel)
 
             # Autonomous keep-going: in an autonomous solve, the Mythic_Operator must not yield control to the
