@@ -1031,15 +1031,79 @@ def _compact_tool_result_str(s: str, *, trigger: int = 4000, ceiling: int = 1600
         return s
 
 
-def _transform_content(content: Any, *, ceiling: int = 16000) -> Any:
+def _compact_task_history_result_str(s: str, *, ceiling: int = 16000) -> str:
+    """Keep complete native task-state rows when callback history exceeds its budget."""
+    try:
+        payload = json.loads(s)
+    except (TypeError, ValueError):
+        return _compact_tool_result_str(s, ceiling=ceiling)
+    rows = payload
+    envelope_key = None
+    if isinstance(payload, dict):
+        for key in ("tasks", "task"):
+            if isinstance(payload.get(key), list):
+                rows = payload[key]
+                envelope_key = key
+                break
+    if (not isinstance(rows, list) or not rows
+            or not all(isinstance(row, dict) and type(row.get("display_id")) is int
+                       for row in rows)):
+        return _compact_tool_result_str(s, ceiling=ceiling)
+    compact = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    if len(compact) <= ceiling:
+        # A literal truncation marker inside task parameters is data, not proof
+        # that this oversized result was already bounded by the generic cap.
+        if len(s) > ceiling:
+            return compact
+        return _compact_tool_result_str(s, ceiling=ceiling)
+
+    # Parameters and nested subtasks can consume the cap before the most recent
+    # task's status. Project native state first, then omit entire older rows;
+    # never slice a state field or turn a partial row into an execution claim.
+    keys = ("id", "display_id", "callback", "command_name", "completed", "status",
+            "timestamp", "request_provenance")
+    projected = [{key: row[key] for key in keys if key in row} for row in rows]
+    projected.sort(key=lambda row: row["display_id"], reverse=True)
+    metadata = {
+        "total_tasks": len(rows), "retained_tasks": 0, "omitted_tasks": len(rows),
+        "task_details_omitted": True, "selection": "latest_task_display_ids",
+    }
+    if envelope_key is not None:
+        omitted_fields = len(payload) - 1
+        metadata.update(source_envelope=envelope_key,
+                        omitted_envelope_fields=omitted_fields,
+                        envelope_metadata_omitted=omitted_fields > 0)
+    result_key = envelope_key or "tasks"
+    # Reserve the maximum-width counts so adding a whole row cannot exceed the
+    # ceiling as the omission count changes. State values themselves stay exact.
+    reserve = {**metadata, "retained_tasks": len(rows)}
+    size = len(json.dumps({result_key: [], "history_compaction": reserve},
+                          separators=(",", ":"), sort_keys=True))
+    retained = []
+    for row in projected:
+        row_size = len(json.dumps(row, separators=(",", ":"), sort_keys=True))
+        addition = row_size + bool(retained)
+        if size + addition > ceiling:
+            continue
+        retained.append(row)
+        size += addition
+    retained.reverse()
+    metadata.update(retained_tasks=len(retained), omitted_tasks=len(rows) - len(retained))
+    return json.dumps({result_key: retained, "history_compaction": metadata},
+                      separators=(",", ":"), sort_keys=True)
+
+
+def _transform_content(content: Any, *, ceiling: int = 16000,
+                       task_history: bool = False) -> Any:
+    compact = _compact_task_history_result_str if task_history else _compact_tool_result_str
     if isinstance(content, str):
-        return _compact_tool_result_str(content, ceiling=ceiling)
+        return compact(content, ceiling=ceiling)
     if isinstance(content, list):
         transformed = []
         for item in content:
             if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str):
                 new_item = dict(item)
-                new_item["text"] = _compact_tool_result_str(item["text"], ceiling=ceiling)
+                new_item["text"] = compact(item["text"], ceiling=ceiling)
                 transformed.append(new_item)
             else:
                 transformed.append(item)
@@ -2845,7 +2909,9 @@ class _ToolResultCompactionMiddleware(AgentMiddleware):
                     # that the Supervisor can receive in its 24k handback. The old
                     # 16k cap hid late values and explicit completion markers.
                     ceiling = 24000
-            new_content = _transform_content(result.content, ceiling=ceiling)
+            new_content = _transform_content(
+                result.content, ceiling=ceiling,
+                task_history=name == "get_task_history_for_callback")
             if new_content is result.content or new_content == result.content:
                 return result
             try:
