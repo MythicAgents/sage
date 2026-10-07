@@ -85,6 +85,17 @@ CALLBACKS = [
     {"id": 8, "agent": "apollo", "user": "LAB\\operator", "host": "LAB-WS02", "integrity": 2, "status": "active", "secs_since_checkin": 7},
 ]
 COMMANDS = ("whoami", "shell", "ps")
+
+
+def fixture_task_schema(command, callback_id):
+    """Known inert Apollo task schema for this synthetic callback inventory."""
+    if type(callback_id) is not int or callback_id not in (7, 8) or command not in COMMANDS:
+        return None
+    if command == "shell":
+        return [{"name": "command", "cli_name": "command", "type": "String",
+                 "parameter_group_name": "Default", "required": True,
+                 "default_value": "", "choices": []}]
+    return []
 OUTPUTS = {
     "whoami": "LAB\\analyst",
     "ps": "PID  Name\n100  explorer.exe\n200  powershell.exe",
@@ -191,8 +202,23 @@ def card_scope(case_id: str, cards: list[dict]) -> tuple[bool, list[dict]]:
             return False, actions
         if set(args) - {"callback_display_id", "command", "parameters", "token_id", "timeout", "visibility_context"}:
             return False, actions
-        if any(args.get(key) is not None for key in ("token_id", "timeout", "visibility_context")):
+        if args.get("token_id") is not None:
             return False, actions
+        context = args.get("visibility_context")
+        if context is None:
+            if args.get("timeout") is not None:
+                return False, actions
+        else:
+            schema = fixture_task_schema(args.get("command"), args["callback_display_id"])
+            binding = context.get("_sage_prepared_binding") if isinstance(context, dict) else None
+            if (schema is None or args.get("timeout") != 300
+                    or not isinstance(context, dict)
+                    or set(context) != {"_sage_prepared_action", "_sage_prepared_binding"}
+                    or context.get("_sage_prepared_action") is not True
+                    or binding != {"schema_digest": hashlib.sha256(json.dumps(
+                        schema, sort_keys=True, default=str).encode()).hexdigest(),
+                        "group": None, "file": None}):
+                return False, actions
         normalized = normalize_command(args.get("command"), args.get("parameters"))
         if case_id[:2] == "04" and normalized not in {"whoami", "shell:whoami"}:
             return False, actions
@@ -308,6 +334,14 @@ async def run_case(case_id, prompt, decision, profile, output_dir, limits, tls_c
     ledger["model_calls"] = usage.calls
     ledger["transport_rejections"] = transport.rejections
     sink = MythicTools(agent_task_id="operator-matrix", operation_id=1, channel_id=1)
+    async def fixture_live_command(command, callback_id):
+        if fixture_task_schema(command, callback_id) is None:
+            return {"status": "missing", "payload_type": "apollo"}
+        return {"status": "available", "command": command}
+    async def fixture_schema_read(command, callback_id, **_kwargs):
+        return fixture_task_schema(command, callback_id)
+    sink._authenticate_live_command = fixture_live_command
+    sink._fetch_command_schema = fixture_schema_read
     retained_patches = contextlib.ExitStack()
     if retained_fixture is not None:
         from ai.langgraph import mythic_tools as tools_module

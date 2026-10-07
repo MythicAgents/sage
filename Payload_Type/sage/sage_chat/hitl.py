@@ -260,9 +260,18 @@ def build_approval_request(action_requests: list[dict[str, Any]]) -> dict[str, A
     description_blocks = []
     for index, action in enumerate(actions, 1):
         action_args = action["arguments"]
+        display_args = dict(action_args)
+        context = display_args.get("visibility_context")
+        if isinstance(context, dict):
+            public_context = {key: value for key, value in context.items()
+                              if not key.startswith("_sage_prepared_")}
+            if public_context:
+                display_args["visibility_context"] = public_context
+            else:
+                display_args.pop("visibility_context", None)
         args_block = (
-            "\n".join(f"  • {key}: {_fmt(value)}" for key, value in action_args.items())
-            if action_args
+            "\n".join(f"  • {key}: {_fmt(value)}" for key, value in display_args.items())
+            if display_args
             else "  • (no arguments)"
         )
         description_blocks.append(

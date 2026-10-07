@@ -66,6 +66,15 @@ scope the channel token lacks is disabled up front.
 | `ensure_tool_uploaded` | Ensure a tool binary is in Mythic's file store (uploads if missing) | `file.write` |
 | `sandbox_exec` | Run untrusted code in an isolated ephemeral sandbox container | `callback.write` |
 
+For a direct `issue_task_and_waitfor_task_output` proposal in native supervised chat, Sage resolves
+deterministic command aliases, parameter names, defaults, and supported context before it displays the
+approval card. The displayed command and arguments are the action held for checkpoint resume. At issue
+time, Sage rechecks the command schema, declared parameter group, and any selected registered file's
+Mythic identity; a changed binding stops the task and needs a fresh proposal and approval. A selected
+`token_id` is currently refused before the card because this task transport does not forward it to
+Mythic. File registration or upload is a separate guarded action; accepting a task card does not
+authorize a hidden upload.
+
 ## Tool drop zone
 
 `download_tool` and `ensure_tool_uploaded` operate on `Payload_Type/sage/tools/`, an operator drop zone. The

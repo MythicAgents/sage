@@ -922,7 +922,8 @@ def test_report_fresh_native_task_evidence_boundary(decision, handback, monkeypa
     assert result["status"] == "passed", result
     assert result["structural_success"]
     assert result["report_sent"] == (decision == "accept")
-    assert result["effect_calls"] == ([module.REPORT_NETSTAT_ARGS] if decision == "accept" else [])
+    assert result["effect_calls"] == ([{**module.REPORT_NETSTAT_ARGS,
+                                       "parameters": "netstat -ano"}] if decision == "accept" else [])
     assert result["mock_issue_outputs"] == ([module.REPORT_FRESH_OUTPUT] if decision == "accept" else [])
     assert len(result["execution_events"]) == (2 if decision == "accept" else 0)
     if decision == "accept":

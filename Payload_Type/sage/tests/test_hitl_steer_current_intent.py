@@ -26,6 +26,7 @@ from ai.langgraph.model import (  # noqa: E402
     _current_assisted_operator_input,
 )
 from ai.langgraph.turn_authority import TurnAuthority  # noqa: E402
+from ai.langgraph.mythic_tools import MythicTools  # noqa: E402
 from sage_chat.headless import HeadlessSageChat, build_chat_request  # noqa: E402
 from sage_chat.service import bind_channel_thread_id  # noqa: E402
 from sage_chat.session import (  # noqa: E402
@@ -442,6 +443,17 @@ async def _run_native_case_inner(script: list, steer: str):
         apitoken_id=0,
     )
     sink = MagicMock()
+    preparer = MythicTools(agent_task_id="offline-native-steer")
+    preparer.client = object()
+    async def live_command(command, callback):
+        return ({"status": "available", "command": command}
+                if callback == 5 and command in {"getprivs", "whoami"}
+                else {"status": "missing", "payload_type": "apollo"})
+    async def known_schema(command, callback):
+        return [] if callback == 5 and command in {"getprivs", "whoami"} else None
+    preparer._authenticate_live_command = live_command
+    preparer._fetch_command_schema = known_schema
+    sink._prepare_supervised_issue_action = preparer._prepare_supervised_issue_action
     sink.get_tools.side_effect = lambda names: (
         [issue_task_and_waitfor_task_output]
         if "issue_task_and_waitfor_task_output" in names
@@ -586,10 +598,12 @@ def test_native_chat_production_graph_different_action_gets_a_new_card():
     cards = _cards(chat)
     assert effects == []
     assert len(cards) == 2
-    assert cards[1]["data"]["actions"] == [{
-        "tool_name": NEW_ACTION["name"],
-        "display_name": NEW_ACTION["name"],
-        "arguments": NEW_ACTION["args"],
-    }]
+    assert len(cards[1]["data"]["actions"]) == 1
+    next_action = cards[1]["data"]["actions"][0]
+    assert next_action["tool_name"] == next_action["display_name"] == NEW_ACTION["name"]
+    assert {key: next_action["arguments"][key] for key in NEW_ACTION["args"]} == NEW_ACTION["args"]
+    assert next_action["arguments"]["timeout"] == 300
+    assert next_action["arguments"]["token_id"] is None
+    assert next_action["arguments"]["visibility_context"]["_sage_prepared_action"] is True
     assert snapshot.next
     assert _current_assisted_operator_input(model.state) == DIFFERENT_STEER

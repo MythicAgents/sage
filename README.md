@@ -344,6 +344,9 @@ proposals are narrowed to one; Sage must propose a later guarded action on a fre
 controller run also pauses before each proposed move. A card for `execute_capability` approves that exact
 capability action and its arguments; its adapter may issue several Mythic tasks while carrying it out. Inspect
 the displayed scope before accepting. Read-only tools (`list_*`, `get_*`, downloads) never prompt.
+For direct Mythic task proposals, the card shows the deterministically prepared command and arguments.
+If the command schema or selected registered file changes before issuance, Sage stops and requires a
+fresh proposal; an explicit `token_id` is refused because this task path does not forward it to Mythic.
 
 With **Autonomous Solve** enabled in a supervised channel, the first prompt becomes a continuing objective
 for Sage's controller. Each controller move still pauses for a native approval card. With that option off,

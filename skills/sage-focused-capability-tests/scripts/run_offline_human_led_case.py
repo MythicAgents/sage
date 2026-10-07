@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import copy
 from contextlib import redirect_stdout
+import hashlib
 import json
 import sys
 import tempfile
@@ -50,9 +51,36 @@ REDIRECT_ANSWER = (
 )
 
 
+def fixture_base_arguments(arguments: object) -> dict | None:
+    """Validate and remove only the deterministic internal preparation fields."""
+    if not isinstance(arguments, dict):
+        return None
+    extra = set(arguments) - set(EXPECTED["args"])
+    if extra and extra != {"timeout", "token_id", "visibility_context"}:
+        return None
+    if not set(EXPECTED["args"]).issubset(arguments):
+        return None
+    if extra:
+        binding = arguments.get("visibility_context")
+        if (arguments.get("timeout") != 300 or arguments.get("token_id") is not None
+                or not isinstance(binding, dict)
+                or binding.get("_sage_prepared_action") is not True
+                or set(binding) != {"_sage_prepared_action", "_sage_prepared_binding"}
+                or binding["_sage_prepared_binding"] != {
+                    "schema_digest": hashlib.sha256(b"[]").hexdigest(),
+                    "group": None, "file": None,
+                }):
+            return None
+        arguments = {key: arguments[key] for key in EXPECTED["args"]}
+    if set(arguments) != set(EXPECTED["args"]):
+        return None
+    return dict(arguments)
+
+
 def accepted_effective_arguments(arguments: object) -> dict | None:
     """The two scoped identity actions this human-led case permits."""
-    if not isinstance(arguments, dict) or set(arguments) != set(EXPECTED["args"]):
+    arguments = fixture_base_arguments(arguments)
+    if arguments is None:
         return None
     if type(arguments["callback_display_id"]) is not int or arguments["callback_display_id"] != 7:
         return None
@@ -79,6 +107,21 @@ def accepted_effective_arguments(arguments: object) -> dict | None:
     if effective["parameters"] != expected_parameters:
         return None
     return effective
+
+
+def install_inert_supervised_preparation(sink, *, commands=("whoami", "shell", "hostname"), callback_id=7):
+    """Give a fixture sink real deterministic preparation backed by known empty schemas."""
+    preparer = MythicTools(agent_task_id="offline-preparation")
+    preparer.client = object()
+    async def live_command(command, callback):
+        if callback != callback_id or command not in commands:
+            return {"status": "missing", "payload_type": "apollo"}
+        return {"status": "available", "command": command}
+    async def known_empty_schema(command, callback):
+        return [] if callback == callback_id and command in commands else None
+    preparer._authenticate_live_command = live_command
+    preparer._fetch_command_schema = known_empty_schema
+    sink._prepare_supervised_issue_action = preparer._prepare_supervised_issue_action
 
 
 class ScriptedModel(GenericFakeChatModel):
@@ -185,6 +228,7 @@ async def _run_case(*, decision: str, proposed_command: str) -> dict:
                   task_id=0, agent_task_id="offline-human-led", mode="supervised",
                   operation_id=1, channel_id=1, apitoken_id=0)
     sink = MagicMock()
+    install_inert_supervised_preparation(sink)
     sink.get_tools.side_effect = lambda names: ([issue_task_and_waitfor_task_output]
                                                 if EXPECTED["name"] in names else [])
     model.mythic_client = sink

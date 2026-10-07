@@ -358,7 +358,8 @@ def effective_case_arguments(arguments: object) -> dict | None:
 
 def report_netstat_effective_arguments(arguments: object) -> dict | None:
     """Accept only the one bounded callback-7 netstat action, not arbitrary shell."""
-    if (not isinstance(arguments, dict) or set(arguments) != set(REPORT_NETSTAT_ARGS) or
+    arguments = CASE.fixture_base_arguments(arguments)
+    if (arguments is None or set(arguments) != set(REPORT_NETSTAT_ARGS) or
             type(arguments.get("callback_display_id")) is not int or
             arguments["callback_display_id"] != 7 or arguments.get("command") != "shell"):
         return None
@@ -1032,7 +1033,10 @@ async def run_episode(profile: dict[str, str], *, decision: str,
 
     @tool
     async def issue_task_and_waitfor_task_output(command: str, parameters: str,
-                                                  callback_display_id: int) -> str:
+                                                  callback_display_id: int,
+                                                  token_id: int | None = None,
+                                                  timeout: int | None = None,
+                                                  visibility_context: dict | None = None) -> str:
         """Issue a task on a callback and wait for its output."""
         nonlocal issued_task_source_request_id
         raw = {"command": command, "parameters": parameters,
@@ -1147,6 +1151,7 @@ async def run_episode(profile: dict[str, str], *, decision: str,
                           task_id=0, agent_task_id="real-model-human-led", mode="supervised",
                           operation_id=1, channel_id=1, apitoken_id=0)
             sink = MagicMock()
+            CASE.install_inert_supervised_preparation(sink)
             # No real Mythic task ledger exists in this mock-effects runner.
             sink._current_request_task_provenance_notice.return_value = ""
             def scoped_tools(names):

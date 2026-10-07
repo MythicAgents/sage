@@ -2391,7 +2391,12 @@ class MythicTools:
             # way does not match and the denial stands. It therefore cannot let a material argument
             # change past the gate, which is the failure mode that kept ISC-67 held.
             _binding = getattr(self, "_last_argres_binding", None)
-            if isinstance(_binding, dict) and isinstance(values.get("parameters"), dict):
+            prepared_action = (
+                isinstance(values.get("visibility_context"), dict)
+                and values["visibility_context"].get("_sage_prepared_action") is True
+            )
+            if (not prepared_action and isinstance(_binding, dict)
+                    and isinstance(values.get("parameters"), dict)):
                 if (
                     _normalize_command_name(values.get("command")) == _binding.get("command")
                     and values.get("callback_display_id") == _binding.get("callback_display_id")
@@ -4142,6 +4147,92 @@ class MythicTools:
         except Exception as e:
             return f"Error downloading payload {payload_uuid}: {e}"
 
+    async def _prepare_supervised_issue_action(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Resolve a direct task proposal before its native approval card is built.
+
+        This uses only local normalization and Mythic/BloodHound control-plane reads.
+        A prerequisite that would register a file must receive separate authority.
+        The issue path still rechecks its live bindings and exact approved effect.
+        """
+        prepared = dict(args)
+        command = prepared.get("command")
+        callback_id = prepared.get("callback_display_id")
+        if not isinstance(command, str) or not command or type(callback_id) is not int:
+            raise ValueError("task command and exact callback are required before approval")
+        if prepared.get("token_id") is not None:
+            raise ValueError("explicit token_id tasking is unsupported by the Mythic task transport")
+        parameters = prepared.get("parameters")
+        parameters = self._qualify_dcsync_params(command, parameters)
+        parameters = await self._coerce_native_dcsync_to_working_form(command, parameters)
+        parameters = self._normalize_sharphound_assembly_params(command, parameters)
+        if parameters is None or parameters == {} or (
+            isinstance(parameters, str) and parameters.strip() in ("", "{}", '""', "''")
+        ):
+            parameters = ""
+        if isinstance(parameters, str):
+            stripped = parameters.strip()
+            if stripped.startswith("{") and stripped.endswith("}"):
+                try:
+                    parsed = json.loads(stripped)
+                    if isinstance(parsed, dict):
+                        parameters = parsed
+                except (TypeError, ValueError):
+                    pass
+        command, parameters = self._rewrite_shell_like_run(command, parameters)
+        parameters = await self._coerce_shell_parameters_from_schema(command, parameters, callback_id)
+        live = await self._authenticate_live_command(command, callback_id)
+        if live.get("status") == "missing":
+            raise ValueError(self._missing_live_command_message(
+                command, live.get("payload_type"), callback_id))
+        if live.get("status") == "available" and live.get("command"):
+            command = live["command"]
+        schema = await self._fetch_command_schema(command, callback_id)
+        if schema is None:
+            raise ValueError("task schema is unavailable; approval requires a known command schema")
+        resolved_group = None
+        if isinstance(parameters, dict) and parameters and schema:
+            resolved = command_builder.resolve_params(schema, parameters, command=command)
+            if not resolved.ok:
+                raise ValueError(resolved.repair or "task parameters do not match the live schema")
+            resolved_group = resolved.group
+            parameters = await self._bind_mythic_credential_parameters(
+                command, resolved.params, callback_id, param_schema=schema)
+        if isinstance(parameters, dict) and parameters:
+            error = await self._validate_command_parameters(command, parameters, callback_id)
+            if error:
+                raise ValueError(error)
+        parameters = self._bind_kerberos_ticket_artifact(command, parameters)
+        name = self._registered_file_name_from_schema(command, parameters, schema)
+        if name and not self._registered_file_available_in_schema(schema, name):
+            raise ValueError(f"registered file {name!r} needs its own approval before this task")
+        file_identity = None
+        if name:
+            file_identity = await self._find_uploaded_file_by_name(name)
+            if not isinstance(file_identity, dict) or not file_identity.get("agent_file_id"):
+                raise ValueError(f"registered file {name!r} has no verifiable Mythic identity")
+            file_identity = {key: file_identity.get(key) for key in
+                             ("id", "agent_file_id", "filename_utf8", "md5", "sha1", "complete")}
+        if parameters == "" and isinstance(schema, list) and schema:
+            parameters = "{}"
+        prepared.update(command=command, parameters=parameters,
+                        callback_display_id=callback_id)
+        if prepared.get("timeout") is None:
+            prepared["timeout"] = self._derive_task_timeout(callback_id)
+        prepared.setdefault("token_id", None)
+        visibility = prepared.get("visibility_context")
+        if visibility is not None and not isinstance(visibility, dict):
+            raise ValueError("task visibility context must be an object")
+        prepared["visibility_context"] = {
+            **(visibility or {}), "_sage_prepared_action": True,
+            "_sage_prepared_binding": {
+                "schema_digest": hashlib.sha256(json.dumps(
+                    schema, sort_keys=True, default=str).encode()).hexdigest(),
+                "group": self._parameter_group_to_declare(resolved_group, parameters, command=command),
+                "file": file_identity,
+            },
+        }
+        return prepared
+
     @tool_safety(TOOL_SAFETY_GUARDED)
     async def delete_payload(
         self,
@@ -5517,6 +5608,36 @@ class MythicTools:
         if command_binding.get("entered_issue") and command_binding.get("task") is asyncio.current_task():
             command_binding["runner_command"] = command
             command_binding["runner_parameters"] = copy.deepcopy(parameters)
+        prepared_binding = (
+            visibility_context.get("_sage_prepared_binding")
+            if isinstance(visibility_context, dict)
+            and visibility_context.get("_sage_prepared_action") is True else None
+        )
+        if prepared_binding is not None:
+            if not isinstance(prepared_binding, dict):
+                return self._note_effect_denial("STOP — prepared task binding is invalid")
+            try:
+                current_schema = await self._fetch_command_schema(
+                    command, callback_display_id, force_refresh=True)
+                current_digest = hashlib.sha256(json.dumps(
+                    current_schema, sort_keys=True, default=str).encode()).hexdigest()
+                if current_digest != prepared_binding.get("schema_digest"):
+                    return self._note_effect_denial("STOP — task schema changed after approval")
+                selected_file = self._registered_file_name_from_schema(command, parameters, current_schema)
+                expected_file = prepared_binding.get("file")
+                if bool(selected_file) != bool(expected_file):
+                    return self._note_effect_denial("STOP — registered file selection changed after approval")
+                if selected_file:
+                    current_file = await self._find_uploaded_file_by_name(selected_file)
+                    keys = ("id", "agent_file_id", "filename_utf8", "md5", "sha1", "complete")
+                    if not isinstance(current_file, dict) or {
+                        key: current_file.get(key) for key in keys
+                    } != expected_file:
+                        return self._note_effect_denial("STOP — registered file identity changed after approval")
+            except Exception as exc:
+                return self._note_effect_denial(
+                    f"STOP — prepared task binding could not be revalidated: {type(exc).__name__}"
+                )
         try:
             registered_file_blocker = await self._ensure_registered_file_available(
                 command,
@@ -5639,6 +5760,11 @@ class MythicTools:
                 return _validation_error
 
         parameters = self._bind_kerberos_ticket_artifact(command, parameters)
+        if prepared_binding is not None:
+            declared_group = self._parameter_group_to_declare(
+                resolved_parameter_group, parameters, command=command)
+            if declared_group != prepared_binding.get("group"):
+                return self._note_effect_denial("STOP — task parameter group changed after approval")
         fail_key = self._task_failure_key(command, callback_display_id, parameters)
         if self._task_failure_counts.get(fail_key, 0) >= 2:
             return (
@@ -5754,6 +5880,14 @@ class MythicTools:
                                 "own defaults instead of failing to parse an empty string (ISC-65)"
                             )
                             parameters = "{}"
+                    if prepared_binding is not None:
+                        authority_blocker = self._turn_authority_issue_blocker(
+                            command, callback_display_id, parameters=parameters,
+                            token_id=token_id, timeout=timeout,
+                            visibility_context=visibility_context, recheck=True,
+                        )
+                        if authority_blocker:
+                            raise PermissionError(authority_blocker)
                     # Bind observer facts before the asynchronous issue/wait. A later
                     # request must not inherit an old task's approval or outcome.
                     execution_request_id = self._current_request_id()
@@ -5791,6 +5925,10 @@ class MythicTools:
                         if repaired == parameters:
                             raise
                         parameters = repaired
+                        if prepared_binding is not None and self._parameter_group_to_declare(
+                            resolved_parameter_group, parameters, command=command
+                        ) != prepared_binding.get("group"):
+                            raise PermissionError("STOP — task parameter group changed after approval")
                         authority_blocker = self._turn_authority_issue_blocker(
                             command,
                             callback_display_id,
@@ -18601,7 +18739,7 @@ class MythicTools:
             raise Exception(f"Failed to create task: {status.get('error')}")
         return status
 
-    async def _fetch_command_schema(self, command, callback_display_id):
+    async def _fetch_command_schema(self, command, callback_display_id, *, force_refresh=False):
         """Resolve the parameter-group schema for `command` on the callback's payload type.
 
         ISC-2.2: the fetch is delegated to the shared resolver, which removes the f-string-built
@@ -18627,6 +18765,8 @@ class MythicTools:
                 self._cmd_schema_cache = {}
 
             cache_key = (payload_type, command)
+            if force_refresh:
+                self._cmd_schema_cache.pop(cache_key, None)
             if cache_key not in self._cmd_schema_cache:
                 groups = await command_parameter_schema.get_command_schema(
                     self.client,

@@ -123,14 +123,23 @@ def test_native_accept_reaches_real_final_sink_in_ordinary_supervised(monkeypatc
         AssertionError("offline test attempted network access")))
     effects = []
     sink = MythicTools(agent_task_id="offline-authority", operation_id=4, channel_id=9)
+    async def live_command(_command, _callback):
+        return {"status": "available", "command": "whoami"}
+    async def empty_schema(_command, _callback):
+        return []
+    sink._authenticate_live_command = live_command
+    sink._fetch_command_schema = empty_schema
 
     @tool
     async def issue_task_and_waitfor_task_output(
         command: str, parameters: str, callback_display_id: int,
+        token_id: int | None = None, timeout: int | None = None,
+        visibility_context: dict | None = None,
     ) -> str:
         """Issue one inert callback task after the real final authority check."""
         blocker = sink._turn_authority_issue_blocker(
             command, callback_display_id, parameters=parameters,
+            token_id=token_id, timeout=timeout, visibility_context=visibility_context,
         )
         if blocker:
             return blocker
@@ -184,6 +193,7 @@ def test_native_accept_reaches_real_final_sink_in_ordinary_supervised(monkeypatc
                      if (item.get("metadata") or {}).get("special_type") == "input_requested"]
             assert len(cards) == 1
             assert effects == []
+            assert cards[0]["data"]["arguments"]["visibility_context"]["_sage_prepared_action"] is True
             second = build_chat_request("", channel_id=9, operation_id=4,
                                         request_id=2, config={"mode": "supervised",
                                                               "autonomous_solve": False})

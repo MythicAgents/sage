@@ -1810,6 +1810,8 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
         if last_ai is None:
             return None
         original_calls = list(last_ai.tool_calls)
+        batch_error = _tool_call_envelope_error(last_ai)
+        deferred: list[ToolMessage] = []
         # Supervised one-at-a-time: if multiple guarded tool calls are proposed, keep only the
         # first and reject the rest. The model sequences its work — one approval, one execution,
         # then the next proposal. This prevents batch HITL cards and their decision-count/
@@ -1822,9 +1824,8 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
                 i for i, tc in enumerate(original_calls)
                 if isinstance(tc, dict) and str(tc.get("name") or "") in GUARDED_TOOLS
             ]
-            if len(guarded_indices) > 1:
+            if not batch_error and len(guarded_indices) > 1:
                 keep_idx = guarded_indices[0]
-                deferred = []
                 for idx in guarded_indices[1:]:
                     tc = original_calls[idx]
                     name = str(tc.get("name") or "unknown")
@@ -1839,10 +1840,7 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
                 last_ai.tool_calls = [
                     tc for i, tc in enumerate(original_calls) if i not in guarded_indices[1:]
                 ]
-                if deferred:
-                    return {"messages": [last_ai, *deferred]}
                 original_calls = list(last_ai.tool_calls)
-        batch_error = _tool_call_envelope_error(last_ai)
         if not original_calls and not batch_error:
             return None
         first_control = next(
@@ -1964,7 +1962,7 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
                 self._model._guarded_attempt_pending = True
         rewrite = bool(batch_error) or has_control or allowed_calls != original_calls
         if not blocked_reasons and not rewrite:
-            return None
+            return {"messages": [last_ai, *deferred]} if deferred else None
         denial_text = (
             "[turn-authority] " + " | ".join(blocked_reasons)
             if blocked_reasons
@@ -1993,13 +1991,74 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
         # LangChain invokes callbacks with the same generation message object later
         # consumed by agent middleware. Mutating that object prevents a pre-authority
         # callback snapshot from restoring removed calls.
-        return None
+        return {"messages": [last_ai, *deferred]} if deferred else None
 
     def after_model(self, state, runtime):
         return self._after_model_update(state)
 
     async def aafter_model(self, state, runtime):
-        return self._after_model_update(state)
+        prepared_message = None
+        if (getattr(self._model, "mode", "") == "supervised"
+                and getattr(self._model, "_native_chat_explicit_hitl", False)):
+            messages = state.get("messages", []) if isinstance(state, dict) else getattr(state, "messages", [])
+            last_ai = next((message for message in reversed(messages) if isinstance(message, AIMessage)), None)
+            if last_ai is not None:
+                if _tool_call_envelope_error(last_ai):
+                    return self._after_model_update(state)
+                preparer = getattr(getattr(self._model, "mythic_client", None),
+                                   "_prepare_supervised_issue_action", None)
+                kept = []
+                preparation_failed = False
+                control_proposed = any(
+                    isinstance(call, dict) and _is_control_tool(str(call.get("name") or ""))
+                    for call in last_ai.tool_calls
+                )
+                selected_guarded = next((index for index, call in enumerate(last_ai.tool_calls)
+                                         if isinstance(call, dict)
+                                         and str(call.get("name") or "") in GUARDED_TOOLS), None)
+                for index, call in enumerate(last_ai.tool_calls):
+                    if (control_proposed or index != selected_guarded
+                            or not isinstance(call, dict)
+                            or call.get("name") != "issue_task_and_waitfor_task_output"):
+                        kept.append(call)
+                        continue
+                    try:
+                        if not callable(preparer):
+                            raise ValueError("task preparation is unavailable")
+                        prepared = await preparer(call.get("args") or {})
+                        call["args"] = prepared
+                        prepared_message = last_ai
+                        kept.append(call)
+                    except (TypeError, ValueError) as exc:
+                        prepared_message = last_ai
+                        preparation_failed = True
+                        note = f"[task preparation] Approval was not requested: {exc}"
+                        last_ai.content = f"{_message_content_as_text(last_ai.content)}\n{note}".strip()
+                if preparation_failed:
+                    kept = [call for call in kept if not (
+                        isinstance(call, dict)
+                        and str(call.get("name") or "") in GUARDED_TOOLS
+                    )]
+                if len(kept) != len(last_ai.tool_calls):
+                    last_ai.tool_calls[:] = kept
+                    last_ai.additional_kwargs.pop("tool_calls", None)
+                    last_ai.additional_kwargs.pop("function_call", None)
+                if prepared_message is not None:
+                    if isinstance(last_ai.content, list):
+                        last_ai.content[:] = [block for block in last_ai.content if not (
+                            isinstance(block, dict)
+                            and str(block.get("type") or "").casefold() in {"tool_use", "tool_call"}
+                        )]
+                    last_ai.additional_kwargs.pop("tool_calls", None)
+                    last_ai.additional_kwargs.pop("function_call", None)
+        result = self._after_model_update(state)
+        if prepared_message is not None:
+            output = list((result or {}).get("messages") or [])
+            if not any(isinstance(message, AIMessage)
+                       and message.id == prepared_message.id for message in output):
+                output.insert(0, prepared_message)
+            return {**(result or {}), "messages": output}
+        return result
 
     async def awrap_tool_call(self, request, handler):
         from sage_chat.hitl import approval_action_fingerprint

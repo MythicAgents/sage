@@ -1,0 +1,403 @@
+"""A native card binds the same deterministic task arguments the sink sees."""
+
+import asyncio
+import copy
+import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+import pytest
+from langchain_core.messages import AIMessage
+from langgraph.checkpoint.memory import InMemorySaver
+
+from ai.langgraph.model import Model, _TurnAuthorityToolMiddleware
+from ai.langgraph.mythic_tools import MythicTools
+from ai.langgraph import mythic_tools as mythic_tools_module
+from ai.langgraph.request_contract import build_request_contract
+from ai.langgraph.turn_authority import authority_from_request_contract
+from sage_chat.hitl import (approval_action_digest, approval_action_fingerprint,
+                            approval_proposal_digest, approval_selection_digest,
+                            build_approval_request)
+from sage_chat import session
+from sage_chat.headless import build_chat_request
+from tests.test_supervised_objective_native import driver
+
+
+TOOL = "issue_task_and_waitfor_task_output"
+RAW = {"command": "dcsync", "callback_display_id": 2, "timeout": 60,
+       "parameters": {"domain": "lab.invalid",
+                      "dc": "dc.lab.invalid", "user": "krbtgt"}}
+SCHEMA = [{"name": key, "cli_name": key, "type": "String",
+           "parameter_group_name": "Default", "required": True,
+           "default_value": "", "choices": []} for key in ("Domain", "DC", "User")]
+
+
+def _tools():
+    tools = MythicTools(agent_task_id="offline-approval")
+    tools.client = object()
+    return tools
+
+
+def _claim(tools, action):
+    contract = build_request_contract(
+        request_id="request-prepared", channel_id="channel-prepared",
+        operation_id="operation-prepared", mode="supervised", autonomous_solve=False,
+        requested_actions=(),
+    )
+    # The producer inserts its prepared action into this request before the card.
+    from ai.langgraph.request_contract import action_spec_from_tool_call
+    contract = contract.amend(requested_actions=(action_spec_from_tool_call(action),))
+    tools.set_turn_authority(authority_from_request_contract(contract))
+    tools.set_request_contract(contract)
+    digest = approval_action_digest([action])
+    action_id = approval_action_fingerprint(action)
+    tools.set_approval_claim({
+        "approval_id": "approved-prepared", "request_id": contract.request_id,
+        "request_contract_digest": contract.digest, "tool_name": TOOL,
+        "selection_mode": "single", "actions": [action],
+        "approved_actions": [action], "approved_action_ids": [action_id],
+        "action_digest": digest,
+        "proposal_digest": approval_proposal_digest(contract.digest, digest),
+        "selection_digest": approval_selection_digest(contract.digest, digest, [action_id]),
+    })
+    return contract
+
+
+def test_retained_dcsync_prepared_before_card_and_exact_after_restore(monkeypatch):
+    tools = _tools()
+    monkeypatch.setattr(tools, "_authenticate_live_command", AsyncMock(return_value={
+        "status": "available", "command": "dcsync"}))
+    monkeypatch.setattr(tools, "_fetch_command_schema", AsyncMock(return_value=SCHEMA))
+    monkeypatch.setattr(tools, "_validate_command_parameters", AsyncMock(return_value=None))
+    model = Model.__new__(Model)
+    model.mode = "supervised"
+    model._native_chat_explicit_hitl = True
+    model.mythic_client = tools
+    model._request_dynamic_proposals = True
+    model._request_contract = build_request_contract(
+        request_id="request-prepared", channel_id="channel-prepared",
+        operation_id="operation-prepared", mode="supervised", autonomous_solve=False)
+    model.install_request_contract = lambda contract: setattr(model, "_request_contract", contract)
+    middleware = _TurnAuthorityToolMiddleware(model, agent_name="Mythic_Operator")
+    monkeypatch.setattr(middleware, "_after_model_update",
+        lambda state: model.bind_supervised_request_proposal(state["messages"][-1].tool_calls))
+    message = AIMessage(content="", tool_calls=[{"name": TOOL, "args": copy.deepcopy(RAW), "id": "call-1"}])
+    asyncio.run(middleware.aafter_model({"messages": [message]}, None))
+    prepared = copy.deepcopy(message.tool_calls[0])  # checkpointed tool call, not ambient cache
+    card = build_approval_request([prepared])
+    assert prepared["args"]["parameters"] == {
+        "Domain": "lab.invalid", "DC": "dc.lab.invalid",
+        "User": "LAB\\krbtgt",
+    }
+    assert prepared["args"]["visibility_context"]["_sage_prepared_action"] is True
+    assert "lab.invalid" in card["description"]
+    assert "krbtgt" in card["description"]
+    assert model._request_contract.requested_actions
+    _claim(tools, prepared)
+    assert tools._approval_effect_blocker(TOOL, prepared["args"]) == ""
+    changed = copy.deepcopy(prepared["args"])
+    changed["parameters"]["User"] = "LAB\\other"
+    assert "does not cover this exact effect" in tools._approval_effect_blocker(TOOL, changed)
+    # A later resolver binding cannot excuse a material post-approval change.
+    tools._last_argres_binding = {"command": "dcsync", "callback_display_id": 2,
+        "original": prepared["args"]["parameters"], "resolved": changed["parameters"]}
+    assert "does not cover this exact effect" in tools._approval_effect_blocker(TOOL, changed)
+
+
+def test_preparation_failure_creates_no_guarded_card(monkeypatch):
+    tools = _tools()
+    monkeypatch.setattr(tools, "_authenticate_live_command", AsyncMock(return_value={
+        "status": "missing", "payload_type": "apollo"}))
+    model = SimpleNamespace(mode="supervised", _native_chat_explicit_hitl=True,
+                            mythic_client=tools)
+    middleware = _TurnAuthorityToolMiddleware(model)
+    monkeypatch.setattr(middleware, "_after_model_update", lambda state: None)
+    message = AIMessage(content="", tool_calls=[{"name": TOOL, "args": copy.deepcopy(RAW), "id": "call-1"}])
+    asyncio.run(middleware.aafter_model({"messages": [message]}, None))
+    assert message.tool_calls == []
+    assert "Approval was not requested" in message.content
+
+
+def test_explicit_token_is_refused_before_approval():
+    tools = _tools()
+    action = {**RAW, "token_id": 42}
+    with pytest.raises(ValueError, match="explicit token_id tasking is unsupported"):
+        asyncio.run(tools._prepare_supervised_issue_action(action))
+
+
+def test_unknown_schema_fails_before_card_but_known_empty_schema_prepares(monkeypatch):
+    tools = _tools()
+    monkeypatch.setattr(tools, "_authenticate_live_command", AsyncMock(return_value={
+        "status": "available", "command": "whoami"}))
+    schema = AsyncMock(return_value=None)
+    monkeypatch.setattr(tools, "_fetch_command_schema", schema)
+    action = {"command": "whoami", "callback_display_id": 2, "parameters": ""}
+    with pytest.raises(ValueError, match="schema is unavailable"):
+        asyncio.run(tools._prepare_supervised_issue_action(action))
+    schema.return_value = []
+    prepared = asyncio.run(tools._prepare_supervised_issue_action(action))
+    assert prepared["parameters"] == ""
+    assert prepared["visibility_context"]["_sage_prepared_action"] is True
+
+
+def test_schema_revalidation_bypasses_live_schema_cache(monkeypatch):
+    tools = _tools()
+    monkeypatch.setattr(tools, "_resolve_payload_type", AsyncMock(return_value="apollo"))
+    current = [copy.deepcopy(SCHEMA)]
+    remote = AsyncMock(side_effect=lambda *_args, **_kwargs: current[0])
+    monkeypatch.setattr(mythic_tools_module.command_parameter_schema,
+                        "get_command_schema", remote)
+    monkeypatch.setattr(mythic_tools_module.command_parameter_schema,
+                        "flatten_groups", lambda groups: groups)
+
+    async def probe():
+        first = await tools._fetch_command_schema("dcsync", 2)
+        current[0] = [*copy.deepcopy(SCHEMA), {"name": "Extra", "type": "String"}]
+        cached = await tools._fetch_command_schema("dcsync", 2)
+        refreshed = await tools._fetch_command_schema("dcsync", 2, force_refresh=True)
+        return first, cached, refreshed
+
+    first, cached, refreshed = asyncio.run(probe())
+    assert first == cached == SCHEMA
+    assert refreshed != first
+    assert remote.await_count == 2
+
+
+def test_divergent_provider_envelope_is_rejected_before_preparation(monkeypatch):
+    tools = _tools()
+    preparer = AsyncMock(side_effect=AssertionError("divergent proposal was prepared"))
+    monkeypatch.setattr(tools, "_prepare_supervised_issue_action", preparer)
+    model = SimpleNamespace(mode="supervised", _native_chat_explicit_hitl=True,
+                            mythic_client=tools, _request_contract=object())
+    middleware = _TurnAuthorityToolMiddleware(model)
+    raw_call = {"id": "call-1", "type": "function", "function": {
+        "name": TOOL, "arguments": json.dumps({**RAW, "timeout": 99})}}
+    message = AIMessage(content="", tool_calls=[{
+        "name": TOOL, "args": copy.deepcopy(RAW), "id": "call-1"}],
+        additional_kwargs={"tool_calls": [raw_call]})
+    asyncio.run(middleware.aafter_model({"messages": [message]}, None))
+    assert message.tool_calls == []
+    assert "raw tool_calls diverge" in message.content
+    preparer.assert_not_awaited()
+
+
+def test_divergent_multi_call_envelope_cannot_become_valid_after_pruning(monkeypatch):
+    tools = _tools()
+    preparer = AsyncMock(side_effect=AssertionError("divergent proposal was prepared"))
+    monkeypatch.setattr(tools, "_prepare_supervised_issue_action", preparer)
+    model = SimpleNamespace(mode="supervised", _native_chat_explicit_hitl=True,
+                            mythic_client=tools, _request_contract=object())
+    middleware = _TurnAuthorityToolMiddleware(model)
+    first = {"name": TOOL, "args": copy.deepcopy(RAW), "id": "call-1"}
+    second = {"name": TOOL, "args": {**copy.deepcopy(RAW), "callback_display_id": 3},
+              "id": "call-2"}
+    raw_first = {"id": "call-1", "type": "function", "function": {
+        "name": TOOL, "arguments": json.dumps(RAW)}}
+    message = AIMessage(content="", tool_calls=[first, second],
+                        additional_kwargs={"tool_calls": [raw_first]})
+    asyncio.run(middleware.aafter_model({"messages": [message]}, None))
+    assert message.tool_calls == []
+    assert "raw tool_calls diverge" in message.content
+    preparer.assert_not_awaited()
+
+
+def test_failed_first_preparation_drops_entire_guarded_batch(monkeypatch):
+    tools = _tools()
+    monkeypatch.setattr(tools, "_authenticate_live_command", AsyncMock(return_value={
+        "status": "missing", "payload_type": "apollo"}))
+    model = SimpleNamespace(mode="supervised", _native_chat_explicit_hitl=True,
+                            mythic_client=tools)
+    middleware = _TurnAuthorityToolMiddleware(model)
+    monkeypatch.setattr(middleware, "_after_model_update", lambda state: None)
+    message = AIMessage(content="", tool_calls=[
+        {"name": TOOL, "args": copy.deepcopy(RAW), "id": "call-1"},
+        {"name": TOOL, "args": {**copy.deepcopy(RAW), "callback_display_id": 3}, "id": "call-2"},
+    ])
+    asyncio.run(middleware.aafter_model({"messages": [message]}, None))
+    assert message.tool_calls == []
+    assert "Approval was not requested" in message.content
+
+
+def test_multiple_proposals_keep_first_prepared_call_and_deferred_result(monkeypatch):
+    tools = _tools()
+    monkeypatch.setattr(tools, "_authenticate_live_command", AsyncMock(return_value={
+        "status": "available", "command": "dcsync"}))
+    monkeypatch.setattr(tools, "_fetch_command_schema", AsyncMock(return_value=SCHEMA))
+    monkeypatch.setattr(tools, "_validate_command_parameters", AsyncMock(return_value=None))
+    model = Model.__new__(Model)
+    model.mode = "supervised"
+    model._native_chat_explicit_hitl = True
+    model.mythic_client = tools
+    model._request_dynamic_proposals = True
+    model._denied_action_keys = ()
+    model._request_contract = build_request_contract(
+        request_id="request-multiple", channel_id="channel-multiple",
+        operation_id="operation-multiple", mode="supervised", autonomous_solve=False)
+    model._turn_authority = authority_from_request_contract(model._request_contract)
+    def install(contract):
+        model._request_contract = contract
+        model._turn_authority = authority_from_request_contract(contract)
+    model.install_request_contract = install
+    middleware = _TurnAuthorityToolMiddleware(model, agent_name="Mythic_Operator")
+    message = AIMessage(content="", tool_calls=[
+        {"name": TOOL, "args": copy.deepcopy(RAW), "id": "call-1"},
+        {"name": TOOL, "args": {**copy.deepcopy(RAW), "callback_display_id": 3}, "id": "call-2"},
+    ])
+    result = asyncio.run(middleware.aafter_model({"messages": [message]}, None))
+    assert len(message.tool_calls) == 1
+    assert message.tool_calls[0]["args"]["parameters"]["User"] == "LAB\\krbtgt"
+    assert [item.tool_call_id for item in result["messages"][1:]] == ["call-2"]
+    assert len(model._request_contract.requested_actions) == 1
+
+
+@pytest.mark.parametrize("case", ["dcsync", "sharphound"])
+def test_native_approval_reaches_registered_task_sink_with_prepared_args(monkeypatch, tmp_path, case):
+    """Checkpointed HITL resume carries prepared args through the real task tool."""
+    monkeypatch.setattr(session, "_CHANNEL_MARKER_DB_PATH", str(tmp_path / "sage.db"))
+    monkeypatch.setattr("socket.socket.connect", lambda *_a, **_k: (_ for _ in ()).throw(
+        AssertionError("offline approval test attempted network access")))
+    monkeypatch.setattr("socket.socket.connect_ex", lambda *_a, **_k: (_ for _ in ()).throw(
+        AssertionError("offline approval test attempted network access")))
+    tools = _tools()
+    issued = []
+    if case == "dcsync":
+        raw, command, schema = copy.deepcopy(RAW), "dcsync", SCHEMA
+    else:
+        command = "execute_assembly"
+        raw = {"command": command, "callback_display_id": 2, "timeout": 60,
+               "parameters": {"assembly_name": "SharpHound.exe",
+                              "assembly_arguments": r"-c All -o C:\Temp"}}
+        schema = [
+            {"name": "assembly_name", "cli_name": "Assembly", "type": "ChooseOne",
+             "parameter_group_name": "Default", "required": True,
+             "default_value": "", "choices": ["SharpHound.exe"]},
+            {"name": "assembly_arguments", "cli_name": "Arguments", "type": "String",
+             "parameter_group_name": "Default", "required": False,
+             "default_value": "", "choices": []},
+            {"name": "assembly_file", "cli_name": "AssemblyFile", "type": "File",
+             "parameter_group_name": "New Assembly", "required": True,
+             "default_value": "", "choices": []},
+        ]
+    monkeypatch.setattr(tools, "_authenticate_live_command", AsyncMock(return_value={
+        "status": "available", "command": command}))
+    monkeypatch.setattr(tools, "_fetch_command_schema", AsyncMock(return_value=schema))
+    if case == "sharphound":
+        monkeypatch.setattr(tools, "_find_uploaded_file_by_name", AsyncMock(return_value={
+            "id": 77, "agent_file_id": "inert-file-77", "filename_utf8": "SharpHound.exe",
+            "md5": "inert-md5", "sha1": "inert-sha1", "complete": True}))
+    monkeypatch.setattr(tools, "_validate_command_parameters", AsyncMock(return_value=None))
+    monkeypatch.setattr(tools, "_callback_tasking_liveness_blocker", AsyncMock(return_value=None))
+    monkeypatch.setattr(tools, "_ensure_registered_file_available", AsyncMock(return_value=None))
+    monkeypatch.setattr(tools, "_engagement_issue_hook", AsyncMock(return_value=None))
+    async def inert_sink(command, parameters, callback_display_id, **kwargs):
+        issued.append((command, parameters, callback_display_id, kwargs))
+        raise RuntimeError("inert task sink reached")
+    monkeypatch.setattr(tools, "_issue_mythic_task", inert_sink)
+    prompt = "Run the specified LAB check on callback 2."
+    fake = driver.ScriptedModel(messages=iter([
+        driver.call("transfer_to_Mythic_Operator", {
+            "handoff_title": "LAB check", "handoff_instruction": prompt}, 1),
+        driver.call(TOOL, raw, 2),
+        AIMessage(content="The task result was handled."),
+        AIMessage(content="The request is complete."),
+    ]))
+
+    async def episode():
+        model = Model(
+            provider="openai", model="offline-model", system_prompt="offline test",
+            config={"configurable": {"api_key": "offline-only",
+                                    "API_ENDPOINT": "http://127.0.0.1:9/v1"}},
+            task_id=0, agent_task_id="offline-prepared", mode="supervised",
+            autonomous_solve=False, operation_id=4, channel_id=9, apitoken_id=0,
+        )
+        model.mythic_client = tools
+        model._payload_names = []
+        model.memory = InMemorySaver()
+        model._get_base_chat_model = lambda *args, **kwargs: fake
+        model._native_chat_explicit_hitl = True
+        model.command_name = "chat"
+        model._rebuild_graph()
+        chat = driver.DriverChat(model)
+        first = build_chat_request(prompt, channel_id=9, operation_id=4,
+                                   request_id=1, config={"mode": "supervised",
+                                                         "autonomous_solve": False})
+        session.bind_channel_thread_id(first, model)
+        try:
+            await chat.chat(first)
+            chat._used = True
+            cards = [item["metadata"]["input_requested"] for item in chat.emissions
+                     if (item.get("metadata") or {}).get("special_type") == "input_requested"]
+            assert len(cards) == 1
+            assert issued == []
+            card_args = cards[0]["data"]["arguments"]
+            if case == "dcsync":
+                assert card_args["parameters"] == {
+                    "Domain": "lab.invalid", "DC": "dc.lab.invalid", "User": "LAB\\krbtgt"}
+            else:
+                assert card_args["parameters"] == {
+                    "Assembly": "SharpHound.exe",
+                    "Arguments": r"-c All --OutputDirectory C:\Temp",
+                }
+                assert card_args["visibility_context"]["_sage_prepared_binding"]["file"]["agent_file_id"] == "inert-file-77"
+            second = build_chat_request("", channel_id=9, operation_id=4,
+                                        request_id=2, config={"mode": "supervised",
+                                                              "autonomous_solve": False})
+            second.InputResponse = driver.input_response("accept", cards[0])
+            await chat.chat(second)
+            assert len(issued) == 1
+            assert issued[0][:3] == (command, card_args["parameters"], 2)
+        finally:
+            await session.drop_channel_session(first)
+
+    asyncio.run(episode())
+
+
+@pytest.mark.parametrize("drift", ["schema", "file"])
+def test_postapproval_binding_drift_denies_real_issue_before_sink(monkeypatch, drift):
+    tools = _tools()
+    if drift == "schema":
+        command, parameters, schema = "dcsync", copy.deepcopy(RAW["parameters"]), copy.deepcopy(SCHEMA)
+    else:
+        command, parameters = "install_package", {"Package": "sample.exe"}
+        schema = [
+            {"name": "Package", "cli_name": "Package", "type": "ChooseOne",
+             "parameter_group_name": "Default", "required": True,
+             "default_value": "", "choices": ["sample.exe"]},
+            {"name": "Binary", "cli_name": "Binary", "type": "File",
+             "parameter_group_name": "Upload", "required": False,
+             "default_value": "", "choices": []},
+        ]
+    live_schema = [copy.deepcopy(schema)]
+    monkeypatch.setattr(tools, "_authenticate_live_command", AsyncMock(return_value={
+        "status": "available", "command": command}))
+    monkeypatch.setattr(tools, "_fetch_command_schema",
+                        AsyncMock(side_effect=lambda *_a, **_k: copy.deepcopy(live_schema[0])))
+    monkeypatch.setattr(tools, "_validate_command_parameters", AsyncMock(return_value=None))
+    monkeypatch.setattr(tools, "_callback_tasking_liveness_blocker", AsyncMock(return_value=None))
+    monkeypatch.setattr(tools, "_engagement_issue_hook", AsyncMock(return_value=None))
+    monkeypatch.setattr(tools, "_ensure_registered_file_available", AsyncMock(return_value=None))
+    identity = {"id": 1, "agent_file_id": "file-1", "filename_utf8": "sample.exe",
+                "md5": "old-md5", "sha1": "old-sha1", "complete": True}
+    live_identity = [identity]
+    monkeypatch.setattr(tools, "_find_uploaded_file_by_name",
+                        AsyncMock(side_effect=lambda _name: copy.deepcopy(live_identity[0])))
+    sink = AsyncMock(side_effect=AssertionError("drifted task reached sink"))
+    monkeypatch.setattr(tools, "_issue_mythic_task", sink)
+
+    async def probe():
+        prepared_args = await tools._prepare_supervised_issue_action({
+            "command": command, "parameters": parameters,
+            "callback_display_id": 2, "timeout": 60})
+        action = {"name": TOOL, "args": prepared_args}
+        _claim(tools, action)
+        if drift == "schema":
+            live_schema[0][0]["parameter_group_name"] = "Alternate"
+        else:
+            live_identity[0] = {**identity, "id": 2, "agent_file_id": "file-2",
+                                "md5": "new-md5", "sha1": "new-sha1"}
+        return await tools.issue_task_and_waitfor_task_output(**prepared_args)
+
+    result = asyncio.run(probe())
+    assert ("schema changed after approval" if drift == "schema"
+            else "registered file identity changed after approval") in result
+    sink.assert_not_awaited()
