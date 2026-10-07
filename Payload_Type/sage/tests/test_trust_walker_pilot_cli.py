@@ -152,7 +152,7 @@ def test_source_identity_tracks_working_bytes_without_index_staging(tmp_path):
     subprocess.run(["git", "-C", str(tmp_path), "add", "source.py"], check=True)
     subprocess.run([
         "git", "-C", str(tmp_path), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
-        "commit", "--quiet", "-m", "initial",
+        "commit", "--no-gpg-sign", "--quiet", "-m", "initial",
     ], check=True)
 
     source.write_text("value = 2\n")
@@ -3615,7 +3615,7 @@ def test_operator_dependency_staging_links_without_changing_canonical_identity(t
         (root / ".gitignore").write_text(ignored, encoding="utf-8")
         (root / "tracked.txt").write_text("same\n", encoding="utf-8")
         subprocess.run(["git", "add", ".gitignore", "tracked.txt"], cwd=root, check=True)
-        subprocess.run(["git", "commit", "-qm", "fixture"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "--no-gpg-sign", "-qm", "fixture"], cwd=root, check=True)
     before = {root: cli._source_identity(root) for root in (baseline, candidate)}
 
     materialized, problems = cli._stage_operator_links(
