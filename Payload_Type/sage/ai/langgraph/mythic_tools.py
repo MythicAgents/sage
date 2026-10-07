@@ -3702,11 +3702,27 @@ class MythicTools:
                                 result = await __method(*args, **kwargs)
                                 task_id = receipt.get("task_id")
                                 if type(task_id) is int and task_id > 0:
+                                    completed = receipt.get("task_completed")
+                                    native_completed = (
+                                        str(completed).lower() if type(completed) is bool else "null"
+                                    )
+                                    native_status = receipt.get("task_status")
+                                    native_status = (
+                                        json.dumps(native_status)
+                                        if type(native_status) is str and native_status else "null"
+                                    )
+                                    observation = receipt.get("observation_status") or (
+                                        "observed" if type(completed) is bool else "unknown"
+                                    )
                                     return (
                                         "[Mythic task issuance identity] "
                                         f"task_display_id={task_id} "
                                         f"callback_display_id={receipt.get('callback_id')} "
-                                        f"requested_command={receipt.get('command')}\n\n{result}"
+                                        f"requested_command={receipt.get('command')}\n"
+                                        "[Mythic task state] "
+                                        f"task_completed={native_completed} "
+                                        f"task_status={native_status} "
+                                        f"observation={observation}\n\n{result}"
                                     )
                                 return result
                             finally:
@@ -5850,6 +5866,8 @@ class MythicTools:
                             mythic=self.client, task_display_id=tdid, timeout=timeout,
                         )
                     except BaseException as exc:
+                        if isinstance(issuance_receipt, dict):
+                            issuance_receipt["observation_status"] = "wait_failed"
                         self._record_contract_task_terminal(
                             command,
                             parameters,
@@ -5862,7 +5880,7 @@ class MythicTools:
                             {
                                 **base_event,
                                 "status": "error",
-                                "terminal_status": "failed",
+                                "terminal_status": "wait_failed",
                                 "result_preview": f"{type(exc).__name__}: {exc}",
                                 "output": f"{type(exc).__name__}: {exc}",
                             }
@@ -5942,6 +5960,9 @@ class MythicTools:
                     results = await asyncio.wait_for(_issue_and_wait(), timeout=timeout + 20)
                 fail_key = self._task_failure_key(command, callback_display_id, parameters)
             except asyncio.TimeoutError:
+                issuance_receipt = _task_issuance_receipt_context.get()
+                if isinstance(issuance_receipt, dict):
+                    issuance_receipt["observation_status"] = "deferred"
                 # Grace expired. This is a normal operating condition with a receipt, not a failure:
                 # the task is queued and fine, and the agent will run it on its next check-in. So it
                 # deliberately does NOT go through classify_result/_apply_task_result_class — counting
@@ -6089,7 +6110,16 @@ class MythicTools:
                 pass  # fail-open: a downgrade must never break the issue path
             return results_str
         except Exception as e:
-            error_result = f"Error issuing command '{command}' to agent {callback_display_id}: {e}"
+            issuance_receipt = _task_issuance_receipt_context.get()
+            issued_task_id = (
+                issuance_receipt.get("task_id") if isinstance(issuance_receipt, dict) else None
+            )
+            error_result = (
+                f"Error observing output for issued task {issued_task_id} "
+                f"('{command}' on callback {callback_display_id}): {e}"
+                if type(issued_task_id) is int and issued_task_id > 0
+                else f"Error issuing command '{command}' to agent {callback_display_id}: {e}"
+            )
             result_class = command_builder.classify_result(command, error_result, str(e))
             decision = self._apply_task_result_class(fail_key, result_class)
             if decision == "stop":
