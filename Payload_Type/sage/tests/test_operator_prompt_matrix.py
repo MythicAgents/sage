@@ -30,6 +30,117 @@ def action(command, parameters="", callback=7):
         "command": command, "parameters": parameters, "callback_display_id": callback}}
 
 
+def retained_fixture():
+    return {"callback_display_id": 2, "task_display_id": 25,
+        "observation_scope": "historical snapshot on 2026-10-06; no live read",
+        "source_sha256": {"history": "a" * 64}, "task_output": [],
+        "callback": {"display_id": 2, "last_checkin": "2026-10-06T17:42:06Z"},
+        "history": [{"id": task, "display_id": task, "callback": {"display_id": 2},
+            "command_name": "inline_assembly" if task == 25 else "whoami",
+            "completed": task != 25, "status": "Fetching File Chunk 1..." if task == 25 else "completed",
+            "timestamp": "2026-10-06T17:42:06Z", "original_params": "fixture [truncated " + "x" * 1200}
+            for task in range(1, 26)]}
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda f: f.update(callback_display_id=7),
+    lambda f: f.update(task_output=[{"response_text": "success"}]),
+    lambda f: f["history"][-1].update(completed=True),
+    lambda f: f["history"][-1].update(status="completed"),
+    lambda f: f["history"][-1]["callback"].update(display_id=8),
+    lambda f: f.update(source_sha256={"history": "invalid"}),
+])
+def test_retained_fixture_rejects_scope_and_state_mismatch(tmp_path, mutate):
+    runner = module()
+    fixture = retained_fixture()
+    mutate(fixture)
+    path = tmp_path / "fixture.json"
+    path.write_text(json.dumps(fixture))
+    with pytest.raises(ValueError):
+        runner.load_retained_fixture(path)
+
+
+def test_retained_episode_uses_registered_history_and_empty_output_without_network(tmp_path, monkeypatch):
+    runner = module()
+    from sage_chat import session
+    from ai.langgraph.model import _ToolResultCompactionMiddleware
+    from langchain_core.messages import ToolMessage
+    from langgraph.prebuilt.tool_node import ToolCallRequest
+    monkeypatch.setattr(session, "_CHANNEL_MARKER_DB_PATH", str(tmp_path / "sage.db"))
+    monkeypatch.setattr(socket.socket, "connect", lambda *_: (_ for _ in ()).throw(AssertionError("network")))
+    fake = runner.CASE.ScriptedModel(messages=iter([
+        runner.CASE.call("transfer_to_Mythic_Operator", {
+            "handoff_title": "state", "handoff_instruction": runner.RETAINED_PROMPT}, 1),
+        runner.CASE.call("get_task_history_for_callback", {"callback_display_id": 2}, 2),
+        runner.CASE.call("get_all_task_output_by_task_id", {"task_id": 25}, 3),
+        AIMessage(content="Historical task25 is pending at file fetch; no output proves GPO changes."),
+        AIMessage(content="Task25 was pending; effect unknown."),
+        AIMessage(content="A historical callback check-in does not prove task effects."),
+    ]))
+    monkeypatch.setattr(runner.model_module, "init_chat_model", lambda *a, **kw: fake)
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(retained_fixture()))
+    fixture = runner.load_retained_fixture(fixture_path)
+    profile = {"provider": "openai", "model": "synthetic-test", "API_ENDPOINT": "https://127.0.0.1:7443/v1", "API_KEY": "offline"}
+    limits = type("Limits", (), {"max_case_calls": 8, "max_calls": 8, "max_case_tokens": 131072,
+        "max_tokens": 131072, "output_tokens": 2048, "request_seconds": 5, "max_wall": 30})()
+    result = asyncio.run(runner.run_case(runner.RETAINED_CASE, runner.RETAINED_PROMPT,
+        None, profile, tmp_path, limits, None, {"127.0.0.1"}, retained_fixture=fixture))
+    assert result["status"] == "observed", result.get("error")
+    assert len(result["turns"]) == 2
+    assert not result["effects"] and not result["initial_cards"]
+    source = result["tool_events"][0]["result"]
+    request = ToolCallRequest(tool_call={"name": "get_task_history_for_callback", "args": {}, "id": "fixture"},
+                              tool=None, state={}, runtime=None)
+    compacted = _ToolResultCompactionMiddleware(model=object()).wrap_tool_call(request,
+        lambda _: ToolMessage(content=source, tool_call_id="fixture", name="get_task_history_for_callback"))
+    assert len(compacted.content) <= 16000
+    task = json.loads(compacted.content)["tasks"][-1]
+    assert task["display_id"] == 25 and task["completed"] is False
+    assert task["status"] == "Fetching File Chunk 1..."
+    assert task["request_provenance"]["observation_scope"] == fixture["observation_scope"]
+    output = json.loads(result["tool_events"][1]["result"])
+    assert output["task_output"] == []
+    assert output["provenance"]["origin"] == "historical_or_external"
+
+
+def test_reporting_followup_requires_substantive_terminal_without_cards_or_effects():
+    runner = module()
+    turn = {"emissions": [{"complete_request": True, "kind": "message", "content": "Pending; unknown effect."}], "error": None}
+    assert runner.reporting_followup_ready([turn], [], [])
+    assert not runner.reporting_followup_ready([turn], [{}], [])
+    assert not runner.reporting_followup_ready([turn], [], [{"task_id": 25}])
+    assert not runner.reporting_followup_ready([{"emissions": [], "error": None}], [], [])
+
+
+@pytest.mark.parametrize("name,args", [
+    ("read_credentials", {}),
+    ("get_task_history_for_callback", {"callback_display_id": 7}),
+    ("get_all_task_output_by_task_id", {"task_id": 24}),
+])
+def test_retained_episode_stops_on_out_of_fixture_reads(tmp_path, monkeypatch, name, args):
+    runner = module()
+    from sage_chat import session
+    monkeypatch.setattr(session, "_CHANNEL_MARKER_DB_PATH", str(tmp_path / "sage.db"))
+    monkeypatch.setattr(socket.socket, "connect", lambda *_: (_ for _ in ()).throw(AssertionError("network")))
+    fake = runner.CASE.ScriptedModel(messages=iter([
+        runner.CASE.call("transfer_to_Mythic_Operator", {
+            "handoff_title": "state", "handoff_instruction": runner.RETAINED_PROMPT}, 1),
+        runner.CASE.call(name, args, 2),
+        AIMessage(content="This must not be consumed."),
+    ]))
+    monkeypatch.setattr(runner.model_module, "init_chat_model", lambda *a, **kw: fake)
+    profile = {"provider": "openai", "model": "synthetic-test", "API_ENDPOINT": "https://127.0.0.1:7443/v1", "API_KEY": "offline"}
+    limits = type("Limits", (), {"max_case_calls": 8, "max_calls": 8, "max_case_tokens": 131072,
+        "max_tokens": 131072, "output_tokens": 2048, "request_seconds": 5, "max_wall": 30})()
+    result = asyncio.run(runner.run_case(runner.RETAINED_CASE, runner.RETAINED_PROMPT,
+        None, profile, tmp_path, limits, None, {"127.0.0.1"}, retained_fixture=retained_fixture()))
+    assert result["status"] == "harness_gap"
+    assert result["harness_fault"] == "out_of_fixture_tool"
+    assert result["effects"] == [] and result["turns"] == []
+    assert len(result["tool_events"]) == 1
+
+
 def test_scope_accepts_only_bounded_local_actions():
     runner = module()
     assert runner.card_scope("04_whoami_accept", card([action("whoami")]))[0]

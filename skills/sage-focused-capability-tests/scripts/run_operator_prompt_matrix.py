@@ -65,7 +65,13 @@ SUPPLEMENTAL_PROMPTS = (
     ("09_direct_evidence", "Read the output of task 811 and report what it establishes about LAB-WS01 domain membership and domain trusts. Do not execute anything.", None),
     ("09_stored_enumeration", "Review callback 7 metadata and existing tasks 701, 702, and 703. What did you learn? Cite the task IDs and distinguish observations from guesses. Do not execute anything.", None),
 )
+RETAINED_CASE = "retained_task_state"
+RETAINED_PROMPT = ("Using the retained snapshot, report task 25's native state and whether its output "
+                   "demonstrates assembly execution or any GPO change. Do not submit new tasks.")
+RETAINED_FOLLOWUP = ("Does the callback's recent check-in in that snapshot change what we can conclude "
+                     "about task 25? Summarize confirmed facts and unknowns without doing more work.")
 FOLLOWUPS = {
+    RETAINED_CASE: (("retained_callback_followup", RETAINED_FOLLOWUP),),
     "04_whoami_reject": (("07_after_reject", "I rejected that action. Summarize what happened and wait for my next instruction."),),
     "05_enumerate_accept": (
         ("09_after_enumeration", "What did you learn from those results? Cite the task IDs and distinguish observations from guesses."),
@@ -94,6 +100,46 @@ OUTPUTS = {
 
 class FixtureGap(BaseException):
     """Abort this synthetic case before another paid model request."""
+
+
+def load_retained_fixture(path: Path) -> dict:
+    """Validate a frozen, historical reporting fixture; never contact Mythic."""
+    fixture = json.loads(path.read_text(encoding="utf-8"))
+    if (fixture.get("callback_display_id") != 2 or fixture.get("task_display_id") != 25
+            or not isinstance(fixture.get("observation_scope"), str)
+            or not fixture["observation_scope"].strip()
+            or not isinstance(fixture.get("source_sha256"), dict)
+            or not fixture["source_sha256"]
+            or any(not isinstance(value, str) or len(value) != 64
+                   or any(ch not in "0123456789abcdef" for ch in value)
+                   for value in fixture["source_sha256"].values())
+            or fixture.get("task_output") != []):
+        raise ValueError("invalid retained fixture scope/provenance/output")
+    history = fixture.get("history")
+    if not isinstance(history, list) or len(history) != 25:
+        raise ValueError("retained fixture requires the complete 25-task history")
+    if {row.get("display_id") for row in history if isinstance(row, dict)} != set(range(1, 26)):
+        raise ValueError("retained fixture task identities mismatch")
+    for row in history:
+        if (not isinstance(row.get("callback"), dict) or row["callback"].get("display_id") != 2
+                or type(row.get("completed")) is not bool or not isinstance(row.get("status"), str)):
+            raise ValueError("retained history identity/state mismatch")
+    task = next(row for row in history if row["display_id"] == 25)
+    callback = fixture.get("callback")
+    if (task["completed"] is not False or task["status"] != "Fetching File Chunk 1..."
+            or task.get("command_name") != "inline_assembly"
+            or not isinstance(callback, dict) or callback.get("display_id") != 2
+            or not isinstance(callback.get("last_checkin"), str)):
+        raise ValueError("retained task/callback state mismatch")
+    fixture["fixture_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return fixture
+
+
+def reporting_followup_ready(turns, cards, effects) -> bool:
+    return bool(turns and not cards and not effects and not turns[-1].get("error")
+                and REAL.substantive_text(turns[-1]["emissions"])
+                and not any(row.get("kind") in {"error", "input_requested"}
+                            for row in turns[-1]["emissions"]))
 
 
 def atomic_json(path: Path, value: dict):
@@ -173,6 +219,17 @@ class MatrixTransport(REAL.BoundedTransport):
 
     async def handle_async_request(self, request):
         try:
+            if getattr(self, "conservative_input_headroom", False):
+                observed = sum(part.get("total_tokens", 0)
+                    for call in self.usage_recorder.calls if call.get("status") == "completed"
+                    for part in call.get("usage", []))
+                # Serialized UTF-8 bytes bound the ordinary text input conservatively;
+                # reserve the full configured output before sending, not after usage arrives.
+                maximum = len(request.content) + self.output_tokens
+                if observed + maximum > self.max_observed_tokens:
+                    self.rejections.append({"reason": "conservative_token_headroom",
+                        "observed_tokens": observed, "request_byte_bound": maximum})
+                    raise REAL.CaseError("conservative_token_headroom")
             return await super().handle_async_request(request)
         finally:
             self.persist()
@@ -215,7 +272,7 @@ def observed(path: Path) -> bool:
 
 
 async def run_case(case_id, prompt, decision, profile, output_dir, limits, tls_context, ips,
-                   *, report_source_metadata=False):
+                   *, report_source_metadata=False, retained_fixture=None):
     path = output_dir / f"case_{case_id}.json"
     ledger = {"case_id": case_id, "prompt": prompt, "decision": decision,
               "status": "started", "synthetic_fixture": (
@@ -232,6 +289,10 @@ async def run_case(case_id, prompt, decision, profile, output_dir, limits, tls_c
     def persist():
         atomic_json(path, ledger)
     persist()
+    if retained_fixture is not None:
+        ledger["synthetic_fixture"] = "retained-task-state-v1"
+        ledger["retained_fixture"] = copy.deepcopy(retained_fixture)
+        persist()
     usage = MatrixUsage(persist)
     calls_used, tokens_used, _ = totals(output_dir)
     # This case's empty record is already included; the remaining limits apply globally.
@@ -242,10 +303,30 @@ async def run_case(case_id, prompt, decision, profile, output_dir, limits, tls_c
         request_seconds=limits.request_seconds,
         utc_deadline=datetime.now(timezone.utc) + timedelta(seconds=limits.max_wall),
         persist=persist)
+    transport.conservative_input_headroom = retained_fixture is not None
     ledger["provider_requests"] = transport.requests
     ledger["model_calls"] = usage.calls
     ledger["transport_rejections"] = transport.rejections
     sink = MythicTools(agent_task_id="operator-matrix", operation_id=1, channel_id=1)
+    retained_patches = contextlib.ExitStack()
+    if retained_fixture is not None:
+        from ai.langgraph import mythic_tools as tools_module
+        sink.client = object()
+        async def retained_history(**kwargs):
+            if kwargs.get("callback_display_id") != 2:
+                raise FixtureGap("out-of-fixture callback history")
+            return copy.deepcopy(retained_fixture["history"])
+        async def retained_output(**kwargs):
+            if kwargs.get("task_display_id") != 25:
+                raise FixtureGap("out-of-fixture task output")
+            return copy.deepcopy(retained_fixture["task_output"])
+        async def retained_completed(_task_id):
+            if _task_id != 25:
+                raise FixtureGap("out-of-fixture task completion")
+            return False
+        retained_patches.enter_context(patch.object(tools_module.mythic, "get_all_tasks", retained_history))
+        retained_patches.enter_context(patch.object(tools_module.mythic, "get_all_task_output_by_id", retained_output))
+        sink._is_task_completed = retained_completed
     if report_source_metadata:
         # Inert authenticated-client handle for the report fixture's mocked
         # canonical marker read. No Mythic transport or RPC is constructed.
@@ -279,6 +360,31 @@ async def run_case(case_id, prompt, decision, profile, output_dir, limits, tls_c
         event = {"tool": name, "arguments": args}
         ledger["tool_events"].append(event)
         try:
+            if retained_fixture is not None:
+                if name == "get_task_history_for_callback" and args.get("callback_display_id") == 2:
+                    result = await registered_retained_tools[name].ainvoke(args)
+                    payload = json.loads(result)
+                    for row in payload:
+                        row["request_provenance"]["observation_scope"] = retained_fixture["observation_scope"]
+                    result = json.dumps(payload, sort_keys=True)
+                elif name == "get_all_task_output_by_task_id" and args.get("task_id") == 25:
+                    result = await registered_retained_tools[name].ainvoke(args)
+                    payload = json.loads(result)
+                    payload["observation_scope"] = retained_fixture["observation_scope"]
+                    result = json.dumps(payload, sort_keys=True)
+                elif name in {"list_callbacks", "get_all_active_callbacks"}:
+                    result = json.dumps({"observation_scope": retained_fixture["observation_scope"],
+                                         "callback": [retained_fixture["callback"]]}, sort_keys=True)
+                elif name == "check_callback_alive" and args.get("callback_display_id") == 2:
+                    result = json.dumps({"observation_scope": retained_fixture["observation_scope"],
+                                         "callback_display_id": 2,
+                                         "last_checkin": retained_fixture["callback"]["last_checkin"],
+                                         "scope": "historical callback metadata; no current liveness assessment"})
+                else:
+                    ledger["harness_fault"] = "out_of_fixture_tool"
+                    raise FixtureGap("out-of-fixture activity: " + name)
+                event["result"] = result
+                return result
             if name == "list_callbacks":
                 result = json.dumps(CALLBACKS)
             elif name == "get_all_active_callbacks":
@@ -430,6 +536,10 @@ async def run_case(case_id, prompt, decision, profile, output_dir, limits, tls_c
         finally:
             persist()
 
+    registered_retained_tools = {
+        tool.name: tool for tool in MythicTools.get_tools(sink, [
+            "get_task_history_for_callback", "get_all_task_output_by_task_id"])
+    } if retained_fixture is not None else {}
     def fixture_tools(names):
         tools = []
         for original in MythicTools.get_tools(sink, names):
@@ -444,7 +554,8 @@ async def run_case(case_id, prompt, decision, profile, output_dir, limits, tls_c
     direct_list_callbacks.__doc__ = MythicTools.list_callbacks.__doc__
     sink.list_callbacks = direct_list_callbacks
     async def fixture_payload_type(callback_display_id):
-        return "apollo" if type(callback_display_id) is int and callback_display_id in (7, 8) else None
+        ids = (2,) if retained_fixture is not None else (7, 8)
+        return "apollo" if type(callback_display_id) is int and callback_display_id in ids else None
     sink._resolve_payload_type = fixture_payload_type
     async_client = httpx.AsyncClient(transport=transport, timeout=limits.request_seconds, trust_env=False)
     sync_transport = REAL.BoundedSyncTransport()
@@ -549,7 +660,9 @@ async def run_case(case_id, prompt, decision, profile, output_dir, limits, tls_c
                         case_id == "08_ambiguous" and completed and not ledger["initial_cards"]
                         and not ledger["effects"]) or (
                         case_id == "09_stored_enumeration" and completed and
-                        not ledger["initial_cards"] and not ledger["effects"])
+                        not ledger["initial_cards"] and not ledger["effects"]) or (
+                        case_id == RETAINED_CASE and reporting_followup_ready(
+                            ledger["turns"], ledger["initial_cards"], ledger["effects"]))
                     follow_path = output_dir / f"case_{follow_id}.json"
                     if not prerequisite:
                         atomic_json(follow_path, {"is_followup": True, "case_id": follow_id,
@@ -576,6 +689,7 @@ async def run_case(case_id, prompt, decision, profile, output_dir, limits, tls_c
             await drop_channel_session(first)
         await async_client.aclose()
         sync_client.close()
+        retained_patches.close()
         persist()
     return ledger
 
@@ -603,15 +717,18 @@ def main(argv=None):
     parser.add_argument("--max-case-tokens", type=int, default=50000)
     parser.add_argument("--output-tokens", type=int, default=2048)
     parser.add_argument("--request-seconds", type=int, default=30)
+    parser.add_argument("--retained-task-state-fixture", type=Path)
     args = parser.parse_args(argv)
     try:
-        all_prompts = PROMPTS + SUPPLEMENTAL_PROMPTS
+        retained_fixture = (load_retained_fixture(args.retained_task_state_fixture)
+                            if args.retained_task_state_fixture else None)
+        all_prompts = ((RETAINED_CASE, RETAINED_PROMPT, None),) if retained_fixture else PROMPTS + SUPPLEMENTAL_PROMPTS
         parent_ids = [case_id for case_id, _, _ in all_prompts]
         requested = [part.strip() for group in (args.cases or []) for value in group
                      for part in value.split(",")]
         if any(not item or item not in parent_ids for item in requested):
             raise ValueError("unknown or non-parent case ID")
-        selected_cases = [case_id for case_id, _, _ in (all_prompts if requested else PROMPTS)
+        selected_cases = [case_id for case_id, _, _ in (all_prompts if requested or retained_fixture else PROMPTS)
                           if not requested or case_id in requested]
         profile = REAL.load_profile(args.config)
         if any(getattr(args, key) <= 0 for key in ("max_calls", "max_tokens", "max_wall",
@@ -639,7 +756,9 @@ def main(argv=None):
         print(json.dumps({"status": "dry_run_ready", "model": profile["model"],
             "endpoint_sha256": hashlib.sha256(profile["API_ENDPOINT"].encode()).hexdigest(),
             "pending": pending, "used_calls": calls, "used_tokens": tokens,
-            "fixture": "operator-matrix-v1", "callback_ids": [7, 8],
+            "fixture": "retained-task-state-v1" if retained_fixture else "operator-matrix-v1",
+            "callback_ids": [2] if retained_fixture else [7, 8],
+            "retained_fixture_sha256": retained_fixture["fixture_sha256"] if retained_fixture else None,
             "selected_cases": selected_cases}))
         return 0
     started = time.monotonic()
@@ -648,6 +767,9 @@ def main(argv=None):
              "endpoint_sha256": hashlib.sha256(profile["API_ENDPOINT"].encode()).hexdigest()}
     if budget_path.exists():
         budget = json.loads(budget_path.read_text(encoding="utf-8"))
+        if retained_fixture is not None:
+            print(json.dumps({"status": "configuration_error", "reason": "retained episode cannot be retried"}))
+            return 2
         if (budget.get("route") != route or budget.get("fixture") != "operator-matrix-v1" or
                 budget.get("selected_cases", [case_id for case_id, _, _ in PROMPTS]) != selected_cases):
             print(json.dumps({"status": "configuration_error", "reason": "resume identity mismatch"}))
@@ -665,6 +787,10 @@ def main(argv=None):
                   "selected_cases": selected_cases,
                   "started_epoch": time.time(), "max_calls": args.max_calls,
                   "max_tokens": args.max_tokens, "max_wall": args.max_wall}
+        if retained_fixture is not None:
+            budget.update(fixture="retained-task-state-v1",
+                          retained_fixture_sha256=retained_fixture["fixture_sha256"],
+                          episode_retries=0)
         atomic_json(budget_path, budget)
     global_deadline = budget["started_epoch"] + args.max_wall
     ips = REAL.resolved_endpoint_ips(profile["API_ENDPOINT"])
@@ -694,7 +820,8 @@ def main(argv=None):
                         with (contextlib.redirect_stdout(discard), contextlib.redirect_stderr(discard),
                               patch.object(session, "_CHANNEL_MARKER_DB_PATH", str(Path(scratch) / "sage.db"))):
                             result = asyncio.run(asyncio.wait_for(run_case(case_id, prompt, decision, profile,
-                                args.output_dir, args, tls_context, ips), timeout=remaining))
+                                args.output_dir, args, tls_context, ips,
+                                retained_fixture=retained_fixture), timeout=remaining))
                     finally:
                         os.chdir(previous)
                 if (result["status"] == "error" and
