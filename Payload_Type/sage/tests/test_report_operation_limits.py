@@ -53,6 +53,7 @@ def test_storage_capacity_is_disclosed_and_no_partial_extra_source(tmp_path, mon
                                             omitted_sources=omitted, capacity_reached=capacity)
             assert "capacity" in output.lower()
             assert "operator4" not in output
+            assert "| LAB&#92;operator1 |" not in output.split("### Bounded task output excerpts")[0]
         finally:
             await store.close()
     asyncio.run(run())

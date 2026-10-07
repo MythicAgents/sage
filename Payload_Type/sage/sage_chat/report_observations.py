@@ -204,5 +204,11 @@ async def retained_observations(store: OperationMemoryStore, operation_id: int,
         if len(revisions) != 1:
             record["source_metadata_conflict"] = True
             record["revision_ambiguity"] = True
+        if capacity_reached:
+            # Once writes are refused, a later contradicting revision may be
+            # absent from this store. Keep excerpts visible but do not promote
+            # any retained row as a supported current-scope fact.
+            record["source_metadata_conflict"] = True
+            record["retention_capacity_exhausted"] = True
         result.append(record)
     return result, omitted, capacity_reached

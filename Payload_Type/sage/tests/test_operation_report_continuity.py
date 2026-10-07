@@ -57,6 +57,167 @@ def _paired(request_id="chat:4:request:1"):
     return call, tool
 
 
+def _report_reads(values, *, request_id="chat:4:request:1", task_ids=None):
+    messages = []
+    for index, value in enumerate(values):
+        call, tool = _paired(request_id)
+        task_id = task_ids[index] if task_ids is not None else 701
+        call_id = f"read-{index}"
+        call.tool_calls[0]["id"] = call_id
+        call.tool_calls[0]["args"]["task_id"] = task_id
+        tool.tool_call_id = call_id
+        payload = json.loads(tool.content)
+        payload["provenance"]["task_id"] = task_id
+        payload["task_output"][0]["id"] = 1701 + index
+        payload["task_output"][0]["response_text"] = value
+        payload["task_output"][0]["task"]["display_id"] = task_id
+        payload["task_output"][0]["task"]["id"] = 901 + task_id
+        tool.content = json.dumps(payload)
+        messages.extend((call, tool))
+    return messages
+
+
+@pytest.mark.parametrize("values", [
+    ["LAB\\analyst", "LAB\\other"],
+    ["LAB\\analyst"] * 8 + ["LAB\\other"],
+    ["LAB\\analyst", "LAB\\other", "LAB\\analyst"],
+])
+def test_native_report_later_conflicting_read_suppresses_fact(tmp_path, values):
+    from ai.langgraph.assisted_reporting import render_identity_report
+
+    async def run():
+        model = Model.__new__(Model)
+        model.channel_id = 4
+        model.operation_id = 7
+        model.mode = "conversation"
+        records = model.native_report_collection(
+            {"mythic_operator_messages": _report_reads(values)}, "chat:4:request:1")
+        assert records and any(record.get("source_metadata_conflict") for record in records)
+        store = OperationMemoryStore(tmp_path / "sage.db")
+        await admit_observations(store, 7, UUID_A, channel_id=4,
+            request_id="chat:4:request:1", checkpoint_thread="4:generation:a",
+            records=records)
+        retained, _, _ = await retained_observations(store, 7, UUID_A)
+        report = render_identity_report(retained)
+        assert "LAB&#92;analyst" not in report
+        assert "LAB&#92;other" not in report
+        await store.close()
+    asyncio.run(run())
+
+
+def test_native_report_identical_rereads_stay_nonambiguous():
+    model = Model.__new__(Model)
+    model.channel_id = 4
+    model.operation_id = 7
+    model.mode = "conversation"
+    records = model.native_report_collection(
+        {"mythic_operator_messages": _report_reads(["LAB\\analyst"] * 9)},
+        "chat:4:request:1")
+    assert len(records) == 1
+    assert not records[0].get("source_metadata_conflict")
+
+
+def test_native_report_eight_task_cap_preserves_late_conflict():
+    model = Model.__new__(Model)
+    model.channel_id = 4
+    model.operation_id = 7
+    model.mode = "conversation"
+    records = model.native_report_collection({"mythic_operator_messages": _report_reads(
+        ["LAB\\analyst"] * 9 + ["LAB\\other"],
+        task_ids=list(range(701, 710)) + [701],
+    )}, "chat:4:request:1")
+    assert len(records) == 8
+    assert {row["task_id"] for row in records} == set(range(701, 709))
+    assert next(row for row in records if row["task_id"] == 701)["source_metadata_conflict"]
+
+
+def test_native_report_later_foreign_and_unbound_reads_do_not_challenge_source():
+    model = Model.__new__(Model)
+    model.channel_id = 4
+    model.operation_id = 7
+    model.mode = "conversation"
+    messages = _report_reads(["LAB\\analyst", "LAB\\other", "LAB\\other"])
+    foreign = json.loads(messages[3].content)
+    foreign["task_output"][0]["task"]["operation_id"] = 8
+    messages[3].content = json.dumps(foreign)
+    messages[5].additional_kwargs.clear()
+    records = model.native_report_collection(
+        {"mythic_operator_messages": messages}, "chat:4:request:1")
+    assert len(records) == 1
+    assert records[0]["response_text_excerpts"] == ["LAB\\analyst"]
+    assert not records[0].get("source_metadata_conflict")
+
+
+def test_native_report_conflict_challenges_prior_request_fact(tmp_path):
+    from ai.langgraph.assisted_reporting import render_identity_report
+
+    async def run():
+        model = Model.__new__(Model)
+        model.channel_id = 4
+        model.operation_id = 7
+        model.mode = "conversation"
+        store = OperationMemoryStore(tmp_path / "sage.db")
+        first = model.native_report_collection({"mythic_operator_messages":
+            _report_reads(["LAB\\analyst"])}, "chat:4:request:1")
+        await admit_observations(store, 7, UUID_A, channel_id=4,
+            request_id="chat:4:request:1", checkpoint_thread="4:generation:a",
+            records=first)
+        later = model.native_report_collection({"mythic_operator_messages":
+            _report_reads(["LAB\\analyst", "LAB\\other"],
+                          request_id="chat:4:request:2")}, "chat:4:request:2")
+        assert later[0]["source_metadata_conflict"]
+        await admit_observations(store, 7, UUID_A, channel_id=4,
+            request_id="chat:4:request:2", checkpoint_thread="4:generation:a",
+            records=later)
+        retained, _, _ = await retained_observations(store, 7, UUID_A)
+        assert retained[0]["revision_ambiguity"]
+        assert "LAB&#92;analyst" not in render_identity_report(retained)
+        await store.close()
+    asyncio.run(run())
+
+
+def test_native_report_late_conflict_after_shared_excerpt_budget(tmp_path):
+    from ai.langgraph.assisted_reporting import render_identity_report
+
+    async def run():
+        model = Model.__new__(Model)
+        model.channel_id = 4
+        model.operation_id = 7
+        model.mode = "conversation"
+        messages = _report_reads(
+            ["LAB\\analyst"] + ["X" * 4096] * 3 + ["LAB\\other"],
+            task_ids=[701, 702, 703, 704, 701])
+        records = model.native_report_collection(
+            {"mythic_operator_messages": messages}, "chat:4:request:1")
+        assert sum(len(text) for row in records
+                   for text in row["response_text_excerpts"]) == 12000
+        assert next(row for row in records if row["task_id"] == 701)["source_metadata_conflict"]
+        store = OperationMemoryStore(tmp_path / "sage.db")
+        await admit_observations(store, 7, UUID_A, channel_id=4,
+            request_id="chat:4:request:1", checkpoint_thread="4:generation:a",
+            records=records)
+        retained, _, _ = await retained_observations(store, 7, UUID_A)
+        assert "LAB&#92;analyst" not in render_identity_report(retained).split(
+            "### Bounded task output excerpts")[0]
+        await store.close()
+    asyncio.run(run())
+
+
+def test_native_report_late_conflict_across_worker_channels():
+    model = Model.__new__(Model)
+    model.channel_id = 4
+    model.operation_id = 7
+    model.mode = "conversation"
+    first = _report_reads(["LAB\\analyst"])
+    later = _report_reads(["LAB\\other"])
+    records = model.native_report_collection({
+        "mythic_operator_messages": first,
+        "generalist_messages": later,
+    }, "chat:4:request:1")
+    assert len(records) == 1
+    assert records[0]["source_metadata_conflict"]
+
+
 def test_report_store_dedup_revisions_withdrawal_and_scope(tmp_path):
     async def run():
         store = OperationMemoryStore(tmp_path / "sage.db")

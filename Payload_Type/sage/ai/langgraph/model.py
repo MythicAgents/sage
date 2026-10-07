@@ -3302,7 +3302,7 @@ def _terminal_worker_answer(messages: list[AnyMessage]) -> tuple[AIMessage, str]
 
 
 def _matched_worker_task_outputs(
-    messages: list[AnyMessage], *, request_id: str,
+    messages: list[AnyMessage], *, request_id: str, deduplicate_task_ids: bool = True,
 ) -> list[tuple[int, str, Any]]:
     """Match output reads to their call and current-request provenance."""
     if not request_id:
@@ -3343,7 +3343,8 @@ def _matched_worker_task_outputs(
         call = calls.get(message.tool_call_id)
         args = call.get("args") if call else None
         task_id = args.get("task_id") if isinstance(args, dict) else None
-        if type(task_id) is not int or task_id < 0 or task_id in seen:
+        if (type(task_id) is not int or task_id < 0
+                or (deduplicate_task_ids and task_id in seen)):
             continue
         content = message.content
         if not isinstance(content, str) or len(content) > 1_000_000:
@@ -3381,6 +3382,7 @@ def _worker_task_output_evidence(
     messages: list[AnyMessage], *, request_id: str, limit: int = 8,
     max_output_chars: int | None = None, max_total_chars: int | None = None,
     supervised: bool = False, retain_source_identity: bool = False,
+    matched_outputs: list[tuple[int, str, Any]] | None = None,
 ) -> list[dict]:
     """Copy bounded observed response text; never infer an exhaustive task result."""
     if max_output_chars is None:
@@ -3391,7 +3393,9 @@ def _worker_task_output_evidence(
         return []
     records: list[dict] = []
     remaining = max_total_chars
-    for task_id, origin, output in _matched_worker_task_outputs(messages, request_id=request_id)[:limit]:
+    paired = (matched_outputs if matched_outputs is not None else
+              _matched_worker_task_outputs(messages, request_id=request_id))
+    for task_id, origin, output in paired[:limit]:
         if remaining <= 0:
             break
         if not isinstance(output, list):
@@ -7538,7 +7542,9 @@ class Model:
         if not isinstance(request_id, str) or not request_id.startswith(
                 f"chat:{self.channel_id}:request:"):
             return []
-        records: dict[str, dict] = {}
+        records: dict[int, dict] = {}
+        signatures: dict[int, str] = {}
+        remaining_chars = 32000 if self.mode == "supervised" else 12000
         for key in ("supervisor_messages", "mythic_operator_messages", "generalist_messages",
                     "mythic_payload_messages", "bloodhound_messages", "mcp_manager_messages",
                     "sandbox_messages"):
@@ -7548,19 +7554,41 @@ class Model:
             bound = [message for message in messages
                 if not isinstance(message, ToolMessage)
                 or message.additional_kwargs.get("_task_output_collection_request_id") == request_id]
-            for record in _worker_task_output_evidence(
-                    bound, request_id=request_id, supervised=self.mode == "supervised",
-                    retain_source_identity=True):
+            paired = _matched_worker_task_outputs(
+                bound, request_id=request_id, deduplicate_task_ids=False)
+            for task_id, origin, output in paired:
+                if task_id not in records and (len(records) >= 8 or remaining_chars <= 0):
+                    continue
+                # Revisited tasks get an independent bounded read so a late
+                # contradiction still challenges the first retained source after
+                # the eight-task or shared excerpt budget has been consumed.
+                budget = (32000 if self.mode == "supervised" else 12000) if task_id in records else remaining_chars
+                evidence = _worker_task_output_evidence(
+                    [], request_id=request_id, limit=1, max_total_chars=budget,
+                    supervised=self.mode == "supervised", retain_source_identity=True,
+                    matched_outputs=[(task_id, origin, output)])
+                if not evidence:
+                    continue
+                record = evidence[0]
                 if (type(record.get("task_operation_id")) is not int
                         or record["task_operation_id"] != self.operation_id
                         or type(record.get("task_internal_id")) is not int
                         or record.get("source_identity_complete") is not True):
                     continue
-                # A bound source with conflicting callback/command metadata is still
-                # a retained revision, not a supported fact. Dropping it would leave
-                # an older favorable revision unchallenged in operation memory.
-                records[json.dumps(record, sort_keys=True, ensure_ascii=False)] = record
-        return list(records.values())[:8]
+                signature = json.dumps({key: record.get(key) for key in (
+                    "response_text_excerpts", "partial_snapshot", "truncated",
+                    "scoped_content_omitted", "callback_display_id", "stored_command_name",
+                    "task_timestamp", "task_internal_id", "task_operation_id",
+                    "agent_task_id", "source_metadata_conflict",
+                )}, sort_keys=True, ensure_ascii=False)
+                if task_id in records:
+                    if signature != signatures[task_id]:
+                        records[task_id]["source_metadata_conflict"] = True
+                    continue
+                records[task_id] = record
+                signatures[task_id] = signature
+                remaining_chars -= sum(len(value) for value in record["response_text_excerpts"])
+        return list(records.values())
 
     async def identity_report(self) -> str:
         """Render an explicitly requested report without model calls or live reads.
