@@ -5254,6 +5254,8 @@ class MythicTools:
             "callback_display_id": int(callback_display_id),
             "task_display_id": task_display_id,
             "waited_seconds": int(waited_seconds),
+            "request_id": self._current_request_id(),
+            "observation_status": "deferred",
         }
         if task_display_id is None:
             # The grace expired before the issue itself completed, so there is no id this call can
@@ -5261,14 +5263,13 @@ class MythicTools:
             return (
                 f"DEFERRED: '{command}' on callback {callback_display_id} did not confirm a task id "
                 f"within {waited_seconds}s, so it is unknown whether Mythic accepted the task. This "
-                f"is not a failure of the command. Check with get_task_history_for_callback before "
+                f"leaves the command outcome unknown. Check with get_task_history_for_callback before "
                 f"considering a re-issue, and do not re-issue blindly."
             )
         return (
-            f"DEFERRED: task {task_display_id} ('{command}') is issued and queued on callback "
-            f"{callback_display_id}, and did not return output within the {waited_seconds}s grace "
-            f"period. This is expected for an agent that sleeps longer than the grace period; it is "
-            f"NOT an error and the task has NOT failed. The agent will run it on its next check-in. "
+            f"DEFERRED: Mythic accepted task {task_display_id} ('{command}') on callback "
+            f"{callback_display_id}, but output was not observed within the {waited_seconds}s grace "
+            f"period. Its current execution state and outcome are unconfirmed. "
             f"Read the result later with get_task_output for task {task_display_id}, or "
             f"get_task_history_for_callback for callback {callback_display_id}. Do NOT re-issue it."
         )
@@ -6006,6 +6007,16 @@ class MythicTools:
                     except BaseException as exc:
                         if isinstance(issuance_receipt, dict):
                             issuance_receipt["observation_status"] = "wait_failed"
+                        contract = getattr(self, "_request_contract", None)
+                        if (not isinstance(exc, asyncio.CancelledError)
+                                and getattr(contract, "lane", None) == "supervised_workflow"):
+                            self._deferred_task_receipt = {
+                                "command": command,
+                                "callback_display_id": int(callback_display_id),
+                                "task_display_id": tdid,
+                                "request_id": execution_request_id,
+                                "observation_status": "wait_failed",
+                            }
                         self._record_contract_task_terminal(
                             command,
                             parameters,
@@ -6050,6 +6061,25 @@ class MythicTools:
                     task_proved = _mythic_task_terminal_success(
                         task_state.get("task_completed"), task_state.get("task_status"),
                     )
+                    contract = getattr(self, "_request_contract", None)
+                    if (completion_evidence_required
+                            and getattr(contract, "lane", None) == "supervised_workflow"
+                            and task_state.get("task_completed") is not True):
+                        self._deferred_task_receipt = {
+                            "command": command,
+                            "callback_display_id": int(callback_display_id),
+                            "task_display_id": tdid,
+                            "request_id": execution_request_id,
+                            "observation_status": (
+                                "pending" if task_state.get("task_completed") is False else "unknown"
+                            ),
+                            "task_status": (
+                                str(task_state.get("task_status"))[:80]
+                                if task_state.get("task_completed") is False
+                                and isinstance(task_state.get("task_status"), str)
+                                else ""
+                            ),
+                        }
                     if completion_evidence_required and not task_proved:
                         self._last_issued_task_terminal_status = (
                             str(task_state.get("task_status") or "unknown")[:80]
@@ -6101,11 +6131,10 @@ class MythicTools:
                 issuance_receipt = _task_issuance_receipt_context.get()
                 if isinstance(issuance_receipt, dict):
                     issuance_receipt["observation_status"] = "deferred"
-                # Grace expired. This is a normal operating condition with a receipt, not a failure:
-                # the task is queued and fine, and the agent will run it on its next check-in. So it
-                # deliberately does NOT go through classify_result/_apply_task_result_class — counting
-                # a healthy queued task as a failure would walk the circuit breaker toward STOP and
-                # teach the model that the command is broken.
+                # Grace expired without an observed outcome. Preserve the exact issuance receipt,
+                # but do not classify the task itself as failed or claim it is still queued.
+                # classify_result/_apply_task_result_class would turn an observation limit into
+                # a command failure and advance the circuit breaker without task evidence.
                 issued_task_id = getattr(self, "_last_issued_task_display_id", None)
                 if issued_task_id == task_id_before_wait:
                     issued_task_id = None

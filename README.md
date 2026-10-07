@@ -347,6 +347,10 @@ the displayed scope before accepting. Read-only tools (`list_*`, `get_*`, downlo
 For direct Mythic task proposals, the card shows the deterministically prepared command and arguments.
 If the command schema or selected registered file changes before issuance, Sage stops and requires a
 fresh proposal; an explicit `token_id` is refused because this task path does not forward it to Mythic.
+If an accepted task has not returned a confirmed result by the wait deadline, ordinary supervised chat
+ends that request with the exact Mythic task ID and an incomplete-observation notice. The task's outcome
+is still unknown; Sage does not automatically issue it again. A fresh request can inspect that task's
+output or history before you decide whether to approve another action.
 
 With **Autonomous Solve** enabled in a supervised channel, the first prompt becomes a continuing objective
 for Sage's controller. Each controller move still pauses for a native approval card. With that option off,

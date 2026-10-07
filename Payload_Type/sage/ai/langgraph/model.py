@@ -1622,6 +1622,16 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
         self._model = model
         self._agent_name = str(agent_name or "").strip()
 
+    @hook_config(can_jump_to=["end"])
+    def before_model(self, state, runtime):
+        if self._agent_name == "Mythic_Operator" and self._model._pending_task_receipt_for_request():
+            return {"jump_to": "end"}
+        return None
+
+    @hook_config(can_jump_to=["end"])
+    async def abefore_model(self, state, runtime):
+        return self.before_model(state, runtime)
+
     @staticmethod
     def _blocked_tool_message(request: Any, reason: str) -> ToolMessage:
         name = _tool_name_from_request(request) or "unknown_tool"
@@ -4981,6 +4991,20 @@ class Model:
 
     def _assisted_operator_input_for_handoff(self) -> str | None:
         return _current_assisted_operator_input(self.state)
+
+    def _pending_task_receipt_for_request(self) -> dict[str, Any] | None:
+        """Return a trusted unfinished-task receipt for this supervised graph request."""
+        if getattr(self, "mode", "") != "supervised":
+            return None
+        state = getattr(self, "state", None)
+        if not isinstance(state, dict) or state.get("_request_lane") != "supervised_workflow":
+            return None
+        request_id = str(state.get("_request_id") or "").strip()
+        receipt = getattr(getattr(self, "mythic_client", None), "_deferred_task_receipt", None)
+        if (not request_id or not isinstance(receipt, dict)
+                or receipt.get("request_id") != request_id):
+            return None
+        return receipt
 
     def _install_turn_authority(self, authority: TurnAuthority) -> None:
         self._turn_authority = authority
@@ -8509,6 +8533,56 @@ class Model:
                 state_key: new_messages_from_agent,  # Only new messages for operator.add
                 "messages": new_messages_from_agent,  # keep legacy/global mirror
             }
+
+            pending_receipt = (
+                self._pending_task_receipt_for_request() if _mythic_operator else None
+            )
+            if pending_receipt is not None:
+                task_id = pending_receipt.get("task_display_id")
+                callback_id = pending_receipt.get("callback_display_id")
+                command = pending_receipt.get("command")
+                if task_id is None:
+                    summary_text = (
+                        f"Observation ended for {command!r} on callback {callback_id}; "
+                        "whether Mythic accepted the task is unknown. Check task history "
+                        "before considering another issue."
+                    )
+                else:
+                    observed_status = str(pending_receipt.get("task_status") or "")
+                    state_note = (
+                        f"Mythic reported the task pending with status "
+                        f"{json.dumps(observed_status)}; its outcome is unconfirmed."
+                        if pending_receipt.get("observation_status") == "pending"
+                        else (
+                            "The observation failed; current task state and outcome are unknown."
+                            if pending_receipt.get("observation_status") == "wait_failed"
+                            else "Current task state and outcome are unconfirmed."
+                        )
+                    )
+                    summary_text = (
+                        f"Mythic accepted task {task_id} ({command!r}) on callback "
+                        f"{callback_id}. Observation is incomplete "
+                        f"({pending_receipt.get('observation_status') or 'unknown'}). "
+                        f"{state_note} Inspect that exact task "
+                        "in a fresh request before deciding what to do next."
+                    )
+                final_msg = AIMessage(
+                    content=summary_text,
+                    name="Supervisor",
+                    additional_kwargs={"_is_final_report": True, "_pending_task_handoff": True},
+                )
+                _tag_msg(final_msg, next_seq)
+                self._message_seq = next_seq + 1
+                self.state["_message_seq"] = self._message_seq
+                await self._close_delegation(node_name, content=summary_text, status="finished")
+                return Command(goto=END, update={
+                    state_key: new_messages_from_agent,
+                    "messages": new_messages_from_agent + [final_msg],
+                    "supervisor_messages": [final_msg],
+                    "_message_seq": self._message_seq,
+                    "recursion_summary_requested": False,
+                    "recursion_handback": True,
+                })
 
             if _mythic_operator and _bounded_one_action_request:
                 terminal_payload = _terminal_execute_capability_payload(new_messages_from_agent)
@@ -13148,6 +13222,12 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                 await self._surface_hitl_interrupt(event)
                 break
             await self._process_stream_event(event)
+            if isinstance(event, dict) and any(
+                isinstance(update, dict) and update.get("recursion_handback")
+                for update in event.values()
+            ):
+                self.state["recursion_handback"] = True
+                break
 
         # ISC-74: terminalize the rejected tool events (see the snapshot note above).
         # `_close_open_tool_lifecycles` filters against the ledger's CURRENTLY-open lifecycles, so an

@@ -318,7 +318,7 @@ def test_registered_timeout_identifies_current_issued_task_without_success_claim
         result = asyncio.run(_invoke_registered(mt, "tasklist", 31))
 
     assert "task_display_id=9003 callback_display_id=31 requested_command=tasklist" in result
-    assert "DEFERRED: task 9003" in result
+    assert "DEFERRED: Mythic accepted task 9003" in result
     assert "task_completed=null task_status=null observation=deferred" in result
     assert "task_display_id=4242" not in result
     assert "[Mythic task issuance identity]" in result
