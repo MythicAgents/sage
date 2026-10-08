@@ -36,6 +36,7 @@ from ai.langgraph.mythic_tools import MythicTools
 from sage_chat.headless import build_chat_request
 from sage_chat.hitl import approval_response_matches
 from sage_chat.service import bind_channel_thread_id
+from sage_chat.service import ChatStreamEmitter
 from sage_chat.session import drop_channel_session
 
 
@@ -111,6 +112,10 @@ OUTPUTS = {
 
 class FixtureGap(BaseException):
     """Abort this synthetic case before another paid model request."""
+
+
+class WireIntercept(BaseException):
+    """Offline component probe matched the first wire request without sending it."""
 
 
 def load_retained_fixture(path: Path) -> dict:
@@ -256,6 +261,9 @@ class MatrixTransport(REAL.BoundedTransport):
                     self.rejections.append({"reason": "conservative_token_headroom",
                         "observed_tokens": observed, "request_byte_bound": maximum})
                     raise REAL.CaseError("conservative_token_headroom")
+            guard = getattr(self, "request_guard", None)
+            if guard is not None:
+                guard(json.loads(request.content))
             return await super().handle_async_request(request)
         finally:
             self.persist()
@@ -298,7 +306,9 @@ def observed(path: Path) -> bool:
 
 
 async def run_case(case_id, prompt, decision, profile, output_dir, limits, tls_context, ips,
-                   *, report_source_metadata=False, retained_fixture=None):
+                   *, report_source_metadata=False, retained_fixture=None,
+                   fixture_dispatch=None, before_build=None, after_build=None,
+                   fixture_metadata=None, component_run=False, wire_guard=None):
     path = output_dir / f"case_{case_id}.json"
     ledger = {"case_id": case_id, "prompt": prompt, "decision": decision,
               "status": "started", "synthetic_fixture": (
@@ -314,6 +324,8 @@ async def run_case(case_id, prompt, decision, profile, output_dir, limits, tls_c
               "effects": [], "execution_events": [], "denials": [], "transport_rejections": []}
     def persist():
         atomic_json(path, ledger)
+    if fixture_metadata is not None:
+        ledger.update(fixture_metadata)
     persist()
     if retained_fixture is not None:
         ledger["synthetic_fixture"] = "retained-task-state-v1"
@@ -329,7 +341,8 @@ async def run_case(case_id, prompt, decision, profile, output_dir, limits, tls_c
         request_seconds=limits.request_seconds,
         utc_deadline=datetime.now(timezone.utc) + timedelta(seconds=limits.max_wall),
         persist=persist)
-    transport.conservative_input_headroom = retained_fixture is not None
+    transport.conservative_input_headroom = retained_fixture is not None or fixture_dispatch is not None
+    transport.request_guard = wire_guard
     ledger["provider_requests"] = transport.requests
     ledger["model_calls"] = usage.calls
     ledger["transport_rejections"] = transport.rejections
@@ -394,6 +407,10 @@ async def run_case(case_id, prompt, decision, profile, output_dir, limits, tls_c
         event = {"tool": name, "arguments": args}
         ledger["tool_events"].append(event)
         try:
+            if fixture_dispatch is not None:
+                result = await fixture_dispatch(name, args, sink, ledger)
+                event["result"] = result
+                return result
             if retained_fixture is not None:
                 if name == "get_task_history_for_callback" and args.get("callback_display_id") == 2:
                     result = await registered_retained_tools[name].ainvoke(args)
@@ -618,7 +635,33 @@ async def run_case(case_id, prompt, decision, profile, output_dir, limits, tls_c
             model.memory = InMemorySaver()
             model._native_chat_explicit_hitl = True
             model.command_name = "chat"
+            if before_build is not None:
+                before_build(model, ledger)
             model._rebuild_graph()
+            if after_build is not None:
+                after_build(model, ledger)
+            if component_run:
+                chat = CASE.DriverChat(model)
+                stream_request = build_chat_request(prompt, channel_id=1, operation_id=1,
+                    request_id=1, config={"mode": "supervised", "policy_mode": "hybrid",
+                                          "autonomous_solve": False})
+                model._response_emitter = ChatStreamEmitter(chat, stream_request)
+                graph_config = {"configurable": {"thread_id": f"component:{case_id}"}}
+                state = await model.graph.ainvoke(model.state, graph_config,
+                    interrupt_before=["Supervisor"])
+                checkpoint = await model.graph.aget_state(graph_config)
+                ledger["component_next"] = list(checkpoint.next)
+                ledger["component_bloodhound_messages"] = [
+                    {"type": message.type, "content": message.content,
+                     "additional_kwargs": message.additional_kwargs}
+                    for message in state.get("bloodhound_messages", [])]
+                ledger["component_supervisor_messages"] = [
+                    {"type": message.type, "content": message.content,
+                     "additional_kwargs": message.additional_kwargs}
+                    for message in state.get("supervisor_messages", [])]
+                ledger["component_emissions"] = list(chat.emissions)
+                ledger["status"] = "component_observed"
+                return ledger
             chat = CASE.DriverChat(model)
             request_id = 1
             async def turn(text, response=None):
@@ -716,7 +759,8 @@ async def run_case(case_id, prompt, decision, profile, output_dir, limits, tls_c
                         "effects": ledger["effects"][before_effects:]})
             ledger["status"] = "observed"
     except BaseException as exc:
-        ledger["status"] = "harness_gap" if isinstance(exc, FixtureGap) else "error"
+        ledger["status"] = ("component_wire_verified" if isinstance(exc, WireIntercept)
+                            else "harness_gap" if isinstance(exc, FixtureGap) else "error")
         ledger["error"] = type(exc).__name__ + ": " + str(exc)
     finally:
         if first is not None:
