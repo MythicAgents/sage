@@ -19296,6 +19296,7 @@ class MythicTools:
                     payload_type,
                     command,
                     include_example=False,
+                    use_cache=not force_refresh,
                     fields=command_parameter_schema.INTERNAL_SCHEMA_FIELDS,
                     drop_empty=False,
                 )

@@ -12,7 +12,9 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from ai.langgraph.model import Model, _TurnAuthorityToolMiddleware
 from ai.langgraph.mythic_tools import MythicTools
-from ai.langgraph import mythic_tools as mythic_tools_module
+from ai.langgraph import command_parameter_schema
+from mythic import mythic
+from mythic import mythic_utilities
 from ai.langgraph.request_contract import build_request_contract
 from ai.langgraph.turn_authority import authority_from_request_contract
 from sage_chat.hitl import (approval_action_digest, approval_action_fingerprint,
@@ -143,12 +145,12 @@ def test_unknown_schema_fails_before_card_but_known_empty_schema_prepares(monkey
 def test_schema_revalidation_bypasses_live_schema_cache(monkeypatch):
     tools = _tools()
     monkeypatch.setattr(tools, "_resolve_payload_type", AsyncMock(return_value="apollo"))
+    monkeypatch.setattr(command_parameter_schema, "DEFAULT_RESOLVER",
+                        command_parameter_schema.CommandSchemaResolver())
     current = [copy.deepcopy(SCHEMA)]
-    remote = AsyncMock(side_effect=lambda *_args, **_kwargs: current[0])
-    monkeypatch.setattr(mythic_tools_module.command_parameter_schema,
-                        "get_command_schema", remote)
-    monkeypatch.setattr(mythic_tools_module.command_parameter_schema,
-                        "flatten_groups", lambda groups: groups)
+    remote = AsyncMock(side_effect=lambda **_kwargs: {
+        "Default": {"parameters": copy.deepcopy(current[0])}})
+    monkeypatch.setattr(mythic, "get_command_parameter_options", remote)
 
     async def probe():
         first = await tools._fetch_command_schema("dcsync", 2)
@@ -161,6 +163,40 @@ def test_schema_revalidation_bypasses_live_schema_cache(monkeypatch):
     assert first == cached == SCHEMA
     assert refreshed != first
     assert remote.await_count == 2
+
+
+def test_forced_schema_reads_refetch_and_do_not_reuse_cached_schema_on_error(monkeypatch):
+    tools = _tools()
+    monkeypatch.setattr(tools, "_resolve_payload_type", AsyncMock(return_value="apollo"))
+    monkeypatch.setattr(command_parameter_schema, "DEFAULT_RESOLVER",
+                        command_parameter_schema.CommandSchemaResolver())
+    current = [copy.deepcopy(SCHEMA)]
+
+    async def upstream(**_kwargs):
+        if current[0] is None:
+            raise RuntimeError("inert schema fetch failure")
+        return {"Default": {"parameters": copy.deepcopy(current[0])}}
+
+    remote = AsyncMock(side_effect=upstream)
+    monkeypatch.setattr(mythic, "get_command_parameter_options", remote)
+    fallback = AsyncMock(return_value={"commandparameters": []})
+    monkeypatch.setattr(mythic_utilities, "graphql_post", fallback)
+
+    async def probe():
+        first = await tools._fetch_command_schema("dcsync", 2)
+        current[0] = [{**row, "parameter_group_name": "New"} for row in SCHEMA]
+        second = await tools._fetch_command_schema("dcsync", 2, force_refresh=True)
+        third = await tools._fetch_command_schema("dcsync", 2, force_refresh=True)
+        current[0] = None
+        missing = await tools._fetch_command_schema("dcsync", 2, force_refresh=True)
+        return first, second, third, missing
+
+    first, second, third, missing = asyncio.run(probe())
+    assert first == SCHEMA
+    assert second == third != first
+    assert missing is None
+    assert remote.await_count == 4
+    fallback.assert_awaited_once()
 
 
 def test_divergent_provider_envelope_is_rejected_before_preparation(monkeypatch):
@@ -374,8 +410,16 @@ def test_postapproval_binding_drift_denies_real_issue_before_sink(monkeypatch, d
     live_schema = [copy.deepcopy(schema)]
     monkeypatch.setattr(tools, "_authenticate_live_command", AsyncMock(return_value={
         "status": "available", "command": command}))
-    monkeypatch.setattr(tools, "_fetch_command_schema",
-                        AsyncMock(side_effect=lambda *_a, **_k: copy.deepcopy(live_schema[0])))
+    if drift == "schema":
+        monkeypatch.setattr(tools, "_resolve_payload_type", AsyncMock(return_value="apollo"))
+        monkeypatch.setattr(command_parameter_schema, "DEFAULT_RESOLVER",
+                            command_parameter_schema.CommandSchemaResolver())
+        upstream = AsyncMock(side_effect=lambda **_kwargs: {
+            "Default": {"parameters": copy.deepcopy(live_schema[0])}})
+        monkeypatch.setattr(mythic, "get_command_parameter_options", upstream)
+    else:
+        monkeypatch.setattr(tools, "_fetch_command_schema",
+                            AsyncMock(side_effect=lambda *_a, **_k: copy.deepcopy(live_schema[0])))
     monkeypatch.setattr(tools, "_validate_command_parameters", AsyncMock(return_value=None))
     monkeypatch.setattr(tools, "_callback_tasking_liveness_blocker", AsyncMock(return_value=None))
     monkeypatch.setattr(tools, "_engagement_issue_hook", AsyncMock(return_value=None))
@@ -405,3 +449,5 @@ def test_postapproval_binding_drift_denies_real_issue_before_sink(monkeypatch, d
     assert ("schema changed after approval" if drift == "schema"
             else "registered file identity changed after approval") in result
     sink.assert_not_awaited()
+    if drift == "schema":
+        assert upstream.await_count == 2
