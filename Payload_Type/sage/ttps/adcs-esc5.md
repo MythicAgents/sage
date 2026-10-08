@@ -36,7 +36,8 @@ opsec_notes: |
 gotchas: |
   ESC5 exploitation often leads to CA compromise → CA private key extraction →
   ForgeCert for unlimited domain persistence. This is a high-value but also high-signal
-  operation. Only Certipy (not Certify) fully enumerates ESC5 vulnerabilities.
+  operation. Prefer Certipy for the complete documented workflow; the pinned Certify v2
+  parser has PKI-object enumeration, but its ESC5 classification has not been verified.
   The exploitation path depends on what specific object control exists.
 related_ttps: [certipy, certify-v2, adcs-esc7, forgecert, pspkiaudit]
 alternatives: []
@@ -77,7 +78,7 @@ domain authentication. If an attacker can write to this object:
 
 ## Detection
 
-Only Certipy's `find` with full PKI inspection detects ESC5:
+This reference uses Certipy's documented PKI inspection for ESC5:
 ```
 certipy find -u user -p pass -dc-ip DC_IP -text
 # Look for: "ESC5" or unusual ACLs on PKI objects

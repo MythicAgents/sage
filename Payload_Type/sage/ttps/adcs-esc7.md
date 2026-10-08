@@ -47,8 +47,8 @@ gotchas: |
     3. Use ManageCertificates right to approve the pending request
     4. Certificate issued — extract and use for PKINIT
   
-  Certipy handles both paths. Certify v1 did NOT support ESC7; Certipy is the tool
-  of choice.
+  Certipy documents both paths. The pinned Certify v2 parser has related CA management
+  options, but that does not establish a complete ESC7 workflow.
 related_ttps: [certipy, certify-v2, adcs-esc6, adcs-esc8, rubeus, pspkiaudit]
 alternatives: [pspkiaudit-ca-acl-check]
 common_args: {}
@@ -110,8 +110,8 @@ certificate requests.
 
 ## Detection with Certify vs Certipy
 
-- Certify v1: Does NOT detect ESC7 (only template-level checks)
-- Certify v2: Partial detection
+- Certify v1: version-specific behavior; do not apply to the pinned v2 binary
+- Pinned Certify v2: related parser surface verified; ESC7 completeness unverified
 - Certipy: Full detection and exploitation of ESC7
 
 Use Certipy for comprehensive ESC7 checking.

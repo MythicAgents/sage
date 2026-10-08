@@ -88,7 +88,7 @@ common_args:
     description: Certificate template name
     typical_values: ["VulnTemplate", "User"]
   -upn:
-    description: UPN for ESC1 SAN (equivalent to Certify /altname)
+    description: UPN for ESC1 SAN (the pinned Certify v2 uses --upn)
     typical_values: ["administrator@corp.local"]
   -vulnerable:
     description: Filter find output to vulnerable templates only
@@ -113,7 +113,7 @@ to include ADCS attack paths in the graph.
 - Shadow credentials from Linux (single command: `shadow auto`)
 - ESC8 relay attack against ADCS web enrollment endpoint
 - BloodHound CE ADCS data enrichment (`find -bloodhound`)
-- ESC9/10/13 exploitation (newer ESC variants beyond Certify's scope)
+- ESC9/10/13 exploitation using Certipy's documented workflow
 
 ## How Sage uses this
 Certipy is the infrastructure-side complement to Certify+Whisker+Rubeus for Linux-based

