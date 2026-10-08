@@ -285,6 +285,10 @@ def test_native_approval_reaches_registered_task_sink_with_prepared_args(monkeyp
         monkeypatch.setattr(tools, "_find_uploaded_file_by_name", AsyncMock(return_value={
             "id": 77, "agent_file_id": "inert-file-77", "filename_utf8": "SharpHound.exe",
             "md5": "inert-md5", "sha1": "inert-sha1", "complete": True}))
+        monkeypatch.setattr(
+            tools, "_download_registered_file_bytes_bounded",
+            AsyncMock(return_value=b"inert unenrolled SharpHound bytes"),
+        )
     monkeypatch.setattr(tools, "_validate_command_parameters", AsyncMock(return_value=None))
     monkeypatch.setattr(tools, "_callback_tasking_liveness_blocker", AsyncMock(return_value=None))
     monkeypatch.setattr(tools, "_ensure_registered_file_available", AsyncMock(return_value=None))

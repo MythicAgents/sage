@@ -2,8 +2,9 @@
 
 The operator inspection CLI sends exact artifact bytes to an ephemeral Docker container.
 It provides static inspection and a reviewed Certify help profile without using a payload
-callback. It does not register a new Sage model tool, approve target actions, or enforce
-the executable arguments subsequently sent through Mythic.
+callback. It does not register a new Sage model tool or approve target actions. The separate
+[executable contract path](EXECUTABLE_CONTRACTS.md) validates arguments sent through
+supported Mythic wrappers.
 
 Sage ships image definitions and harmless test-fixture sources. Operators supply their
 own tool binaries; the images contain no Certify executable.

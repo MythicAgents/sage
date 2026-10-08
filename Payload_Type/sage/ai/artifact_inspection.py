@@ -26,7 +26,7 @@ RECIPES = {
     "static-v1": frozenset({"metadata"}),
     "certify-help-v1": frozenset({"top", "enum-cas", "enum-templates", "request", "request-download"}),
     "fixture-v1": frozenset({"native", "managed-com", "network-attempt", "output-flood",
-                              "hang", "child-hang"}),
+                              "hang", "child-hang", "argv-contract"}),
 }
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")

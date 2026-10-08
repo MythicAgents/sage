@@ -3064,6 +3064,144 @@ class _ToolSchemaSlimMiddleware(AgentMiddleware):
         return await handler(self._slim_request(request))
 
 
+class _EnrolledExecutableSchemaMiddleware(AgentMiddleware):
+    """Expose one callback-bound command schema without changing the issue handler."""
+
+    _ISSUE_TOOL = "issue_task_and_waitfor_task_output"
+
+    def __init__(self, model: "Model"):
+        super().__init__()
+        self._model = model
+
+    @staticmethod
+    def _bedrock_optional_properties(schema: dict) -> None:
+        """Keep nullable executable options optional after Bedrock's adapter conversion.
+
+        The installed langchain-aws adapter removes null branches from nested anyOf and
+        type arrays. It leaves `required` unchanged, which would force a value for every
+        optional contract option. This model-facing copy instead permits omission; local
+        executable preparation still applies defaults and validates the resulting action.
+        """
+        if schema.get("type") != "object" or not isinstance(schema.get("properties"), dict):
+            return
+        nullable_names = set()
+        for name, property_schema in schema["properties"].items():
+            if not isinstance(property_schema, dict):
+                continue
+            variants = property_schema.get("anyOf")
+            concrete = None
+            if isinstance(variants, list) and len(variants) == 2:
+                non_null = [item for item in variants if not (isinstance(item, dict) and item.get("type") == "null")]
+                if len(non_null) == 1 and isinstance(non_null[0], dict):
+                    concrete = non_null[0]
+            type_values = property_schema.get("type")
+            if concrete is None and isinstance(type_values, list) and len(type_values) == 2 and "null" in type_values:
+                concrete = {**property_schema, "type": next(item for item in type_values if item != "null")}
+            if concrete is not None:
+                schema["properties"][name] = concrete
+                nullable_names.add(name)
+                property_schema = concrete
+            _EnrolledExecutableSchemaMiddleware._bedrock_optional_properties(property_schema)
+        if nullable_names and isinstance(schema.get("required"), list):
+            schema["required"] = [name for name in schema["required"] if name not in nullable_names]
+
+    @staticmethod
+    def _omit_unsupported_bedrock_constraints(schema: Any) -> None:
+        """Project unsupported numeric/string keywords for the Bedrock-backed proxy.
+
+        Its structured-tool subset rejects integer bounds and string length keywords.
+        Descriptions retain their guidance; the executable contract enforces the exact
+        values locally before any Mythic task is created.
+        """
+        if isinstance(schema, dict):
+            guidance = []
+            if schema.get("type") == "integer":
+                minimum = schema.pop("minimum", None)
+                maximum = schema.pop("maximum", None)
+                multiple_of = schema.pop("multipleOf", None)
+                if minimum is not None:
+                    guidance.append(f"Minimum value: {minimum}.")
+                if maximum is not None:
+                    guidance.append(f"Maximum value: {maximum}.")
+                if multiple_of is not None:
+                    guidance.append(f"Must be a multiple of {multiple_of}.")
+            elif schema.get("type") == "string":
+                min_length = schema.pop("minLength", None)
+                max_length = schema.pop("maxLength", None)
+                if min_length is not None:
+                    guidance.append(f"Minimum length: {min_length}.")
+                if max_length is not None:
+                    guidance.append(f"Maximum length: {max_length}.")
+            if guidance:
+                schema["description"] = " ".join(
+                    part for part in (str(schema.get("description") or "").strip(), *guidance) if part
+                )
+            for value in schema.values():
+                _EnrolledExecutableSchemaMiddleware._omit_unsupported_bedrock_constraints(value)
+        elif isinstance(schema, list):
+            for value in schema:
+                _EnrolledExecutableSchemaMiddleware._omit_unsupported_bedrock_constraints(value)
+
+    def _with_enrolled_schema(self, request):
+        client = getattr(self._model, "mythic_client", None)
+        getter = getattr(client, "get_enrolled_issue_schema", None)
+        if not callable(getter):
+            return request
+        try:
+            schema = getter()
+        except Exception:
+            logger.warning("Enrolled command schema could not be read", exc_info=True)
+            return request
+        if schema is None:
+            return request
+        properties = schema.get("properties") if isinstance(schema, dict) else None
+        if (
+            not isinstance(schema, dict)
+            or schema.get("type") != "object"
+            or not isinstance(properties, dict)
+            or not {"command", "callback_display_id", "parameters"}.issubset(properties)
+        ):
+            logger.warning("Ignoring invalid enrolled command tool schema")
+            return request
+        tools = getattr(request, "tools", ()) or ()
+        replaced = False
+        bound_tools = []
+        for tool in tools:
+            function = tool.get("function") if isinstance(tool, dict) else None
+            name = (function or {}).get("name") if isinstance(function, dict) else getattr(tool, "name", None)
+            if name != self._ISSUE_TOOL:
+                bound_tools.append(tool)
+                continue
+            description = (
+                (function or {}).get("description")
+                if isinstance(tool, dict)
+                else getattr(tool, "description", "")
+            )
+            provider = str(getattr(self._model, "provider", "")).casefold()
+            model_schema = copy.deepcopy(schema)
+            if provider == "bedrock":
+                self._bedrock_optional_properties(model_schema)
+            elif provider == "openai":
+                self._omit_unsupported_bedrock_constraints(model_schema)
+            definition = {
+                "name": self._ISSUE_TOOL,
+                "description": description or self._ISSUE_TOOL,
+                "parameters": model_schema,
+            }
+            # The OpenAI adapter preserves this provider-compatible nested strict schema.
+            if provider == "openai":
+                definition["strict"] = True
+            bound_tools.append({"type": "function", "function": definition})
+            replaced = True
+        return request.override(tools=bound_tools) if replaced else request
+
+    def wrap_model_call(self, request, handler):
+        return handler(self._with_enrolled_schema(request))
+
+    async def awrap_model_call(self, request, handler):
+        return await handler(self._with_enrolled_schema(request))
+
+
 class _LoggingSummarizationMiddleware(SummarizationMiddleware):
     """Thin wrapper: logs when summarization actually fires."""
 
@@ -6173,6 +6311,10 @@ class Model:
         )
 
     def _rebuild_graph(self) -> None:
+        clear_enrollment = getattr(getattr(self, "mythic_client", None),
+                                   "clear_enrolled_issue_schema", None)
+        if callable(clear_enrollment):
+            clear_enrollment()
         start_node = self._graph_start_node_for_turn()
         # The only relationship this value must still respect: it has to survive the gap between two
         # heartbeats, or a legitimately waiting node is cancelled between beats. It no longer needs to
@@ -12175,6 +12317,8 @@ class Model:
                 token_count_method="approximate",
             ),
         ]
+        if agent_name == "Mythic_Operator":
+            mw.insert(4, _EnrolledExecutableSchemaMiddleware(self))
         if bounded_execute_stop:
             # Mythic_Operator treats execute_capability as an atomic transaction boundary.
             # Explicit bounded one-action requests still get a graph-END final report in

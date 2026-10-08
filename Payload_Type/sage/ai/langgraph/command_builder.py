@@ -76,6 +76,16 @@ _GENERIC_ERROR_HINT_RE = re.compile(
     re.IGNORECASE,
 )
 
+_ENROLLED_EXECUTABLE_PARSER_FAILURES = tuple(
+    re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+    for pattern in (
+        r"^\s*Verb\s+'[^'\r\n]+'\s+is\s+not\s+recognized\.\s*$",
+        r"^\s*Required\s+option\s+'[^'\r\n]+'\s+is\s+missing\.\s*$",
+        r"^\s*(?:Unknown\s+option|Option\s+'[^'\r\n]+'\s+is\s+unknown)\b.*$",
+        r"^\s*Sequence\s+option\s+'[^'\r\n]+'\s+has\s+no\s+values\.\s*$",
+    )
+)
+
 _SHARPHOUND_COMMAND_SELECTORS = {
     "execute_assembly": "Assembly",
     "execute-assembly": "assembly",
@@ -151,6 +161,15 @@ def classify_result(command: str, output: str, exception: str | None = None, par
         return ResultClass.SUCCESS.value
     except Exception:
         return ResultClass.TRANSIENT.value
+
+
+def enrolled_executable_parser_failure(output: Any) -> bool:
+    """Recognize narrow CLI-parser failures only after the caller proves enrollment."""
+    try:
+        text = _text(output)
+        return any(pattern.search(text) is not None for pattern in _ENROLLED_EXECUTABLE_PARSER_FAILURES)
+    except Exception:
+        return False
 
 
 def _sharphound_completion_override(command: str, output: str, parameters: Any) -> bool | None:

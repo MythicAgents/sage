@@ -6,6 +6,7 @@ import contextvars
 import functools
 import inspect
 from pathlib import Path
+import ssl
 import sys
 
 try:
@@ -66,6 +67,9 @@ SAGE_MYTHIC_SLEEP_TIMEOUT_MULTIPLIER = _env_positive_int("SAGE_MYTHIC_SLEEP_TIME
 #: Seconds between graph heartbeats emitted while a Mythic task wait is legitimately outstanding.
 #: See `_graph_heartbeat` for why this exists at all.
 SAGE_TASK_HEARTBEAT_INTERVAL = _env_positive_int("SAGE_TASK_HEARTBEAT_INTERVAL", 30)
+
+_EXECUTABLE_CONTRACT_ROOT = Path(__file__).resolve().parents[2] / "tool_contracts"
+_MAX_ENROLLED_EXECUTABLE_BYTES = 4 * 1024 * 1024
 
 
 def _resolve_graph_heartbeat():
@@ -496,13 +500,22 @@ import hashlib
 import inspect
 import re
 import uuid
-from typing import Annotated, Any, List, Dict, TypedDict
+from typing import Annotated, Any, List, Dict, Mapping, TypedDict
 import aiohttp
 from mythic import graphql_queries, mythic, mythic_classes, mythic_utilities
 from mythic_container.MythicGoRPC import SendMythicRPCAPITokenCreate, MythicRPCAPITokenCreateMessage
 from mythic_container.logging import logger
 from langchain.tools import tool, BaseTool
 from langchain_core.tools import StructuredTool
+try:
+    from ssl_bootstrap import configure_sage_ssl_cert_file
+except ModuleNotFoundError as exc:
+    if exc.name != "ssl_bootstrap":
+        raise
+    _SAGE_RUNTIME_ROOT = Path(__file__).resolve().parents[2]
+    if str(_SAGE_RUNTIME_ROOT) not in sys.path:
+        sys.path.insert(0, str(_SAGE_RUNTIME_ROOT))
+    from ssl_bootstrap import configure_sage_ssl_cert_file
 
 try:
     from . import ttp_library
@@ -513,6 +526,11 @@ try:
     from . import command_builder
 except ImportError:  # allow running this module directly for manual testing
     import command_builder
+
+try:
+    from . import executable_contracts
+except ImportError:  # allow running this module directly for manual testing
+    import executable_contracts
 
 try:
     from .footprint import footprint
@@ -1870,6 +1888,8 @@ class MythicTools:
         # in Mythic; no hidden agent task is required.
         self._registered_file_checks: set[str] = set()
         self._assembly_file_checks = self._registered_file_checks  # compatibility for older tests/helpers
+        self._enrolled_issue_selection: dict[str, Any] | None = None
+        self._enrolled_construction_failures: set[tuple] = set()
         # Forward-planner graph facts: BloodHound ACL edges (GenericWrite on GPOs, WriteDacl on domains,
         # etc.) projected into engagement predicates, cached here and refreshed after each verified ingest
         # so the per-turn injection can DIRECT the operator to the next available hop instead of letting it
@@ -4189,6 +4209,21 @@ class MythicTools:
         schema = await self._fetch_command_schema(command, callback_id)
         if schema is None:
             raise ValueError("task schema is unavailable; approval requires a known command schema")
+        executable_binding = None
+        selected_executable = getattr(self, "_enrolled_issue_selection", None)
+        if not (
+            isinstance(selected_executable, dict)
+            and selected_executable.get("command") == command
+            and selected_executable.get("callback_display_id") == callback_id
+        ):
+            selected_executable = None
+        parameters, executable_binding = await self._validated_executable_parameters(
+            command,
+            parameters,
+            callback_id,
+            schema,
+            selection=selected_executable,
+        )
         resolved_group = None
         if isinstance(parameters, dict) and parameters and schema:
             resolved = command_builder.resolve_params(schema, parameters, command=command)
@@ -4207,11 +4242,17 @@ class MythicTools:
             raise ValueError(f"registered file {name!r} needs its own approval before this task")
         file_identity = None
         if name:
-            file_identity = await self._find_uploaded_file_by_name(name)
+            if (
+                isinstance(executable_binding, dict)
+                and executable_binding.get("file", {}).get("filename_utf8") == name
+            ):
+                file_identity = executable_binding["file"]
+            else:
+                file_identity = await self._find_uploaded_file_by_name(name)
             if not isinstance(file_identity, dict) or not file_identity.get("agent_file_id"):
                 raise ValueError(f"registered file {name!r} has no verifiable Mythic identity")
             file_identity = {key: file_identity.get(key) for key in
-                             ("id", "agent_file_id", "filename_utf8", "md5", "sha1", "complete")}
+                             ("id", "agent_file_id", "filename_utf8", "md5", "sha1", "complete", "sha256")}
         if parameters == "" and isinstance(schema, list) and schema:
             parameters = "{}"
         prepared.update(command=command, parameters=parameters,
@@ -4222,14 +4263,17 @@ class MythicTools:
         visibility = prepared.get("visibility_context")
         if visibility is not None and not isinstance(visibility, dict):
             raise ValueError("task visibility context must be an object")
+        prepared_action_binding = {
+            "schema_digest": hashlib.sha256(json.dumps(
+                schema, sort_keys=True, default=str).encode()).hexdigest(),
+            "group": self._parameter_group_to_declare(resolved_group, parameters, command=command),
+            "file": file_identity,
+        }
+        if executable_binding is not None:
+            prepared_action_binding["executable"] = executable_binding
         prepared["visibility_context"] = {
             **(visibility or {}), "_sage_prepared_action": True,
-            "_sage_prepared_binding": {
-                "schema_digest": hashlib.sha256(json.dumps(
-                    schema, sort_keys=True, default=str).encode()).hexdigest(),
-                "group": self._parameter_group_to_declare(resolved_group, parameters, command=command),
-                "file": file_identity,
-            },
+            "_sage_prepared_binding": prepared_action_binding,
         }
         return prepared
 
@@ -4372,7 +4416,11 @@ class MythicTools:
     async def get_all_command_args_for_payloadtype(
             self, 
             payload: Annotated[str, "The name of the payload type (e.g., 'sage', 'apollo', 'poseidon') to get its available commands"],
-            command: Annotated[str, "The name of the command to get its arguments (e.g., 'ls', 'pwd', 'whoami')"]) -> str:
+            command: Annotated[str, "The name of the command to get its arguments (e.g., 'ls', 'pwd', 'whoami')"],
+            callback_display_id: Annotated[int | None, "Exact callback when selecting an enrolled executable"] = None,
+            executable_filename: Annotated[str, "Registered executable filename selected from the live command schema"] = "",
+            executable_verb: Annotated[str, "Enrolled executable operation to expose as typed arguments"] = "",
+    ) -> str:
         """Get all of a command's arguments for a specific payload type (agent).
         
         This tool retrieves all information about a command's arguments available for a given payload type.
@@ -4392,6 +4440,7 @@ class MythicTools:
         #
         # Command-level metadata stays on a separate parameterized query. `needs_admin` is not
         # decoration: footprint.py reads it out of schema items to score Mythic-native risk.
+        self._enrolled_issue_selection = None
         try:
             if self.client is None:
                 raise Exception("MythicAPIClient not initialized. Call create() first.")
@@ -4419,9 +4468,389 @@ class MythicTools:
                 result["needs_admin"] = True
             if metadata.get("help_cmd"):
                 result["help_cmd"] = metadata["help_cmd"]
+            requested = callback_display_id is not None or bool(executable_filename) or bool(executable_verb)
+            if requested:
+                if type(callback_display_id) is not int or not executable_filename or not executable_verb:
+                    result["executable_contract"] = {
+                        "status": "unsupported",
+                        "error": (
+                            "callback_display_id, executable_filename, and executable_verb are all required "
+                            "for typed executable selection"
+                        ),
+                    }
+                else:
+                    result["executable_contract"] = await self._select_enrolled_executable(
+                        payload, command, callback_display_id, executable_filename, executable_verb
+                    )
             return json.dumps(result, sort_keys=True)
         except Exception as e:
             return f"Error getting command {command} args for payload type {payload}: {e}"
+
+    @tool_safety(TOOL_SAFETY_READ_ONLY)
+    def get_enrolled_issue_schema(self) -> dict[str, Any] | None:
+        """Return the ephemeral typed issue schema selected by command discovery."""
+        selection = getattr(self, "_enrolled_issue_selection", None)
+        if not isinstance(selection, dict):
+            return None
+        schema = selection.get("issue_schema")
+        return copy.deepcopy(schema) if isinstance(schema, dict) else None
+
+    @tool_safety(TOOL_SAFETY_READ_ONLY)
+    def clear_enrolled_issue_schema(self) -> None:
+        """Clear the ephemeral per-turn executable selection before rebuilding tools."""
+        self._enrolled_issue_selection = None
+
+    async def _select_enrolled_executable(
+        self, payload: str, command: str, callback_display_id: int,
+        filename: str, verb: str,
+    ) -> dict[str, Any]:
+        try:
+            actual_payload = await self._resolve_payload_type(callback_display_id)
+            if not actual_payload or actual_payload.casefold() != str(payload).strip().casefold():
+                raise ValueError("callback does not expose the requested payload type")
+            live = await self._authenticate_live_command(command, callback_display_id)
+            if live.get("status") != "available" or not live.get("command"):
+                raise ValueError("command is not available on the exact callback")
+            canonical_command = str(live["command"])
+            schema = await self._fetch_command_schema(
+                canonical_command, callback_display_id, force_refresh=True
+            )
+            wrapper = self._executable_wrapper_binding(canonical_command, schema, filename)
+            if wrapper is None or not self._registered_file_available_in_schema(schema, filename):
+                raise ValueError("registered executable selector/group is absent or ambiguous")
+            contract, file_identity = await self._executable_contract_for_file(filename)
+            if contract is None:
+                raise ValueError("registered executable bytes have no enrolled contract")
+            contract._require_verb(verb)
+            invocation_schema = contract.strict_schema_for_verb(verb)
+            issue_schema = {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "enum": [canonical_command]},
+                    "callback_display_id": {"type": "integer", "enum": [callback_display_id]},
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            wrapper["selector_key"]: {
+                                "type": "string", "enum": [file_identity["filename_utf8"]]
+                            },
+                            wrapper["arguments_key"]: invocation_schema,
+                        },
+                        "required": [wrapper["selector_key"], wrapper["arguments_key"]],
+                        "additionalProperties": False,
+                    },
+                },
+                "required": ["command", "callback_display_id", "parameters"],
+                "additionalProperties": False,
+            }
+            self._enrolled_issue_selection = {
+                "payload": actual_payload,
+                "callback_display_id": callback_display_id,
+                "command": canonical_command,
+                "wrapper": wrapper,
+                "file": file_identity,
+                "contract": contract,
+                "verb": verb,
+                "issue_schema": issue_schema,
+            }
+            return {
+                "status": "enrolled",
+                "artifact_sha256": file_identity["sha256"],
+                "contract_sha256": contract.descriptor_sha256,
+                "contract_version": contract.descriptor.contract_version,
+                "filename": file_identity["filename_utf8"],
+                "verb": verb,
+                "invocation_schema": invocation_schema,
+                "instruction": (
+                    "Call issue_task_and_waitfor_task_output with exactly the typed parameters now exposed. "
+                    "Sage will render and independently revalidate the native argument string before task creation."
+                ),
+            }
+        except Exception as exc:
+            self._enrolled_issue_selection = None
+            return {"status": "unsupported", "error": str(exc)}
+
+    def _executable_wrapper_binding(
+        self, command: str, schema: Any, filename: str
+    ) -> dict[str, str] | None:
+        if str(command or "").strip() not in {"execute_assembly", "inline_assembly"}:
+            return None
+        if not isinstance(schema, list):
+            return None
+        wanted = str(filename or "").strip().casefold()
+        matches = []
+        for selector in self._registered_file_selectors(schema):
+            choice_match = any(str(choice or "").strip().casefold() == wanted for choice in selector.get("choices") or [])
+            if not choice_match:
+                continue
+            group = str(selector.get("parameter_group_name") or "Default")
+            arguments = [
+                param for param in schema
+                if isinstance(param, dict)
+                and str(param.get("parameter_group_name") or "Default") == group
+                and str(param.get("type") or "").casefold() == "string"
+                and param is not selector
+            ]
+            if len(arguments) == 1:
+                matches.append({
+                    "group": group,
+                    "selector_key": str(selector.get("cli_name") or selector.get("name") or ""),
+                    "selector_name": str(selector.get("name") or selector.get("cli_name") or ""),
+                    "arguments_key": str(arguments[0].get("cli_name") or arguments[0].get("name") or ""),
+                    "arguments_name": str(arguments[0].get("name") or arguments[0].get("cli_name") or ""),
+                })
+        valid = [
+            item for item in matches
+            if item["selector_key"] and item["arguments_key"] and item["selector_key"] != item["arguments_key"]
+        ]
+        return valid[0] if len(valid) == 1 else None
+
+    @staticmethod
+    def _exact_schema_value(parameters: Mapping[str, Any], keys: tuple[str, ...]) -> Any:
+        found = [parameters[key] for key in dict.fromkeys(keys) if key and key in parameters]
+        if len(found) != 1:
+            raise ValueError("executable wrapper uses a missing or ambiguous parameter alias")
+        return found[0]
+
+    def _registered_file_selection_from_schema(
+        self, parameters: Mapping[str, Any], schema: Any
+    ) -> str:
+        matches: list[str] = []
+        for selector in self._registered_file_selectors(schema):
+            values = []
+            for key in dict.fromkeys((selector.get("cli_name"), selector.get("name"))):
+                if key and key in parameters:
+                    values.append(parameters[key])
+            if len(values) > 1:
+                raise ValueError("registered executable selector uses ambiguous aliases")
+            if not values or type(values[0]) is not str or not values[0].strip():
+                continue
+            wanted = values[0].strip()
+            if any(
+                str(choice or "").strip().casefold() == wanted.casefold()
+                for choice in selector.get("choices") or []
+            ):
+                matches.append(wanted)
+        if len(matches) > 1:
+            raise ValueError("multiple registered executable selectors are present")
+        return matches[0] if matches else ""
+
+    async def _validated_executable_parameters(
+        self,
+        command: str,
+        parameters: Any,
+        callback_display_id: int,
+        schema: Any,
+        *,
+        selection: Mapping[str, Any] | None = None,
+    ) -> tuple[Any, dict[str, Any] | None]:
+        compatible_command = str(command or "").strip() in {
+            "execute_assembly", "inline_assembly"
+        }
+        if not compatible_command:
+            return parameters, None
+        if not isinstance(schema, list):
+            raise ValueError("compatible executable wrapper live schema is unavailable")
+        raw_outer = None
+        raw_outer_original = None
+        if isinstance(parameters, str):
+            if not parameters:
+                return parameters, None
+            raw_outer_original = parameters
+            normalized_outer = parameters.strip(" \t")
+            if not normalized_outer or any(
+                character in "\r\n\x00" for character in parameters
+            ):
+                raise ValueError("compatible executable wrapper raw parameters are malformed")
+            filename, separator, raw_outer = normalized_outer.partition(" ")
+            if not separator:
+                raw_outer = ""
+            possible = self._executable_wrapper_binding(command, schema, filename)
+            if possible is None:
+                selector_matches = [
+                    selector for selector in self._registered_file_selectors(schema)
+                    if any(
+                        str(choice or "").strip().casefold() == filename.casefold()
+                        for choice in selector.get("choices") or []
+                    )
+                ]
+                if len(selector_matches) == 1:
+                    contract, _identity = await self._executable_contract_for_file(filename)
+                    if contract is not None:
+                        raise ValueError(
+                            "known executable uses an ambiguous or unsupported Mythic wrapper"
+                        )
+                return parameters, None
+            # A raw outer command is the exact Apollo execute/inline-assembly parser
+            # form: registered filename, one space, then the untouched assembly argv.
+            parameters = {
+                possible["selector_key"]: filename,
+                possible["arguments_key"]: raw_outer,
+            }
+        if not isinstance(parameters, dict):
+            return parameters, None
+        if selection is not None:
+            if (
+                selection.get("command") != command
+                or selection.get("callback_display_id") != callback_display_id
+            ):
+                raise ValueError("typed executable selection changed before preparation")
+            expected_wrapper = selection.get("wrapper")
+            expected_file = selection.get("file")
+            if not isinstance(expected_wrapper, Mapping) or not isinstance(expected_file, Mapping):
+                raise ValueError("typed executable selection is incomplete")
+            selector_value = self._exact_schema_value(
+                parameters,
+                (str(expected_wrapper.get("selector_key") or ""), str(expected_wrapper.get("selector_name") or "")),
+            )
+            filename = str(selector_value or "").strip()
+            if filename.casefold() != str(expected_file.get("filename_utf8") or "").casefold():
+                raise ValueError("typed executable selector changed")
+        else:
+            filename = self._registered_file_selection_from_schema(parameters, schema)
+            if not filename:
+                return parameters, None
+
+        contract, file_identity = await self._executable_contract_for_file(filename)
+        if contract is None:
+            if selection is not None:
+                raise ValueError("selected executable bytes no longer match the enrolled contract")
+            return parameters if raw_outer_original is None else raw_outer_original, None
+        payload_type = await self._resolve_payload_type(callback_display_id)
+        if str(payload_type or "").casefold() != "apollo":
+            raise ValueError("enrolled executable transport is verified only for Apollo")
+        wrapper = self._executable_wrapper_binding(command, schema, filename)
+        if wrapper is None:
+            raise ValueError("known executable uses an ambiguous or unsupported Mythic wrapper")
+        selector_value = self._exact_schema_value(
+            parameters, (wrapper["selector_key"], wrapper["selector_name"])
+        )
+        if str(selector_value or "").strip().casefold() != filename.casefold():
+            raise ValueError("known executable selector changed during wrapper resolution")
+        arguments = self._exact_schema_value(
+            parameters, (wrapper["arguments_key"], wrapper["arguments_name"])
+        )
+        accepted_outer_keys = {
+            key for key in (
+                wrapper["selector_key"], wrapper["selector_name"],
+                wrapper["arguments_key"], wrapper["arguments_name"],
+            ) if key
+        }
+        if not set(parameters) <= accepted_outer_keys:
+            raise ValueError("known executable wrapper contains undeclared mixed parameters")
+        if isinstance(arguments, dict):
+            if set(arguments) != {"verb", "options"}:
+                raise ValueError("typed executable invocation must contain only verb and options")
+            prepared = contract.prepare(
+                arguments.get("verb"), arguments.get("options"),
+                artifact_sha256=file_identity["sha256"],
+            )
+        elif isinstance(arguments, str):
+            prepared = contract.parse_and_prepare(
+                arguments, artifact_sha256=file_identity["sha256"]
+            )
+        else:
+            raise ValueError("known executable arguments must be typed or a legacy raw string")
+        if selection is not None:
+            expected_file = selection["file"]
+            identity_keys = (
+                "id", "agent_file_id", "filename_utf8", "md5", "sha1", "complete", "sha256"
+            )
+            if {key: file_identity.get(key) for key in identity_keys} != {
+                key: expected_file.get(key) for key in identity_keys
+            }:
+                raise ValueError("selected executable identity changed")
+            selected_contract = selection.get("contract")
+            if (
+                not isinstance(selected_contract, executable_contracts.ExecutableContract)
+                or selected_contract.descriptor_sha256 != contract.descriptor_sha256
+                or selection.get("verb") != prepared.verb
+            ):
+                raise ValueError("selected executable contract or verb changed")
+        canonical_parameters = {
+            wrapper["selector_key"]: file_identity["filename_utf8"],
+            wrapper["arguments_key"]: prepared.argument_string,
+        }
+        binding = {
+            "file": file_identity,
+            "wrapper": wrapper,
+            "invocation": prepared.as_binding(),
+        }
+        signature = "enrolled-executable:" + json.dumps({
+            "artifact_sha256": prepared.artifact_sha256,
+            "contract_sha256": prepared.contract_sha256,
+            "contract_version": prepared.contract_version,
+            "verb": prepared.verb,
+            "argv": list(prepared.argv),
+        }, sort_keys=True)
+        self._bound_failure_parameter_signatures[
+            _capability_command_key(command, canonical_parameters)
+        ] = signature
+        return canonical_parameters, binding
+
+    async def _download_registered_file_bytes_bounded(self, agent_file_id: str) -> bytes:
+        if self.client is None:
+            raise ValueError("Mythic client is unavailable")
+        if re.fullmatch(r"[0-9A-Fa-f-]{1,128}", str(agent_file_id or "")) is None:
+            raise ValueError("registered file UUID is invalid")
+        url = (
+            f"{self.client.http}{self.client.server_ip}:{self.client.server_port}"
+            f"/direct/download/{agent_file_id}"
+        )
+        ssl_context = None
+        if str(url).casefold().startswith("https://"):
+            configured_ca = configure_sage_ssl_cert_file() or None
+            ssl_context = ssl.create_default_context(cafile=configured_ca)
+        timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                url,
+                headers=mythic_utilities.get_headers(self.client),
+                ssl=ssl_context,
+                allow_redirects=False,
+            ) as response:
+                if response.status != 200:
+                    raise ValueError(f"registered file download returned HTTP {response.status}")
+                if response.content_length is not None and response.content_length > _MAX_ENROLLED_EXECUTABLE_BYTES:
+                    raise ValueError("registered executable exceeds the inspection byte limit")
+                output = bytearray()
+                async for chunk in response.content.iter_chunked(65536):
+                    output.extend(chunk)
+                    if len(output) > _MAX_ENROLLED_EXECUTABLE_BYTES:
+                        raise ValueError("registered executable exceeds the inspection byte limit")
+                if not output:
+                    raise ValueError("registered executable download was empty")
+                return bytes(output)
+
+    async def _executable_contract_for_file(
+        self, filename: str
+    ) -> tuple[executable_contracts.ExecutableContract | None, dict[str, Any]]:
+        row = await self._find_uploaded_file_by_name(filename)
+        if (
+            not isinstance(row, dict)
+            or not row.get("agent_file_id")
+            or row.get("complete") is not True
+            or str(row.get("filename_utf8") or "").casefold() != str(filename).casefold()
+        ):
+            raise ValueError("registered executable has no complete unambiguous Mythic identity")
+        content = await self._download_registered_file_bytes_bounded(str(row["agent_file_id"]))
+        sha256 = hashlib.sha256(content).hexdigest()
+        try:
+            contract = executable_contracts.load_contract_for_artifact(
+                _EXECUTABLE_CONTRACT_ROOT, sha256
+            )
+        except executable_contracts.UnsupportedExecutableError as exc:
+            if executable_contracts.recognizes_executable_filename(
+                _EXECUTABLE_CONTRACT_ROOT, filename
+            ):
+                raise ValueError("recognized executable filename has changed or unsupported bytes") from exc
+            contract = None
+        identity = {
+            key: row.get(key) for key in
+            ("id", "agent_file_id", "filename_utf8", "md5", "sha1", "complete")
+        }
+        identity["sha256"] = sha256
+        return contract, identity
 
     async def _fetch_command_metadata(self, payload: str, command: str) -> dict:
         """Command-level fields the parameter resolver does not own.
@@ -5178,7 +5607,11 @@ class MythicTools:
             )
         except Exception:
             serialized = str(parameters)
-        key = (command, callback_display_id, serialized)
+        key = (
+            ("enrolled-executable", callback_display_id, serialized)
+            if str(serialized).startswith("enrolled-executable:")
+            else (command, callback_display_id, serialized)
+        )
         context = self._deterministic_capability_command_context(command, parameters)
         capability = self._capability_text(context.get("capability")).casefold()
         expected_probe = self._capability_text(context.get("expected_probe")).casefold()
@@ -5583,6 +6016,24 @@ class MythicTools:
                 command = live_command["command"]
         except Exception:
             pass
+        executable_binding = None
+        try:
+            executable_schema = (
+                await self._fetch_command_schema(command, callback_display_id)
+                if str(command or "").strip() in {"execute_assembly", "inline_assembly"}
+                else None
+            )
+            parameters, executable_binding = await self._validated_executable_parameters(
+                command, parameters, callback_display_id, executable_schema
+            )
+        except (
+            ValueError,
+            executable_contracts.ExecutableContractError,
+        ) as exc:
+            self._pending_task_backed_transition = None
+            return self._note_effect_denial(
+                f"STOP — known executable construction failure: {exc}"
+            )
         raw_gpo_blocker = self._raw_gpo_mutation_blocker(command, parameters)
         if raw_gpo_blocker:
             self._pending_task_backed_transition = None
@@ -5594,6 +6045,12 @@ class MythicTools:
         # unbounded retry loop (cosmetic param permutations) that explodes context and
         # exhausts the recursion limit.
         fail_key = self._task_failure_key(command, callback_display_id, parameters)
+        if executable_binding is not None and fail_key in self._enrolled_construction_failures:
+            return (
+                f"STOP — equivalent enrolled executable invocation for '{command}' on callback "
+                f"{callback_display_id} already produced a construction failure. Obtain new compatibility "
+                "evidence and select a revised contract before retrying."
+            )
         if self._task_failure_counts.get(fail_key, 0) >= 2:
             return (
                 f"STOP — command '{command}' on callback {callback_display_id} with these parameters has already "
@@ -5624,17 +6081,37 @@ class MythicTools:
                     current_schema, sort_keys=True, default=str).encode()).hexdigest()
                 if current_digest != prepared_binding.get("schema_digest"):
                     return self._note_effect_denial("STOP — task schema changed after approval")
-                selected_file = self._registered_file_name_from_schema(command, parameters, current_schema)
                 expected_file = prepared_binding.get("file")
-                if bool(selected_file) != bool(expected_file):
-                    return self._note_effect_denial("STOP — registered file selection changed after approval")
-                if selected_file:
-                    current_file = await self._find_uploaded_file_by_name(selected_file)
-                    keys = ("id", "agent_file_id", "filename_utf8", "md5", "sha1", "complete")
-                    if not isinstance(current_file, dict) or {
-                        key: current_file.get(key) for key in keys
-                    } != expected_file:
-                        return self._note_effect_denial("STOP — registered file identity changed after approval")
+                expected_executable = prepared_binding.get("executable")
+                if expected_executable is not None:
+                    if not isinstance(expected_executable, dict):
+                        return self._note_effect_denial(
+                            "STOP — prepared executable binding is invalid"
+                        )
+                    parameters, current_executable = await self._validated_executable_parameters(
+                        command, parameters, callback_display_id, current_schema
+                    )
+                    if current_executable != expected_executable:
+                        return self._note_effect_denial(
+                            "STOP — executable artifact, contract, or invocation changed after approval"
+                        )
+                else:
+                    selected_file = self._registered_file_name_from_schema(
+                        command, parameters, current_schema
+                    )
+                    if bool(selected_file) != bool(expected_file):
+                        return self._note_effect_denial(
+                            "STOP — registered file selection changed after approval"
+                        )
+                    if selected_file:
+                        current_file = await self._find_uploaded_file_by_name(selected_file)
+                        keys = ("id", "agent_file_id", "filename_utf8", "md5", "sha1", "complete")
+                        if not isinstance(current_file, dict) or {
+                            key: current_file.get(key) for key in keys
+                        } != {key: expected_file.get(key) for key in keys}:
+                            return self._note_effect_denial(
+                                "STOP — registered file identity changed after approval"
+                            )
             except Exception as exc:
                 return self._note_effect_denial(
                     f"STOP — prepared task binding could not be revalidated: {type(exc).__name__}"
@@ -5767,6 +6244,12 @@ class MythicTools:
             if declared_group != prepared_binding.get("group"):
                 return self._note_effect_denial("STOP — task parameter group changed after approval")
         fail_key = self._task_failure_key(command, callback_display_id, parameters)
+        if executable_binding is not None and fail_key in self._enrolled_construction_failures:
+            return (
+                f"STOP — equivalent enrolled executable invocation for '{command}' on callback "
+                f"{callback_display_id} already produced a construction failure. Obtain new compatibility "
+                "evidence and select a revised contract before retrying."
+            )
         if self._task_failure_counts.get(fail_key, 0) >= 2:
             return (
                 f"STOP — command '{command}' on callback {callback_display_id} with these parameters has already "
@@ -6037,6 +6520,11 @@ class MythicTools:
                         raise
                     result_text = _task_output_text(result)
                     result_class = command_builder.classify_result(command, result_text, parameters=parameters)
+                    if (
+                        executable_binding is not None
+                        and command_builder.enrolled_executable_parser_failure(result_text)
+                    ):
+                        result_class = command_builder.ResultClass.CONSTRUCTION.value
                     self._last_issued_task_terminal_status = (
                         "completed"
                         if result_class == command_builder.ResultClass.SUCCESS.value
@@ -6198,6 +6686,12 @@ class MythicTools:
             # Agent-side execution errors come back in the OUTPUT (not as exceptions); count
             # them toward the circuit breaker so blind retries are still capped.
             result_class = command_builder.classify_result(command, results_str, parameters=parameters)
+            if (
+                executable_binding is not None
+                and command_builder.enrolled_executable_parser_failure(results_str)
+            ):
+                result_class = command_builder.ResultClass.CONSTRUCTION.value
+                self._enrolled_construction_failures.add(fail_key)
             decision = self._apply_task_result_class(fail_key, result_class)
             # Loop-guard: detect a SUCCESSFUL-but-unproductive repeat (same command/params/normalized output)
             # that the failure breaker resets past. On the Nth identical success, surface a STOP nudge and flag

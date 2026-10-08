@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import replace
+import hashlib
 import importlib
 import inspect
 import io
@@ -100,6 +101,52 @@ def _resolve_collection_authority(authority, *, callback_id=7, payload_type="apo
     return replace(authority, objective_contract=contract)
 
 
+def _install_unenrolled_collection_file_fixture(monkeypatch, tools):
+    """Use an actual Apollo registered-file shape and positively downloaded unknown bytes."""
+    schema = [
+        {
+            "name": "assembly_name", "cli_name": "Assembly", "type": "ChooseOne",
+            "choices": ["SharpHound.exe"], "parameter_group_name": "Default", "required": True,
+        },
+        {
+            "name": "assembly_arguments", "cli_name": "Arguments", "type": "String",
+            "choices": [], "parameter_group_name": "Default", "required": False,
+        },
+        {
+            "name": "assembly_file", "cli_name": "New Assembly", "type": "File",
+            "choices": [], "parameter_group_name": "New Assembly", "required": True,
+        },
+        {
+            "name": "assembly_arguments", "cli_name": "Arguments", "type": "String",
+            "choices": [], "parameter_group_name": "New Assembly", "required": False,
+        },
+    ]
+    content = b"positively downloaded unenrolled SharpHound fixture"
+    row = {
+        "id": 1,
+        "agent_file_id": "00000000-0000-0000-0000-000000000001",
+        "filename_utf8": "SharpHound.exe",
+        "md5": hashlib.md5(content).hexdigest(),
+        "sha1": hashlib.sha1(content).hexdigest(),
+        "complete": True,
+    }
+
+    async def fetch(command, _callback_display_id, **_kwargs):
+        return schema if command in {"execute_assembly", "inline_assembly"} else []
+
+    async def find(filename):
+        return row if str(filename).casefold() == "sharphound.exe" else None
+
+    async def download(agent_file_id):
+        if agent_file_id != row["agent_file_id"]:
+            raise AssertionError("unexpected fixture artifact")
+        return content
+
+    monkeypatch.setattr(tools, "_fetch_command_schema", fetch)
+    monkeypatch.setattr(tools, "_find_uploaded_file_by_name", find)
+    monkeypatch.setattr(tools, "_download_registered_file_bytes_bounded", download)
+
+
 def _install_collection_issue_test_path(monkeypatch, tools, mythic_mod, *, liveness=None):
     """Keep public issue tests on the real engagement hook while stubbing external Mythic edges."""
     access_reconciler = importlib.import_module("ai.langgraph.access_reconciler")
@@ -142,7 +189,7 @@ def _install_collection_issue_test_path(monkeypatch, tools, mythic_mod, *, liven
     )
     monkeypatch.setattr(tools, "_authenticate_live_command", _available)
     monkeypatch.setattr(tools, "_ensure_registered_file_available", _none)
-    monkeypatch.setattr(tools, "_fetch_command_schema", _none)
+    _install_unenrolled_collection_file_fixture(monkeypatch, tools)
     monkeypatch.setattr(tools, "_validate_command_parameters", _none)
     monkeypatch.setattr(tools, "_action_footprint", _none)
     monkeypatch.setattr(tools, "_ledger_record", lambda *_args, **_kwargs: None)
@@ -3541,6 +3588,7 @@ def test_public_issue_transformed_parameters_are_denied_at_later_exact_boundary(
     monkeypatch.setattr(tools, "_action_footprint", _none)
     monkeypatch.setattr(tools, "_ledger_record", _ledger)
     monkeypatch.setattr(mythic_mod.mythic, "issue_task", _issue)
+    _install_unenrolled_collection_file_fixture(monkeypatch, tools)
 
     result = asyncio.run(tools.issue_task_and_waitfor_task_output(
         task["command"],

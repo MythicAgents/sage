@@ -36,6 +36,57 @@ def _make_tools() -> MythicTools:
     return mt
 
 
+def _arm_unenrolled_executable_fixture(mt: MythicTools, *filenames: str) -> None:
+    """Install a live-shaped Apollo wrapper plus independently hashed unknown files."""
+    schema = [
+        {
+            "name": "assembly_name", "cli_name": "Assembly", "type": "ChooseOne",
+            "choices": list(filenames), "parameter_group_name": "Default", "required": True,
+        },
+        {
+            "name": "assembly_arguments", "cli_name": "Arguments", "type": "String",
+            "choices": [], "parameter_group_name": "Default", "required": False,
+        },
+        {
+            "name": "assembly_file", "cli_name": "New Assembly", "type": "File",
+            "choices": [], "parameter_group_name": "New Assembly", "required": True,
+        },
+        {
+            "name": "assembly_arguments", "cli_name": "Arguments", "type": "String",
+            "choices": [], "parameter_group_name": "New Assembly", "required": False,
+        },
+    ]
+    contents = {name: f"unenrolled fixture for {name}".encode() for name in filenames}
+    rows = {
+        name.casefold(): {
+            "id": index + 1,
+            "agent_file_id": f"00000000-0000-0000-0000-{index + 1:012d}",
+            "filename_utf8": name,
+            "md5": hashlib.md5(contents[name]).hexdigest(),
+            "sha1": hashlib.sha1(contents[name]).hexdigest(),
+            "complete": True,
+        }
+        for index, name in enumerate(filenames)
+    }
+    bytes_by_uuid = {
+        row["agent_file_id"]: contents[row["filename_utf8"]]
+        for row in rows.values()
+    }
+
+    async def fetch(command, _callback_display_id, **_kwargs):
+        return schema if command in {"execute_assembly", "inline_assembly"} else []
+
+    async def find(filename):
+        return rows.get(str(filename).casefold())
+
+    async def download(agent_file_id):
+        return bytes_by_uuid[agent_file_id]
+
+    mt._fetch_command_schema = fetch
+    mt._find_uploaded_file_by_name = find
+    mt._download_registered_file_bytes_bounded = download
+
+
 def _arm_runtime_lineage(mt, task_id="4242", callback_id="50", command="test-command"):
     mt._last_issued_task_display_id = task_id
     mt._last_issued_callback_id = callback_id
@@ -431,13 +482,14 @@ def test_existing_gpo_effect_no_longer_short_circuits_issue_path():
         return []
 
     mt = _make_tools()
+    _arm_unenrolled_executable_fixture(mt, "SharpGPOAbuse.exe")
     _seed_hop(mt, "gpo-abuse", "winterfell")
     with patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
         _split_issue("should not issue", calls):
         result = asyncio.run(
             mt.issue_task_and_waitfor_task_output(
                 "execute_assembly",
-                "--Assembly SharpGPOAbuse.exe --GPOName winterfell",
+                {"assembly_name": "SharpGPOAbuse.exe", "assembly_arguments": "--GPOName winterfell"},
                 11,
             )
         )
@@ -488,6 +540,7 @@ def test_collect_graph_inflight_marker_is_task_backed_after_issue(monkeypatch):
         return []
 
     mt = _make_tools()
+    _arm_unenrolled_executable_fixture(mt, "SharpHound.exe")
     mt._assembly_file_checks.add("sharphound.exe")
     with patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
         patch.object(mythic_tools.mythic, "get_all_tasks", fake_tasks), \
@@ -495,7 +548,7 @@ def test_collect_graph_inflight_marker_is_task_backed_after_issue(monkeypatch):
         result = asyncio.run(
             mt.issue_task_and_waitfor_task_output(
                 "execute_assembly",
-                {"assembly": "SharpHound.exe", "arguments": "-c All --SearchForest"},
+                {"Assembly": "SharpHound.exe", "Arguments": "-c All --SearchForest"},
                 50,
                 timeout=5,
             )
@@ -533,6 +586,7 @@ def test_collect_graph_targeted_scope_uses_distinct_inflight_key(monkeypatch):
         return []
 
     mt = _make_tools()
+    _arm_unenrolled_executable_fixture(mt, "SharpHound.exe")
     mt._assembly_file_checks.add("sharphound.exe")
     mt._engagement_hops = achieved.hops
     mt._engagement_graph_facts = [
@@ -577,6 +631,7 @@ def test_collect_graph_unbacked_inflight_marker_self_heals_and_issues(monkeypatc
         return []
 
     mt = _make_tools()
+    _arm_unenrolled_executable_fixture(mt, "SharpHound.exe")
     mt._assembly_file_checks.add("sharphound.exe")
     mt._collection_in_flight[access_key] = {"kind": "collect-graph", "key": access_key}
     with patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
@@ -585,7 +640,7 @@ def test_collect_graph_unbacked_inflight_marker_self_heals_and_issues(monkeypatc
         result = asyncio.run(
             mt.issue_task_and_waitfor_task_output(
                 "execute_assembly",
-                {"assembly": "SharpHound.exe", "arguments": "-c All --SearchForest"},
+                {"Assembly": "SharpHound.exe", "Arguments": "-c All --SearchForest"},
                 50,
                 timeout=5,
             )
@@ -840,6 +895,7 @@ def test_stage_b_collect_graph_skip_requires_graph_corroboration(monkeypatch):
     )
 
     mt = _make_tools()
+    _arm_unenrolled_executable_fixture(mt, "SharpHound.exe")
     mt._assembly_file_checks.add("sharphound.exe")
     mt._engagement_hops = achieved.hops
     calls = {"issue": 0}
@@ -849,7 +905,7 @@ def test_stage_b_collect_graph_skip_requires_graph_corroboration(monkeypatch):
         result = asyncio.run(
             mt.issue_task_and_waitfor_task_output(
                 "execute_assembly",
-                {"assembly": "SharpHound.exe", "arguments": "-c All --SearchForest"},
+                {"Assembly": "SharpHound.exe", "Arguments": "-c All --SearchForest"},
                 50,
                 timeout=5,
             )
@@ -918,6 +974,7 @@ def test_operator_requested_collection_overrides_same_scope_graph_skip(monkeypat
     )
 
     mt = _make_tools()
+    _arm_unenrolled_executable_fixture(mt, "SharpHound.exe")
     mt._assembly_file_checks.add("sharphound.exe")
     mt._engagement_hops = achieved.hops
     mt._engagement_graph_facts = [
@@ -1134,6 +1191,7 @@ def test_ticket_gate_allows_builder_emitted_managed_kerberos_forge_command():
         return [_foothold(host="CASTELBLACK", forest="north.sevenkingdoms.local")]
 
     mt = _make_tools()
+    _arm_unenrolled_executable_fixture(mt, "Rubeus.exe")
     mt._engagement_hops = engagement_state.record_hop_result(
         engagement_state.EngagementState(objective="test"),
         "dcsync",
@@ -1179,6 +1237,7 @@ def test_ensure_kerberos_context_forge_is_not_skipped_by_durable_da():
         return [_foothold(host="CASTELBLACK", forest="north.sevenkingdoms.local")]
 
     mt = _make_tools()
+    _arm_unenrolled_executable_fixture(mt, "Rubeus.exe")
     mt._engagement_hops = engagement_state.record_hop_result(
         engagement_state.EngagementState(objective="test"),
         "sid-history-escalation",
@@ -1358,12 +1417,13 @@ def test_gate_proceed_records_gpo_setup_as_pending_until_system_proof():
         return []
 
     mt = _make_tools()
+    _arm_unenrolled_executable_fixture(mt, "SharpGPOAbuse.exe")
     with patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
         _split_issue("[+] The GPO was modified to include an immediate scheduled task.", calls, display_id=2712):
         result = asyncio.run(
             mt.issue_task_and_waitfor_task_output(
                 "execute_assembly",
-                "--Assembly SharpGPOAbuse.exe --GPOName NewGPO",
+                {"assembly_name": "SharpGPOAbuse.exe", "assembly_arguments": "--GPOName NewGPO"},
                 11,
             )
         )
@@ -1396,12 +1456,13 @@ def test_gate_proceed_annotates_gpo_guid_only_noop():
         "[+] GUID of \"STARKWALLPAPER\" is: {0A93E998-2599-4DA8-9717-6744993DED3A}\r\n"
     )
     mt = _make_tools()
+    _arm_unenrolled_executable_fixture(mt, "SharpGPOAbuse.exe")
     with patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
         _split_issue(output, calls, display_id=2713):
         result = asyncio.run(
             mt.issue_task_and_waitfor_task_output(
                 "execute_assembly",
-                "--Assembly SharpGPOAbuse.exe --GPOName STARKWALLPAPER",
+                {"assembly_name": "SharpGPOAbuse.exe", "assembly_arguments": "--GPOName STARKWALLPAPER"},
                 11,
             )
         )
@@ -8176,12 +8237,13 @@ def test_forge_golden_ticket_service_proof_records_da_effect():
 def test_gate_failure_fails_open_and_issues_normally():
     calls = {"issue": 0}
     mt = _make_tools()
+    _arm_unenrolled_executable_fixture(mt, "SharpGPOAbuse.exe")
     with patch.object(intent_classifier, "classify_tool_call", side_effect=RuntimeError("boom")), \
         _split_issue("normal result", calls):
         result = asyncio.run(
             mt.issue_task_and_waitfor_task_output(
                 "execute_assembly",
-                "--Assembly SharpGPOAbuse.exe --GPOName NewGPO",
+                {"assembly_name": "SharpGPOAbuse.exe", "assembly_arguments": "--GPOName NewGPO"},
                 11,
             )
         )

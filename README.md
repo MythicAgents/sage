@@ -448,6 +448,8 @@ from its TTP source straight into this folder.
 For operator-run static metadata and reviewed executable-help inspection in isolated
 containers, see [off-target artifact inspection](docs/development/ARTIFACT_INSPECTION.md).
 This workflow does not use a target callback or add a new chat command.
+For enrolled executables, Sage supports [versioned executable arguments](docs/development/EXECUTABLE_CONTRACTS.md)
+with typed fields and deterministic rendering before approval through supported Apollo wrappers.
 
 Sage discovers commands and validates arguments against the **live payload's advertised command schema**.
 Automated workflows also use payload-specific profiles in `mythic_capability_adapter.py` to select commands

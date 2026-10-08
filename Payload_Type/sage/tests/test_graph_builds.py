@@ -123,6 +123,34 @@ def test_the_graph_builds_across_turn_configurations(kwargs):
 
 
 @pytest.mark.parametrize("mode", ["conversation", "supervised", "auto"])
+def test_enrolled_schema_middleware_is_operator_only_and_cleared_on_rebuild(mode, monkeypatch):
+    original = model_module.create_agent
+    captured = {}
+
+    def capture_agent(*args, **kwargs):
+        captured[kwargs["name"]] = kwargs["middleware"]
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(model_module, "create_agent", capture_agent)
+
+    async def body():
+        instance = _hermetic_model(mode=mode)
+        instance._rebuild_graph()
+        instance._rebuild_graph()
+        return instance
+
+    instance = asyncio.run(body())
+    assert instance.mythic_client.clear_enrolled_issue_schema.call_count == 2
+    schema_middleware = model_module._EnrolledExecutableSchemaMiddleware
+    assert sum(isinstance(item, schema_middleware) for item in captured["Mythic_Operator"]) == 1
+    assert all(
+        not isinstance(item, schema_middleware)
+        for name, middleware in captured.items() if name != "Mythic_Operator"
+        for item in middleware
+    )
+
+
+@pytest.mark.parametrize("mode", ["conversation", "supervised", "auto"])
 def test_built_supervisor_offers_both_final_report_modes(mode, monkeypatch):
     original = model_module.create_agent
     offered = []

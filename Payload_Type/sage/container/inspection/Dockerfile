@@ -14,8 +14,9 @@ RUN mkdir -p /out \
     && x86_64-w64-mingw32-gcc -O2 -s -o /out/output-flood.exe output-flood.c \
     && x86_64-w64-mingw32-gcc -O2 -s -o /out/hang.exe hang.c \
     && x86_64-w64-mingw32-gcc -O2 -s -o /out/child-hang.exe child-hang.c \
+    && x86_64-w64-mingw32-gcc -O2 -s -o /out/argv-contract.exe argv-contract.c -lshell32 \
     && mcs -nologo -optimize+ -platform:anycpu -out:/out/managed-com.exe managed-com.cs \
-    && test "$(find /out -type f -name '*.exe' | wc -l)" = 6
+    && test "$(find /out -type f -name '*.exe' | wc -l)" = 7
 
 FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS static
 COPY requirements-static.txt /tmp/requirements-static.txt

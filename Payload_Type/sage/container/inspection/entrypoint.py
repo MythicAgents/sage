@@ -31,6 +31,7 @@ FIXTURES = {
     "output-flood": "/opt/inspection/fixtures/output-flood.exe",
     "hang": "/opt/inspection/fixtures/hang.exe",
     "child-hang": "/opt/inspection/fixtures/child-hang.exe",
+    "argv-contract": "/opt/inspection/fixtures/argv-contract.exe",
 }
 
 
