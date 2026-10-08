@@ -34,7 +34,7 @@ def test_binary_identity_and_enrollment_are_explicit():
     assert contract["disabled_registered_verbs"] == []
     assert contract["legacy_unregistered_verbs"] == ["find", "cas", "download"]
     assert contract["identity_rule"].startswith("verified only when sha256 matches")
-    assert contract["evidence"]["help_execution"] == "not_observed_off_target"
+    assert contract["evidence"]["help_execution"].startswith("observed_off_target_four_enrolled_verbs_")
     assert contract["evidence"]["command_execution"].startswith("unverified_")
     assert contract["comparison_source"]["binding"].startswith("comparison only")
 

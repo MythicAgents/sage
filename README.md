@@ -445,6 +445,10 @@ Sage bundles no offensive binaries. Drop a binary in (for example `Rubeus.exe`, 
 demand instead of making you upload it by hand. `download_tool` can also fetch a pinned, sha256-verified binary
 from its TTP source straight into this folder.
 
+For operator-run static metadata and reviewed executable-help inspection in isolated
+containers, see [off-target artifact inspection](docs/development/ARTIFACT_INSPECTION.md).
+This workflow does not use a target callback or add a new chat command.
+
 Sage discovers commands and validates arguments against the **live payload's advertised command schema**.
 Automated workflows also use payload-specific profiles in `mythic_capability_adapter.py` to select commands
 and account for execution and authentication behavior. The automated graph-collection controller currently
