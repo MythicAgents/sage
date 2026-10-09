@@ -190,6 +190,31 @@ def test_raw_credential_material_never_declares_a_group():
     assert declare("credential_store", "whoami /all") is None
 
 
+def test_only_exact_bound_inline_file_declares_its_schema_group():
+    declare = mythic_tools.MythicTools._parameter_group_to_declare
+    file_uuid = "11111111-2222-4333-8444-555555555555"
+    schema = [{
+        "name": "assembly_file", "cli_name": "AssemblyFile", "type": "File",
+        "parameter_group_name": "New Assembly", "required": True,
+    }]
+    parameter = {
+        "group": "New Assembly", "name": "assembly_file",
+        "cli_name": "AssemblyFile", "value": file_uuid,
+    }
+    identity = {"agent_file_id": file_uuid, "parameter": parameter}
+    params = {"AssemblyFile": file_uuid}
+
+    assert declare(
+        "New Assembly", params, command="inline_assembly",
+        schema=schema, file_identity=identity,
+    ) == "New Assembly"
+    assert declare("New Assembly", params, command="inline_assembly", schema=schema) is None
+    assert declare(
+        "New Assembly", {"AssemblyFile": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"},
+        command="inline_assembly", schema=schema, file_identity=identity,
+    ) is None
+
+
 def test_link_references_and_nested_values_are_recognised():
     declare = mythic_tools.MythicTools._parameter_group_to_declare
     assert declare("p2p", {"connection": "@link:callback=3,c2=smb"}) == "p2p"

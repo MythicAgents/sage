@@ -118,6 +118,41 @@ def test_inline_assembly_prior_keys_resolve_to_one_group_without_group_mix():
     assert set(result.params) == {"filename", "arguments"}
 
 
+def test_inline_assembly_uploaded_uuid_and_registered_name_select_their_exact_groups():
+    schema = [
+        _param("filename", "Default", name="assembly_name", kind="ChooseOne",
+               required=True, choices=["SharpDPAPI.exe"]),
+        _param("arguments", "Default", name="assembly_arguments", required=False),
+        _param("file", "New Assembly", name="assembly_file", kind="File", required=True),
+        _param("arguments", "New Assembly", name="assembly_arguments", required=False),
+    ]
+    file_uuid = "11111111-2222-4333-8444-555555555555"
+
+    uploaded = resolve_params(
+        schema, {"assembly_file": file_uuid, "assembly_arguments": "triage"},
+        command="inline_assembly",
+    )
+    assert uploaded.ok is True
+    assert uploaded.group == "New Assembly"
+    assert uploaded.params == {"file": file_uuid, "arguments": "triage"}
+
+    recovered = resolve_params(
+        schema, {"assembly_file": "sharpdpapi.EXE", "assembly_arguments": "triage"},
+        command="inline_assembly",
+    )
+    assert recovered.ok is True
+    assert recovered.group == "Default"
+    assert recovered.params == {"filename": "SharpDPAPI.exe", "arguments": "triage"}
+
+    invalid_selector = resolve_params(
+        schema, {"assembly_name": file_uuid, "assembly_arguments": "triage"},
+        command="inline_assembly",
+    )
+    assert invalid_selector.ok is False
+    assert invalid_selector.group == "Default"
+    assert "invalid ChooseOne" in (invalid_selector.repair or "")
+
+
 def test_mimikatz_commands_aliases_to_arguments_and_defaults_spawnto():
     schema = [
         _param("arguments", "Default", required=True),

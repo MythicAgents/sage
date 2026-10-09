@@ -440,11 +440,11 @@ def _reroute_registered_file_refs(
     Mythic file-exec commands (execute_assembly, inline_assembly, load-assembly, ...) have TWO parameter
     groups: a "Default"/registered group with a ChooseOne selector (cli `Assembly`/`assembly`/`filename`)
     for an ALREADY-REGISTERED file, and a "New File" group with a File-type param (cli `assembly_file`/
-    `file`) for uploading a NEW file. Sage references already-registered tools, so a value the model placed
-    on the File/upload param is a registered reference — it belongs on the ChooseOne selector. Leaving it on
-    the File param selects the "New File"/upload group, which (with a registered UUID) crashes Merlin and
-    misbehaves on Apollo. Reroute so the registered group is chosen; ChooseOne validation then either accepts
-    a valid registered name or returns a repair hint listing the valid names.
+    `file`) for uploading a NEW file. An existing registered name placed on the File/upload param belongs on
+    the ChooseOne selector. Leaving that name on the File param selects the wrong group. Reroute so the
+    registered group is chosen; ChooseOne validation then either accepts a valid registered name or returns
+    a repair hint listing the valid names. Apollo inline_assembly's schema is the narrower exception: an
+    unmatched value stays on its File group and the issue layer requires an exact uploaded-file identity.
 
     Mythic upload and register_file (including Apollo's register_assembly alias) are the inverse case:
     their File parameter transports a Mythic file UUID, even when the schema also exposes a registered-file
@@ -470,6 +470,17 @@ def _reroute_registered_file_refs(
         for fp in file_params:
             fcli = fp["cli_name"]
             if fcli in mapped and sel_cli not in mapped:
+                # Apollo inline_assembly genuinely accepts a newly uploaded Mythic file UUID in
+                # its typed File group. Preserve the existing registered-name recovery, but do
+                # not turn an unmatched File value into authority for the registered selector.
+                # execute_assembly deliberately retains the historical unconditional reroute:
+                # its uploaded UUID path is unsafe on Merlin and was the original reason for this
+                # repair layer.
+                if _lower(command).replace("-", "_") == "inline_assembly" and not any(
+                    _lower(choice) == _lower(mapped[fcli])
+                    for choice in selector.get("choices") or []
+                ):
+                    continue
                 mapped[sel_cli] = mapped.pop(fcli)
                 for key, cli in list(sources.items()):
                     if cli == fcli:

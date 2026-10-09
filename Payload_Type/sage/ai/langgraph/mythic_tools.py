@@ -4245,9 +4245,13 @@ class MythicTools:
                 raise ValueError(error)
         parameters = self._bind_kerberos_ticket_artifact(command, parameters)
         name = self._registered_file_name_from_schema(command, parameters, schema)
+        file_identity = await self._validated_inline_assembly_file_identity(
+            command, schema, parameters, resolved_group
+        )
+        if name and file_identity is not None:
+            raise ValueError("task contains both registered and uploaded file selections")
         if name and not self._registered_file_available_in_schema(schema, name):
             raise ValueError(f"registered file {name!r} needs its own approval before this task")
-        file_identity = None
         if name:
             if (
                 isinstance(executable_binding, dict)
@@ -4272,7 +4276,10 @@ class MythicTools:
             raise ValueError("task visibility context must be an object")
         prepared_action_binding = {
             "schema_digest": _task_schema_digest(schema),
-            "group": self._parameter_group_to_declare(resolved_group, parameters, command=command),
+            "group": self._parameter_group_to_declare(
+                resolved_group, parameters, command=command,
+                schema=schema, file_identity=file_identity,
+            ),
             "file": file_identity,
         }
         if executable_binding is not None:
@@ -4705,6 +4712,104 @@ class MythicTools:
         if len(matches) > 1:
             raise ValueError("multiple registered executable selectors are present")
         return matches[0] if matches else ""
+
+    @staticmethod
+    def _selected_inline_assembly_file_parameter(
+        command: str, schema: Any, parameters: Any, group: Any,
+    ) -> dict[str, str] | None:
+        """Return the one schema-typed inline-assembly File binding in the selected group."""
+        if str(command or "").strip() != "inline_assembly":
+            return None
+        if not isinstance(schema, list) or not isinstance(parameters, Mapping):
+            return None
+        selected_group = str(group or "").strip()
+        if not selected_group or selected_group == "Default":
+            return None
+        matches = []
+        for parameter in schema:
+            if (
+                not isinstance(parameter, dict)
+                or str(parameter.get("parameter_group_name") or "Default") != selected_group
+                or str(parameter.get("type") or "").casefold() != "file"
+            ):
+                continue
+            keys = tuple(dict.fromkeys(
+                key for key in (parameter.get("cli_name"), parameter.get("name")) if key
+            ))
+            values = [(str(key), parameters[key]) for key in keys if key in parameters]
+            if len(values) > 1:
+                raise ValueError("inline assembly File parameter uses ambiguous aliases")
+            if len(values) == 1:
+                if type(values[0][1]) is not str or not values[0][1]:
+                    raise ValueError("inline assembly File parameter is empty or invalid")
+                matches.append({
+                    "group": selected_group,
+                    "cli_name": str(parameter.get("cli_name") or parameter.get("name") or ""),
+                    "name": str(parameter.get("name") or parameter.get("cli_name") or ""),
+                    "value": values[0][1],
+                })
+        if len(matches) > 1:
+            raise ValueError("inline assembly group contains multiple selected File parameters")
+        return matches[0] if matches else None
+
+    async def _validated_inline_assembly_file_identity(
+        self, command: str, schema: Any, parameters: Any, group: Any,
+    ) -> dict[str, Any] | None:
+        """Bind one complete operator upload selected through inline_assembly's File group."""
+        binding = self._selected_inline_assembly_file_parameter(
+            command, schema, parameters, group
+        )
+        if binding is None:
+            return None
+        try:
+            parsed = uuid.UUID(binding["value"])
+        except (ValueError, AttributeError):
+            raise ValueError("inline assembly File value is not a valid Mythic file UUID")
+        if str(parsed).casefold() != binding["value"].casefold():
+            raise ValueError("inline assembly File value is not a canonical Mythic file UUID")
+        metadata = await self._get_file_metadata(binding["value"])
+        if not isinstance(metadata, dict) or metadata.get("agent_file_id") != binding["value"]:
+            raise ValueError("inline assembly File UUID has no exact Mythic metadata identity")
+        if metadata.get("complete") is not True or metadata.get("deleted") is not False:
+            raise ValueError("inline assembly File is incomplete or deleted")
+        if metadata.get("is_payload") is not False or metadata.get("is_download_from_agent") is not False:
+            raise ValueError("inline assembly File must be a complete operator upload")
+        if type(metadata.get("id")) is not int or metadata["id"] <= 0:
+            raise ValueError("inline assembly File metadata has no exact row identity")
+        if not all(
+            type(metadata.get(key)) is str and metadata[key]
+            for key in ("filename_utf8", "md5", "sha1")
+        ):
+            raise ValueError("inline assembly File metadata or hash identity is incomplete")
+        content = await self._download_registered_file_bytes_bounded(binding["value"])
+        artifact_sha256 = hashlib.sha256(content).hexdigest()
+        try:
+            contract = executable_contracts.load_contract_for_artifact(
+                _EXECUTABLE_CONTRACT_ROOT, artifact_sha256
+            )
+        except executable_contracts.UnsupportedExecutableError as exc:
+            if executable_contracts.recognizes_executable_filename(
+                _EXECUTABLE_CONTRACT_ROOT, metadata["filename_utf8"]
+            ):
+                raise ValueError(
+                    "recognized executable filename has changed or unsupported bytes; use the "
+                    "registered selector and typed executable schema"
+                ) from exc
+            contract = None
+        if contract is not None:
+            raise ValueError(
+                "enrolled executable bytes must use the registered selector and typed "
+                "executable schema"
+            )
+        keys = (
+            "id", "agent_file_id", "filename_utf8", "md5", "sha1", "complete",
+            "deleted", "is_payload", "is_download_from_agent",
+        )
+        return {
+            **{key: metadata.get(key) for key in keys},
+            "sha256": artifact_sha256,
+            "parameter": binding,
+        }
 
     async def _validated_executable_parameters(
         self,
@@ -6142,6 +6247,8 @@ class MythicTools:
             if isinstance(visibility_context, dict)
             and visibility_context.get("_sage_prepared_action") is True else None
         )
+        current_schema = None
+        expected_inline_file = None
         if prepared_binding is not None:
             if not isinstance(prepared_binding, dict):
                 return self._note_effect_denial("STOP — prepared task binding is invalid")
@@ -6152,6 +6259,10 @@ class MythicTools:
                 if current_digest != prepared_binding.get("schema_digest"):
                     return self._note_effect_denial("STOP — task schema changed after approval")
                 expected_file = prepared_binding.get("file")
+                expected_inline_file = (
+                    expected_file if isinstance(expected_file, dict)
+                    and isinstance(expected_file.get("parameter"), dict) else None
+                )
                 expected_executable = prepared_binding.get("executable")
                 if expected_executable is not None:
                     if not isinstance(expected_executable, dict):
@@ -6165,7 +6276,7 @@ class MythicTools:
                         return self._note_effect_denial(
                             "STOP — executable artifact, contract, or invocation changed after approval"
                         )
-                else:
+                elif expected_inline_file is None:
                     selected_file = self._registered_file_name_from_schema(
                         command, parameters, current_schema
                     )
@@ -6206,6 +6317,8 @@ class MythicTools:
         # the answer depends on the parameters as they stand at that moment: the credential repair
         # path can turn raw material into a reference between the first attempt and the retry.
         resolved_parameter_group = None
+        param_schema = current_schema
+        issue_inline_file = None
 
         # Deterministic pre-flight: first repair prior-key names and group mixes against the
         # live schema, then keep the existing validator as the conservative hard stop.
@@ -6217,7 +6330,8 @@ class MythicTools:
                     if isinstance(transaction, _PrivateCollectionTransaction) and transaction.active_for(self)
                     else None
                 )
-                param_schema = await self._fetch_command_schema(command, callback_display_id)
+                if param_schema is None:
+                    param_schema = await self._fetch_command_schema(command, callback_display_id)
                 if param_schema:
                     original_parameters = dict(parameters)
                     resolved = command_builder.resolve_params(param_schema, parameters, command=command)
@@ -6292,6 +6406,22 @@ class MythicTools:
                     logger.info(f"🛡️ ARGRES failed_open command={command} reason=exception:{e}")
                 except Exception:
                     pass
+            try:
+                issue_inline_file = await self._validated_inline_assembly_file_identity(
+                    command, param_schema, parameters, resolved_parameter_group
+                )
+            except ValueError as exc:
+                if expected_inline_file is not None:
+                    return self._note_effect_denial(
+                        "STOP — inline assembly File identity changed after approval"
+                    )
+                return self._note_effect_denial(
+                    f"STOP — known executable construction failure: {exc}"
+                )
+            if expected_inline_file is not None and issue_inline_file != expected_inline_file:
+                return self._note_effect_denial(
+                    "STOP — inline assembly File identity changed after approval"
+                )
             _validation_error = await self._validate_command_parameters(command, parameters, callback_display_id)
             if _validation_error:
                 result_class = command_builder.classify_result(command, _validation_error)
@@ -6310,7 +6440,9 @@ class MythicTools:
         parameters = self._bind_kerberos_ticket_artifact(command, parameters)
         if prepared_binding is not None:
             declared_group = self._parameter_group_to_declare(
-                resolved_parameter_group, parameters, command=command)
+                resolved_parameter_group, parameters, command=command,
+                schema=param_schema, file_identity=issue_inline_file,
+            )
             if declared_group != prepared_binding.get("group"):
                 return self._note_effect_denial("STOP — task parameter group changed after approval")
         fail_key = self._task_failure_key(command, callback_display_id, parameters)
@@ -6459,7 +6591,8 @@ class MythicTools:
                         task = await self._issue_mythic_task(
                             command, parameters, callback_display_id, timeout=timeout,
                             parameter_group_name=self._parameter_group_to_declare(
-                                resolved_parameter_group, parameters, command=command
+                                resolved_parameter_group, parameters, command=command,
+                                schema=param_schema, file_identity=issue_inline_file,
                             ),
                         )  # token_id=token_id
                     except Exception as exc:
@@ -6480,7 +6613,8 @@ class MythicTools:
                             raise
                         parameters = repaired
                         if prepared_binding is not None and self._parameter_group_to_declare(
-                            resolved_parameter_group, parameters, command=command
+                            resolved_parameter_group, parameters, command=command,
+                            schema=param_schema, file_identity=issue_inline_file,
                         ) != prepared_binding.get("group"):
                             raise PermissionError("STOP — task parameter group changed after approval")
                         authority_blocker = self._turn_authority_issue_blocker(
@@ -6504,7 +6638,8 @@ class MythicTools:
                         task = await self._issue_mythic_task(
                             command, parameters, callback_display_id, timeout=timeout,
                             parameter_group_name=self._parameter_group_to_declare(
-                                resolved_parameter_group, parameters, command=command
+                                resolved_parameter_group, parameters, command=command,
+                                schema=param_schema, file_identity=issue_inline_file,
                             ),
                         )  # token_id=token_id
                     tdid = task.get("display_id") if isinstance(task, dict) else None
@@ -18087,8 +18222,8 @@ class MythicTools:
     async def _get_file_metadata(self, file_uuid: str) -> dict | None:
         """Look up filemeta for a Mythic file by its agent_file_id WITHOUT downloading the bytes.
 
-        Returns the filemeta dict (agent_file_id, complete, deleted, is_payload, filename_utf8,
-        chunks_received, total_chunks) or None if no file row matches the UUID. Used as a cheap
+        Returns the filemeta dict (id, agent_file_id, complete, deleted, is_payload, filename_utf8,
+        md5, sha1, chunks_received, total_chunks) or None if no file row matches the UUID. Used as a cheap
         pre-flight check so we don't pull multi-MB files into the agent process just to validate them.
         """
         if self.client is None:
@@ -18096,12 +18231,15 @@ class MythicTools:
         query = """
             query FileMetaByUuid($uuid: String!) {
                 filemeta(where: { agent_file_id: { _eq: $uuid } }, limit: 1) {
+                    id
                     agent_file_id
                     complete
                     deleted
                     is_payload
                     is_download_from_agent
                     filename_utf8
+                    md5
+                    sha1
                     chunks_received
                     total_chunks
                     task {
@@ -19235,7 +19373,10 @@ class MythicTools:
         return False
 
     @classmethod
-    def _parameter_group_to_declare(cls, group, parameters, *, command: str = "") -> str | None:
+    def _parameter_group_to_declare(
+        cls, group, parameters, *, command: str = "", schema: Any = None,
+        file_identity: Mapping[str, Any] | None = None,
+    ) -> str | None:
         """The parameter group worth declaring to Mythic, or None when declaring it would hurt.
 
         Two independent reasons to stay silent, and the second is the important one.
@@ -19250,7 +19391,9 @@ class MythicTools:
         arguments`. Sage must keep the raw form available, because an agent whose credentials are
         not in Mythic's store (Merlin, unlike Apollo) can only be tasked that way. So the group is
         declared only when the blob actually carries a reference for Mythic to expand. Raw
-        material takes the same path it always took.
+        material takes the same path it always took. The other declaration case is a schema-typed
+        inline_assembly File parameter whose exact uploaded-file identity was already validated;
+        that group selects Mythic's intended File transport rather than a reference expansion.
         """
         name = str(group or "").strip()
         carries_reference = cls._carries_task_reference(parameters)
@@ -19266,7 +19409,17 @@ class MythicTools:
                     "and the reference may reach the agent unresolved"
                 )
             return None
-        if not carries_reference:
+        selected_file = cls._selected_inline_assembly_file_parameter(
+            command, schema, parameters, group
+        )
+        bound_file = isinstance(file_identity, Mapping) and file_identity.get("parameter")
+        carries_bound_file = bool(
+            selected_file is not None
+            and isinstance(bound_file, Mapping)
+            and selected_file == bound_file
+            and file_identity.get("agent_file_id") == selected_file.get("value")
+        )
+        if not carries_reference and not carries_bound_file:
             return None
         return name
 

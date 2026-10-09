@@ -305,7 +305,10 @@ def test_multiple_proposals_keep_first_prepared_call_and_deferred_result(monkeyp
     assert len(model._request_contract.requested_actions) == 1
 
 
-@pytest.mark.parametrize("case", ["dcsync", "sharphound", "register_file", "register_assembly"])
+@pytest.mark.parametrize(
+    "case", ["dcsync", "sharphound", "inline_registered", "inline_file",
+             "register_file", "register_assembly"]
+)
 def test_native_approval_reaches_registered_task_sink_with_prepared_args(monkeypatch, tmp_path, case):
     """Checkpointed HITL resume carries prepared args through the real task tool."""
     monkeypatch.setattr(session, "_CHANNEL_MARKER_DB_PATH", str(tmp_path / "sage.db"))
@@ -315,13 +318,21 @@ def test_native_approval_reaches_registered_task_sink_with_prepared_args(monkeyp
         AssertionError("offline approval test attempted network access")))
     tools = _tools()
     issued = []
+    posted = []
     if case == "dcsync":
         raw, command, schema = copy.deepcopy(RAW), "dcsync", SCHEMA
-    elif case == "sharphound":
-        command = "execute_assembly"
+    elif case in {"sharphound", "inline_registered", "inline_file"}:
+        command = "execute_assembly" if case == "sharphound" else "inline_assembly"
+        file_uuid = "11111111-2222-4333-8444-555555555555"
         raw = {"command": command, "callback_display_id": 2, "timeout": 60,
-               "parameters": {"assembly_name": "SharpHound.exe",
-                              "assembly_arguments": r"-c All -o C:\Temp"}}
+               "parameters": (
+                   {"assembly_name": "SharpHound.exe",
+                    "assembly_arguments": r"-c All -o C:\Temp"}
+                   if case == "sharphound" else
+                   {"assembly_file": (
+                        "sharphound.EXE" if case == "inline_registered" else file_uuid
+                    ), "assembly_arguments": "triage"}
+               )}
         schema = [
             {"name": "assembly_name", "cli_name": "Assembly", "type": "ChooseOne",
              "parameter_group_name": "Default", "required": True,
@@ -348,7 +359,7 @@ def test_native_approval_reaches_registered_task_sink_with_prepared_args(monkeyp
     monkeypatch.setattr(tools, "_authenticate_live_command", AsyncMock(return_value={
         "status": "available", "command": command}))
     monkeypatch.setattr(tools, "_fetch_command_schema", AsyncMock(return_value=schema))
-    if case == "sharphound":
+    if case in {"sharphound", "inline_registered"}:
         monkeypatch.setattr(tools, "_find_uploaded_file_by_name", AsyncMock(return_value={
             "id": 77, "agent_file_id": "inert-file-77", "filename_utf8": "SharpHound.exe",
             "md5": "inert-md5", "sha1": "inert-sha1", "complete": True}))
@@ -356,6 +367,15 @@ def test_native_approval_reaches_registered_task_sink_with_prepared_args(monkeyp
             tools, "_download_registered_file_bytes_bounded",
             AsyncMock(return_value=b"inert unenrolled SharpHound bytes"),
         )
+    elif case == "inline_file":
+        monkeypatch.setattr(tools, "_resolve_payload_type", AsyncMock(return_value="apollo"))
+        monkeypatch.setattr(tools, "_get_file_metadata", AsyncMock(return_value={
+            "id": 88, "agent_file_id": file_uuid, "filename_utf8": "SharpDPAPI.exe",
+            "md5": "file-md5", "sha1": "file-sha1", "complete": True,
+            "deleted": False, "is_payload": False, "is_download_from_agent": False,
+        }))
+        monkeypatch.setattr(tools, "_download_registered_file_bytes_bounded",
+                            AsyncMock(return_value=b"unknown SharpDPAPI fixture bytes"))
     if case in {"register_file", "register_assembly"}:
         monkeypatch.setattr(tools, "_resolve_payload_type", AsyncMock(return_value="apollo"))
     else:
@@ -363,10 +383,21 @@ def test_native_approval_reaches_registered_task_sink_with_prepared_args(monkeyp
     monkeypatch.setattr(tools, "_callback_tasking_liveness_blocker", AsyncMock(return_value=None))
     monkeypatch.setattr(tools, "_ensure_registered_file_available", AsyncMock(return_value=None))
     monkeypatch.setattr(tools, "_engagement_issue_hook", AsyncMock(return_value=None))
-    async def inert_sink(command, parameters, callback_display_id, **kwargs):
-        issued.append((command, parameters, callback_display_id, kwargs))
-        raise RuntimeError("inert task sink reached")
-    monkeypatch.setattr(tools, "_issue_mythic_task", inert_sink)
+    if case == "inline_file":
+        async def inert_create_task(*, variables, **_kwargs):
+            posted.append(copy.deepcopy(variables))
+            return {"createTask": {"status": "success", "display_id": 901}}
+        monkeypatch.setattr(mythic_utilities, "graphql_post", inert_create_task)
+        monkeypatch.setattr(mythic, "waitfor_for_task_output",
+                            AsyncMock(return_value={"response": "inert completion"}))
+        monkeypatch.setattr(tools, "_supervised_task_state", AsyncMock(return_value={
+            "task_completed": True, "task_status": "completed",
+        }))
+    else:
+        async def inert_sink(command, parameters, callback_display_id, **kwargs):
+            issued.append((command, parameters, callback_display_id, kwargs))
+            raise RuntimeError("inert task sink reached")
+        monkeypatch.setattr(tools, "_issue_mythic_task", inert_sink)
     prompt = "Run the specified LAB check on callback 2."
     fake = driver.ScriptedModel(messages=iter([
         driver.call("transfer_to_Mythic_Operator", {
@@ -413,6 +444,17 @@ def test_native_approval_reaches_registered_task_sink_with_prepared_args(monkeyp
                     "Arguments": r"-c All --OutputDirectory C:\Temp",
                 }
                 assert card_args["visibility_context"]["_sage_prepared_binding"]["file"]["agent_file_id"] == "inert-file-77"
+            elif case == "inline_registered":
+                assert card_args["parameters"] == {
+                    "Assembly": "SharpHound.exe", "Arguments": "triage",
+                }
+                assert card_args["visibility_context"]["_sage_prepared_binding"]["group"] is None
+            elif case == "inline_file":
+                assert card_args["parameters"] == {
+                    "AssemblyFile": file_uuid, "Arguments": "triage",
+                }
+                assert card_args["visibility_context"]["_sage_prepared_binding"]["file"]["agent_file_id"] == file_uuid
+                assert card_args["visibility_context"]["_sage_prepared_binding"]["group"] == "New Assembly"
             else:
                 assert card_args["parameters"] == {"File": "11111111-2222-4333-8444-555555555555"}
                 assert card_args["visibility_context"]["_sage_prepared_binding"]["group"] is None
@@ -421,15 +463,198 @@ def test_native_approval_reaches_registered_task_sink_with_prepared_args(monkeyp
                                                               "autonomous_solve": False})
             second.InputResponse = driver.input_response("accept", cards[0])
             await chat.chat(second)
-            assert len(issued) == 1
-            assert issued[0][:3] == (command, card_args["parameters"], 2)
-            if case in {"register_file", "register_assembly"}:
+            if case == "inline_file":
+                task_posts = [variables for variables in posted if variables.get("command")]
+                assert len(task_posts) == 1
+                assert task_posts[0]["command"] == command
+                assert json.loads(task_posts[0]["params"]) == card_args["parameters"]
+                assert task_posts[0]["parameter_group_name"] == "New Assembly"
+            else:
+                assert len(issued) == 1
+                assert issued[0][:3] == (command, card_args["parameters"], 2)
+            if case in {"inline_registered", "register_file", "register_assembly"}:
                 # The Mythic transport omits the group variable for its Default group.
                 assert issued[0][3]["parameter_group_name"] is None
         finally:
             await session.drop_channel_session(first)
 
     asyncio.run(episode())
+
+
+@pytest.mark.parametrize("defect", [
+    "not_uuid", "missing", "uuid", "incomplete", "deleted", "payload", "download", "hash",
+])
+def test_inline_file_preparation_rejects_missing_or_wrong_file_identity(monkeypatch, defect):
+    tools = _tools()
+    file_uuid = "11111111-2222-4333-8444-555555555555"
+    schema = [
+        {"name": "assembly_name", "cli_name": "Assembly", "type": "ChooseOne",
+         "parameter_group_name": "Default", "required": True, "choices": ["Known.exe"]},
+        {"name": "assembly_arguments", "cli_name": "Arguments", "type": "String",
+         "parameter_group_name": "Default", "required": False, "choices": []},
+        {"name": "assembly_file", "cli_name": "AssemblyFile", "type": "File",
+         "parameter_group_name": "New Assembly", "required": True, "choices": []},
+        {"name": "assembly_arguments", "cli_name": "Arguments", "type": "String",
+         "parameter_group_name": "New Assembly", "required": False, "choices": []},
+    ]
+    identity = {
+        "id": 88, "agent_file_id": file_uuid, "filename_utf8": "Fresh.exe",
+        "md5": "md5", "sha1": "sha1", "complete": True, "deleted": False,
+        "is_payload": False, "is_download_from_agent": False,
+    }
+    if defect == "missing":
+        identity = None
+    elif defect == "uuid":
+        identity["agent_file_id"] = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    elif defect == "incomplete":
+        identity["complete"] = False
+    elif defect == "deleted":
+        identity["deleted"] = True
+    elif defect == "payload":
+        identity["is_payload"] = True
+    elif defect == "download":
+        identity["is_download_from_agent"] = True
+    elif defect == "hash":
+        identity["sha1"] = ""
+    monkeypatch.setattr(tools, "_authenticate_live_command", AsyncMock(return_value={
+        "status": "available", "command": "inline_assembly"}))
+    monkeypatch.setattr(tools, "_fetch_command_schema", AsyncMock(return_value=schema))
+    monkeypatch.setattr(tools, "_validate_command_parameters", AsyncMock(return_value=None))
+    metadata = AsyncMock(return_value=identity)
+    monkeypatch.setattr(tools, "_get_file_metadata", metadata)
+
+    async def probe():
+        return await tools._prepare_supervised_issue_action({
+            "command": "inline_assembly", "callback_display_id": 2,
+            "parameters": {"assembly_file": "not-a-uuid" if defect == "not_uuid" else file_uuid,
+                           "assembly_arguments": "triage"},
+        })
+
+    with pytest.raises(ValueError, match="inline assembly File"):
+        asyncio.run(probe())
+    if defect == "not_uuid":
+        metadata.assert_not_awaited()
+
+
+@pytest.mark.parametrize("drift", ["argument", "uuid", "hash", "bytes", "group", "schema"])
+def test_inline_file_postapproval_identity_drift_denies_before_sink(monkeypatch, drift):
+    tools = _tools()
+    file_uuid = "11111111-2222-4333-8444-555555555555"
+    schema = [
+        {"name": "assembly_name", "cli_name": "Assembly", "type": "ChooseOne",
+         "parameter_group_name": "Default", "required": True, "choices": ["Known.exe"]},
+        {"name": "assembly_arguments", "cli_name": "Arguments", "type": "String",
+         "parameter_group_name": "Default", "required": False, "choices": []},
+        {"name": "assembly_file", "cli_name": "AssemblyFile", "type": "File",
+         "parameter_group_name": "New Assembly", "required": True, "choices": []},
+        {"name": "assembly_arguments", "cli_name": "Arguments", "type": "String",
+         "parameter_group_name": "New Assembly", "required": False, "choices": []},
+    ]
+    identity = [{
+        "id": 88, "agent_file_id": file_uuid, "filename_utf8": "Fresh.exe",
+        "md5": "md5", "sha1": "sha1", "complete": True, "deleted": False,
+        "is_payload": False, "is_download_from_agent": False,
+    }]
+    monkeypatch.setattr(tools, "_authenticate_live_command", AsyncMock(return_value={
+        "status": "available", "command": "inline_assembly"}))
+    monkeypatch.setattr(tools, "_fetch_command_schema", AsyncMock(return_value=schema))
+    monkeypatch.setattr(tools, "_validate_command_parameters", AsyncMock(return_value=None))
+    monkeypatch.setattr(tools, "_get_file_metadata",
+                        AsyncMock(side_effect=lambda _uuid: copy.deepcopy(identity[0])))
+    content = [b"unknown assembly fixture bytes"]
+    monkeypatch.setattr(tools, "_download_registered_file_bytes_bounded",
+                        AsyncMock(side_effect=lambda _uuid: content[0]))
+    monkeypatch.setattr(tools, "_callback_tasking_liveness_blocker", AsyncMock(return_value=None))
+    monkeypatch.setattr(tools, "_ensure_registered_file_available", AsyncMock(return_value=None))
+    monkeypatch.setattr(tools, "_engagement_issue_hook", AsyncMock(return_value=None))
+    sink = AsyncMock(side_effect=AssertionError("drifted inline File reached sink"))
+    monkeypatch.setattr(tools, "_issue_mythic_task", sink)
+
+    async def probe():
+        prepared = await tools._prepare_supervised_issue_action({
+            "command": "inline_assembly", "callback_display_id": 2,
+            "parameters": {"assembly_file": file_uuid, "assembly_arguments": "triage"},
+        })
+        _claim(tools, {"name": TOOL, "args": prepared})
+        if drift == "argument":
+            prepared["parameters"]["AssemblyFile"] = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        elif drift == "uuid":
+            identity[0]["agent_file_id"] = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        elif drift == "hash":
+            identity[0]["md5"] = "new-md5"
+        elif drift == "bytes":
+            content[0] = b"changed unknown assembly fixture bytes"
+        elif drift == "group":
+            schema[2]["parameter_group_name"] = "Other Assembly"
+        else:
+            schema[2]["required"] = False
+        return await tools.issue_task_and_waitfor_task_output(**prepared)
+
+    result = asyncio.run(probe())
+    if drift == "argument":
+        assert "does not cover this exact effect" in result
+    elif drift in {"group", "schema"}:
+        assert "task schema changed after approval" in result
+    else:
+        assert "inline assembly File identity changed after approval" in result
+    sink.assert_not_awaited()
+
+
+@pytest.mark.parametrize("valid_identity", [True, False])
+def test_unprepared_inline_file_issue_validates_identity_before_grouped_sink(
+    monkeypatch, valid_identity,
+):
+    tools = _tools()
+    file_uuid = "11111111-2222-4333-8444-555555555555"
+    parameters = {"assembly_file": file_uuid, "assembly_arguments": "triage"}
+    action_args = {
+        "command": "inline_assembly", "callback_display_id": 2,
+        "parameters": parameters, "timeout": 60, "token_id": None,
+    }
+    schema = [
+        {"name": "assembly_name", "cli_name": "Assembly", "type": "ChooseOne",
+         "parameter_group_name": "Default", "required": True, "choices": ["Known.exe"]},
+        {"name": "assembly_arguments", "cli_name": "Arguments", "type": "String",
+         "parameter_group_name": "Default", "required": False, "choices": []},
+        {"name": "assembly_file", "cli_name": "AssemblyFile", "type": "File",
+         "parameter_group_name": "New Assembly", "required": True, "choices": []},
+        {"name": "assembly_arguments", "cli_name": "Arguments", "type": "String",
+         "parameter_group_name": "New Assembly", "required": False, "choices": []},
+    ]
+    identity = ({
+        "id": 88, "agent_file_id": file_uuid, "filename_utf8": "Fresh.exe",
+        "md5": "md5", "sha1": "sha1", "complete": True, "deleted": False,
+        "is_payload": False, "is_download_from_agent": False,
+    } if valid_identity else None)
+    monkeypatch.setattr(tools, "_authenticate_live_command", AsyncMock(return_value={
+        "status": "available", "command": "inline_assembly"}))
+    monkeypatch.setattr(tools, "_fetch_command_schema", AsyncMock(return_value=schema))
+    monkeypatch.setattr(tools, "_validate_command_parameters", AsyncMock(return_value=None))
+    monkeypatch.setattr(tools, "_get_file_metadata", AsyncMock(return_value=identity))
+    monkeypatch.setattr(tools, "_download_registered_file_bytes_bounded",
+                        AsyncMock(return_value=b"unknown assembly fixture bytes"))
+    monkeypatch.setattr(tools, "_callback_tasking_liveness_blocker", AsyncMock(return_value=None))
+    monkeypatch.setattr(tools, "_ensure_registered_file_available", AsyncMock(return_value=None))
+    monkeypatch.setattr(tools, "_engagement_issue_hook", AsyncMock(return_value=None))
+    seen = []
+
+    async def sink(command, resolved, callback_display_id, **kwargs):
+        seen.append((command, resolved, callback_display_id, kwargs))
+        raise RuntimeError("inert task sink reached")
+
+    monkeypatch.setattr(tools, "_issue_mythic_task", sink)
+    _claim(tools, {"name": TOOL, "args": action_args})
+    result = asyncio.run(tools.issue_task_and_waitfor_task_output(**action_args))
+
+    if valid_identity:
+        assert len(seen) == 1
+        assert seen[0][:3] == (
+            "inline_assembly", {"AssemblyFile": file_uuid, "Arguments": "triage"}, 2,
+        )
+        assert seen[0][3]["parameter_group_name"] == "New Assembly"
+    else:
+        assert "inline assembly File UUID has no exact Mythic metadata identity" in result
+        assert seen == []
 
 
 @pytest.mark.parametrize("drift", ["schema", "file"])
