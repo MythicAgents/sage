@@ -28,6 +28,29 @@ assert ORCHESTRATE_SPEC and ORCHESTRATE_SPEC.loader
 ORCHESTRATE_SPEC.loader.exec_module(orchestrate)
 
 
+@pytest.fixture(scope="module", autouse=True)
+def isolate_development_row_import():
+    """Restore the legacy kernel import loaded by row diagnostics."""
+    from ai import hillclimb
+
+    module_name = "ai.hillclimb.development_row_kernel"
+    child_name = "development_row_kernel"
+    missing = object()
+    module_before = sys.modules.get(module_name, missing)
+    child_before = vars(hillclimb).get(child_name, missing)
+    try:
+        yield
+    finally:
+        if module_before is missing:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = module_before
+        if child_before is missing:
+            vars(hillclimb).pop(child_name, None)
+        else:
+            vars(hillclimb)[child_name] = child_before
+
+
 def test_gate1p_exact_child_command_parses_help_without_pythonpath():
     payload_root = ROOT / "Payload_Type" / "sage"
     result = subprocess.run(
