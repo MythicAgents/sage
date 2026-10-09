@@ -18919,7 +18919,7 @@ class MythicTools:
                           command {
                             cmd
                             commandparameters {
-                              name cli_name type description default_value choices dynamic_query_function parameter_group_name required
+                              name cli_name type description default_value choices dynamic_query_function parameter_group_name required verifier_regex
                             }
                             description
                             help_cmd
@@ -18974,6 +18974,7 @@ class MythicTools:
             dynamic_query_function
             parameter_group_name
             required
+            verifier_regex
             }
             description
             help_cmd

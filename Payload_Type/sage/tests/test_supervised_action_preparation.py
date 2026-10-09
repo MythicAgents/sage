@@ -3,6 +3,7 @@
 import asyncio
 import copy
 import json
+import re
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -490,3 +491,84 @@ def test_postapproval_binding_drift_denies_real_issue_before_sink(monkeypatch, d
     sink.assert_not_awaited()
     if drift == "schema":
         assert upstream.await_count == 2
+
+
+@pytest.mark.parametrize("surface", ["callback", "payload_fallback"])
+@pytest.mark.parametrize("regex", ["", r"^.{1,80}$"])
+@pytest.mark.parametrize("change", [None, "verifier_regex", "required", "type", "parameter_group_name"])
+def test_registered_file_seeded_schema_matches_forced_sdk_before_approved_sink(
+    monkeypatch, surface, regex, change,
+):
+    """The live-surface query and SDK refresh must hash the same internal fields."""
+    tools = _tools()
+    monkeypatch.setattr(tools, "_resolve_payload_type", AsyncMock(return_value="apollo"))
+    monkeypatch.setattr(command_parameter_schema, "DEFAULT_RESOLVER",
+                        command_parameter_schema.CommandSchemaResolver())
+    rows = [
+        {"name": "file", "cli_name": "File", "type": "File", "description": "",
+         "parameter_group_name": "Default", "required": True, "choices": [],
+         "default_value": "", "dynamic_query_function": "", "verifier_regex": regex},
+        {"name": "existingFile", "cli_name": "existingFile", "type": "ChooseOne",
+         "description": "", "parameter_group_name": "Use Existing File", "required": True,
+         "choices": [], "default_value": "", "dynamic_query_function": "get_files",
+         "verifier_regex": ""},
+    ]
+    current = copy.deepcopy(rows)
+
+    def projected(query):
+        selection = re.search(r"commandparameters\s*\{([^{}]+)\}", query)
+        assert selection, "fake backend requires an explicit command-parameter selection"
+        keys = set(selection.group(1).split())
+        return [{key: value for key, value in row.items() if key in keys} for row in rows]
+
+    async def callback_query(_client, query, **_kwargs):
+        if surface == "payload_fallback":
+            return {"callback": []}
+        return {"callback": [{"payload": {"payloadtype": {"name": "apollo"}},
+                              "loadedcommands": [{"command": {
+                                  "cmd": "register_assembly",
+                                  "commandparameters": projected(query),
+                              }}]}]}
+
+    async def fallback_commands(_client, _payload, attr):
+        return [{"cmd": "register_assembly", "commandparameters": projected(attr)}]
+
+    async def sdk_schema(**_kwargs):
+        return {
+            "Default": {"parameters": [copy.deepcopy(current[0])]},
+            "Use Existing File": {"parameters": [copy.deepcopy(current[1])]},
+        }
+
+    monkeypatch.setattr(mythic, "execute_custom_query", callback_query)
+    monkeypatch.setattr(mythic, "get_all_commands_for_payloadtype", fallback_commands)
+    monkeypatch.setattr(mythic, "get_command_parameter_options", sdk_schema)
+    monkeypatch.setattr(tools, "_callback_tasking_liveness_blocker", AsyncMock(return_value=None))
+    monkeypatch.setattr(tools, "_ensure_registered_file_available", AsyncMock(return_value=None))
+    monkeypatch.setattr(tools, "_engagement_issue_hook", AsyncMock(return_value=None))
+    sink = AsyncMock(side_effect=RuntimeError("inert task sink reached"))
+    monkeypatch.setattr(tools, "_issue_mythic_task", sink)
+
+    async def probe():
+        payload, surface_commands, error = await tools._fetch_live_command_surface(5)
+        assert payload == "apollo" and not error and surface_commands
+        prepared = await tools._prepare_supervised_issue_action({
+            "command": "register_assembly", "callback_display_id": 5, "timeout": 120,
+            "parameters": {"file": "11111111-2222-4333-8444-555555555555"},
+        })
+        assert prepared["parameters"] == {"File": "11111111-2222-4333-8444-555555555555"}
+        _claim(tools, {"name": TOOL, "args": prepared})
+        if change:
+            current[0][change] = {
+                "verifier_regex": r"^[A-Z]+$", "required": False,
+                "type": "String", "parameter_group_name": "Alternate",
+            }[change]
+        return await tools.issue_task_and_waitfor_task_output(**prepared)
+
+    result = asyncio.run(probe())
+    if change is None:
+        assert "schema changed after approval" not in result
+        sink.assert_awaited_once()
+        assert "inert task sink reached" in result
+    else:
+        sink.assert_not_awaited()
+        assert "schema changed after approval" in result
