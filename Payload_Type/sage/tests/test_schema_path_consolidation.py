@@ -221,7 +221,8 @@ def test_seeded_cache_entries_match_a_direct_fetch_shape():
     rows = [
         {"name": "domain", "cli_name": "Domain", "type": "String", "required": True,
          "choices": None, "parameter_group_name": "Default", "default_value": "",
-         "verifier_regex": "", "description": "dropped by the internal projection",
+         "verifier_regex": "", "dynamic_query_function": "",
+         "description": "dropped by the internal projection",
          "id": 98, "ui_position": 1},
     ]
     tools._seed_command_schema_cache("apollo", [{"cmd": "pth", "commandparameters": rows}])
@@ -233,7 +234,7 @@ def test_seeded_cache_entries_match_a_direct_fetch_shape():
         )
     )
     assert sorted(entry[0]) == sorted(schema.INTERNAL_SCHEMA_FIELDS), (
-        "the seeded entry must carry exactly the seven keys the internal contract promises"
+        "the seeded entry must carry every field the internal contract promises"
     )
     assert "description" not in entry[0] and "id" not in entry[0]
 

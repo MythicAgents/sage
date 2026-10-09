@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from ai.langgraph import command_builder, executable_contracts, mythic_tools
+from ai.langgraph import command_builder, command_parameter_schema, executable_contracts, mythic_tools
 from ai.langgraph.mythic_tools import MythicTools
 
 
@@ -39,6 +39,131 @@ def _schema(*filenames: str):
             "choices": [], "parameter_group_name": "New Assembly", "required": False,
         },
     ]
+
+
+def _apollo_dynamic_schema():
+    """Apollo's real execute_assembly projection: get_files populates empty choices."""
+    schema = _schema()
+    schema[0]["dynamic_query_function"] = "get_files"
+    return schema
+
+
+def test_apollo_dynamic_choices_enroll_and_reject_changed_choices(tmp_path, monkeypatch):
+    client, _, _, _, _ = _fixture(tmp_path, monkeypatch)
+    client._fetch_command_schema = MythicTools._fetch_command_schema.__get__(client, MythicTools)
+    monkeypatch.setattr(command_parameter_schema, "DEFAULT_RESOLVER",
+                        command_parameter_schema.CommandSchemaResolver())
+    raw = _apollo_dynamic_schema()
+    for index, param in enumerate(raw):
+        param.update(id=65 + index, ui_position=index % 2 + 1,
+                     description="Captured Apollo command parameter",
+                     display_name=param["cli_name"], default_value="", verifier_regex="")
+        param.setdefault("dynamic_query_function", "")
+    producer = {
+        "Default": {"example": "Apollo dynamic selector", "parameters": raw[:2]},
+        "New Assembly": {"example": "Apollo file upload", "parameters": raw[2:]},
+    }
+    monkeypatch.setattr(mythic_tools.mythic, "get_command_parameter_options",
+                        AsyncMock(return_value=producer))
+    choices = ["Certify.exe"]
+
+    async def dynamic_query(_client, query, variables):
+        assert "dynamicQueryFunction" in query
+        assert variables == {
+            "callback_display_id": 7, "command": "execute_assembly",
+            "payload_type": "apollo", "parameter_name": "assembly_name",
+            "other_parameters": {},
+        }
+        return {"dynamicQueryFunction": {
+            "status": "success", "parameter_name": "assembly_name",
+            "choices": list(choices), "complex_choices": [],
+        }}
+
+    monkeypatch.setattr(mythic_tools.mythic, "execute_custom_query", dynamic_query)
+    enrolled = asyncio.run(client._select_enrolled_executable(
+        "apollo", "execute_assembly", 7, "Certify.exe", "enum-cas"
+    ))
+    assert enrolled["status"] == "enrolled"
+    prepared = asyncio.run(client._prepare_supervised_issue_action({
+        "command": "execute_assembly", "callback_display_id": 7,
+        "parameters": {"Assembly": "Certify.exe", "Arguments": {
+            "verb": "enum-cas", "options": {},
+        }},
+    }))
+    assert prepared["parameters"] == {
+        "Assembly": "Certify.exe", "Arguments": "enum-cas",
+    }
+    cached = client._cmd_schema_cache[("apollo", "execute_assembly")]
+    assert cached[0]["choices"] == []
+    with patch.object(client, "_turn_authority_issue_blocker", return_value=""), patch.object(
+        client, "_issue_mythic_task", AsyncMock(return_value={"display_id": 11})
+    ) as issue, patch.object(mythic_tools.mythic, "waitfor_for_task_output", AsyncMock(
+        return_value="enumerated"
+    )):
+        result = asyncio.run(client.issue_task_and_waitfor_task_output(**prepared))
+    assert "enumerated" in result
+    assert issue.call_count == 1
+    assert issue.call_args.args[:3] == (
+        "execute_assembly", {"Assembly": "Certify.exe", "Arguments": "enum-cas"}, 7,
+    )
+    assert cached[0]["choices"] == []
+    choices.clear()
+    with patch.object(client, "_turn_authority_issue_blocker", return_value=""), patch.object(
+        mythic_tools.mythic, "issue_task", AsyncMock()
+    ) as issue:
+        result = asyncio.run(client.issue_task_and_waitfor_task_output(**prepared))
+    assert "schema changed after approval" in result
+    issue.assert_not_called()
+
+
+@pytest.mark.parametrize("response", [
+    {"status": "error", "parameter_name": "assembly_name", "choices": ["Certify.exe"]},
+    {"status": "success", "parameter_name": "assembly_name", "choices": []},
+    {"status": "success", "parameter_name": "wrong", "choices": ["Certify.exe"]},
+    {"status": "success", "parameter_name": "assembly_name", "choices": [1]},
+    {"status": "success", "parameter_name": "assembly_name", "choices": ["Other.exe"]},
+])
+def test_apollo_dynamic_choices_deny_missing_or_invalid_selection(tmp_path, monkeypatch, response):
+    client, _, _, _, _ = _fixture(tmp_path, monkeypatch)
+    client._fetch_command_schema = AsyncMock(return_value=_apollo_dynamic_schema())
+    monkeypatch.setattr(mythic_tools.mythic, "execute_custom_query", AsyncMock(
+        return_value={"dynamicQueryFunction": response}
+    ))
+    result = asyncio.run(client._select_enrolled_executable(
+        "apollo", "execute_assembly", 7, "Certify.exe", "enum-cas"
+    ))
+    assert result["status"] == "unsupported"
+    assert client.get_enrolled_issue_schema() is None
+
+
+def test_dynamic_selector_reaches_existing_verb_contract(tmp_path, monkeypatch):
+    client, _, _, _, _ = _fixture(tmp_path, monkeypatch)
+    client._fetch_command_schema = AsyncMock(return_value=_apollo_dynamic_schema())
+    monkeypatch.setattr(mythic_tools.mythic, "execute_custom_query", AsyncMock(
+        return_value={"dynamicQueryFunction": {
+            "status": "success", "parameter_name": "assembly_name", "choices": ["Certify.exe"],
+        }}
+    ))
+    result = asyncio.run(client._select_enrolled_executable(
+        "apollo", "execute_assembly", 7, "Certify.exe", "find"
+    ))
+    assert result["status"] == "unsupported"
+    assert "verb" in result["error"].lower()
+
+
+def test_dynamic_choice_query_failure_denies_before_file_download(tmp_path, monkeypatch):
+    client, _, _, _, _ = _fixture(tmp_path, monkeypatch)
+    client._fetch_command_schema = AsyncMock(return_value=_apollo_dynamic_schema())
+    client._download_registered_file_bytes_bounded.reset_mock()
+    monkeypatch.setattr(mythic_tools.mythic, "execute_custom_query", AsyncMock(
+        side_effect=RuntimeError("control plane unavailable")
+    ))
+    result = asyncio.run(client._select_enrolled_executable(
+        "apollo", "execute_assembly", 7, "Certify.exe", "enum-cas"
+    ))
+    assert result["status"] == "unsupported"
+    assert "choices are unavailable" in result["error"]
+    client._download_registered_file_bytes_bounded.assert_not_called()
 
 
 def _fixture(tmp_path: Path, monkeypatch, *, filenames=("Certify.exe",), contents=None):

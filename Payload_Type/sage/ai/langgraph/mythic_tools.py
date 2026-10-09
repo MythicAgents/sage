@@ -4206,7 +4206,7 @@ class MythicTools:
                 command, live.get("payload_type"), callback_id))
         if live.get("status") == "available" and live.get("command"):
             command = live["command"]
-        schema = await self._fetch_command_schema(command, callback_id)
+        schema = await self._fetch_enrolled_executable_schema(command, callback_id)
         if schema is None:
             raise ValueError("task schema is unavailable; approval requires a known command schema")
         executable_binding = None
@@ -4512,7 +4512,7 @@ class MythicTools:
             if live.get("status") != "available" or not live.get("command"):
                 raise ValueError("command is not available on the exact callback")
             canonical_command = str(live["command"])
-            schema = await self._fetch_command_schema(
+            schema = await self._fetch_enrolled_executable_schema(
                 canonical_command, callback_display_id, force_refresh=True
             )
             wrapper = self._executable_wrapper_binding(canonical_command, schema, filename)
@@ -4569,6 +4569,71 @@ class MythicTools:
         except Exception as exc:
             self._enrolled_issue_selection = None
             return {"status": "unsupported", "error": str(exc)}
+
+    async def _fetch_enrolled_executable_schema(
+        self, command: str, callback_display_id: int, *, force_refresh: bool = False
+    ) -> Any:
+        """Add Mythic's current Apollo file choices to a transient wrapper schema."""
+        schema = (
+            await self._fetch_command_schema(
+                command, callback_display_id, force_refresh=True
+            ) if force_refresh else
+            await self._fetch_command_schema(command, callback_display_id)
+        )
+        if command not in {"execute_assembly", "inline_assembly"} or not isinstance(schema, list):
+            return schema
+        selectors = [
+            param for param in self._registered_file_selectors(schema)
+            if param.get("name") == "assembly_name"
+            and param.get("dynamic_query_function") == "get_files"
+        ]
+        if not selectors:
+            return schema
+        if self.client is None:
+            raise ValueError("Mythic client is unavailable for executable choices")
+        payload_type = await self._resolve_payload_type(callback_display_id)
+        if str(payload_type or "").casefold() != "apollo":
+            raise ValueError("dynamic executable choices require an Apollo callback")
+        if len(selectors) != 1:
+            raise ValueError("registered executable selector/group is ambiguous")
+        query = """
+            mutation SageExecutableChoices(
+                $callback_display_id: Int!, $command: String!, $payload_type: String!,
+                $parameter_name: String!, $other_parameters: jsonb
+            ) {
+                dynamicQueryFunction(
+                    callback_display_id: $callback_display_id, command: $command,
+                    payload_type: $payload_type, parameter_name: $parameter_name,
+                    other_parameters: $other_parameters
+                ) { status error choices parameter_name }
+            }
+        """
+        selector = selectors[0]
+        try:
+            response = await mythic.execute_custom_query(
+                self.client, query, variables={
+                    "callback_display_id": callback_display_id,
+                    "command": command,
+                    "payload_type": payload_type,
+                    "parameter_name": selector["name"],
+                    "other_parameters": {},
+                },
+            )
+        except Exception as exc:
+            raise ValueError("Mythic executable choices are unavailable") from exc
+        result = response.get("dynamicQueryFunction") if isinstance(response, dict) else None
+        choices = result.get("choices") if isinstance(result, dict) else None
+        if (
+            not isinstance(result, dict)
+            or result.get("status") != "success"
+            or result.get("parameter_name") != selector["name"]
+            or not isinstance(choices, list)
+            or not all(type(choice) is str and choice for choice in choices)
+        ):
+            raise ValueError("Mythic executable choices are unavailable or malformed")
+        hydrated = copy.deepcopy(schema)
+        hydrated[schema.index(selector)]["choices"] = choices
+        return hydrated
 
     def _executable_wrapper_binding(
         self, command: str, schema: Any, filename: str
@@ -6019,7 +6084,7 @@ class MythicTools:
         executable_binding = None
         try:
             executable_schema = (
-                await self._fetch_command_schema(command, callback_display_id)
+                await self._fetch_enrolled_executable_schema(command, callback_display_id)
                 if str(command or "").strip() in {"execute_assembly", "inline_assembly"}
                 else None
             )
@@ -6075,7 +6140,7 @@ class MythicTools:
             if not isinstance(prepared_binding, dict):
                 return self._note_effect_denial("STOP — prepared task binding is invalid")
             try:
-                current_schema = await self._fetch_command_schema(
+                current_schema = await self._fetch_enrolled_executable_schema(
                     command, callback_display_id, force_refresh=True)
                 current_digest = hashlib.sha256(json.dumps(
                     current_schema, sort_keys=True, default=str).encode()).hexdigest()
@@ -8942,7 +9007,7 @@ class MythicTools:
         """
         if not isinstance(parameters, dict) or not parameters:
             return
-        schema = await self._fetch_command_schema(command, callback_display_id)
+        schema = await self._fetch_enrolled_executable_schema(command, callback_display_id)
         name = self._registered_file_name_from_schema(command, parameters, schema)
         if not name:
             return
@@ -18854,7 +18919,7 @@ class MythicTools:
                           command {
                             cmd
                             commandparameters {
-                              name cli_name type description default_value choices parameter_group_name required
+                              name cli_name type description default_value choices dynamic_query_function parameter_group_name required
                             }
                             description
                             help_cmd
@@ -18906,6 +18971,7 @@ class MythicTools:
             description
             default_value
             choices
+            dynamic_query_function
             parameter_group_name
             required
             }
@@ -19270,7 +19336,7 @@ class MythicTools:
         could not distinguish from a real empty answer, so validation silently failed open.
 
         The RETURN CONTRACT is deliberately unchanged: a flat list of parameter dicts carrying the
-        same seven keys the old query selected, empty values included. That is not a preference —
+        original keys plus verifier and dynamic-selector metadata, empty values included. That is not a preference —
         this function has nine production callers and is stubbed in roughly seventy tests, all of
         which expect that shape. Grouping is consumed directly from the resolver by
         `_validate_command_parameters`, which is the one caller that wants it.
