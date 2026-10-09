@@ -6608,7 +6608,9 @@ class MythicTools:
                         or self._private_collection_transaction_active()
                     )
                     task_state = (
-                        await self._supervised_task_state(tdid, callback_display_id, command)
+                        await self._supervised_task_state(
+                            tdid, callback_display_id, command, parameters
+                        )
                         if completion_evidence_required else {}
                     )
                     if isinstance(issuance_receipt, dict):
@@ -17982,6 +17984,7 @@ class MythicTools:
 
     async def _supervised_task_state(
         self, task_display_id: int, callback_display_id: int, command: str,
+        parameters: str | dict | None = None,
     ) -> dict[str, Any]:
         """Observe one issued task's state; missing or mismatched metadata stays unknown."""
         unknown = {"task_completed": None, "task_status": ""}
@@ -17993,7 +17996,8 @@ class MythicTools:
             result = await asyncio.wait_for(mythic.execute_custom_query(
                 self.client,
                 "query supervisedTaskState($id:Int!){ task(where:{display_id:{_eq:$id}}){ "
-                "display_id completed status command_name callback { display_id } } }",
+                "display_id completed status command_name original_params display_params "
+                "callback { display_id } } }",
                 variables={"id": task_id},
             ), timeout=5.0)
             rows = result.get("task", []) if isinstance(result, dict) else []
@@ -18001,11 +18005,22 @@ class MythicTools:
                 return unknown
             row = rows[0]
             callback = row.get("callback")
+            # Apollo's shell alias returns CommandName="run" during task creation. Bind
+            # that rewrite to the exact command line originally issued and displayed;
+            # no other command rename or absent parameter evidence is accepted.
+            command_matches = row.get("command_name") == command or (
+                command == "shell"
+                and row.get("command_name") == "run"
+                and isinstance(parameters, str)
+                and bool(parameters)
+                and row.get("original_params") == parameters
+                and row.get("display_params") == parameters
+            )
             if (
                 self._exact_task_display_id(row.get("display_id")) != task_id
                 or not isinstance(callback, dict)
                 or self._exact_task_display_id(callback.get("display_id")) != callback_id
-                or row.get("command_name") != command
+                or not command_matches
                 or type(row.get("completed")) is not bool
             ):
                 return unknown

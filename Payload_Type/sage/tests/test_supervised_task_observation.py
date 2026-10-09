@@ -60,6 +60,110 @@ def test_query_failure_is_unknown():
         assert asyncio.run(mt._supervised_task_state(4242, 11, "whoami"))["task_completed"] is None
 
 
+SHELL_TEXT = 'tasklist /v /fo csv | findstr /i "sql mssql spoolsv services.exe winlogon lsass"'
+
+
+@pytest.mark.parametrize("changes,expected", [
+    ({}, True),
+    ({"display_id": 4243}, False),
+    ({"callback": {"display_id": 12}}, False),
+    ({"command_name": "powershell"}, False),
+    ({"original_params": "whoami"}, False),
+    ({"display_params": "whoami"}, False),
+    ({"original_params": SHELL_TEXT + " "}, False),
+    ({"display_params": SHELL_TEXT.upper()}, False),
+    ({"original_params": None}, False),
+    ({"display_params": None}, False),
+])
+def test_shell_run_observation_requires_exact_native_task_binding(changes, expected):
+    mt = _make_tools()
+    row = _row(**{"command_name": "run", "original_params": SHELL_TEXT,
+                  "display_params": SHELL_TEXT, "status": "success", **changes})
+    with patch.object(mythic_tools.mythic, "execute_custom_query",
+                      AsyncMock(return_value={"task": [row]})):
+        state = asyncio.run(mt._supervised_task_state(4242, 11, "shell", SHELL_TEXT))
+    assert state == ({"task_completed": True, "task_status": "success"} if expected else
+                     {"task_completed": None, "task_status": ""})
+
+
+@pytest.mark.parametrize("command,parameters", [
+    ("run", SHELL_TEXT), ("shell", "whoami"), ("whoami", SHELL_TEXT),
+    ("shell", None), ("shell", ""), ("shell", {"command": SHELL_TEXT}),
+])
+def test_shell_run_observation_limits_renamed_actions(command, parameters):
+    mt = _make_tools()
+    row = _row(command_name="run", original_params=SHELL_TEXT, display_params=SHELL_TEXT)
+    with patch.object(mythic_tools.mythic, "execute_custom_query",
+                      AsyncMock(return_value={"task": [row]})):
+        state = asyncio.run(mt._supervised_task_state(4242, 11, command, parameters))
+    expected = ({"task_completed": True, "task_status": "completed"} if command == "run"
+                else {"task_completed": None, "task_status": ""})
+    assert state == expected
+
+
+def test_run_request_does_not_accept_a_shell_named_task():
+    mt = _make_tools()
+    with patch.object(mythic_tools.mythic, "execute_custom_query",
+                      AsyncMock(return_value={"task": [_row(
+                          command_name="shell", original_params=SHELL_TEXT,
+                          display_params=SHELL_TEXT)]})):
+        state = asyncio.run(mt._supervised_task_state(4242, 11, "run", SHELL_TEXT))
+    assert state == {"task_completed": None, "task_status": ""}
+
+
+@pytest.mark.parametrize("completed,status", [
+    (False, "processing"), (True, "error"), (True, "success"),
+])
+def test_shell_run_observation_preserves_native_terminal_state(completed, status):
+    mt = _make_tools()
+    with patch.object(mythic_tools.mythic, "execute_custom_query",
+                      AsyncMock(return_value={"task": [_row(
+                          command_name="run", original_params=SHELL_TEXT,
+                          display_params=SHELL_TEXT, completed=completed, status=status)]})):
+        state = asyncio.run(mt._supervised_task_state(4242, 11, "shell", SHELL_TEXT))
+    assert state == {"task_completed": completed, "task_status": status}
+
+
+def test_exact_command_name_keeps_existing_observation_without_parameter_fields():
+    mt = _make_tools()
+    with patch.object(mythic_tools.mythic, "execute_custom_query",
+                      AsyncMock(return_value={"task": [_row(command_name="shell")]})):
+        state = asyncio.run(mt._supervised_task_state(4242, 11, "shell", SHELL_TEXT))
+    assert state == {"task_completed": True, "task_status": "completed"}
+
+
+def test_issued_shell_observes_native_run_with_exact_parameters():
+    mt = _make_tools()
+    mt._request_contract = SimpleNamespace(request_id="r", digest="d")
+    mt._active_approval_claim = {"request_id": "r", "request_contract_digest": "d",
+                                 "approval_id": "a"}
+    events = []
+    mt.set_execution_observer(lambda event: events.append(event.copy()))
+    issue = AsyncMock(return_value={"display_id": 4242})
+    query = AsyncMock(return_value={"task": [_row(
+        command_name="run", original_params=SHELL_TEXT, display_params=SHELL_TEXT,
+        status="success") ]})
+    with patch.object(mythic_tools.mythic, "issue_task", issue), \
+         patch.object(mythic_tools.mythic, "waitfor_for_task_output",
+                      AsyncMock(return_value="process rows")), \
+         patch.object(mythic_tools.mythic, "execute_custom_query", query), \
+         patch.object(mythic_tools, "assess_callback_liveness", AsyncMock(return_value={
+             "status": "alive", "reason": "",
+         })), \
+         patch.object(mt, "_turn_authority_issue_blocker", return_value=""), \
+         patch.object(mt, "_bind_contract_task_issue_parameters", return_value=""):
+        result = asyncio.run(_invoke_registered(mt, "shell", 11, timeout=60,
+                                                parameters=SHELL_TEXT))
+    assert "task_display_id=4242 callback_display_id=11 requested_command=shell" in result
+    assert 'task_completed=true task_status="success" observation=observed' in result
+    assert "process rows" in result
+    assert issue.call_args.kwargs["command_name"] == "shell"
+    assert issue.call_args.kwargs["parameters"] == SHELL_TEXT
+    issue.assert_awaited_once()
+    assert [event["status"] for event in events] == ["started", "completed"]
+    assert events[-1]["task_completed"] is True
+
+
 def test_partial_successful_output_does_not_prove_completion_and_binding_is_captured():
     mt = _make_tools()
     mt._request_contract = SimpleNamespace(request_id="request-one", digest="contract-one")
@@ -130,10 +234,11 @@ def _registered_issue_tool(mt):
     return mt.get_tools(["issue_task_and_waitfor_task_output"])[0]
 
 
-async def _invoke_registered(mt, command="whoami", callback_display_id=11, timeout=1):
+async def _invoke_registered(mt, command="whoami", callback_display_id=11, timeout=1,
+                             parameters=""):
     return await _registered_issue_tool(mt).ainvoke({
         "command": command,
-        "parameters": "",
+        "parameters": parameters,
         "callback_display_id": callback_display_id,
         "timeout": timeout,
     })

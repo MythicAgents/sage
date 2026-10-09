@@ -538,7 +538,7 @@ def test_private_runner_requires_actual_terminal_success_before_listing(collecti
     case = collection
     _install_apollo_alias_schema(case, monkeypatch)
 
-    async def task_state(_task_id, _callback_id, command):
+    async def task_state(_task_id, _callback_id, command, _parameters=None):
         if command == "execute_assembly":
             return state
         return {"task_completed": True, "task_status": "completed"}
