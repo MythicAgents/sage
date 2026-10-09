@@ -72,6 +72,13 @@ _EXECUTABLE_CONTRACT_ROOT = Path(__file__).resolve().parents[2] / "tool_contract
 _MAX_ENROLLED_EXECUTABLE_BYTES = 4 * 1024 * 1024
 
 
+def _task_schema_digest(schema) -> str:
+    """Bind every schema value while ignoring only top-level parameter row order."""
+    if isinstance(schema, list):
+        schema = sorted(schema, key=lambda row: json.dumps(row, sort_keys=True, default=str))
+    return hashlib.sha256(json.dumps(schema, sort_keys=True, default=str).encode()).hexdigest()
+
+
 def _resolve_graph_heartbeat():
     """The current graph node's heartbeat callable, or None when not running inside a graph.
 
@@ -4264,8 +4271,7 @@ class MythicTools:
         if visibility is not None and not isinstance(visibility, dict):
             raise ValueError("task visibility context must be an object")
         prepared_action_binding = {
-            "schema_digest": hashlib.sha256(json.dumps(
-                schema, sort_keys=True, default=str).encode()).hexdigest(),
+            "schema_digest": _task_schema_digest(schema),
             "group": self._parameter_group_to_declare(resolved_group, parameters, command=command),
             "file": file_identity,
         }
@@ -6142,8 +6148,7 @@ class MythicTools:
             try:
                 current_schema = await self._fetch_enrolled_executable_schema(
                     command, callback_display_id, force_refresh=True)
-                current_digest = hashlib.sha256(json.dumps(
-                    current_schema, sort_keys=True, default=str).encode()).hexdigest()
+                current_digest = _task_schema_digest(current_schema)
                 if current_digest != prepared_binding.get("schema_digest"):
                     return self._note_effect_denial("STOP — task schema changed after approval")
                 expected_file = prepared_binding.get("file")

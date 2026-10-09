@@ -572,3 +572,108 @@ def test_registered_file_seeded_schema_matches_forced_sdk_before_approved_sink(
     else:
         sink.assert_not_awaited()
         assert "schema changed after approval" in result
+
+
+@pytest.mark.parametrize("surface", ["callback", "payload_fallback"])
+@pytest.mark.parametrize("change", [
+    None, "verifier_regex", "required", "type", "parameter_group_name",
+    "choices", "default_value", "cli_name", "dynamic_query_function",
+    "nested_order", "added", "removed", "duplicate", "missing",
+])
+def test_approved_schema_ignores_only_parameter_row_order(
+    monkeypatch, surface, change,
+):
+    """A reordered producer schema reaches the approved sink; real drift does not."""
+    tools = _tools()
+    monkeypatch.setattr(tools, "_resolve_payload_type", AsyncMock(return_value="apollo"))
+    monkeypatch.setattr(command_parameter_schema, "DEFAULT_RESOLVER",
+                        command_parameter_schema.CommandSchemaResolver())
+    rows = [
+        {"name": name, "cli_name": name, "type": kind, "description": "",
+         "parameter_group_name": "Default", "required": False, "choices": [],
+         "default_value": default, "dynamic_query_function": "", "verifier_regex": ""}
+        for name, kind, default in (
+            ("base", "String", ""), ("query", "String", ""),
+            ("attributes", "Array", "[]"), ("limit", "Number", "100"),
+        )
+    ]
+    rows[0]["choices"] = ["one", "two"]
+    # Callback/payload enumeration may return these rows in a different order
+    # than the per-command SDK refresh, with every field otherwise identical.
+    seeded = [rows[1], rows[0], rows[2], rows[3]]
+    current = [copy.deepcopy(rows)]
+
+    def projected(query):
+        selection = re.search(r"commandparameters\s*\{([^{}]+)\}", query)
+        assert selection
+        keys = set(selection.group(1).split())
+        return [{key: value for key, value in row.items() if key in keys}
+                for row in seeded]
+
+    async def callback_query(_client, query, **_kwargs):
+        if surface == "payload_fallback":
+            return {"callback": []}
+        return {"callback": [{"payload": {"payloadtype": {"name": "apollo"}},
+                              "loadedcommands": [{"command": {
+                                  "cmd": "ldap_query", "commandparameters": projected(query),
+                              }}]}]}
+
+    async def fallback_commands(_client, _payload, attr):
+        return [{"cmd": "ldap_query", "commandparameters": projected(attr)}]
+
+    async def sdk_schema(**_kwargs):
+        if current[0] is None:
+            raise RuntimeError("inert schema read failure")
+        return {"Default": {"parameters": copy.deepcopy(current[0])}}
+
+    monkeypatch.setattr(mythic, "execute_custom_query", callback_query)
+    monkeypatch.setattr(mythic, "get_all_commands_for_payloadtype", fallback_commands)
+    monkeypatch.setattr(mythic, "get_command_parameter_options", sdk_schema)
+    monkeypatch.setattr(mythic_utilities, "graphql_post",
+                        AsyncMock(return_value={"commandparameters": []}))
+    monkeypatch.setattr(tools, "_validate_command_parameters", AsyncMock(return_value=None))
+    monkeypatch.setattr(tools, "_callback_tasking_liveness_blocker", AsyncMock(return_value=None))
+    monkeypatch.setattr(tools, "_engagement_issue_hook", AsyncMock(return_value=None))
+    monkeypatch.setattr(tools, "_ensure_registered_file_available", AsyncMock(return_value=None))
+    sink = AsyncMock(side_effect=RuntimeError("inert task sink reached"))
+    monkeypatch.setattr(tools, "_issue_mythic_task", sink)
+
+    async def probe():
+        payload, commands, error = await tools._fetch_live_command_surface(5)
+        assert payload == "apollo" and commands and not error
+        prepared = await tools._prepare_supervised_issue_action({
+            "command": "ldap_query", "callback_display_id": 5, "timeout": 60,
+            "parameters": {"query": "(objectClass=computer)",
+                           "attributes": ["name,dnshostname"], "limit": "100"},
+        })
+        action = {"name": TOOL, "args": prepared}
+        card = build_approval_request([action])
+        assert "ldap_query" in card["description"]
+        _claim(tools, action)
+        assert tools._approval_effect_blocker(TOOL, prepared) == ""
+        if change in {"added", "duplicate"}:
+            current[0].append(copy.deepcopy(rows[0]) if change == "duplicate" else {
+                **rows[0], "name": "extra", "cli_name": "extra"})
+        elif change == "removed":
+            current[0].pop(0)
+        elif change == "missing":
+            current[0] = None
+        elif change == "nested_order":
+            current[0][0]["choices"].reverse()
+        elif change:
+            current[0][0][change] = {
+                "verifier_regex": "^[A-Z]+$", "required": True,
+                "type": "Number", "parameter_group_name": "Other",
+                "choices": ["one"], "default_value": "new default",
+                "cli_name": "other", "dynamic_query_function": "get_other",
+            }[change]
+        return await tools.issue_task_and_waitfor_task_output(**prepared)
+
+    result = asyncio.run(probe())
+    if change is None:
+        assert "schema changed after approval" not in result
+        sink.assert_awaited_once()
+        assert "inert task sink reached" in result
+    else:
+        sink.assert_not_awaited()
+        assert "schema changed after approval" in result
