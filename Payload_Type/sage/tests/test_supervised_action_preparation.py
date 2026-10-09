@@ -142,6 +142,24 @@ def test_unknown_schema_fails_before_card_but_known_empty_schema_prepares(monkey
     assert prepared["visibility_context"]["_sage_prepared_action"] is True
 
 
+@pytest.mark.parametrize("command", ["register_file", "register_assembly"])
+def test_registration_existing_file_selector_rejects_bare_uuid_before_card(monkeypatch, command):
+    tools = _tools()
+    monkeypatch.setattr(tools, "_authenticate_live_command", AsyncMock(return_value={
+        "status": "available", "command": command}))
+    monkeypatch.setattr(tools, "_resolve_payload_type", AsyncMock(return_value="apollo"))
+    monkeypatch.setattr(tools, "_fetch_command_schema", AsyncMock(return_value=[
+        {"name": "file", "cli_name": "File", "type": "File",
+         "parameter_group_name": "Default", "required": True, "choices": []},
+        {"name": "existingFile", "cli_name": "existingFile", "type": "ChooseOne",
+         "parameter_group_name": "Use Existing File", "required": True, "choices": []},
+    ]))
+    action = {"command": command, "callback_display_id": 2,
+              "parameters": {"existingFile": "11111111-2222-4333-8444-555555555555"}}
+    with pytest.raises(ValueError, match="bare UUID"):
+        asyncio.run(tools._prepare_supervised_issue_action(action))
+
+
 def test_schema_revalidation_bypasses_live_schema_cache(monkeypatch):
     tools = _tools()
     monkeypatch.setattr(tools, "_resolve_payload_type", AsyncMock(return_value="apollo"))
@@ -286,7 +304,7 @@ def test_multiple_proposals_keep_first_prepared_call_and_deferred_result(monkeyp
     assert len(model._request_contract.requested_actions) == 1
 
 
-@pytest.mark.parametrize("case", ["dcsync", "sharphound"])
+@pytest.mark.parametrize("case", ["dcsync", "sharphound", "register_file", "register_assembly"])
 def test_native_approval_reaches_registered_task_sink_with_prepared_args(monkeypatch, tmp_path, case):
     """Checkpointed HITL resume carries prepared args through the real task tool."""
     monkeypatch.setattr(session, "_CHANNEL_MARKER_DB_PATH", str(tmp_path / "sage.db"))
@@ -298,7 +316,7 @@ def test_native_approval_reaches_registered_task_sink_with_prepared_args(monkeyp
     issued = []
     if case == "dcsync":
         raw, command, schema = copy.deepcopy(RAW), "dcsync", SCHEMA
-    else:
+    elif case == "sharphound":
         command = "execute_assembly"
         raw = {"command": command, "callback_display_id": 2, "timeout": 60,
                "parameters": {"assembly_name": "SharpHound.exe",
@@ -314,6 +332,18 @@ def test_native_approval_reaches_registered_task_sink_with_prepared_args(monkeyp
              "parameter_group_name": "New Assembly", "required": True,
              "default_value": "", "choices": []},
         ]
+    else:
+        command = case
+        raw = {"command": command, "callback_display_id": 2, "timeout": 60,
+               "parameters": {"file": "11111111-2222-4333-8444-555555555555"}}
+        schema = [
+            {"name": "file", "cli_name": "File", "type": "File",
+             "parameter_group_name": "Default", "required": True,
+             "default_value": "", "choices": []},
+            {"name": "existingFile", "cli_name": "existingFile", "type": "ChooseOne",
+             "parameter_group_name": "Use Existing File", "required": True,
+             "default_value": "", "choices": []},
+        ]
     monkeypatch.setattr(tools, "_authenticate_live_command", AsyncMock(return_value={
         "status": "available", "command": command}))
     monkeypatch.setattr(tools, "_fetch_command_schema", AsyncMock(return_value=schema))
@@ -325,7 +355,10 @@ def test_native_approval_reaches_registered_task_sink_with_prepared_args(monkeyp
             tools, "_download_registered_file_bytes_bounded",
             AsyncMock(return_value=b"inert unenrolled SharpHound bytes"),
         )
-    monkeypatch.setattr(tools, "_validate_command_parameters", AsyncMock(return_value=None))
+    if case in {"register_file", "register_assembly"}:
+        monkeypatch.setattr(tools, "_resolve_payload_type", AsyncMock(return_value="apollo"))
+    else:
+        monkeypatch.setattr(tools, "_validate_command_parameters", AsyncMock(return_value=None))
     monkeypatch.setattr(tools, "_callback_tasking_liveness_blocker", AsyncMock(return_value=None))
     monkeypatch.setattr(tools, "_ensure_registered_file_available", AsyncMock(return_value=None))
     monkeypatch.setattr(tools, "_engagement_issue_hook", AsyncMock(return_value=None))
@@ -373,12 +406,15 @@ def test_native_approval_reaches_registered_task_sink_with_prepared_args(monkeyp
             if case == "dcsync":
                 assert card_args["parameters"] == {
                     "Domain": "lab.invalid", "DC": "dc.lab.invalid", "User": "LAB\\krbtgt"}
-            else:
+            elif case == "sharphound":
                 assert card_args["parameters"] == {
                     "Assembly": "SharpHound.exe",
                     "Arguments": r"-c All --OutputDirectory C:\Temp",
                 }
                 assert card_args["visibility_context"]["_sage_prepared_binding"]["file"]["agent_file_id"] == "inert-file-77"
+            else:
+                assert card_args["parameters"] == {"File": "11111111-2222-4333-8444-555555555555"}
+                assert card_args["visibility_context"]["_sage_prepared_binding"]["group"] is None
             second = build_chat_request("", channel_id=9, operation_id=4,
                                         request_id=2, config={"mode": "supervised",
                                                               "autonomous_solve": False})
@@ -386,6 +422,9 @@ def test_native_approval_reaches_registered_task_sink_with_prepared_args(monkeyp
             await chat.chat(second)
             assert len(issued) == 1
             assert issued[0][:3] == (command, card_args["parameters"], 2)
+            if case in {"register_file", "register_assembly"}:
+                # The Mythic transport omits the group variable for its Default group.
+                assert issued[0][3]["parameter_group_name"] is None
         finally:
             await session.drop_channel_session(first)
 

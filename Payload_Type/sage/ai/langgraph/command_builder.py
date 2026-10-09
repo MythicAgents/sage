@@ -446,9 +446,9 @@ def _reroute_registered_file_refs(
     misbehaves on Apollo. Reroute so the registered group is chosen; ChooseOne validation then either accepts
     a valid registered name or returns a repair hint listing the valid names.
 
-    The Mythic `upload` operation is the inverse case: its File parameter is the intended transport for a
-    Mythic file UUID, even when the schema also exposes a registered-file selector. Do not reroute transport
-    uploads into a selector group that expects a display string.
+    Mythic upload and register_file (including Apollo's register_assembly alias) are the inverse case:
+    their File parameter transports a Mythic file UUID, even when the schema also exposes a registered-file
+    selector. Do not reroute those values into a selector group that expects a filename.
     """
     try:
         if _is_file_transport_command(command):
@@ -481,7 +481,7 @@ def _reroute_registered_file_refs(
 
 def _is_file_transport_command(command: str) -> bool:
     normalized = _lower(command).replace("-", "_")
-    return normalized in {"upload", "upload_file", "file_upload"}
+    return normalized in {"upload", "upload_file", "file_upload", "register_file", "register_assembly"}
 
 
 def _clean_schema(command_parameters: Any) -> list[dict]:

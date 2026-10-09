@@ -1,6 +1,8 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph"))
 from command_builder import ResultClass, breaker_decision, classify_result, resolve_params  # noqa: E402
@@ -301,6 +303,31 @@ def test_upload_file_uuid_stays_on_file_transport_group():
     assert result.group == "New File"
     assert result.params == {"file": file_uuid, "path": r"C:\Windows\Temp\ca.pfx"}
     assert not any("rerouted" in note for note in result.notes)
+
+
+@pytest.mark.parametrize("command", ["register_file", "register_assembly"])
+def test_registration_file_uuid_stays_in_default_transport_group(command):
+    schema = [
+        _param("file", "Default", kind="File", required=True),
+        _param("existingFile", "Use Existing File", kind="ChooseOne", required=True,
+               choices=["Certify.exe"]),
+    ]
+    file_uuid = "11111111-2222-4333-8444-555555555555"
+
+    uploaded = resolve_params(schema, {"file": file_uuid}, command=command)
+    assert uploaded.ok is True
+    assert uploaded.group == "Default"
+    assert uploaded.params == {"file": file_uuid}
+    assert not any("rerouted" in note for note in uploaded.notes)
+
+    existing = resolve_params(schema, {"existingFile": "Certify.exe"}, command=command)
+    assert existing.ok is True
+    assert existing.group == "Use Existing File"
+    assert existing.params == {"existingFile": "Certify.exe"}
+
+    invalid = resolve_params(schema, {"existingFile": file_uuid}, command=command)
+    assert invalid.ok is False
+    assert invalid.group == "Use Existing File"
 
 
 def test_classify_parameter_group_mismatch_as_construction():
