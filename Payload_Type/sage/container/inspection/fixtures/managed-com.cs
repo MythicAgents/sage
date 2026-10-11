@@ -15,7 +15,7 @@ internal static class ManagedComFixture
     [DllImport("ole32.dll")]
     private static extern void CoUninitialize();
 
-    public static int Main()
+    public static int Main(string[] args)
     {
         int initialize = CoInitializeEx(IntPtr.Zero, 0);
         int security = CoInitializeSecurity(
