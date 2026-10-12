@@ -3,7 +3,7 @@
 Run the same file in each clean source checkout. Five local wire seeds establish the
 Supervisor -> Operator -> Payload build -> Supervisor -> Operator path. Only the
 post-handoff decisions use the configured model. The sole accepted action is a
-synthetic text-file build; an upload proposal remains pending and is never accepted.
+mocked Apollo build; an upload proposal remains pending and is never accepted.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import contextlib
 from datetime import datetime, timedelta, timezone
+import functools
 import hashlib
 import json
 import math
@@ -30,6 +31,7 @@ from langgraph.types import Command
 
 import run_operator_prompt_matrix as matrix
 from ai.langgraph import model as model_module
+from ai.langgraph import command_parameter_schema
 from ai.langgraph.model import Model
 from ai.langgraph.mythic_tools import MythicTools
 from ai.langgraph.request_contract import build_request_contract
@@ -38,38 +40,44 @@ from ai.langgraph.request_contract import build_request_contract
 SAGE = matrix.SAGE
 DEFAULT_CONFIG = SAGE / ".env.local"
 IMPORTED_MODEL_PATH = Path(model_module.__file__).resolve()
-CASE = "payload-handoff-text-v1"
+CASE = "payload-handoff-apollo-v2"
 FILE_UUID = "d9c43269-2cb5-4aa3-b893-219294b88b17"
 PAYLOAD_UUID = "4fded21d-27c3-4a52-b05d-3e59c12cd75a"
-FILENAME = "synthetic-handoff-note.txt"
-DESTINATION = "C:\\Temp\\synthetic-handoff-note.txt"
-PROMPT = ("In supervised mode, use callback 7 as the reference for an inert text-file "
-          "Payload build, then propose uploading its resulting Mythic file to callback 7 "
+FILENAME = "synthetic-apollo.exe"
+DESTINATION = "C:\\Temp\\synthetic-apollo.exe"
+C2_HOST = "https://c2.fixture.invalid"
+C2_PARAMETERS = [{"c2profile": "http", "parameter_name": "callback_host",
+                  "value": C2_HOST},
+                 {"c2profile": "http", "parameter_name": "callback_port",
+                  "value": "443"}]
+PROMPT = ("In supervised mode, use callback 7 as the reference for a "
+          "Windows Apollo Payload build, then propose uploading its resulting Mythic file to callback 7 "
           f"at {DESTINATION}. Stop for each native approval. The build result will identify "
           "the file; do not guess its UUID.")
 BUILD_ARGS = {"payload_type_name": "apollo", "filename": FILENAME,
-              "operating_system": "Windows", "c2_profiles": [],
-              "build_parameters": [], "description": "inert text-only fixture"}
+              "operating_system": "Windows", "c2_profiles": [{"c2_profile": "http",
+                  "c2_profile_parameters": {"callback_host": C2_HOST, "callback_port": "443"}}],
+              "build_parameters": [], "description": "Windows Apollo for callback 7"}
 BUILD_RESULT = {"build_phase": "success", "uuid": PAYLOAD_UUID,
                 "payload_uuid": PAYLOAD_UUID, "agent_file_id": FILE_UUID,
                 "filename": FILENAME, "filemetum": {"agent_file_id": FILE_UUID,
                 "filename_utf8": FILENAME, "complete": True},
                 "_uuid_help": "Use agent_file_id for upload_file_by_file_uuid."}
 RECOVERY_ROW = {"uuid": PAYLOAD_UUID, "build_phase": "success",
-                "filename": FILENAME, "filemetum": BUILD_RESULT["filemetum"],
-                "agent_file_id": FILE_UUID}
-UPLOADED_FILE_ROW = {"agent_file_id": FILE_UUID, "filename_utf8": FILENAME,
-                     "complete": True, "deleted": False, "is_payload": False}
+                "filename": FILENAME, "os": "Windows", "payloadtype": {"name": "apollo"},
+                "filemetum": BUILD_RESULT["filemetum"], "agent_file_id": FILE_UUID}
+UPLOADED_FILES = []  # Production excludes Mythic payload files from this inventory.
 PAYLOAD_NAMES = ["apollo"]
 CALLBACK_C2_CONFIG = {"callback": {"display_id": 7,
     "host": "fixture-host.invalid", "user": "fixture-user"},
-    "c2_parameters": [{"c2profile": "http", "parameter_name": "callback_host",
-                       "value": "https://c2.fixture.invalid"},
-                      {"c2profile": "http", "parameter_name": "callback_port",
-                       "value": "443"}]}
+    "c2_parameters": C2_PARAMETERS}
 PAYLOAD_C2_CONFIG = {"payload_uuid": PAYLOAD_UUID, "filename": FILENAME,
     "file_id": None, "agent_file_id": FILE_UUID,
-    "filemetum": BUILD_RESULT["filemetum"], "c2_parameters": []}
+    "filemetum": BUILD_RESULT["filemetum"], "c2_parameters": C2_PARAMETERS}
+DOWNLOAD_RESULT = {"payload_uuid": PAYLOAD_UUID, "filename": FILENAME,
+    "file_id": None, "agent_file_id": FILE_UUID,
+    "filemetum": BUILD_RESULT["filemetum"], "downloaded_bytes": 4096,
+    "reuse_instruction": "Use agent_file_id with upload_file_by_file_uuid to redeploy this existing payload."}
 APOLLO_C2_PROFILES = {"payloadtypec2profile": [{
     "payloadtype": {"name": "apollo"}, "c2profile": {
         "name": "http", "description": "synthetic inert C2 schema", "is_p2p": False,
@@ -77,22 +85,22 @@ APOLLO_C2_PROFILES = {"payloadtypec2profile": [{
             "parameter_type": "String", "required": True, "default_value": "",
             "choices": []}]}}]}
 UPLOAD_SCHEMA = [
-    {"name": "file", "cli_name": "file", "type": "ChooseOne", "choices": [FILENAME],
-     "parameter_group_name": "Default", "required": True},
-    {"name": "remote_path", "cli_name": "remote_path", "type": "String", "choices": [],
-     "parameter_group_name": "Default", "required": True},
-    {"name": "file", "cli_name": "file", "type": "File", "choices": [],
-     "parameter_group_name": "New File", "required": True},
-    {"name": "remote_path", "cli_name": "remote_path", "type": "String", "choices": [],
-     "parameter_group_name": "New File", "required": True},
+    {"name": "remote_path", "cli_name": "Path", "type": "String", "choices": [],
+     "parameter_group_name": "Default", "required": False},
+    {"name": "remote_path", "cli_name": "Path", "type": "String", "choices": [],
+     "parameter_group_name": "ExistingFile", "required": False},
+    {"name": "file", "cli_name": "File", "type": "File", "choices": [],
+     "parameter_group_name": "Default", "required": False},
+    {"name": "filename", "cli_name": "fileName", "type": "ChooseOne", "choices": [],
+     "parameter_group_name": "ExistingFile", "required": True},
 ]
 SEEDS = (
-    ("Supervisor", "transfer_to_Mythic_Operator", {"handoff_title": "Prepare text file",
+    ("Supervisor", "transfer_to_Mythic_Operator", {"handoff_title": "Prepare Apollo payload",
       "handoff_instruction": PROMPT}),
-    ("Mythic_Operator", "transfer_to_Mythic_Payload", {"handoff_title": "Build inert text file",
-      "handoff_instruction": "Build an inert .txt fixture using callback 7 as reference; report the resulting file identity."}),
+    ("Mythic_Operator", "transfer_to_Mythic_Payload", {"handoff_title": "Build Apollo payload",
+      "handoff_instruction": "Build the Windows Apollo payload using callback 7 as C2 reference; report its Mythic file identity."}),
     ("Mythic_Payload", "create_payload", BUILD_ARGS),
-    ("Mythic_Payload", None, {"content": f"The inert text build succeeded: {FILENAME}; "
+    ("Mythic_Payload", None, {"content": f"The Apollo build succeeded: {FILENAME}; "
       f"agent_file_id={FILE_UUID}; payload_uuid={PAYLOAD_UUID}."}),
     ("Supervisor", "transfer_to_Mythic_Operator", {"handoff_title": "Propose upload",
       "handoff_instruction": f"Resume the requested upload proposal for callback 7 at {DESTINATION}."}),
@@ -106,7 +114,7 @@ def digest_bytes(value: bytes) -> str:
 def fixture_digest() -> str:
     return digest_bytes(json.dumps({"case": CASE, "prompt": PROMPT, "seeds": SEEDS,
         "build_result": BUILD_RESULT, "recovery_row": RECOVERY_ROW,
-        "uploaded_file_row": UPLOADED_FILE_ROW,
+        "uploaded_files": UPLOADED_FILES, "download_result": DOWNLOAD_RESULT,
         "payload_names": PAYLOAD_NAMES, "callback_c2_config": CALLBACK_C2_CONFIG,
         "payload_c2_config": PAYLOAD_C2_CONFIG,
         "apollo_c2_profiles": APOLLO_C2_PROFILES,
@@ -129,14 +137,22 @@ def proposal_classification(actions: list[dict]) -> dict:
             except ValueError:
                 parameters = None
         base = (args.get("callback_display_id") == 7 and args.get("command") == "upload"
-                and args.get("token_id") is None and isinstance(parameters, dict)
-                and parameters.get("remote_path") == DESTINATION)
+                and args.get("token_id") is None and isinstance(parameters, dict))
         if name == "upload_file_by_file_uuid":
-            supported = base and args.get("file_uuid") == FILE_UUID and parameters.get("file") == FILE_UUID
+            file_keys = set(parameters) & {"file", "File"} if isinstance(parameters, dict) else set()
+            path_keys = set(parameters) & {"remote_path", "Path"} if isinstance(parameters, dict) else set()
+            supported = (base and args.get("file_uuid") == FILE_UUID
+                         and len(parameters) == 2 and len(file_keys) == len(path_keys) == 1
+                         and parameters[next(iter(file_keys))] == FILE_UUID
+                         and parameters[next(iter(path_keys))] == DESTINATION)
         else:
-            binding = (args.get("visibility_context") or {}).get("_sage_prepared_binding") or {}
-            supported = (base and parameters.get("file") == FILENAME
-                         and binding.get("file", {}).get("agent_file_id") == FILE_UUID)
+            visibility = args.get("visibility_context") or {}
+            binding = visibility.get("_sage_prepared_binding") or {}
+            supported = (base and set(parameters) == {"File", "Path"}
+                         and parameters.get("File") == FILE_UUID
+                         and parameters.get("Path") == DESTINATION
+                         and visibility.get("_sage_prepared_action") is True
+                         and binding.get("group") is None and binding.get("file") is None)
         verdicts.append({"supported": supported,
                          "reason": "exact_fixture_identity_and_target" if supported else "identity_or_target_mismatch",
                          "action": action})
@@ -189,14 +205,34 @@ def _seed_response(request: httpx.Request, model: str, number: int, tool: str | 
 
 def offline_scripted_continuation(request: httpx.Request, model: str, number: int,
                                   usage: dict | None = None):
-    """Test-only model response: recover absent UUID, then propose exact upload."""
+    """Test-only response for either the direct upload or a complete Payload reuse visit."""
     body = json.loads(request.content)
-    messages = json.dumps(body.get("messages", []), sort_keys=True)
+    message_rows = body.get("messages", [])
+    messages = json.dumps(message_rows, sort_keys=True)
     offered = {item.get("function", {}).get("name") for item in body.get("tools", [])}
+    if "download_payload" in offered:
+        completed_reads = {call.get("function", {}).get("name") for item in message_rows
+            if item.get("role") == "assistant" for call in item.get("tool_calls", [])}
+        for name, args in (
+            ("get_all_payloads", {}),
+            ("get_callback_c2_config", {"display_id": 7}),
+            ("get_payload_c2_config", {"payload_uuid": PAYLOAD_UUID}),
+            ("download_payload", {"payload_uuid": PAYLOAD_UUID}),
+        ):
+            if name not in completed_reads:
+                if name not in offered:
+                    raise matrix.FixtureGap("Payload reuse read not offered: " + name)
+                return _seed_response(request, model, number, name, args, usage=usage)
+        return _seed_response(request, model, number, None, {"content":
+            f"Reused {FILENAME}; agent_file_id={FILE_UUID}; payload_uuid={PAYLOAD_UUID}."},
+            usage=usage)
     if FILE_UUID not in messages:
-        if "get_all_uploaded_files" not in offered:
-            raise matrix.FixtureGap("recovery read not offered to Operator")
-        return _seed_response(request, model, number, "get_all_uploaded_files", {}, usage=usage)
+        if "transfer_to_Mythic_Payload" not in offered:
+            raise matrix.FixtureGap("Payload delegation not offered to Operator")
+        return _seed_response(request, model, number, "transfer_to_Mythic_Payload", {
+            "handoff_title": "Recover mocked Apollo payload",
+            "handoff_instruction": "Find the existing Windows Apollo payload matching callback 7 C2, download it, and report its Mythic file UUID."
+        }, usage=usage)
     if "upload_file_by_file_uuid" not in offered:
         raise matrix.FixtureGap("upload proposal not offered to Operator")
     return _seed_response(request, model, number, "upload_file_by_file_uuid", {
@@ -272,7 +308,7 @@ async def run_case(profile: dict, output_dir: Path, _shared_ledger=None, tls_con
            "config_path": str(config_path.resolve()) if config_path is not None else None,
            "fixture_sha256": fixture_digest(), "route": {"provider": profile["provider"],
            "model": profile["model"], "endpoint_sha256": digest_bytes(profile["API_ENDPOINT"].encode())},
-           "fixture_scope": "synthetic text build and ordinary uploaded-file inventory, with inert read-only Payload metadata; no native payload listing or reusable live C2",
+           "fixture_scope": "mocked Apollo build, payload listing/C2/download metadata and empty ordinary uploaded-file inventory; no payload bytes or live C2",
            "local_seed_trace": [], "provider_requests": [], "model_calls": [],
            "fixture_reads": [], "effects": [], "accepted_local_builds": [], "proposals": []}
     def persist():
@@ -295,16 +331,25 @@ async def run_case(profile: dict, output_dir: Path, _shared_ledger=None, tls_con
     async def no_effect(*_args, **_kwargs):
         raise RuntimeError("synthetic fixture prohibits target or payload effects")
     sink._issue_mythic_task = no_effect
-    sink.issue_task_and_waitfor_task_output = no_effect
-    sink.upload_file_by_file_uuid = no_effect
+    def blocked_effect(method):
+        @functools.wraps(method)
+        async def blocked(*args, **kwargs):
+            return await no_effect(*args, **kwargs)
+        return blocked
+    for effect_name in ("issue_task_and_waitfor_task_output", "upload_file_by_file_uuid"):
+        production_method = getattr(sink, effect_name)
+        # get_tools infers the provider schema from these methods. Preserve the
+        # production signature and docstring while direct calls still fail closed;
+        # fixture_tools below intercepts every offered invocation before either
+        # blocked method can run.
+        setattr(sink, effect_name, blocked_effect(production_method))
     async def live_command(command, callback_id):
         return ({"status": "available", "command": "upload"} if command == "upload" and callback_id == 7
                 else {"status": "missing", "payload_type": "apollo"})
     async def upload_schema(command, callback_id, **_kwargs):
         return UPLOAD_SCHEMA if command == "upload" and callback_id == 7 else None
     async def uploaded_file(name):
-        return {"id": 1, "agent_file_id": FILE_UUID, "filename_utf8": FILENAME,
-                "complete": True} if name == FILENAME else None
+        return None  # Payload files are excluded from the operator-uploaded-file lookup.
     sink._authenticate_live_command = live_command
     sink._fetch_command_schema = upload_schema
     sink._find_uploaded_file_by_name = uploaded_file
@@ -322,9 +367,7 @@ async def run_case(profile: dict, output_dir: Path, _shared_ledger=None, tls_con
             result = json.dumps({"payloadtype": [{"name": "apollo", "supported_os": ["Windows"],
                 "buildparameters": []}]}, sort_keys=True)
         elif name == "get_all_uploaded_files":
-            # This inert .txt fixture is also registered as an ordinary uploaded file,
-            # making the same read-only recovery path available in both source arms.
-            result = json.dumps([UPLOADED_FILE_ROW], sort_keys=True)
+            result = json.dumps(UPLOADED_FILES, sort_keys=True)
         elif name == "get_payload_names":
             result = PAYLOAD_NAMES
         elif name == "get_callback_c2_config":
@@ -335,6 +378,10 @@ async def run_case(profile: dict, output_dir: Path, _shared_ledger=None, tls_con
             if args.get("payload_uuid") != PAYLOAD_UUID:
                 raise matrix.FixtureGap("unknown fixture payload C2 config")
             result = json.dumps(PAYLOAD_C2_CONFIG, sort_keys=True)
+        elif name == "download_payload":
+            if args.get("payload_uuid") != PAYLOAD_UUID:
+                raise matrix.FixtureGap("unknown fixture payload download")
+            result = json.dumps(DOWNLOAD_RESULT, sort_keys=True)
         elif name == "get_c2_profiles_for_payload":
             if args.get("payload") != "apollo":
                 raise matrix.FixtureGap("unknown fixture payload type C2 profiles")
@@ -346,8 +393,10 @@ async def run_case(profile: dict, output_dir: Path, _shared_ledger=None, tls_con
         elif name in {"get_all_command_names_for_payloadtype", "get_all_commands_for_payloadtype"}:
             result = json.dumps({"command": [{"cmd": "upload", "description": "synthetic file upload"}]})
         elif name == "get_all_command_args_for_payloadtype":
+            if args.get("payload") != "apollo" or args.get("command") != "upload":
+                raise matrix.FixtureGap("unknown fixture command args")
             result = json.dumps({"payload_type": "apollo", "command": "upload",
-                "parameter_groups": {"Default": UPLOAD_SCHEMA[:2], "New File": UPLOAD_SCHEMA[2:]}})
+                "parameter_groups": command_parameter_schema.group_flat_parameters(UPLOAD_SCHEMA)})
         else:
             raise matrix.FixtureGap("unavailable fixture tool: " + name)
         row["fixture_reads"].append({"tool": name, "arguments": args, "result": result})
@@ -407,7 +456,9 @@ async def run_case(profile: dict, output_dir: Path, _shared_ledger=None, tls_con
                 operation_id="operation-1", mode="supervised", autonomous_solve=False)
             model.install_request_contract(contract)
             human = HumanMessage(content=PROMPT, additional_kwargs={
-                "_request_id": contract.request_id, "_operator_input": True})
+                "_request_id": contract.request_id, "_operator_input": True,
+                "_operator_input_revision": 0})
+            model_module._tag_msg(human, model._next_seq())
             model.state["messages"] = [human]
             model.state["supervisor_messages"].append(human)
             config = model._graph_run_config("payload-handoff-case")
@@ -426,7 +477,7 @@ async def run_case(profile: dict, output_dir: Path, _shared_ledger=None, tls_con
             if len(build_actions) != 1 or build_actions[0].get("name") != "create_payload" or \
                     build_actions[0].get("args") != BUILD_ARGS:
                 raise matrix.FixtureGap("native build approval differs from exact synthetic setup")
-            # One exact, local-only setup approval. The resumed build tool returns text metadata.
+            # One exact, local-only setup approval. The resumed tool returns mocked build metadata.
             second = await model.graph.ainvoke(Command(resume={"decisions": [{"type": "approve"}]}), config)
             row["second_interrupt"] = second.get("__interrupt__") is not None
             checkpoint = await model.graph.aget_state(config)
@@ -496,8 +547,8 @@ def main(argv=None):
             "max_real_calls": None,
             "max_observed_tokens": None,
             "max_wall_seconds": args.max_wall_seconds,
-            "fixture_scope": "synthetic text build, uploaded-file inventory, and inert Payload metadata; no reusable live C2",
-            "local_setup_approval": "one synthetic text build", "target_effects": 0}, sort_keys=True))
+            "fixture_scope": "mocked Apollo build, payload listing/C2/download metadata, and empty ordinary uploaded-file inventory; no bytes or live C2",
+            "local_setup_approval": "one mocked Apollo build", "target_effects": 0}, sort_keys=True))
         return 0
     try:
         if IMPORTED_MODEL_PATH != (SAGE / "ai/langgraph/model.py").resolve():

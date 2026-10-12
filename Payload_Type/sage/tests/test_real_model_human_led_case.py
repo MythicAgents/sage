@@ -178,6 +178,61 @@ def test_request_count_and_output_token_limit_fail_before_network():
     assert inner.sent == module.MAX_REQUESTS
 
 
+@pytest.mark.parametrize("streamed", [False, True])
+@pytest.mark.parametrize("raw", [
+    b'{"error":{"message":"invalid final role; key=probe-secret"}}',
+    b"Gateway rejected request: probe-secret",
+])
+def test_transport_retains_provider_error_without_losing_usage_stop(streamed, raw):
+    module = _module()
+    recorder = module.UsageRecorder()
+    transport = module.BoundedTransport(
+        "https://127.0.0.1:7443/v1", "synthetic-test-model",
+        usage_recorder=recorder, require_complete_usage=True)
+
+    class Stream(httpx.AsyncByteStream):
+        closed = False
+        async def __aiter__(self):
+            yield raw[:11]
+            yield raw[11:]
+        async def aclose(self):
+            self.closed = True
+
+    stream = Stream()
+    class Inner:
+        sent = 0
+        async def handle_async_request(self, request):
+            self.sent += 1
+            return httpx.Response(400, request=request,
+                headers={"x-request-id": "provider-request-123", "set-cookie": "private-cookie"},
+                **({"stream": stream} if streamed else {"content": raw}))
+
+    inner = Inner()
+    transport.inner = inner
+    request = httpx.Request("POST", transport.endpoint,
+        headers={"Authorization": "Bearer probe-secret"},
+        json={"model": "synthetic-test-model", "max_completion_tokens": 512})
+
+    async def exercise():
+        response = await transport.handle_async_request(request)
+        assert response.status_code == 400
+        # Evidence capture must not change what the SDK receives.
+        assert await response.aread() == raw
+        await response.aclose()
+        with pytest.raises(module.CaseError, match="unknown_observed_usage"):
+            await transport.handle_async_request(request)
+
+    asyncio.run(exercise())
+    row = transport.requests[0]
+    assert row["error_response_body"] == raw.decode().replace("probe-secret", "[REDACTED]")
+    assert row["provider_request_ids"] == {"x-request-id": "provider-request-123"}
+    assert "response" not in row and recorder.calls == []
+    assert "probe-secret" not in json.dumps(row) and "private-cookie" not in json.dumps(row)
+    assert inner.sent == 1
+    if streamed:
+        assert stream.closed
+
+
 def test_transport_captures_exact_wire_request_and_paired_response_without_route_or_secret():
     module = _module()
     transport = module.BoundedTransport("https://127.0.0.1:7443/v1", "synthetic-test-model")

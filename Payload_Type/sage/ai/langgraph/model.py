@@ -3812,6 +3812,65 @@ def _assisted_worker_observation_context(
     return copied
 
 
+def _supervised_completed_return_context(
+    messages: list[AnyMessage], state: Mapping[str, Any], node_name: str,
+) -> list[AnyMessage]:
+    """Let a same-request specialist return follow the repeated operator input.
+
+    Assisted handoffs persist the exact operator instruction as the worker's last
+    HumanMessage. On return to Mythic_Operator this can put the unchanged opening
+    request after an already completed worker result. Reorder only the invocation
+    copy; the recorded channels and the handoff's exact authority bytes stay intact.
+    ``_sanitize_messages`` adds its neutral provider-required user turn afterward.
+    """
+    if (node_name != "Mythic_Operator" or
+            state.get("_request_lane") != "supervised_workflow" or
+            not messages or not isinstance(messages[-1], HumanMessage) or
+            messages[-1].additional_kwargs.get("_delegated_to") != node_name):
+        return messages
+    request_id = str(state.get("_request_id") or "").strip()
+    if not request_id:
+        return messages
+    entries = _assisted_operator_input_entries(state)
+    if not entries or max(revision for revision, _ in entries) != 0:
+        # An accepted steer is a newer operator instruction and must remain last.
+        return messages
+    if messages[-1].content != _current_assisted_operator_input(state):
+        return messages
+    if (messages[-1].additional_kwargs.get("_handoff_request_id") not in {None, "", request_id}):
+        return messages
+    current_operator_input = next((
+        message for message in reversed(state.get("supervisor_messages", ()) or ())
+        if isinstance(message, HumanMessage)
+        and message.additional_kwargs.get("_operator_input") is True
+        and message.additional_kwargs.get("_request_id") == request_id
+        and message.additional_kwargs.get("_operator_input_revision", 0) == 0
+    ), None)
+    authenticated_seq = _get_seq(current_operator_input) if current_operator_input else 0
+    if authenticated_seq <= 0:
+        return messages
+    header_index = next((
+        index for index in range(len(messages) - 2, -1, -1)
+        if isinstance(messages[index], AIMessage)
+        and messages[index].additional_kwargs.get("_is_completion_header") is True
+        and messages[index].additional_kwargs.get("_request_id") == request_id
+        and messages[index].name != node_name
+    ), None)
+    if header_index is None or not any(
+        isinstance(message, HumanMessage)
+        and message.content == messages[-1].content
+        and message.additional_kwargs.get("_delegated_to") == node_name
+        and message.additional_kwargs.get("_handoff_request_id") in {None, "", request_id}
+        and _get_seq(message) > authenticated_seq
+        for message in messages[:header_index]
+    ) or any(
+        not isinstance(message, (AIMessage, ToolMessage))
+        for message in messages[header_index:-1]
+    ):
+        return messages
+    return messages[:header_index] + messages[-1:] + messages[header_index:-1]
+
+
 def _handoff_task_output_evidence(
     source_model: Any, messages: list[AnyMessage], *, request_id: str,
     supervised: bool,
@@ -8346,6 +8405,11 @@ class Model:
                 )
                 if observations:
                     sanitized_channel = sanitized_channel[:-1] + observations + sanitized_channel[-1:]
+                reordered = _supervised_completed_return_context(
+                    sanitized_channel, state, node_name,
+                )
+                if reordered is not sanitized_channel:
+                    sanitized_channel = self._sanitize_messages(reordered)
             initial_agent_input_length = len(sanitized_channel)
 
             # Autonomous keep-going: in an autonomous solve, the Mythic_Operator must not yield control to the

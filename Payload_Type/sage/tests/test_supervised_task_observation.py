@@ -164,6 +164,187 @@ def test_issued_shell_observes_native_run_with_exact_parameters():
     assert events[-1]["task_completed"] is True
 
 
+REGISTER_FILE_UUID = "11111111-2222-3333-4444-555555555555"
+REGISTER_FILENAME = "example.dll"
+_UNSET = object()
+
+
+def _registration_row(*, original_params=_UNSET, params=_UNSET, **updates):
+    requested = {"File": REGISTER_FILE_UUID}
+    native = {
+        "file": REGISTER_FILE_UUID,
+        "file_name": REGISTER_FILENAME,
+        "file_id": REGISTER_FILE_UUID,
+    }
+    return _row(**{
+        "command_name": "register_file",
+        "original_params": (
+            json.dumps(requested) if original_params is _UNSET
+            else original_params if isinstance(original_params, str)
+            else json.dumps(original_params) if isinstance(original_params, dict)
+            else original_params
+        ),
+        "params": (
+            json.dumps(native) if params is _UNSET
+            else params if isinstance(params, str)
+            else json.dumps(params) if isinstance(params, dict)
+            else params
+        ),
+        "display_params": REGISTER_FILENAME,
+        "callback": {
+            "display_id": 11,
+            "payload": {"payloadtype": {"name": "apollo"}},
+        },
+        "status": "success",
+        **updates,
+    })
+
+
+def test_registered_register_assembly_observes_exact_apollo_rewrite():
+    mt = _make_tools()
+    mt._request_contract = SimpleNamespace(
+        lane="supervised_workflow", request_id="r", digest="d",
+    )
+    mt._active_approval_claim = {
+        "request_id": "r", "request_contract_digest": "d", "approval_id": "a",
+    }
+    events = []
+    mt.set_execution_observer(lambda event: events.append(event.copy()))
+    issue = AsyncMock(return_value={"display_id": 4242})
+    query = AsyncMock(return_value={"task": [_registration_row()]})
+    with patch.object(mythic_tools.mythic, "issue_task", issue), \
+         patch.object(mythic_tools.mythic, "waitfor_for_task_output", AsyncMock(
+             return_value=f"{REGISTER_FILENAME} has been registered.",
+         )), \
+         patch.object(mythic_tools.mythic, "execute_custom_query", query), \
+         patch.object(mythic_tools, "assess_callback_liveness", AsyncMock(return_value={
+             "status": "alive", "reason": "",
+         })), \
+         patch.object(mt, "_turn_authority_issue_blocker", return_value=""), \
+         patch.object(mt, "_bind_contract_task_issue_parameters", return_value=""):
+        result = asyncio.run(_invoke_registered(
+            mt, "register_assembly", 11, timeout=60,
+            parameters={"File": REGISTER_FILE_UUID},
+        ))
+
+    assert issue.call_args.kwargs["command_name"] == "register_assembly"
+    assert 'task_completed=true task_status="success" observation=observed' in result
+    assert "observation=unknown" not in result
+    assert mt._deferred_task_receipt is None
+    assert [event["status"] for event in events] == ["started", "completed"]
+    assert events[-1]["tool_name"] == "register_assembly"
+    query_text = query.call_args.args[1]
+    assert "command_name params original_params display_params" in query_text
+    assert "payload { payloadtype { name } }" in query_text
+
+
+def test_apollo_register_alias_accepts_equivalent_json_and_existing_file_group():
+    mt = _make_tools()
+    original = '{ "File" : "' + REGISTER_FILE_UUID + '" }'
+    with patch.object(mythic_tools.mythic, "execute_custom_query", AsyncMock(
+        return_value={"task": [_registration_row(original_params={"File": REGISTER_FILE_UUID})]},
+    )):
+        assert asyncio.run(mt._supervised_task_state(
+            4242, 11, "register_assembly", original,
+        )) == {"task_completed": True, "task_status": "success"}
+
+    existing = {
+        "file_name": REGISTER_FILENAME,
+        "file_id": REGISTER_FILE_UUID,
+    }
+    with patch.object(mythic_tools.mythic, "execute_custom_query", AsyncMock(
+        return_value={"task": [_registration_row(
+            original_params={"existingFile": REGISTER_FILENAME}, params=existing,
+        )]},
+    )):
+        assert asyncio.run(mt._supervised_task_state(
+            4242, 11, "register_assembly", {"existingFile": REGISTER_FILENAME},
+        )) == {"task_completed": True, "task_status": "success"}
+
+
+@pytest.mark.parametrize("issued_parameters,changes", [
+    ({"File": REGISTER_FILE_UUID}, {"display_id": 4243}),
+    ({"File": REGISTER_FILE_UUID}, {"callback": {
+        "display_id": 12, "payload": {"payloadtype": {"name": "apollo"}},
+    }}),
+    ({"File": REGISTER_FILE_UUID}, {"callback": {
+        "display_id": 11, "payload": {"payloadtype": {"name": "merlin"}},
+    }}),
+    ({"File": REGISTER_FILE_UUID}, {"command_name": "whoami"}),
+    ({"File": REGISTER_FILE_UUID}, {"command_name": "execute_assembly"}),
+    ({"File": REGISTER_FILE_UUID}, {"display_params": "other.dll"}),
+    ({"File": REGISTER_FILE_UUID}, {"params": json.dumps({
+        "file": REGISTER_FILE_UUID, "file_name": REGISTER_FILENAME,
+        "file_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+    })}),
+    ({"File": REGISTER_FILE_UUID, "extra": "value"}, {
+        "original_params": {"File": REGISTER_FILE_UUID, "extra": "value"},
+    }),
+    ({"File": REGISTER_FILE_UUID, "existingFile": REGISTER_FILENAME}, {
+        "original_params": {"File": REGISTER_FILE_UUID,
+                            "existingFile": REGISTER_FILENAME},
+    }),
+    ({"File": REGISTER_FILE_UUID}, {"original_params": None}),
+    ({"File": REGISTER_FILE_UUID}, {
+        "original_params": '{"File":"' + REGISTER_FILE_UUID + '","File":"other"}',
+    }),
+    ({"File": REGISTER_FILE_UUID}, {
+        "original_params": {"File": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"},
+    }),
+    ({"File": REGISTER_FILE_UUID}, {"original_params": "{"}),
+    ({"File": REGISTER_FILE_UUID}, {"params": "{"}),
+    ('{"File":"' + REGISTER_FILE_UUID + '","File":"' + REGISTER_FILE_UUID + '"}', {
+        "original_params": '{"File":"' + REGISTER_FILE_UUID + '","File":"'
+                           + REGISTER_FILE_UUID + '"}',
+    }),
+    ({"File": REGISTER_FILE_UUID}, {
+        "params": '{"file_id":"' + REGISTER_FILE_UUID
+                  + '","file_id":"' + REGISTER_FILE_UUID
+                  + '","file_name":"' + REGISTER_FILENAME + '"}',
+    }),
+    ({"existingFile": REGISTER_FILENAME}, {
+        "original_params": {"existingFile": REGISTER_FILENAME},
+        "params": {"file_id": REGISTER_FILE_UUID, "file_name": "EXAMPLE.dll"},
+        "display_params": "EXAMPLE.dll",
+    }),
+])
+def test_apollo_register_alias_rejects_mismatched_or_ambiguous_metadata(
+    issued_parameters, changes,
+):
+    mt = _make_tools()
+    with patch.object(mythic_tools.mythic, "execute_custom_query", AsyncMock(
+        return_value={"task": [_registration_row(**changes)]},
+    )):
+        state = asyncio.run(mt._supervised_task_state(
+            4242, 11, "register_assembly", issued_parameters,
+        ))
+    assert state == {"task_completed": None, "task_status": ""}
+
+
+@pytest.mark.parametrize("completed,status", [(False, "processing"), (True, "error")])
+def test_apollo_register_alias_preserves_native_pending_and_error(completed, status):
+    mt = _make_tools()
+    with patch.object(mythic_tools.mythic, "execute_custom_query", AsyncMock(
+        return_value={"task": [_registration_row(completed=completed, status=status)]},
+    )):
+        state = asyncio.run(mt._supervised_task_state(
+            4242, 11, "register_assembly", {"File": REGISTER_FILE_UUID},
+        ))
+    assert state == {"task_completed": completed, "task_status": status}
+
+
+def test_register_file_request_does_not_accept_reverse_alias():
+    mt = _make_tools()
+    row = _registration_row(command_name="register_assembly")
+    with patch.object(mythic_tools.mythic, "execute_custom_query", AsyncMock(
+        return_value={"task": [row]},
+    )):
+        state = asyncio.run(mt._supervised_task_state(
+            4242, 11, "register_file", {"File": REGISTER_FILE_UUID},
+        ))
+    assert state == {"task_completed": None, "task_status": ""}
+
+
 def test_partial_successful_output_does_not_prove_completion_and_binding_is_captured():
     mt = _make_tools()
     mt._request_contract = SimpleNamespace(request_id="request-one", digest="contract-one")

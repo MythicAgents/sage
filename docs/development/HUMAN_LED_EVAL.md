@@ -157,6 +157,11 @@ Distinguish SDK message metadata from the actual provider payload when assessing
 specialist's answer reached the Supervisor. A scripted capture proves the recorder works; it does
 not recover the unrecorded inputs of an earlier paid run.
 
+The shared measurement transport also retains provider HTTP error bodies and selected
+request IDs for diagnosis. It redacts the request's bearer credential if echoed in an
+error body and leaves the SDK's response bytes unchanged. An HTTP rejection does not
+establish zero token usage; missing usage still stops the next measured request.
+
 ## Operator requests and reporting diagnostics
 
 The Payload handoff measurement helper (`run_payload_handoff_case.py`) uses the
@@ -171,6 +176,11 @@ case has no aggregate provider call or token ceiling. It records each request an
 provider-reported input/output usage, stops before another request if earlier usage
 is missing, and marks final or interrupted usage as uncertain. It rejects a configured
 runtime resource ledger so that an inherited finite ledger cannot silently cap the case.
+The case seeds one locally approved Apollo build and returns synthetic Mythic metadata,
+including a matching callback and payload C2 configuration. A later Payload visit can
+list, inspect, and "download" that synthetic payload through mocked read-only responses;
+no payload bytes are built or downloaded. The ordinary uploaded-file inventory is empty,
+as production excludes Mythic payload files from that tool.
 
 Three development helpers isolate different questions. None is a production reporting gate:
 

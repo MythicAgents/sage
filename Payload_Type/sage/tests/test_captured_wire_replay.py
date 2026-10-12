@@ -192,3 +192,52 @@ def test_freeze_only_duplicate_removal_requires_exact_source_shape(tmp_path):
     with pytest.raises(ValueError, match="exact duplicate removal"):
         module.freeze_case(source_path, 4, "omit_duplicate_supervisor_answer",
                            module.read_profile(profile_path))
+
+
+def test_payload_return_reorder_uses_production_sanitizer_and_exact_source(tmp_path):
+    module, profile_path, source_path, _, _ = _files(
+        tmp_path, scenario="payload-handoff-apollo-v2", request_index=0,
+    )
+    source = json.loads(source_path.read_text())
+    source.pop("scenario")
+    source.pop("provider")
+    source.pop("model")
+    source["case"] = "payload-handoff-apollo-v2"
+    source["route"] = {"provider": "openai", "model": "synthetic-model",
+                       "endpoint_sha256": hashlib.sha256(b"http://127.0.0.1:7443/v1").hexdigest()}
+    original_request = source["provider_requests"][0]["request"]
+    original_request["messages"] = [
+        {"role": "system", "content": "Operator instructions"},
+        {"role": "user", "content": "Build Apollo, then propose upload."},
+        {"role": "assistant", "name": "Mythic_Payload",
+         "content": "[Mythic_Payload completed task]"},
+        {"role": "assistant", "name": "Mythic_Payload", "content": ".",
+         "tool_calls": [{"id": "seed-build", "type": "function",
+                         "function": {"name": "create_payload", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "seed-build", "content": '{"file_id":"uuid"}'},
+        {"role": "assistant", "name": "Mythic_Payload", "content": "Apollo exists: uuid"},
+        {"role": "user", "content": "Build Apollo, then propose upload."},
+    ]
+    source_path.write_text(json.dumps(source))
+    profile = module.read_profile(profile_path)
+    case = module.freeze_case(source_path, 0, "payload_handoff_completion_last", profile)
+    candidate = case["request"]["messages"]
+    assert candidate[:-1] == (
+        original_request["messages"][:2] + [original_request["messages"][-1]] +
+        original_request["messages"][2:-1]
+    )
+    assert candidate[-1] == {"role": "user", "content":
+        "Internal conversation continuation. The operator's request and authorization are unchanged."}
+    assert case["request"]["tools"] == original_request["tools"]
+    assert case["request"]["model"] == original_request["model"]
+    module._check_case(case, source_path.read_bytes(), profile)
+
+    case["request"]["messages"][-1]["content"] = "Do something else"
+    case["frozen_request_sha256"] = module.digest(case["request"])
+    with pytest.raises(ValueError, match="production sanitizer"):
+        module._check_case(case, source_path.read_bytes(), profile)
+
+    source["route"]["endpoint_sha256"] = "0" * 64
+    source_path.write_text(json.dumps(source))
+    with pytest.raises(ValueError, match="payload source endpoint"):
+        module.freeze_case(source_path, 0, "payload_handoff_completion_last", profile)

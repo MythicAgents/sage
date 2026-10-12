@@ -743,23 +743,37 @@ def _streamed_response_choices(body: bytes) -> dict | None:
     return {"model": response_model, "choices": [choices[i] for i in sorted(choices)]} if found else None
 
 
+def _capture_provider_response(body: bytes, row: dict, authorization: str = "") -> None:
+    if row.get("http_status", 200) >= 400:
+        # Keep provider errors as evidence, including non-JSON gateway responses.
+        # A rejected request is not evidence of zero usage. Never retain an echoed key.
+        content = body.decode("utf-8", errors="replace")
+        token = authorization.partition(" ")[2] or authorization
+        if token:
+            content = content.replace(token, "[REDACTED]")
+        row["error_response_body"] = content
+        return
+    parsed = _response_choices(body)
+    if parsed is not None:
+        row["response"] = parsed
+    else:
+        row["response_capture"] = "unparsed"
+
+
 class CapturingResponseStream(httpx.AsyncByteStream):
     """Observe bytes as the provider SDK consumes them, preserving its stream lifecycle."""
 
-    def __init__(self, inner: httpx.AsyncByteStream, row: dict):
+    def __init__(self, inner: httpx.AsyncByteStream, row: dict, authorization: str = ""):
         self.inner = inner
         self.row = row
+        self.authorization = authorization
 
     async def __aiter__(self):
         chunks = []
         async for chunk in self.inner:
             chunks.append(chunk)
             yield chunk
-        parsed = _response_choices(b"".join(chunks))
-        if parsed is not None:
-            self.row["response"] = parsed
-        else:
-            self.row["response_capture"] = "unparsed"
+        _capture_provider_response(b"".join(chunks), self.row, self.authorization)
 
     async def aclose(self):
         await self.inner.aclose()
@@ -895,15 +909,15 @@ class BoundedTransport(httpx.AsyncBaseTransport):
         reported_response_cost = result.headers.get("x-litellm-response-cost")
         if reported_response_cost is not None:
             row["reported_response_cost_usd"] = reported_response_cost
-        if result.status_code < 400:
-            if result.is_stream_consumed:
-                parsed = _response_choices(result.content)
-                if parsed is not None:
-                    row["response"] = parsed
-                else:
-                    row["response_capture"] = "unparsed"
-            else:
-                result.stream = CapturingResponseStream(result.stream, row)
+        # Only correlation IDs are retained, never the full response headers.
+        for header in ("x-request-id", "request-id", "x-amzn-requestid"):
+            if result.headers.get(header):
+                row.setdefault("provider_request_ids", {})[header] = result.headers[header]
+        authorization = request.headers.get("authorization", "")
+        if result.is_stream_consumed:
+            _capture_provider_response(result.content, row, authorization)
+        else:
+            result.stream = CapturingResponseStream(result.stream, row, authorization)
         return result
 
     async def aclose(self):

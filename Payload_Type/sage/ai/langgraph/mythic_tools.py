@@ -18131,8 +18131,8 @@ class MythicTools:
             result = await asyncio.wait_for(mythic.execute_custom_query(
                 self.client,
                 "query supervisedTaskState($id:Int!){ task(where:{display_id:{_eq:$id}}){ "
-                "display_id completed status command_name original_params display_params "
-                "callback { display_id } } }",
+                "display_id completed status command_name params original_params display_params "
+                "callback { display_id payload { payloadtype { name } } } } }",
                 variables={"id": task_id},
             ), timeout=5.0)
             rows = result.get("task", []) if isinstance(result, dict) else []
@@ -18142,7 +18142,7 @@ class MythicTools:
             callback = row.get("callback")
             # Apollo's shell alias returns CommandName="run" during task creation. Bind
             # that rewrite to the exact command line originally issued and displayed;
-            # no other command rename or absent parameter evidence is accepted.
+            # no other shell command rename or absent parameter evidence is accepted.
             command_matches = row.get("command_name") == command or (
                 command == "shell"
                 and row.get("command_name") == "run"
@@ -18151,6 +18151,62 @@ class MythicTools:
                 and row.get("original_params") == parameters
                 and row.get("display_params") == parameters
             )
+            if not command_matches and command == "register_assembly" \
+                    and row.get("command_name") == "register_file":
+                def strict_object(value: object) -> dict[str, Any] | None:
+                    if isinstance(value, dict):
+                        return value
+                    if not isinstance(value, str) or not value.strip():
+                        return None
+                    try:
+                        def unique(pairs):
+                            result = {}
+                            for key, item in pairs:
+                                if key in result:
+                                    raise ValueError("duplicate key")
+                                result[key] = item
+                            return result
+                        decoded = json.loads(value, object_pairs_hook=unique)
+                    except (TypeError, ValueError):
+                        return None
+                    return decoded if isinstance(decoded, dict) else None
+
+                payload = callback.get("payload") if isinstance(callback, dict) else None
+                payloadtype = payload.get("payloadtype") if isinstance(payload, dict) else None
+                requested = strict_object(parameters)
+                original = strict_object(row.get("original_params"))
+                native = strict_object(row.get("params"))
+                native_file_id = (native or {}).get("file_id")
+                native_filename = (native or {}).get("file_name")
+                common_binding = bool(
+                    isinstance(payloadtype, dict)
+                    and str(payloadtype.get("name") or "").casefold() == "apollo"
+                    and requested is not None
+                    and requested == original
+                    and native is not None
+                    and isinstance(native_file_id, str) and bool(native_file_id)
+                    and isinstance(native_filename, str) and bool(native_filename)
+                    and row.get("display_params") == native_filename
+                )
+                default_selector = next(iter(requested), "") if requested is not None else ""
+                default_binding = bool(
+                    common_binding
+                    and default_selector in {"File", "file"}
+                    and set(requested) == {default_selector}
+                    and set(native) in (
+                        {"file_id", "file_name"},
+                        {"file", "file_id", "file_name"},
+                    )
+                    and requested[default_selector] == native_file_id
+                    and ("file" not in native or native["file"] == native_file_id)
+                )
+                existing_binding = bool(
+                    common_binding
+                    and set(requested) == {"existingFile"}
+                    and set(native) == {"file_id", "file_name"}
+                    and requested["existingFile"] == native_filename
+                )
+                command_matches = default_binding or existing_binding
             if (
                 self._exact_task_display_id(row.get("display_id")) != task_id
                 or not isinstance(callback, dict)
