@@ -6353,7 +6353,6 @@ class Model:
             .add_edge("BloodHound", "Supervisor")
             .add_edge("MCP_Manager", "Supervisor")
             .add_edge("Sandbox", "Supervisor")
-            .add_edge("Mythic_Operator", "Supervisor")
             .add_edge("Autonomous_Executor", "Supervisor")
             .compile(checkpointer=self.memory, name="Sage")
         )
@@ -9028,6 +9027,13 @@ class Model:
                 for flag in ("recursion_summary_requested", "recursion_handback"):
                     if flag in result:
                         update[flag] = result[flag]
+            # Mythic_Operator can transfer directly to another specialist from its
+            # inner agent. A static Operator -> Supervisor edge also schedules
+            # Supervisor beside that specialist, including across HITL pauses.
+            # Route only an ordinary completed Operator turn back here; handoff
+            # ParentCommands and the terminal/error returns above bypass this path.
+            if node_name == "Mythic_Operator":
+                return Command(goto="Supervisor", update=update)
             return update
         _ainvoke.__name__ = node_name
         return _ainvoke
