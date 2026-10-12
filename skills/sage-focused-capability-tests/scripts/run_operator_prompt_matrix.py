@@ -250,7 +250,7 @@ class MatrixTransport(REAL.BoundedTransport):
 
     async def handle_async_request(self, request):
         try:
-            if getattr(self, "conservative_input_headroom", False):
+            if getattr(self, "conservative_input_headroom", False) and self.max_observed_tokens is not None:
                 observed = sum(part.get("total_tokens", 0)
                     for call in self.usage_recorder.calls if call.get("status") == "completed"
                     for part in call.get("usage", []))

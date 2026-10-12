@@ -767,15 +767,18 @@ class CapturingResponseStream(httpx.AsyncByteStream):
 
 class BoundedTransport(httpx.AsyncBaseTransport):
     def __init__(self, endpoint: str, model: str, tls_context: ssl.SSLContext | None = None,
-                 *, max_requests: int = MAX_REQUESTS, output_tokens: int = MAX_OUTPUT_TOKENS,
+                 *, max_requests: int | None = MAX_REQUESTS, output_tokens: int = MAX_OUTPUT_TOKENS,
                  usage_recorder: UsageRecorder | None = None,
                  max_observed_tokens: int | None = None,
                  monetary_guard: MonetaryGuard | None = None,
-                 request_seconds: float = REQUEST_SECONDS,
-                 utc_deadline: datetime | None = None):
-        if (not isinstance(request_seconds, (int, float)) or
-                not math.isfinite(request_seconds) or request_seconds <= 0 or
-                request_seconds > WALL_SECONDS):
+                 request_seconds: float | None = REQUEST_SECONDS,
+                 utc_deadline: datetime | None = None,
+                 require_complete_usage: bool = False):
+        if (request_seconds is None and utc_deadline is None) or (
+            request_seconds is not None and
+            (not isinstance(request_seconds, (int, float)) or
+             not math.isfinite(request_seconds) or request_seconds <= 0 or
+             request_seconds > WALL_SECONDS)):
             raise CaseError("invalid_request_seconds")
         self.endpoint = endpoint.rstrip("/") + "/chat/completions"
         self.model = model
@@ -790,6 +793,7 @@ class BoundedTransport(httpx.AsyncBaseTransport):
         self.monetary_guard = monetary_guard
         self.request_seconds = request_seconds
         self.utc_deadline = utc_deadline
+        self.require_complete_usage = require_complete_usage
 
     async def handle_async_request(self, request):
         remaining = remaining_utc_seconds(self.utc_deadline)
@@ -800,10 +804,32 @@ class BoundedTransport(httpx.AsyncBaseTransport):
             self.rejections.append({"reason": "unexpected_network_endpoint",
                                     "method": request.method, "path": request.url.path})
             raise CaseError("unexpected_network_endpoint")
-        if len(self.requests) >= self.max_requests:
+        if self.max_requests is not None and len(self.requests) >= self.max_requests:
             self.rejections.append({"reason": "model_request_limit"})
             raise CaseError("model_request_limit")
-        if self.max_observed_tokens is not None and self.requests:
+        if self.requests and self.require_complete_usage:
+            by_id = {}
+            for call in (self.usage_recorder.calls if self.usage_recorder else []):
+                by_id.setdefault(call.get("run_id"), []).append(call)
+            observed = 0
+            complete = True
+            for sent in self.requests:
+                matches = by_id.get(sent.get("callback_run_id"), [])
+                call = matches[0] if sent.get("callback_run_id") is not None and len(matches) == 1 else None
+                usage = call.get("usage", []) if call and call.get("status") == "completed" else []
+                if (sent.get("status") != "returned" or sent.get("http_status") != 200
+                        or len(usage) != 1 or any(
+                            type(usage[0].get(key)) is not int or usage[0][key] < 0
+                            for key in ("input_tokens", "output_tokens", "total_tokens"))
+                        or usage[0]["input_tokens"] + usage[0]["output_tokens"]
+                        != usage[0]["total_tokens"]):
+                    complete = False
+                    break
+                observed += usage[0]["total_tokens"]
+            if not complete:
+                self.rejections.append({"reason": "unknown_observed_usage"})
+                raise CaseError("unknown_observed_usage")
+        elif self.requests and self.max_observed_tokens is not None:
             completed = [row for row in (self.usage_recorder.calls if self.usage_recorder else [])
                          if row.get("status") == "completed"]
             totals = [item.get("total_tokens") for row in completed
@@ -813,6 +839,7 @@ class BoundedTransport(httpx.AsyncBaseTransport):
                 self.rejections.append({"reason": "unknown_observed_usage"})
                 raise CaseError("unknown_observed_usage")
             observed = sum(totals)
+        if self.max_observed_tokens is not None and self.requests:
             if observed >= self.max_observed_tokens:
                 self.rejections.append({"reason": "observed_token_limit",
                                         "observed_tokens": observed})
@@ -857,7 +884,9 @@ class BoundedTransport(httpx.AsyncBaseTransport):
         self.requests.append(row)
         try:
             async with asyncio.timeout(min(self.request_seconds, remaining)
-                                       if remaining is not None else self.request_seconds):
+                                       if self.request_seconds is not None and remaining is not None
+                                       else remaining if self.request_seconds is None
+                                       else self.request_seconds):
                 result = await self.inner.handle_async_request(request)
         except BaseException as exc:
             row.update(status="error", error_type=type(exc).__name__)

@@ -14,6 +14,7 @@ import contextlib
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -28,7 +29,6 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
 import run_operator_prompt_matrix as matrix
-from ai import resource_budget, resource_http
 from ai.langgraph import model as model_module
 from ai.langgraph.model import Model
 from ai.langgraph.mythic_tools import MythicTools
@@ -205,13 +205,8 @@ def offline_scripted_continuation(request: httpx.Request, model: str, number: in
 
 
 class SeededTransport(matrix.MatrixTransport):
-    def __init__(self, *args, ledger, **kwargs):
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if ledger is None:
-            raise ValueError("shared resource ledger required")
-        self.inner = resource_http.MeteredAsyncHTTPTransport(
-            "provider", ledger=ledger, transport=self.inner,
-            operation="payload-handoff-provider")
         self.seed_index = 0
         self.local_seeds = []
         self.posthandoff_input_bytes = []
@@ -235,17 +230,41 @@ class SeededTransport(matrix.MatrixTransport):
             return _seed_response(request, self.model, self.seed_index, tool, args)
         self.posthandoff_input_bytes.append(len(request.content))
         self.persist()
-        if len(request.content) + self.output_tokens > self.inner.provider_token_reservation:
-            self.rejections.append({"reason": "per_call_reservation_headroom",
-                "request_bytes": len(request.content),
-                "reserved_tokens": self.inner.provider_token_reservation})
-            raise matrix.REAL.CaseError("per_call_reservation_headroom")
         return await super().handle_async_request(request)
 
 
-async def run_case(profile: dict, output_dir: Path, shared_ledger, tls_context, ips: set[str],
+def _account_provider_requests(requests: list[dict], calls: list[dict]) -> dict:
+    """Reconcile every dispatched request, including the final or interrupted one."""
+    by_id = {}
+    for call in calls:
+        by_id.setdefault(call.get("run_id"), []).append(call)
+    total_input = total_output = total_tokens = 0
+    unknown = []
+    for request in requests:
+        matches = by_id.get(request.get("callback_run_id"), [])
+        call = matches[0] if request.get("callback_run_id") is not None and len(matches) == 1 else None
+        usages = call.get("usage", []) if call and call.get("status") == "completed" else []
+        if (request.get("status") != "returned" or request.get("http_status") != 200
+                or len(usages) != 1 or any(
+                    type(usages[0].get(key)) is not int or usages[0][key] < 0
+                    for key in ("input_tokens", "output_tokens", "total_tokens"))
+                or usages[0]["input_tokens"] + usages[0]["output_tokens"] != usages[0]["total_tokens"]):
+            unknown.append(request["index"])
+            continue
+        total_input += usages[0]["input_tokens"]
+        total_output += usages[0]["output_tokens"]
+        total_tokens += usages[0]["total_tokens"]
+    return {"requests": len(requests), "input_tokens": total_input,
+            "output_tokens": total_output, "total_tokens": total_tokens,
+            "unknown_request_indices": unknown, "usage_complete": not unknown}
+
+
+async def run_case(profile: dict, output_dir: Path, _shared_ledger=None, tls_context=None,
+                   ips: set[str] | None = None,
                    limits=None, config_path: Path | None = None):
-    limits = limits or SimpleNamespace(max_calls=4, max_tokens=98304, max_wall=120)
+    limits = limits or SimpleNamespace(max_wall=300)
+    if os.environ.get("SAGE_RESOURCE_BUDGET_CONFIG") or os.environ.get("SAGE_RESOURCE_BUDGET_LEDGER"):
+        raise ValueError("handoff case requires SAGE_RESOURCE_BUDGET_CONFIG and SAGE_RESOURCE_BUDGET_LEDGER unset")
     path = output_dir / "case.json"
     row = {"case": CASE, "tier": "assembled LangGraph HITL", "status": "started",
            "model_sha256": digest_bytes(IMPORTED_MODEL_PATH.read_bytes()),
@@ -260,13 +279,12 @@ async def run_case(profile: dict, output_dir: Path, shared_ledger, tls_context, 
         matrix.atomic_json(path, row)
     persist()
     usage = matrix.MatrixUsage(persist)
+    deadline_at = datetime.now(timezone.utc) + timedelta(seconds=limits.max_wall)
     transport = SeededTransport(profile["API_ENDPOINT"], profile["model"], tls_context,
-        max_requests=limits.max_calls, output_tokens=2048, usage_recorder=usage,
-        max_observed_tokens=limits.max_tokens, request_seconds=30,
-        utc_deadline=datetime.now(timezone.utc) + timedelta(seconds=limits.max_wall),
-        persist=persist, ledger=shared_ledger)
-    row["provider_token_reservation"] = transport.inner.provider_token_reservation
-    transport.conservative_input_headroom = True
+        max_requests=None, output_tokens=2048, usage_recorder=usage,
+        max_observed_tokens=None, request_seconds=None, require_complete_usage=True,
+        utc_deadline=deadline_at,
+        persist=persist)
     row["provider_requests"] = transport.requests
     row["model_calls"] = usage.calls
     row["transport_rejections"] = transport.rejections
@@ -347,17 +365,25 @@ async def run_case(profile: dict, output_dir: Path, shared_ledger, tls_context, 
     async def payload_type(callback_id):
         return "apollo" if callback_id == 7 else None
     sink._resolve_payload_type = payload_type
-    async_client = httpx.AsyncClient(transport=transport, timeout=30, trust_env=False)
-    sync_client = httpx.Client(transport=matrix.REAL.BoundedSyncTransport(), timeout=30, trust_env=False)
+    async_client = httpx.AsyncClient(transport=transport, timeout=300, trust_env=False)
+    sync_client = httpx.Client(transport=matrix.REAL.BoundedSyncTransport(), timeout=300, trust_env=False)
     factory = model_module.init_chat_model
     def bounded_factory(*args, **kwargs):
         if kwargs.get("model_provider") != "openai" or kwargs.get("model") != profile["model"]:
             raise matrix.REAL.CaseError("unexpected_model_construction")
         kwargs.update(http_client=sync_client, http_async_client=async_client,
-                      max_retries=0, timeout=30, max_tokens=2048)
+                      max_retries=0, timeout=300, max_tokens=2048)
         llm = factory(*args, **kwargs)
         llm.callbacks = [usage]
         return llm
+    task = asyncio.current_task()
+    timed_out = False
+    def deadline_cancel():
+        nonlocal timed_out
+        timed_out = True
+        task.cancel()
+    deadline_handle = asyncio.get_running_loop().call_later(
+        max(0, (deadline_at - datetime.now(timezone.utc)).total_seconds()), deadline_cancel)
     try:
         with (patch.object(model_module, "init_chat_model", bounded_factory),
               patch.dict(os.environ, {"SAGE_EVAL_MAX_OUTPUT_TOKENS": "2048"}),
@@ -385,7 +411,10 @@ async def run_case(profile: dict, output_dir: Path, shared_ledger, tls_context, 
             model.state["messages"] = [human]
             model.state["supervisor_messages"].append(human)
             config = model._graph_run_config("payload-handoff-case")
-            config["recursion_limit"] = 32
+            # This installed LangGraph accepts infinity (only checks >= 1, then
+            # compares graph steps to current_step + recursion_limit + 1).
+            # The external wall deadline is this measurement's stopping limit.
+            config["recursion_limit"] = math.inf
             first = await model.graph.ainvoke(model.state, config)
             row["first_interrupt"] = first.get("__interrupt__") is not None
             row["build_approval_request"] = [getattr(item, "value", {})
@@ -418,11 +447,32 @@ async def run_case(profile: dict, output_dir: Path, shared_ledger, tls_context, 
             row["objective_success"] = bool(row["protocol_valid"] and row["classification"]["supported"])
             row["status"] = "observed" if row["second_interrupt"] else "no_pending_upload"
     except BaseException as exc:
-        row["status"] = "harness_gap" if isinstance(exc, matrix.FixtureGap) else "error"
+        deadline_expired = (timed_out or datetime.now(timezone.utc) >= transport.utc_deadline
+            or any(item.get("reason") == "utc_deadline_expired" for item in transport.rejections))
+        unknown_usage = any(item.get("reason") == "unknown_observed_usage"
+            for item in transport.rejections)
+        row["status"] = ("time_limit" if deadline_expired else
+            "unknown_provider_usage" if unknown_usage else
+            "harness_gap" if isinstance(exc, matrix.FixtureGap) else
+            "cancelled" if isinstance(exc, asyncio.CancelledError) else "error")
         row["error"] = type(exc).__name__ + ": " + str(exc)
+        row["stop_reason"] = ("wall_time" if deadline_expired else
+            "unknown_provider_usage" if unknown_usage else type(exc).__name__)
+        row["protocol_valid"] = bool(deadline_expired and transport.seed_index == len(SEEDS)
+            and len(row["accepted_local_builds"]) == 1 and not row["effects"])
+        row["objective_success"] = False
     finally:
+        deadline_handle.cancel()
         await async_client.aclose()
         sync_client.close()
+        row["provider_accounting"] = _account_provider_requests(transport.requests, usage.calls)
+        if not row["provider_accounting"]["usage_complete"]:
+            row["usage_uncertain"] = True
+            if row["status"] in {"observed", "no_pending_upload"}:
+                row["status"] = "unknown_provider_usage"
+                row["stop_reason"] = "unknown_provider_usage"
+                row["protocol_valid"] = False
+                row["objective_success"] = False
         persist()
     return row
 
@@ -436,29 +486,24 @@ def main(argv=None):
     parser.add_argument("--expected-model")
     parser.add_argument("--expected-endpoint-sha256")
     parser.add_argument("--expected-source-sha256")
-    parser.add_argument("--max-real-calls", type=int, default=4)
-    parser.add_argument("--max-observed-tokens", type=int, default=98304)
-    parser.add_argument("--max-wall-seconds", type=int, default=120)
+    parser.add_argument("--max-wall-seconds", type=int, default=300)
     args = parser.parse_args(argv)
     source = digest_bytes(IMPORTED_MODEL_PATH.read_bytes())
-    reservation = resource_http._provider_token_reservation()
     if not args.run:
         print(json.dumps({"status": "offline_inspection", "tier": "assembled LangGraph HITL",
             "config_path": str(args.config.resolve()),
             "source_sha256": source, "fixture_sha256": fixture_digest(),
-            "max_real_calls": args.max_real_calls,
-            "max_observed_tokens": args.max_observed_tokens,
+            "max_real_calls": None,
+            "max_observed_tokens": None,
             "max_wall_seconds": args.max_wall_seconds,
-            "provider_token_reservation": reservation,
             "fixture_scope": "synthetic text build, uploaded-file inventory, and inert Payload metadata; no reusable live C2",
             "local_setup_approval": "one synthetic text build", "target_effects": 0}, sort_keys=True))
         return 0
     try:
         if IMPORTED_MODEL_PATH != (SAGE / "ai/langgraph/model.py").resolve():
             raise ValueError("imported model.py does not match the selected checkout")
-        if (not 1 <= args.max_real_calls <= 4 or not reservation <= args.max_observed_tokens
-                or args.max_observed_tokens > 250000 or not 1 <= args.max_wall_seconds <= 120):
-            raise ValueError("invalid per-arm limits or token reservation exceeds arm cap")
+        if not 1 <= args.max_wall_seconds <= 300:
+            raise ValueError("invalid per-arm wall limit")
         if not all((args.output_dir, args.expected_model,
                     args.expected_endpoint_sha256, args.expected_source_sha256)):
             raise ValueError("--run requires output and exact model, endpoint and source identities")
@@ -467,29 +512,23 @@ def main(argv=None):
                 or source != args.expected_source_sha256
                 or digest_bytes(profile["API_ENDPOINT"].encode()) != args.expected_endpoint_sha256):
             raise ValueError("source or route identity mismatch")
+        if os.environ.get("SAGE_RESOURCE_BUDGET_CONFIG") or os.environ.get("SAGE_RESOURCE_BUDGET_LEDGER"):
+            raise ValueError("handoff case requires SAGE_RESOURCE_BUDGET_CONFIG and SAGE_RESOURCE_BUDGET_LEDGER unset")
         if args.output_dir.exists():
             raise ValueError("output directory already exists")
-        shared = resource_budget.configured_ledger()
-        if shared is None:
-            raise ValueError("SAGE_RESOURCE_BUDGET_CONFIG and SAGE_RESOURCE_BUDGET_LEDGER required")
-        status = shared.status()
-        if status.get("unknown_provider_usage") or status.get("provider_overrun"):
-            raise ValueError("shared ledger has unknown or overrun provider usage")
         ips = matrix.REAL.resolved_endpoint_ips(profile["API_ENDPOINT"])
         tls = matrix.REAL.sage_tls_context()
         args.output_dir.mkdir(parents=True)
         with tempfile.TemporaryDirectory(prefix="sage-payload-handoff-") as temp:
             from sage_chat import session
             with patch.object(session, "_CHANNEL_MARKER_DB_PATH", str(Path(temp) / "sage.db")):
-                row = asyncio.run(asyncio.wait_for(run_case(profile, args.output_dir,
-                    shared, tls, ips, SimpleNamespace(max_calls=args.max_real_calls,
-                    max_tokens=args.max_observed_tokens, max_wall=args.max_wall_seconds),
-                    config_path=args.config),
-                    timeout=args.max_wall_seconds))
+                row = asyncio.run(run_case(profile, args.output_dir,
+                    None, tls, ips, SimpleNamespace(max_wall=args.max_wall_seconds),
+                    config_path=args.config))
         print(json.dumps({"status": row["status"], "classification": row.get("classification"),
             "source_sha256": source, "fixture_sha256": fixture_digest(),
             "config_path": str(args.config.resolve())}))
-        return 0 if row["status"] in {"observed", "no_pending_upload"} else 1
+        return 0 if row["status"] in {"observed", "no_pending_upload", "time_limit"} else 1
     except Exception as exc:
         print(json.dumps({"status": "configuration_or_run_error", "type": type(exc).__name__,
                           "reason": str(exc)}))

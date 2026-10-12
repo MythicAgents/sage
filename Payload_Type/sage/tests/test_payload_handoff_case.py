@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 import importlib.util
 import json
 from pathlib import Path
@@ -26,13 +27,14 @@ def test_default_inspection_is_offline_and_records_exact_scope(monkeypatch, caps
     row = json.loads(capsys.readouterr().out)
     assert row["status"] == "offline_inspection"
     assert row["config_path"] == str(case.DEFAULT_CONFIG.resolve())
-    assert row["max_real_calls"] == 4
-    assert row["max_observed_tokens"] == 98304
+    assert row["max_real_calls"] is None
+    assert row["max_observed_tokens"] is None
+    assert row["max_wall_seconds"] == 300
     assert row["target_effects"] == 0
     assert row["fixture_sha256"] == case.fixture_digest()
 
 
-def test_run_requires_identity_and_shared_ledger_before_dns(monkeypatch, capsys, tmp_path):
+def test_run_requires_identity_before_dns(monkeypatch, capsys, tmp_path):
     profile = {"provider": "openai", "model": "fixture-model",
                "API_ENDPOINT": "http://127.0.0.1:9/v1", "API_KEY": "inert"}
     monkeypatch.setattr(case.matrix.REAL, "load_profile", lambda *_: profile)
@@ -46,9 +48,6 @@ def test_run_requires_identity_and_shared_ledger_before_dns(monkeypatch, capsys,
                  "--expected-source-sha256"):
         assert case.main([*common, flag, "wrong"]) == 2
         assert "identity mismatch" in capsys.readouterr().out
-    monkeypatch.setattr(case.resource_budget, "configured_ledger", lambda: None)
-    assert case.main(common) == 2
-    assert "SAGE_RESOURCE_BUDGET" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("change", [
@@ -137,15 +136,11 @@ def test_assembled_seed_approval_and_pending_upload_have_no_effect(
 
 
 @pytest.mark.parametrize("explicit_config", [False, True])
-def test_run_cli_reaches_assembled_case_with_inert_route_and_ledger(
+def test_run_cli_reaches_assembled_case_with_inert_route(
     monkeypatch, tmp_path, capsys, explicit_config,
 ):
     profile = {"provider": "openai", "model": "fixture-model",
                "API_ENDPOINT": "http://127.0.0.1:9/v1", "API_KEY": "inert"}
-
-    class Ledger:
-        def status(self):
-            return {"unknown_provider_usage": False, "provider_overrun": False}
 
     original = case.SeededTransport
 
@@ -163,7 +158,6 @@ def test_run_cli_reaches_assembled_case_with_inert_route_and_ledger(
     monkeypatch.setattr(case.matrix.REAL, "load_profile", load_profile)
     monkeypatch.setattr(case.matrix.REAL, "resolved_endpoint_ips", lambda *_: {"127.0.0.1"})
     monkeypatch.setattr(case.matrix.REAL, "sage_tls_context", lambda: None)
-    monkeypatch.setattr(case.resource_budget, "configured_ledger", Ledger)
     output = tmp_path / "case"
     config = tmp_path / "explicit.env" if explicit_config else case.DEFAULT_CONFIG
     args = ["--run", "--output-dir", str(output),
@@ -193,27 +187,11 @@ def test_missing_default_config_fails_before_dns(monkeypatch, tmp_path, capsys):
     assert not (tmp_path / "case").exists()
 
 
-@pytest.mark.parametrize("reservation,expected_success", [(65536, True), (32768, False)])
-def test_posthandoff_uses_bounded_metered_provider_transport(
-    monkeypatch, tmp_path, reservation, expected_success,
-):
-    monkeypatch.setenv("SAGE_RESOURCE_PROVIDER_TOKEN_RESERVATION", str(reservation))
+def test_posthandoff_accounts_provider_without_reservation_headroom(monkeypatch, tmp_path):
+    monkeypatch.setenv("SAGE_RESOURCE_PROVIDER_TOKEN_RESERVATION", "1")
     profile = {"provider": "openai", "model": "fixture-model",
                "API_ENDPOINT": "http://127.0.0.1:9/v1", "API_KEY": "inert"}
 
-    class Ledger:
-        def __init__(self):
-            self.reservations = []
-            self.settlements = []
-
-        def reserve(self, amounts, operation):
-            self.reservations.append((amounts, operation))
-            return f"r-{len(self.reservations)}"
-
-        def settle_provider(self, reservation_id, actual_tokens):
-            self.settlements.append((reservation_id, actual_tokens))
-
-    shared = Ledger()
     original = case.SeededTransport
 
     class Provider(httpx.AsyncBaseTransport):
@@ -224,20 +202,16 @@ def test_posthandoff_uses_bounded_metered_provider_transport(
     class MeteredLocalTransport(original):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
-            self.inner.transport = Provider()
+            self.inner = Provider()
 
     monkeypatch.setattr(case, "SeededTransport", MeteredLocalTransport)
     result = asyncio.run(asyncio.wait_for(case.run_case(
-        profile, tmp_path, shared, None, {"127.0.0.1"}), timeout=10))
-    if not expected_success:
-        assert result["status"] == "error"
-        assert result["transport_rejections"][-1]["reason"] == "per_call_reservation_headroom"
-        assert shared.reservations == [] and result["provider_requests"] == []
-        return
+        profile, tmp_path, None, None, {"127.0.0.1"}), timeout=10))
     assert result["status"] == "observed", result.get("error")
     assert result["objective_success"] and result["effects"] == []
-    assert len(shared.reservations) == len(shared.settlements) == len(result["provider_requests"]) == 1
-    assert shared.settlements[0][1] == 123
+    assert len(result["provider_requests"]) == 1
+    assert result["provider_accounting"]["total_tokens"] == 123
+    assert result["provider_accounting"]["usage_complete"]
     assert result["posthandoff_input_bytes"][0] > 0
     assert result["provider_requests"][0]["request"]["messages"]
     assert result["model_calls"][-1]["usage"][0]["total_tokens"] == 123
@@ -296,7 +270,7 @@ def test_redelegated_payload_metadata_reads_and_repeated_build_pause(
     class MeteredLocalTransport(original):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
-            self.inner.transport = provider
+            self.inner = provider
 
     monkeypatch.setattr(case, "SeededTransport", MeteredLocalTransport)
     result = asyncio.run(asyncio.wait_for(case.run_case(
@@ -306,12 +280,210 @@ def test_redelegated_payload_metadata_reads_and_repeated_build_pause(
     assert [read["tool"] for read in result["fixture_reads"]] == [name for name, _ in reads]
     assert [read["result"] if isinstance(read["result"], list) else json.loads(read["result"])
             for read in result["fixture_reads"]] == expected
-    assert len(shared.reservations) == len(shared.settlements) == len(sequence)
+    assert result["provider_accounting"]["requests"] == len(sequence)
+    assert result["provider_accounting"]["usage_complete"]
     assert len(result["accepted_local_builds"]) == 1
     assert result["proposals"][0]["tool_name"] == "create_payload"
     assert result["classification"]["supported"] is False
     assert result["objective_success"] is False
     assert result["effects"] == []
+
+
+def test_more_than_four_calls_and_old_token_ceiling_reach_pending_upload(monkeypatch, tmp_path):
+    profile = {"provider": "openai", "model": "fixture-model",
+               "API_ENDPOINT": "http://127.0.0.1:9/v1", "API_KEY": "inert"}
+    sequence = [("get_all_uploaded_files", {})] * 5 + [
+        ("upload_file_by_file_uuid", {"command": "upload", "parameters": {
+            "file": case.FILE_UUID, "remote_path": case.DESTINATION},
+            "file_uuid": case.FILE_UUID, "callback_display_id": 7})]
+    original = case.SeededTransport
+
+    class Provider(httpx.AsyncBaseTransport):
+        def __init__(self):
+            self.calls = 0
+
+        async def handle_async_request(self, request):
+            name, args = sequence[self.calls]
+            self.calls += 1
+            return case._seed_response(request, profile["model"], self.calls + 100,
+                name, args, usage={"prompt_tokens": 20000,
+                "completion_tokens": 23, "total_tokens": 20023})
+
+    provider = Provider()
+
+    class Local(original):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.inner = provider
+
+    monkeypatch.setattr(case, "SeededTransport", Local)
+    result = asyncio.run(asyncio.wait_for(case.run_case(
+        profile, tmp_path, None, None, {"127.0.0.1"}), timeout=20))
+    assert result["status"] == "observed", result.get("error")
+    assert provider.calls == 6
+    assert result["provider_accounting"]["requests"] == 6
+    assert result["provider_accounting"]["total_tokens"] == 6 * 20023 > 98304
+    assert result["provider_accounting"]["usage_complete"]
+    assert result["classification"]["supported"] and result["effects"] == []
+
+
+@pytest.mark.parametrize("first_tool", ["get_all_uploaded_files", "upload_file_by_file_uuid"])
+def test_missing_provider_usage_is_uncertain_even_with_known_seed_usage(
+    monkeypatch, tmp_path, first_tool,
+):
+    profile = {"provider": "openai", "model": "fixture-model",
+               "API_ENDPOINT": "http://127.0.0.1:9/v1", "API_KEY": "inert"}
+    upload = {"command": "upload", "parameters": {"file": case.FILE_UUID,
+        "remote_path": case.DESTINATION}, "file_uuid": case.FILE_UUID,
+        "callback_display_id": 7}
+    original = case.SeededTransport
+
+    class Provider(httpx.AsyncBaseTransport):
+        calls = 0
+
+        async def handle_async_request(self, request):
+            self.calls += 1
+            response = case._seed_response(request, profile["model"], self.calls + 100,
+                first_tool, {} if first_tool == "get_all_uploaded_files" else upload,
+                usage={"prompt_tokens": 100, "completion_tokens": 23,
+                       "total_tokens": 123})
+            if json.loads(request.content).get("stream"):
+                chunks = [chunk for chunk in response.content.decode().split("\n\n")
+                          if '"usage"' not in chunk]
+                return httpx.Response(200, request=request,
+                    content="\n\n".join(chunks).encode(),
+                    headers={"content-type": "text/event-stream"})
+            body = response.json()
+            del body["usage"]
+            return httpx.Response(200, request=request, json=body)
+
+    provider = Provider()
+
+    class Local(original):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.inner = provider
+
+    monkeypatch.setattr(case, "SeededTransport", Local)
+    result = asyncio.run(asyncio.wait_for(case.run_case(
+        profile, tmp_path, None, None, {"127.0.0.1"}), timeout=20))
+    assert provider.calls == 1
+    assert result["status"] == "unknown_provider_usage"
+    assert result["usage_uncertain"] is True
+    assert result["provider_accounting"]["unknown_request_indices"] == [1]
+    assert result["objective_success"] is False
+    assert result["effects"] == []
+    if first_tool == "get_all_uploaded_files":
+        assert any(row["reason"] == "unknown_observed_usage"
+                   for row in result["transport_rejections"])
+
+
+def test_wall_limit_persists_in_flight_uncertainty(monkeypatch, tmp_path):
+    profile = {"provider": "openai", "model": "fixture-model",
+               "API_ENDPOINT": "http://127.0.0.1:9/v1", "API_KEY": "inert"}
+    original = case.SeededTransport
+
+    class WaitingProvider(httpx.AsyncBaseTransport):
+        calls = 0
+
+        async def handle_async_request(self, request):
+            self.calls += 1
+            await asyncio.Event().wait()
+
+    provider = WaitingProvider()
+
+    class Local(original):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.inner = provider
+
+    monkeypatch.setattr(case, "SeededTransport", Local)
+    result = asyncio.run(case.run_case(profile, tmp_path, None, None, {"127.0.0.1"},
+        limits=case.SimpleNamespace(max_wall=1)))
+    assert result["status"] == "time_limit"
+    assert result["stop_reason"] == "wall_time"
+    assert result["protocol_valid"] and not result["objective_success"]
+    assert provider.calls == 1
+    assert result["provider_accounting"]["unknown_request_indices"] == [1]
+    assert result["usage_uncertain"] is True
+    assert json.loads((tmp_path / "case.json").read_text())["status"] == "time_limit"
+    assert result["effects"] == []
+
+
+def test_external_cancellation_is_not_labeled_wall_time(monkeypatch, tmp_path):
+    profile = {"provider": "openai", "model": "fixture-model",
+               "API_ENDPOINT": "http://127.0.0.1:9/v1", "API_KEY": "inert"}
+    started = asyncio.Event()
+    original = case.SeededTransport
+
+    class WaitingProvider(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            started.set()
+            await asyncio.Event().wait()
+
+    class Local(original):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.inner = WaitingProvider()
+
+    monkeypatch.setattr(case, "SeededTransport", Local)
+
+    async def execute():
+        running = asyncio.create_task(case.run_case(profile, tmp_path, None, None,
+            {"127.0.0.1"}, limits=case.SimpleNamespace(max_wall=5)))
+        await asyncio.wait_for(started.wait(), timeout=4)
+        running.cancel()
+        return await running
+
+    result = asyncio.run(execute())
+    assert result["status"] == "cancelled"
+    assert result["stop_reason"] == "CancelledError"
+    assert result["usage_uncertain"] is True
+    assert result["effects"] == []
+
+
+def test_transport_deadline_first_is_reported_as_time_limit(monkeypatch, tmp_path):
+    profile = {"provider": "openai", "model": "fixture-model",
+               "API_ENDPOINT": "http://127.0.0.1:9/v1", "API_KEY": "inert"}
+    original = case.SeededTransport
+
+    class WaitingProvider(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            await asyncio.Event().wait()
+
+    class EarlierTransport(original):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.utc_deadline = datetime.now(timezone.utc) + timedelta(seconds=1.2)
+            self.inner = WaitingProvider()
+
+        async def handle_async_request(self, request):
+            try:
+                return await super().handle_async_request(request)
+            finally:
+                # A response timeout has no explicit pre-dispatch rejection.
+                self.rejections[:] = [row for row in self.rejections
+                    if row.get("reason") != "utc_deadline_expired"]
+
+    monkeypatch.setattr(case, "SeededTransport", EarlierTransport)
+    result = asyncio.run(case.run_case(profile, tmp_path, None, None, {"127.0.0.1"},
+        limits=case.SimpleNamespace(max_wall=3)))
+    assert result["status"] == "time_limit"
+    assert result["stop_reason"] == "wall_time"
+    assert result["usage_uncertain"] is True
+
+
+def test_inherited_runtime_resource_ledger_rejected_before_dns(monkeypatch, tmp_path, capsys):
+    profile = {"provider": "openai", "model": "fixture-model",
+               "API_ENDPOINT": "http://127.0.0.1:9/v1", "API_KEY": "inert"}
+    monkeypatch.setenv("SAGE_RESOURCE_BUDGET_CONFIG", str(tmp_path / "old-budget.json"))
+    monkeypatch.setattr(case.matrix.REAL, "load_profile", lambda *_: profile)
+    monkeypatch.setattr(case.matrix.REAL, "resolved_endpoint_ips", lambda *_: pytest.fail("DNS"))
+    assert case.main(["--run", "--output-dir", str(tmp_path / "case"),
+        "--expected-model", profile["model"],
+        "--expected-endpoint-sha256", case.digest_bytes(profile["API_ENDPOINT"].encode()),
+        "--expected-source-sha256", case.digest_bytes(case.IMPORTED_MODEL_PATH.read_bytes())]) == 2
+    assert "requires SAGE_RESOURCE_BUDGET_CONFIG" in capsys.readouterr().out
 
 
 def test_payload_metadata_identity_and_digest(monkeypatch):
@@ -367,7 +539,7 @@ def test_unknown_payload_metadata_fails_closed_in_assembled_graph(
     class MeteredLocalTransport(original):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
-            self.inner.transport = provider
+            self.inner = provider
 
     monkeypatch.setattr(case, "SeededTransport", MeteredLocalTransport)
     result = asyncio.run(asyncio.wait_for(case.run_case(

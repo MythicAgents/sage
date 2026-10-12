@@ -161,12 +161,16 @@ not recover the unrecorded inputs of an earlier paid run.
 
 The Payload handoff measurement helper (`run_payload_handoff_case.py`) uses the
 same `Payload_Type/sage/.env.local` provider profile as the other focused model
-runners. Its default invocation only prints the selected path and fixture limits;
+runners. Its default invocation only prints the selected path and five-minute wall limit;
 it does not read credentials or contact the provider. A bounded `--run` reads that
 profile and records the selected path in the private case result. For a clean source
 checkout without its own local profile, pass `--config` with the intended existing
 `.env.local` path explicitly. This selects one profile for that run; it does not
-create a second credential store or copy credentials into the checkout.
+create a second credential store or copy credentials into the checkout. The handoff
+case has no aggregate provider call or token ceiling. It records each request and
+provider-reported input/output usage, stops before another request if earlier usage
+is missing, and marks final or interrupted usage as uncertain. It rejects a configured
+runtime resource ledger so that an inherited finite ledger cannot silently cap the case.
 
 Three development helpers isolate different questions. None is a production reporting gate:
 
