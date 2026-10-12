@@ -25,6 +25,7 @@ def test_default_inspection_is_offline_and_records_exact_scope(monkeypatch, caps
     assert case.main([]) == 0
     row = json.loads(capsys.readouterr().out)
     assert row["status"] == "offline_inspection"
+    assert row["config_path"] == str(case.DEFAULT_CONFIG.resolve())
     assert row["max_real_calls"] == 4
     assert row["max_observed_tokens"] == 98304
     assert row["target_effects"] == 0
@@ -135,8 +136,9 @@ def test_assembled_seed_approval_and_pending_upload_have_no_effect(
         assert result["fixture_reads"] == []  # Current source carries the build result.
 
 
+@pytest.mark.parametrize("explicit_config", [False, True])
 def test_run_cli_reaches_assembled_case_with_inert_route_and_ledger(
-    monkeypatch, tmp_path, capsys,
+    monkeypatch, tmp_path, capsys, explicit_config,
 ):
     profile = {"provider": "openai", "model": "fixture-model",
                "API_ENDPOINT": "http://127.0.0.1:9/v1", "API_KEY": "inert"}
@@ -154,20 +156,41 @@ def test_run_cli_reaches_assembled_case_with_inert_route_and_ledger(
             return case.offline_scripted_continuation(request, self.model, 99)
 
     monkeypatch.setattr(case, "SeededTransport", OfflineTransport)
-    monkeypatch.setattr(case.matrix.REAL, "load_profile", lambda *_: profile)
+    selected = []
+    def load_profile(path):
+        selected.append(path)
+        return profile
+    monkeypatch.setattr(case.matrix.REAL, "load_profile", load_profile)
     monkeypatch.setattr(case.matrix.REAL, "resolved_endpoint_ips", lambda *_: {"127.0.0.1"})
     monkeypatch.setattr(case.matrix.REAL, "sage_tls_context", lambda: None)
     monkeypatch.setattr(case.resource_budget, "configured_ledger", Ledger)
     output = tmp_path / "case"
-    args = ["--run", "--config", str(tmp_path / "config"), "--output-dir", str(output),
+    config = tmp_path / "explicit.env" if explicit_config else case.DEFAULT_CONFIG
+    args = ["--run", "--output-dir", str(output),
         "--expected-model", profile["model"],
         "--expected-endpoint-sha256", case.digest_bytes(profile["API_ENDPOINT"].encode()),
         "--expected-source-sha256", case.digest_bytes(case.IMPORTED_MODEL_PATH.read_bytes())]
+    if explicit_config:
+        args += ["--config", str(config)]
     assert case.main(args) == 0
+    assert selected == [config]
     assert json.loads(capsys.readouterr().out.splitlines()[-1])["status"] == "observed"
     result = json.loads((output / "case.json").read_text())
     assert result["objective_success"] is True
     assert result["effects"] == []
+    assert result["config_path"] == str(config.resolve())
+
+
+def test_missing_default_config_fails_before_dns(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(case, "DEFAULT_CONFIG", tmp_path / "absent.env")
+    monkeypatch.setattr(case.matrix.REAL, "resolved_endpoint_ips", lambda *_: pytest.fail("DNS"))
+    args = ["--run", "--output-dir", str(tmp_path / "case"),
+        "--expected-model", "fixture-model", "--expected-endpoint-sha256", "0" * 64,
+        "--expected-source-sha256", case.digest_bytes(case.IMPORTED_MODEL_PATH.read_bytes())]
+    assert case.main(args) == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result["reason"] == "missing_config_file"
+    assert not (tmp_path / "case").exists()
 
 
 @pytest.mark.parametrize("reservation,expected_success", [(65536, True), (32768, False)])

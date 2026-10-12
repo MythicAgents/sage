@@ -36,6 +36,7 @@ from ai.langgraph.request_contract import build_request_contract
 
 
 SAGE = matrix.SAGE
+DEFAULT_CONFIG = SAGE / ".env.local"
 IMPORTED_MODEL_PATH = Path(model_module.__file__).resolve()
 CASE = "payload-handoff-text-v1"
 FILE_UUID = "d9c43269-2cb5-4aa3-b893-219294b88b17"
@@ -224,12 +225,13 @@ class SeededTransport(matrix.MatrixTransport):
 
 
 async def run_case(profile: dict, output_dir: Path, shared_ledger, tls_context, ips: set[str],
-                   limits=None):
+                   limits=None, config_path: Path | None = None):
     limits = limits or SimpleNamespace(max_calls=4, max_tokens=98304, max_wall=120)
     path = output_dir / "case.json"
     row = {"case": CASE, "tier": "assembled LangGraph HITL", "status": "started",
            "model_sha256": digest_bytes(IMPORTED_MODEL_PATH.read_bytes()),
            "imported_model_path": str(IMPORTED_MODEL_PATH),
+           "config_path": str(config_path.resolve()) if config_path is not None else None,
            "fixture_sha256": fixture_digest(), "route": {"provider": profile["provider"],
            "model": profile["model"], "endpoint_sha256": digest_bytes(profile["API_ENDPOINT"].encode())},
            "fixture_scope": "synthetic dual registration: mock build result and ordinary uploaded-file inventory; not native payload listing behavior",
@@ -394,7 +396,8 @@ async def run_case(profile: dict, output_dir: Path, shared_ledger, tls_context, 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", action="store_true")
-    parser.add_argument("--config", type=Path)
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG,
+                        help="provider profile (default: this checkout's Payload_Type/sage/.env.local)")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--expected-model")
     parser.add_argument("--expected-endpoint-sha256")
@@ -407,6 +410,7 @@ def main(argv=None):
     reservation = resource_http._provider_token_reservation()
     if not args.run:
         print(json.dumps({"status": "offline_inspection", "tier": "assembled LangGraph HITL",
+            "config_path": str(args.config.resolve()),
             "source_sha256": source, "fixture_sha256": fixture_digest(),
             "max_real_calls": args.max_real_calls,
             "max_observed_tokens": args.max_observed_tokens,
@@ -421,9 +425,9 @@ def main(argv=None):
         if (not 1 <= args.max_real_calls <= 4 or not reservation <= args.max_observed_tokens
                 or args.max_observed_tokens > 250000 or not 1 <= args.max_wall_seconds <= 120):
             raise ValueError("invalid per-arm limits or token reservation exceeds arm cap")
-        if not all((args.config, args.output_dir, args.expected_model,
+        if not all((args.output_dir, args.expected_model,
                     args.expected_endpoint_sha256, args.expected_source_sha256)):
-            raise ValueError("--run requires config, output, exact model, endpoint and source identities")
+            raise ValueError("--run requires output and exact model, endpoint and source identities")
         profile = matrix.REAL.load_profile(args.config)
         if (profile["provider"] != "openai" or profile["model"] != args.expected_model
                 or source != args.expected_source_sha256
@@ -445,10 +449,12 @@ def main(argv=None):
             with patch.object(session, "_CHANNEL_MARKER_DB_PATH", str(Path(temp) / "sage.db")):
                 row = asyncio.run(asyncio.wait_for(run_case(profile, args.output_dir,
                     shared, tls, ips, SimpleNamespace(max_calls=args.max_real_calls,
-                    max_tokens=args.max_observed_tokens, max_wall=args.max_wall_seconds)),
+                    max_tokens=args.max_observed_tokens, max_wall=args.max_wall_seconds),
+                    config_path=args.config),
                     timeout=args.max_wall_seconds))
         print(json.dumps({"status": row["status"], "classification": row.get("classification"),
-            "source_sha256": source, "fixture_sha256": fixture_digest()}))
+            "source_sha256": source, "fixture_sha256": fixture_digest(),
+            "config_path": str(args.config.resolve())}))
         return 0 if row["status"] in {"observed", "no_pending_upload"} else 1
     except Exception as exc:
         print(json.dumps({"status": "configuration_or_run_error", "type": type(exc).__name__,
