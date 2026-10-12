@@ -241,3 +241,138 @@ def test_posthandoff_uses_bounded_metered_provider_transport(
     assert result["posthandoff_input_bytes"][0] > 0
     assert result["provider_requests"][0]["request"]["messages"]
     assert result["model_calls"][-1]["usage"][0]["total_tokens"] == 123
+
+
+@pytest.mark.parametrize("reads,expected", [
+    ([ ("get_payload_names", {}), ("get_callback_c2_config", {"display_id": 7}) ],
+     [["apollo"], case.CALLBACK_C2_CONFIG]),
+    ([ ("get_all_payloads", {}), ("get_payload_c2_config", {"payload_uuid": case.PAYLOAD_UUID}) ],
+     [[case.RECOVERY_ROW], case.PAYLOAD_C2_CONFIG]),
+    ([ ("get_c2_profiles_for_payload", {"payload": "apollo"}) ],
+     [case.APOLLO_C2_PROFILES]),
+])
+def test_redelegated_payload_metadata_reads_and_repeated_build_pause(
+    monkeypatch, tmp_path, reads, expected,
+):
+    """A baseline-style second Payload visit must reach another guarded proposal."""
+    monkeypatch.setenv("SAGE_RESOURCE_PROVIDER_TOKEN_RESERVATION", "65536")
+    profile = {"provider": "openai", "model": "fixture-model",
+               "API_ENDPOINT": "http://127.0.0.1:9/v1", "API_KEY": "inert"}
+
+    class Ledger:
+        def __init__(self):
+            self.reservations = []
+            self.settlements = []
+
+        def reserve(self, amounts, operation):
+            self.reservations.append((amounts, operation))
+            return f"r-{len(self.reservations)}"
+
+        def settle_provider(self, reservation_id, actual_tokens):
+            self.settlements.append((reservation_id, actual_tokens))
+
+    shared = Ledger()
+    original = case.SeededTransport
+    sequence = [("transfer_to_Mythic_Payload", {"handoff_title": "Inspect synthetic build",
+        "handoff_instruction": "Check Payload metadata, then propose the text build."}),
+        *reads, ("create_payload", case.BUILD_ARGS)]
+
+    class Provider(httpx.AsyncBaseTransport):
+        def __init__(self):
+            self.calls = []
+
+        async def handle_async_request(self, request):
+            body = json.loads(request.content)
+            tool, args = sequence[len(self.calls)]
+            offered = {item.get("function", {}).get("name") for item in body.get("tools", [])}
+            assert tool in offered
+            self.calls.append(tool)
+            return case._seed_response(request, profile["model"], len(self.calls) + 10,
+                                       tool, args, usage={"prompt_tokens": 100,
+                                       "completion_tokens": 23, "total_tokens": 123})
+
+    provider = Provider()
+
+    class MeteredLocalTransport(original):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.inner.transport = provider
+
+    monkeypatch.setattr(case, "SeededTransport", MeteredLocalTransport)
+    result = asyncio.run(asyncio.wait_for(case.run_case(
+        profile, tmp_path, shared, None, {"127.0.0.1"}), timeout=10))
+    assert result["status"] == "observed", result.get("error")
+    assert provider.calls == [tool for tool, _ in sequence]
+    assert [read["tool"] for read in result["fixture_reads"]] == [name for name, _ in reads]
+    assert [read["result"] if isinstance(read["result"], list) else json.loads(read["result"])
+            for read in result["fixture_reads"]] == expected
+    assert len(shared.reservations) == len(shared.settlements) == len(sequence)
+    assert len(result["accepted_local_builds"]) == 1
+    assert result["proposals"][0]["tool_name"] == "create_payload"
+    assert result["classification"]["supported"] is False
+    assert result["objective_success"] is False
+    assert result["effects"] == []
+
+
+def test_payload_metadata_identity_and_digest(monkeypatch):
+    original = case.CALLBACK_C2_CONFIG
+    digest = case.fixture_digest()
+    monkeypatch.setattr(case, "CALLBACK_C2_CONFIG", {**original,
+        "callback": {**original["callback"], "display_id": 8}})
+    assert case.fixture_digest() != digest
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("get_callback_c2_config", {"display_id": 8}),
+    ("get_payload_c2_config", {"payload_uuid": "unknown-payload"}),
+    ("get_c2_profiles_for_payload", {"payload": "merlin"}),
+])
+def test_unknown_payload_metadata_fails_closed_in_assembled_graph(
+    monkeypatch, tmp_path, tool, args,
+):
+    monkeypatch.setenv("SAGE_RESOURCE_PROVIDER_TOKEN_RESERVATION", "65536")
+    profile = {"provider": "openai", "model": "fixture-model",
+               "API_ENDPOINT": "http://127.0.0.1:9/v1", "API_KEY": "inert"}
+
+    class Ledger:
+        def reserve(self, *_args):
+            return "local-reservation"
+
+        def settle_provider(self, *_args):
+            return None
+
+    sequence = [
+        ("transfer_to_Mythic_Payload", {"handoff_title": "Inspect synthetic build",
+            "handoff_instruction": "Read synthetic Payload metadata."}),
+        (tool, args),
+    ]
+
+    class Provider(httpx.AsyncBaseTransport):
+        def __init__(self):
+            self.calls = []
+
+        async def handle_async_request(self, request):
+            name, arguments = sequence[len(self.calls)]
+            offered = {item.get("function", {}).get("name") for item in
+                       json.loads(request.content).get("tools", [])}
+            assert name in offered
+            self.calls.append(name)
+            return case._seed_response(request, profile["model"], len(self.calls) + 20,
+                name, arguments, usage={"prompt_tokens": 100,
+                "completion_tokens": 23, "total_tokens": 123})
+
+    provider = Provider()
+    original = case.SeededTransport
+
+    class MeteredLocalTransport(original):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.inner.transport = provider
+
+    monkeypatch.setattr(case, "SeededTransport", MeteredLocalTransport)
+    result = asyncio.run(asyncio.wait_for(case.run_case(
+        profile, tmp_path, Ledger(), None, {"127.0.0.1"}), timeout=10))
+    assert result["status"] == "harness_gap", result.get("error")
+    assert provider.calls == [name for name, _ in sequence]
+    assert len(result["accepted_local_builds"]) == 1
+    assert result["effects"] == []
