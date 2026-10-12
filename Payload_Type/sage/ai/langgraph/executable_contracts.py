@@ -226,7 +226,11 @@ class ExecutableContract:
         if type(verb) is not str:
             raise UnsupportedExecutableError("executable verb must be a string")
         if verb not in self.enrolled_verbs:
-            raise UnsupportedExecutableError(f"executable verb {verb!r} is not enrolled")
+            enrolled = ", ".join(self.enrolled_verbs)
+            raise UnsupportedExecutableError(
+                f"executable verb {verb!r} is not enrolled; "
+                f"enrolled verbs for this artifact: {enrolled}"
+            )
         specification = self.descriptor.verbs[verb]
         return verb, {**self.descriptor.global_options, **specification.options}, specification
 

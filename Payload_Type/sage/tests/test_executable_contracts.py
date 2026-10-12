@@ -144,6 +144,27 @@ def test_unregistered_and_unenrolled_verbs_fail_closed(certify, verb):
     _assert_rejected(lambda: certify.prepare(verb, {}, artifact_sha256=CERTIFY_SHA256), "not enrolled")
 
 
+def test_unsupported_verb_lists_only_this_artifacts_enrolled_verbs(certify, tmp_path):
+    with pytest.raises(UnsupportedExecutableError) as caught:
+        certify.prepare("find", {}, artifact_sha256=CERTIFY_SHA256)
+    assert str(caught.value) == (
+        "executable verb 'find' is not enrolled; enrolled verbs for this artifact: "
+        "enum-cas, enum-templates, request, request-download"
+    )
+
+    artifact_sha256 = hashlib.sha256(b"other exact executable").hexdigest()
+    descriptor = _synthetic_descriptor(artifact_sha256)
+    descriptor["legacy_unregistered_verbs"] = ["find"]
+    path = _write_descriptor(tmp_path, descriptor)
+    other = load_executable_contract(path, artifact_sha256)
+    with pytest.raises(UnsupportedExecutableError) as caught:
+        other.prepare("compiled-out", {}, artifact_sha256=artifact_sha256)
+    assert str(caught.value) == (
+        "executable verb 'compiled-out' is not enrolled; "
+        "enrolled verbs for this artifact: inspect"
+    )
+
+
 @pytest.mark.parametrize(
     "verb, supplied, needles",
     [

@@ -11,8 +11,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from langchain_core.messages import AIMessage
 
 from ai.langgraph import command_builder, command_parameter_schema, executable_contracts, mythic_tools
+from ai.langgraph.model import _TurnAuthorityToolMiddleware
 from ai.langgraph.mythic_tools import MythicTools
 
 
@@ -149,6 +151,51 @@ def test_dynamic_selector_reaches_existing_verb_contract(tmp_path, monkeypatch):
     ))
     assert result["status"] == "unsupported"
     assert "verb" in result["error"].lower()
+    assert "enrolled verbs for this artifact: enum-cas, enum-templates, request, request-download" in result["error"]
+    assert client.get_enrolled_issue_schema() is None
+
+
+def test_invalid_certify_verb_fails_supervised_preparation_before_task(tmp_path, monkeypatch):
+    client, _, _, _, _ = _fixture(tmp_path, monkeypatch)
+    client._issue_mythic_task = AsyncMock()
+    with pytest.raises(executable_contracts.UnsupportedExecutableError) as caught:
+        asyncio.run(client._prepare_supervised_issue_action({
+            "command": "execute_assembly", "callback_display_id": 7,
+            "parameters": {"Assembly": "Certify.exe", "Arguments": {
+                "verb": "find", "options": {},
+            }},
+        }))
+    assert "enrolled verbs for this artifact: enum-cas, enum-templates, request, request-download" in str(caught.value)
+    prepared = asyncio.run(client._prepare_supervised_issue_action({
+        "command": "execute_assembly", "callback_display_id": 7,
+        "parameters": {"Assembly": "Certify.exe", "Arguments": {
+            "verb": "enum-templates", "options": {"filter-vulnerable": True},
+        }},
+    }))
+    assert prepared["parameters"] == {
+        "Assembly": "Certify.exe", "Arguments": "enum-templates --filter-vulnerable",
+    }
+    client._issue_mythic_task.assert_not_awaited()
+
+
+def test_invalid_certify_verb_feedback_reaches_model_without_approval(tmp_path, monkeypatch):
+    client, _, _, _, _ = _fixture(tmp_path, monkeypatch)
+    client._issue_mythic_task = AsyncMock()
+    model = SimpleNamespace(mode="supervised", _native_chat_explicit_hitl=True,
+                            mythic_client=client)
+    middleware = _TurnAuthorityToolMiddleware(model, agent_name="Mythic_Operator")
+    monkeypatch.setattr(middleware, "_after_model_update", lambda state: None)
+    message = AIMessage(content="", tool_calls=[{
+        "name": "issue_task_and_waitfor_task_output",
+        "args": {"command": "execute_assembly", "callback_display_id": 7,
+                 "parameters": {"Assembly": "Certify.exe", "Arguments": "find"}},
+        "id": "invalid-certify-verb", "type": "tool_call",
+    }])
+    asyncio.run(middleware.aafter_model({"messages": [message]}, None))
+    assert message.tool_calls == []
+    assert "Approval was not requested" in message.content
+    assert "enrolled verbs for this artifact: enum-cas, enum-templates, request, request-download" in message.content
+    client._issue_mythic_task.assert_not_awaited()
 
 
 def test_dynamic_choice_query_failure_denies_before_file_download(tmp_path, monkeypatch):
@@ -311,6 +358,8 @@ def test_known_raw_legacy_malicious_and_mixed_forms_fail_before_native_issue(tmp
             "execute_assembly", parameters, 7
         ))
     assert result.startswith("STOP") or "construction failure" in result.lower()
+    if isinstance(parameters, str) and parameters.startswith("Certify.exe find") and "\n" not in parameters:
+        assert "enrolled verbs for this artifact: enum-cas, enum-templates, request, request-download" in result
     assert seen["issued"] == 0
 
 
