@@ -9028,8 +9028,19 @@ class Model:
                         logger.info(f"✅ Copied summary from {node_name} to Supervisor channel ({len(supervisor_summary_text)} chars)")
 
                         # ALSO copy to calling agent channel if this was a worker-to-worker handoff
+                        # The handoff tool runs in an inner react graph. Its parent-state
+                        # caller key is not checkpointed, but this delegated message is.
                         calling_agent = state.get("_last_calling_agent")
-                        if calling_agent and calling_agent != "Supervisor":
+                        for handoff_message in reversed(channel):
+                            if (isinstance(handoff_message, HumanMessage)
+                                    and handoff_message.additional_kwargs.get("_delegated_to") == node_name):
+                                if (handoff_message.additional_kwargs.get("_handoff_request_id")
+                                        == str(state.get("_request_id") or "")):
+                                    calling_agent = handoff_message.additional_kwargs.get("_handoff_caller")
+                                else:
+                                    calling_agent = None
+                                break
+                        if calling_agent and calling_agent not in {"Supervisor", node_name}:
                             channel_map = {
                                 "Mythic_Operator": "mythic_operator_messages",
                                 "Mythic_Payload": "mythic_payload_messages",
@@ -12478,6 +12489,10 @@ class Model:
             # Add handoff to Mythic_Payload for payload creation needs
             transfer_to_payload = _create_handoff_tool(
                 agent_name="Mythic_Payload",
+                caller_agent_name=name,
+                caller_request_id_lookup=lambda: str(
+                    getattr(getattr(self, "_request_contract", None), "request_id", "") or ""
+                ),
                 description="Delegate payload creation task to Mythic_Payload agent. Use when privilege escalation, lateral movement, or persistence requires a new payload. Always include the source/reference callback display_id in handoff_instruction so Mythic_Payload can inherit working C2 config, e.g. 'inherit C2 config from reference callback 22'.",
                 subgoal_scheduler=self._schedule_subgoal_transition,
             )
@@ -15026,6 +15041,8 @@ def _current_assisted_operator_input(state: Mapping[str, Any]) -> str | None:
 def _create_handoff_tool(
     *,
     agent_name: str,
+    caller_agent_name: str | None = None,
+    caller_request_id_lookup: Callable[[], str] | None = None,
     description: str | None = None,
     autonomous_redirect: Callable[[str, str, dict], _HandoffDirective | tuple[str, str] | dict[str, str] | None] | None = None,
     worker_outcome_lookup: Callable[[dict[str, Any]], tuple[dict[str, Any], str] | None] | None = None,
@@ -15352,7 +15369,7 @@ def _create_handoff_tool(
         current_agent = (
             subgoal_caller
             if isinstance(raw_subgoal, dict) and raw_subgoal and subgoal_caller
-            else None
+            else caller_agent_name if caller_agent_name != actual_agent_name else None
         )
         if current_agent is None:
             for channel_name, channel_key in channel_map.items():
@@ -15361,7 +15378,14 @@ def _create_handoff_tool(
                         current_agent = channel_name
                         break
 
-        # Store calling agent info for response routing
+        # Keep caller provenance on the delegated message: inner tool state does not
+        # carry the parent request fields through an approval pause/resume.
+        if current_agent:
+            injected_human.additional_kwargs["_handoff_caller"] = current_agent
+        injected_human.additional_kwargs["_handoff_request_id"] = str(
+            caller_request_id_lookup() if caller_request_id_lookup is not None
+            else runtime.state.get("_request_id") or ""
+        )
         update_state["_last_calling_agent"] = current_agent
         update_state["_last_target_agent"] = actual_agent_name
 
