@@ -43,6 +43,7 @@ from .mythic_tools import (
     SAGE_TASK_HEARTBEAT_INTERVAL,
     _env_positive_int,
 )
+from .executable_contracts import UnsupportedExecutableVerbError
 from .tool_cache import ToolCache
 from runtime_db import database_path, assert_legacy_migrated
 from ..comparison_tool_surface import (
@@ -2006,8 +2007,10 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
     def after_model(self, state, runtime):
         return self._after_model_update(state)
 
+    @hook_config(can_jump_to=["model"])
     async def aafter_model(self, state, runtime):
         prepared_message = None
+        recoverable_verb_error = False
         if (getattr(self._model, "mode", "") == "supervised"
                 and getattr(self._model, "_native_chat_explicit_hitl", False)):
             messages = state.get("messages", []) if isinstance(state, dict) else getattr(state, "messages", [])
@@ -2042,6 +2045,7 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
                     except (TypeError, ValueError) as exc:
                         prepared_message = last_ai
                         preparation_failed = True
+                        recoverable_verb_error = isinstance(exc, UnsupportedExecutableVerbError)
                         note = f"[task preparation] Approval was not requested: {exc}"
                         last_ai.content = f"{_message_content_as_text(last_ai.content)}\n{note}".strip()
                 if preparation_failed:
@@ -2067,7 +2071,35 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
             if not any(isinstance(message, AIMessage)
                        and message.id == prepared_message.id for message in output):
                 output.insert(0, prepared_message)
-            return {**(result or {}), "messages": output}
+            update = {**(result or {}), "messages": output}
+            if recoverable_verb_error and self._agent_name == "Mythic_Operator":
+                from .request_contract import (
+                    RequestContract, RequestLane, StopConditionKind,
+                )
+                contract = getattr(self._model, "_request_contract", None)
+                current_state = getattr(self._model, "state", None)
+                request_id = (
+                    contract.request_id
+                    if isinstance(contract, RequestContract)
+                    and contract.lane == RequestLane.SUPERVISED_WORKFLOW
+                    and not contract.is_terminal_control
+                    and contract.stop_condition.kind != StopConditionKind.OPERATOR_STOP
+                    and isinstance(current_state, dict)
+                    and current_state.get("_request_id") == contract.request_id
+                    and not getattr(self._model, "_stop_requested", False)
+                    and (getattr(self._model, "_eval_arm_deadline_epoch", None) is None
+                         or time.time() < self._model._eval_arm_deadline_epoch)
+                    and not self._model._request_contract_block_reason("list_callbacks")
+                    else ""
+                )
+                if (request_id and getattr(self._model, "_unsupported_verb_retry_request_id", "")
+                        != request_id):
+                    self._model._unsupported_verb_retry_request_id = request_id
+                    if (not prepared_message.tool_calls and not any(
+                            isinstance(message, ToolMessage) for message in output)
+                            and not update.get("jump_to")):
+                        update["jump_to"] = "model"
+            return update
         return result
 
     async def awrap_tool_call(self, request, handler):
@@ -4591,6 +4623,7 @@ class Model:
         # no-progress backstop. Keyed by node name; reset to 0 whenever that node returns work.
         self._zero_progress_returns: dict[str, int] = {}
         self._request_contract = None
+        self._unsupported_verb_retry_request_id = ""
         self._request_execution_digest = ""
         self._request_admitted_action_digests: set[str] = set()
         self._subgoal_authority_lock = threading.Lock()
@@ -5177,6 +5210,8 @@ class Model:
         if not isinstance(contract, RequestContract):
             raise TypeError("request contract must be a RequestContract")
         prior = getattr(self, "_request_contract", None)
+        if not isinstance(prior, RequestContract) or prior.request_id != contract.request_id:
+            self._unsupported_verb_retry_request_id = ""
         if (
             not isinstance(prior, RequestContract)
             or prior.request_id != contract.request_id

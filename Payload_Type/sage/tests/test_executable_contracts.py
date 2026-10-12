@@ -12,6 +12,7 @@ from ai.langgraph.executable_contracts import (
     ContractValidationError,
     ExecutableIdentityError,
     UnsupportedExecutableError,
+    UnsupportedExecutableVerbError,
     load_contract_for_artifact,
     load_executable_contract,
     parse_windows_command_line,
@@ -145,7 +146,7 @@ def test_unregistered_and_unenrolled_verbs_fail_closed(certify, verb):
 
 
 def test_unsupported_verb_lists_only_this_artifacts_enrolled_verbs(certify, tmp_path):
-    with pytest.raises(UnsupportedExecutableError) as caught:
+    with pytest.raises(UnsupportedExecutableVerbError) as caught:
         certify.prepare("find", {}, artifact_sha256=CERTIFY_SHA256)
     assert str(caught.value) == (
         "executable verb 'find' is not enrolled; enrolled verbs for this artifact: "
@@ -157,12 +158,16 @@ def test_unsupported_verb_lists_only_this_artifacts_enrolled_verbs(certify, tmp_
     descriptor["legacy_unregistered_verbs"] = ["find"]
     path = _write_descriptor(tmp_path, descriptor)
     other = load_executable_contract(path, artifact_sha256)
-    with pytest.raises(UnsupportedExecutableError) as caught:
+    with pytest.raises(UnsupportedExecutableVerbError) as caught:
         other.prepare("compiled-out", {}, artifact_sha256=artifact_sha256)
     assert str(caught.value) == (
         "executable verb 'compiled-out' is not enrolled; "
         "enrolled verbs for this artifact: inspect"
     )
+
+    with pytest.raises(UnsupportedExecutableError) as caught:
+        certify.prepare(7, {}, artifact_sha256=CERTIFY_SHA256)
+    assert type(caught.value) is UnsupportedExecutableError
 
 
 @pytest.mark.parametrize(

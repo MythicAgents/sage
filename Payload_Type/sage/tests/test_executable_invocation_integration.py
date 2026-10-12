@@ -14,8 +14,9 @@ import pytest
 from langchain_core.messages import AIMessage
 
 from ai.langgraph import command_builder, command_parameter_schema, executable_contracts, mythic_tools
-from ai.langgraph.model import _TurnAuthorityToolMiddleware
+from ai.langgraph.model import Model, _TurnAuthorityToolMiddleware
 from ai.langgraph.mythic_tools import MythicTools
+from ai.langgraph.request_contract import build_request_contract
 
 
 SAGE_ROOT = Path(__file__).resolve().parents[1]
@@ -196,6 +197,112 @@ def test_invalid_certify_verb_feedback_reaches_model_without_approval(tmp_path, 
     assert "Approval was not requested" in message.content
     assert "enrolled verbs for this artifact: enum-cas, enum-templates, request, request-download" in message.content
     client._issue_mythic_task.assert_not_awaited()
+
+
+def test_unsupported_verb_gets_one_local_operator_retry_per_native_request(tmp_path, monkeypatch):
+    client, _, _, _, _ = _fixture(tmp_path, monkeypatch)
+    client._issue_mythic_task = AsyncMock()
+    model = Model.__new__(Model)
+    model.mode = "supervised"
+    model._native_chat_explicit_hitl = True
+    model._request_contract = None
+    model.mythic_client = client
+    model.state = {"_request_id": ""}
+
+    def install(request_id):
+        model.install_request_contract(build_request_contract(
+            request_id=request_id, channel_id="1", operation_id="inert",
+            mode="supervised", autonomous_solve=False,
+        ))
+
+    def prepare(verb, *, sibling=False, agent="Mythic_Operator"):
+        middleware = _TurnAuthorityToolMiddleware(model, agent_name=agent)
+        monkeypatch.setattr(middleware, "_after_model_update", lambda state: None)
+        message = AIMessage(content="", tool_calls=[{
+            "name": "issue_task_and_waitfor_task_output",
+            "args": {"command": "execute_assembly", "callback_display_id": 7,
+                     "parameters": {"Assembly": "Certify.exe", "Arguments": {
+                         "verb": verb, "options": {},
+                     }}},
+            "id": "inert-preparation", "type": "tool_call",
+        }])
+        if sibling:
+            message.tool_calls.append({
+                "name": "get_all_command_args_for_payloadtype",
+                "args": {"payload": "apollo", "command": "execute_assembly",
+                         "callback_display_id": 7},
+                "id": "inert-read-only-sibling", "type": "tool_call",
+            })
+        update = asyncio.run(middleware.aafter_model({"messages": [message]}, None))
+        return update, message
+
+    install("inert-request-1")
+    assert "jump_to" not in prepare(7)[0]  # A malformed verb type is terminal.
+    assert model._unsupported_verb_retry_request_id == ""
+    first, first_message = prepare("find")
+    assert first["jump_to"] == "model"
+    assert first_message.tool_calls == []
+    assert "Approval was not requested" in first_message.content
+    assert model._unsupported_verb_retry_request_id == "inert-request-1"
+
+    second, _ = prepare("find")  # A rebuilt middleware must not reset the allowance.
+    assert "jump_to" not in second
+    model.install_request_contract(model._request_contract.amend())
+    assert model._unsupported_verb_retry_request_id == "inert-request-1"
+    assert "jump_to" not in prepare("find")[0]
+    assert "jump_to" not in prepare(7)[0]  # Invalid type is not the safe verb subtype.
+    model.install_request_contract(model._request_contract.stop())
+    assert "jump_to" not in prepare("find")[0]
+
+    install("inert-request-2")
+    assert model._unsupported_verb_retry_request_id == ""
+    mixed, mixed_message = prepare("find", sibling=True)
+    assert "jump_to" not in mixed
+    assert [call["name"] for call in mixed_message.tool_calls] == [
+        "get_all_command_args_for_payloadtype"]
+    assert model._unsupported_verb_retry_request_id == "inert-request-2"
+    assert "jump_to" not in prepare("find")[0]
+    install("inert-request-3")
+    assert prepare("find")[0]["jump_to"] == "model"
+    client._issue_mythic_task.assert_not_awaited()
+
+
+def test_unsupported_verb_retry_requires_active_request_projection(tmp_path, monkeypatch):
+    client, _, _, _, _ = _fixture(tmp_path, monkeypatch)
+    model = Model.__new__(Model)
+    model.mode = "supervised"
+    model._native_chat_explicit_hitl = True
+    model._request_contract = None
+    model.mythic_client = client
+    model.state = {"_request_id": ""}
+    model.install_request_contract(build_request_contract(
+        request_id="inert-request", channel_id="1", operation_id="inert",
+        mode="supervised", autonomous_solve=False,
+    ))
+
+    def attempt():
+        middleware = _TurnAuthorityToolMiddleware(model, agent_name="Mythic_Operator")
+        monkeypatch.setattr(middleware, "_after_model_update", lambda state: None)
+        message = AIMessage(content="", tool_calls=[{
+            "name": "issue_task_and_waitfor_task_output",
+            "args": {"command": "execute_assembly", "callback_display_id": 7,
+                     "parameters": {"Assembly": "Certify.exe", "Arguments": "find"}},
+            "id": "inert-preparation", "type": "tool_call",
+        }])
+        return asyncio.run(middleware.aafter_model({"messages": [message]}, None))
+
+    model.state["_request_id"] = "other-request"
+    assert "jump_to" not in attempt()
+    model.state["_request_id"] = "inert-request"
+    model._stop_requested = True
+    assert "jump_to" not in attempt()
+    model._stop_requested = False
+    model._turn_authority = None
+    assert "jump_to" not in attempt()
+    assert model._unsupported_verb_retry_request_id == ""
+    model.install_request_contract(model._request_contract.stop())
+    assert "jump_to" not in attempt()
+    assert model._unsupported_verb_retry_request_id == ""
 
 
 def test_dynamic_choice_query_failure_denies_before_file_download(tmp_path, monkeypatch):

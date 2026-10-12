@@ -33,6 +33,10 @@ class UnsupportedExecutableError(ExecutableContractError):
     """The artifact or operation has no compatible enrolled contract."""
 
 
+class UnsupportedExecutableVerbError(UnsupportedExecutableError):
+    """A string verb is absent from this artifact's enrolled operations."""
+
+
 class ExecutableIdentityError(ExecutableContractError):
     """The supplied executable bytes do not match the selected contract."""
 
@@ -227,7 +231,7 @@ class ExecutableContract:
             raise UnsupportedExecutableError("executable verb must be a string")
         if verb not in self.enrolled_verbs:
             enrolled = ", ".join(self.enrolled_verbs)
-            raise UnsupportedExecutableError(
+            raise UnsupportedExecutableVerbError(
                 f"executable verb {verb!r} is not enrolled; "
                 f"enrolled verbs for this artifact: {enrolled}"
             )
