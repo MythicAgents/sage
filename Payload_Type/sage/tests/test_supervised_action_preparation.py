@@ -718,14 +718,19 @@ def test_postapproval_binding_drift_denies_real_issue_before_sink(monkeypatch, d
         assert upstream.await_count == 2
 
 
-def _registered_file_guard_tools(monkeypatch, choices=("mimikatz",)):
+def _registered_file_guard_tools(
+    monkeypatch,
+    choices=("mimikatz",),
+    command="run_as",
+    selector=("Binary", "Binary"),
+):
     """Guard harness: the resolver is stubbed because the guard branch is reachable
     in production through schemas whose choice lists are not populated (the
     'false means unknown' case); these tests target the guard's remedy message."""
     from ai.langgraph import command_builder
 
     schema = [
-        {"name": "Binary", "cli_name": "Binary", "type": "ChooseOne",
+        {"name": selector[0], "cli_name": selector[1], "type": "ChooseOne",
          "parameter_group_name": "Default", "required": True,
          "default_value": "", "choices": list(choices)},
         {"name": "Payload", "cli_name": "Payload", "type": "File",
@@ -734,14 +739,13 @@ def _registered_file_guard_tools(monkeypatch, choices=("mimikatz",)):
     ]
     tools = _tools()
     monkeypatch.setattr(tools, "_authenticate_live_command", AsyncMock(return_value={
-        "status": "available", "command": "run_as"}))
+        "status": "available", "command": command}))
     monkeypatch.setattr(
-        tools, "_fetch_command_schema",
-        AsyncMock(side_effect=lambda *_a, **_k: copy.deepcopy(schema)))
+        tools, "_fetch_enrolled_executable_schema",
+        AsyncMock(return_value=copy.deepcopy(schema)))
     monkeypatch.setattr(tools, "_validate_command_parameters", AsyncMock(return_value=None))
     monkeypatch.setattr(tools, "_callback_tasking_liveness_blocker", AsyncMock(return_value=None))
     monkeypatch.setattr(tools, "_engagement_issue_hook", AsyncMock(return_value=None))
-    monkeypatch.setattr(tools, "_ensure_registered_file_available", AsyncMock(return_value=None))
     monkeypatch.setattr(
         tools, "_bind_mythic_credential_parameters",
         AsyncMock(side_effect=lambda _command, params, _cb, param_schema=None: params))
@@ -761,11 +765,14 @@ def _registered_file_guard_tools(monkeypatch, choices=("mimikatz",)):
 
 def test_registered_file_guard_error_names_the_registered_choices(monkeypatch):
     """A not-among-choices guard error enumerates the exact registered identifiers."""
-    tools = _registered_file_guard_tools(monkeypatch, choices=("mimikatz",))
+    tools = _registered_file_guard_tools(
+        monkeypatch, choices=("mimikatz",), command="execute_assembly",
+        selector=("Assembly", "assembly_name"))
+    monkeypatch.setattr(tools, "_find_uploaded_file_by_name", AsyncMock(return_value=None))
 
     async def probe():
         return await tools._prepare_supervised_issue_action({
-            "command": "run_as", "parameters": {"Binary": "mimikatz.exe"},
+            "command": "execute_assembly", "parameters": {"assembly_name": "mimikatz.exe"},
             "callback_display_id": 2, "timeout": 60})
 
     with pytest.raises(ValueError) as excinfo:
@@ -780,11 +787,14 @@ def test_registered_file_guard_error_names_the_registered_choices(monkeypatch):
 
 def test_registered_file_guard_error_without_choice_list_names_the_schema_remedy(monkeypatch):
     """When the schema exposes no choices, the error sends the model to the schema, not a loop."""
-    tools = _registered_file_guard_tools(monkeypatch, choices=())
+    tools = _registered_file_guard_tools(
+        monkeypatch, choices=(), command="execute_assembly",
+        selector=("Assembly", "assembly_name"))
+    monkeypatch.setattr(tools, "_find_uploaded_file_by_name", AsyncMock(return_value=None))
 
     async def probe():
         return await tools._prepare_supervised_issue_action({
-            "command": "run_as", "parameters": {"Binary": "mimikatz.exe"},
+            "command": "execute_assembly", "parameters": {"assembly_name": "mimikatz.exe"},
             "callback_display_id": 2, "timeout": 60})
 
     with pytest.raises(ValueError) as excinfo:
@@ -811,6 +821,112 @@ def test_registered_file_identity_error_names_the_upload_remedy(monkeypatch):
     assert "registered choice for this command" in message
     assert "uploading it is an operator decision" in message.lower()
     assert "report this blocker to the operator" in message
+
+
+def test_agent_resolved_executable_reference_prepares_without_file_binding(monkeypatch):
+    """execute_pe's pe_name may name an agent-resolved (embedded) executable.
+
+    Observed live (acceptance run): the same pe_name=mimikatz.exe passed preparation
+    and executed when the schema fetch returned no choices, and was blocked pre-card
+    when choices were populated — cache-state-dependent semantics. The target agent
+    resolves the name itself, so preparation must not demand a Mythic file binding.
+    """
+    tools = _registered_file_guard_tools(
+        monkeypatch, choices=("mimikatz",), command="execute_pe",
+        selector=("PE", "pe_name"))
+
+    async def probe():
+        return await tools._prepare_supervised_issue_action({
+            "command": "execute_pe",
+            "parameters": {
+                "pe_name": "mimikatz.exe",
+                "pe_arguments": '"lsadump::dcsync /domain:sevenkingdoms.local '
+                                '/dc:kingslanding.sevenkingdoms.local '
+                                '/user:sevenkingdoms\\\\krbtgt" exit'},
+            "callback_display_id": 2, "timeout": 60})
+
+    prepared = asyncio.run(probe())
+    binding = prepared["visibility_context"]["_sage_prepared_binding"]
+    assert binding["file"] is None, (
+        "an agent-resolved executable reference must prepare with no Mythic file "
+        f"binding (the empty-schema shape): {binding}"
+    )
+    assert prepared["parameters"]["pe_name"] == "mimikatz.exe"
+
+
+def test_issue_preflight_treats_unstaged_reference_as_agent_resolved(monkeypatch):
+    """An unstaged by-name reference on a non-strict command must not dead-end.
+
+    ensure_tool_uploaded distinguishes `missing` (not in Mythic's store and not locally
+    staged — an upload cannot happen; the agent may resolve the name embedded) from
+    `error` (a transport failure, which still blocks as designed). Observed live: the
+    pre-card guard blocked the same value that a cold schema cache let through.
+    """
+    tools = _registered_file_guard_tools(
+        monkeypatch, choices=("mimikatz",), command="execute_pe",
+        selector=("PE", "pe_name"))
+    attempts: list[str] = []
+
+    async def fake_ensure(name):
+        attempts.append(name)
+        return json.dumps({
+            "status": "missing", "binary_filename": name,
+            "note": "Not in Mythic's file store and not found at tools/mimikatz.exe.",
+        })
+
+    monkeypatch.setattr(tools, "ensure_tool_uploaded", fake_ensure)
+
+    result = asyncio.run(tools._ensure_registered_file_available(
+        "execute_pe", {"pe_name": "mimikatz.exe"}, 2))
+
+    assert attempts == ["mimikatz.exe"], "the upload attempt must still happen first"
+    assert result is None, (
+        f"an unstaged agent-resolved reference must not block the approved task: {result}"
+    )
+
+
+def test_issue_preflight_still_blocks_transport_upload_failures(monkeypatch):
+    """A transport-level upload failure still blocks: only `missing` classifies as
+    agent-resolved."""
+    tools = _registered_file_guard_tools(
+        monkeypatch, choices=("mimikatz",), command="execute_pe",
+        selector=("PE", "pe_name"))
+
+    async def fake_ensure(name):
+        return json.dumps({
+            "status": "error", "binary_filename": name,
+            "error": "Mythic file upload /task_upload_file_webhook returned HTTP 404",
+        })
+
+    monkeypatch.setattr(tools, "ensure_tool_uploaded", fake_ensure)
+
+    result = asyncio.run(tools._ensure_registered_file_available(
+        "execute_pe", {"pe_name": "mimikatz.exe"}, 2))
+
+    assert isinstance(result, str) and "Do not retry" in result
+
+
+def test_strict_wrapper_still_blocks_unregistered_file_selection(monkeypatch):
+    """The typed-executable wrappers stay strict: their bytes are contract-verified,
+    so a by-name selection absent from the registered choices must still raise."""
+    tools = _registered_file_guard_tools(
+        monkeypatch, choices=("SharpKatz.exe",), command="execute_assembly",
+        selector=("Assembly", "assembly_name"))
+    monkeypatch.setattr(tools, "_find_uploaded_file_by_name", AsyncMock(return_value=None))
+
+    async def probe():
+        return await tools._prepare_supervised_issue_action({
+            "command": "execute_assembly",
+            "parameters": {"assembly_name": "mimikatz.exe", "arguments": "lsadump::dcsync"},
+            "callback_display_id": 2, "timeout": 60})
+
+    with pytest.raises(ValueError) as excinfo:
+        asyncio.run(probe())
+    message = str(excinfo.value)
+    assert "'SharpKatz.exe'" in message, (
+        f"the strict wrapper must name the registered identifiers in its remedy: {message}"
+    )
+    assert "no approval card will appear" in message
 
 
 @pytest.mark.parametrize("surface", ["callback", "payload_fallback"])

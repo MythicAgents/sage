@@ -72,6 +72,17 @@ _EXECUTABLE_CONTRACT_ROOT = Path(__file__).resolve().parents[2] / "tool_contract
 _MAX_ENROLLED_EXECUTABLE_BYTES = 4 * 1024 * 1024
 
 
+def _strict_registered_file_identity_command(command) -> bool:
+    """True when a by-name registered-file selection must bind verified Mythic bytes.
+
+    The typed-executable wrappers are strict: their bytes are contract-verified before
+    tasking. Every other command's by-name executable reference may be agent-resolved
+    (embedded or loader-resolved on the target), so a missing Mythic file must not
+    block preparation — the same value passes whenever the schema cache is cold.
+    """
+    return str(command or "").strip().casefold() in {"execute_assembly", "inline_assembly"}
+
+
 def _task_schema_digest(schema) -> str:
     """Bind every schema value while ignoring only top-level parameter row order."""
     if isinstance(schema, list):
@@ -4251,7 +4262,13 @@ class MythicTools:
         if name and file_identity is not None:
             raise ValueError("task contains both registered and uploaded file selections")
         if name and not self._registered_file_available_in_schema(schema, name):
-            raise ValueError(self._registered_file_remedy_text(schema, name))
+            if _strict_registered_file_identity_command(command):
+                raise ValueError(self._registered_file_remedy_text(schema, name))
+            # Agent-resolved executable reference: the target agent resolves this name
+            # itself (embedded or loader-resolved), so no Mythic file binding exists.
+            # Drop the name here so the flow below keeps the binding file-less — the
+            # same prepared shape the cold-schema path has always produced.
+            name = ""
         if name:
             if (
                 isinstance(executable_binding, dict)
@@ -9232,6 +9249,12 @@ class MythicTools:
         status = str(up.get("status") or "unknown")
         if status not in {"uploaded", "already_present"} or not up.get("file_uuid"):
             detail = str(up.get("error") or up.get("note") or "no Mythic file UUID returned")
+            if status == "missing" and not _strict_registered_file_identity_command(command):
+                # Agent-resolved executable reference: the binary is not in Mythic's
+                # store and not locally staged, so no upload is possible — but the
+                # target agent may resolve the name itself (embedded or loader-resolved).
+                # The operator approved this exact task; Mythic is the truth at runtime.
+                return None
             blocker = (
                 f"{_REGISTERED_FILE_PREFLIGHT_PREFIX} could not register {name!r} before {command!r}: "
                 f"ensure_tool_uploaded returned {status}: {detail}. "
