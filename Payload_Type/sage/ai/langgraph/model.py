@@ -15,7 +15,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from langgraph.graph import StateGraph, START, MessagesState, END
 from langgraph.graph.state import CompiledStateGraph
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from .sqlite_checkpointer import SageAsyncSqliteSaver
 from langgraph.prebuilt import tools_condition
 from langgraph.managed.is_last_step import RemainingSteps
 from langchain.agents import create_agent
@@ -4622,7 +4622,7 @@ class Model:
     llm: BaseChatModel | Any # The initialized LangChain BaseChatModel instance for the specified provider and model
     messages: list[AnyMessage]
     system_message: SystemMessage
-    memory: AsyncSqliteSaver # The LangChain AsyncSqliteSaver instance for saving messages to the SQLite database in sage.db
+    memory: SageAsyncSqliteSaver # The LangChain SQLite checkpointer for messages in sage.db
     state: dict[str, Any]
     graph: CompiledStateGraph | None
     # Tool cache for flexible data caching
@@ -4767,7 +4767,7 @@ class Model:
         assert_legacy_migrated(db_path)
         self.tool_cache = ToolCache(db_path)
         conn = aiosqlite.connect(db_path, check_same_thread=False)
-        self.memory = AsyncSqliteSaver(conn)
+        self.memory = SageAsyncSqliteSaver(conn)
         # Guard against an empty top-level system prompt. In chat mode `system_prompt` defaults to "" and this
         # SystemMessage is seeded as the FIRST message of the supervisor channel (below); an empty system block
         # makes Bedrock raise `ValidationException: system: text content blocks must be non-empty`. Normalize a
