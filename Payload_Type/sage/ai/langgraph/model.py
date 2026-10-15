@@ -5357,6 +5357,53 @@ class Model:
             return None
         return receipt
 
+    async def _reconcile_deferred_task_receipt(self, receipt: dict[str, Any]) -> dict[str, Any] | None:
+        """D6 slice A: one control-plane read of a deferred task's actual outcome.
+
+        The deferral bounds a turn because the result was unobserved (ISC-4: no stacking of tasks
+        the operator has not seen the result of). By the time the wrapper builds the handback the
+        task has often already completed; a single bounded read at that boundary either delivers
+        the real outcome — removing both the false "unconfirmed" label and the pointless forced
+        end — or confirms the task is still in flight, in which case the caller keeps today's
+        designed cap. Read-only: this never issues, re-issues, or mutates target state.
+
+        Returns {"status", "completed", "excerpt"} or None when the outcome is still unresolved.
+        """
+        mythic_client = getattr(self, "mythic_client", None)
+        task_id = receipt.get("task_display_id")
+        if mythic_client is None or task_id is None:
+            return None
+        reader = getattr(mythic_client, "get_all_task_output_by_task_id", None)
+        if reader is None:
+            return None
+        try:
+            raw = await asyncio.wait_for(
+                reader(task_id=task_id),
+                timeout=15,
+            )
+        except Exception as e:
+            logger.warning(f"D6 receipt reconciliation read failed for task {task_id}: {type(e).__name__}: {e}")
+            return None
+        try:
+            rows = json.loads(raw) if isinstance(raw, str) else raw
+        except (TypeError, ValueError) as e:
+            logger.warning(f"D6 receipt reconciliation read returned unparseable output for task {task_id}: {e}")
+            return None
+        if not isinstance(rows, list) or not rows:
+            return None
+        task_fields = rows[-1].get("task") if isinstance(rows[-1], dict) else None
+        status = str((task_fields or {}).get("status") or "").strip().casefold()
+        completed = (task_fields or {}).get("completed")
+        if type(completed) is not bool:
+            completed = status in {"success", "completed", "complete"}
+        excerpt_parts = [
+            str(row.get("response_text") or "").strip()
+            for row in rows
+            if isinstance(row, dict) and str(row.get("response_text") or "").strip()
+        ]
+        excerpt = "\n".join(excerpt_parts).strip()
+        return {"status": status, "completed": completed, "excerpt": excerpt}
+
     def _install_turn_authority(self, authority: TurnAuthority) -> None:
         self._turn_authority = authority
         mythic_client = getattr(self, "mythic_client", None)
@@ -8873,6 +8920,9 @@ class Model:
                 "messages": new_messages_from_agent,  # keep legacy/global mirror
             }
 
+            # D6 slice A: set when a deferred-task receipt was reconciled at this handback; carried
+            # into the summary metadata below so the Supervisor-facing copy traces its provenance.
+            reconciled_deferred: dict[str, Any] | None = None
             pending_receipt = (
                 self._pending_task_receipt_for_request() if _mythic_operator else None
             )
@@ -8880,48 +8930,126 @@ class Model:
                 task_id = pending_receipt.get("task_display_id")
                 callback_id = pending_receipt.get("callback_display_id")
                 command = pending_receipt.get("command")
-                if task_id is None:
-                    summary_text = (
-                        f"Observation ended for {command!r} on callback {callback_id}; "
-                        "whether Mythic accepted the task is unknown. Check task history "
-                        "before considering another issue."
+                # D6 slice A: one bounded read before declaring the observation incomplete. The
+                # deferral exists because the result was unobserved; if the task finished in the
+                # meantime, the honest handback is the real result and the turn continues (the
+                # ISC-4 stacking rationale no longer holds once the result is in hand, and any
+                # next action still passes its own HITL card). A genuinely pending/failed-read
+                # task keeps today's designed turn cap.
+                reconcile = await self._reconcile_deferred_task_receipt(pending_receipt)
+                if reconcile is not None and reconcile.get("completed") is True:
+                    reconcile_status = str(reconcile.get("status") or "")
+                    outcome = (
+                        "failed"
+                        if reconcile_status in {"error", "failed", "timeout"}
+                        else "completed"
                     )
                 else:
-                    observed_status = str(pending_receipt.get("task_status") or "")
-                    state_note = (
-                        f"Mythic reported the task pending with status "
-                        f"{json.dumps(observed_status)}; its outcome is unconfirmed."
-                        if pending_receipt.get("observation_status") == "pending"
-                        else (
-                            "The observation failed; current task state and outcome are unknown."
-                            if pending_receipt.get("observation_status") == "wait_failed"
-                            else "Current task state and outcome are unconfirmed."
+                    outcome = ""
+                if outcome and reconcile is not None:
+                    status_word = "completed" if outcome == "completed" else "FAILED"
+                    excerpt = str(reconcile.get("excerpt") or "").strip()
+                    excerpt_cap = 4000
+                    excerpt_note = (
+                        f"Result excerpt:\n{excerpt[:excerpt_cap]}"
+                        + ("\n…(truncated; read the full output with get_all_task_output_by_task_id)"
+                           if len(excerpt) > excerpt_cap else "")
+                    ) if excerpt else "The task returned no output text."
+                    receipt_summary = (
+                        f"Mythic task {task_id} ({command!r}) on callback {callback_id} "
+                        f"{status_word}; its outcome was reconciled at handback. {excerpt_note}"
+                    )
+                    resolved_msg = AIMessage(
+                        content=receipt_summary,
+                        name=node_name,
+                        additional_kwargs={
+                            "_deferred_task_reconciled": True,
+                            "_reconciled_outcome": outcome,
+                            "_reconciled_task_id": task_id,
+                        },
+                    )
+                    _tag_msg(resolved_msg, self._next_seq())
+                    try:
+                        self.mythic_client._deferred_task_receipt = None
+                    except Exception:
+                        pass
+                    reconciled_deferred = {
+                        "task_id": task_id,
+                        "outcome": outcome,
+                    }
+                    # Fall through to the ordinary worker-return path below: the Supervisor
+                    # receives this typed outcome plus the Operator's own return, and the node's
+                    # routing (Command(goto="Supervisor")) continues the turn.
+                    new_messages_from_agent = list(new_messages_from_agent) + [resolved_msg]
+                    logger.info(
+                        "✅ [%s] deferred task %s reconciled as %s at handback; continuing turn",
+                        node_name, task_id, outcome,
+                    )
+                else:
+                    if task_id is None:
+                        summary_text = (
+                            f"Observation ended for {command!r} on callback {callback_id}; "
+                            "whether Mythic accepted the task is unknown. Check task history "
+                            "before considering another issue."
                         )
+                    else:
+                        excerpt = str((reconcile or {}).get("excerpt") or "").strip()
+                        observed_status = str((reconcile or {}).get("status") or "")
+                        if reconcile is None:
+                            observed_note = "the reconciliation read could not confirm its state"
+                            triage_note = (
+                                "Triage: the task may still be legitimately running, or the "
+                                "spawned process may be blocked. Deciding between those — and any "
+                                "recovery — is an operator decision."
+                            )
+                        elif excerpt:
+                            observed_note = (
+                                f"partial output was observed ({len(excerpt)} chars) and Mythic "
+                                f"reported status {json.dumps(observed_status)}"
+                            )
+                            triage_note = (
+                                "The task has produced output but has not reached a terminal "
+                                "state; it may still be legitimately running."
+                            )
+                        else:
+                            observed_note = (
+                                f"Mythic reported status {json.dumps(observed_status)} with no "
+                                "output rows"
+                            )
+                            triage_note = (
+                                "Triage: no output has been observed since issue, so the spawned "
+                                "process may still be legitimately running — or it may be blocked "
+                                "awaiting interactive input on the target (a command that reads "
+                                "stdin, or a form such as certutil -config -, never completes on "
+                                "its own). Distinguishing those, and any recovery such as ending "
+                                "the process or re-issuing with the input supplied "
+                                "non-interactively, is an operator decision — none of it runs "
+                                "automatically."
+                            )
+                        summary_text = (
+                            f"Mythic task {task_id} ({command!r}) on callback {callback_id} has "
+                            f"not reached a terminal state; {observed_note}. {triage_note} No "
+                            "further target task may be issued in this turn until its result is "
+                            "seen. Inspect that exact task (get_all_task_output_by_task_id) in a "
+                            "fresh request before deciding what to do next."
+                        )
+                    final_msg = AIMessage(
+                        content=summary_text,
+                        name="Supervisor",
+                        additional_kwargs={"_is_final_report": True, "_pending_task_handoff": True},
                     )
-                    summary_text = (
-                        f"Mythic accepted task {task_id} ({command!r}) on callback "
-                        f"{callback_id}. Observation is incomplete "
-                        f"({pending_receipt.get('observation_status') or 'unknown'}). "
-                        f"{state_note} Inspect that exact task "
-                        "in a fresh request before deciding what to do next."
-                    )
-                final_msg = AIMessage(
-                    content=summary_text,
-                    name="Supervisor",
-                    additional_kwargs={"_is_final_report": True, "_pending_task_handoff": True},
-                )
-                _tag_msg(final_msg, next_seq)
-                self._message_seq = next_seq + 1
-                self.state["_message_seq"] = self._message_seq
-                await self._close_delegation(node_name, content=summary_text, status="finished")
-                return Command(goto=END, update={
-                    state_key: new_messages_from_agent,
-                    "messages": new_messages_from_agent + [final_msg],
-                    "supervisor_messages": [final_msg],
-                    "_message_seq": self._message_seq,
-                    "recursion_summary_requested": False,
-                    "recursion_handback": True,
-                })
+                    _tag_msg(final_msg, next_seq)
+                    self._message_seq = next_seq + 1
+                    self.state["_message_seq"] = self._message_seq
+                    await self._close_delegation(node_name, content=summary_text, status="finished")
+                    return Command(goto=END, update={
+                        state_key: new_messages_from_agent,
+                        "messages": new_messages_from_agent + [final_msg],
+                        "supervisor_messages": [final_msg],
+                        "_message_seq": self._message_seq,
+                        "recursion_summary_requested": False,
+                        "recursion_handback": True,
+                    })
 
             if _mythic_operator and _bounded_one_action_request:
                 terminal_payload = _terminal_execute_capability_payload(new_messages_from_agent)
@@ -9113,6 +9241,8 @@ class Model:
 
                         await self._close_delegation(node_name, content=summary_text, status="finished")
                         summary_kwargs: dict[str, Any] = {}
+                        if reconciled_deferred is not None:
+                            summary_kwargs["_deferred_task_reconciled"] = reconciled_deferred
                         handoff_outcome = _worker_handoff_metadata(
                             new_messages_from_agent,
                             source_worker=node_name,
