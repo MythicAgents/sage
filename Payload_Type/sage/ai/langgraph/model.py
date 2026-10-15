@@ -6553,6 +6553,17 @@ class Model:
             f"Node {error.node} failed; handing back to Supervisor: {type(exc).__name__}: {exc}",
             exc_info=exc,
         )
+        # D8/D13: close the failed node's delegation card as an error NOW, with the exception
+        # summary. Leaving it open handed the card to the Supervisor's finished-sweep, which
+        # closed a failed delegation as a success-shaped card (finished + streamed text).
+        try:
+            await self._close_delegation(
+                error.node,
+                content=f"{type(exc).__name__}: {exc}",
+                status="error",
+            )
+        except Exception as close_error:
+            logger.debug(f"node-failure card close failed (non-fatal): {close_error}")
         failure_message = AIMessage(
             content=(
                 f"⚠️ **{error.node} could not complete its assignment**\n\n"
@@ -7108,6 +7119,35 @@ class Model:
             return
         self._observe_supervised_execution_event({**event, "source": source,
                                                   "tool_name": tool_name, "status": status})
+        # D8: the operator-facing status label must not contradict Mythic's own task state.
+        # The execution event carries the authoritative task terminal state (task_completed /
+        # task_status). When Mythic says the task completed successfully, the card and the
+        # request-ledger phase say completed — even when Sage's output classification reads the
+        # command output as a failure (observed live: Mythic task 45 `run success` while the card
+        # said "Tool `shell` failed." because certutil printed "command FAILED"). The
+        # classification nuance is preserved as a note in the preview, never dropped and never
+        # promoted to the status label. An event WITHOUT Mythic task truth (e.g., an observation
+        # exception, task_completed=None) keeps its original label.
+        render_status = status or "completed"
+        result_preview = str(event.get("result_preview") or "") or None
+        if (
+            source == "mythic"
+            and event.get("task_completed") is True
+            and str(event.get("task_status") or "").strip().casefold() in {"success", "completed"}
+            and render_status == "error"
+        ):
+            render_status = "completed"
+            if result_preview is None:
+                result_preview = (
+                    "Mythic task completed successfully; Sage's output classification read the "
+                    "command output as a failure — see the full task output before treating "
+                    "either label as the whole story."
+                )
+            else:
+                result_preview = (
+                    "Mythic task completed successfully; Sage's output classification read the "
+                    f"command output as a failure. {result_preview}"
+                )
         activity = event.get("activity") if isinstance(event.get("activity"), dict) else {}
         arguments = event.get("arguments")
         if source == "mythic":
@@ -7126,11 +7166,11 @@ class Model:
         await self._emit_tool_use_card(
             tool_call_id=event_id,
             tool_name=tool_name,
-            status=status or "completed",
-            complete=status != "started",
+            status=render_status,
+            complete=render_status != "started",
             arguments_present=arguments not in (None, "", {}),
             arguments=arguments,
-            result_preview=str(event.get("result_preview") or "") or None,
+            result_preview=result_preview,
             output=str(event.get("output") or "") or None,
             delegation_id=str(activity.get("id") or "") or None,
             delegation_name=str(activity.get("name") or "") or None,
