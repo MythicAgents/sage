@@ -106,8 +106,9 @@ def test_explicit_synthesis_remains_available_after_multiple_workers():
 def test_final_tool_offers_reuse_and_explicit_report():
     tool = model._create_respond_to_user_tool()
     schema = tool.tool_call_schema
-    assert set(schema.model_fields) == {"final_response", "reuse_latest_worker_answer"}
+    assert set(schema.model_fields) == {"final_response", "reuse_latest_worker_answer", "outcome"}
     assert not schema.model_fields["final_response"].is_required()
+    assert not schema.model_fields["outcome"].is_required()
     reused = tool.func(SimpleNamespace(state=_valid_state(), tool_call_id="respond-test"),
                        reuse_latest_worker_answer=True)
     assert reused.update["messages"][0].content == _ANSWER

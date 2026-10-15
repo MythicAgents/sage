@@ -434,6 +434,10 @@ def test_still_pending_deferred_task_keeps_the_forced_turn_end():
     )
     assert "operator decision" in content
     assert "No further target task may be issued in this turn" in content
+    assert final_msgs[0].additional_kwargs.get("_turn_outcome") == "checkpoint", (
+        "a pending-task forced end is a mid-objective pause and must classify as a "
+        "checkpoint, not a final report (D9)"
+    )
 
 
 def test_unresolvable_reconciliation_read_keeps_the_forced_turn_end():

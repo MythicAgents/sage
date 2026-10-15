@@ -2216,6 +2216,9 @@ def test_typed_worker_outcome_terminalizes_repeated_same_worker(outcome, tool_te
     assert command.update["messages"][0].content == tool_text
     assert command.update["messages"][1].content == final_text
     assert command.update["messages"][1].additional_kwargs["_is_final_report"] is True
+    assert command.update["messages"][1].additional_kwargs["_turn_outcome"] == (
+        "blocked" if outcome == "blocked" else "completed"
+    )
 
 
 def _typed_subgoal_runtime_state(request_id="request-subgoal"):

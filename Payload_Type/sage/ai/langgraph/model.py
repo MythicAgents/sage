@@ -4336,6 +4336,40 @@ def _terminal_execute_capability_report(
     return "\n".join(lines)
 
 
+# D9 turn-end taxonomy: how a turn ended, distinct from the fact that it ended.
+# Stamped where the cause is structurally known or declared via respond_to_user;
+# the native-chat banner is derived from it. Unknown values classify as nothing.
+_TURN_OUTCOME_COMPLETED = "completed"
+_TURN_OUTCOME_BLOCKED = "blocked"
+_TURN_OUTCOME_CHECKPOINT = "checkpoint"
+
+_TURN_END_BANNERS = {
+    _TURN_OUTCOME_COMPLETED: "📊 **Final Report**",
+    _TURN_OUTCOME_BLOCKED: "⛔ **Blocked**",
+    _TURN_OUTCOME_CHECKPOINT: "⏸️ **Checkpoint — awaiting continuation**",
+}
+
+
+def _turn_end_banner(outcome: Any) -> str:
+    """Banner line for a declared turn outcome; empty when undeclared or unknown.
+
+    Exact-match only: near-misses ("Completed", " checkpoint") must not classify.
+    """
+    if not isinstance(outcome, str):
+        return ""
+    return _TURN_END_BANNERS.get(outcome, "")
+
+
+def _turn_outcome_from_capability_verdict(verdict: Any) -> str:
+    """Map a typed capability verdict to a turn outcome; empty when not classifiable."""
+    return {
+        "achieved": _TURN_OUTCOME_COMPLETED,
+        "failed": _TURN_OUTCOME_BLOCKED,
+        "blocked": _TURN_OUTCOME_BLOCKED,
+        "partial": _TURN_OUTCOME_CHECKPOINT,
+    }.get(str(verdict or "").strip().casefold(), "")
+
+
 def _agent_state_messages(state: Any) -> list[AnyMessage]:
     """Return create_agent's internal message list from middleware state."""
     try:
@@ -7974,9 +8008,13 @@ class Model:
                 # stream exactly one closing executive summary after the specialist live stream.
                 elif isinstance(msg, AIMessage) and getattr(msg, 'name', None) == "Supervisor":
                     if msg.additional_kwargs.get("_is_final_report"):
-                        # Keep the agent prefix first (nothing before it); the "Final Report" header
+                        # Keep the agent prefix first (nothing before it); the turn-end banner
                         # goes AFTER the prefix: 🤖[Supervisor]> 📊 **Final Report**\n<content>
-                        report_msg = msg.model_copy(update={"content": f"📊 **Final Report**\n{msg.content}"})
+                        # The banner classifies the ending (D9): completed / blocked /
+                        # checkpoint. Undeclared endings stream without a banner.
+                        banner = _turn_end_banner(msg.additional_kwargs.get("_turn_outcome"))
+                        content = f"{banner}\n{msg.content}" if banner else msg.content
+                        report_msg = msg.model_copy(update={"content": content})
                         formatted = self._format_message_for_streaming(report_msg, agent_name="Supervisor")
                         if formatted:
                             await self._stream_message_to_mythic(f"\n\n{formatted}")
@@ -9076,7 +9114,11 @@ class Model:
                     final_msg = AIMessage(
                         content=summary_text,
                         name="Supervisor",
-                        additional_kwargs={"_is_final_report": True, "_pending_task_handoff": True},
+                        additional_kwargs={
+                            "_is_final_report": True,
+                            "_pending_task_handoff": True,
+                            "_turn_outcome": _TURN_OUTCOME_CHECKPOINT,
+                        },
                     )
                     _tag_msg(final_msg, next_seq)
                     self._message_seq = next_seq + 1
@@ -9098,13 +9140,19 @@ class Model:
                         terminal_payload,
                         bounded_one_action=True,
                     )
+                    terminal_outcome = _turn_outcome_from_capability_verdict(
+                        terminal_payload.get("verdict")
+                    )
+                    terminal_kwargs = {
+                        "_is_final_report": True,
+                        "_terminal_execute_capability": True,
+                    }
+                    if terminal_outcome:
+                        terminal_kwargs["_turn_outcome"] = terminal_outcome
                     final_msg = AIMessage(
                         content=terminal_report,
                         name="Supervisor",
-                        additional_kwargs={
-                            "_is_final_report": True,
-                            "_terminal_execute_capability": True,
-                        },
+                        additional_kwargs=terminal_kwargs,
                     )
                     _tag_msg(final_msg, next_seq)
                     next_seq += 1
@@ -9150,14 +9198,22 @@ class Model:
                     if summary_message is not None
                     else "Scoped turn completed."
                 )
+                # A typed capability verdict classifies the ending mechanically; a
+                # prose-only worker ending stays undeclared rather than guessing.
+                bounded_outcome = _turn_outcome_from_capability_verdict(
+                    (_terminal_execute_capability_payload(new_messages_from_agent) or {}).get("verdict")
+                )
+                bounded_kwargs = {
+                    "_is_final_report": True,
+                    "_bounded_turn_terminal": True,
+                    "_turn_id": authority.turn_id,
+                }
+                if bounded_outcome:
+                    bounded_kwargs["_turn_outcome"] = bounded_outcome
                 final_msg = AIMessage(
                     content=summary_text,
                     name="Supervisor",
-                    additional_kwargs={
-                        "_is_final_report": True,
-                        "_bounded_turn_terminal": True,
-                        "_turn_id": authority.turn_id,
-                    },
+                    additional_kwargs=bounded_kwargs,
                 )
                 _tag_msg(final_msg, next_seq)
                 next_seq += 1
@@ -9920,6 +9976,7 @@ class Model:
             additional_kwargs={
                 "_is_final_report": True,
                 "_scoped_callback_inventory": True,
+                "_turn_outcome": _TURN_OUTCOME_COMPLETED,
             },
         )
         try:
@@ -10017,6 +10074,7 @@ class Model:
                     "_is_final_report": True,
                     terminal_marker: True,
                     "_turn_id": authority.turn_id,
+                    "_turn_outcome": _TURN_OUTCOME_BLOCKED,
                 },
             )
             _tag_msg(final_message, self._next_seq())
@@ -10046,7 +10104,11 @@ class Model:
             final_message = AIMessage(
                 content=f"{reason} The turn was stopped because exact MCP-server pinning must fail closed.",
                 name="Supervisor",
-                additional_kwargs={"_is_final_report": True, "_mcp_pin_failed": True},
+                additional_kwargs={
+                    "_is_final_report": True,
+                    "_mcp_pin_failed": True,
+                    "_turn_outcome": _TURN_OUTCOME_BLOCKED,
+                },
             )
             _tag_msg(final_message, self._next_seq())
             self.state.setdefault("messages", []).append(final_message)
@@ -15298,14 +15360,26 @@ def _create_respond_to_user_tool():
     delegating and wants to deliver a user-facing final report. It may synthesize
     findings or reuse one complete specialist answer verbatim.
     """
-    def finish(runtime: ToolRuntime, final_response: str) -> Command:
+    def finish(runtime: ToolRuntime, final_response: str, outcome: str = "") -> Command:
         if not final_response.strip():
             raise ValueError("final_response must be complete")
+        outcome_kwargs: dict[str, Any] = {"_is_final_report": True}
+        declared = str(outcome or "").strip()
+        if declared:
+            if declared not in {
+                _TURN_OUTCOME_COMPLETED,
+                _TURN_OUTCOME_BLOCKED,
+                _TURN_OUTCOME_CHECKPOINT,
+            }:
+                raise ValueError(
+                    "outcome must be one of completed, blocked, checkpoint — or omitted"
+                )
+            outcome_kwargs["_turn_outcome"] = declared
         # Create a final AI message with the response
         response_message = AIMessage(
             content=final_response,
             name="Supervisor",
-            additional_kwargs={"_is_final_report": True},
+            additional_kwargs=outcome_kwargs,
         )
 
         update_state = {**runtime.state}
@@ -15323,6 +15397,7 @@ def _create_respond_to_user_tool():
         runtime: ToolRuntime,
         final_response: Annotated[str, "A complete, user-facing markdown synthesis. Leave empty only when reuse_latest_worker_answer is true."] = "",
         reuse_latest_worker_answer: Annotated[bool, "Use the one current specialist's complete answer verbatim. Use only when that answer already fulfills the operator's request; leave final_response empty."] = False,
+        outcome: Annotated[str, "Why this turn ends: 'completed' (the request's work is done with task evidence), 'blocked' (work cannot continue — the blocker and its remedy lead the response), or 'checkpoint' (pausing mid-objective, awaiting operator continuation). Omit only when the ending cause is genuinely unknown."] = "",
     ) -> Command | ToolMessage:
         """Finish with a complete synthesized report or one sufficient specialist answer verbatim. Do not delegate again after calling this."""
         if reuse_latest_worker_answer:
@@ -15342,7 +15417,7 @@ def _create_respond_to_user_tool():
                     tool_call_id=runtime.tool_call_id,
                     status="error",
                 )
-        return finish(runtime, final_response)
+        return finish(runtime, final_response, outcome)
 
     return respond_to_user
 
@@ -15642,7 +15717,10 @@ def _create_handoff_tool(
                     final_message = AIMessage(
                         content=prior or "The requested actions have been completed.",
                         name="Supervisor",
-                        additional_kwargs={"_is_final_report": True},
+                        additional_kwargs={
+                            "_is_final_report": True,
+                            "_turn_outcome": _TURN_OUTCOME_COMPLETED,
+                        },
                     )
                     _tag_msg(tool_message, max_seq + 1)
                     _tag_msg(final_message, max_seq + 2)
@@ -15707,7 +15785,12 @@ def _create_handoff_tool(
                 final_message = AIMessage(
                     content=f"**{label}**\n\n{detail}".rstrip(),
                     name="Supervisor",
-                    additional_kwargs={"_is_final_report": True},
+                    additional_kwargs={
+                        "_is_final_report": True,
+                        "_turn_outcome": (
+                            _TURN_OUTCOME_COMPLETED if completed else _TURN_OUTCOME_BLOCKED
+                        ),
+                    },
                 )
                 _tag_msg(tool_message, max_seq + 1)
                 _tag_msg(final_message, max_seq + 2)
@@ -15742,7 +15825,12 @@ def _create_handoff_tool(
             final_message = AIMessage(
                 content=f"**{label}**\n\n{outcome_summary}".rstrip(),
                 name="Supervisor",
-                additional_kwargs={"_is_final_report": True},
+                additional_kwargs={
+                    "_is_final_report": True,
+                    "_turn_outcome": (
+                        _TURN_OUTCOME_COMPLETED if outcome == "complete" else _TURN_OUTCOME_BLOCKED
+                    ),
+                },
             )
             _tag_msg(tool_message, max_seq + 1)
             _tag_msg(final_message, max_seq + 2)

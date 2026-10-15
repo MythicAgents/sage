@@ -170,8 +170,9 @@ def test_built_supervisor_offers_both_final_report_modes(mode, monkeypatch):
     assert asyncio.run(body()) is not None
     assert len(offered) == 1
     fields = offered[0].tool_call_schema.model_fields
-    assert set(fields) == {"final_response", "reuse_latest_worker_answer"}
+    assert set(fields) == {"final_response", "reuse_latest_worker_answer", "outcome"}
     assert not fields["final_response"].is_required()
+    assert not fields["outcome"].is_required()
 
 
 def test_the_hermetic_fixture_never_reaches_the_network():
