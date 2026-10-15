@@ -12638,7 +12638,7 @@ class Model:
         except Exception as e:
             logger.debug(f"BloodHound not-connected EventFeed notify failed: {e}")
 
-    def _bloodhound_agent(self):
+    def _bloodhound_agent(self, *, consultation: bool = False):
         # Dedicated BloodHound agent: owns the BloodHound graph lifecycle (ingest -> verify -> query) on its
         # OWN message channel ("bloodhound_messages"). Scoped to ONLY the BloodHound MCP server's tools so it
         # stays distinct from the general-purpose MCP_Manager (which owns any OTHER connected MCP servers).
@@ -12648,7 +12648,7 @@ class Model:
 
         prompt = load_prompt("bloodhound", servers_text=servers_text)
 
-        if not self.state["bloodhound_messages"]:
+        if not consultation and not self.state["bloodhound_messages"]:
             self.state["bloodhound_messages"].append(SystemMessage(content=prompt))
 
         # Bind the process to the configured local BloodHound launcher, then expose only the exact
@@ -12663,7 +12663,23 @@ class Model:
         mcp_tools = self._bloodhound_tools_for_turn() if bh_servers else []
 
         # Add handback tool for recursion limit management
-        handback_tool = _create_summarize_handback_tool()
+        # A nested consultation returns to its caller through the tool result. The
+        # graph-parent handback command is valid only for the normal specialist node.
+        if consultation:
+            @tool("summarize_and_handback", return_direct=True)
+            def local_handback(
+                progress_summary: Annotated[str, "Summary of work completed so far"],
+                tasks_remaining: Annotated[str, "Description of tasks still remaining"],
+                key_findings: Annotated[str, "Important findings or results discovered"] = "",
+            ) -> str:
+                """End this consultation and return bounded progress to the caller."""
+                return json.dumps({"progress_summary": progress_summary,
+                                   "tasks_remaining": tasks_remaining,
+                                   "key_findings": key_findings}, sort_keys=True)
+
+            handback_tool = local_handback
+        else:
+            handback_tool = _create_summarize_handback_tool()
 
         # Sage TTP knowledge tools (read-only local files) + the stage->ingest bridge so the BloodHound
         # agent can self-serve standup guidance, the attack-path-loop playbook, and stage a staged file UUID.
@@ -12675,7 +12691,9 @@ class Model:
                 "list_ttp_categories",
             ])
 
-        tools = mcp_tools + filter_tools_by_frontmatter("bloodhound", ttp_tools + [handback_tool])
+        tools = mcp_tools + filter_tools_by_frontmatter(
+            "bloodhound", ttp_tools + [handback_tool]
+        )
 
         # Handle case when BloodHound MCP not connected — the agent still loads (with only its TTP/handback
         # tools) so it can NOTIFY the user how to connect BloodHound rather than silently failing.
@@ -12696,7 +12714,7 @@ class Model:
                 _BloodHoundConnectionGuardMiddleware(self),
             ] + self._context_middleware(agent_name=name),
         )
-        return self._wrap_create_agent(agent, "bloodhound_messages", name)
+        return agent if consultation else self._wrap_create_agent(agent, "bloodhound_messages", name)
 
     def _mcp_manager_agent(self):
         # General-purpose MCP manager: lets users connect ARBITRARY MCP servers to Sage and use their tools.
@@ -12767,15 +12785,23 @@ class Model:
         )
         return self._wrap_create_agent(agent, "sandbox_messages", name)
 
-    def _supervisor_agent(self):
+    def _supervisor_agent(self, *, bloodhound_consultation_tool=None, consultation_middleware=None,
+                          consultation_completion_tool=None):
         name = "Supervisor"
         prompt = load_prompt("supervisor")
         if not self.state["supervisor_messages"]:
             self.state["supervisor_messages"].append(SystemMessage(content=prompt))
 
         # Handoffs
+        handoff_context = {
+            "caller_agent_name": name,
+            "caller_request_id_lookup": lambda: str(
+                getattr(getattr(self, "_request_contract", None), "request_id", "") or ""
+            ),
+        }
         assign_to_generalist_agent = _create_handoff_tool(
             agent_name="Generalist",
+            **handoff_context,
             description="Assign task to Generalist for general questions, explanations, advice, and tasks that don't require Mythic operations or external tools.",
             autonomous_redirect=self._autonomous_handoff_step_redirect,
             worker_outcome_lookup=self._latest_admitted_worker_handoff,
@@ -12785,6 +12811,7 @@ class Model:
 
         assign_to_mythic_operator_agent = _create_handoff_tool(
                 agent_name="Mythic_Operator",
+                **handoff_context,
                 description="Assign task to Mythic Operator for ALL Mythic C2 operations: callbacks, agents, tasks, commands, files, reconnaissance. ALWAYS use this for Mythic-related queries instead of the BloodHound agent.",
                 autonomous_redirect=self._autonomous_handoff_step_redirect,
                 worker_outcome_lookup=self._latest_admitted_worker_handoff,
@@ -12794,6 +12821,7 @@ class Model:
 
         assign_to_mythic_payload_agent = _create_handoff_tool(
                 agent_name="Mythic_Payload",
+                **handoff_context,
                 description="Assign task to Mythic Payload for creating Mythic payloads, configuring C2 profiles, and build options.",
                 autonomous_redirect=self._autonomous_handoff_step_redirect,
                 worker_outcome_lookup=self._latest_admitted_worker_handoff,
@@ -12801,8 +12829,9 @@ class Model:
                 assisted_operator_lookup=self._assisted_operator_input_for_handoff,
             )
 
-        assign_to_bloodhound_agent = _create_handoff_tool(
+        assign_to_bloodhound_agent = bloodhound_consultation_tool or _create_handoff_tool(
                 agent_name="BloodHound",
+                **handoff_context,
                 description="Assign to the BloodHound agent for the BloodHound attack-graph: INGEST a staged SharpHound/AzureHound collection (file_upload) then VERIFY it, and attack-path ANALYSIS (shortest path, ADCS/ESC paths, Cypher, object detail). NOTE: the Operator auto-hands-off freshly-staged collections to BloodHound; route here for any BloodHound/graph work, to re-attempt a failed ingest, or for path analysis. Do NOT route BloodHound work to Mythic_Operator.",
                 autonomous_redirect=self._autonomous_handoff_step_redirect,
                 worker_outcome_lookup=self._latest_admitted_worker_handoff,
@@ -12812,6 +12841,7 @@ class Model:
 
         assign_to_mcp_manager_agent = _create_handoff_tool(
                 agent_name="MCP_Manager",
+                **handoff_context,
                 description="Assign to the general-purpose MCP Manager for tools from ARBITRARY third-party MCP servers a user has connected (web fetching, external APIs, non-Mythic integrations) — anything that is NOT BloodHound, NOT Mythic C2, and NOT a payload build. For BloodHound/graph work use the BloodHound agent; for Mythic operations use Mythic_Operator.",
                 autonomous_redirect=self._autonomous_handoff_step_redirect,
                 worker_outcome_lookup=self._latest_admitted_worker_handoff,
@@ -12821,6 +12851,7 @@ class Model:
 
         assign_to_sandbox_agent = _create_handoff_tool(
                 agent_name="Sandbox",
+                **handoff_context,
                 description="Assign to the Sandbox agent for isolated LOCAL scratch execution only: run shell/Python snippets, parse/transform text, test regexes, or perform ad-hoc computation in a throwaway container. Do NOT use this for Mythic, BloodHound, target-facing actions, payload work, or proof.",
                 autonomous_redirect=self._autonomous_handoff_step_redirect,
                 worker_outcome_lookup=self._latest_admitted_worker_handoff,
@@ -12829,7 +12860,7 @@ class Model:
             )
 
         # Completion tool - use when task is done
-        respond_to_user_tool = _create_respond_to_user_tool()
+        respond_to_user_tool = consultation_completion_tool or _create_respond_to_user_tool()
 
         # Recursion limit management tool
         request_continuation_tool = _create_recursion_summary_tool()
@@ -12866,7 +12897,7 @@ class Model:
             # _sanitize_messages. supervisor.md is non-empty today, but a blank render would otherwise send an
             # empty `system` block to Bedrock (bug 2). Normalize here too, consistently with __init__.
             system_prompt=_nonempty_system(prompt),
-            middleware=self._context_middleware(agent_name=name),
+            middleware=self._context_middleware(agent_name=name) + (consultation_middleware or []),
         )
         return self._wrap_create_agent(agent, "supervisor_messages", name)
 
