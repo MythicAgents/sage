@@ -7590,7 +7590,15 @@ class Model:
             # must therefore not be repeated as card-close content.
             summary = explicit_content or final_summary or last_text
             if status == "finished" and not summary:
-                summary = "Completed without a textual summary."
+                # D7: a delegation that ends without any text or tool output completed nothing.
+                # Closing it as "finished" with filler text hid the empty return from both the
+                # operator and the Supervisor. Close it honestly as an error instead.
+                status = "error"
+                summary = (
+                    f"{str(delegation.get('name', '') or agent_name)} delegation ended with no text "
+                    "and no tool results — it produced no action and no evidence. Treat this as an "
+                    "incomplete observation, not a completion."
+                )
             content = summary
             streamed_text_candidates = {last_text} if last_text else set()
             if isinstance(streamed_text_chunks, list):
