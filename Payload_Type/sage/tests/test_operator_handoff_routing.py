@@ -259,6 +259,8 @@ def test_real_agent_handoff_to_payload_waits_for_approval_before_supervisor(
         "Supervisor": driver.ScriptedModel(messages=iter([
             lambda _messages: (calls.append("Supervisor:initial"), _handoff_call())[1],
             lambda _messages: (calls.append("Supervisor:resume"), _handoff_call())[1],
+            lambda _messages: (calls.append("Supervisor:final"),
+                               AIMessage(content=f"Observed: {payload_outcome}"))[1],
         ])),
         "Mythic_Operator": driver.ScriptedModel(messages=iter([
             operator_first, operator_resumed,
@@ -325,7 +327,7 @@ def test_real_agent_handoff_to_payload_waits_for_approval_before_supervisor(
     assert effects == (["inert.bin"] if decision == "approve" else [])
     assert calls == ["Supervisor:initial", "Mythic_Operator:initial", "Mythic_Payload:propose",
                      "Mythic_Payload:complete",
-                     "Supervisor:resume", "Mythic_Operator:resumed"], calls
+                     "Supervisor:resume", "Mythic_Operator:resumed", "Supervisor:final"], calls
     assert sum(payload_outcome in str(message.content)
                for message in resumed_context) == 1
     assert any("Prior inert Operator observation marker." in str(message.content)
@@ -354,6 +356,8 @@ def test_supervisor_direct_payload_result_does_not_copy_into_operator(monkeypatc
                     "id": "supervisor-to-payload", "type": "tool_call",
                 }]))[1],
             lambda _messages: (calls.append("Supervisor:operator"), _handoff_call())[1],
+            lambda _messages: (calls.append("Supervisor:final"),
+                               AIMessage(content="Operator response reviewed."))[1],
         ])),
         "Mythic_Payload": driver.ScriptedModel(messages=iter([
             lambda _messages: (calls.append("Mythic_Payload"),
@@ -391,7 +395,7 @@ def test_supervisor_direct_payload_result_does_not_copy_into_operator(monkeypatc
 
     result = asyncio.run(exercise())
     assert calls == ["Supervisor:direct", "Mythic_Payload", "Supervisor:operator",
-                     "Mythic_Operator"]
+                     "Mythic_Operator", "Supervisor:final"]
     assert sum("Direct payload completion marker." in str(message.content)
                for message in operator_context) == 0
     assert sum("Direct payload completion marker." in str(message.content)

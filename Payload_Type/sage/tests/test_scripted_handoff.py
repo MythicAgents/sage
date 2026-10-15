@@ -842,17 +842,19 @@ def test_supervisor_can_continue_authorized_work_after_incomplete_specialist_ret
         AIMessage(content="First check incomplete; a second callback needs review."),
         next_handoff,
         AIMessage(content="The second callback is alive."),
+        AIMessage(content="One callback is alive; the first check remains incomplete."),
     ])
     result = asyncio.run(harness.run("Check all callbacks.", assisted=True))
 
-    # This graph's two-specialist cap ends the request after the second return.
-    assert len(seen) == 4
+    assert len(seen) == 5
     assert any(
         isinstance(message, HumanMessage)
         and message.content.startswith("Internal Supervisor continuation:")
         for message in seen[2]
     )
     assert "The second callback is alive." in _contents(result["mythic_operator_messages"])
+    assert "One callback is alive; the first check remains incomplete." in _contents(
+        result["supervisor_messages"])
     assert not getattr(harness.mythic, "issue_task", MagicMock()).called
 
 

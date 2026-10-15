@@ -99,7 +99,13 @@ def test_retained_task_outputs_reach_generalist_model_input_without_new_authorit
     assert any("LAB\\analyst" in excerpt for row in evidence
                for excerpt in row["response_text_excerpts"])
     contents = "\n".join(str(m.content) for m in provider_messages)
-    assert generated_instruction not in contents
+    assignments = [m for m in provider_messages
+                   if m.additional_kwargs.get("_assisted_assignment_context")]
+    assert len(assignments) == 1 and isinstance(assignments[0], AIMessage)
+    assert generated_instruction in assignments[0].content
+    assert "not operator input, approval, or source evidence" in assignments[0].content
+    assert all(generated_instruction not in str(m.content) for m in provider_messages
+               if not m.additional_kwargs.get("_assisted_assignment_context"))
     assert worker_summary not in contents
     assert "The worker reviewed stored task outputs." not in contents
     assert not any(isinstance(m, ToolMessage) and m.name == "get_all_task_output_by_task_id"
@@ -207,7 +213,13 @@ def test_withdrawn_native_task_output_does_not_become_generalist_evidence(
     assert [m for m in provider_messages if isinstance(m, HumanMessage)][-1].content == followup
     contents = "\n".join(str(m.content) for m in provider_messages)
     assert worker_summary not in contents
-    assert generated_instruction not in contents
+    assignment = [m for m in provider_messages
+                  if m.additional_kwargs.get("_assisted_assignment_context")]
+    assert len(assignment) == 1 and isinstance(assignment[0], AIMessage)
+    assert generated_instruction in assignment[0].content
+    assert "not operator input, approval, or source evidence" in assignment[0].content
+    assert all(generated_instruction not in str(m.content) for m in provider_messages
+               if not m.additional_kwargs.get("_assisted_assignment_context"))
 
 
 def test_recent_whole_evidence_keeps_supervised_32k_source_within_cap():

@@ -1,8 +1,8 @@
-"""Regression tests for the supervised plan-and-execute gate's termination Command.
+"""Regression tests for top-level graph Command handling.
 
 Two defects are covered, both observed together on a live Mythic chat channel:
 
-1. The gate returned ``Command(graph=Command.PARENT)`` from ``_wrap_create_agent._ainvoke``,
+1. A prior gate returned ``Command(graph=Command.PARENT)`` from ``_wrap_create_agent._ainvoke``,
    which is a *top-level* node body on the "Sage" graph. A top-level node has no parent, so
    langgraph raised ``ParentCommand``, rewrote its ``graph`` to the empty parent namespace,
    and the exception escaped ``astream`` with nothing to catch it.
@@ -112,11 +112,8 @@ def test_top_level_node_body_never_returns_a_parent_command():
         and node.func.id == "Command"
     ]
 
-    # Floor assertions: a guard that inspected an empty or truncated body would report
-    # success while examining nothing at all.
-    assert len(calls) >= 3, f"expected the three Command returns, saw {len(calls)}"
-    names = {n.id for n in ast.walk(body) if isinstance(n, ast.Name)}
-    assert "_SUPERVISED_DELEGATION_CAP" in names, "did not capture the gate branch"
+    # Floor assertion: an empty or truncated body must not report success.
+    assert len(calls) >= 2, f"expected terminal Command returns, saw {len(calls)}"
 
     offenders = [
         ast.unparse(kw.value)

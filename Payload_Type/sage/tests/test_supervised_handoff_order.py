@@ -87,7 +87,12 @@ def test_assembled_operator_input_prioritizes_same_request_completed_return():
     asyncio.run(wrapped(state, {}))
     assert len(seen) == 1
     provider_input = seen[0]
-    assert provider_input[:-1] == [parts[0], delegated] + parts[1:]
+    assignments = [m for m in provider_input
+                   if m.additional_kwargs.get("_assisted_assignment_context")]
+    assert len(assignments) == 1
+    assert "Model-authored wording must not replace authority." in assignments[0].content
+    without_assignment = [m for m in provider_input if m not in assignments]
+    assert without_assignment[:-1] == [parts[0], delegated] + parts[1:]
     assert isinstance(provider_input[-1], HumanMessage)
     assert provider_input[-1].additional_kwargs["_synthetic_nudge"] == (
         "provider_requires_user_turn"

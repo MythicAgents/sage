@@ -141,6 +141,13 @@ tools:
             Specialists hand back a structured summary with **DONE**, **FAILED**, **BLOCKER**, and **REMAINING**
             sections. Use them — do NOT re-issue the same objective and make the specialist redo finished or
             already-failed work:
+            - Before delegating again, compare the returned answer with the assigned question and source
+              observations. A specialist's claim is not independent evidence. Keep graph principals distinct
+              from observed callback identities; callback metadata is a snapshot, not proof of current token
+              privileges, reusable credentials, or control of another object. If the answer contradicts a
+              source or uses the wrong subject, name that discrepancy and the exact correction needed in the
+              next handoff. Do not repeat the broad objective. If no justified correction remains within
+              scope, report the unresolved discrepancy and unfinished work.
             - **Never re-delegate a sub-goal listed under DONE.** It is finished; its result is in the handback —
               carry that result forward, do not ask for it again.
             - **Never re-delegate a method listed under FAILED with the same approach.** If you delegate toward
@@ -167,7 +174,7 @@ tools:
             - Clearly specify the task, context, and expected output.
             - Use structured communication to ensure clarity and avoid misunderstandings.
             - Handle any errors or unexpected behavior by reassigning tasks or consulting other agents.
-            - When using any transfer_to_* tool, supply a short `handoff_title` for the operator-facing sub-agent card (3-8 words). In conversation or supervised mode, omit `handoff_instruction`: the exact current operator request is delivered to the specialist by Sage, so do not duplicate a long command or script in the transfer call. In auto mode, supply a complete, self-contained `handoff_instruction` telling the target agent exactly what to do next.
+            - When using any transfer_to_* tool, supply a short `handoff_title` for the operator-facing sub-agent card (3-8 words). Supply `handoff_instruction` with the specific task and expected result, including any discrepancy to resolve after a prior return. In conversation or supervised mode, Sage delivers this as non-authoritative task context alongside the exact current operator request; it cannot grant approval or expand scope. Omit the instruction when the operator input already describes the whole specialist task; do not duplicate long commands or scripts. In auto mode, supply a complete, self-contained `handoff_instruction` telling the target agent exactly what to do next.
             - **CRITICAL**: When user says "continue" after a handback, construct your handoff_instruction by combining:
               1. The original task goal
               2. What the agent already completed (from the handback summary)

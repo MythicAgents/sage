@@ -1,6 +1,6 @@
 """Request isolation regressions for checkpointed native-chat turns.
 
-These tests exercise the production ``Model.invoke`` seam and the real supervised gate with
+These tests exercise the production ``Model.invoke`` seam and the Supervisor wrapper with
 an in-memory checkpoint.  Only the leaf agent runnable is scripted; state reducers, request
 contracts, node wrapping, request reuse, and termination commands are production code.
 """
@@ -150,7 +150,7 @@ def test_same_checkpoint_starts_a_fresh_supervisor_turn_with_prior_context_once(
     )
 
 
-def test_prior_request_completion_headers_do_not_consume_current_budget():
+def test_prior_request_completion_headers_do_not_block_current_assessment():
     async def run() -> tuple[Command | dict[str, Any], _RecordingAgent]:
         model = _new_model()
         _install_contract_without_graph_rebuild(model, "chat:channel-isolation:request:2")
@@ -185,12 +185,12 @@ def test_prior_request_completion_headers_do_not_consume_current_budget():
     assert any(message.content == _FRESH_FINAL for message in result["supervisor_messages"])
 
 
-def test_current_request_completion_headers_still_trigger_the_cap():
+def test_current_request_completion_headers_reach_supervisor_assessment():
     async def run() -> tuple[Command | dict[str, Any], _RecordingAgent]:
         model = _new_model()
         request_id = "chat:channel-isolation:request:2"
         _install_contract_without_graph_rebuild(model, request_id)
-        supervisor = _RecordingAgent("must not run")
+        supervisor = _RecordingAgent("The current specialist results need review.")
         wrapped = model._wrap_create_agent(supervisor, "supervisor_messages", "Supervisor")
         state = {
             "_request_id": request_id,
@@ -211,10 +211,11 @@ def test_current_request_completion_headers_still_trigger_the_cap():
 
     result, supervisor = asyncio.run(run())
 
-    assert isinstance(result, Command)
-    assert result.goto == END
-    assert supervisor.inputs == []
-    assert result.update["supervisor_messages"][0].content == "second current-request summary"
+    assert isinstance(result, dict)
+    assert len(supervisor.inputs) == 1
+    assert any(m.content == "second current-request summary" for m in supervisor.inputs[0])
+    assert any(m.content == "The current specialist results need review."
+               for m in result["supervisor_messages"])
 
 
 def test_same_channel_worker_sees_prior_command_schema_after_second_handoff(monkeypatch):

@@ -434,8 +434,9 @@ def test_concurrent_fourth_capture_recovery_reserves_one_slot(tmp_path):
         episode = f"used-{number}"; _episode(budget, episode)
         _reserve_replacement(budget, tmp_path, episode, source); budget.close_episode(episode); source = episode
     _episode(budget, "last"); disposition = _capture_disposition(tmp_path, source)
-    queue = multiprocessing.Queue()
-    processes = [multiprocessing.Process(target=_capture_worker, args=(budget.config_path,
+    context = multiprocessing.get_context("fork")
+    queue = context.Queue()
+    processes = [context.Process(target=_capture_worker, args=(budget.config_path,
         budget.ledger_path, "last", disposition, _sha(disposition), budget.status()["started_epoch"], queue))
         for _ in range(2)]
     for process in processes: process.start()
