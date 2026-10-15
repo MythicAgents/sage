@@ -1880,6 +1880,10 @@ class MythicTools:
         self._last_issued_callback_id = None
         self._last_issued_task_terminal_status = ""
         self._last_issued_command = ""
+        # Set at the issue boundary: True when the just-issued task's failure key already
+        # carried a recorded failure, so the delegation wrapper counts the repeat as
+        # no-progress instead of letting the new task marker read as progress.
+        self._last_issued_task_is_repeat_failure = False
         # Presentation-only observer for deterministic capability child commands. The capability executor
         # remains the only execution boundary; this reports real callback tasks to the chat surface.
         self._capability_command_observer = None
@@ -5794,16 +5798,90 @@ class MythicTools:
         except Exception:
             return {}
 
+    def _canonical_dcsync_argument_text(self, text: str) -> str:
+        """Canonical form of an `lsadump::dcsync` argument string for breaker keys ONLY.
+
+        Flag order, quoting, whitespace, case, and the user-principal spelling (bare,
+        NETBIOS-qualified, or UPN) are cosmetic permutations: in the acceptance run the
+        same failed DCSync re-attempted across requests produced a fresh failure key
+        every time, so the cross-request circuit breaker never fired. A /dc: choice is
+        material targeting and stays part of the key. Task parameters themselves are
+        never rewritten — this only merges failure-counting keys.
+        """
+        tokens = [token.strip() for token in str(text).split() if token.strip()]
+        flags: dict[str, str] = {}
+        tail: list[str] = []
+        index = 0
+        while index < len(tokens):
+            raw = tokens[index]
+            token = raw.strip("\"'")
+            match = re.fullmatch(r"/(domain|dc|user):(.+)", token, re.IGNORECASE)
+            if match:
+                flags[match.group(1).lower()] = match.group(2).strip().strip("\"'")
+                index += 1
+                continue
+            # A quoted flag value containing whitespace spans several raw tokens.
+            span_match = re.fullmatch(r"/(domain|dc|user):([\"'])(.*)", token, re.IGNORECASE)
+            if span_match and not raw.rstrip().endswith(span_match.group(2)):
+                quote = span_match.group(2)
+                collected = [span_match.group(3)]
+                index += 1
+                while index < len(tokens):
+                    collected.append(tokens[index].strip())
+                    if tokens[index].strip().endswith(quote):
+                        index += 1
+                        break
+                    index += 1
+                flags[span_match.group(1).lower()] = (
+                    " ".join(collected).rstrip(quote).strip().strip("\"'")
+                )
+                continue
+            tail.append(token)
+            index += 1
+        domain = (flags.get("domain") or "").casefold()
+        ordered: list[str] = []
+        if "domain" in flags:
+            ordered.append(f"/domain:{domain}")
+        if "dc" in flags:
+            ordered.append(f"/dc:{flags['dc'].casefold()}")
+        if "user" in flags:
+            ordered.append(f"/user:{self._normalize_dcsync_user(flags['user'], domain)}")
+        head = "lsadump::dcsync"
+        body = [token for token in tail if "lsadump::dcsync" not in token.casefold()]
+        return " ".join([head] + ordered + body)
+
+    def _canonical_task_failure_parameters(self, parameters):
+        """Breaker-key view of task parameters with dcsync argument permutations merged.
+
+        Returns the parameters unchanged unless a string value carries a dcsync
+        argument span; only the key view is canonicalized, never the tasking values.
+        """
+        if isinstance(parameters, dict) and parameters:
+            canonical: dict = {}
+            changed = False
+            for key, value in parameters.items():
+                new_value = value
+                if isinstance(value, str) and "lsadump::dcsync" in value.casefold():
+                    new_value = self._canonical_dcsync_argument_text(value)
+                    changed = changed or new_value != value
+                canonical[key] = new_value
+            return canonical if changed else parameters
+        if isinstance(parameters, str) and "lsadump::dcsync" in parameters.casefold():
+            return self._canonical_dcsync_argument_text(parameters)
+        return parameters
+
     def _task_failure_key(self, command: str, callback_display_id: int, parameters) -> tuple:
         try:
             serialized = self._bound_failure_parameter_signatures.get(
-                _capability_command_key(command, parameters),
-                (
-                    json.dumps(parameters, sort_keys=True)
-                    if isinstance(parameters, (dict, list))
-                    else str(parameters)
-                ),
+                _capability_command_key(command, parameters)
             )
+            if serialized is None:
+                canonical = self._canonical_task_failure_parameters(parameters)
+                serialized = (
+                    json.dumps(canonical, sort_keys=True)
+                    if isinstance(canonical, (dict, list))
+                    else str(canonical)
+                )
         except Exception:
             serialized = str(parameters)
         key = (
@@ -6543,6 +6621,7 @@ class MythicTools:
                 self._last_issued_task_display_id = None
                 self._last_issued_task_terminal_status = ""
                 self._last_issued_command = command
+                self._last_issued_task_is_repeat_failure = False
 
                 async def _issue_and_wait():
                     nonlocal parameters
@@ -6676,6 +6755,12 @@ class MythicTools:
                             "command": command,
                         })
                     self._last_issued_task_display_id = tdid
+                    self._last_issued_task_is_repeat_failure = (
+                        self._task_failure_counts.get(
+                            self._task_failure_key(command, callback_display_id, parameters),
+                            0,
+                        ) >= 1
+                    )
                     # ISC-71: task creation is the lineage boundary. Record before waiting so a timeout,
                     # subscription failure, or failed command cannot make an accepted Mythic task look manual.
                     self._record_current_request_task(tdid)
@@ -11935,6 +12020,7 @@ class MythicTools:
             except (TypeError, ValueError):
                 timeout = None
             self._last_issued_task_display_id = None
+            self._last_issued_task_is_repeat_failure = False
             upload_visibility_context = dict(_task_visibility_context.get() or {})
             upload_visibility_context.update({
                 "capability": capability,

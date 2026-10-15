@@ -107,3 +107,76 @@ if __name__ == "__main__":
             fn()
             print(f"PASS {name}")
     print("all circuit-breaker tests passed")
+
+
+def test_failure_key_treats_dcsync_argument_permutations_as_one_failure():
+    """Flag order, quoting, case, and user-principal spelling are cosmetic: the
+    cross-request circuit breaker must count them as the same failed signature."""
+    mt = _make_tools()
+    base = {
+        "pe_name": "mimikatz.exe",
+        "pe_arguments": '"lsadump::dcsync /domain:north.sevenkingdoms.local /user:krbtgt" exit',
+    }
+    permuted = {
+        "pe_name": "mimikatz.exe",
+        "pe_arguments": "'lsadump::dcsync /user:NORTH\\krbtgt /domain:NORTH.SEVENKINGDOMS.LOCAL' exit",
+    }
+    k1 = mt._task_failure_key("execute_pe", 1, base)
+    k2 = mt._task_failure_key("execute_pe", 1, permuted)
+    assert k1 == k2, (
+        f"cosmetic permutations must share one failure key:\n{k1}\n{k2}"
+    )
+
+
+def test_failure_key_still_distinguishes_material_targeting_changes():
+    """A different /dc, a different principal, or a different domain is a genuinely
+    new attempt and must keep its own failure key."""
+    mt = _make_tools()
+    base = {
+        "pe_name": "mimikatz.exe",
+        "pe_arguments": '"lsadump::dcsync /domain:north.sevenkingdoms.local /user:krbtgt" exit',
+    }
+    k_base = mt._task_failure_key("execute_pe", 1, base)
+    with_dc = {
+        "pe_name": "mimikatz.exe",
+        "pe_arguments": '"lsadump::dcsync /domain:north.sevenkingdoms.local '
+                        '/dc:winterfell.north.sevenkingdoms.local /user:krbtgt" exit',
+    }
+    other_user = {
+        "pe_name": "mimikatz.exe",
+        "pe_arguments": '"lsadump::dcsync /domain:north.sevenkingdoms.local /user:administrator" exit',
+    }
+    other_domain = {
+        "pe_name": "mimikatz.exe",
+        "pe_arguments": '"lsadump::dcsync /domain:essos.local /user:krbtgt" exit',
+    }
+    assert mt._task_failure_key("execute_pe", 1, with_dc) != k_base
+    assert mt._task_failure_key("execute_pe", 1, other_user) != k_base
+    assert mt._task_failure_key("execute_pe", 1, other_domain) != k_base
+
+
+def test_permuted_dcsync_retries_hit_the_circuit_breaker():
+    """The acceptance-run shape: the same failed dcsync re-attempted across requests
+    with cosmetically different arguments must be short-circuited on the second try."""
+    calls = {"n": 0}
+    fail = (
+        "[*] Using Mimikatz... lsadump::dcsync /domain:north.sevenkingdoms.local\n"
+        "ERROR kull_m_rpc_drsr_get_DRSRHandle; 0x000020f7 (5) - access denied"
+    )
+    mt = _make_tools()
+    with _split_issue(fail, on_issue=lambda p: calls.__setitem__("n", calls["n"] + 1)):
+        r1 = asyncio.run(mt.issue_task_and_waitfor_task_output(
+            "execute_pe",
+            {"pe_name": "mimikatz.exe",
+             "pe_arguments": '"lsadump::dcsync /domain:north.sevenkingdoms.local /user:krbtgt" exit'},
+            1))
+        r2 = asyncio.run(mt.issue_task_and_waitfor_task_output(
+            "execute_pe",
+            {"pe_name": "mimikatz.exe",
+             "pe_arguments": "'lsadump::dcsync /user:NORTH\\krbtgt /domain:NORTH.SEVENKINGDOMS.LOCAL' exit"},
+            1))
+    assert not r1.startswith("STOP"), "the first attempt must run"
+    assert r2.startswith("STOP"), (
+        f"the permuted re-attempt of a failed signature must be short-circuited: {r2[:200]}"
+    )
+    assert calls["n"] == 1, "Mythic must be called only once; the permuted retry is blocked locally"
