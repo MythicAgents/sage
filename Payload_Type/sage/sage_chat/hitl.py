@@ -292,7 +292,9 @@ def build_approval_request(action_requests: list[dict[str, Any]]) -> dict[str, A
                     f"Sage proposed {count} guarded actions. "
                 )
             )
-            + "Accept approves; Reject denies."
+            + ("Accept approves; Reject denies without any reply; "
+               "Respond denies the action and sends your typed text to Sage as "
+               "steering guidance.")
         ),
         "description": "\n\n".join(description_blocks),
         "data": {

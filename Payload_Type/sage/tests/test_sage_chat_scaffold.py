@@ -3287,6 +3287,18 @@ def test_approval_request_shape():
     assert req["data"]["guarded_action_count"] == 1
 
 
+def test_approval_request_prompt_teaches_all_three_operator_affordances():
+    """Reject closes the card with no reply; Respond is the deny-with-guidance path.
+
+    Mythic's Reject button never collects text, so the card must not present a
+    two-affordance story: an operator who wants to deny with guidance must know
+    that Respond is the path that carries their text to Sage.
+    """
+    req = build_approval_request([{"name": "create_payload", "args": {"os": "windows"}}])
+    assert "Reject denies without any reply" in req["prompt"]
+    assert "Respond denies the action and sends your typed text to Sage as steering guidance" in req["prompt"]
+
+
 def test_approval_request_uses_capability_display_name_without_changing_guarded_tool():
     req = build_approval_request([{
         "name": "execute_capability",

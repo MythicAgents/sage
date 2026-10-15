@@ -4251,7 +4251,7 @@ class MythicTools:
         if name and file_identity is not None:
             raise ValueError("task contains both registered and uploaded file selections")
         if name and not self._registered_file_available_in_schema(schema, name):
-            raise ValueError(f"registered file {name!r} needs its own approval before this task")
+            raise ValueError(self._registered_file_remedy_text(schema, name))
         if name:
             if (
                 isinstance(executable_binding, dict)
@@ -4261,7 +4261,13 @@ class MythicTools:
             else:
                 file_identity = await self._find_uploaded_file_by_name(name)
             if not isinstance(file_identity, dict) or not file_identity.get("agent_file_id"):
-                raise ValueError(f"registered file {name!r} has no verifiable Mythic identity")
+                raise ValueError(
+                    f"registered file {name!r} is a registered choice for this command, "
+                    "but no uploaded file with that exact name exists in Mythic. "
+                    "Uploading it is an operator decision that needs its own approval; "
+                    "report this blocker to the operator instead of retrying, or "
+                    "re-task with a different registered identifier if one fits."
+                )
             file_identity = {key: file_identity.get(key) for key in
                              ("id", "agent_file_id", "filename_utf8", "md5", "sha1", "complete", "sha256")}
         if parameters == "" and isinstance(schema, list) and schema:
@@ -9255,6 +9261,36 @@ class MythicTools:
                 if choice_text == wanted:
                     return True
         return False
+
+    def _registered_file_remedy_text(self, schema, name: str) -> str:
+        """Actionable remedy for a registered-file reference the guard could not verify.
+
+        A guard error that names no next step sends the model guessing — it assumed an
+        approval card would appear and looped registration checks for 11 cycles. Name
+        the exact registered identifiers instead, and say plainly that no card appears.
+        """
+        choices = sorted({
+            self._capability_text(choice).strip()
+            for param in self._registered_file_selectors(schema)
+            if isinstance(param, dict) and isinstance(param.get("choices"), list)
+            for choice in param["choices"]
+            if self._capability_text(choice).strip()
+        })
+        if choices:
+            listed = ", ".join(repr(choice) for choice in choices)
+            return (
+                f"registered file {name!r} is not among this command's registered-file "
+                f"choices ({listed}). Re-issue with one of those exact identifiers; do "
+                "not guess a filename, and no approval card will appear for a guessed "
+                "name. If the needed binary is genuinely absent from Mythic, report that "
+                "and stop instead of re-checking registrations."
+            )
+        return (
+            f"registered file {name!r} could not be confirmed against this command's "
+            "registered-file choices (the schema exposed no choice list). Use the exact "
+            "registered identifier from the command's own schema choices; do not guess "
+            "a filename or re-check registrations repeatedly."
+        )
 
     async def _invalidate_command_schema_cache(self, command: str, callback_display_id) -> None:
         try:

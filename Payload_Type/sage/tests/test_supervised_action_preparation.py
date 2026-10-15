@@ -718,6 +718,101 @@ def test_postapproval_binding_drift_denies_real_issue_before_sink(monkeypatch, d
         assert upstream.await_count == 2
 
 
+def _registered_file_guard_tools(monkeypatch, choices=("mimikatz",)):
+    """Guard harness: the resolver is stubbed because the guard branch is reachable
+    in production through schemas whose choice lists are not populated (the
+    'false means unknown' case); these tests target the guard's remedy message."""
+    from ai.langgraph import command_builder
+
+    schema = [
+        {"name": "Binary", "cli_name": "Binary", "type": "ChooseOne",
+         "parameter_group_name": "Default", "required": True,
+         "default_value": "", "choices": list(choices)},
+        {"name": "Payload", "cli_name": "Payload", "type": "File",
+         "parameter_group_name": "Upload", "required": False,
+         "default_value": "", "choices": []},
+    ]
+    tools = _tools()
+    monkeypatch.setattr(tools, "_authenticate_live_command", AsyncMock(return_value={
+        "status": "available", "command": "run_as"}))
+    monkeypatch.setattr(
+        tools, "_fetch_command_schema",
+        AsyncMock(side_effect=lambda *_a, **_k: copy.deepcopy(schema)))
+    monkeypatch.setattr(tools, "_validate_command_parameters", AsyncMock(return_value=None))
+    monkeypatch.setattr(tools, "_callback_tasking_liveness_blocker", AsyncMock(return_value=None))
+    monkeypatch.setattr(tools, "_engagement_issue_hook", AsyncMock(return_value=None))
+    monkeypatch.setattr(tools, "_ensure_registered_file_available", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        tools, "_bind_mythic_credential_parameters",
+        AsyncMock(side_effect=lambda _command, params, _cb, param_schema=None: params))
+
+    class _Resolved:
+        ok = True
+        group = "Default"
+
+        def __init__(self, params):
+            self.params = params
+
+    monkeypatch.setattr(
+        command_builder, "resolve_params",
+        lambda _schema, parameters, command=None: _Resolved(dict(parameters)))
+    return tools
+
+
+def test_registered_file_guard_error_names_the_registered_choices(monkeypatch):
+    """A not-among-choices guard error enumerates the exact registered identifiers."""
+    tools = _registered_file_guard_tools(monkeypatch, choices=("mimikatz",))
+
+    async def probe():
+        return await tools._prepare_supervised_issue_action({
+            "command": "run_as", "parameters": {"Binary": "mimikatz.exe"},
+            "callback_display_id": 2, "timeout": 60})
+
+    with pytest.raises(ValueError) as excinfo:
+        asyncio.run(probe())
+    message = str(excinfo.value)
+    assert "'mimikatz'" in message, (
+        f"the guard error must enumerate the registered identifiers: {message}"
+    )
+    assert "no approval card will appear" in message
+    assert "re-checking registrations" in message
+
+
+def test_registered_file_guard_error_without_choice_list_names_the_schema_remedy(monkeypatch):
+    """When the schema exposes no choices, the error sends the model to the schema, not a loop."""
+    tools = _registered_file_guard_tools(monkeypatch, choices=())
+
+    async def probe():
+        return await tools._prepare_supervised_issue_action({
+            "command": "run_as", "parameters": {"Binary": "mimikatz.exe"},
+            "callback_display_id": 2, "timeout": 60})
+
+    with pytest.raises(ValueError) as excinfo:
+        asyncio.run(probe())
+    message = str(excinfo.value)
+    assert "exposed no choice list" in message
+    assert "command's own schema choices" in message
+    assert "do not guess a filename" in message
+
+
+def test_registered_file_identity_error_names_the_upload_remedy(monkeypatch):
+    """A registered choice with no uploaded file names the operator-decision upload path."""
+    tools = _registered_file_guard_tools(monkeypatch, choices=("mimikatz.exe",))
+    monkeypatch.setattr(tools, "_find_uploaded_file_by_name", AsyncMock(return_value=None))
+
+    async def probe():
+        return await tools._prepare_supervised_issue_action({
+            "command": "run_as", "parameters": {"Binary": "mimikatz.exe"},
+            "callback_display_id": 2, "timeout": 60})
+
+    with pytest.raises(ValueError) as excinfo:
+        asyncio.run(probe())
+    message = str(excinfo.value)
+    assert "registered choice for this command" in message
+    assert "uploading it is an operator decision" in message.lower()
+    assert "report this blocker to the operator" in message
+
+
 @pytest.mark.parametrize("surface", ["callback", "payload_fallback"])
 @pytest.mark.parametrize("regex", ["", r"^.{1,80}$"])
 @pytest.mark.parametrize("change", [None, "verifier_regex", "required", "type", "parameter_group_name"])
