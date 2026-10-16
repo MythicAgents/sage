@@ -4350,6 +4350,27 @@ _TURN_END_BANNERS = {
 }
 
 
+def _closing_content_is_proposals_json(content: Any) -> bool:
+    """True when the closing report is exactly the machine-parseable proposals JSON.
+
+    The report-projection surface audits Supervisor final chunks as ``{"proposals": …}``
+    blocks; the D12 engagement-state table must not corrupt that contract, so it rides
+    only on prose closings.
+    """
+    if isinstance(content, (list, tuple)):
+        text = " ".join(str(item) for item in content)
+    else:
+        text = str(content or "")
+    stripped = text.strip()
+    if not stripped.startswith("{"):
+        return False
+    try:
+        value = json.loads(stripped)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(value, dict) and set(value) == {"proposals"}
+
+
 def _turn_end_banner(outcome: Any) -> str:
     """Banner line for a declared turn outcome; empty when undeclared or unknown.
 
@@ -4358,6 +4379,65 @@ def _turn_end_banner(outcome: Any) -> str:
     if not isinstance(outcome, str):
         return ""
     return _TURN_END_BANNERS.get(outcome, "")
+
+
+def _fmt_card_value(value: Any) -> str:
+    """Compact scalar-ish rendering of a typed plan parameter for card text."""
+    if isinstance(value, (dict, list)):
+        try:
+            return json.dumps(value, default=str)
+        except Exception:
+            return str(value)
+    return str(value)
+
+
+def _capability_name_from_request_args(args: dict[str, Any]) -> str:
+    """Best-effort capability name from an execute_capability request's arguments."""
+    action = args.get("action")
+    if isinstance(action, dict):
+        name = str(action.get("name") or action.get("capability") or "").strip()
+        if name:
+            return name
+    if isinstance(action, str) and action.strip():
+        try:
+            parsed = json.loads(action)
+            if isinstance(parsed, dict):
+                name = str(parsed.get("name") or parsed.get("capability") or "").strip()
+                if name:
+                    return name
+        except (TypeError, ValueError):
+            pass
+        return action.strip()[:60]
+    return "requested"
+
+
+def _capability_rejection_message(tool_name: str, args: dict[str, Any]) -> str:
+    """Rejection decision message for a guarded tool call (D10).
+
+    A bare reject of a capability card declines the whole bundled effect (2026-10-14 Q1,
+    settled 2026-10-17): the model may NOT re-attempt it through issue_task or any other
+    tool in this request. Without the policy statement the model reads a bare denial as
+    "use a different tool for the same effect" and the declined effect lands anyway.
+    Raw tasking keeps the generic message — a denied command is not an effect refusal.
+    """
+    message = f"[DENIED by operator] {tool_name} was not executed."
+    if tool_name != "execute_capability":
+        return message
+    capability_name = _capability_name_from_request_args(args)
+    return (
+        f"[DENIED by operator] The {capability_name} capability was not executed. The "
+        "operator declined this effect: do NOT re-attempt it in this request through "
+        "issue_task or any other tool. Propose a different approach or hand back to the "
+        "operator."
+    )
+
+
+def _md_cell_value(value: Any, limit: int = 0) -> str:
+    """Escape a value for a markdown table cell (pipes), with an optional length cap."""
+    text = str(value if value is not None else "").replace("|", "\\|").replace("\n", " ")
+    if limit and len(text) > limit:
+        return text[: limit - 1] + "…"
+    return text
 
 
 def _turn_outcome_from_capability_verdict(verdict: Any) -> str:
@@ -7850,6 +7930,16 @@ class Model:
         terminal_status = str(status or "").strip().casefold()
         if terminal_status not in {"stopped", "cancelled", "error"}:
             raise ValueError("request stop status is invalid")
+        # D12: the reconciled engagement ledger rides INSIDE the stop notice — the
+        # terminal must stay one response, and a stopped request is exactly the
+        # operator decision moment. Non-fatal by contract.
+        try:
+            state_summary = await self._engagement_state_turn_summary_text()
+        except Exception as e:
+            logger.debug(f"engagement state summary after stop failed (non-fatal): {e}")
+            state_summary = ""
+        if state_summary:
+            stop_message = f"{stop_message}\n\n{state_summary}"
         await self._close_all_request_lifecycles(status=terminal_status)
         ledger = getattr(self, "_request_event_ledger", None)
         if not isinstance(ledger, RequestEventLedger):
@@ -8014,6 +8104,22 @@ class Model:
                         # checkpoint. Undeclared endings stream without a banner.
                         banner = _turn_end_banner(msg.additional_kwargs.get("_turn_outcome"))
                         content = f"{banner}\n{msg.content}" if banner else msg.content
+                        # D12: the reconciled engagement ledger rides INSIDE the closing
+                        # content — the terminal must stay one response (a post-final
+                        # stream would merge into it), and the operator decides what next
+                        # with the current hop table in view. Proposals-JSON reports keep
+                        # their machine-parseable format and carry no summary. Non-fatal.
+                        try:
+                            state_summary = (
+                                ""
+                                if _closing_content_is_proposals_json(msg.content)
+                                else await self._engagement_state_turn_summary_text()
+                            )
+                        except Exception as e:
+                            logger.debug(f"engagement state turn summary failed (non-fatal): {e}")
+                            state_summary = ""
+                        if state_summary:
+                            content = f"{content}\n\n{state_summary}"
                         report_msg = msg.model_copy(update={"content": content})
                         formatted = self._format_message_for_streaming(report_msg, agent_name="Supervisor")
                         if formatted:
@@ -9158,6 +9264,22 @@ class Model:
                             "seen. Inspect that exact task (get_all_task_output_by_task_id) in a "
                             "fresh request before deciding what to do next."
                         )
+                        # D15: the per-binary knowledge note rides on the forced-end
+                        # triage — the model replans with the remedy, not just the
+                        # observation. Advisory only; no note renders nothing.
+                        try:
+                            _client = getattr(self, "mythic_client", None)
+                            if _client is not None and hasattr(_client, "_tool_note_advisory"):
+                                _tool_note = str(_client._tool_note_advisory(
+                                    command,
+                                    (pending_receipt or {}).get("parameters_text") or "",
+                                ) or "")
+                            else:
+                                _tool_note = ""
+                        except Exception:
+                            _tool_note = ""
+                        if _tool_note:
+                            summary_text = f"{summary_text}\n\n{_tool_note}"
                     final_msg = AIMessage(
                         content=summary_text,
                         name="Supervisor",
@@ -13831,7 +13953,10 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                             f"`{tool_name}` was not executed this round but may be proposed again."
                         )
                     else:
-                        message = f"[DENIED by operator] {tool_name} was not executed."
+                        message = _capability_rejection_message(
+                            tool_name,
+                            ar.get("args") if isinstance(ar.get("args"), dict) else {},
+                        )
                     decisions.append({"type": "reject", "message": message})
         logger.info(f"HITL resume on thread {thread_id}: {decision_word} for {len(decisions)} tool call(s)")
 
@@ -13968,6 +14093,222 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             pass
         return True
 
+    def _hitl_decision_context(self, action_requests: list[Any]) -> str:
+        """Extra PLAIN-TEXT decision content for the approval card (D10).
+
+        Capability actions get the planned inner-task sequence, the intended effects,
+        and the operational cost; raw tasking gets the expected verification when the
+        command maps to a modeled technique. Built from the same pure plan builders the
+        execution path uses, so the card cannot promise a different sequence than the
+        executor runs. Failures degrade to empty text — never block the card.
+        """
+        blocks: list[str] = []
+        for action in action_requests:
+            if not isinstance(action, dict):
+                continue
+            args = action.get("args") if isinstance(action.get("args"), dict) else {}
+            if str(action.get("name") or "") == "execute_capability":
+                try:
+                    blocks.append(self._capability_card_plan_text(args))
+                except Exception as e:
+                    logger.debug(f"capability card plan render failed (non-fatal): {e}")
+            elif str(action.get("name") or "") == "issue_task_and_waitfor_task_output":
+                try:
+                    blocks.append(self._issue_task_card_verification_text(args))
+                except Exception as e:
+                    logger.debug(f"issue-task card verification render failed (non-fatal): {e}")
+                try:
+                    blocks.append(self._issue_task_card_tool_note(args))
+                except Exception as e:
+                    logger.debug(f"issue-task card tool note render failed (non-fatal): {e}")
+        return "\n\n".join(block for block in blocks if block)
+
+    def _capability_card_plan_text(self, args: dict[str, Any]) -> str:
+        """Render the planned inner-task sequence for an execute_capability card."""
+        try:
+            from . import capabilities as capabilities_mod
+        except ImportError:
+            import capabilities as capabilities_mod  # type: ignore
+        client = getattr(self, "mythic_client", None)
+        if client is None:
+            return ""
+        action = args.get("action") if isinstance(args.get("action"), (dict, str)) else None
+        inputs = args.get("inputs") if isinstance(args.get("inputs"), dict) else {}
+        input_values = client._capability_tool_inputs(inputs)
+        action_obj = client._capability_tool_action(action, input_values, capabilities_mod)
+        if action_obj is None:
+            return ""
+        plan = capabilities_mod.build_capability_execution_plan(action_obj, input_values)
+        cost = getattr(action_obj, "operational_cost", None) or {}
+        lines: list[str] = []
+        if not getattr(plan, "ok", False):
+            missing = ", ".join(str(item) for item in getattr(plan, "missing", []) or [])
+            reason = str(getattr(plan, "reason", "") or "").strip()
+            detail = missing or reason or "unknown cause"
+            lines.append(f"⚠️ Capability plan could not be built: {detail}")
+        else:
+            steps = list(getattr(plan, "steps", []) or [])
+            lines.append(f"Planned inner tasks ({len(steps)}):")
+            for index, step in enumerate(steps, 1):
+                parameters = getattr(step, "parameters", None) or {}
+                keys = (
+                    "domain", "gpo", "principal", "command", "command_path",
+                    "arguments", "command_arguments", "proof_path", "account",
+                )
+                shown = [
+                    f"{key}={_fmt_card_value(parameters[key])}"
+                    for key in keys
+                    if parameters.get(key) not in (None, "")
+                ]
+                detail = f" ({', '.join(shown)})" if shown else ""
+                lines.append(
+                    f"  {index}. {getattr(step, 'operation', '?')} — "
+                    f"{getattr(step, 'purpose', '')}{detail}"
+                )
+            effects = [str(item) for item in (getattr(action_obj, "effects", None) or []) if str(item)]
+            if effects:
+                lines.append(f"Intended effects: {', '.join(effects)}")
+        wait = cost.get("expected_wait_seconds")
+        if cost.get("requires_propagation_wait") and wait:
+            lines.append(f"Operational cost: propagation-bound, ~{wait}s wait before proof.")
+        return "\n".join(lines)
+
+    def _issue_task_card_verification_text(self, args: dict[str, Any]) -> str:
+        """Expected-verification line for a raw issue_task card when the command maps
+        to a modeled technique (D10: the card should state what evidence proves the
+        effect). Unknown commands render nothing — no prose is invented."""
+        try:
+            from . import intent_classifier
+        except ImportError:
+            import intent_classifier  # type: ignore
+        command = str(args.get("command") or "")
+        if not command:
+            return ""
+        parameters = args.get("parameters")
+        classified = intent_classifier.classify_tool_call(command, parameters)
+        if not classified:
+            return ""
+        technique, _target_key = classified
+        try:
+            from . import engagement_state
+        except ImportError:
+            import engagement_state  # type: ignore
+        model = getattr(engagement_state, "TECHNIQUE_MODEL", {}).get(technique)
+        if not isinstance(model, dict):
+            return ""
+        effect = str(model.get("effect") or model.get("name") or technique)
+        verify = model.get("verify") or {}
+        signals: list[str] = []
+        for item in (verify.get("achieved_all") or []) + (verify.get("achieved_any") or []):
+            text = str(item).strip()
+            if text and text not in signals:
+                signals.append(text)
+        detail = f" (expected evidence: {', '.join(signals)})" if signals else ""
+        return f"Intended effect: {effect}{detail}"
+
+    def _issue_task_card_tool_note(self, args: dict[str, Any]) -> str:
+        """Per-binary knowledge note for the binary a raw task invokes (D15).
+
+        Notes live in `tool_notes/<basename>.md` (operator-maintained, public). Advisory
+        only: no note, no read failure, or no client renders nothing and never blocks
+        the card.
+        """
+        client = getattr(self, "mythic_client", None)
+        if client is None or not hasattr(client, "_tool_note_advisory"):
+            return ""
+        try:
+            return str(client._tool_note_advisory(
+                args.get("command"), args.get("parameters"),
+            ) or "")
+        except Exception as e:
+            logger.debug(f"tool note advisory render failed (non-fatal): {e}")
+            return ""
+
+    async def _engagement_state_turn_summary_text(self) -> str:
+        """D12: build the compact reconciled engagement ledger for a turn end.
+
+        Status-only reconciliation runs first (bounded: only when a new Mythic task was
+        issued since the last reconcile), so a hop whose verified task history proves the
+        effect is corrected without operator action. Credential material stays behind the
+        operator's `/state reconcile apply`. Returns "" when there is no client/ledger,
+        the one-line "unchanged" notice when the state matches the last shown table, and
+        the table text otherwise. The caller appends it to the turn's closing content, so
+        the terminal stays one response.
+        """
+        client = getattr(self, "mythic_client", None)
+        if client is None or not hasattr(client, "_eng_key"):
+            return ""
+        try:
+            from . import engagement_ledger
+        except ImportError:
+            import engagement_ledger  # type: ignore
+        key = client._eng_key()
+        if not key:
+            return ""
+        data = engagement_ledger.load_runtime(key)
+        marker = str(getattr(client, "_last_issued_task_display_id", "") or "")
+        last_reconciled = str(getattr(self, "_last_state_reconcile_marker", "") or "")
+        if marker and marker != last_reconciled:
+            self._last_state_reconcile_marker = marker
+            try:
+                from . import state_reconcile
+                raw_client = getattr(client, "client", None)
+                if raw_client is not None:
+                    from datetime import datetime, timezone
+                    now = datetime.now(timezone.utc).isoformat()
+                    data, _notes = await state_reconcile.reconcile_task_history(
+                        raw_client, data, "", "", 10, now, apply=False,
+                    )
+                    engagement_ledger.save_runtime(data, key)
+            except Exception as e:
+                # A turn-end summary must never break the turn: offline/unreachable
+                # Mythic skips the reconciliation and renders the ledger as-is.
+                logger.debug(f"turn-end reconciliation skipped (non-fatal): {e}")
+        hops = data.get("hops") or []
+        objective = str(data.get("objective") or "").strip()
+        signature = (
+            objective,
+            tuple(sorted(
+                (str(h.get("technique") or ""), str(h.get("target") or ""), str(h.get("status") or ""))
+                for h in hops
+                if isinstance(h, dict)
+            )),
+        )
+        if signature == getattr(self, "_last_turn_state_signature", None):
+            return "📊 Engagement state unchanged since the last turn."
+        self._last_turn_state_signature = signature
+        lines = ["📊 **Engagement state**"]
+        if objective:
+            lines.append(f"Objective: {objective}")
+        if not hops:
+            lines.append("_(empty — no hops recorded yet)_")
+        else:
+            lines.append("")
+            lines.append("| Hop | Effect | Status | Task | Evidence |")
+            lines.append("|---|---|---|---|---|")
+            shown = 0
+            for hop in reversed(hops):
+                if shown >= 8:
+                    break
+                if not isinstance(hop, dict):
+                    continue
+                evidence = hop.get("evidence") if isinstance(hop.get("evidence"), dict) else {}
+                task_id = evidence.get("mythic_task_id")
+                preview = str(evidence.get("result_preview") or evidence.get("source") or "")
+                label = str(hop.get("technique") or "")
+                target = str(hop.get("target") or "")
+                hop_label = f"{label} → {target}" if target else label
+                lines.append(
+                    f"| {_md_cell_value(hop_label, 48)} | {_md_cell_value(hop.get('effect'))} | "
+                    f"`{_md_cell_value(hop.get('status') or '-', 16)}` | "
+                    f"{task_id if task_id is not None else '-'} | {_md_cell_value(preview, 60)} |"
+                )
+                shown += 1
+            remaining = len(hops) - shown
+            if remaining > 0:
+                lines.append(f"_…{remaining} earlier hop(s) not shown — `/state` for the full ledger._")
+        return "\n".join(lines)
+
     async def _surface_hitl_interrupt(self, event: dict) -> bool:
         """If an astream event carries a HumanInTheLoopMiddleware approval interrupt, stream a clear
         approve/deny prompt to the operator and return True. The graph stays paused (checkpointed) so
@@ -14016,8 +14357,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                 if fingerprint.strip("|:") == "":
                     fingerprint = ""
             except Exception:  # pragma: no cover - never break the approval path on bookkeeping
-                fingerprint = ""
-            # A real Mythic task id moving is the progress signal — it means the effect boundary was
+                fingerprint = ""            # A real Mythic task id moving is the progress signal — it means the effect boundary was
             # actually crossed. Without it, an operator legitimately running the same command three
             # times in a row would trip the guard (ISC-61: never truncate a healthy run).
             task_marker = str(
@@ -14054,6 +14394,31 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                 # is refused. Starting at 0 here would ask three times and refuse the fourth.
                 self._last_card_fingerprint = fingerprint
                 self._repeat_card_count = 1
+            # D10: a capability proposal whose plan cannot be built must not consume an
+            # approval round-trip — the card would offer an action that cannot run. Deny
+            # pre-approval with the missing fields named (same paused-graph resume path
+            # as the ISC-69 refusal: the operator's next message replans).
+            if len(action_requests) == 1:
+                single = action_requests[0]
+                if (
+                    isinstance(single, dict)
+                    and str(single.get("name") or "") == "execute_capability"
+                ):
+                    try:
+                        plan_text = self._capability_card_plan_text(
+                            single.get("args") if isinstance(single.get("args"), dict) else {}
+                        )
+                    except Exception:
+                        plan_text = ""
+                    if "could not be built" in plan_text:
+                        detail = plan_text.split("could not be built", 1)[1].lstrip(": ").strip()
+                        await self._stream_message_to_mythic(
+                            "⛔ **Blocked — the capability request could not be planned.**\n\n"
+                            f"> {detail[:400]}\n\n"
+                            "Nothing was issued. Re-propose with the missing fields, or tell me "
+                            "how you'd like to proceed."
+                        )
+                        return True
             try:
                 self.bind_supervised_request_proposal(action_requests)
                 await self._hitl_card_emitter(action_requests)

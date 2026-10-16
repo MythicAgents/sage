@@ -303,7 +303,7 @@ def test_the_receipt_record_cannot_serve_as_a_resumption_handle():
     receipt = tools._deferred_task_receipt
     assert set(receipt) == {
         "command", "callback_display_id", "task_display_id", "waited_seconds",
-        "request_id", "observation_status",
+        "request_id", "observation_status", "parameters_text",
     }
     assert receipt["observation_status"] == "deferred"
     for value in receipt.values():

@@ -1178,6 +1178,7 @@ class SageChat(Chat):
                 approval_context_store=lambda context: setattr(
                     model, "_pending_approval_context", dict(context)
                 ),
+                decision_context_lookup=getattr(model, "_hitl_decision_context", None),
             )
             model._hitl_card_pending = False
             set_active_agent = getattr(model, "set_active_agent", None)

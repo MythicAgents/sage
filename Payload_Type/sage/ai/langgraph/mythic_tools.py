@@ -69,6 +69,8 @@ SAGE_MYTHIC_SLEEP_TIMEOUT_MULTIPLIER = _env_positive_int("SAGE_MYTHIC_SLEEP_TIME
 SAGE_TASK_HEARTBEAT_INTERVAL = _env_positive_int("SAGE_TASK_HEARTBEAT_INTERVAL", 30)
 
 _EXECUTABLE_CONTRACT_ROOT = Path(__file__).resolve().parents[2] / "tool_contracts"
+_TOOL_NOTES_DIR = Path(__file__).resolve().parents[2] / "tool_notes"
+_TOOL_NOTE_MAX_CHARS = 1200
 _MAX_ENROLLED_EXECUTABLE_BYTES = 4 * 1024 * 1024
 
 
@@ -4317,6 +4319,95 @@ class MythicTools:
         }
         return prepared
 
+    def _tool_note_advisory(self, command: Any, parameters: Any) -> str:
+        """Per-binary knowledge note for the binary this task invokes (D15).
+
+        Notes live in `Payload_Type/sage/tool_notes/<basename>.md` — operator-maintained,
+        public-committable knowledge about known-bad argument sequences, quirks, and
+        remedies. Advisory only: an empty result or a read failure never blocks tasking.
+        """
+        try:
+            candidates = self._invoked_binary_basenames(command, parameters)
+        except Exception:
+            return ""
+        for candidate in candidates:
+            variants = {candidate}
+            if candidate.endswith(".exe"):
+                variants.add(candidate[:-4])
+            for name in sorted(variants):
+                if not name:
+                    continue
+                path = _TOOL_NOTES_DIR / f"{name.casefold()}.md"
+                if not path.is_file():
+                    continue
+                try:
+                    text = path.read_text(encoding="utf-8").strip()
+                except Exception:
+                    continue
+                if not text:
+                    continue
+                if len(text) > _TOOL_NOTE_MAX_CHARS:
+                    cut = text[:_TOOL_NOTE_MAX_CHARS].rsplit("\n", 1)[0]
+                    text = f"{cut}\n…(note truncated; read tool_notes/{name.casefold()}.md for the full text)"
+                return f"⚠️ Tool note ({name}):\n{text}"
+        return ""
+
+    def _path_basename(self, value: Any) -> str:
+        """Basename across Windows and POSIX separators (notes are host-neutral)."""
+        parts = re.split(r"[/\\]", str(value or "").strip())
+        return parts[-1] if parts else ""
+
+    def _invoked_binary_basenames(self, command: Any, parameters: Any) -> list[str]:
+        """Candidate binary basenames the constructed task may invoke (D15 lookup keys).
+
+        Deliberately coarse: executable-shaped parameters, the first token of the freeform
+        payload text (the `shell certutil …` shape, JSON-decoded when the parameters arrive
+        as a JSON string), and the Mythic command name itself. Candidates that match no
+        note are inert.
+        """
+        candidates: list[str] = []
+        params = parameters if isinstance(parameters, dict) else {}
+        for key in ("executable", "assembly_name", "assembly", "tool", "binary"):
+            value = params.get(key)
+            if isinstance(value, str) and value.strip():
+                candidates.append(self._path_basename(value))
+        texts: list[str] = []
+        if isinstance(parameters, str):
+            text = parameters.strip()
+            if text.startswith("{") and text.endswith("}"):
+                try:
+                    parsed = json.loads(text)
+                except Exception:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    texts.extend(
+                        str(value) for value in parsed.values()
+                        if isinstance(value, str) and value.strip()
+                    )
+                else:
+                    texts.append(text)
+            else:
+                texts.append(text)
+        else:
+            for value in params.values():
+                if isinstance(value, str) and value.strip():
+                    texts.append(value)
+        for text in texts[:4]:
+            first = text.strip().split(maxsplit=1)[0] if text.strip() else ""
+            if first:
+                candidates.append(self._path_basename(first))
+        command_name = str(command or "").strip()
+        if command_name:
+            candidates.append(self._path_basename(command_name))
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            folded = candidate.strip().casefold()
+            if folded and folded not in seen:
+                seen.add(folded)
+                deduped.append(folded)
+        return deduped
+
     @tool_safety(TOOL_SAFETY_GUARDED)
     async def delete_payload(
         self,
@@ -5952,6 +6043,7 @@ class MythicTools:
         callback_display_id: int,
         task_display_id: Any,
         waited_seconds: int,
+        parameters_text: str = "",
     ) -> str:
         """Record the deferral for this turn and return the operator-facing receipt (ISC-2).
 
@@ -5966,6 +6058,7 @@ class MythicTools:
             "waited_seconds": int(waited_seconds),
             "request_id": self._current_request_id(),
             "observation_status": "deferred",
+            "parameters_text": str(parameters_text or "")[:2000],
         }
         if task_display_id is None:
             # The grace expired before the issue itself completed, so there is no id this call can
@@ -6812,6 +6905,7 @@ class MythicTools:
                                 "task_display_id": tdid,
                                 "request_id": execution_request_id,
                                 "observation_status": "wait_failed",
+                                "parameters_text": self._serialize_params_for_signature(parameters)[:2000],
                             }
                         self._record_contract_task_terminal(
                             command,
@@ -6876,6 +6970,7 @@ class MythicTools:
                             "observation_status": (
                                 "pending" if task_state.get("task_completed") is False else "unknown"
                             ),
+                            "parameters_text": self._serialize_params_for_signature(parameters)[:2000],
                             "task_status": (
                                 str(task_state.get("task_status"))[:80]
                                 if task_state.get("task_completed") is False
@@ -6946,6 +7041,7 @@ class MythicTools:
                     callback_display_id,
                     issued_task_id,
                     timeout,
+                    parameters_text=self._serialize_params_for_signature(parameters),
                 )
             if results is None:
                 result_class = command_builder.classify_result(command, "No output returned from task.")
