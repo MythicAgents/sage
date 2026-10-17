@@ -2115,6 +2115,8 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
         if control_reason:
             return self._blocked_tool_message(request, control_reason)
         selected_control = self._selected_control_call(request)
+        # Nominal digest: settle calls below stay valid no-ops for non-guarded tools.
+        action_digest = ""
         # Reserve a bounded attempt before the first await. LangGraph may execute sibling tool
         # calls concurrently; consuming afterward lets both pass the same attempts_used=0 check.
         if _tool_name_from_request(request) in GUARDED_TOOLS:
@@ -2126,13 +2128,21 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
                     request,
                     "request contract denied malformed guarded action identity",
                 )
+            reissued = action_digest in getattr(
+                self._model, "_request_settled_action_digests", set()
+            )
             if not self._model._reserve_supervised_request_action(action_digest):
                 return self._blocked_tool_message(
                     request,
-                    "request contract already admitted this guarded action",
+                    "request contract already admitted this guarded action: this exact action "
+                    "has one execution in progress in this request — attend to its reported "
+                    "result instead of re-issuing an identical proposal; a repeat effect "
+                    "re-opens a fresh approval card after that execution settles",
                 )
             if getattr(self._model, "_request_contract", None) is None:
                 self._model._consume_turn_authority_attempt()
+            if reissued:
+                self._model._record_guarded_action_reissue(action_digest)
         self._record_selected_control_summary(selected_control)
 
         async def close_selected_delegation() -> None:
@@ -2148,13 +2158,20 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
         try:
             result = await handler(request)
         except ParentCommand:
+            self._model._settle_supervised_request_action(action_digest)
             await close_selected_delegation()
+            raise
+        except BaseException:
+            # Guarded execution did not complete cleanly; settle so a retry can re-card
+            # instead of dead-ending on the in-flight reservation.
+            self._model._settle_supervised_request_action(action_digest)
             raise
         if (
             isinstance(result, Command)
             and result.graph == Command.PARENT
         ):
             await close_selected_delegation()
+        self._model._settle_supervised_request_action(action_digest)
         return result
 
     def wrap_tool_call(self, request, handler):
@@ -2170,6 +2187,8 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
         if control_reason:
             return self._blocked_tool_message(request, control_reason)
         selected_control = self._selected_control_call(request)
+        # Nominal digest: settle calls below stay valid no-ops for non-guarded tools.
+        action_digest = ""
         if _tool_name_from_request(request) in GUARDED_TOOLS:
             tool_call = getattr(request, "tool_call", None)
             try:
@@ -2179,15 +2198,31 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
                     request,
                     "request contract denied malformed guarded action identity",
                 )
+            reissued = action_digest in getattr(
+                self._model, "_request_settled_action_digests", set()
+            )
             if not self._model._reserve_supervised_request_action(action_digest):
                 return self._blocked_tool_message(
                     request,
-                    "request contract already admitted this guarded action",
+                    "request contract already admitted this guarded action: this exact action "
+                    "has one execution in progress in this request — attend to its reported "
+                    "result instead of re-issuing an identical proposal; a repeat effect "
+                    "re-opens a fresh approval card after that execution settles",
                 )
             if getattr(self._model, "_request_contract", None) is None:
                 self._model._consume_turn_authority_attempt()
+            if reissued:
+                self._model._record_guarded_action_reissue(action_digest)
         self._record_selected_control_summary(selected_control)
-        return handler(request)
+        try:
+            result = handler(request)
+        except BaseException:
+            # Guarded execution did not complete cleanly; settle so a retry can re-card
+            # instead of dead-ending on the in-flight reservation.
+            self._model._settle_supervised_request_action(action_digest)
+            raise
+        self._model._settle_supervised_request_action(action_digest)
+        return result
 
 
 def _provider_continuation_text(agent_name: str | None) -> str:
@@ -4920,6 +4955,7 @@ class Model:
         self._unsupported_verb_retry_request_id = ""
         self._request_execution_digest = ""
         self._request_admitted_action_digests: set[str] = set()
+        self._request_settled_action_digests: set[str] = set()
         self._subgoal_authority_lock = threading.Lock()
         self._subgoal_authority = None
         self._subgoal_evidence_records: set[str] = set()
@@ -5599,6 +5635,7 @@ class Model:
         if getattr(self, "_request_execution_digest", "") != contract.digest:
             self._request_execution_digest = contract.digest
             self._request_admitted_action_digests = set()
+            self._request_settled_action_digests = set()
             self._active_approval_claim = None
             self._supervised_execution_snapshots = []
         self._request_contract = contract
@@ -6192,7 +6229,16 @@ class Model:
         return ""
 
     def _reserve_supervised_request_action(self, action_digest: str) -> bool:
-        """Admit one exact guarded action once for a supervised native request."""
+        """Admit one exact guarded action once per settled execution for a supervised request.
+
+        The reserved digest blocks ONLY an unsettled duplicate: a second reservation of the
+        identical action while its execution is still in flight in this request. Once that
+        execution settles (`_settle_supervised_request_action`), a continuation turn may
+        re-issue the same action — the re-issue re-enters the normal guarded flow and gets
+        its own approval card instead of dead-ending here with no legal action path.
+        (Live 2026-10-16, channel 4 Rubeus PKINIT continuation: a contract-admitted action
+        re-issued after a handback was refused with no card and no remedy.)
+        """
         from .request_contract import RequestContract, RequestLane
 
         contract = getattr(self, "_request_contract", None)
@@ -6201,12 +6247,117 @@ class Model:
         if contract.lane != RequestLane.SUPERVISED_WORKFLOW:
             return True
         normalized = str(action_digest or "").strip()
-        admitted = getattr(self, "_request_admitted_action_digests", set())
-        if not normalized or normalized in admitted:
+        if not normalized:
             return False
+        admitted = getattr(self, "_request_admitted_action_digests", set())
+        if normalized in admitted:
+            return False
+        # A settled prior execution re-opens admission for this exact action. The re-issue
+        # must still pass its own native approval card before the inner chain ran, so this
+        # is a fresh operator decision, not a silent replay of the earlier one.
+        settled = getattr(self, "_request_settled_action_digests", set())
+        if normalized in settled:
+            settled.discard(normalized)
+            self._request_settled_action_digests = settled
         admitted.add(normalized)
         self._request_admitted_action_digests = admitted
         return True
+
+    def _settle_supervised_request_action(self, action_digest: str) -> None:
+        """Mark a reserved guarded action's execution attempt finished (any outcome).
+
+        Called from the tool wrappers right after the guarded execution completes — success,
+        error, parent-jump, or cancellation. The digest moves to the settled registry so a
+        later continuation turn can re-open the exact action through a fresh approval card;
+        while it remains unsettled, a duplicate reservation of the same action stays blocked.
+        """
+        from .request_contract import RequestContract, RequestLane
+
+        contract = getattr(self, "_request_contract", None)
+        if not isinstance(contract, RequestContract):
+            return
+        if contract.lane != RequestLane.SUPERVISED_WORKFLOW:
+            return
+        normalized = str(action_digest or "").strip()
+        admitted = getattr(self, "_request_admitted_action_digests", set())
+        if not normalized or normalized not in admitted:
+            return
+        admitted.discard(normalized)
+        self._request_admitted_action_digests = admitted
+        settled = getattr(self, "_request_settled_action_digests", set())
+        settled.add(normalized)
+        self._request_settled_action_digests = settled
+        try:
+            ledger = self._ensure_request_event_ledger(contract.request_id)
+            sole = sum(
+                1
+                for event in ledger.actual_events(
+                    kind="guarded_action",
+                    phase="settled",
+                )
+            )
+            ledger.record(
+                event_id=stable_event_id(
+                    contract.request_id,
+                    "guarded_action",
+                    f"settled:{sole + 1}",
+                ),
+                kind="guarded_action",
+                phase="settled",
+                content=(
+                    "guarded action execution settled; a continuation turn may re-issue it "
+                    "through a fresh approval card"
+                ),
+                metadata={
+                    "action_digest": normalized,
+                    "settled_count": sole + 1,
+                },
+            )
+        except Exception:  # ledger bookkeeping must never break the execution seam
+            logger.debug("guarded-action settle event recording failed", exc_info=True)
+
+    def _record_guarded_action_reissue(self, action_digest: str) -> None:
+        """Record that a settled guarded action was re-admitted through a fresh card.
+
+        Continuation turns legitimately re-run an exact action (e.g. after a handback).
+        The re-execution already passed its own approval card, so nothing here widens
+        authority — this is only the audit trail that makes "why did this exact action
+        run twice in one request?" answerable from the request event ledger.
+        """
+        from .request_contract import RequestContract
+
+        contract = getattr(self, "_request_contract", None)
+        digest = str(action_digest or "").strip()
+        if not isinstance(contract, RequestContract) or not digest:
+            return
+        try:
+            ledger = self._ensure_request_event_ledger(contract.request_id)
+            count = sum(
+                1
+                for event in ledger.actual_events(
+                    kind="guarded_action",
+                    phase="reissued",
+                )
+            )
+            ledger.record(
+                event_id=stable_event_id(
+                    contract.request_id,
+                    "guarded_action",
+                    f"reissued:{count + 1}",
+                ),
+                kind="guarded_action",
+                phase="reissued",
+                content=(
+                    "settled guarded action re-admitted for a continuation turn; the "
+                    "re-execution held its own approval card"
+                ),
+                metadata={
+                    "action_digest": digest,
+                    "reissue_count": count + 1,
+                },
+            )
+        except Exception:
+            logger.debug("guarded-action reissue event recording failed", exc_info=True)
 
     def _canonical_subgoal_projection(self) -> dict[str, Any]:
         """Return only the active request's canonical subgoal projection."""
