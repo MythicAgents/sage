@@ -96,13 +96,21 @@ def test_respond_to_user_undeclared_outcome_stamps_nothing():
 
 
 def test_respond_to_user_rejects_an_unrecognized_outcome():
+    """The outcome is still refused: no report ships; the refusal lands as a
+    remedy-bearing corrective tool message instead of raising out of the tool."""
     tool = model_mod._create_respond_to_user_tool()
-    with pytest.raises(ValueError):
-        tool.func(
-            _respond_runtime(),
-            final_response="Task 12 wrote the GPO.",
-            outcome="whenever",
-        )
+    runtime = _respond_runtime()
+    result = tool.func(
+        runtime,
+        final_response="Task 12 wrote the GPO.",
+        outcome="whenever",
+    )
+    assert isinstance(result, ToolMessage)
+    assert result.status == "error"
+    assert "[Argument review]" in result.content
+    assert "outcome must be one of" in result.content
+    assert runtime.state["supervisor_messages"] == []
+    assert runtime.state["messages"] == []
 
 
 class _CapabilityAgent:

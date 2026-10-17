@@ -15932,6 +15932,11 @@ def _create_respond_to_user_tool():
     findings or reuse one complete specialist answer verbatim.
     """
     def finish(runtime: ToolRuntime, final_response: str, outcome: str = "") -> Command:
+        # Internal invariant, not a model-facing crash: respond_to_user delivers its
+        # argument guards as corrective ToolMessages (the live defect was this guard
+        # raising straight out of the tool and erroring the whole graph). finish is
+        # only reached after those validations, so the raise stays as the shape of
+        # the invariant: a blank final report never ends a request.
         if not final_response.strip():
             raise ValueError("final_response must be complete")
         outcome_kwargs: dict[str, Any] = {"_is_final_report": True}
@@ -15971,9 +15976,28 @@ def _create_respond_to_user_tool():
         outcome: Annotated[str, "Why this turn ends: 'completed' (the request's work is done with task evidence), 'blocked' (work cannot continue — the blocker and its remedy lead the response), or 'checkpoint' (pausing mid-objective, awaiting operator continuation). Omit only when the ending cause is genuinely unknown."] = "",
     ) -> Command | ToolMessage:
         """Finish with a complete synthesized report or one sufficient specialist answer verbatim. Do not delegate again after calling this."""
+        def argument_review(detail: str) -> ToolMessage:
+            return ToolMessage(
+                content="[Argument review] respond_to_user needs revision: " + detail,
+                name="respond_to_user",
+                tool_call_id=runtime.tool_call_id,
+                status="error",
+            )
+
+        if not reuse_latest_worker_answer and not final_response.strip():
+            return argument_review(
+                "final_response is required to deliver the request's final report: "
+                "synthesize it from the current specialist summary and supporting "
+                "evidence, or pass reuse_latest_worker_answer=true with "
+                "final_response omitted to reuse the current specialist's complete "
+                "answer verbatim."
+            )
         if reuse_latest_worker_answer:
             if final_response.strip():
-                raise ValueError("worker answer reuse cannot be combined with final_response")
+                return argument_review(
+                    "a synthesized final_response and reuse_latest_worker_answer "
+                    "cannot be combined: pass exactly one of them."
+                )
             try:
                 final_response = _reusable_worker_answer(runtime.state)
             except ValueError:
@@ -15988,6 +16012,15 @@ def _create_respond_to_user_tool():
                     tool_call_id=runtime.tool_call_id,
                     status="error",
                 )
+        declared = str(outcome or "").strip()
+        if declared and declared not in {
+            _TURN_OUTCOME_COMPLETED,
+            _TURN_OUTCOME_BLOCKED,
+            _TURN_OUTCOME_CHECKPOINT,
+        }:
+            return argument_review(
+                "outcome must be one of completed, blocked, checkpoint — or omitted."
+            )
         return finish(runtime, final_response, outcome)
 
     return respond_to_user

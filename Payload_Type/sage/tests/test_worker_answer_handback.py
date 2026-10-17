@@ -119,12 +119,24 @@ def test_final_tool_offers_reuse_and_explicit_report():
     assert finished.update["messages"][0].additional_kwargs["_is_final_report"] is True
 
 
-@pytest.mark.parametrize("response,reuse", [
-    ("Competing summary", True), ("", False), ("   ", False),
-])
-def test_final_response_requires_one_explicit_mode(response, reuse):
-    with pytest.raises(ValueError):
-        _finish(_valid_state(), final_response=response, reuse=reuse)
+_MISUSE_CASES = [
+    ("Competing summary", True, "cannot be combined"),
+    ("", False, "final_response is required"),
+    ("   ", False, "final_response is required"),
+]
+
+
+@pytest.mark.parametrize("response,reuse,remedy", _MISUSE_CASES)
+def test_final_response_requires_one_explicit_mode(response, reuse, remedy):
+    """One explicit mode is still required: the misuse lands as a remedy-bearing
+    corrective tool message (no raise escapes the tool, no report is shipped)."""
+    result = _finish(_valid_state(), final_response=response, reuse=reuse)
+    assert isinstance(result, ToolMessage)
+    assert result.name == "respond_to_user"
+    assert result.tool_call_id == "respond-test"
+    assert result.status == "error"
+    assert "[Argument review]" in result.content
+    assert remedy in result.content
 
 
 def test_worker_selection_keeps_terminal_answer_after_interim_tool_prose():

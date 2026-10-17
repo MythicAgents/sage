@@ -1851,6 +1851,14 @@ class MythicTools:
         # parameter permutations — the cause of the 2.47M-token context explosion on
         # 2026-06-01 (rev2self issued 7x, whoami 4x, all failing).
         self._task_failure_counts: dict[tuple, int] = {}
+        # Rotation-proof shape cap (issue #46): the param-keyed breaker above misses a command
+        # that keeps failing with a DIFFERENT parameter variant each time — the channel-4
+        # make_token+ldap_query rotation (every variant is a fresh key, so no count ever
+        # reached 2, and the D3 repeat-failure flag never saw a repeat). This shape counter
+        # counts failed attempts on the coarse (command, callback) key; reaching the limit
+        # refuses further variants and success on that pair clears it.
+        self._task_failure_shape_counts: dict[tuple, int] = {}
+        self._task_failure_shape_limit: int = 2
         self._artifact_ledger: list[dict] = []
         # Recent get_ttp_guidance goals — anti-cycle guard so the agent can't loop re-querying guidance
         # instead of executing (the 2026-06-07 BRAAVOS-LAPS run did this ~7×).
@@ -2061,6 +2069,21 @@ class MythicTools:
             self._deferred_task_receipt = None
         self._turn_authority = authority
 
+    def _request_shape_counts(self) -> dict:
+        """The same-request rotation-cap counts, defensively materialized: harnesses may
+        construct MythicTools without running __init__ (mirror of model.py's getattr rule)."""
+        counts = getattr(self, "_task_failure_shape_counts", None)
+        if not isinstance(counts, dict):
+            counts = self._task_failure_shape_counts = {}
+        return counts
+
+    def reset_request_loop_guards(self) -> None:
+        """Same-request loop-guard window reset (issue #46). Called when a NEW request
+        contract binds (and directly by request-boundary harnesses): the rotation-proof
+        (command, callback) shape cap counts failures within the current request only,
+        so a fresh request — operator steering or a new objective — starts clean."""
+        self._request_shape_counts().clear()
+
     def set_request_contract(self, contract) -> None:
         """Bind the typed native request contract at the final effect sink."""
         try:
@@ -2072,6 +2095,10 @@ class MythicTools:
         prior = getattr(self, "_request_contract", None)
         if prior is None or getattr(prior, "digest", "") != contract.digest:
             self._active_approval_claim = None
+            # Same-request loop-guard window (issue #46): the rotation-proof shape cap counts
+            # failures of a (command, callback) pair within the CURRENT request only. A fresh
+            # request — operator steering or a new objective — starts it clean.
+            self.reset_request_loop_guards()
         self._request_contract_required = True
         self._request_contract = contract
 
@@ -5459,13 +5486,53 @@ class MythicTools:
     def _apply_task_result_class(self, fail_key, result_class: str) -> str:
         attempts = self._task_failure_counts.get(fail_key, 0)
         decision = command_builder.breaker_decision(result_class, attempts)
+        shape_key = self._failure_shape_key_from_fail_key(fail_key)
         if decision == "reset":
             self._task_failure_counts.pop(fail_key, None)
-        elif decision == "stop":
-            self._task_failure_counts[fail_key] = max(attempts, 2)
-        else:
+            if shape_key is not None:
+                self._request_shape_counts().pop(shape_key, None)
+            return decision
+        if decision == "retry":
             self._task_failure_counts[fail_key] = attempts + 1
+        else:  # stop
+            self._task_failure_counts[fail_key] = max(attempts, 2)
+        if shape_key is not None:
+            # The shape cap accumulates on EVERY failed attempt of this (command, callback)
+            # pair regardless of parameter/credential rotation; the pre-issue gates refuse
+            # further variants once the limit is reached. Success on the pair clears it.
+            counts = self._request_shape_counts()
+            counts[shape_key] = counts.get(shape_key, 0) + 1
         return decision
+
+    def _failure_shape_key_from_fail_key(self, fail_key) -> tuple | None:
+        """Derive the rotation-proof (command, callback) key from a (command, callback,
+        params) failure key. Enrolled-executable construction keys replace the command
+        slot, so they have no command+callback shape and keep their own breaker."""
+        try:
+            if isinstance(fail_key, tuple) and len(fail_key) >= 2 and fail_key[0] != "enrolled-executable":
+                return (fail_key[0], fail_key[1])
+        except Exception:
+            return None
+        return None
+
+    def _task_failure_shape_key(self, command: str, callback_display_id) -> tuple:
+        """Permutation-blind failure unit: the same command failing on the same callback
+        counts together even when parameters rotate (rotated credentials)."""
+        return (str(command), callback_display_id)
+
+    def _task_failure_shape_refusal(self, command: str, callback_display_id) -> str | None:
+        """Pre-issue refusal once the (command, callback) shape cap has been reached."""
+        shape_key = self._task_failure_shape_key(command, callback_display_id)
+        attempts = self._request_shape_counts().get(shape_key, 0)
+        if attempts < self._task_failure_shape_limit:
+            return None
+        return (
+            f"STOP — '{command}' on callback {callback_display_id} already failed {attempts} times in a row, "
+            f"each with a different parameter/credential variant (parameter rotation does not restart the "
+            f"count). Stop issuing this command on this callback with fresh parameter permutations. "
+            f"Report this to the operator, consult get_all_commands_for_payloadtype for the correct "
+            f"parameter schema, or choose a different approach."
+        )
 
     def _serialize_params_for_signature(self, parameters) -> str:
         """Stable serialization of command parameters for the loop-guard action signature."""
@@ -6152,6 +6219,9 @@ class MythicTools:
                 f"{callback_display_id}; not retrying identical parameters.{hint}"
             )
         count = self._task_failure_counts.get(fail_key, 2)
+        _fail_shape_key = self._failure_shape_key_from_fail_key(fail_key)
+        if _fail_shape_key is not None:
+            count = max(count, self._request_shape_counts().get(_fail_shape_key, 0))
         return (
             f"STOP — command '{command}' on callback {callback_display_id} with these parameters has already "
             f"failed {count} times. Do NOT re-issue it "
@@ -6429,6 +6499,9 @@ class MythicTools:
                 f"likely wrong or the failure is environmental. Report this to the operator, consult "
                 f"get_all_commands_for_payloadtype for the correct parameter schema, or choose a different approach."
             )
+        _shape_refusal = self._task_failure_shape_refusal(command, callback_display_id)
+        if _shape_refusal:
+            return _shape_refusal
 
         # Registered-file commands often expose a ChooseOne selector whose choices are populated from Mythic
         # filemeta. Satisfy that control-plane prerequisite before argument resolution; otherwise the resolver
@@ -6582,6 +6655,9 @@ class MythicTools:
                                     f"likely wrong or the failure is environmental. Report this to the operator, consult "
                                     f"get_all_commands_for_payloadtype for the correct parameter schema, or choose a different approach."
                                 )
+                            _shape_refusal = self._task_failure_shape_refusal(command, callback_display_id)
+                            if _shape_refusal:
+                                return _shape_refusal
                     else:
                         result_class = command_builder.classify_result(command, resolved.repair or "")
                         decision = self._apply_task_result_class(fail_key, result_class)
@@ -6654,6 +6730,9 @@ class MythicTools:
                 f"likely wrong or the failure is environmental. Report this to the operator, consult "
                 f"get_all_commands_for_payloadtype for the correct parameter schema, or choose a different approach."
             )
+        _shape_refusal = self._task_failure_shape_refusal(command, callback_display_id)
+        if _shape_refusal:
+            return _shape_refusal
 
         logon_context_key = self._kerberos_logon_context_key(command, callback_display_id, parameters)
         if logon_context_key and logon_context_key in self._kerberos_logon_context_keys:
@@ -6848,10 +6927,17 @@ class MythicTools:
                             "command": command,
                         })
                     self._last_issued_task_display_id = tdid
+                    # D3 repeat-failure flag: parameter rotation must not hide a repeat.
+                    # A failed attempt of this (command, callback) shape already exists, so
+                    # the delegation loop containment sees a re-run of a known failure even
+                    # when the failure key itself is fresh (issue #46).
                     self._last_issued_task_is_repeat_failure = (
                         self._task_failure_counts.get(
                             self._task_failure_key(command, callback_display_id, parameters),
                             0,
+                        ) >= 1
+                        or self._request_shape_counts().get(
+                            self._task_failure_shape_key(command, callback_display_id), 0
                         ) >= 1
                     )
                     # ISC-71: task creation is the lineage boundary. Record before waiting so a timeout,
