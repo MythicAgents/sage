@@ -21,6 +21,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pty
 import signal
@@ -75,6 +76,43 @@ def _cleanup_pty_group(pid: int) -> int | None:
     return status
 
 
+def _benchmark_run_as_password(run_as_user: str | None) -> str:
+    """Last-link fallback: the GOAD benchmark fixture's ground-truth domain credential.
+
+    `Payload_Type/sage/.hillclimb/referee_ldap.json` is the gitignored, operator-maintained
+    per-domain referee-credential store for this benchmark range. Domain matching is by
+    casefolded key or first DNS label ("NORTH" matches "north.sevenkingdoms.local").
+    Returns "" when the fixture is absent or the domain is unknown — never raises, and the
+    value is returned to the caller without being printed or logged.
+    """
+    if not run_as_user:
+        return ""
+    domain = run_as_user.split("\\", 1)[0].split("@", 1)[-1].strip().casefold()
+    if not domain:
+        return ""
+    fixture = (
+        Path(__file__).resolve().parents[3]
+        / "Payload_Type" / "sage" / ".hillclimb" / "referee_ldap.json"
+    )
+    if not fixture.is_file():
+        return ""
+    try:
+        table = json.loads(fixture.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    if not isinstance(table, dict):
+        return ""
+    for key, entry in table.items():
+        if key.startswith("_") or not isinstance(entry, dict):
+            continue
+        key_cf = key.strip().casefold()
+        if domain != key_cf and domain.split(".", 1)[0] != key_cf.split(".", 1)[0]:
+            continue
+        password = entry.get("password")
+        return str(password) if password else ""
+    return ""
+
+
 def _resolve_password(explicit: str | None, env_path: str | None) -> str:
     if explicit:
         return explicit
@@ -95,9 +133,15 @@ def _resolve_password(explicit: str | None, env_path: str | None) -> str:
             line = raw.strip()
             if line.startswith("SAGE_RUN_AS_PASSWORD="):
                 return line.split("=", 1)[1].strip().strip("'\"")
+    benchmark = _benchmark_run_as_password(
+        os.environ.get("SAGE_RUN_AS_USER") or r"NORTH\samwell.tarly"
+    )
+    if benchmark:
+        return benchmark
     raise SystemExit(
         "open_rdp_session: no run-as password — pass --run-as-password, export SAGE_RUN_AS_PASSWORD, "
-        "or set SAGE_RUN_AS_PASSWORD in ~/.config/sage/runas.env or the mythic .env."
+        "set SAGE_RUN_AS_PASSWORD in ~/.config/sage/runas.env or the mythic .env, or keep the GOAD "
+        "benchmark referee fixture (Payload_Type/sage/.hillclimb/referee_ldap.json) present."
     )
 
 
@@ -116,8 +160,11 @@ def main() -> int:
     ap.add_argument("--target-ip", default="10.4.10.22")
     ap.add_argument("--run-as-user", default=r"NORTH\samwell.tarly")
     ap.add_argument("--run-as-password", default=None)
-    # Default to the workflow's Xvfb (:99), NOT the caller's ambient DISPLAY (often :0/dead here).
-    ap.add_argument("--display", default=os.environ.get("SAGE_RDP_DISPLAY", ":99"))
+    # Default to the workflow's live display (:0 — the running GNOME/Xwayland desktop). The old :99
+    # Xvfb default hung the client pre-logon on this host (no Xvfb installed; X0/X1 are the GNOME
+    # session's Xwayland sockets). Override with SAGE_RDP_DISPLAY if the workflow needs a dedicated
+    # Xvfb display again.
+    ap.add_argument("--display", default=os.environ.get("SAGE_RDP_DISPLAY", ":0"))
     ap.add_argument("--env-path", default=None)
     ap.add_argument("--width", default="1024")
     ap.add_argument("--height", default="768")

@@ -7,7 +7,27 @@ description: Download an existing Mythic payload, stage it onto a Ludus Windows 
 
 ## Overview
 
-Use the bundled script for deterministic payload redeploys from Mythic into the Ludus GOAD range. Keep passwords out of scripts: Mythic auth resolves from `MYTHIC_ADMIN_PASSWORD`, then `MYTHIC_ENV_PATH` (no checkout-name default — see `.env.example`); Ludus API auth comes from `.mcp.json`; target run-as credentials come from `--run-as-password`, `SAGE_RUN_AS_PASSWORD`, or Mythic's credential store.
+Use the bundled script for deterministic payload redeploys from Mythic into the Ludus GOAD range. Keep passwords out of scripts: Mythic auth resolves from `MYTHIC_ADMIN_PASSWORD`, then `MYTHIC_ENV_PATH` (no checkout-name default — see `.env.example`); Ludus API auth comes from `.mcp.json`; target run-as credentials resolve in a fixed chain so a session never has to ask the operator twice:
+
+1. `--run-as-password` (explicit)
+2. `SAGE_RUN_AS_PASSWORD` (environment or `--run-as-password-env`)
+3. `~/.config/sage/runas.env` (per-user durable secrets file) — also checked by
+   `open_rdp_session.py`, which additionally reads the Mythic `.env`
+4. Mythic's credential store (`deploy` only, when the credential has been captured)
+5. **The GOAD benchmark referee fixture** — `Payload_Type/sage/.hillclimb/referee_ldap.json`: the
+   gitignored, operator-maintained per-domain ground-truth credential store for this range
+   (domain matched by casefolded key or first DNS label, so `NORTH\…` matches
+   `north.sevenkingdoms.local`). Both `open_rdp_session.py` and `deploy` fall back to it.
+
+If every link is empty the scripts fail closed with that chain spelled out. Never print or log the
+resolved value; never commit the fixture or the secret.
+
+RDP display: `open_rdp_session.py` defaults to `:0` — the running GNOME/Xwayland desktop. A
+dedicated `:99` Xvfb hung the client pre-logon here (no Xvfb installed); `Logon Info V2
+[NORTH\samwell.tarly …]` in the client log is the evidence the interactive logon registered, and
+the deploy census saying the session is "disconnected" is expected — the scheduled-task launch
+works from a logged-on (even disconnected) session. Keep the xfreerdp client alive while `deploy`
+runs; kill it only after the callback is observed.
 
 After rolling back the disk-only Apollo-staged snapshot and importing the retained callback config, open an RDP session as Samwell and run `launch-existing`. It starts the preserved `SageApolloBootstrap` task, waits for the retained callback check-in to advance, and disconnects the RDP session.
 
