@@ -14,13 +14,13 @@ import pytest
 from langchain_core.messages import AIMessage
 
 from ai.langgraph import command_builder, command_parameter_schema, executable_contracts, mythic_tools
-from ai.langgraph.model import Model, _TurnAuthorityToolMiddleware
+from ai.langgraph.model import Model, STOP_REASON_TERMINAL_BLOCKER, _TurnAuthorityToolMiddleware
 from ai.langgraph.mythic_tools import MythicTools
 from ai.langgraph.request_contract import build_request_contract
 
 
 SAGE_ROOT = Path(__file__).resolve().parents[1]
-CERTIFY_SOURCE = SAGE_ROOT / "tool_contracts" / "certify.json"
+CERTIFY_SOURCE = SAGE_ROOT / "ttps" / "contracts" / "certify.json"
 
 
 def _schema(*filenames: str):
@@ -148,7 +148,7 @@ def test_dynamic_selector_reaches_existing_verb_contract(tmp_path, monkeypatch):
         }}
     ))
     result = asyncio.run(client._select_enrolled_executable(
-        "apollo", "execute_assembly", 7, "Certify.exe", "find"
+        "apollo", "execute_assembly", 7, "Certify.exe", "forge"
     ))
     assert result["status"] == "unsupported"
     assert "verb" in result["error"].lower()
@@ -163,7 +163,7 @@ def test_invalid_certify_verb_fails_supervised_preparation_before_task(tmp_path,
         asyncio.run(client._prepare_supervised_issue_action({
             "command": "execute_assembly", "callback_display_id": 7,
             "parameters": {"Assembly": "Certify.exe", "Arguments": {
-                "verb": "find", "options": {},
+                "verb": "forge", "options": {},
             }},
         }))
     assert "enrolled verbs for this artifact: enum-cas, enum-templates, request, request-download" in str(caught.value)
@@ -179,6 +179,51 @@ def test_invalid_certify_verb_fails_supervised_preparation_before_task(tmp_path,
     client._issue_mythic_task.assert_not_awaited()
 
 
+def test_legacy_certify_verb_is_repaired_through_supervised_preparation(tmp_path, monkeypatch):
+    # The regression that killed the channel-3 ADCS solve: the Operator proposed the
+    # legacy Certify verb `cas`. A declared contract alias now rewrites it to the
+    # enrolled `enum-cas` before the approval card, with auditable provenance — the
+    # action prepares normally instead of looping on an unenrolled-verb rejection.
+    client, _, _, _, _ = _fixture(tmp_path, monkeypatch)
+    client._issue_mythic_task = AsyncMock()
+    prepared = asyncio.run(client._prepare_supervised_issue_action({
+        "command": "execute_assembly", "callback_display_id": 7,
+        "parameters": {"Assembly": "Certify.exe", "Arguments": {
+            "verb": "cas", "options": {"filter-vulnerable": True},
+        }},
+    }))
+    assert prepared["parameters"] == {
+        "Assembly": "Certify.exe", "Arguments": "enum-cas --filter-vulnerable",
+    }
+    binding = prepared["visibility_context"]["_sage_prepared_binding"]["executable"]
+    assert binding["repaired_from"] == "cas"
+    assert binding["invocation"]["verb"] == "enum-cas"
+    client._issue_mythic_task.assert_not_awaited()
+
+
+def test_legacy_certify_option_syntax_is_normalized_through_supervised_preparation(tmp_path, monkeypatch):
+    # The channel-3 (2026-10-18) residual: the Operator proposed a raw Certify argument string using
+    # legacy slash-option syntax `/domain:essos.local`, which looped on an "unexpected executable
+    # argument" rejection (verb-only aliasing did not cover options). The Normalizer rewrites the
+    # legacy option syntax to the enrolled `--domain essos.local` before the approval card, with
+    # auditable provenance, so the action prepares instead of looping.
+    client, _, _, _, _ = _fixture(tmp_path, monkeypatch)
+    client._issue_mythic_task = AsyncMock()
+    raw = "enum-cas /domain:essos.local --filter-vulnerable"
+    prepared = asyncio.run(client._prepare_supervised_issue_action({
+        "command": "execute_assembly", "callback_display_id": 7,
+        "parameters": {"Assembly": "Certify.exe", "Arguments": raw},
+    }))
+    args = prepared["parameters"]["Arguments"]
+    assert "--domain essos.local" in args
+    assert "--filter-vulnerable" in args
+    assert "/domain:" not in args
+    binding = prepared["visibility_context"]["_sage_prepared_binding"]["executable"]
+    assert binding["normalized_from"] == raw
+    assert binding["invocation"]["verb"] == "enum-cas"
+    client._issue_mythic_task.assert_not_awaited()
+
+
 def test_invalid_certify_verb_feedback_reaches_model_without_approval(tmp_path, monkeypatch):
     client, _, _, _, _ = _fixture(tmp_path, monkeypatch)
     client._issue_mythic_task = AsyncMock()
@@ -189,7 +234,7 @@ def test_invalid_certify_verb_feedback_reaches_model_without_approval(tmp_path, 
     message = AIMessage(content="", tool_calls=[{
         "name": "issue_task_and_waitfor_task_output",
         "args": {"command": "execute_assembly", "callback_display_id": 7,
-                 "parameters": {"Assembly": "Certify.exe", "Arguments": "find"}},
+                 "parameters": {"Assembly": "Certify.exe", "Arguments": "forge"}},
         "id": "invalid-certify-verb", "type": "tool_call",
     }])
     asyncio.run(middleware.aafter_model({"messages": [message]}, None))
@@ -199,7 +244,7 @@ def test_invalid_certify_verb_feedback_reaches_model_without_approval(tmp_path, 
     client._issue_mythic_task.assert_not_awaited()
 
 
-def test_unsupported_verb_gets_one_local_operator_retry_per_native_request(tmp_path, monkeypatch):
+def test_unsupported_verb_repair_budget_is_bounded_and_request_scoped(tmp_path, monkeypatch):
     client, _, _, _, _ = _fixture(tmp_path, monkeypatch)
     client._issue_mythic_task = AsyncMock()
     model = Model.__new__(Model)
@@ -208,6 +253,8 @@ def test_unsupported_verb_gets_one_local_operator_retry_per_native_request(tmp_p
     model._request_contract = None
     model.mythic_client = client
     model.state = {"_request_id": ""}
+    # Isolate the Tier-2 budget here; the Tier-3 loop-breaker accrual is exercised separately below.
+    model._loop_breaker = None
 
     def install(request_id):
         model.install_request_contract(build_request_contract(
@@ -216,6 +263,8 @@ def test_unsupported_verb_gets_one_local_operator_retry_per_native_request(tmp_p
         ))
 
     def prepare(verb, *, sibling=False, agent="Mythic_Operator"):
+        # A fresh middleware per call proves the budget lives on the Model's request-scoped ledger, not on
+        # any middleware instance: a Supervisor↔Operator handoff rebuilds the middleware but keeps the count.
         middleware = _TurnAuthorityToolMiddleware(model, agent_name=agent)
         monkeypatch.setattr(middleware, "_after_model_update", lambda state: None)
         message = AIMessage(content="", tool_calls=[{
@@ -237,33 +286,89 @@ def test_unsupported_verb_gets_one_local_operator_retry_per_native_request(tmp_p
         return update, message
 
     install("inert-request-1")
-    assert "jump_to" not in prepare(7)[0]  # A malformed verb type is terminal.
-    assert model._unsupported_verb_retry_request_id == ""
-    first, first_message = prepare("find")
+    assert "jump_to" not in prepare(7)[0]  # A malformed verb type is terminal, not an unsupported verb.
+
+    # Each unenrolled verb earns a forced re-run until the bounded budget is spent. The budget survives a
+    # rebuilt middleware and a same-id contract amend (both keep the logical request_id, hence the ledger).
+    first, first_message = prepare("forge")
     assert first["jump_to"] == "model"
     assert first_message.tool_calls == []
     assert "Approval was not requested" in first_message.content
-    assert model._unsupported_verb_retry_request_id == "inert-request-1"
-
-    second, _ = prepare("find")  # A rebuilt middleware must not reset the allowance.
-    assert "jump_to" not in second
+    assert prepare("forge")[0]["jump_to"] == "model"
     model.install_request_contract(model._request_contract.amend())
-    assert model._unsupported_verb_retry_request_id == "inert-request-1"
-    assert "jump_to" not in prepare("find")[0]
-    assert "jump_to" not in prepare(7)[0]  # Invalid type is not the safe verb subtype.
-    model.install_request_contract(model._request_contract.stop())
-    assert "jump_to" not in prepare("find")[0]
+    assert prepare("forge")[0]["jump_to"] == "model"
+    # _UNSUPPORTED_VERB_REPAIR_BUDGET forced re-runs spent -> no further jump this request.
+    assert "jump_to" not in prepare("forge")[0]
+    assert "jump_to" not in prepare(7)[0]
 
+    # A terminal request never forces a re-run even with budget nominally left.
     install("inert-request-2")
-    assert model._unsupported_verb_retry_request_id == ""
-    mixed, mixed_message = prepare("find", sibling=True)
+    model.install_request_contract(model._request_contract.stop())
+    assert "jump_to" not in prepare("forge")[0]
+
+    # A mixed turn that keeps a read-only sibling must not force a re-run (and so must not burn budget):
+    # the next request gets its full allowance.
+    install("inert-request-3")
+    mixed, mixed_message = prepare("forge", sibling=True)
     assert "jump_to" not in mixed
     assert [call["name"] for call in mixed_message.tool_calls] == [
         "get_all_command_args_for_payloadtype"]
-    assert model._unsupported_verb_retry_request_id == "inert-request-2"
-    assert "jump_to" not in prepare("find")[0]
-    install("inert-request-3")
-    assert prepare("find")[0]["jump_to"] == "model"
+    assert prepare("forge")[0]["jump_to"] == "model"
+    assert prepare("forge")[0]["jump_to"] == "model"
+    assert prepare("forge")[0]["jump_to"] == "model"
+    assert "jump_to" not in prepare("forge")[0]
+
+    # A new logical request resets the budget.
+    install("inert-request-4")
+    assert prepare("forge")[0]["jump_to"] == "model"
+    client._issue_mythic_task.assert_not_awaited()
+
+
+def test_repeated_unsupported_verb_accrues_to_loop_breaker_and_halts(tmp_path, monkeypatch):
+    """Tier 3: a task-prep rejection is invisible to the issued-task path, so it must feed the control-state
+    loop-breaker directly. The SAME unenrolled verb re-proposed with no progress trips a clean terminal
+    halt (the channel-3 Certify `cas` loop), while distinct verbs stay first-sight and are bounded only by
+    the repair budget."""
+    from ai.langgraph import worker_outcome as _wo
+
+    client, _, _, _, _ = _fixture(tmp_path, monkeypatch)
+    client._issue_mythic_task = AsyncMock()
+    model = Model.__new__(Model)
+    model.mode = "supervised"
+    model._native_chat_explicit_hitl = True
+    model._request_contract = None
+    model.mythic_client = client
+    model.state = {"_request_id": ""}
+    model._loop_breaker = _wo.LoopBreakerState()
+    model._stop_requested = False
+    model.install_request_contract(build_request_contract(
+        request_id="inert-request", channel_id="1", operation_id="inert",
+        mode="supervised", autonomous_solve=False,
+    ))
+
+    def prepare(verb, call_id):
+        # Distinct ids model the fresh tool-call id a real re-proposal carries (the breaker's per-turn
+        # dedup key); reusing one id would be a same-turn re-fire and must not count.
+        middleware = _TurnAuthorityToolMiddleware(model, agent_name="Mythic_Operator")
+        monkeypatch.setattr(middleware, "_after_model_update", lambda state: None)
+        message = AIMessage(content="", tool_calls=[{
+            "name": "issue_task_and_waitfor_task_output",
+            "args": {"command": "execute_assembly", "callback_display_id": 7,
+                     "parameters": {"Assembly": "Certify.exe", "Arguments": {
+                         "verb": verb, "options": {},
+                     }}},
+            "id": call_id, "type": "tool_call",
+        }])
+        return asyncio.run(middleware.aafter_model({"messages": [message]}, None))
+
+    # First sight of this blocker: forced re-run, solve continues.
+    assert prepare("forge", "call-1")["jump_to"] == "model"
+    assert model._stop_requested is False
+    # Same unenrolled verb, fresh id, no progress since -> terminal blocker halt, no further re-run.
+    halted = prepare("forge", "call-2")
+    assert model._stop_requested is True
+    assert model._stop_reason == STOP_REASON_TERMINAL_BLOCKER
+    assert "jump_to" not in halted
     client._issue_mythic_task.assert_not_awaited()
 
 
@@ -286,7 +391,7 @@ def test_unsupported_verb_retry_requires_active_request_projection(tmp_path, mon
         message = AIMessage(content="", tool_calls=[{
             "name": "issue_task_and_waitfor_task_output",
             "args": {"command": "execute_assembly", "callback_display_id": 7,
-                     "parameters": {"Assembly": "Certify.exe", "Arguments": "find"}},
+                     "parameters": {"Assembly": "Certify.exe", "Arguments": "forge"}},
             "id": "inert-preparation", "type": "tool_call",
         }])
         return asyncio.run(middleware.aafter_model({"messages": [message]}, None))
@@ -299,10 +404,11 @@ def test_unsupported_verb_retry_requires_active_request_projection(tmp_path, mon
     model._stop_requested = False
     model._turn_authority = None
     assert "jump_to" not in attempt()
-    assert model._unsupported_verb_retry_request_id == ""
     model.install_request_contract(model._request_contract.stop())
     assert "jump_to" not in attempt()
-    assert model._unsupported_verb_retry_request_id == ""
+    # None of the refused projections spent the repair budget, so the ledger recorded no retry.
+    assert not model._ensure_request_event_ledger("inert-request").actual_events(
+        kind="unsupported_verb_repair", phase="retry")
 
 
 def test_dynamic_choice_query_failure_denies_before_file_download(tmp_path, monkeypatch):
@@ -445,9 +551,9 @@ def test_raw_outer_json_string_and_typed_forms_normalize_before_shared_sink(
 @pytest.mark.parametrize(
     "parameters",
     [
-        "Certify.exe find",
-        "Certify.exe find ",
-        "Certify.exe find\n",
+        "Certify.exe forge",
+        "Certify.exe forge ",
+        "Certify.exe forge\n",
         {"Assembly": "Certify.exe", "Arguments": "request --ca S\\C"},
         {"Assembly": "Certify.exe", "Arguments": "enum-cas", "other": "mixed"},
     ],
@@ -465,7 +571,7 @@ def test_known_raw_legacy_malicious_and_mixed_forms_fail_before_native_issue(tmp
             "execute_assembly", parameters, 7
         ))
     assert result.startswith("STOP") or "construction failure" in result.lower()
-    if isinstance(parameters, str) and parameters.startswith("Certify.exe find") and "\n" not in parameters:
+    if isinstance(parameters, str) and parameters.startswith("Certify.exe forge") and "\n" not in parameters:
         assert "enrolled verbs for this artifact: enum-cas, enum-templates, request, request-download" in result
     assert seen["issued"] == 0
 

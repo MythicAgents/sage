@@ -181,7 +181,7 @@ class _RecordingModel(GenericFakeChatModel):
 
 def test_real_agent_executes_typed_same_name_call_then_restores_generic_schema():
     contract = load_executable_contract(
-        Path(__file__).resolve().parents[1] / "tool_contracts" / "certify.json",
+        Path(__file__).resolve().parents[1] / "ttps" / "contracts" / "certify.json",
         "1383e8bca90e4be70ff2224b7e2af465a8f3d5bede1fde60f1ece71e3b02d346",
     )
     invocation_schema = contract.strict_schema_for_verb("request")

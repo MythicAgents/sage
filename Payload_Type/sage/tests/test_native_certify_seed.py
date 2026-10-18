@@ -95,8 +95,8 @@ def test_exact_operator_response_seeded_once_before_meter_then_delegate(tmp_path
     assert len(meter.requests) == 2 and meter.closed
     body = first.text
     assert "issue_task_and_waitfor_task_output" in body
-    assert '\\"find\\"' in body
-    assert "synthetic-native-certify-find" in body
+    assert '\\"forge\\"' in body
+    assert "synthetic-native-certify-forge" in body
     event = seed._private_json(Path(config["seed_event_path"]))
     assert event["channel_id"] == 4 and event["request_id"] == 5
     assert event["arguments"]["callback_display_id"] == 7
@@ -226,7 +226,7 @@ def test_openai_sdk_consumes_seeded_native_tool_call_without_network(tmp_path, s
                                   "args": {"callback_display_id": 7,
                                            "command": "execute_assembly",
                                            "parameters": {"assembly_name": "Certify.exe",
-                                                          "assembly_arguments": "find"}},
-                                  "id": "synthetic-invalid-certify-find", "type": "tool_call"}]
+                                                          "assembly_arguments": "forge"}},
+                                  "id": "synthetic-invalid-certify-forge", "type": "tool_call"}]
     assert meter.requests == []
     assert Path(config["seed_event_path"]).is_file()

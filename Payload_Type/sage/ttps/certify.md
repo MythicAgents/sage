@@ -14,7 +14,7 @@ binary_type: .net-assembly
 binary_filename: Certify.exe
 binary_sha256: 1383e8bca90e4be70ff2224b7e2af465a8f3d5bede1fde60f1ece71e3b02d346
 binary_version: "2.0.0"
-binary_contract: tool_contracts/certify.json
+binary_contract: ttps/contracts/certify.json
 binary_contract_evidence: compiled-parser-metadata
 supported_os: [windows]
 architecture: [x64, x86]

@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Annotated, Any, Literal, Mapping
@@ -85,6 +85,19 @@ class ContractDescriptor(_StrictModel):
     global_options: dict[str, OptionDescriptor] = {}
     disabled_registered_verbs: list[StrictStr] = []
     legacy_unregistered_verbs: list[StrictStr] = []
+    # Deterministic repair map: a legacy (unregistered) verb -> the enrolled verb it
+    # should be rewritten to before the approval card is built. Keys must be declared
+    # legacy verbs and values must be enrolled verbs (validated below). Empty by default,
+    # so a contract that declares no aliases keeps the strict fail-closed behavior.
+    legacy_verb_aliases: dict[StrictStr, StrictStr] = {}
+    # Deterministic repair map for RENAMED options: a legacy option name -> the enrolled
+    # option name it should be rewritten to (e.g. "altname" -> "upn"). Applied across verbs,
+    # but only ever fires when the target names a real option for the resolved verb, so a
+    # global alias cannot inject an option a verb does not declare. Keys must not shadow a
+    # real option name; targets must be a declared option somewhere (validated below).
+    # Generic slash/`=` SYNTAX normalization (`/name:value` -> `--name value`) needs no
+    # declaration; this map is only for names that actually changed between builds.
+    legacy_option_aliases: dict[StrictStr, StrictStr] = {}
     identity_rule: StrictStr | None = None
     comparison_source: dict[str, StrictStr] | None = None
     evidence: dict[str, StrictStr] | None = None
@@ -101,6 +114,17 @@ class PreparedInvocation:
     options: Mapping[str, Any]
     argv: tuple[str, ...]
     argument_string: str
+    # Advisory provenance only: the legacy verb this invocation was deterministically
+    # rewritten from (e.g. "cas" when the enrolled verb is "enum-cas"), else None.
+    # Excluded from equality/hash and from as_binding()/revalidate so canonical
+    # invocation identity stays the enrolled form and round-trips unchanged after approval.
+    repaired_from: str | None = field(default=None, compare=False)
+    # Advisory provenance only: the original raw argument string this invocation was
+    # deterministically normalized from (legacy slash/`=` option syntax or a declared renamed
+    # option rewritten to the enrolled double-dash grammar), else None. Excluded from
+    # equality/hash and from as_binding()/revalidate for the same reason as repaired_from —
+    # canonical identity is always the enrolled argv.
+    normalized_from: str | None = field(default=None, compare=False)
 
     def as_binding(self) -> dict[str, Any]:
         return {
@@ -121,6 +145,42 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             raise ContractValidationError(f"descriptor contains duplicate key {key!r}")
         result[key] = value
     return result
+
+
+def _split_option_token(token: str) -> tuple[str | None, str | None]:
+    """Split one OPTION-position token into (name, inline_value) across the enrolled and legacy
+    syntaxes, WITHOUT resolving it against any contract:
+
+      --name          -> ("name", None)
+      --name=value    -> ("name", "value")      # `=`-joined value
+      /name           -> ("name", None)         # legacy GhostPack/.NET slash flag
+      /name:value     -> ("name", "value")      # legacy slash option
+
+    A token in none of these option shapes returns (None, None) so the caller fails closed exactly
+    as before (an unexpected positional argument). This is a pure syntax split; the name still has
+    to resolve to a real enrolled option (or a declared rename) or it is rejected as unknown."""
+    if token.startswith("--") and token != "--":
+        body = token[2:]
+        if "=" in body:
+            name, value = body.split("=", 1)
+            return (name or None), value
+        return (body or None), None
+    if token.startswith("/") and len(token) > 1 and not token.startswith("//"):
+        body = token[1:]
+        if ":" in body:
+            name, value = body.split(":", 1)
+            return (name or None), value
+        return (body or None), None
+    return None, None
+
+
+def _looks_like_option_token(token: str) -> bool:
+    """Whether a token begins a new option (so it terminates a preceding sequence option). Covers
+    both the enrolled double-dash form and the legacy slash form; enrolled sequence VALUES never
+    start with either, so this does not truncate a legitimate value."""
+    return token.startswith("--") or (
+        token.startswith("/") and len(token) > 1 and not token.startswith("//")
+    )
 
 
 def _read_descriptor(path: Path) -> tuple[dict[str, Any], str]:
@@ -180,10 +240,28 @@ class ExecutableContract:
         disabled = set(self.descriptor.disabled_registered_verbs)
         if len(disabled) != len(self.descriptor.disabled_registered_verbs) or not disabled <= registered:
             raise ContractValidationError("disabled_registered_verbs must name unique registered verbs")
+        legacy = set()
         for verb in self.descriptor.legacy_unregistered_verbs:
             _validate_name(verb, "legacy verb")
             if verb in registered:
                 raise ContractValidationError(f"legacy verb {verb!r} is also registered")
+            legacy.add(verb)
+        enrolled = set(self.enrolled_verbs)
+        for alias_verb, target_verb in self.descriptor.legacy_verb_aliases.items():
+            _validate_name(alias_verb, "legacy verb alias")
+            _validate_name(target_verb, "legacy verb alias target")
+            if alias_verb not in legacy:
+                raise ContractValidationError(
+                    f"legacy verb alias {alias_verb!r} must name a declared legacy verb"
+                )
+            if alias_verb in enrolled:
+                raise ContractValidationError(
+                    f"legacy verb alias {alias_verb!r} must not shadow an enrolled verb"
+                )
+            if target_verb not in enrolled:
+                raise ContractValidationError(
+                    f"legacy verb alias {alias_verb!r} must map to an enrolled verb, not {target_verb!r}"
+                )
         for name, specification in self.descriptor.verbs.items():
             _validate_name(name, "verb")
             if name not in registered:
@@ -195,6 +273,20 @@ class ExecutableContract:
         for name, specification in self.descriptor.global_options.items():
             _validate_name(name, "global option")
             self._validate_option(name, specification)
+        declared_options = set(self.descriptor.global_options)
+        for specification in self.descriptor.verbs.values():
+            declared_options |= set(specification.options)
+        for legacy_option, target_option in self.descriptor.legacy_option_aliases.items():
+            _validate_name(legacy_option, "legacy option alias")
+            _validate_name(target_option, "legacy option alias target")
+            if legacy_option in declared_options:
+                raise ContractValidationError(
+                    f"legacy option alias {legacy_option!r} must not shadow a declared option"
+                )
+            if target_option not in declared_options:
+                raise ContractValidationError(
+                    f"legacy option alias {legacy_option!r} must map to a declared option, not {target_option!r}"
+                )
 
     def _validate_verb_specification(self, verb: str, specification: VerbDescriptor) -> None:
         names = set(self.descriptor.global_options)
@@ -225,6 +317,44 @@ class ExecutableContract:
                 raise ContractValidationError(f"option {name!r} enum contains duplicates")
         if option.default is not None:
             _validate_option_value(name, option, option.default)
+
+    def _alias_for(self, verb: Any) -> str | None:
+        """The enrolled verb a declared legacy alias rewrites to, else None.
+
+        Only fires for a verb that is not itself enrolled and has an unambiguous
+        contract-declared replacement; never guesses a near match.
+        """
+        if type(verb) is not str:
+            return None
+        if verb in self.enrolled_verbs:
+            return None
+        return self.descriptor.legacy_verb_aliases.get(verb)
+
+    def _canonical_option(
+        self, name: str, option_specs: Mapping[str, "OptionDescriptor"]
+    ) -> str | None:
+        """Resolve a supplied option name to its enrolled spelling for the resolved verb, else None.
+
+        Exact match wins; then a case-insensitive match against the verb's declared options; then a
+        contract-declared legacy rename whose target is a real option for THIS verb. Never guesses a
+        near match, so an unknown option still fails closed. A global rename only fires when its
+        target is actually declared for the current verb, so it can never inject a foreign option.
+        """
+        if name in option_specs:
+            return name
+        folded = name.casefold()
+        for declared in option_specs:
+            if declared.casefold() == folded:
+                return declared
+        target = self.descriptor.legacy_option_aliases.get(name)
+        if target is None:
+            for legacy, mapped in self.descriptor.legacy_option_aliases.items():
+                if legacy.casefold() == folded:
+                    target = mapped
+                    break
+        if target is not None and target in option_specs:
+            return target
+        return None
 
     def _require_verb(self, verb: Any) -> tuple[str, dict[str, OptionDescriptor], VerbDescriptor]:
         if type(verb) is not str:
@@ -308,6 +438,11 @@ class ExecutableContract:
         *,
         artifact_sha256: str,
     ) -> PreparedInvocation:
+        repaired_from: str | None = None
+        alias = self._alias_for(verb)
+        if alias is not None:
+            repaired_from = verb
+            verb = alias
         verb, option_specs, specification = self._require_verb(verb)
         self.assert_artifact_identity(artifact_sha256)
         source: Any = options.model_dump(by_alias=True) if isinstance(options, BaseModel) else options
@@ -361,6 +496,7 @@ class ExecutableContract:
             options=MappingProxyType(canonical),
             argv=argv,
             argument_string=argument_string,
+            repaired_from=repaired_from,
         )
 
     def parse_and_prepare(self, raw: Any, *, artifact_sha256: str) -> PreparedInvocation:
@@ -371,37 +507,59 @@ class ExecutableContract:
         argv = parse_windows_command_line(raw)
         if not argv:
             raise ContractValidationError("raw executable arguments are empty")
-        verb, option_specs, _ = self._require_verb(argv[0])
+        # Resolve a declared legacy alias for the option-spec lookup, but hand the raw
+        # verb to prepare() so it performs the rewrite once and records repaired_from.
+        raw_verb = argv[0]
+        effective_verb = self._alias_for(raw_verb) or raw_verb
+        _, option_specs, _ = self._require_verb(effective_verb)
         supplied: dict[str, Any] = {}
+        normalized = False
         index = 1
         while index < len(argv):
             token = argv[index]
-            if not token.startswith("--") or token == "--" or "=" in token:
+            index += 1
+            # Normalizer (contract-driven, position-aware): canonicalize this OPTION-position token
+            # from the enrolled or legacy syntax into the enrolled double-dash grammar. Values are
+            # consumed inside the branches below and are never re-canonicalized, so a value that
+            # happens to begin with `/` is untouched. Unknown names still fail closed.
+            raw_name, inline_value = _split_option_token(token)
+            if raw_name is None:
                 raise ContractValidationError(f"unexpected executable argument {token!r}")
-            name = token[2:]
-            option = option_specs.get(name)
-            if option is None:
-                raise ContractValidationError(f"unknown executable option {name!r}")
+            name = self._canonical_option(raw_name, option_specs)
+            if name is None:
+                raise ContractValidationError(f"unknown executable option {raw_name!r}")
+            if token != f"--{name}":
+                normalized = True
             if name in supplied:
                 raise ContractValidationError(f"duplicate executable option {name!r}")
-            index += 1
+            option = option_specs[name]
             if option.type == "boolean":
+                if inline_value is not None:
+                    raise ContractValidationError(f"boolean option {name!r} takes no value")
                 supplied[name] = True
                 continue
-            if index >= len(argv):
-                raise ContractValidationError(f"option {name!r} is missing its value")
             if option.value_shape == "sequence":
                 values: list[str] = []
-                while index < len(argv) and not argv[index].startswith("--"):
+                if inline_value is not None:
+                    values.append(inline_value)
+                while index < len(argv) and not _looks_like_option_token(argv[index]):
                     values.append(argv[index])
                     index += 1
                 if not values:
                     raise ContractValidationError(f"sequence option {name!r} has no values")
                 supplied[name] = values
             else:
-                supplied[name] = _raw_scalar(name, option, argv[index])
-                index += 1
-        prepared = self.prepare(verb, supplied, artifact_sha256=artifact_sha256)
+                if inline_value is not None:
+                    value = inline_value
+                else:
+                    if index >= len(argv):
+                        raise ContractValidationError(f"option {name!r} is missing its value")
+                    value = argv[index]
+                    index += 1
+                supplied[name] = _raw_scalar(name, option, value)
+        prepared = self.prepare(raw_verb, supplied, artifact_sha256=artifact_sha256)
+        if normalized:
+            prepared = replace(prepared, normalized_from=raw)
         return prepared
 
     def revalidate(

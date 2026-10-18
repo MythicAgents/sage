@@ -68,7 +68,7 @@ SAGE_MYTHIC_SLEEP_TIMEOUT_MULTIPLIER = _env_positive_int("SAGE_MYTHIC_SLEEP_TIME
 #: See `_graph_heartbeat` for why this exists at all.
 SAGE_TASK_HEARTBEAT_INTERVAL = _env_positive_int("SAGE_TASK_HEARTBEAT_INTERVAL", 30)
 
-_EXECUTABLE_CONTRACT_ROOT = Path(__file__).resolve().parents[2] / "tool_contracts"
+_EXECUTABLE_CONTRACT_ROOT = Path(__file__).resolve().parents[2] / "ttps" / "contracts"
 _TOOL_NOTES_DIR = Path(__file__).resolve().parents[2] / "tool_notes"
 _TOOL_NOTE_MAX_CHARS = 1200
 _MAX_ENROLLED_EXECUTABLE_BYTES = 4 * 1024 * 1024
@@ -5097,6 +5097,17 @@ class MythicTools:
             "wrapper": wrapper,
             "invocation": prepared.as_binding(),
         }
+        if prepared.repaired_from is not None:
+            # Provenance for a deterministic legacy-verb rewrite (e.g. cas -> enum-cas).
+            # The approval card already shows the corrected argument_string; this records
+            # what it was normalized from so the rewrite is auditable, never silent.
+            binding["repaired_from"] = prepared.repaired_from
+        if prepared.normalized_from is not None:
+            # Provenance for a deterministic legacy OPTION-syntax normalization
+            # (e.g. `/opt:<value>` -> `--opt <value>`). Same audit intent as repaired_from:
+            # the approval card shows the enrolled argument_string, this records the exact raw
+            # string it was normalized from.
+            binding["normalized_from"] = prepared.normalized_from
         signature = "enrolled-executable:" + json.dumps({
             "artifact_sha256": prepared.artifact_sha256,
             "contract_sha256": prepared.contract_sha256,

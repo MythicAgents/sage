@@ -11,7 +11,7 @@ from ai.langgraph.mythic_tools import MythicTools
 
 
 SAGE_ROOT = Path(__file__).resolve().parents[1]
-CONTRACT_PATH = SAGE_ROOT / "tool_contracts" / "certify.json"
+CONTRACT_PATH = SAGE_ROOT / "ttps" / "contracts" / "certify.json"
 
 
 def _contract():
@@ -43,7 +43,7 @@ def test_guidance_examples_follow_enrolled_v2_parser_shapes():
     contract = _contract()
     frontmatter, _ = ttp_library.load_ttp("certify")
     assert frontmatter["binary_sha256"] == contract["binary"]["sha256"]
-    assert frontmatter["binary_contract"] == "tool_contracts/certify.json"
+    assert frontmatter["binary_contract"] == "ttps/contracts/certify.json"
     for example in frontmatter["usage_examples"]:
         _assert_enrolled_example(contract, example["args"])
 

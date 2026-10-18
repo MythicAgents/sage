@@ -49,15 +49,15 @@ def test_seed_is_local_and_preserves_invalid_proposal(stream, monkeypatch):
     response = asyncio.run(transport.handle_async_request(request(stream=stream)))
     body = response.text
     assert "issue_task_and_waitfor_task_output" in body
-    assert "find" in body
+    assert "forge" in body
     assert transport.seeded and transport.seed_event["kind"] == "local_fault_injection"
     assert transport.requests == []
     asyncio.run(transport.aclose())
 
 
-def test_fixture_real_preparation_denies_find_and_prepares_near_match(tmp_path, monkeypatch):
+def test_fixture_real_preparation_denies_unenrolled_verb_and_prepares_valid(tmp_path, monkeypatch):
     runner = module()
-    descriptor = json.loads((runner.SAGE / "tool_contracts/certify.json").read_text())
+    descriptor = json.loads((runner.SAGE / "ttps/contracts/certify.json").read_text())
     import hashlib
     descriptor["binary"]["sha256"] = hashlib.sha256(runner.ARTIFACT).hexdigest()
     contract_root = tmp_path / "contracts"
@@ -122,7 +122,7 @@ def test_classification_needs_actual_feedback_and_pending_valid_card():
                            "Arguments": "enum-templates --filter-vulnerable"}}}]}}}}
     result = {"initial_cards": [card], "effects": [], "provider_requests": [{
         "status": "returned", "request": {"messages": [{"content":
-        "[task preparation] Approval was not requested: executable verb 'find' is not enrolled; "
+        "[task preparation] Approval was not requested: executable verb 'forge' is not enrolled; "
         "enrolled verbs for this artifact: enum-templates"}]}}]}
     classified = runner.classify(result, {"kind": "local_fault_injection"})
     assert classified["seeded"] and classified["actual_preparation_feedback_seen"]

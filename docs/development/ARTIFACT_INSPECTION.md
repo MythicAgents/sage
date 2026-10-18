@@ -45,7 +45,7 @@ field is not by itself a managed assembly's complete runtime architecture requir
 Malformed files and unsupported formats do not become verified contracts.
 
 The initial help profile accepts only the artifact enrolled in
-[the Certify descriptor](../../Payload_Type/sage/tool_contracts/certify.json):
+[the Certify descriptor](../../Payload_Type/sage/ttps/contracts/certify.json):
 
 ```bash
 .venv/bin/python skills/sage-focused-capability-tests/scripts/inspect_artifact.py Payload_Type/sage/tools/Certify.exe --sha256 1383e8bca90e4be70ff2224b7e2af465a8f3d5bede1fde60f1ece71e3b02d346 --profile certify-help-v1 --recipe request --image-id "$(docker image inspect --format '{{.Id}}' sage-inspection-wine:1)"

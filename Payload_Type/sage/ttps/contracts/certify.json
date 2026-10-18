@@ -38,6 +38,7 @@
   ],
   "disabled_registered_verbs": [],
   "legacy_unregistered_verbs": ["find", "cas", "download"],
+  "legacy_verb_aliases": {"find": "enum-templates", "cas": "enum-cas", "download": "request-download"},
   "verbs": {
     "enum-cas": {
       "options": {

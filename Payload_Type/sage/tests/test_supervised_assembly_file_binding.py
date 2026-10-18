@@ -56,10 +56,10 @@ def test_named_invalid_verb_and_same_enrolled_bytes_by_file_both_fail_before_sin
     with pytest.raises(Exception, match="not enrolled"):
         asyncio.run(client._prepare_supervised_issue_action({
             "command": "inline_assembly", "callback_display_id": 7,
-            "parameters": {"assembly_name": "Certify.exe", "assembly_arguments": "find"},
+            "parameters": {"assembly_name": "Certify.exe", "assembly_arguments": "forge"},
         }))
 
-    result, sink = _direct_issue(client, row, "find")
+    result, sink = _direct_issue(client, row, "forge")
     assert "enrolled executable bytes must use the registered selector" in result
     sink.assert_not_awaited()
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test-only, one-response Certify `find` seed for a bound native Sage chat request.
+"""Test-only, one-response Certify `forge` (unenrolled, no alias) seed for a bound native Sage chat request.
 
 The generated interpreter shim is selected through SAGE_VENV_PY for one local restart.
 It passes ordinary Python invocations through and intercepts only `-u main.py`.
@@ -151,20 +151,20 @@ def _seed_response(request: httpx.Request, model: str, stream: bool,
                    callback_display_id: int) -> httpx.Response:
     seed_args = {"callback_display_id": callback_display_id,
                  "command": "execute_assembly",
-                 "parameters": {"assembly_name": "Certify.exe", "assembly_arguments": "find"}}
-    tool = {"id": "synthetic-invalid-certify-find", "type": "function",
+                 "parameters": {"assembly_name": "Certify.exe", "assembly_arguments": "forge"}}
+    tool = {"id": "synthetic-invalid-certify-forge", "type": "function",
             "function": {"name": "issue_task_and_waitfor_task_output",
                          "arguments": json.dumps(seed_args, sort_keys=True)}}
     if stream:
         chunks = [
-            {"id": "synthetic-native-certify-find", "object": "chat.completion.chunk",
+            {"id": "synthetic-native-certify-forge", "object": "chat.completion.chunk",
              "created": 0, "model": model, "choices": [{"index": 0,
                 "delta": {"role": "assistant", "tool_calls": [{"index": 0, **tool}]},
                 "finish_reason": None}]},
-            {"id": "synthetic-native-certify-find", "object": "chat.completion.chunk",
+            {"id": "synthetic-native-certify-forge", "object": "chat.completion.chunk",
              "created": 0, "model": model, "choices": [{"index": 0, "delta": {},
                 "finish_reason": "tool_calls"}]},
-            {"id": "synthetic-native-certify-find", "object": "chat.completion.chunk",
+            {"id": "synthetic-native-certify-forge", "object": "chat.completion.chunk",
              "created": 0, "model": model, "choices": [],
              "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}},
         ]
@@ -173,7 +173,7 @@ def _seed_response(request: httpx.Request, model: str, stream: bool,
                               content=(content + "data: [DONE]\n\n").encode(),
                               headers={"content-type": "text/event-stream"})
     return httpx.Response(200, request=request, json={
-        "id": "synthetic-native-certify-find", "object": "chat.completion",
+        "id": "synthetic-native-certify-forge", "object": "chat.completion",
         "created": 0, "model": model,
         "choices": [{"index": 0, "finish_reason": "tool_calls",
                      "message": {"role": "assistant", "content": None,
@@ -219,7 +219,7 @@ class OneCertifySeed(httpx.AsyncBaseTransport):
             "arguments": {"callback_display_id": self.config["callback_display_id"],
                           "command": "execute_assembly",
                           "parameters": {"assembly_name": "Certify.exe",
-                                         "assembly_arguments": "find"}},
+                                         "assembly_arguments": "forge"}},
             "stream": stream, "controller_monotonic_ns": time.monotonic_ns(),
             "provider_reservation": None,
         })

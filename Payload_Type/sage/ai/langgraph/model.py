@@ -113,6 +113,15 @@ _RECON_REREAD_STOP_LIMIT = 6
 # One hand-back gives the Supervisor a chance to use the prior result; a second means it is not
 # listening, and trading refusals until the step budget dies helps nobody.
 _SUPERVISED_REPEAT_REFUSAL_CAP = 2
+# Bounded, request-scoped budget for forcing the model to re-pick a valid executable verb after a
+# task-preparation rejection (an unenrolled verb with no deterministic contract alias, e.g. a typo or a
+# genuinely unsupported operation). The old one-shot flag was a binary keyed on volatile instance state,
+# so a single legitimate repair was consumed and a Supervisor↔Operator handoff could not get a second
+# attempt; a small bounded counter on the durable request-scoped event ledger gives a few forced re-runs
+# per logical request without ever becoming an unbounded loop. Repeating the SAME bad verb is caught sooner
+# by the control-state loop-breaker (task-prep rejections now accrue to it); this cap catches flailing
+# across many DISTINCT bad verbs, which the breaker's per-blocker fingerprint never trips on.
+_UNSUPPORTED_VERB_REPAIR_BUDGET = 3
 _BLOODHOUND_AGENT_TOOL_ALLOWLIST = SHIPPING_BLOODHOUND_TOOL_NAMES
 _DEFAULT_GRAPH_RECURSION_LIMIT = 250
 _TOON_SENTINEL = "⟦TOON "
@@ -2065,6 +2074,27 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
                         recoverable_verb_error = isinstance(exc, UnsupportedExecutableVerbError)
                         note = f"[task preparation] Approval was not requested: {exc}"
                         last_ai.content = f"{_message_content_as_text(last_ai.content)}\n{note}".strip()
+                        if recoverable_verb_error:
+                            # Tier 3: a task-preparation rejection never becomes an issued task, so it was
+                            # invisible to the control-state loop-breaker — the Supervisor could re-delegate
+                            # the identical unenrolled verb forever (channel-3 Certify `cas`). Feed it in as a
+                            # blocked outcome keyed on the rejection reason; the per-blocker fingerprint means
+                            # the SAME bad verb recurring with no progress trips a clean stop (this sets
+                            # `_stop_requested`, which zeroes the retry request_id below), while a different
+                            # verb is first-sight and is bounded instead by the repair budget. turn_key is the
+                            # dropped call's id (fresh per re-proposal, deduped within one middleware fire).
+                            # Fail-open: the loop-breaker must never raise into the agent loop.
+                            try:
+                                self._model._note_capability_outcome(
+                                    {
+                                        "ok": False,
+                                        "capability": "issue_task_and_waitfor_task_output",
+                                        "reason": str(exc),
+                                    },
+                                    str(call.get("id") or ""),
+                                )
+                            except Exception:
+                                pass
                 if preparation_failed:
                     kept = [call for call in kept if not (
                         isinstance(call, dict)
@@ -2109,13 +2139,18 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
                     and not self._model._request_contract_block_reason("list_callbacks")
                     else ""
                 )
-                if (request_id and getattr(self._model, "_unsupported_verb_retry_request_id", "")
-                        != request_id):
-                    self._model._unsupported_verb_retry_request_id = request_id
-                    if (not prepared_message.tool_calls and not any(
-                            isinstance(message, ToolMessage) for message in output)
-                            and not update.get("jump_to")):
-                        update["jump_to"] = "model"
+                # Tier 2: force one more model turn to re-pick a valid verb, but only while the bounded,
+                # request-scoped repair budget remains. The budget is counted on the durable event ledger,
+                # so a Supervisor↔Operator handoff or turn restart no longer consumes the single retry the
+                # old volatile one-shot flag allowed; it is never spent unless an actual re-run fires (the
+                # claim is the last, short-circuited condition), and request_id is already "" when a terminal
+                # blocker halt is pending, so a tripped loop-breaker suppresses the re-run.
+                if (request_id
+                        and not prepared_message.tool_calls
+                        and not any(isinstance(message, ToolMessage) for message in output)
+                        and not update.get("jump_to")
+                        and self._model._claim_unsupported_verb_repair_retry(request_id)):
+                    update["jump_to"] = "model"
             return update
         return result
 
@@ -4969,7 +5004,6 @@ class Model:
         # no-progress backstop. Keyed by node name; reset to 0 whenever that node returns work.
         self._zero_progress_returns: dict[str, int] = {}
         self._request_contract = None
-        self._unsupported_verb_retry_request_id = ""
         self._request_execution_digest = ""
         self._request_admitted_action_digests: set[str] = set()
         self._request_settled_action_digests: set[str] = set()
@@ -5604,8 +5638,9 @@ class Model:
         if not isinstance(contract, RequestContract):
             raise TypeError("request contract must be a RequestContract")
         prior = getattr(self, "_request_contract", None)
-        if not isinstance(prior, RequestContract) or prior.request_id != contract.request_id:
-            self._unsupported_verb_retry_request_id = ""
+        # The unsupported-verb repair budget needs no explicit reset here: it is counted on the
+        # request-scoped event ledger, which is rebuilt whenever the logical request_id changes, so a new
+        # request always starts with a fresh budget and a same-id amend keeps the spent count.
         if (
             not isinstance(prior, RequestContract)
             or prior.request_id != contract.request_id
@@ -7178,6 +7213,30 @@ class Model:
             ledger = RequestEventLedger(normalized)
             self._request_event_ledger = ledger
         return ledger
+
+    def _claim_unsupported_verb_repair_retry(self, request_id: str) -> bool:
+        """Spend one unit of the bounded, request-scoped verb-repair retry budget.
+
+        Returns True when a forced jump-back-to-model re-run is still permitted for this logical request,
+        and records the attempt so the next call sees the decremented budget. The count lives on the
+        request-scoped event ledger (keyed by the logical request_id), so — unlike the former volatile
+        one-shot flag — it is shared across a Supervisor↔Operator handoff and survives turn restarts within
+        the request, while remaining strictly bounded (`_UNSUPPORTED_VERB_REPAIR_BUDGET`) so it can never
+        become an unbounded re-prompt loop. Fail-closed on a missing request id (no forced re-run)."""
+        rid = str(request_id or "").strip()
+        if not rid:
+            return False
+        ledger = self._ensure_request_event_ledger(rid)
+        spent = len(ledger.actual_events(kind="unsupported_verb_repair", phase="retry"))
+        if spent >= _UNSUPPORTED_VERB_REPAIR_BUDGET:
+            return False
+        ledger.record(
+            event_id=f"unsupported_verb_repair:{rid}:{spent + 1}",
+            kind="unsupported_verb_repair",
+            phase="retry",
+            content=str(spent + 1),
+        )
+        return True
 
     def _record_subgoal_control_events(self, state: Any) -> None:
         """Append newly committed typed subgoal transitions to request evidence."""

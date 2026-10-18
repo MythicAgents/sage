@@ -32,7 +32,7 @@ approval route is introduced. Selecting a contract does not authorize a task.
 
 ## Identity and validation
 
-Descriptors live in `Payload_Type/sage/tool_contracts/`. The initial pilot is bound to
+Descriptors live in `Payload_Type/sage/ttps/contracts/`. The initial pilot is bound to
 the exact Certify hash documented in `certify.json`, with four enrolled verbs. Names
 alone do not establish identity: changed bytes under a recognized name are refused,
 and renaming enrolled bytes does not remove validation through a supported wrapper.
