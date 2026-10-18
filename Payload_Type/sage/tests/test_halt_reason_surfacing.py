@@ -19,10 +19,16 @@ import asyncio
 
 import pytest
 
+from types import SimpleNamespace
+
 from ai.langgraph.model import (
+    STOP_REASON_NO_PROGRESS,
     STOP_REASON_OPERATOR,
+    STOP_REASON_RUNTIME_ERROR,
     STOP_REASON_STEP_LIMIT,
+    STOP_REASON_TERMINAL_BLOCKER,
     STOP_REASON_UNSPECIFIED,
+    Model,
     _OperatorStopRequested,
     _StopCheckMiddleware,
     stop_notice_for,
@@ -102,6 +108,58 @@ def test_operator_stop_is_not_reported_as_a_step_limit():
     text = _render(excinfo.value)
     assert "stopped by operator" in text.lower()
     assert "step budget" not in text.lower()
+
+
+# --------------------------------------------------------------------------------------
+# No false success. A self-halt returns through the NORMAL terminal path; it must not be recorded as
+# `complete` with the bare "Completed." narrative (the channel-3 routing-loop halt that reported an
+# objective it never reached). `request_terminal_disposition` is that path's single source of truth.
+# --------------------------------------------------------------------------------------
+
+
+def _disposition(stop, reason):
+    # The method reads only `_stop_requested` and `_stop_reason`, so a minimal stand-in suffices.
+    return Model.request_terminal_disposition(
+        SimpleNamespace(_stop_requested=stop, _stop_reason=reason)
+    )
+
+
+def test_genuine_completion_is_the_only_complete_disposition():
+    status, notice = _disposition(False, "")
+    assert status == "complete"
+    assert notice == ""
+
+
+def test_routing_loop_halt_is_not_reported_as_complete():
+    # The exact channel-3 case: ISC-3b sets a no-progress halt, the graph ends through the normal path.
+    status, notice = _disposition(True, STOP_REASON_NO_PROGRESS)
+    assert status == "stopped"
+    assert status != "complete"
+    assert notice == stop_notice_for(STOP_REASON_NO_PROGRESS)
+    assert "Completed." not in notice
+
+
+def test_terminal_blocker_halt_is_stopped_not_complete():
+    status, notice = _disposition(True, STOP_REASON_TERMINAL_BLOCKER)
+    assert status == "stopped"
+    assert "no progress" in notice.lower()
+
+
+def test_runtime_error_halt_is_recorded_as_error():
+    status, _ = _disposition(True, STOP_REASON_RUNTIME_ERROR)
+    assert status == "error"
+
+
+def test_operator_halt_is_recorded_as_cancelled():
+    status, _ = _disposition(True, STOP_REASON_OPERATOR)
+    assert status == "cancelled"
+
+
+def test_unlabelled_halt_defaults_to_stopped_never_complete():
+    # A halt whose reason was never recorded must still fail closed as a non-complete stop.
+    for reason in ("", STOP_REASON_UNSPECIFIED, "some-unmapped-internal-reason"):
+        status, _ = _disposition(True, reason)
+        assert status == "stopped", reason
 
 
 def test_step_limit_is_not_reported_as_an_operator_stop():

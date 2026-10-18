@@ -109,8 +109,67 @@ def test_happy_path_emits_exactly_one_terminal():
     terminals = chat.terminal_emissions
     assert len(terminals) == 1, f"expected exactly one terminal, got {chat.emissions}"
     assert terminals[0]["kind"] == "complete"
+    # The terminal lands in the MAIN window (assistant key), not a sub-agent/event stream.
+    assert terminals[0]["response_key"].startswith("assistant:")
     # prompt threaded through, first turn → is_interactive False
     assert model.invoked_with == ("do the thing", False)
+
+
+def test_self_halt_terminal_is_not_complete_and_lands_in_main_window():
+    """A self-halt must (1) record a non-`complete` request status (no operator-facing false success,
+    #50) and (2) surface the terminal in the MAIN chat window even when the last streamed block was a
+    collapsed sub-agent panel (#54 — channel 3 ended entirely inside the Mythic_Operator panel)."""
+
+    class _HaltModel(_FakeModel):
+        def request_terminal_disposition(self):
+            return "stopped", "🛑 Stopped — routing loop (test notice)."
+
+        async def invoke(self, prompt, is_interactive=False):
+            self.invoked_with = (prompt, is_interactive)
+            # Simulate a turn whose last streamed block was a delegation (sub-agent) stream and that
+            # produced no main-window final — exactly the channel-3 shape.
+            self._response_emitter.last_response_key = (
+                "agent_text:mythic_operator:chat:5:request:9:7"
+            )
+            self._response_emitter.last_content = ""
+            return ""  # recursion_handback / no main-window final text
+
+    model = _HaltModel(stream=(), return_value="")
+    chat = _DriverChat(model)
+    req = build_chat_request("do the thing", channel_id=5, request_id=9)
+    _run(chat.chat(req))
+
+    terminals = chat.terminal_emissions
+    assert len(terminals) == 1, f"expected exactly one terminal, got {chat.emissions}"
+    terminal = terminals[0]
+    # #50: the request row carries the real disposition, never a false `complete`.
+    assert terminal["kind"] == "response"
+    assert terminal["status"] == "stopped"
+    assert terminal.get("complete_request") is True
+    # #54: forced onto the main-window assistant key, not the sub-agent delegation stream.
+    assert terminal["response_key"].startswith("assistant:")
+    assert not terminal["response_key"].startswith("agent_text:")
+    # The operator sees the halt explanation rather than silence or "Completed.".
+    assert "routing loop (test notice)" in terminal["content"]
+    assert "Completed." not in terminal["content"]
+
+
+def test_genuine_completion_still_uses_send_complete_in_main_window():
+    """Guard the no-regression side: a real completion keeps the `complete` terminal path."""
+
+    class _CompleteModel(_FakeModel):
+        def request_terminal_disposition(self):
+            return "complete", ""
+
+    model = _CompleteModel(stream=("🤖> done",), return_value="all done")
+    chat = _DriverChat(model)
+    req = build_chat_request("do the thing", channel_id=5, request_id=9)
+    _run(chat.chat(req))
+
+    terminals = chat.terminal_emissions
+    assert len(terminals) == 1
+    assert terminals[0]["kind"] == "complete"
+    assert terminals[0]["response_key"].startswith("assistant:")
 
 
 def test_restarted_native_channel_refuses_lost_scope_before_model_invoke():

@@ -1521,13 +1521,31 @@ class SageChat(Chat):
             terminal_metadata = {"channel_id": request.ChannelID}
             if runtime_telemetry:
                 terminal_metadata["runtime_telemetry"] = runtime_telemetry
-            response_key = stream_emitter.last_response_key or turn.response_key
+            # The terminal must land in the MAIN chat window. When the last streamed block was a
+            # delegation/event (sub-agent) stream, its response_key points at the sub-agent panel —
+            # collapsed by default — so keying the terminal there leaves the operator with no visible
+            # final (the channel-3 "nothing in the main window" defect: the whole request ended inside
+            # the Mythic_Operator panel). Reuse the last streamed key only when it is a main-window
+            # assistant block; otherwise force the main turn key.
+            _main_turn_key = f"assistant:{request.RequestID}:turn"
+            response_key = stream_emitter.last_response_key or turn.response_key or _main_turn_key
+            if not str(response_key).startswith("assistant:"):
+                response_key = _main_turn_key
             _last_streamed = stream_emitter.last_content
             if _last_streamed and _last_streamed.lstrip().startswith("Command("):
                 _last_streamed = ""
+            # A self-requested halt (loop-breaker, no-progress, step-budget, …) returns through this normal
+            # terminal path; its status must not be recorded as `complete`, and its fallback narrative must
+            # explain the halt rather than claim "Completed." (the channel-3 false-success defect).
+            terminal_status = "complete"
+            halt_notice = ""
+            disposition = getattr(model, "request_terminal_disposition", None)
+            if callable(disposition):
+                terminal_status, halt_notice = disposition()
             response_content = (
                 native_response_text
                 or _last_streamed
+                or halt_notice
                 or "Completed."
             )
             # ISC-71: model prose is not the provenance authority. Apply one deterministic
@@ -1565,7 +1583,7 @@ class SageChat(Chat):
                         "Request lifecycle reconciliation failed before terminal response."
                     )
                 if callable(record_terminal):
-                    record_terminal("complete")
+                    record_terminal(terminal_status)
                 lifecycle_event_id = record_final(
                     response_content,
                     response_key=response_key,
@@ -1582,13 +1600,28 @@ class SageChat(Chat):
                     )
             elif callable(finalize_visibility):
                 await finalize_visibility()
-            await self.send_complete(
-                request,
-                response_key,
-                metadata=turn._metadata(terminal_metadata),
-                content=response_content,
-                complete_request=True,
-            )
+            # A self-halt must not mark the Mythic request row `complete` — send_complete hardcodes
+            # status="complete", which is the operator-facing false success (the control-transition
+            # ledger already recorded the honest `stopped`/`blocked`). Send the terminal with the real
+            # disposition status; a genuine completion still goes through send_complete unchanged.
+            if terminal_status == "complete":
+                await self.send_complete(
+                    request,
+                    response_key,
+                    metadata=turn._metadata(terminal_metadata),
+                    content=response_content,
+                    complete_request=True,
+                )
+            else:
+                await self.send_response(
+                    request,
+                    response_key,
+                    content=response_content,
+                    complete=True,
+                    complete_request=True,
+                    status=terminal_status,
+                    metadata=turn._metadata(terminal_metadata),
+                )
             if lifecycle_event_id and callable(record_projection):
                 record_projection(
                     lifecycle_event_id,

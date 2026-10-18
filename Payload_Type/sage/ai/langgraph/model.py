@@ -1407,6 +1407,23 @@ _STOP_NOTICE_BY_REASON = {
     ),
 }
 
+# Terminal lifecycle status for a self-requested halt that ends the turn through the NORMAL terminal path.
+# The invariant that matters: a halt is NEVER `complete`. Recording a routing-loop/no-progress/blocker halt
+# as `complete` (with the bare "Completed." fallback narrative) is the false-success defect from channel 3 —
+# the request reported an achieved objective it never reached. Any reason absent here defaults to `stopped`
+# (a deliberate self-halt), never `complete`; only a genuine completion (no stop requested) is `complete`.
+_TERMINAL_STATUS_BY_STOP_REASON = {
+    STOP_REASON_OPERATOR: "cancelled",
+    STOP_REASON_RUNTIME_ERROR: "error",
+    STOP_REASON_PROVIDER_FILTER: "error",
+    STOP_REASON_NO_PROGRESS: "stopped",
+    STOP_REASON_TERMINAL_BLOCKER: "stopped",
+    STOP_REASON_SESSION_ROTATED: "stopped",
+    STOP_REASON_RESUME_REFUSED: "stopped",
+    STOP_REASON_STEP_LIMIT: "stopped",
+    STOP_REASON_UNSPECIFIED: "stopped",
+}
+
 
 def stop_notice_for(reason: str, detail: str = "") -> str:
     """Operator-facing text for a halt, chosen by why it happened.
@@ -7530,6 +7547,21 @@ class Model:
             metadata={"status": normalized},
         )
         return event_id
+
+    def request_terminal_disposition(self) -> tuple[str, str]:
+        """Terminal lifecycle status + an operator-facing fallback narrative for the NORMAL end-of-turn path.
+
+        A self-halt (loop-breaker, no-progress backstop, step-budget, session rotation, …) ends the graph
+        and returns through the SAME normal terminal path as a genuine completion. Recording that path as
+        `complete` with the bare "Completed." fallback is a FALSE SUCCESS — the channel-3 routing-loop halt
+        that reported an objective it never reached. When a stop was requested this turn, the request did not
+        complete: map the recorded reason to a non-`complete` terminal status and hand back the reason's own
+        halt notice so the fallback narrative explains the stop instead of claiming success."""
+        if not getattr(self, "_stop_requested", False):
+            return "complete", ""
+        reason = str(getattr(self, "_stop_reason", "") or STOP_REASON_UNSPECIFIED)
+        status = _TERMINAL_STATUS_BY_STOP_REASON.get(reason, "stopped")
+        return status, stop_notice_for(reason)
 
     def record_final_response_projection(
         self,
