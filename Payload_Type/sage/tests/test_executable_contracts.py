@@ -14,6 +14,7 @@ from ai.langgraph.executable_contracts import (
     UnsupportedExecutableError,
     UnsupportedExecutableVerbError,
     load_contract_for_artifact,
+    load_contract_for_filename,
     load_executable_contract,
     parse_windows_command_line,
     render_windows_command_line,
@@ -77,11 +78,32 @@ def test_loads_only_the_exact_certify_identity_and_four_enrolled_verbs(certify, 
     renamed = _write_descriptor(tmp_path, json.loads(CERTIFY_CONTRACT.read_text(encoding="utf-8")))
     assert load_executable_contract(renamed, CERTIFY_SHA256).filename == "Certify.exe"
 
-    _assert_rejected(
-        lambda: load_executable_contract(CERTIFY_CONTRACT, "0" * 64), "sha-256", "does not match"
-    )
+    # Non-pinned identity (#56): the contract loads for any well-formed observed hash (a CI-rebuilt
+    # binary), since identity is the filename and the inspected hash is advisory provenance.
+    assert load_executable_contract(CERTIFY_CONTRACT, "0" * 64).filename == "Certify.exe"
+    # A malformed (non-SHA-256) observed hash is still rejected on shape.
     _assert_rejected(
         lambda: load_executable_contract(CERTIFY_CONTRACT, "Certify.exe"), "lowercase sha-256"
+    )
+
+
+def test_pinned_allowlist_enforces_byte_integrity_while_non_pinned_accepts_any_build(tmp_path):
+    # #56: a contract that pins an integrity allowlist (sealed/eval) accepts only the listed builds;
+    # a non-pinned contract (the default) accepts any build of the named tool.
+    pinned_hash = hashlib.sha256(b"the one trusted build").hexdigest()
+    other_hash = hashlib.sha256(b"a different build").hexdigest()
+    descriptor = _synthetic_descriptor(pinned_hash)
+    descriptor["binary"]["accepted_sha256"] = [pinned_hash]
+    path = _write_descriptor(tmp_path, descriptor)
+    # In-allowlist build loads; off-allowlist build is rejected on identity.
+    assert load_executable_contract(path, pinned_hash).filename == "unrelated-cli.exe"
+    _assert_rejected(
+        lambda: load_executable_contract(path, other_hash), "allowlist"
+    )
+    # By-filename resolution honors the same allowlist.
+    assert load_contract_for_filename(tmp_path, "unrelated-cli.exe", pinned_hash) is not None
+    _assert_rejected(
+        lambda: load_contract_for_filename(tmp_path, "unrelated-cli.exe", other_hash), "allowlist"
     )
 
 

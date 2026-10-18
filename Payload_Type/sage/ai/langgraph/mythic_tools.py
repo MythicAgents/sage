@@ -4928,20 +4928,12 @@ class MythicTools:
             raise ValueError("inline assembly File metadata or hash identity is incomplete")
         content = await self._download_registered_file_bytes_bounded(binding["value"])
         artifact_sha256 = hashlib.sha256(content).hexdigest()
-        try:
-            contract = executable_contracts.load_contract_for_artifact(
-                _EXECUTABLE_CONTRACT_ROOT, artifact_sha256
-            )
-        except executable_contracts.UnsupportedExecutableError as exc:
-            if executable_contracts.recognizes_executable_filename(
-                _EXECUTABLE_CONTRACT_ROOT, metadata["filename_utf8"]
-            ):
-                raise ValueError(
-                    "recognized executable filename has changed or unsupported bytes; use the "
-                    "registered selector and typed executable schema"
-                ) from exc
-            contract = None
-        if contract is not None:
+        # Identity is the filename: an enrolled executable may not be smuggled through the inline File
+        # param regardless of its (rebuilt) bytes. If a contract claims this filename, it must go
+        # through the registered selector and typed schema.
+        if executable_contracts.recognizes_executable_filename(
+            _EXECUTABLE_CONTRACT_ROOT, metadata["filename_utf8"]
+        ):
             raise ValueError(
                 "enrolled executable bytes must use the registered selector and typed "
                 "executable schema"
@@ -5168,15 +5160,16 @@ class MythicTools:
         content = await self._download_registered_file_bytes_bounded(str(row["agent_file_id"]))
         sha256 = hashlib.sha256(content).hexdigest()
         try:
-            contract = executable_contracts.load_contract_for_artifact(
-                _EXECUTABLE_CONTRACT_ROOT, sha256
+            # Identity is the filename: a CI-rebuilt binary (new hash, same name) resolves its
+            # contract instead of being hard-blocked. A None result is an un-contracted executable
+            # (handled open). A contract that pins an integrity allowlist still rejects off-list bytes.
+            contract = executable_contracts.load_contract_for_filename(
+                _EXECUTABLE_CONTRACT_ROOT, filename, sha256
             )
-        except executable_contracts.UnsupportedExecutableError as exc:
-            if executable_contracts.recognizes_executable_filename(
-                _EXECUTABLE_CONTRACT_ROOT, filename
-            ):
-                raise ValueError("recognized executable filename has changed or unsupported bytes") from exc
-            contract = None
+        except executable_contracts.ExecutableIdentityError as exc:
+            raise ValueError(
+                "enrolled executable bytes are not in this contract's accepted-hash allowlist"
+            ) from exc
         identity = {
             key: row.get(key) for key in
             ("id", "agent_file_id", "filename_utf8", "md5", "sha1", "complete")

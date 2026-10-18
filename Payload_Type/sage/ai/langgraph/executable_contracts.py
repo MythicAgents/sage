@@ -51,7 +51,14 @@ class _StrictModel(BaseModel):
 
 class BinaryDescriptor(_StrictModel):
     filename: StrictStr
-    sha256: StrictStr
+    # The inspected REFERENCE hash (provenance of the build the grammar was derived from), not the
+    # identity gate. Optional, because a CI/CD pipeline rebuilds .NET tools on every run so the file
+    # hash changes every build while the CLI grammar does not. Contract identity is the filename.
+    sha256: StrictStr | None = None
+    # Optional integrity allowlist. When NON-EMPTY the contract is strict: the observed binary hash
+    # must be one of these (a sealed/eval run that genuinely pins known-good builds). When empty
+    # (the default) the filename identifies the contract and the observed hash is advisory provenance.
+    accepted_sha256: list[StrictStr] = []
     display_version: StrictStr | None = None
     assembly_version: StrictStr | None = None
     clr_version: StrictStr | None = None
@@ -208,7 +215,10 @@ class ExecutableContract:
     def __init__(self, descriptor: ContractDescriptor, descriptor_sha256: str):
         self.descriptor = descriptor
         self.descriptor_sha256 = descriptor_sha256
-        self.artifact_sha256 = descriptor.binary.sha256
+        # Reference hash (provenance of the inspected build), may be None. NOT the identity gate;
+        # identity is the filename. The integrity allowlist (when set) is the only hash gate.
+        self.reference_sha256 = descriptor.binary.sha256
+        self._accepted_sha256 = frozenset(descriptor.binary.accepted_sha256)
         self._options_models: dict[str, type[BaseModel]] = {}
         self._invocation_models: dict[str, type[BaseModel]] = {}
         self._validate_descriptor()
@@ -216,6 +226,12 @@ class ExecutableContract:
     @property
     def filename(self) -> str:
         return self.descriptor.binary.filename
+
+    @property
+    def artifact_sha256(self) -> str | None:
+        """The inspected REFERENCE hash (provenance), or None. Kept for callers that need a concrete
+        hash for this contract; identity is the filename, so this is not the identity gate."""
+        return self.reference_sha256
 
     @property
     def enrolled_verbs(self) -> tuple[str, ...]:
@@ -228,7 +244,10 @@ class ExecutableContract:
     def _validate_descriptor(self) -> None:
         if self.descriptor.contract_version < 1:
             raise ContractValidationError("contract_version must be positive")
-        _checked_sha256(self.descriptor.binary.sha256, label="descriptor binary.sha256")
+        if self.descriptor.binary.sha256 is not None:
+            _checked_sha256(self.descriptor.binary.sha256, label="descriptor binary.sha256")
+        for pinned in self.descriptor.binary.accepted_sha256:
+            _checked_sha256(pinned, label="descriptor binary.accepted_sha256 entry")
         if not self.descriptor.binary.filename or self.descriptor.binary.filename != self.descriptor.binary.filename.strip():
             raise ContractValidationError("descriptor binary filename must be non-empty and unambiguous")
         registered: set[str] = set()
@@ -489,7 +508,10 @@ class ExecutableContract:
         if reparsed != argv:
             raise ContractValidationError("rendered executable arguments do not round-trip through CommandLineToArgvW")
         return PreparedInvocation(
-            artifact_sha256=self.artifact_sha256,
+            # The OBSERVED artifact hash (the actual uploaded binary), so the approval card binds to
+            # the real bytes and revalidate enforces "same binary approved == executed", regardless of
+            # whether the contract pins a reference hash.
+            artifact_sha256=artifact_sha256,
             contract_sha256=self.descriptor_sha256,
             contract_version=self.descriptor.contract_version,
             verb=verb,
@@ -567,7 +589,9 @@ class ExecutableContract:
     ) -> PreparedInvocation:
         self.assert_artifact_identity(artifact_sha256)
         source = prepared.as_binding() if isinstance(prepared, PreparedInvocation) else dict(prepared)
-        if source.get("artifact_sha256") != self.artifact_sha256:
+        # The binding records the OBSERVED hash at prepare time; require the same binary bytes at
+        # execute time (approved binary == executed binary), independent of any reference hash.
+        if source.get("artifact_sha256") != artifact_sha256:
             raise ExecutableIdentityError("prepared invocation artifact identity changed")
         if source.get("contract_sha256") != self.descriptor_sha256:
             raise ExecutableIdentityError("prepared invocation contract identity changed")
@@ -581,13 +605,22 @@ class ExecutableContract:
         return rebuilt
 
     def assert_artifact_identity(self, artifact_sha256: Any) -> None:
+        # Contract identity is the filename; the observed hash is validated for shape and, only when
+        # the contract pins an integrity allowlist (sealed/eval), required to be one of the pinned
+        # builds. A non-pinned contract accepts any build of the named tool (the CI-rebuild case),
+        # recording the observed hash as provenance in the prepared binding.
         actual = _checked_sha256(artifact_sha256, label="actual artifact SHA-256")
-        if actual != self.artifact_sha256:
-            raise ExecutableIdentityError("actual artifact SHA-256 does not match the executable contract")
+        if self._accepted_sha256 and actual not in self._accepted_sha256:
+            raise ExecutableIdentityError(
+                "actual artifact SHA-256 is not in this contract's accepted-hash allowlist"
+            )
 
 
 def load_executable_contract(path: str | Path, artifact_sha256: str) -> ExecutableContract:
-    """Load one descriptor and require its embedded artifact hash to match exactly."""
+    """Load one descriptor and assert its integrity policy against the observed artifact hash.
+
+    The hash is validated for shape and, only when the contract pins an allowlist, required to be one
+    of the pinned builds. A non-pinned contract loads for any build of the named tool."""
     raw, descriptor_sha256 = _read_descriptor(Path(path))
     try:
         descriptor = ContractDescriptor.model_validate(raw)
@@ -598,8 +631,40 @@ def load_executable_contract(path: str | Path, artifact_sha256: str) -> Executab
     return contract
 
 
+def load_contract_for_filename(
+    directory: str | Path, filename: Any, artifact_sha256: str
+) -> ExecutableContract | None:
+    """Resolve the single contract that claims ``filename`` (identity is the filename, not the bytes).
+
+    This is the runtime resolver. A CI-rebuilt binary (same name, new hash) resolves its contract
+    instead of being hard-blocked. Returns None when no contract claims the filename (an un-contracted
+    executable, handled open by the caller). Raises ContractValidationError when more than one contract
+    claims the same filename, and ExecutableIdentityError when a contract that pins an allowlist rejects
+    the observed bytes."""
+    if type(filename) is not str or not filename.strip():
+        return None
+    wanted = filename.strip().casefold()
+    expected = _checked_sha256(artifact_sha256, label="actual artifact SHA-256")
+    matches: list[Path] = []
+    for path in sorted(Path(directory).glob("*.json")):
+        try:
+            raw, _ = _read_descriptor(path)
+            descriptor = ContractDescriptor.model_validate(raw)
+        except (ContractValidationError, ValidationError):
+            continue
+        if descriptor.binary.filename.casefold() == wanted:
+            matches.append(path)
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise ContractValidationError("filename matches multiple executable contracts")
+    return load_executable_contract(matches[0], expected)
+
+
 def load_contract_for_artifact(directory: str | Path, artifact_sha256: str) -> ExecutableContract:
-    """Find exactly one contract by artifact hash; filenames are not identity."""
+    """Find exactly one contract whose reference hash or pinned allowlist contains the artifact hash.
+
+    By-hash lookup retained for strict/eval callers; the runtime uses ``load_contract_for_filename``."""
     expected = _checked_sha256(artifact_sha256, label="actual artifact SHA-256")
     matches: list[ExecutableContract] = []
     for path in sorted(Path(directory).glob("*.json")):
@@ -607,7 +672,10 @@ def load_contract_for_artifact(directory: str | Path, artifact_sha256: str) -> E
             raw, _ = _read_descriptor(path)
         except ContractValidationError:
             continue
-        if isinstance(raw.get("binary"), dict) and raw["binary"].get("sha256") == expected:
+        binary = raw.get("binary")
+        if not isinstance(binary, dict):
+            continue
+        if binary.get("sha256") == expected or expected in (binary.get("accepted_sha256") or []):
             matches.append(load_executable_contract(path, expected))
     if not matches:
         raise UnsupportedExecutableError("artifact SHA-256 has no enrolled executable contract")

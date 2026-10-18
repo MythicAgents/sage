@@ -576,30 +576,33 @@ def test_known_raw_legacy_malicious_and_mixed_forms_fail_before_native_issue(tmp
     assert seen["issued"] == 0
 
 
-def test_extensionless_renamed_enrolled_bytes_validate_and_changed_recognized_bytes_fail(tmp_path, monkeypatch):
+def test_filename_identity_accepts_a_rebuilt_binary_and_ignores_an_unclaimed_name(tmp_path, monkeypatch):
+    # #56: contract identity is the filename, not the bytes.
     exact = b"same exact enrolled bytes"
     client, _, root, _, _ = _fixture(
         tmp_path, monkeypatch,
         filenames=("Certify.exe", "alias"),
         contents={"Certify.exe": exact, "alias": exact},
     )
-    normalized, binding = asyncio.run(client._validated_executable_parameters(
+    # An unclaimed filename is un-contracted (no typed binding), even with enrolled bytes.
+    _normalized, binding = asyncio.run(client._validated_executable_parameters(
         "execute_assembly", {"Assembly": "alias", "Arguments": "enum-cas"}, 7,
         _schema("Certify.exe", "alias"),
     ))
-    assert normalized == {"Assembly": "alias", "Arguments": "enum-cas"}
-    assert binding["file"]["filename_utf8"] == "alias"
+    assert binding is None
 
-    changed = b"same name changed bytes"
-    row = copy.deepcopy(asyncio.run(client._find_uploaded_file_by_name("Certify.exe")))
-    client._download_registered_file_bytes_bounded = AsyncMock(return_value=changed)
-    _assert_async_rejected(
-        client._validated_executable_parameters(
-            "execute_assembly", {"Assembly": "Certify.exe", "Arguments": "enum-cas"}, 7,
-            _schema("Certify.exe", "alias"),
-        ),
-        "changed", "bytes",
-    )
+    # A CI-rebuilt Certify.exe (same name, DIFFERENT bytes/hash) resolves its contract and validates,
+    # instead of being hard-blocked -- the core #56 fix. The binding records the OBSERVED hash.
+    rebuilt = b"freshly rebuilt certify bytes with a new hash"
+    assert hashlib.sha256(rebuilt).hexdigest() != hashlib.sha256(exact).hexdigest()
+    client._download_registered_file_bytes_bounded = AsyncMock(return_value=rebuilt)
+    _normalized, binding = asyncio.run(client._validated_executable_parameters(
+        "execute_assembly", {"Assembly": "Certify.exe", "Arguments": "enum-cas"}, 7,
+        _schema("Certify.exe", "alias"),
+    ))
+    assert binding["file"]["filename_utf8"] == "Certify.exe"
+    assert binding["file"]["sha256"] == hashlib.sha256(rebuilt).hexdigest()
+    assert binding["invocation"]["verb"] == "enum-cas"
 
 
 def _assert_async_rejected(coroutine, *needles):
@@ -701,10 +704,12 @@ def test_parser_output_is_construction_only_for_exact_enrolled_binding(tmp_path,
             "execute_assembly", "Certify.exe enum-cas", 7
         ))
         second = asyncio.run(client.issue_task_and_waitfor_task_output(
-            "inline_assembly", "Alias.exe   enum-cas", 7
+            "inline_assembly", "Certify.exe   enum-cas", 7
         ))
     assert "required option" in first.lower()
-    assert second.startswith("STOP — equivalent enrolled executable invocation")
+    # Filename identity (#56): the claimed "Certify.exe" is refused through the inline route and must
+    # use the registered selector; it is never issued as a generic inline task.
+    assert "STOP" in second and "enrolled executable" in second
     assert calls["issued"] == 1
     assert command_builder.classify_result(
         "execute_assembly", "Required option 'x' is missing."

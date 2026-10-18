@@ -75,13 +75,27 @@ def test_valid_enrolled_bytes_file_route_directs_to_registered_typed_route(
     sink.assert_not_awaited()
 
 
-def test_renamed_enrolled_bytes_fail_before_file_sink(tmp_path, monkeypatch):
+def test_renamed_enrolled_bytes_reach_new_assembly_group(tmp_path, monkeypatch):
+    # Filename identity (#56): a binary whose name is not claimed by any contract is un-contracted and
+    # runs open through the New Assembly group, even when its bytes match an enrolled tool. Byte-level
+    # "enrolled bytes smuggled under a different name" detection is intentionally dropped -- it is
+    # incompatible with CI rebuilds (which change the hash, not the name) and un-contracted tools are
+    # open by design. The contract here claims "Certify.exe"; the upload is "Renamed.exe".
     client, _descriptor, row, _metadata, _by_uuid = _inline_fixture(
         tmp_path, monkeypatch, filename="Renamed.exe"
     )
-    result, sink = _direct_issue(client, row, "find")
-    assert "enrolled executable bytes must use the registered selector" in result
-    sink.assert_not_awaited()
+    sink = AsyncMock(side_effect=RuntimeError("inert task sink reached"))
+    with patch.object(client, "_turn_authority_issue_blocker", return_value=""), patch.object(
+        client, "_issue_mythic_task", sink,
+    ):
+        asyncio.run(client.issue_task_and_waitfor_task_output(
+            "inline_assembly",
+            {"assembly_file": row["agent_file_id"], "assembly_arguments": "triage"},
+            7,
+        ))
+    sink.assert_awaited_once()
+    assert sink.call_args.args[1] == {"New Assembly": row["agent_file_id"], "Arguments": "triage"}
+    assert sink.call_args.kwargs["parameter_group_name"] == "New Assembly"
 
 
 def test_recognized_filename_with_unknown_bytes_fails_before_file_sink(
@@ -95,8 +109,11 @@ def test_recognized_filename_with_unknown_bytes_fails_before_file_sink(
     by_uuid[row["agent_file_id"]] = unknown
     assert descriptor["binary"]["sha256"] != hashlib.sha256(unknown).hexdigest()
 
+    # Filename identity (#56): the name "Certify.exe" is claimed by the contract, so an inline-File
+    # upload of those bytes (even changed/rebuilt bytes) is refused -- an enrolled executable must go
+    # through the registered selector and typed schema, regardless of its exact bytes.
     result, sink = _direct_issue(client, row, "find")
-    assert "recognized executable filename has changed or unsupported bytes" in result
+    assert "enrolled executable bytes must use the registered selector" in result
     sink.assert_not_awaited()
 
 
