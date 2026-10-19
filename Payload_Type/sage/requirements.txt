@@ -4,7 +4,7 @@ langchain-mcp-adapters==0.3.2
 # langchain-mcp-adapters 0.3.2 still imports `mcp.server.fastmcp` and declares `mcp<2.0.0,>=1.24.0`.
 # mcp 2.0.0 removed that module, so mcp must stay below 2.0 until adapters drops the fastmcp import.
 # Track: https://github.com/langchain-ai/langchain-mcp-adapters/issues/578
-mcp==1.28.1
+mcp==1.30.0
 langchain-anthropic==1.5.4
 langchain-aws==1.7.0
 langchain-openai==1.4.2
@@ -29,7 +29,7 @@ grpcio-tools==1.83.0
 # websockets<16. Blocked until mythic ships a release allowing gql 4.1+.
 gql==4.0.0
 websockets==15.0.1
-aiohttp==3.14.3
+aiohttp==3.14.4
 aiosqlite==0.22.1
 arize-phoenix==19.19.0
 arize-phoenix-evals==3.3.0
