@@ -75,7 +75,9 @@ def fixture_bindings(sink: MythicTools) -> None:
 
     async def file_by_name(name):
         return ({"id": 1, "agent_file_id": "00000000-0000-0000-0000-000000000001",
-                 "filename_utf8": name, "complete": True}
+                 "filename_utf8": name, "complete": True,
+                 "md5": hashlib.md5(ARTIFACT).hexdigest(),
+                 "sha1": hashlib.sha1(ARTIFACT).hexdigest()}
                 if name == "Certify.exe" else None)
 
     async def file_bytes(file_id):
@@ -245,7 +247,7 @@ def classify(result: dict, seed: dict | None) -> dict:
 async def run_case(profile, output_dir, ledger, limits, tls_context, ips, contract_root):
     source = SAGE / "ttps" / "contracts" / "certify.json"
     descriptor = json.loads(source.read_text(encoding="utf-8"))
-    descriptor["binary"]["sha256"] = hashlib.sha256(ARTIFACT).hexdigest()
+    descriptor["binary"]["sha1"] = hashlib.sha1(ARTIFACT).hexdigest()
     contract_root.mkdir()
     (contract_root / "certify.json").write_text(json.dumps(descriptor), encoding="utf-8")
     async def grouped(_client, payload, command):
@@ -255,7 +257,7 @@ async def run_case(profile, output_dir, ledger, limits, tls_context, ips, contra
                 "New Assembly": {"parameters": fixture_schema()[2:]}}
     def setup(model, row):
         fixture_bindings(model.mythic_client)
-        row["fixture_artifact_sha256"] = hashlib.sha256(ARTIFACT).hexdigest()
+        row["fixture_artifact_sha1"] = hashlib.sha1(ARTIFACT).hexdigest()
         row["source_contract_sha256"] = sha256(source)
     SeededMeteredTransport.configured_ledger = ledger
     SeededMeteredTransport.instance = None

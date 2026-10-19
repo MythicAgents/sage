@@ -428,9 +428,9 @@ def test_dynamic_choice_query_failure_denies_before_file_download(tmp_path, monk
 
 def _fixture(tmp_path: Path, monkeypatch, *, filenames=("Certify.exe",), contents=None):
     contents = contents or {name: b"same exact enrolled bytes" for name in filenames}
-    enrolled_sha = hashlib.sha256(next(iter(contents.values()))).hexdigest()
+    enrolled_sha1 = hashlib.sha1(next(iter(contents.values()))).hexdigest()
     descriptor = json.loads(CERTIFY_SOURCE.read_text(encoding="utf-8"))
-    descriptor["binary"]["sha256"] = enrolled_sha
+    descriptor["binary"]["sha1"] = enrolled_sha1
     root = tmp_path / "contracts"
     root.mkdir()
     (root / "certify.json").write_text(json.dumps(descriptor), encoding="utf-8")
@@ -518,7 +518,7 @@ def test_discovery_emits_full_strict_schema_and_prepare_renders_native_parameter
         ),
     }
     binding = prepared["visibility_context"]["_sage_prepared_binding"]["executable"]
-    assert binding["invocation"]["artifact_sha256"] == descriptor["binary"]["sha256"]
+    assert binding["invocation"]["artifact_sha1"] == descriptor["binary"]["sha1"]
     assert binding["invocation"]["argv"][0] == "request"
 
 
@@ -579,7 +579,7 @@ def test_known_raw_legacy_malicious_and_mixed_forms_fail_before_native_issue(tmp
 def test_filename_identity_accepts_a_rebuilt_binary_and_ignores_an_unclaimed_name(tmp_path, monkeypatch):
     # #56: contract identity is the filename, not the bytes.
     exact = b"same exact enrolled bytes"
-    client, _, root, _, _ = _fixture(
+    client, _, root, rows, _ = _fixture(
         tmp_path, monkeypatch,
         filenames=("Certify.exe", "alias"),
         contents={"Certify.exe": exact, "alias": exact},
@@ -592,16 +592,21 @@ def test_filename_identity_accepts_a_rebuilt_binary_and_ignores_an_unclaimed_nam
     assert binding is None
 
     # A CI-rebuilt Certify.exe (same name, DIFFERENT bytes/hash) resolves its contract and validates,
-    # instead of being hard-blocked -- the core #56 fix. The binding records the OBSERVED hash.
-    rebuilt = b"freshly rebuilt certify bytes with a new hash"
-    assert hashlib.sha256(rebuilt).hexdigest() != hashlib.sha256(exact).hexdigest()
-    client._download_registered_file_bytes_bounded = AsyncMock(return_value=rebuilt)
+    # instead of being hard-blocked -- the core #56 fix. The rebuild is simulated by Mythic's file
+    # metadata reporting a NEW SHA-1 (the binary is never downloaded/rehashed). The binding records
+    # that observed SHA-1.
+    rebuilt_sha1 = hashlib.sha1(b"freshly rebuilt certify bytes with a new hash").hexdigest()
+    assert rebuilt_sha1 != hashlib.sha1(exact).hexdigest()
+    rows["Certify.exe"]["sha1"] = rebuilt_sha1
+    client._find_uploaded_file_by_name = AsyncMock(
+        side_effect=lambda name: copy.deepcopy(rows.get(name))
+    )
     _normalized, binding = asyncio.run(client._validated_executable_parameters(
         "execute_assembly", {"Assembly": "Certify.exe", "Arguments": "enum-cas"}, 7,
         _schema("Certify.exe", "alias"),
     ))
     assert binding["file"]["filename_utf8"] == "Certify.exe"
-    assert binding["file"]["sha256"] == hashlib.sha256(rebuilt).hexdigest()
+    assert binding["file"]["sha1"] == rebuilt_sha1
     assert binding["invocation"]["verb"] == "enum-cas"
 
 
@@ -612,18 +617,24 @@ def _assert_async_rejected(coroutine, *needles):
         assert needle in str(caught.value).lower()
 
 
-def test_download_or_schema_failure_cannot_make_known_or_renamed_artifact_generic(tmp_path, monkeypatch):
-    client, _, _, _, _ = _fixture(
+def test_metadata_or_schema_failure_cannot_make_known_or_renamed_artifact_generic(tmp_path, monkeypatch):
+    client, _, _, rows, _ = _fixture(
         tmp_path, monkeypatch, filenames=("Certify.exe", "renamed-tool")
     )
     client._authenticate_live_command = AsyncMock(
         side_effect=lambda command, _callback: {"status": "available", "command": command}
     )
-    client._download_registered_file_bytes_bounded = AsyncMock(side_effect=ValueError("download failed"))
+    # The contract path never downloads the binary; identity is the filename plus Mythic's own SHA-1
+    # metadata. A KNOWN (contracted) artifact whose registered row lacks a well-formed SHA-1 must fail
+    # closed, not fall through to a generic handling that would bypass the typed schema.
+    rows["Certify.exe"]["sha1"] = ""
+    client._find_uploaded_file_by_name = AsyncMock(
+        side_effect=lambda name: copy.deepcopy(rows.get(name))
+    )
     _assert_async_rejected(
         client._validated_executable_parameters(
-            "execute_assembly", "renamed-tool enum-cas", 7, _schema("renamed-tool")
-        ), "download failed"
+            "execute_assembly", "Certify.exe enum-cas", 7, _schema("Certify.exe")
+        ), "identity"
     )
     _assert_async_rejected(
         client._validated_executable_parameters(

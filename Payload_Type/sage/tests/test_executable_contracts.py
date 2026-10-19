@@ -24,18 +24,18 @@ from ai.langgraph.executable_contracts import (
 
 SAGE_ROOT = Path(__file__).resolve().parents[1]
 CERTIFY_CONTRACT = SAGE_ROOT / "ttps" / "contracts" / "certify.json"
-CERTIFY_SHA256 = "1383e8bca90e4be70ff2224b7e2af465a8f3d5bede1fde60f1ece71e3b02d346"
+CERTIFY_SHA1 = "7f949a895c51e747fa334b380a9511c4442ad5d0"
 
 
 @pytest.fixture
 def certify():
-    return load_executable_contract(CERTIFY_CONTRACT, CERTIFY_SHA256)
+    return load_executable_contract(CERTIFY_CONTRACT, CERTIFY_SHA1)
 
 
-def _synthetic_descriptor(sha256: str) -> dict:
+def _synthetic_descriptor(sha1: str) -> dict:
     return {
         "contract_version": 7,
-        "binary": {"filename": "unrelated-cli.exe", "sha256": sha256},
+        "binary": {"filename": "unrelated-cli.exe", "sha1": sha1},
         "registered_verbs": [
             {"name": "inspect", "options_type": "Other.Options", "enrolled": True},
             {"name": "compiled-out", "enrolled": True},
@@ -76,24 +76,24 @@ def test_loads_only_the_exact_certify_identity_and_four_enrolled_verbs(certify, 
     assert certify.filename == "Certify.exe"
     assert certify.enrolled_verbs == ("enum-cas", "enum-templates", "request", "request-download")
     renamed = _write_descriptor(tmp_path, json.loads(CERTIFY_CONTRACT.read_text(encoding="utf-8")))
-    assert load_executable_contract(renamed, CERTIFY_SHA256).filename == "Certify.exe"
+    assert load_executable_contract(renamed, CERTIFY_SHA1).filename == "Certify.exe"
 
     # Non-pinned identity (#56): the contract loads for any well-formed observed hash (a CI-rebuilt
     # binary), since identity is the filename and the inspected hash is advisory provenance.
-    assert load_executable_contract(CERTIFY_CONTRACT, "0" * 64).filename == "Certify.exe"
-    # A malformed (non-SHA-256) observed hash is still rejected on shape.
+    assert load_executable_contract(CERTIFY_CONTRACT, "0" * 40).filename == "Certify.exe"
+    # A malformed (non-SHA-1) observed hash is still rejected on shape.
     _assert_rejected(
-        lambda: load_executable_contract(CERTIFY_CONTRACT, "Certify.exe"), "lowercase sha-256"
+        lambda: load_executable_contract(CERTIFY_CONTRACT, "Certify.exe"), "lowercase sha-1"
     )
 
 
 def test_pinned_allowlist_enforces_byte_integrity_while_non_pinned_accepts_any_build(tmp_path):
     # #56: a contract that pins an integrity allowlist (sealed/eval) accepts only the listed builds;
     # a non-pinned contract (the default) accepts any build of the named tool.
-    pinned_hash = hashlib.sha256(b"the one trusted build").hexdigest()
-    other_hash = hashlib.sha256(b"a different build").hexdigest()
+    pinned_hash = hashlib.sha1(b"the one trusted build").hexdigest()
+    other_hash = hashlib.sha1(b"a different build").hexdigest()
     descriptor = _synthetic_descriptor(pinned_hash)
-    descriptor["binary"]["accepted_sha256"] = [pinned_hash]
+    descriptor["binary"]["accepted_sha1"] = [pinned_hash]
     path = _write_descriptor(tmp_path, descriptor)
     # In-allowlist build loads; off-allowlist build is rejected on identity.
     assert load_executable_contract(path, pinned_hash).filename == "unrelated-cli.exe"
@@ -108,11 +108,11 @@ def test_pinned_allowlist_enforces_byte_integrity_while_non_pinned_accepts_any_b
 
 
 def test_hash_lookup_never_uses_a_filename_or_returns_unknown_artifacts(tmp_path):
-    artifact_sha256 = hashlib.sha256(b"unrelated binary bytes").hexdigest()
-    _write_descriptor(tmp_path, _synthetic_descriptor(artifact_sha256), "renamed-description.json")
-    contract = load_contract_for_artifact(tmp_path, artifact_sha256)
+    artifact_sha1 = hashlib.sha1(b"unrelated binary bytes").hexdigest()
+    _write_descriptor(tmp_path, _synthetic_descriptor(artifact_sha1), "renamed-description.json")
+    contract = load_contract_for_artifact(tmp_path, artifact_sha1)
     assert contract.filename == "unrelated-cli.exe"
-    _assert_rejected(lambda: load_contract_for_artifact(tmp_path, hashlib.sha256(b"other").hexdigest()), "no enrolled")
+    _assert_rejected(lambda: load_contract_for_artifact(tmp_path, hashlib.sha1(b"other").hexdigest()), "no enrolled")
 
 
 def test_per_verb_models_and_json_schemas_have_explicit_typed_options(certify):
@@ -156,10 +156,10 @@ def test_per_verb_models_and_json_schemas_have_explicit_typed_options(certify):
     ],
 )
 def test_prepares_each_enrolled_verb_and_applies_declared_defaults(certify, verb, supplied, expected):
-    prepared = certify.prepare(verb, supplied, artifact_sha256=CERTIFY_SHA256)
+    prepared = certify.prepare(verb, supplied, artifact_sha1=CERTIFY_SHA1)
     assert prepared.argument_string == expected
     assert parse_windows_command_line(prepared.argument_string) == prepared.argv
-    assert certify.revalidate(prepared.as_binding(), artifact_sha256=CERTIFY_SHA256) == prepared
+    assert certify.revalidate(prepared.as_binding(), artifact_sha1=CERTIFY_SHA1) == prepared
 
 
 @pytest.mark.parametrize("verb", ["forge", "request-agent", "anything", "enumcas"])
@@ -167,7 +167,7 @@ def test_unenrolled_verbs_without_a_declared_alias_fail_closed(certify, verb):
     # Legacy verbs WITH a declared alias (find/cas/download) are repaired instead —
     # see test_declared_legacy_aliases_repair_deterministically. Everything else,
     # including a near-miss like "enumcas", still fails closed with the guard intact.
-    _assert_rejected(lambda: certify.prepare(verb, {}, artifact_sha256=CERTIFY_SHA256), "not enrolled")
+    _assert_rejected(lambda: certify.prepare(verb, {}, artifact_sha1=CERTIFY_SHA1), "not enrolled")
 
 
 @pytest.mark.parametrize(
@@ -182,18 +182,18 @@ def test_unenrolled_verbs_without_a_declared_alias_fail_closed(certify, verb):
 def test_declared_legacy_aliases_repair_deterministically(
     certify, legacy, supplied, expected_verb, expected_args
 ):
-    prepared = certify.prepare(legacy, supplied, artifact_sha256=CERTIFY_SHA256)
+    prepared = certify.prepare(legacy, supplied, artifact_sha1=CERTIFY_SHA1)
     assert prepared.verb == expected_verb
     assert prepared.argument_string == expected_args
     assert prepared.repaired_from == legacy
     # The repair is advisory provenance only: canonical invocation identity is the
     # enrolled form, so as_binding() carries no repaired_from and revalidate round-trips.
     assert "repaired_from" not in prepared.as_binding()
-    assert certify.revalidate(prepared.as_binding(), artifact_sha256=CERTIFY_SHA256) == prepared
+    assert certify.revalidate(prepared.as_binding(), artifact_sha1=CERTIFY_SHA1) == prepared
 
 
 def test_legacy_alias_repairs_through_the_raw_string_parser(certify):
-    prepared = certify.parse_and_prepare("cas --filter-vulnerable", artifact_sha256=CERTIFY_SHA256)
+    prepared = certify.parse_and_prepare("cas --filter-vulnerable", artifact_sha1=CERTIFY_SHA1)
     assert prepared.verb == "enum-cas"
     assert prepared.repaired_from == "cas"
     assert prepared.argument_string == "enum-cas --filter-vulnerable"
@@ -203,33 +203,33 @@ def test_repaired_verb_still_enforces_target_option_grammar(certify):
     # Repair rewrites the verb, not the options: request-download requires ca+id, so a
     # bare `download` with no options surfaces a recoverable grammar error, not a loop.
     _assert_rejected(
-        lambda: certify.prepare("download", {}, artifact_sha256=CERTIFY_SHA256),
+        lambda: certify.prepare("download", {}, artifact_sha1=CERTIFY_SHA1),
         "required",
     )
 
 
 def test_unsupported_verb_lists_only_this_artifacts_enrolled_verbs(certify, tmp_path):
     with pytest.raises(UnsupportedExecutableVerbError) as caught:
-        certify.prepare("forge", {}, artifact_sha256=CERTIFY_SHA256)
+        certify.prepare("forge", {}, artifact_sha1=CERTIFY_SHA1)
     assert str(caught.value) == (
         "executable verb 'forge' is not enrolled; enrolled verbs for this artifact: "
         "enum-cas, enum-templates, request, request-download"
     )
 
-    artifact_sha256 = hashlib.sha256(b"other exact executable").hexdigest()
-    descriptor = _synthetic_descriptor(artifact_sha256)
+    artifact_sha1 = hashlib.sha1(b"other exact executable").hexdigest()
+    descriptor = _synthetic_descriptor(artifact_sha1)
     descriptor["legacy_unregistered_verbs"] = ["find"]
     path = _write_descriptor(tmp_path, descriptor)
-    other = load_executable_contract(path, artifact_sha256)
+    other = load_executable_contract(path, artifact_sha1)
     with pytest.raises(UnsupportedExecutableVerbError) as caught:
-        other.prepare("compiled-out", {}, artifact_sha256=artifact_sha256)
+        other.prepare("compiled-out", {}, artifact_sha1=artifact_sha1)
     assert str(caught.value) == (
         "executable verb 'compiled-out' is not enrolled; "
         "enrolled verbs for this artifact: inspect"
     )
 
     with pytest.raises(UnsupportedExecutableError) as caught:
-        certify.prepare(7, {}, artifact_sha256=CERTIFY_SHA256)
+        certify.prepare(7, {}, artifact_sha1=CERTIFY_SHA1)
     assert type(caught.value) is UnsupportedExecutableError
 
 
@@ -250,7 +250,7 @@ def test_unsupported_verb_lists_only_this_artifacts_enrolled_verbs(certify, tmp_
     ],
 )
 def test_required_extra_type_int32_and_set_constraints(certify, verb, supplied, needles):
-    _assert_rejected(lambda: certify.prepare(verb, supplied, artifact_sha256=CERTIFY_SHA256), *needles)
+    _assert_rejected(lambda: certify.prepare(verb, supplied, artifact_sha1=CERTIFY_SHA1), *needles)
 
 
 def test_sequence_fields_render_one_option_followed_by_the_declared_values(certify):
@@ -262,14 +262,14 @@ def test_sequence_fields_render_one_option_followed_by_the_declared_values(certi
             "upn": ["one@example.test", "two@example.test"],
             "dns": ["one.example.test", "two.example.test"],
         },
-        artifact_sha256=CERTIFY_SHA256,
+        artifact_sha1=CERTIFY_SHA1,
     )
     assert prepared.argv == (
         "request", "--ca", r"SERVER\CA", "--template", "T", "--upn",
         "one@example.test", "two@example.test", "--dns", "one.example.test",
         "two.example.test", "--key-size", "2048",
     )
-    reparsed = certify.parse_and_prepare(prepared.argument_string, artifact_sha256=CERTIFY_SHA256)
+    reparsed = certify.parse_and_prepare(prepared.argument_string, artifact_sha1=CERTIFY_SHA1)
     assert reparsed.argv == prepared.argv
 
 
@@ -278,7 +278,7 @@ def test_sequence_fields_reject_empty_scalar_and_mixed_values(certify, value):
     _assert_rejected(
         lambda: certify.prepare(
             "request", {"ca": r"S\C", "template": "T", "upn": value},
-            artifact_sha256=CERTIFY_SHA256,
+            artifact_sha1=CERTIFY_SHA1,
         ),
         "upn",
     )
@@ -314,13 +314,13 @@ def test_windows_rendering_preserves_multiple_argv_items():
     ],
 )
 def test_strings_forbid_option_shaped_empty_and_control_character_values(certify, supplied, needle):
-    _assert_rejected(lambda: certify.prepare("request", supplied, artifact_sha256=CERTIFY_SHA256), needle)
+    _assert_rejected(lambda: certify.prepare("request", supplied, artifact_sha1=CERTIFY_SHA1), needle)
 
 
 def test_legacy_raw_form_parses_and_normalizes_through_same_validator(certify):
     prepared = certify.parse_and_prepare(
         'request --output-pem --template "Template One" --ca SERVER\\CA --upn one@test two@test',
-        artifact_sha256=CERTIFY_SHA256,
+        artifact_sha1=CERTIFY_SHA1,
     )
     assert prepared.argument_string == (
         'request --ca SERVER\\CA --template "Template One" --upn one@test two@test '
@@ -341,7 +341,7 @@ def test_legacy_raw_form_parses_and_normalizes_through_same_validator(certify):
     ],
 )
 def test_legacy_mixed_unknown_and_ambiguous_forms_fail_closed(certify, raw, needle):
-    _assert_rejected(lambda: certify.parse_and_prepare(raw, artifact_sha256=CERTIFY_SHA256), needle)
+    _assert_rejected(lambda: certify.parse_and_prepare(raw, artifact_sha1=CERTIFY_SHA1), needle)
 
 
 _CANONICAL_REQUEST = "request --ca SERVER\\CA --template T --key-size 2048"
@@ -357,7 +357,7 @@ _CANONICAL_REQUEST = "request --ca SERVER\\CA --template T --key-size 2048"
     ],
 )
 def test_legacy_option_syntax_is_normalized_to_the_enrolled_grammar(certify, raw):
-    prepared = certify.parse_and_prepare(raw, artifact_sha256=CERTIFY_SHA256)
+    prepared = certify.parse_and_prepare(raw, artifact_sha1=CERTIFY_SHA1)
     # Deterministically canonicalized to the enrolled double-dash grammar...
     assert prepared.argument_string == _CANONICAL_REQUEST
     assert prepared.verb == "request"
@@ -371,17 +371,17 @@ def test_legacy_option_syntax_is_normalized_to_the_enrolled_grammar(certify, raw
 
 
 def test_legacy_slash_flag_and_case_insensitive_option_normalize(certify):
-    flag = certify.parse_and_prepare("enum-cas /filter-vulnerable", artifact_sha256=CERTIFY_SHA256)
+    flag = certify.parse_and_prepare("enum-cas /filter-vulnerable", artifact_sha1=CERTIFY_SHA1)
     assert flag.argument_string == "enum-cas --filter-vulnerable"
     assert flag.normalized_from == "enum-cas /filter-vulnerable"
 
-    cased = certify.parse_and_prepare("enum-cas --Filter-Vulnerable", artifact_sha256=CERTIFY_SHA256)
+    cased = certify.parse_and_prepare("enum-cas --Filter-Vulnerable", artifact_sha1=CERTIFY_SHA1)
     assert cased.argument_string == "enum-cas --filter-vulnerable"
     assert cased.normalized_from == "enum-cas --Filter-Vulnerable"
 
 
 def test_already_canonical_invocation_is_not_marked_normalized(certify):
-    prepared = certify.parse_and_prepare(_CANONICAL_REQUEST, artifact_sha256=CERTIFY_SHA256)
+    prepared = certify.parse_and_prepare(_CANONICAL_REQUEST, artifact_sha1=CERTIFY_SHA1)
     assert prepared.argument_string == _CANONICAL_REQUEST
     assert prepared.normalized_from is None  # no-op: nothing was rewritten
 
@@ -395,23 +395,23 @@ def test_already_canonical_invocation_is_not_marked_normalized(certify):
     ],
 )
 def test_normalizer_never_fabricates_an_unknown_option(certify, raw, needle):
-    _assert_rejected(lambda: certify.parse_and_prepare(raw, artifact_sha256=CERTIFY_SHA256), needle)
+    _assert_rejected(lambda: certify.parse_and_prepare(raw, artifact_sha1=CERTIFY_SHA1), needle)
 
 
-def _descriptor_with_option_aliases(sha256, aliases):
-    descriptor = _synthetic_descriptor(sha256)
+def _descriptor_with_option_aliases(sha1, aliases):
+    descriptor = _synthetic_descriptor(sha1)
     descriptor["legacy_option_aliases"] = aliases
     return descriptor
 
 
 def test_declared_legacy_option_alias_repairs_a_renamed_option(tmp_path):
-    sha256 = hashlib.sha256(b"aliased cli").hexdigest()
+    sha1 = hashlib.sha1(b"aliased cli").hexdigest()
     contract = load_executable_contract(
-        _write_descriptor(tmp_path, _descriptor_with_option_aliases(sha256, {"src": "source"})),
-        sha256,
+        _write_descriptor(tmp_path, _descriptor_with_option_aliases(sha1, {"src": "source"})),
+        sha1,
     )
     # `/src:cache` -> the declared rename `source`, rendered in the enrolled grammar.
-    prepared = contract.parse_and_prepare("inspect --mode brief /src:cache", artifact_sha256=sha256)
+    prepared = contract.parse_and_prepare("inspect --mode brief /src:cache", artifact_sha1=sha1)
     assert prepared.options["source"] == "cache"
     assert "--source cache" in prepared.argument_string
     assert prepared.normalized_from == "inspect --mode brief /src:cache"
@@ -425,10 +425,10 @@ def test_declared_legacy_option_alias_repairs_a_renamed_option(tmp_path):
     ],
 )
 def test_legacy_option_alias_descriptor_is_validated(tmp_path, aliases, needle):
-    sha256 = hashlib.sha256(b"bad aliases cli").hexdigest()
+    sha1 = hashlib.sha1(b"bad aliases cli").hexdigest()
     _assert_rejected(
         lambda: load_executable_contract(
-            _write_descriptor(tmp_path, _descriptor_with_option_aliases(sha256, aliases)), sha256
+            _write_descriptor(tmp_path, _descriptor_with_option_aliases(sha1, aliases)), sha1
         ),
         needle,
     )
@@ -436,86 +436,86 @@ def test_legacy_option_alias_descriptor_is_validated(tmp_path, aliases, needle):
 
 def test_prepared_binding_detects_contract_artifact_argument_and_argv_drift(certify):
     binding = certify.prepare(
-        "request-download", {"ca": r"S\C", "id": 4}, artifact_sha256=CERTIFY_SHA256
+        "request-download", {"ca": r"S\C", "id": 4}, artifact_sha1=CERTIFY_SHA1
     ).as_binding()
     for key, value, needle in (
-        ("artifact_sha256", "0" * 64, "artifact identity"),
+        ("artifact_sha1", "0" * 40, "artifact identity"),
         ("contract_sha256", "0" * 64, "contract identity"),
         ("argument_string", binding["argument_string"] + " --output-pem", "changed"),
         ("argv", [*binding["argv"], "--output-pem"], "argv changed"),
     ):
         changed = dict(binding)
         changed[key] = value
-        _assert_rejected(lambda changed=changed: certify.revalidate(changed, artifact_sha256=CERTIFY_SHA256), needle)
+        _assert_rejected(lambda changed=changed: certify.revalidate(changed, artifact_sha1=CERTIFY_SHA1), needle)
 
 
 def test_unrelated_contract_proves_generic_enums_dependencies_defaults_and_disabled_verbs(tmp_path):
-    artifact_sha256 = hashlib.sha256(b"unrelated cli").hexdigest()
+    artifact_sha1 = hashlib.sha1(b"unrelated cli").hexdigest()
     contract = load_executable_contract(
-        _write_descriptor(tmp_path, _synthetic_descriptor(artifact_sha256)), artifact_sha256
+        _write_descriptor(tmp_path, _synthetic_descriptor(artifact_sha1)), artifact_sha1
     )
     prepared = contract.prepare(
         "inspect", {"mode": "brief", "tag": ["one", "two"], "source": "cache", "confirm": True},
-        artifact_sha256=artifact_sha256,
+        artifact_sha1=artifact_sha1,
     )
     assert prepared.argument_string == "inspect --mode brief --tag one two --limit 10 --source cache --confirm"
     _assert_rejected(
-        lambda: contract.prepare("inspect", {"mode": "other"}, artifact_sha256=artifact_sha256), "mode"
+        lambda: contract.prepare("inspect", {"mode": "other"}, artifact_sha1=artifact_sha1), "mode"
     )
     _assert_rejected(
-        lambda: contract.prepare("inspect", {"mode": "brief", "confirm": True}, artifact_sha256=artifact_sha256),
+        lambda: contract.prepare("inspect", {"mode": "brief", "confirm": True}, artifact_sha1=artifact_sha1),
         "requires", "source",
     )
     _assert_rejected(
-        lambda: contract.prepare("compiled-out", {}, artifact_sha256=artifact_sha256), "not enrolled"
+        lambda: contract.prepare("compiled-out", {}, artifact_sha1=artifact_sha1), "not enrolled"
     )
 
 
 def test_descriptor_with_duplicate_or_ambiguous_hash_entries_fails_closed(tmp_path):
-    artifact_sha256 = hashlib.sha256(b"same binary").hexdigest()
-    descriptor = _synthetic_descriptor(artifact_sha256)
+    artifact_sha1 = hashlib.sha1(b"same binary").hexdigest()
+    descriptor = _synthetic_descriptor(artifact_sha1)
     _write_descriptor(tmp_path, descriptor, "one.json")
     _write_descriptor(tmp_path, descriptor, "two.json")
-    _assert_rejected(lambda: load_contract_for_artifact(tmp_path, artifact_sha256), "multiple")
+    _assert_rejected(lambda: load_contract_for_artifact(tmp_path, artifact_sha1), "multiple")
 
     duplicate = tmp_path / "duplicate.json"
     duplicate.write_text(
-        '{"contract_version":7,"contract_version":8,"binary":{"filename":"x","sha256":"'
-        + artifact_sha256 + '"},"registered_verbs":[],"verbs":{}}',
+        '{"contract_version":7,"contract_version":8,"binary":{"filename":"x","sha1":"'
+        + artifact_sha1 + '"},"registered_verbs":[],"verbs":{}}',
         encoding="utf-8",
     )
-    _assert_rejected(lambda: load_executable_contract(duplicate, artifact_sha256), "duplicate")
+    _assert_rejected(lambda: load_executable_contract(duplicate, artifact_sha1), "duplicate")
 
 
-def _aliased_descriptor(sha256: str, aliases: dict) -> dict:
-    descriptor = _synthetic_descriptor(sha256)
+def _aliased_descriptor(sha1: str, aliases: dict) -> dict:
+    descriptor = _synthetic_descriptor(sha1)
     descriptor["legacy_unregistered_verbs"] = ["old-inspect"]
     descriptor["legacy_verb_aliases"] = aliases
     return descriptor
 
 
 def test_valid_legacy_alias_loads_and_repairs_on_the_synthetic_contract(tmp_path):
-    artifact_sha256 = hashlib.sha256(b"aliased synthetic cli").hexdigest()
-    path = _write_descriptor(tmp_path, _aliased_descriptor(artifact_sha256, {"old-inspect": "inspect"}))
-    contract = load_executable_contract(path, artifact_sha256)
-    prepared = contract.prepare("old-inspect", {"mode": "brief"}, artifact_sha256=artifact_sha256)
+    artifact_sha1 = hashlib.sha1(b"aliased synthetic cli").hexdigest()
+    path = _write_descriptor(tmp_path, _aliased_descriptor(artifact_sha1, {"old-inspect": "inspect"}))
+    contract = load_executable_contract(path, artifact_sha1)
+    prepared = contract.prepare("old-inspect", {"mode": "brief"}, artifact_sha1=artifact_sha1)
     assert prepared.verb == "inspect"
     assert prepared.repaired_from == "old-inspect"
 
 
 def test_legacy_alias_key_must_be_a_declared_legacy_verb(tmp_path):
-    artifact_sha256 = hashlib.sha256(b"bad alias key").hexdigest()
-    path = _write_descriptor(tmp_path, _aliased_descriptor(artifact_sha256, {"ghost": "inspect"}))
+    artifact_sha1 = hashlib.sha1(b"bad alias key").hexdigest()
+    path = _write_descriptor(tmp_path, _aliased_descriptor(artifact_sha1, {"ghost": "inspect"}))
     _assert_rejected(
-        lambda: load_executable_contract(path, artifact_sha256),
+        lambda: load_executable_contract(path, artifact_sha1),
         "legacy verb alias", "declared legacy verb",
     )
 
 
 def test_legacy_alias_target_must_be_enrolled(tmp_path):
-    artifact_sha256 = hashlib.sha256(b"bad alias target").hexdigest()
-    path = _write_descriptor(tmp_path, _aliased_descriptor(artifact_sha256, {"old-inspect": "compiled-out"}))
+    artifact_sha1 = hashlib.sha1(b"bad alias target").hexdigest()
+    path = _write_descriptor(tmp_path, _aliased_descriptor(artifact_sha1, {"old-inspect": "compiled-out"}))
     _assert_rejected(
-        lambda: load_executable_contract(path, artifact_sha256),
+        lambda: load_executable_contract(path, artifact_sha1),
         "must map to an enrolled verb",
     )

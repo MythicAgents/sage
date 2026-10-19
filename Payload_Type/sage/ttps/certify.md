@@ -12,7 +12,7 @@ source:
   maintained: true
 binary_type: .net-assembly
 binary_filename: Certify.exe
-binary_sha256: 1383e8bca90e4be70ff2224b7e2af465a8f3d5bede1fde60f1ece71e3b02d346
+binary_sha1: 7f949a895c51e747fa334b380a9511c4442ad5d0
 binary_version: "2.0.0"
 binary_contract: ttps/contracts/certify.json
 binary_contract_evidence: compiled-parser-metadata

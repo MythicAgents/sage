@@ -536,7 +536,7 @@ def test_inline_file_preparation_rejects_missing_or_wrong_file_identity(monkeypa
         metadata.assert_not_awaited()
 
 
-@pytest.mark.parametrize("drift", ["argument", "uuid", "hash", "bytes", "group", "schema"])
+@pytest.mark.parametrize("drift", ["argument", "uuid", "md5", "sha1", "group", "schema"])
 def test_inline_file_postapproval_identity_drift_denies_before_sink(monkeypatch, drift):
     tools = _tools()
     file_uuid = "11111111-2222-4333-8444-555555555555"
@@ -561,9 +561,10 @@ def test_inline_file_postapproval_identity_drift_denies_before_sink(monkeypatch,
     monkeypatch.setattr(tools, "_validate_command_parameters", AsyncMock(return_value=None))
     monkeypatch.setattr(tools, "_get_file_metadata",
                         AsyncMock(side_effect=lambda _uuid: copy.deepcopy(identity[0])))
-    content = [b"unknown assembly fixture bytes"]
-    monkeypatch.setattr(tools, "_download_registered_file_bytes_bounded",
-                        AsyncMock(side_effect=lambda _uuid: content[0]))
+    # No download: inline-File byte-drift is caught by Mythic's own md5/sha1 metadata, which it
+    # computes server-side on upload. A real byte swap lands under a new UUID with a new hash.
+    download = AsyncMock(side_effect=AssertionError("inline identity must not download bytes"))
+    monkeypatch.setattr(tools, "_download_registered_file_bytes_bounded", download)
     monkeypatch.setattr(tools, "_callback_tasking_liveness_blocker", AsyncMock(return_value=None))
     monkeypatch.setattr(tools, "_ensure_registered_file_available", AsyncMock(return_value=None))
     monkeypatch.setattr(tools, "_engagement_issue_hook", AsyncMock(return_value=None))
@@ -580,10 +581,10 @@ def test_inline_file_postapproval_identity_drift_denies_before_sink(monkeypatch,
             prepared["parameters"]["AssemblyFile"] = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
         elif drift == "uuid":
             identity[0]["agent_file_id"] = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
-        elif drift == "hash":
+        elif drift == "md5":
             identity[0]["md5"] = "new-md5"
-        elif drift == "bytes":
-            content[0] = b"changed unknown assembly fixture bytes"
+        elif drift == "sha1":
+            identity[0]["sha1"] = "new-sha1"
         elif drift == "group":
             schema[2]["parameter_group_name"] = "Other Assembly"
         else:

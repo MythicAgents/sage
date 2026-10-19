@@ -4319,7 +4319,7 @@ class MythicTools:
                     "re-task with a different registered identifier if one fits."
                 )
             file_identity = {key: file_identity.get(key) for key in
-                             ("id", "agent_file_id", "filename_utf8", "md5", "sha1", "complete", "sha256")}
+                             ("id", "agent_file_id", "filename_utf8", "md5", "sha1", "complete")}
         if parameters == "" and isinstance(schema, list) and schema:
             parameters = "{}"
         prepared.update(command=command, parameters=parameters,
@@ -4713,7 +4713,7 @@ class MythicTools:
             }
             return {
                 "status": "enrolled",
-                "artifact_sha256": file_identity["sha256"],
+                "artifact_sha1": file_identity["sha1"],
                 "contract_sha256": contract.descriptor_sha256,
                 "contract_version": contract.descriptor.contract_version,
                 "filename": file_identity["filename_utf8"],
@@ -4926,8 +4926,14 @@ class MythicTools:
             for key in ("filename_utf8", "md5", "sha1")
         ):
             raise ValueError("inline assembly File metadata or hash identity is incomplete")
-        content = await self._download_registered_file_bytes_bounded(binding["value"])
-        artifact_sha256 = hashlib.sha256(content).hexdigest()
+        # Unmanaged inline-File bytes have no executable contract. Post-approval byte-drift is
+        # detected by comparing Mythic's own file metadata (md5 AND sha1, computed server-side on
+        # upload) at approve time vs execute time: a complete Mythic file row is content-fixed, so
+        # its stored md5/sha1 cannot diverge from the served bytes under the same UUID, and a swap
+        # for different bytes would land under a different UUID with a different md5/sha1. Both
+        # hashes are required present above and both are carried in the returned identity, so the
+        # drift comparison is a dual-hash match with no download. This mirrors the enrolled-contract
+        # path (filename identity on Mythic's SHA-1 metadata); Sage never downloads a file to hash it.
         # Identity is the filename: an enrolled executable may not be smuggled through the inline File
         # param regardless of its (rebuilt) bytes. If a contract claims this filename, it must go
         # through the registered selector and typed schema.
@@ -4944,7 +4950,6 @@ class MythicTools:
         )
         return {
             **{key: metadata.get(key) for key in keys},
-            "sha256": artifact_sha256,
             "parameter": binding,
         }
 
@@ -5056,18 +5061,18 @@ class MythicTools:
                 raise ValueError("typed executable invocation must contain only verb and options")
             prepared = contract.prepare(
                 arguments.get("verb"), arguments.get("options"),
-                artifact_sha256=file_identity["sha256"],
+                artifact_sha1=file_identity["sha1"],
             )
         elif isinstance(arguments, str):
             prepared = contract.parse_and_prepare(
-                arguments, artifact_sha256=file_identity["sha256"]
+                arguments, artifact_sha1=file_identity["sha1"]
             )
         else:
             raise ValueError("known executable arguments must be typed or a legacy raw string")
         if selection is not None:
             expected_file = selection["file"]
             identity_keys = (
-                "id", "agent_file_id", "filename_utf8", "md5", "sha1", "complete", "sha256"
+                "id", "agent_file_id", "filename_utf8", "md5", "sha1", "complete"
             )
             if {key: file_identity.get(key) for key in identity_keys} != {
                 key: expected_file.get(key) for key in identity_keys
@@ -5101,7 +5106,7 @@ class MythicTools:
             # string it was normalized from.
             binding["normalized_from"] = prepared.normalized_from
         signature = "enrolled-executable:" + json.dumps({
-            "artifact_sha256": prepared.artifact_sha256,
+            "artifact_sha1": prepared.artifact_sha1,
             "contract_sha256": prepared.contract_sha256,
             "contract_version": prepared.contract_version,
             "verb": prepared.verb,
@@ -5157,24 +5162,32 @@ class MythicTools:
             or str(row.get("filename_utf8") or "").casefold() != str(filename).casefold()
         ):
             raise ValueError("registered executable has no complete unambiguous Mythic identity")
-        content = await self._download_registered_file_bytes_bounded(str(row["agent_file_id"]))
-        sha256 = hashlib.sha256(content).hexdigest()
+        identity = {
+            key: row.get(key) for key in
+            ("id", "agent_file_id", "filename_utf8", "md5", "sha1", "complete")
+        }
+        # An un-contracted filename is open by design (#56): no contract claims it, so it needs no
+        # hash identity and runs generic. Only a contracted name requires the observed-hash identity.
+        if not executable_contracts.recognizes_executable_filename(
+            _EXECUTABLE_CONTRACT_ROOT, filename
+        ):
+            return None, identity
+        # The observed binary hash is Mythic's own SHA-1 metadata — the binary is never downloaded
+        # and rehashed. Mythic stores md5/sha1 (not sha256), so SHA-1 is the hash available for free.
+        sha1 = str(row.get("sha1") or "")
+        if executable_contracts._SHA1_RE.fullmatch(sha1) is None:
+            raise ValueError("registered executable has no complete unambiguous Mythic identity")
         try:
             # Identity is the filename: a CI-rebuilt binary (new hash, same name) resolves its
-            # contract instead of being hard-blocked. A None result is an un-contracted executable
-            # (handled open). A contract that pins an integrity allowlist still rejects off-list bytes.
+            # contract instead of being hard-blocked. A contract that pins an integrity allowlist
+            # still rejects off-list bytes.
             contract = executable_contracts.load_contract_for_filename(
-                _EXECUTABLE_CONTRACT_ROOT, filename, sha256
+                _EXECUTABLE_CONTRACT_ROOT, filename, sha1
             )
         except executable_contracts.ExecutableIdentityError as exc:
             raise ValueError(
                 "enrolled executable bytes are not in this contract's accepted-hash allowlist"
             ) from exc
-        identity = {
-            key: row.get(key) for key in
-            ("id", "agent_file_id", "filename_utf8", "md5", "sha1", "complete")
-        }
-        identity["sha256"] = sha256
         return contract, identity
 
     async def _fetch_command_metadata(self, payload: str, command: str) -> dict:

@@ -33,7 +33,7 @@ def test_binary_identity_and_enrollment_are_explicit():
     assert len(contract["registered_verbs"]) == 11
     assert contract["disabled_registered_verbs"] == []
     assert contract["legacy_unregistered_verbs"] == ["find", "cas", "download"]
-    assert contract["identity_rule"].startswith("verified only when sha256 matches")
+    assert contract["identity_rule"].startswith("the filename identifies the contract")
     assert contract["evidence"]["help_execution"].startswith("observed_off_target_four_enrolled_verbs_")
     assert contract["evidence"]["command_execution"].startswith("unverified_")
     assert contract["comparison_source"]["binding"].startswith("comparison only")
@@ -42,7 +42,7 @@ def test_binary_identity_and_enrollment_are_explicit():
 def test_guidance_examples_follow_enrolled_v2_parser_shapes():
     contract = _contract()
     frontmatter, _ = ttp_library.load_ttp("certify")
-    assert frontmatter["binary_sha256"] == contract["binary"]["sha256"]
+    assert frontmatter["binary_sha1"] == contract["binary"]["sha1"]
     assert frontmatter["binary_contract"] == "ttps/contracts/certify.json"
     for example in frontmatter["usage_examples"]:
         _assert_enrolled_example(contract, example["args"])

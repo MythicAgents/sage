@@ -182,7 +182,7 @@ class _RecordingModel(GenericFakeChatModel):
 def test_real_agent_executes_typed_same_name_call_then_restores_generic_schema():
     contract = load_executable_contract(
         Path(__file__).resolve().parents[1] / "ttps" / "contracts" / "certify.json",
-        "1383e8bca90e4be70ff2224b7e2af465a8f3d5bede1fde60f1ece71e3b02d346",
+        "7f949a895c51e747fa334b380a9511c4442ad5d0",
     )
     invocation_schema = contract.strict_schema_for_verb("request")
     schema = {
@@ -265,10 +265,10 @@ def test_real_agent_executes_typed_same_name_call_then_restores_generic_schema()
     assert schema["properties"]["parameters"]["properties"]["assembly_arguments"] == invocation_schema
     with pytest.raises(ContractValidationError, match="2147483647"):
         contract.prepare("request", {"ca": r"SERVER\CA", "template": "User", "key-size": 2**31},
-                         artifact_sha256=contract.artifact_sha256)
+                         artifact_sha1=contract.artifact_sha1)
     with pytest.raises(ContractValidationError, match="at least 1 character"):
         contract.prepare("request", {"ca": "", "template": "User"},
-                         artifact_sha256=contract.artifact_sha256)
+                         artifact_sha1=contract.artifact_sha1)
 
     client.get_enrolled_issue_schema.return_value = None
     second = asyncio.run(agent.ainvoke({"messages": [HumanMessage(content="generic")]}))
@@ -295,5 +295,5 @@ def test_real_agent_executes_typed_same_name_call_then_restores_generic_schema()
     assert converted_options["subject"]["type"] == "string"
     assert "anyOf" not in converted_options["subject"]
     prepared = contract.prepare("request", {"ca": r"SERVER\CA", "template": "User"},
-                                artifact_sha256=contract.artifact_sha256)
+                                artifact_sha1=contract.artifact_sha1)
     assert "--key-size 2048" in prepared.argument_string

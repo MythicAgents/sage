@@ -107,7 +107,7 @@ def test_recognized_filename_with_unknown_bytes_fails_before_file_sink(
         md5=hashlib.md5(unknown).hexdigest(), sha1=hashlib.sha1(unknown).hexdigest()
     )
     by_uuid[row["agent_file_id"]] = unknown
-    assert descriptor["binary"]["sha256"] != hashlib.sha256(unknown).hexdigest()
+    assert descriptor["binary"]["sha1"] != hashlib.sha1(unknown).hexdigest()
 
     # Filename identity (#56): the name "Certify.exe" is claimed by the contract, so an inline-File
     # upload of those bytes (even changed/rebuilt bytes) is refused -- an enrolled executable must go
@@ -128,7 +128,7 @@ def test_unknown_filename_and_unenrolled_bytes_reach_new_assembly_group(
         md5=hashlib.md5(unknown).hexdigest(), sha1=hashlib.sha1(unknown).hexdigest()
     )
     by_uuid[row["agent_file_id"]] = unknown
-    assert descriptor["binary"]["sha256"] != hashlib.sha256(unknown).hexdigest()
+    assert descriptor["binary"]["sha1"] != hashlib.sha1(unknown).hexdigest()
     sink = AsyncMock(side_effect=RuntimeError("inert task sink reached"))
 
     with patch.object(client, "_turn_authority_issue_blocker", return_value=""), patch.object(

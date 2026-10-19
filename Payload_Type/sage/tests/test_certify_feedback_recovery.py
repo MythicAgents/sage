@@ -59,7 +59,7 @@ def test_fixture_real_preparation_denies_unenrolled_verb_and_prepares_valid(tmp_
     runner = module()
     descriptor = json.loads((runner.SAGE / "ttps/contracts/certify.json").read_text())
     import hashlib
-    descriptor["binary"]["sha256"] = hashlib.sha256(runner.ARTIFACT).hexdigest()
+    descriptor["binary"]["sha1"] = hashlib.sha1(runner.ARTIFACT).hexdigest()
     contract_root = tmp_path / "contracts"
     contract_root.mkdir()
     (contract_root / "certify.json").write_text(json.dumps(descriptor))
@@ -105,7 +105,7 @@ def test_guidance_fixture_reads_checked_in_certify_only_on_matching_request(monk
     assert result["slug"] == "certify"
     assert result["frontmatter"] == expected_frontmatter
     assert result["guidance"] == runner.ttp_library.guidance_body(expected_body)
-    assert result["frontmatter"]["binary_sha256"] == expected_frontmatter["binary_sha256"]
+    assert result["frontmatter"]["binary_sha1"] == expected_frontmatter["binary_sha1"]
     assert result["payload_type"] == "apollo"
     with pytest.raises(runner.matrix.FixtureGap):
         asyncio.run(runner.fixture_dispatch("get_ttp_guidance", {

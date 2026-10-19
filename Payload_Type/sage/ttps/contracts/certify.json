@@ -2,12 +2,12 @@
   "contract_version": 1,
   "binary": {
     "filename": "Certify.exe",
-    "sha256": "1383e8bca90e4be70ff2224b7e2af465a8f3d5bede1fde60f1ece71e3b02d346",
+    "sha1": "7f949a895c51e747fa334b380a9511c4442ad5d0",
     "display_version": "2.0.0",
     "assembly_version": "1.0.0.0",
     "clr_version": "v4.0.30319"
   },
-  "identity_rule": "verified only when sha256 matches; a same-name different-hash binary is unverified",
+  "identity_rule": "the filename identifies the contract; the SHA-1 from Mythic metadata is advisory provenance unless an accepted-hash allowlist is pinned",
   "comparison_source": {
     "repository": "https://github.com/GhostPack/Certify",
     "commit": "ce9a4d27d2f18d391c141ebdc8cb82fa5f6b88e3",

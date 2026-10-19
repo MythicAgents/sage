@@ -1,9 +1,11 @@
 """Typed, version-bound contracts for arguments passed to managed executables.
 
-Contracts bind behavior to the SHA-256 of the executable bytes.  They describe
-only the option grammar that has been enrolled; a filename never enrolls an
-artifact.  Rendering targets the ``CommandLineToArgvW`` splitter used by
-Apollo's managed-assembly runners.
+Contract identity is the executable filename; the SHA-1 (read from Mythic's
+file metadata, never recomputed by downloading the binary) is advisory build
+provenance, and an optional allowlist can make it a strict integrity gate.
+Contracts describe only the option grammar that has been enrolled.  Rendering
+targets the ``CommandLineToArgvW`` splitter used by Apollo's managed-assembly
+runners.
 """
 
 from __future__ import annotations
@@ -19,7 +21,7 @@ from typing import Annotated, Any, Literal, Mapping
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, ValidationError, create_model
 
 
-_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 _OPTION_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 _INT32_MIN = -(2**31)
 _INT32_MAX = 2**31 - 1
@@ -54,11 +56,11 @@ class BinaryDescriptor(_StrictModel):
     # The inspected REFERENCE hash (provenance of the build the grammar was derived from), not the
     # identity gate. Optional, because a CI/CD pipeline rebuilds .NET tools on every run so the file
     # hash changes every build while the CLI grammar does not. Contract identity is the filename.
-    sha256: StrictStr | None = None
+    sha1: StrictStr | None = None
     # Optional integrity allowlist. When NON-EMPTY the contract is strict: the observed binary hash
     # must be one of these (a sealed/eval run that genuinely pins known-good builds). When empty
     # (the default) the filename identifies the contract and the observed hash is advisory provenance.
-    accepted_sha256: list[StrictStr] = []
+    accepted_sha1: list[StrictStr] = []
     display_version: StrictStr | None = None
     assembly_version: StrictStr | None = None
     clr_version: StrictStr | None = None
@@ -114,7 +116,7 @@ class ContractDescriptor(_StrictModel):
 class PreparedInvocation:
     """Canonical invocation material suitable for exact approval and recheck."""
 
-    artifact_sha256: str
+    artifact_sha1: str
     contract_sha256: str
     contract_version: int
     verb: str
@@ -135,7 +137,7 @@ class PreparedInvocation:
 
     def as_binding(self) -> dict[str, Any]:
         return {
-            "artifact_sha256": self.artifact_sha256,
+            "artifact_sha1": self.artifact_sha1,
             "contract_sha256": self.contract_sha256,
             "contract_version": self.contract_version,
             "verb": self.verb,
@@ -203,9 +205,9 @@ def _read_descriptor(path: Path) -> tuple[dict[str, Any], str]:
     return raw, hashlib.sha256(data).hexdigest()
 
 
-def _checked_sha256(value: Any, *, label: str) -> str:
-    if type(value) is not str or _SHA256_RE.fullmatch(value) is None:
-        raise ExecutableIdentityError(f"{label} must be a lowercase SHA-256")
+def _checked_sha1(value: Any, *, label: str) -> str:
+    if type(value) is not str or _SHA1_RE.fullmatch(value) is None:
+        raise ExecutableIdentityError(f"{label} must be a lowercase SHA-1")
     return value
 
 
@@ -217,8 +219,8 @@ class ExecutableContract:
         self.descriptor_sha256 = descriptor_sha256
         # Reference hash (provenance of the inspected build), may be None. NOT the identity gate;
         # identity is the filename. The integrity allowlist (when set) is the only hash gate.
-        self.reference_sha256 = descriptor.binary.sha256
-        self._accepted_sha256 = frozenset(descriptor.binary.accepted_sha256)
+        self.reference_sha1 = descriptor.binary.sha1
+        self._accepted_sha1 = frozenset(descriptor.binary.accepted_sha1)
         self._options_models: dict[str, type[BaseModel]] = {}
         self._invocation_models: dict[str, type[BaseModel]] = {}
         self._validate_descriptor()
@@ -228,10 +230,10 @@ class ExecutableContract:
         return self.descriptor.binary.filename
 
     @property
-    def artifact_sha256(self) -> str | None:
+    def artifact_sha1(self) -> str | None:
         """The inspected REFERENCE hash (provenance), or None. Kept for callers that need a concrete
         hash for this contract; identity is the filename, so this is not the identity gate."""
-        return self.reference_sha256
+        return self.reference_sha1
 
     @property
     def enrolled_verbs(self) -> tuple[str, ...]:
@@ -244,10 +246,10 @@ class ExecutableContract:
     def _validate_descriptor(self) -> None:
         if self.descriptor.contract_version < 1:
             raise ContractValidationError("contract_version must be positive")
-        if self.descriptor.binary.sha256 is not None:
-            _checked_sha256(self.descriptor.binary.sha256, label="descriptor binary.sha256")
-        for pinned in self.descriptor.binary.accepted_sha256:
-            _checked_sha256(pinned, label="descriptor binary.accepted_sha256 entry")
+        if self.descriptor.binary.sha1 is not None:
+            _checked_sha1(self.descriptor.binary.sha1, label="descriptor binary.sha1")
+        for pinned in self.descriptor.binary.accepted_sha1:
+            _checked_sha1(pinned, label="descriptor binary.accepted_sha1 entry")
         if not self.descriptor.binary.filename or self.descriptor.binary.filename != self.descriptor.binary.filename.strip():
             raise ContractValidationError("descriptor binary filename must be non-empty and unambiguous")
         registered: set[str] = set()
@@ -455,7 +457,7 @@ class ExecutableContract:
         verb: str,
         options: Mapping[str, Any] | BaseModel,
         *,
-        artifact_sha256: str,
+        artifact_sha1: str,
     ) -> PreparedInvocation:
         repaired_from: str | None = None
         alias = self._alias_for(verb)
@@ -463,7 +465,7 @@ class ExecutableContract:
             repaired_from = verb
             verb = alias
         verb, option_specs, specification = self._require_verb(verb)
-        self.assert_artifact_identity(artifact_sha256)
+        self.assert_artifact_identity(artifact_sha1)
         source: Any = options.model_dump(by_alias=True) if isinstance(options, BaseModel) else options
         if not isinstance(source, Mapping):
             raise ContractValidationError("executable options must be a typed object")
@@ -511,7 +513,7 @@ class ExecutableContract:
             # The OBSERVED artifact hash (the actual uploaded binary), so the approval card binds to
             # the real bytes and revalidate enforces "same binary approved == executed", regardless of
             # whether the contract pins a reference hash.
-            artifact_sha256=artifact_sha256,
+            artifact_sha1=artifact_sha1,
             contract_sha256=self.descriptor_sha256,
             contract_version=self.descriptor.contract_version,
             verb=verb,
@@ -521,8 +523,8 @@ class ExecutableContract:
             repaired_from=repaired_from,
         )
 
-    def parse_and_prepare(self, raw: Any, *, artifact_sha256: str) -> PreparedInvocation:
-        self.assert_artifact_identity(artifact_sha256)
+    def parse_and_prepare(self, raw: Any, *, artifact_sha1: str) -> PreparedInvocation:
+        self.assert_artifact_identity(artifact_sha1)
         if type(raw) is not str or not raw:
             raise ContractValidationError("raw executable arguments must be a non-empty string")
         _validate_text(raw, label="raw executable arguments", allow_option=False)
@@ -579,44 +581,44 @@ class ExecutableContract:
                     value = argv[index]
                     index += 1
                 supplied[name] = _raw_scalar(name, option, value)
-        prepared = self.prepare(raw_verb, supplied, artifact_sha256=artifact_sha256)
+        prepared = self.prepare(raw_verb, supplied, artifact_sha1=artifact_sha1)
         if normalized:
             prepared = replace(prepared, normalized_from=raw)
         return prepared
 
     def revalidate(
-        self, prepared: PreparedInvocation | Mapping[str, Any], *, artifact_sha256: str
+        self, prepared: PreparedInvocation | Mapping[str, Any], *, artifact_sha1: str
     ) -> PreparedInvocation:
-        self.assert_artifact_identity(artifact_sha256)
+        self.assert_artifact_identity(artifact_sha1)
         source = prepared.as_binding() if isinstance(prepared, PreparedInvocation) else dict(prepared)
         # The binding records the OBSERVED hash at prepare time; require the same binary bytes at
         # execute time (approved binary == executed binary), independent of any reference hash.
-        if source.get("artifact_sha256") != artifact_sha256:
+        if source.get("artifact_sha1") != artifact_sha1:
             raise ExecutableIdentityError("prepared invocation artifact identity changed")
         if source.get("contract_sha256") != self.descriptor_sha256:
             raise ExecutableIdentityError("prepared invocation contract identity changed")
         if source.get("contract_version") != self.descriptor.contract_version:
             raise ExecutableIdentityError("prepared invocation contract version changed")
-        rebuilt = self.parse_and_prepare(source.get("argument_string"), artifact_sha256=artifact_sha256)
+        rebuilt = self.parse_and_prepare(source.get("argument_string"), artifact_sha1=artifact_sha1)
         if source.get("verb") != rebuilt.verb or source.get("options") != _copy_options(rebuilt.options):
             raise ContractValidationError("prepared executable invocation changed after approval")
         if source.get("argv") != list(rebuilt.argv):
             raise ContractValidationError("prepared executable argv changed after approval")
         return rebuilt
 
-    def assert_artifact_identity(self, artifact_sha256: Any) -> None:
+    def assert_artifact_identity(self, artifact_sha1: Any) -> None:
         # Contract identity is the filename; the observed hash is validated for shape and, only when
         # the contract pins an integrity allowlist (sealed/eval), required to be one of the pinned
         # builds. A non-pinned contract accepts any build of the named tool (the CI-rebuild case),
         # recording the observed hash as provenance in the prepared binding.
-        actual = _checked_sha256(artifact_sha256, label="actual artifact SHA-256")
-        if self._accepted_sha256 and actual not in self._accepted_sha256:
+        actual = _checked_sha1(artifact_sha1, label="actual artifact SHA-1")
+        if self._accepted_sha1 and actual not in self._accepted_sha1:
             raise ExecutableIdentityError(
-                "actual artifact SHA-256 is not in this contract's accepted-hash allowlist"
+                "actual artifact SHA-1 is not in this contract's accepted-hash allowlist"
             )
 
 
-def load_executable_contract(path: str | Path, artifact_sha256: str) -> ExecutableContract:
+def load_executable_contract(path: str | Path, artifact_sha1: str) -> ExecutableContract:
     """Load one descriptor and assert its integrity policy against the observed artifact hash.
 
     The hash is validated for shape and, only when the contract pins an allowlist, required to be one
@@ -627,12 +629,12 @@ def load_executable_contract(path: str | Path, artifact_sha256: str) -> Executab
     except ValidationError as exc:
         raise ContractValidationError(_pydantic_error(exc, prefix="invalid executable contract")) from exc
     contract = ExecutableContract(descriptor, descriptor_sha256)
-    contract.assert_artifact_identity(artifact_sha256)
+    contract.assert_artifact_identity(artifact_sha1)
     return contract
 
 
 def load_contract_for_filename(
-    directory: str | Path, filename: Any, artifact_sha256: str
+    directory: str | Path, filename: Any, artifact_sha1: str
 ) -> ExecutableContract | None:
     """Resolve the single contract that claims ``filename`` (identity is the filename, not the bytes).
 
@@ -644,7 +646,7 @@ def load_contract_for_filename(
     if type(filename) is not str or not filename.strip():
         return None
     wanted = filename.strip().casefold()
-    expected = _checked_sha256(artifact_sha256, label="actual artifact SHA-256")
+    expected = _checked_sha1(artifact_sha1, label="actual artifact SHA-1")
     matches: list[Path] = []
     for path in sorted(Path(directory).glob("*.json")):
         try:
@@ -661,11 +663,11 @@ def load_contract_for_filename(
     return load_executable_contract(matches[0], expected)
 
 
-def load_contract_for_artifact(directory: str | Path, artifact_sha256: str) -> ExecutableContract:
+def load_contract_for_artifact(directory: str | Path, artifact_sha1: str) -> ExecutableContract:
     """Find exactly one contract whose reference hash or pinned allowlist contains the artifact hash.
 
     By-hash lookup retained for strict/eval callers; the runtime uses ``load_contract_for_filename``."""
-    expected = _checked_sha256(artifact_sha256, label="actual artifact SHA-256")
+    expected = _checked_sha1(artifact_sha1, label="actual artifact SHA-1")
     matches: list[ExecutableContract] = []
     for path in sorted(Path(directory).glob("*.json")):
         try:
@@ -675,12 +677,12 @@ def load_contract_for_artifact(directory: str | Path, artifact_sha256: str) -> E
         binary = raw.get("binary")
         if not isinstance(binary, dict):
             continue
-        if binary.get("sha256") == expected or expected in (binary.get("accepted_sha256") or []):
+        if binary.get("sha1") == expected or expected in (binary.get("accepted_sha1") or []):
             matches.append(load_executable_contract(path, expected))
     if not matches:
-        raise UnsupportedExecutableError("artifact SHA-256 has no enrolled executable contract")
+        raise UnsupportedExecutableError("artifact SHA-1 has no enrolled executable contract")
     if len(matches) != 1:
-        raise ContractValidationError("artifact SHA-256 matches multiple executable contracts")
+        raise ContractValidationError("artifact SHA-1 matches multiple executable contracts")
     return matches[0]
 
 
