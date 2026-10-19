@@ -1,0 +1,124 @@
+name: CI (offline boundary)
+
+# This workflow is the OFFLINE boundary only. It proves the tree builds, imports, and passes the
+# offline suite, and that nothing private leaked into this public repo. It cannot and does not prove
+# any live Mythic/GOAD/Apollo range behavior — there is no C2, no range, and no credentials here. A
+# green run means the tree is green, not that a run was validated against a range.
+#
+# Canonical environment: a venv AT THE REPO ROOT (./.venv), installed from requirements-dev.txt with
+# constraints.txt pins (the exact versions the shipped image resolves), and the suite is run through
+# ./.venv/bin/python. This mirrors how the project runs locally, and it is required: several
+# operator-script tests spawn subprocesses via `<repo>/.venv/bin/python`, so a system interpreter
+# without ./.venv makes them fail.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # 1. The backbone: the whole offline suite (product + repo hygiene + skills), one command, no
+  #    exclusions. Runs clean on a fresh clone because private-evidence tests skip when the sealed
+  #    dirs (.hillclimb, etc.) are absent.
+  tests:
+    name: Offline suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: Payload_Type/sage/requirements-dev.txt
+      - name: Create repo-root venv and install (dev deps + constraints pins)
+        run: |
+          python -m venv .venv
+          ./.venv/bin/python -m pip install --upgrade pip
+          ./.venv/bin/pip install -r Payload_Type/sage/requirements-dev.txt -c Payload_Type/sage/constraints.txt
+      - name: Run offline suite
+        run: ./.venv/bin/python skills/sage-focused-capability-tests/scripts/run_offline_suite.py
+
+  # 2a. Privacy / hygiene gate, named separately so a leak of maintainer-private material into this
+  #     public repo shows up as its own red check rather than buried in the 9k-test run. Uses the same
+  #     repo-root venv because one hygiene test resolves installed-package metadata.
+  hygiene:
+    name: Repo hygiene (privacy / portability)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: Payload_Type/sage/requirements-dev.txt
+      - name: Create repo-root venv and install (dev deps + constraints pins)
+        run: |
+          python -m venv .venv
+          ./.venv/bin/python -m pip install --upgrade pip
+          ./.venv/bin/pip install -r Payload_Type/sage/requirements-dev.txt -c Payload_Type/sage/constraints.txt
+      - name: Run hygiene tests
+        run: ./.venv/bin/python -m pytest tests/repo_hygiene -q
+
+  # 2b. Secret scanner: catches what unit tests cannot — an accidentally committed credential or
+  #     .env value. Scans full history on push, the PR range on pull_request. Free for public repos,
+  #     uses the built-in GITHUB_TOKEN (no secret to add).
+  secret-scan:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # 3. Payload image build lives in container.yml (build-only on PRs, publish to GHCR on main). It
+  #    builds the image the way Mythic does — context Payload_Type/sage, runtime manifest + the
+  #    constraints.txt pin — so it catches "works in my venv, breaks in the image".
+
+  # 4. Dependency CVE audit on the SHIPPED runtime set (requirements.txt resolved under the same
+  #    constraints the image uses). Advisory for now (report-only); flip to blocking once clean.
+  pip-audit:
+    name: Dependency audit (pip-audit)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install shipped runtime set + pip-audit
+        run: |
+          python -m venv .venv
+          ./.venv/bin/python -m pip install --upgrade pip
+          ./.venv/bin/pip install -r Payload_Type/sage/requirements.txt -c Payload_Type/sage/constraints.txt
+          ./.venv/bin/pip install pip-audit
+      - name: Audit the installed runtime environment
+        run: ./.venv/bin/pip-audit
+
+  # 5. Lint / format. Advisory (report-only): the tree has never been linted, so this reports drift
+  #    without forcing a mass reformat. Promote to blocking after the baseline is addressed.
+  lint:
+    name: Lint (ruff, advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install ruff
+        run: python -m pip install ruff
+      - name: Ruff check
+        run: ruff check .
+      - name: Ruff format check
+        run: ruff format --check .

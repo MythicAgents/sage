@@ -1,0 +1,80 @@
+name: Container image
+
+# Build the Sage Mythic payload image, and publish it to GHCR FROM main ONLY.
+#
+# Follows the MythicAgents convention (see Ne0nd0g/merlin-mythic docker.yml): publish to GHCR with
+# the built-in GITHUB_TOKEN — no external registry secret to leak — and build-only (no push) on
+# pull requests so a PR still validates the Dockerfile. Unlike Merlin, which publishes on version
+# tags, this publishes on push to main, per the project's "from main only" policy.
+#
+# Operator note: Mythic pulls the image named in its installer's remote_images config. Point that at
+# ghcr.io/mythicagents/sage:latest (or a specific sha- tag) to use a published build.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    name: Build and publish (GHCR, main only)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Credentials are only needed when we actually push (main). PR / dispatch builds validate only.
+      - name: Log in to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # arm64 is built via emulation, so QEMU must be registered before buildx.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # github.repository is lowercased by the action -> ghcr.io/mythicagents/sage
+          images: ${{ env.REGISTRY }}/${{ github.repository }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.description=${{ github.repository }} container for use with Mythic
+            org.opencontainers.image.licenses=GPL-3.0-or-later
+
+      - name: Build and (main only) push the Sage image
+        uses: docker/build-push-action@v6
+        with:
+          context: Payload_Type/sage
+          file: Payload_Type/sage/Dockerfile
+          # Both archs per project policy. arm64 builds under QEMU emulation (the image git-fetches
+          # the BloodHound MCP and runs `uv sync`), so expect this job to be slow; the gha cache below
+          # keeps repeat builds reasonable.
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

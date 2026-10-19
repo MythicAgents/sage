@@ -1,0 +1,66 @@
+name: "CodeQL"
+
+# Static code-security analysis of Sage's Python source. Adapted from the MythicAgents CodeQL
+# convention (see Ne0nd0g/merlin-mythic codeql.yml); Merlin is Go with a manual build, whereas Sage
+# is pure Python, so this uses build-mode: none (CodeQL's Python extractor needs no build step).
+# Findings surface in the repo's Security > Code scanning tab.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '.github/**'
+      - 'agent_icons/**'
+      - 'documentation-payload/**'
+      - 'documentation-c2/**'
+      - 'documentation-wrapper/**'
+      - 'agent_capabilities.json'
+      - 'config.json'
+      - 'LICENSE.md'
+      - 'README.md'
+  pull_request:
+    paths-ignore:
+      - '.github/**'
+      - 'agent_icons/**'
+      - 'documentation-payload/**'
+      - 'documentation-c2/**'
+      - 'documentation-wrapper/**'
+      - 'agent_capabilities.json'
+      - 'config.json'
+      - 'LICENSE.md'
+      - 'README.md'
+  schedule:
+    - cron: '32 7 * * 4'
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    name: Analyze (python)
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ['python']
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          # Default query suite keeps signal high. Uncomment for broader coverage:
+          # queries: security-extended
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"

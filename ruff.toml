@@ -1,0 +1,27 @@
+# Repo-level lint/format config. Tooling-only: it ships in the public repo but is never imported by
+# the runtime. The CI `lint` job is advisory (continue-on-error) until the existing baseline is
+# addressed, so this starts with a conservative rule set rather than the full default.
+#
+# target-version is py313 — the lowest version whose syntax ruff assumes. The code runs on 3.14,
+# which is a strict superset, so nothing is lost; pinning to a version ruff definitely knows avoids
+# a hard error from the advisory job.
+target-version = "py313"
+line-length = 100
+
+extend-exclude = [
+    ".venv",
+    ".venv.py313-orphaned",
+    "Plans",
+    ".sage_history",
+    ".hillclimb",
+    "**/goldens",
+    "**/data",
+]
+
+[lint]
+# Start narrow: pyflakes (F), a safe slice of pycodestyle (E), and import sorting (I). Expand once
+# the baseline is clean.
+select = ["E", "F", "I"]
+ignore = [
+    "E501",  # line length is enforced by the formatter, not the linter
+]
