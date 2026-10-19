@@ -1703,6 +1703,29 @@ def render_engagement_state(state: EngagementState) -> str:
             elif status in {"failed", "blocked", "legacy_unverified"}:
                 blocked_hops.append((sort_key, f"- {status}: {technique} → {target}: {effect}"))
 
+        # #58 pathfinding-first: surface the read-only BloodHound path probe (does a path to the
+        # objective domain exist from what we control?) so the plan anchors on the graph, not recalled
+        # tradecraft. Advisory only — these facts carry no enforcement weight.
+        path_lines: list[tuple[str, str]] = []
+        for fact in _render_items(getattr(state, "graph_facts", [])):
+            predicate = _text(getattr(fact, "predicate", "")).casefold()
+            if predicate.startswith("objective-path-found:"):
+                domain = predicate[len("objective-path-found:"):].strip()
+                if domain:
+                    path_lines.append((
+                        domain,
+                        f"- path EXISTS to {domain} — query BloodHound for the shortestPath and plan from it "
+                        "before falling back to recalled tradecraft",
+                    ))
+            elif predicate.startswith("objective-no-path:"):
+                domain = predicate[len("objective-no-path:"):].strip()
+                if domain:
+                    path_lines.append((
+                        domain,
+                        f"- NO path found to {domain} in the current graph — this is a reportable finding; "
+                        "expanding coverage via approved collection may reveal one",
+                    ))
+
         if live_footholds:
             lines.append("Live footholds:")
             lines.extend(item for _, item in sorted(live_footholds, key=lambda item: item[0]))
@@ -1717,7 +1740,15 @@ def render_engagement_state(state: EngagementState) -> str:
             lines.append("Failed/blocked hops:")
             lines.extend(item for _, item in sorted(blocked_hops, key=lambda item: item[0]))
 
-        if not live_footholds and not achieved_hops and not blocked_hops:
+        if path_lines:
+            lines.append("BloodHound attack-path probe:")
+            seen_path_lines: set[str] = set()
+            for _, item in sorted(path_lines, key=lambda item: item[0]):
+                if item not in seen_path_lines:
+                    seen_path_lines.add(item)
+                    lines.append(item)
+
+        if not live_footholds and not achieved_hops and not blocked_hops and not path_lines:
             lines.append("(no observed state yet)")
 
         return _render_bounded("\n".join(lines))

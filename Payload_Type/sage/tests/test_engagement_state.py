@@ -937,3 +937,40 @@ def test_runtime_trace_writer_honors_isolation_never_repo_root(monkeypatch, tmp_
     assert (tmp_path / "isolated" / "rights_trace.jsonl").exists()
     # ...and never created repo-root pollution.
     assert os.path.exists(repo_root_pollution) == existed_before
+
+
+def _path_fact(predicate):
+    return engagement_state.GraphFact(
+        predicate=predicate, source="bloodhound:cypher",
+        timestamp="2026-06-06T12:00:00Z", ttl_seconds=600,
+    )
+
+
+def test_render_surfaces_objective_path_probe_found():
+    state = engagement_state.EngagementState(
+        objective="find attack path to essos.local",
+        footholds=[], hops=[], graph_facts=[_path_fact("objective-path-found:essos.local")],
+    )
+    rendered = engagement_state.render_engagement_state(state)
+    assert "BloodHound attack-path probe:" in rendered
+    assert "path EXISTS to essos.local" in rendered
+    assert "(no observed state yet)" not in rendered
+
+
+def test_render_surfaces_objective_path_probe_no_path_as_reportable():
+    state = engagement_state.EngagementState(
+        objective="find attack path to essos.local",
+        footholds=[], hops=[], graph_facts=[_path_fact("objective-no-path:essos.local")],
+    )
+    rendered = engagement_state.render_engagement_state(state)
+    assert "NO path found to essos.local" in rendered
+    assert "reportable" in rendered
+
+
+def test_render_omits_path_probe_section_when_no_probe_facts():
+    state = engagement_state.EngagementState(
+        objective="find attack path to essos.local", footholds=[], hops=[], graph_facts=[],
+    )
+    rendered = engagement_state.render_engagement_state(state)
+    assert "BloodHound attack-path probe:" not in rendered
+    assert "(no observed state yet)" in rendered

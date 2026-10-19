@@ -1930,6 +1930,9 @@ class MythicTools:
         # hop (suggest-on-known; blocking stays conservative / unknown != false).
         self._engagement_graph_facts: list = []
         self._engagement_graph_facts_ts: str | None = None
+        # #58: objective+coverage key of the last path-shaped probe, so it fires at most once per
+        # objective/coverage horizon (re-fires only when the objective text or covered domains change).
+        self._objective_path_probe_key: str | None = None
         # Exact per-process Kerberos ticket forge command strings emitted by build_capability_commands. The
         # gate requires golden-ticket/SID-history tasks to match one of these keys so a model cannot handcraft
         # a command that merely looks builder-shaped or bypasses the isolated-context sequence.
@@ -7812,11 +7815,12 @@ class MythicTools:
         )
         try:
             try:
-                from . import access_reconciler, engagement_state, graph_reconciler
+                from . import access_reconciler, engagement_state, graph_reconciler, objective_contract
             except ImportError:
                 import access_reconciler
                 import engagement_state
                 import graph_reconciler
+                import objective_contract
 
             # Need footholds to derive the controlled principals the cypher matches on. Use the gate's
             # cache if present; otherwise reconcile once (collection tools aren't classified, so the cache
@@ -7924,6 +7928,39 @@ class MythicTools:
                     self._persist_engagement_ledger()
                 except Exception:
                     pass
+
+            # #58 pathfinding-first: when BloodHound has data AND the objective is a path-shaped ask,
+            # ask the graph ONCE per objective whether a path exists from the controlled principals to
+            # each covered domain, and surface the answer (found / no-path) as an advisory fact the
+            # planner sees first. Strictly gated on data presence (covered_domains) and a path-shaped
+            # ask; otherwise it is a silent no-op. Read-only; never collects; derives its target from
+            # the objective's own covered domains (no hardcoded topology).
+            try:
+                if principals and objective_contract.objective_seeks_attack_path(state.objective):
+                    if not covered_domains:
+                        covered_domains = await _bloodhound_collected_domains()
+                    probe_key = f"{state.objective}|{','.join(sorted(covered_domains or []))}"
+                    if covered_domains and probe_key != getattr(self, "_objective_path_probe_key", None):
+                        probe_facts = list(await graph_reconciler.probe_path_to_objective(
+                            _SingleToolMCP(cypher_tool), principals, covered_domains, now,
+                            self._GRAPH_FACTS_TTL_SECONDS, proof_envelope=proof_envelope,
+                        ) or [])
+                        self._objective_path_probe_key = probe_key
+                        if probe_facts:
+                            existing = {
+                                getattr(fact, "predicate", "")
+                                for fact in self._engagement_graph_facts
+                            }
+                            for fact in probe_facts:
+                                if getattr(fact, "predicate", "") not in existing:
+                                    self._engagement_graph_facts.append(fact)
+                            try:
+                                self._persist_engagement_ledger()
+                            except Exception:
+                                pass
+            except Exception as probe_exc:
+                logger.info(f"🧭 [graph-facts] path probe skipped (fail-open): {probe_exc}")
+
             logger.info(
                 f"🧭 [graph-facts] refresh: principals={len(principals)} new_facts={len(facts)} "
                 f"cached={len(self._engagement_graph_facts)} "
