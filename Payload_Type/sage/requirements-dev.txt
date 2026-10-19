@@ -17,6 +17,9 @@ pytest==9.1.1
 # Bounded OpenAI-compatible provider transport in the operator's real-model case runner.
 httpx==0.28.1
 
+# Typed synthetic tool schemas in the inert native-chat graph comparison runner.
+pydantic==2.13.4
+
 # Operator-skill dependency, not a runtime one. `skills/sage-goad-reset/scripts/sync_range_time.py`
 # imports `winrm` to set Windows guest clocks over WinRM after a range rollback — a step AGENTS.md
 # calls mandatory after *every* rollback. It went undeclared until 2026-08-01, so a clean checkout

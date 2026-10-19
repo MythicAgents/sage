@@ -112,6 +112,40 @@ def _objective_is_informational(text: str) -> bool:
     return bool(_INFORMATIONAL_OBJECTIVE_RE.match(_normalize_text(text)))
 
 
+_ATTACK_PATH_NOUN_RE = re.compile(
+    r"\b(?:attack\s+paths?|shortest\s+paths?|pathfind\w*|path(?:way)?s?\s+to)\b",
+    re.IGNORECASE,
+)
+_ATTACK_PATH_VERBS = (
+    "escalate", "escalating", "escalation", "compromise", "compromising",
+    "own", "owning", "takeover", "take over", "reach", "reaching", "pivot", "pivoting",
+)
+_ATTACK_PATH_PRIV_NOUNS = (
+    "domain admin", "domain admins", "enterprise admin", "enterprise admins",
+    "domain controller", "privilege", "privileges", "privileged",
+)
+
+
+def objective_seeks_attack_path(objective_text: Any) -> bool:
+    """True when the objective asks to find or traverse an attack path, or to reach privilege on a
+    target (the pathfinding-first "path-shaped ask" signal, cairn #58).
+
+    Negation-aware (``do not escalate`` / ``without compromising`` do not count as a positive ask).
+    Pure data classification; never raises. This only decides whether a read-only BloodHound path
+    probe is relevant — it adds no prompt policy and selects no attack path itself."""
+    text = _normalize_text(objective_text)
+    if not text:
+        return False
+    lowered = text.casefold()
+    if _ATTACK_PATH_NOUN_RE.search(lowered):
+        return True
+    verb_positive, verb_negated = _action_polarity(lowered, _ATTACK_PATH_VERBS)
+    if verb_positive and not verb_negated:
+        return True
+    priv_positive, priv_negated = _action_polarity(lowered, _ATTACK_PATH_PRIV_NOUNS)
+    return priv_positive and not priv_negated
+
+
 def _decode_mapping(value: Any) -> dict[str, Any] | None:
     if isinstance(value, dict):
         return dict(value)

@@ -14,6 +14,8 @@ from pathlib import Path
 import re
 from typing import Any, Awaitable, Callable, Mapping
 
+from runtime_db import assert_legacy_migrated, database_path
+
 from .operation_analysis import OperationAnalysisResult, analyze_seeded_operation
 from .operation_findings import (
     FindingViewItem,
@@ -41,8 +43,8 @@ _ASSESS_COMMAND_RE = re.compile(
 
 
 def default_operation_memory_path() -> Path:
-    """Return the container-local durable database path without machine guesses."""
-    return Path(__file__).resolve().parent.parent / "sage_operation_memory.db"
+    """Return Sage's canonical application SQLite database path."""
+    return database_path()
 
 
 def assess_finding_id(prompt: Any) -> str | None:
@@ -189,7 +191,9 @@ class OperationMemoryRuntime:
         limits: OperationMemoryLimits | None = None,
         source_factory: SourceFactory | None = None,
     ) -> None:
-        self.db_path = Path(db_path or default_operation_memory_path())
+        self.db_path = Path(db_path) if db_path is not None else default_operation_memory_path()
+        if db_path is None:
+            assert_legacy_migrated(self.db_path)
         self.store = OperationMemoryStore(self.db_path, limits=limits)
         self._source_factory = source_factory or self._default_source
         self._initialize_lock = asyncio.Lock()

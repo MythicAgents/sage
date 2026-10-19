@@ -76,6 +76,16 @@ _GENERIC_ERROR_HINT_RE = re.compile(
     re.IGNORECASE,
 )
 
+_ENROLLED_EXECUTABLE_PARSER_FAILURES = tuple(
+    re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+    for pattern in (
+        r"^\s*Verb\s+'[^'\r\n]+'\s+is\s+not\s+recognized\.\s*$",
+        r"^\s*Required\s+option\s+'[^'\r\n]+'\s+is\s+missing\.\s*$",
+        r"^\s*(?:Unknown\s+option|Option\s+'[^'\r\n]+'\s+is\s+unknown)\b.*$",
+        r"^\s*Sequence\s+option\s+'[^'\r\n]+'\s+has\s+no\s+values\.\s*$",
+    )
+)
+
 _SHARPHOUND_COMMAND_SELECTORS = {
     "execute_assembly": "Assembly",
     "execute-assembly": "assembly",
@@ -151,6 +161,15 @@ def classify_result(command: str, output: str, exception: str | None = None, par
         return ResultClass.SUCCESS.value
     except Exception:
         return ResultClass.TRANSIENT.value
+
+
+def enrolled_executable_parser_failure(output: Any) -> bool:
+    """Recognize narrow CLI-parser failures only after the caller proves enrollment."""
+    try:
+        text = _text(output)
+        return any(pattern.search(text) is not None for pattern in _ENROLLED_EXECUTABLE_PARSER_FAILURES)
+    except Exception:
+        return False
 
 
 def _sharphound_completion_override(command: str, output: str, parameters: Any) -> bool | None:
@@ -421,15 +440,15 @@ def _reroute_registered_file_refs(
     Mythic file-exec commands (execute_assembly, inline_assembly, load-assembly, ...) have TWO parameter
     groups: a "Default"/registered group with a ChooseOne selector (cli `Assembly`/`assembly`/`filename`)
     for an ALREADY-REGISTERED file, and a "New File" group with a File-type param (cli `assembly_file`/
-    `file`) for uploading a NEW file. Sage references already-registered tools, so a value the model placed
-    on the File/upload param is a registered reference — it belongs on the ChooseOne selector. Leaving it on
-    the File param selects the "New File"/upload group, which (with a registered UUID) crashes Merlin and
-    misbehaves on Apollo. Reroute so the registered group is chosen; ChooseOne validation then either accepts
-    a valid registered name or returns a repair hint listing the valid names.
+    `file`) for uploading a NEW file. An existing registered name placed on the File/upload param belongs on
+    the ChooseOne selector. Leaving that name on the File param selects the wrong group. Reroute so the
+    registered group is chosen; ChooseOne validation then either accepts a valid registered name or returns
+    a repair hint listing the valid names. Apollo inline_assembly's schema is the narrower exception: an
+    unmatched value stays on its File group and the issue layer requires an exact uploaded-file identity.
 
-    The Mythic `upload` operation is the inverse case: its File parameter is the intended transport for a
-    Mythic file UUID, even when the schema also exposes a registered-file selector. Do not reroute transport
-    uploads into a selector group that expects a display string.
+    Mythic upload and register_file (including Apollo's register_assembly alias) are the inverse case:
+    their File parameter transports a Mythic file UUID, even when the schema also exposes a registered-file
+    selector. Do not reroute those values into a selector group that expects a filename.
     """
     try:
         if _is_file_transport_command(command):
@@ -451,6 +470,17 @@ def _reroute_registered_file_refs(
         for fp in file_params:
             fcli = fp["cli_name"]
             if fcli in mapped and sel_cli not in mapped:
+                # Apollo inline_assembly genuinely accepts a newly uploaded Mythic file UUID in
+                # its typed File group. Preserve the existing registered-name recovery, but do
+                # not turn an unmatched File value into authority for the registered selector.
+                # execute_assembly deliberately retains the historical unconditional reroute:
+                # its uploaded UUID path is unsafe on Merlin and was the original reason for this
+                # repair layer.
+                if _lower(command).replace("-", "_") == "inline_assembly" and not any(
+                    _lower(choice) == _lower(mapped[fcli])
+                    for choice in selector.get("choices") or []
+                ):
+                    continue
                 mapped[sel_cli] = mapped.pop(fcli)
                 for key, cli in list(sources.items()):
                     if cli == fcli:
@@ -462,7 +492,7 @@ def _reroute_registered_file_refs(
 
 def _is_file_transport_command(command: str) -> bool:
     normalized = _lower(command).replace("-", "_")
-    return normalized in {"upload", "upload_file", "file_upload"}
+    return normalized in {"upload", "upload_file", "file_upload", "register_file", "register_assembly"}
 
 
 def _clean_schema(command_parameters: Any) -> list[dict]:

@@ -223,6 +223,16 @@ mutation CreateSageMessage($channelId: Int!, $message: String!) {
 }
 """
 
+CANCEL_REQUEST_MUTATION = """
+mutation CancelSageChatRequest($request_id: Int!) {
+  chatCancelRequest(request_id: $request_id) {
+    status
+    error
+    request_id
+  }
+}
+"""
+
 CHAT_INPUT_RESPONSE_MUTATION = """
 mutation SageChatInputResponse($messageId: Int!, $action: String!, $response: String, $choiceId: String) {
   chatInputResponse(message_id: $messageId, action: $action, response: $response, choice_id: $choiceId) {
@@ -813,8 +823,9 @@ async def prepare_locked_channel(
 async def prepare_supervised_channel(
     client: Any, *, channel_name: str, max_steps: int,
     expect_provider: str, expect_model: str, expect_endpoint_sha256: str,
+    objective_led: bool = False,
 ) -> dict[str, Any]:
-    """Create one empty human-operated channel and verify Mythic's stored state."""
+    """Create one empty supervised channel and verify Mythic's stored route."""
     name = channel_name.strip()
     if len(name) < 12 or name.casefold() in {"sage", "supervised", "new channel"}:
         raise ValueError("--channel-name must be a nonempty distinctive visible name")
@@ -825,6 +836,7 @@ async def prepare_supervised_channel(
         raise ValueError("--expect-endpoint-sha256 must be 64 hexadecimal characters")
     metadata = canary_ai_metadata(max_steps=max_steps)
     config = metadata["config"]
+    config["autonomous_solve"] = objective_led
     endpoint = str(config.get("API_ENDPOINT") or "")
     actual_hash = hashlib.sha256(endpoint.encode("utf-8")).hexdigest() if endpoint else ""
     if (
@@ -873,7 +885,7 @@ async def prepare_supervised_channel(
             and stored_config.get("provider") == expect_provider
             and stored_config.get("model") == expect_model
             and stored_config.get("mode") == "supervised"
-            and stored_config.get("autonomous_solve") is False
+            and stored_config.get("autonomous_solve") is objective_led
             and type(stored_config.get("max_steps")) is int
             and stored_config["max_steps"] == max_steps
             and isinstance(stored_config.get("API_ENDPOINT"), str)
@@ -886,7 +898,7 @@ async def prepare_supervised_channel(
         "chat_channel_id": channel_id, "chat_channel_name": name,
         "provider": expect_provider, "model": expect_model,
         "endpoint_sha256": expected_hash, "mode": "supervised",
-        "autonomous_solve": False, "max_steps": max_steps, "empty": True,
+        "autonomous_solve": objective_led, "max_steps": max_steps, "empty": True,
     }
 
 
@@ -1052,6 +1064,32 @@ def _extract_control_transitions(
             + "; ".join(grammar_errors)
         )
     return transitions
+
+
+def request_cancellation_acknowledged(snapshot: dict[str, Any]) -> bool:
+    """Require the exact request's Sage final response to attest cancellation."""
+    request = snapshot.get("request") or {}
+    if str(request.get("status") or "").casefold() not in {"cancelled", "canceled"}:
+        return False
+    messages = snapshot.get("messages") or []
+    _validate_transcript_identity(request, messages)
+    final_messages = []
+    for message in messages:
+        if message.get("author_type") != "ai" or message.get("deleted") is True:
+            continue
+        containers = _metadata_containers(message)
+        if (any(str(metadata.get("event_id") or "").startswith("final_response:")
+                for metadata in containers)
+                and any("control_transitions" in metadata for metadata in containers)):
+            final_messages.append(message)
+    if len(final_messages) != 1:
+        return False
+    try:
+        transitions = _extract_control_transitions(final_messages)
+    except RuntimeError:
+        return False
+    return bool(transitions and transitions[-1]["phase"] == "request_terminal"
+                and transitions[-1]["content"] == "cancelled")
 
 
 def _has_input_requested(messages: list[dict[str, Any]]) -> bool:
@@ -1335,59 +1373,96 @@ async def stop_native_chat_request(
     poll_interval_seconds: float = 2.0,
     progress_sink: Any | None = None,
 ) -> dict[str, Any]:
-    """Send one native ``/stop`` and observe both requests to a bounded terminal state.
-
-    The returned record distinguishes a successfully delivered stop request from confirmation that
-    the original producer actually terminated.  Callers retain the record even when either wait
-    times out; they must never infer remote stop from delivery alone.
-    """
+    """Cancel one exact native request and wait for Sage's final acknowledgement."""
     channel_id = _require_exact_int(channel_id, "Stopped Mythic chat channel id")
     request_id = _require_exact_int(request_id, "Stopped Mythic chat request id")
     if not isinstance(timeout_seconds, (int, float)) or isinstance(timeout_seconds, bool) or timeout_seconds <= 0:
         raise ValueError("stop timeout must be positive")
-    stop_message = await create_message(client, channel_id, "/stop")
-    stop_request_id = _require_exact_int(
-        stop_message.get("chat_request_id"), "Mythic /stop request id"
-    )
+    if (not isinstance(poll_interval_seconds, (int, float))
+            or isinstance(poll_interval_seconds, bool) or poll_interval_seconds <= 0):
+        raise ValueError("stop poll interval must be positive")
     record: dict[str, Any] = {
         "channel_id": channel_id,
         "request_id": request_id,
-        "stop_request_id": stop_request_id,
-        "stop_sent": True,
-        "stop_request_terminal": False,
+        "cancel_sent": False,
+        "cancel_action_status": None,
+        "cancel_action_error": None,
         "original_request_terminal": False,
+        "producer_acknowledged": False,
         "remote_stop_confirmed": False,
     }
     deadline = time.monotonic() + float(timeout_seconds)
+    try:
+        snapshot = await asyncio.wait_for(
+            fetch_request_snapshot(client, request_id),
+            timeout=max(0.001, deadline - time.monotonic()),
+        )
+    except TimeoutError:
+        record["observation_error"] = "initial request snapshot timed out"
+        return record
 
-    async def bounded_wait(selected_request_id: int) -> dict[str, Any] | None:
+    def observe(current: dict[str, Any]) -> str:
+        request = current.get("request") or {}
+        if _require_exact_int(request.get("id"), "Stopped Mythic chat request id") != request_id:
+            raise RuntimeError("Stopped Mythic chat request id does not match selected request.")
+        if _require_exact_int(request.get("channel_id"), "Stopped Mythic chat channel id") != channel_id:
+            raise RuntimeError("Stopped Mythic chat channel id does not match selected channel.")
+        status = str(request.get("status") or "").casefold()
+        record["original_request_status"] = status
+        record["original_request_terminal"] = status in TERMINAL_STATUSES
+        if status in {"cancelled", "canceled"}:
+            record["producer_acknowledged"] = request_cancellation_acknowledged(current)
+            record["remote_stop_confirmed"] = record["producer_acknowledged"]
+        return status
+
+    status = observe(snapshot)
+    if status not in TERMINAL_STATUSES:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return None
+            return record
         try:
-            return await wait_for_request(
-                client,
-                selected_request_id,
-                timeout_seconds=remaining,
-                poll_interval_seconds=min(poll_interval_seconds, remaining),
-                progress_sink=progress_sink,
+            result = await asyncio.wait_for(
+                mythic.execute_custom_query(
+                    client, CANCEL_REQUEST_MUTATION,
+                    variables={"request_id": request_id},
+                ), timeout=remaining,
             )
-        except RequestWaitTimeout as exc:
-            return exc.last_snapshot
+        except TimeoutError:
+            record["cancel_action_error"] = "cancel action timed out"
+            return record
+        record["cancel_sent"] = True
+        action = result.get("chatCancelRequest") or {}
+        record["cancel_action_status"] = str(action.get("status") or "").casefold()
+        record["cancel_action_error"] = action.get("error")
+        if action.get("request_id") is not None or record["cancel_action_status"] == "success":
+            action_request_id = _require_exact_int(
+                action.get("request_id"), "Mythic cancel action request id"
+            )
+            if action_request_id != request_id:
+                raise RuntimeError("Mythic cancel action returned the wrong request id.")
+        if record["cancel_action_status"] != "success":
+            return record
+    elif status not in {"cancelled", "canceled"}:
+        return record
 
-    stop_snapshot = await bounded_wait(stop_request_id)
-    if isinstance(stop_snapshot, dict):
-        stop_status = str((stop_snapshot.get("request") or {}).get("status") or "").casefold()
-        record["stop_request_status"] = stop_status
-        record["stop_request_terminal"] = stop_status in TERMINAL_STATUSES
-    original_snapshot = await bounded_wait(request_id)
-    if isinstance(original_snapshot, dict):
-        original_status = str((original_snapshot.get("request") or {}).get("status") or "").casefold()
-        record["original_request_status"] = original_status
-        record["original_request_terminal"] = original_status in TERMINAL_STATUSES
-    record["remote_stop_confirmed"] = bool(
-        record["stop_request_terminal"] and record["original_request_terminal"]
-    )
+    while not record["remote_stop_confirmed"] and time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        await asyncio.sleep(min(poll_interval_seconds, remaining))
+        if time.monotonic() >= deadline:
+            break
+        try:
+            snapshot = await asyncio.wait_for(
+                fetch_request_snapshot(client, request_id),
+                timeout=max(0.001, deadline - time.monotonic()),
+            )
+        except TimeoutError:
+            break
+        status = observe(snapshot)
+        if progress_sink is not None:
+            progress_sink({"event": "cancel_progress", "chat_request_id": request_id,
+                           "status": status, "producer_acknowledged": record["producer_acknowledged"]})
+        if status in TERMINAL_STATUSES and status not in {"cancelled", "canceled"}:
+            break
     return record
 
 
@@ -2071,6 +2146,7 @@ async def _run(args: argparse.Namespace) -> int:
             client, channel_name=args.channel_name, max_steps=args.max_steps,
             expect_provider=args.expect_provider, expect_model=args.expect_model,
             expect_endpoint_sha256=args.expect_endpoint_sha256,
+            objective_led=args.objective_led,
         )
     elif args.command == "demo-prepare":
         result = await prepare_bhusa_demo_channel(
@@ -2230,6 +2306,10 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_supervised = sub.add_parser("prepare-supervised")
     prepare_supervised.add_argument("--channel-name", required=True)
     prepare_supervised.add_argument("--max-steps", type=int, default=12)
+    prepare_supervised.add_argument(
+        "--objective-led", action="store_true",
+        help="Use the supervised controller for a continuing objective; each guarded move still requires approval.",
+    )
     prepare_supervised.add_argument("--expect-provider", required=True)
     prepare_supervised.add_argument("--expect-model", required=True)
     prepare_supervised.add_argument("--expect-endpoint-sha256", required=True)

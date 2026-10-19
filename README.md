@@ -339,9 +339,27 @@ Set `mode` when you create the channel, or switch it live with `/mode`:
 
 In supervised mode every **guarded** action — issuing a command, executing a capability, creating a payload,
 adding a credential — pauses as a native Mythic approval request before it runs. Approval is **default-deny**:
-only an explicit Accept lets it through. **One action, one card** — when the model proposes multiple guarded
-actions, Sage presents them one at a time. Accept runs the action; Reject denies it. After the action
-completes, the next guarded action is proposed. Read-only tools (`list_*`, `get_*`, downloads) never prompt.
+only an explicit Accept lets it through. In normal native supervised chat, simultaneous guarded tool
+proposals are narrowed to one; Sage must propose a later guarded action on a fresh card. An objective-led
+controller run also pauses before each proposed move. A card for `execute_capability` approves that exact
+capability action and its arguments; its adapter may issue several Mythic tasks while carrying it out. Inspect
+the displayed scope before accepting. Read-only tools (`list_*`, `get_*`, downloads) never prompt.
+For direct Mythic task proposals, the card shows the deterministically prepared command and arguments.
+If the command schema or selected registered file changes before issuance, Sage stops and requires a
+fresh proposal; an explicit `token_id` is refused because this task path does not forward it to Mythic.
+If an accepted task has not returned a confirmed result by the wait deadline, ordinary supervised chat
+ends that request with the exact Mythic task ID and an incomplete-observation notice. The task's outcome
+is still unknown; Sage does not automatically issue it again. A fresh request can inspect that task's
+output or history before you decide whether to approve another action.
+
+With **Autonomous Solve** enabled in a supervised channel, the first prompt becomes a continuing objective
+for Sage's controller. Each controller move still pauses for a native approval card. With that option off,
+supervised chat uses the ordinary LangGraph consultation path and approval cards for guarded tools.
+Reject skips the proposed move and lets Sage consider an alternative with a fresh approval.
+Respond denies that move and carries your guidance into the next model selection. Hybrid consults the
+model for this guidance even when only one alternative remains. Symbolic policy cannot interpret Respond
+guidance and hands control back without issuing another action. Objective-led completion requires objective
+evidence; completing one collection does not prove the objective.
 
 Guarded tools are also **scope-preflighted**: each maps to a required Mythic bot-token scope (`callback.write`,
 `payload.write`, `credential.write`, `file.write`), and a tool whose scope your channel token lacks is disabled
@@ -356,23 +374,47 @@ up front rather than failing mid-run.
 
 | Command | What it does |
 |---|---|
-| `/state` | Show the [engagement ledger](#the-engagement-ledger) — the hop table of proven effects for this channel |
+| `/state` | Show the [engagement ledger](#the-engagement-ledger) — the durable hop table of proven effects shared by chats in the current Mythic operation engagement |
 | `/state objective <text>` | Set the engagement objective |
 | `/state reconcile [task_id] [apply]` | Import verified effects and credentials from completed Mythic tasks — **dry-run unless `apply`** is given, because task output is attacker-influenceable |
 | `/state set <row> <status>` · `/state remove <row>` · `/state wipe` | Edit or clear ledger rows (you cannot hand-promote a row to `achieved` — that needs a real proof envelope) |
 | `/mode [conversation\|supervised\|auto]` | Show or switch the channel's mode |
 | `/list` | List active Sage chat sessions |
+| `/tools` | List Sage's public Mythic tool functions, descriptions, and access requirements |
+| `/report [identity]` | Show retained identity/membership observations shared across assisted chats in this operation engagement, unknown access prerequisites, and next checks; one identity metadata check, no model call or new task |
 | `/stop` | Cooperatively stop the running agent on this channel |
 | `/bloodhound [force] [dir]` | Connect, report, or rebind the BloodHound MCP — see [BloodHound](#bloodhound) |
 | `/mcp <list\|tools\|call\|connect\|disconnect\|policy>` | Manage MCP servers — see [Connecting other MCP servers](#connecting-other-mcp-servers) |
 | `/sandbox [shell\|python] <code>` | Run an isolated local snippet (requires the `callback.write` scope) |
 
+`/state` is available in conversation, supervised and auto modes. Its ledger is shared across
+chats in the same operation engagement and persists once written. A new engagement can show an
+empty ledger: viewing operation details or callbacks does not record an achieved effect, and
+reading `/state` alone does not create a ledger file.
+
+`/report` defaults to the identity report; `/report identity` remains supported.
+It is available in conversation and supervised chat, including a fresh chat
+without model initialization. It uses matched task observations Sage has collected in the same
+Mythic operation engagement, shared across chats and retained across Sage restarts. It performs
+a bounded read-only operation-marker check before reading local evidence; it does not scan
+Mythic task history. Original collection provenance remains visible, and missing or changed
+engagement identity makes sharing unavailable. Observations may be historical or incomplete. A reported identity
+or host membership does not prove current authentication or access. The report has authored
+next checks; general chat remains exploratory model prose. See the
+[bounded report contract](docs/architecture/SPECIALIST_HANDBACKS.md#bounded-identityaccess-report).
+
+`/tools` and simple questions such as “list your tools” use the same deterministic inventory without a
+model call. The inventory distinguishes read-only tools from guarded actions and reports known session
+restrictions. Before a session is initialized, live token availability is unverified. Use `/mcp tools` for
+connected MCP tools; payload callback commands are a separate inventory retrieved from Mythic.
+
 ## Tools and capabilities
 
-Sage exposes **37 classified Mythic tools** to its agents — **26 read-only** (enumerate callbacks, payloads,
-tasks, files, and credentials; retrieve tradecraft guidance; build capability plans) and **11
-guarded/offensive** (issue a command, execute a capability, create a payload, add a credential, ingest a
-collection, run in the sandbox). Every tool carries a `@tool_safety` decorator (`TOOL_SAFETY_READ_ONLY` or
+Sage classifies tools as **read-only** (enumerate callbacks, payloads, tasks, files, and credentials;
+retrieve tradecraft guidance; build capability plans) or **guarded/offensive** (issue a command, execute a
+capability, create a payload, add a credential, ingest a collection, run in the sandbox). The public Mythic
+tool inventory is available through `/tools`; internal helpers and callback payload commands are separate.
+Every tool carries a `@tool_safety` decorator (`TOOL_SAFETY_READ_ONLY` or
 `TOOL_SAFETY_GUARDED`) and CI enforces that no tool ships unclassified — an undecorated method defaults to
 guarded at runtime. The read-only/guarded split determines behavior across modes: guarded tools are
 approval-gated in supervised mode, denied in conversation mode, and only they can change target or Mythic state.
@@ -403,9 +445,21 @@ Sage bundles no offensive binaries. Drop a binary in (for example `Rubeus.exe`, 
 demand instead of making you upload it by hand. `download_tool` can also fetch a pinned, sha256-verified binary
 from its TTP source straight into this folder.
 
-Capability mechanics bind to the **live payload's advertised command schema** at execution time
-(`mythic_capability_adapter.py`), so the same generic capability drives Apollo, Merlin, Poseidon, or any Mythic
-agent — Sage is not tied to one payload.
+For operator-run static metadata and reviewed executable-help inspection in isolated
+containers, see [off-target artifact inspection](docs/development/ARTIFACT_INSPECTION.md).
+This workflow does not use a target callback or add a new chat command.
+For enrolled executables, Sage supports [versioned executable arguments](docs/development/EXECUTABLE_CONTRACTS.md)
+with typed fields and deterministic rendering before approval through supported Apollo wrappers.
+
+Sage discovers commands and validates arguments against the **live payload's advertised command schema**.
+Automated workflows also use payload-specific profiles in `mythic_capability_adapter.py` to select commands
+and account for execution and authentication behavior. The automated graph-collection controller currently
+has profiles for **Apollo and Merlin**; it excludes payload types without a collection profile. Discovering
+a payload's commands does not establish support for every automated capability on that payload.
+
+See [payload adapters and command discovery](docs/reference/TOOLS_AND_CAPABILITIES.md#payload-adapters-and-command-discovery)
+for the profile mappings and approval/alias boundary. An implemented profile is separate from live validation;
+the beta-qualified payload remains Apollo in the exact configuration described under [Limitations](#limitations).
 
 The complete tool and capability reference is in
 [docs/reference/TOOLS_AND_CAPABILITIES.md](docs/reference/TOOLS_AND_CAPABILITIES.md). Because the exposed set is
@@ -468,7 +522,7 @@ Model settings resolve through the chain above. The main settings are:
 | `API_ENDPOINT` | Optional endpoint override — point `openai` at any OpenAI-compatible server (see below) |
 | `API_KEY` | Provider API key when required |
 | `mode` | `conversation` (default), `supervised`, or `auto` — see [Modes](#modes) |
-| `autonomous_solve` | Force the autonomous execution kernel for the channel (equivalent to `mode: auto`) |
+| `autonomous_solve` | Enable objective-led controller execution; supervised mode still requires approval for each guarded action |
 | `policy_mode` | `hybrid` (default), `symbolic`, or `llm` capability selection |
 | `max_steps` | Model-step ceiling; unset defaults to `200`, `0` means unlimited |
 
@@ -488,6 +542,9 @@ constrain the admissible actions and lets the model pick among them — the inte
 a deterministic, model-free baseline, useful for reproducible debugging without LLM variance. `llm` lets the
 model choose from the full catalog: most latitude, weakest guardrails, mainly for research and eval comparisons.
 Choose `hybrid` unless you have a reason not to.
+This setting governs controller capability selection. Ordinary supervised chat with Autonomous Solve off
+uses the agent graph: read-only requests can run immediately, and guarded requests can be proposed for approval.
+Turning Autonomous Solve off does not remove the operator's ability to request an action.
 
 **Step budget.** `max_steps` bounds the number of model steps in a run. Left unset it defaults to 200; set it to
 `0` for unlimited. A small ceiling caps cost and stops runaway loops on scoped work. For a full autonomous
@@ -696,11 +753,28 @@ ever baked into the image.
 
 ## Runtime state and clean resets
 
-`Payload_Type/sage/sage.db` stores LangGraph checkpoint state.
+`Payload_Type/sage/sage.db` stores LangGraph checkpoints, tool cache, channel markers,
+controller recovery and operation-memory tables, including retained report observations.
+These surfaces share a physical SQLite file but retain separate APIs and erasure lifecycles.
+The default path is independent of the process working directory; `SAGE_DATABASE_PATH` can
+select an explicit application database path. Multiple chats share SQLite's writer limit,
+so write transactions must remain short and database lock failures must remain visible.
+If a legacy `sage_operation_memory.db` exists, startup refuses to silently ignore it.
+Stop Sage, then import it with
+`.venv/bin/python skills/sage-goad-reset/scripts/migrate_operation_memory.py --sage-stopped`.
+The import preserves the original file, verifies schema and records, rejects destination
+conflicts, and records an idempotent migration receipt. A changed legacy source requires
+operator review. The archive helper also honors `SAGE_DATABASE_PATH` and preserves legacy
+files and SQLite sidecars. An operation-memory wipe erases its operation rows, including
+report observations; it does not erase chat checkpoints in the same file.
 `Payload_Type/sage/.phoenix/phoenix.db` stores observability history. Treat both as retained trajectory data.
 
-Each chat channel reuses one LangGraph session, checkpointed to `sage.db`, so a pending approval or an in-flight
-objective survives across turns and across a Sage restart rather than being lost.
+An active chat channel retains its session across ordinary turns, including pending approvals and objective
+context. After a Sage restart or session replacement, ordinary Supervised chat does not restore its prior
+conversational scope and evidence. Read-only `/state`, `/report` and tool discovery remain
+available. Shared report observations do not restore conversational scope or pending approvals. Start a fresh
+channel and restate scope and evidence before continuing model work; separately bound Auto-controller
+recovery does not restore the Supervised conversation.
 
 Never delete runtime databases to obtain a clean run. Stop Sage and archive active databases first:
 
@@ -722,7 +796,7 @@ execution kernel — with no configuration, and nothing leaving the host.
 Sage has **two execution paths**, and they produce different traces. Knowing which one you ran is the difference
 between reading a trace and misreading it.
 
-| | Chat and supervised runs (LangGraph agent) | Autonomous runs (deterministic kernel) |
+| | Conversation and ordinary supervised chat (LangGraph agent) | Auto and supervised objective runs (deterministic kernel) |
 |---|---|---|
 | What runs | the agent graph: supervisor, sub-agents, middleware | the controller loop: observe, select, execute, verify |
 | Span tree | `Sage` → `Supervisor` → `model` / `tools` → tool spans | `sage.kernel.episode` → `sage.kernel.cycle` → `sage.kernel.seam.*` → tool spans |

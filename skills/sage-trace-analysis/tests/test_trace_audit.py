@@ -174,6 +174,23 @@ def test_load_transcript_fails_closed_on_redundant_identity_or_status_drift(
         trace_audit.load_transcript(path)
 
 
+def test_initiator_message_without_request_tag_binds_exact_message_id(
+    tmp_path,
+):
+    transcript = _transcript()
+    transcript["messages"][0]["chat_request_id"] = None
+    path = tmp_path / "operator-initiated-transcript.json"
+    path.write_text(json.dumps(transcript), encoding="utf-8")
+    loaded = trace_audit.load_transcript(path)
+    assert loaded["chat_request_id"] == 9
+
+    transcript["request"]["request_message_id"] = 2
+    wrong_binding = tmp_path / "operator-initiated-wrong-binding.json"
+    wrong_binding.write_text(json.dumps(transcript), encoding="utf-8")
+    with pytest.raises(ValueError, match="exact integer"):
+        trace_audit.load_transcript(wrong_binding)
+
+
 @pytest.mark.parametrize("invalid_id", [True, 9.0, "9"])
 @pytest.mark.parametrize(
     "path",

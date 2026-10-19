@@ -41,6 +41,7 @@ def _public_tool_methods() -> list[str]:
         "record_capability_result",
         "record_created",
         "require_request_contract",
+        "reset_request_loop_guards",
         "reserve_ingest",
         "set_approval_claim",
         "set_capability_command_observer",

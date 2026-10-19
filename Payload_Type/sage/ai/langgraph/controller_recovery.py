@@ -14,6 +14,8 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
+from runtime_db import database_path
+
 
 class RecoveryBlocked(RuntimeError):
     """Saved controller state cannot safely be resumed automatically."""
@@ -59,10 +61,10 @@ class ControllerRecoveryStore:
     flock releases it on process death while SQLite commits preserve seam markers.
     """
 
-    def __init__(self, operation_id: int, channel_id: int, *, db_path: str = "sage.db"):
+    def __init__(self, operation_id: int, channel_id: int, *, db_path: str | None = None):
         self.operation_id = int(operation_id)
         self.channel_id = int(channel_id)
-        self._db_path = Path(db_path)
+        self._db_path = Path(db_path if db_path is not None else database_path())
         self._lock_path = f"{self._db_path}.controller.{self.operation_id}.{self.channel_id}.lock"
         self._lock_file = None
 

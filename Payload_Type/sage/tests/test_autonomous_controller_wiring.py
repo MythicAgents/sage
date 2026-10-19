@@ -73,8 +73,12 @@ def _install_supervised_contract(
     m,
     request_id="request-supervised",
     callback_ids=("3",),
+    *,
+    actions_complete=True,
 ):
-    from ai.langgraph.request_contract import build_request_contract
+    from ai.langgraph.request_contract import (
+        StopCondition, StopConditionKind, build_request_contract,
+    )
 
     m.mode = "supervised"
     m.command_name = "chat"
@@ -93,14 +97,19 @@ def _install_supervised_contract(
     m._subgoal_evidence_records = set()
     m._request_event_ledger = None
     m.state = {"messages": [], "supervisor_messages": []}
-    m.install_request_contract(build_request_contract(
+    contract = build_request_contract(
         request_id=request_id,
         channel_id="channel-1",
         operation_id="operation-1",
         mode="supervised",
         autonomous_solve=True,
         callback_ids=callback_ids,
-    ))
+    )
+    if actions_complete:
+        contract = contract.amend(
+            stop_condition=StopCondition(StopConditionKind.ACTIONS_COMPLETE)
+        )
+    m.install_request_contract(contract)
     return m
 
 
@@ -397,6 +406,175 @@ def test_controller_resume_executes_exact_approved_action_without_second_model_d
         assert telemetry["model_calls"] == 0
 
 
+def test_hybrid_approved_singleton_reaches_model_for_successor_branch(monkeypatch):
+    objective = "Complete the declared offline checks."
+    state = es.EngagementState(objective=objective, footholds=[
+        _foothold("3", agent="unsupported-test-agent"),
+    ], hops=[], graph_facts=[])
+    first = capabilities.CapabilityAction(
+        name="offline-check", target="first", effects=["checked:first"],
+        intent={"callback_id": "3"},
+    )
+    successors = [
+        capabilities.CapabilityAction(
+            name="offline-check", target=target, effects=[f"checked:{target}"],
+            intent={"callback_id": "3"},
+        )
+        for target in ("second", "third")
+    ]
+    effects = []
+    monkeypatch.setattr(capabilities, "actions_from_state", lambda _state: successors if effects else [first])
+    m = _install_supervised_contract(
+        _bare_model(json.dumps({"ok": True}), state, []),
+        request_id="request-singleton-then-branch", actions_complete=False,
+    )
+    m.policy_mode = "hybrid"
+    m.provider = "test"
+    m.model = "selector"
+    cards = []
+    requests = []
+
+    class BranchLLM:
+        async def ainvoke(self, messages):
+            request = json.loads(messages[-1].content)
+            requests.append(request)
+            assert len(request["candidates"]) == 2
+            return type("Response", (), {
+                "content": json.dumps({
+                    "disposition": "select",
+                    "candidate_id": request["candidates"][0]["candidate_id"],
+                }),
+                "response_metadata": {"model_provider": "test", "model_name": "selector"},
+                "usage_metadata": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            })()
+
+    async def emit(action_requests):
+        cards.append(copy.deepcopy(action_requests))
+
+    async def execute(action, _inputs):
+        effects.append(action["target"])
+        return json.dumps({"ok": True, "verdict": "achieved", "effects": action["effects"]})
+
+    m.llm = BranchLLM()
+    m._hitl_card_emitter = emit
+    m._hitl_card_pending = False
+    m.mythic_client.execute_capability = execute
+
+    assert asyncio.run(m._run_autonomous_controller(objective)) == ""
+    assert [card[0]["args"]["action"]["target"] for card in cards] == ["first"]
+    assert requests == []
+    digest = _install_exact_card_claim(m, cards[0], "approval-first")
+    assert asyncio.run(m.handle_controller_hitl_resume("approve", expected_action_digest=digest)) == ""
+
+    assert effects == ["first"]
+    assert len(requests) == 1  # an actual configured backend invocation, not an owner label
+    assert [card[0]["args"]["action"]["target"] for card in cards] == ["first", "second"]
+    assert m._controller_hitl_pending["args"]["action"]["target"] == "second"
+    telemetry = m.controller_runtime_telemetry()
+    assert telemetry["model_calls"] == 1
+    assert telemetry["model_response_records"]
+    assert telemetry["model_response_records"][0]["effective_backend"] == "test:selector"
+
+
+def test_hybrid_active_approval_missing_from_changed_frontier_stops_before_model(monkeypatch):
+    objective = "Complete the declared offline checks."
+    state = es.EngagementState(objective=objective, footholds=[
+        _foothold("3", agent="unsupported-test-agent"),
+    ], hops=[], graph_facts=[])
+    actions = [
+        capabilities.CapabilityAction(
+            name="offline-check", target=target, effects=[f"checked:{target}"],
+            intent={"callback_id": "3"},
+        )
+        for target in ("second", "third")
+    ]
+    monkeypatch.setattr(capabilities, "actions_from_state", lambda _state: actions)
+    effects = []
+    m = _install_supervised_contract(
+        _bare_model(json.dumps({"ok": True}), state, effects),
+        request_id="request-changed-active-approval", actions_complete=False,
+    )
+    m.policy_mode = "hybrid"
+    m.provider = "test"
+    m.model = "selector"
+    model_calls = []
+
+    class ForbiddenLLM:
+        async def ainvoke(self, messages):
+            model_calls.append(messages)
+            raise AssertionError("changed active approval reached model")
+
+    m.llm = ForbiddenLLM()
+    old = capabilities.CapabilityAction(
+        name="offline-check", target="first", effects=["checked:first"],
+        intent={"callback_id": "3"},
+    )
+    pending = m._controller_hitl_capability_request(
+        model._capability_action_payload(old), model._autonomous_capability_inputs(old, state), objective,
+    )
+    m._controller_hitl_approved_pending = pending
+    m._controller_hitl_approved_key = pending["key"]
+
+    report = asyncio.run(m._run_autonomous_controller(objective))
+    assert "halted_no_action" in report
+    assert "operator-approved action is no longer admissible" in report
+    assert effects == []
+    assert model_calls == []
+
+
+def test_hybrid_changed_approval_key_requires_fresh_card_before_effect(monkeypatch):
+    objective = "Complete the declared offline checks."
+    state = es.EngagementState(objective=objective, footholds=[
+        _foothold("3", agent="unsupported-test-agent"),
+    ], hops=[], graph_facts=[])
+    actions = [
+        capabilities.CapabilityAction(
+            name="offline-check", target=target, effects=[f"checked:{target}"],
+            intent={"callback_id": "3"},
+        )
+        for target in ("first", "second")
+    ]
+    monkeypatch.setattr(capabilities, "actions_from_state", lambda _state: actions)
+    effects = []
+    m = _install_supervised_contract(
+        _bare_model(json.dumps({"ok": True}), state, effects),
+        request_id="request-changed-approval-binding", actions_complete=False,
+    )
+    m.policy_mode = "hybrid"
+    m.provider = "test"
+    m.model = "selector"
+    requests = []
+    cards = []
+
+    class BranchLLM:
+        async def ainvoke(self, messages):
+            request = json.loads(messages[-1].content)
+            requests.append(request)
+            return type("Response", (), {"content": json.dumps({
+                "disposition": "select",
+                "candidate_id": request["candidates"][0]["candidate_id"],
+            })})()
+
+    async def emit(action_requests):
+        cards.append(copy.deepcopy(action_requests))
+
+    m.llm = BranchLLM()
+    m._hitl_card_emitter = emit
+    m._hitl_card_pending = False
+    pending = m._controller_hitl_capability_request(
+        model._capability_action_payload(actions[0]),
+        model._autonomous_capability_inputs(actions[0], state), objective,
+    )
+    m._controller_hitl_approved_pending = pending
+    m._controller_hitl_approved_key = "changed-key"
+
+    assert asyncio.run(m._run_autonomous_controller(objective)) == ""
+    assert len(requests) == 1
+    assert len(cards) == 1
+    assert cards[0][0]["args"]["action"]["target"] == "first"
+    assert effects == []
+
+
 def test_supervised_denied_pending_selection_keeps_backend_provenance_telemetry():
     calls = []
     m = _bare_model(json.dumps({"ok": True}), _state_with_remote_exec(), calls)
@@ -462,11 +640,11 @@ def test_supervised_denied_pending_selection_keeps_backend_provenance_telemetry(
     assert telemetry["token_usage_complete"] is True
     assert telemetry["total_tokens"] == 22
 
-    assert asyncio.run(m.handle_controller_hitl_resume("deny")) == ""
+    report = asyncio.run(m.handle_controller_hitl_resume("deny"))
+    assert "not currently admissible" in report
     telemetry = m.controller_runtime_telemetry()
-    assert telemetry["controller_status"] == "halted_denied"
-    assert telemetry["controller_terminal_reason"] == "operator denied adcs-ca-private-key-export"
-    assert telemetry["model_calls"] == 1
+    assert telemetry["controller_status"] == "halted_no_action"
+    assert telemetry["model_calls"] == 2
     assert telemetry["effective_backends"] == ["runtime-provider:runtime-model"]
     assert telemetry["backend_provenance_complete"] is True
 
@@ -684,15 +862,19 @@ def test_non_verbose_controller_only_streams_terminal_report():
 
 
 def test_supervised_controller_deny_is_sage_owned_not_controller_prefixed():
-    """A denied controller-native approval is surfaced as Sage stopping, not as a second chat speaker."""
+    """A denied controller card is a Sage-owned replan without issuing its effect."""
     calls = []
     m = _bare_model(json.dumps({"ok": True}), _state_with_remote_exec(), calls)
     m.mode = "supervised"
     m.command_name = "chat"
     m._autonomous_solve = True
     m._controller_hitl_pending = {
+        "kind": "capability",
         "tool": "execute_capability",
-        "args": {},
+        "args": {
+            "action": {"name": "earlier-action", "target": "other-host", "intent": {}},
+            "inputs": {"callback_id": "3"},
+        },
         "objective": "obtain administrative control of essos.local",
         "key": "pending-key",
     }
@@ -708,11 +890,336 @@ def test_supervised_controller_deny_is_sage_owned_not_controller_prefixed():
 
     assert asyncio.run(m.handle_controller_hitl_resume("deny")) == ""
     assert calls == []
-    assert streamed == [
-        "**Execution stopped**\n"
-        "Operator denied `execute_capability`. Sage stopped before execution.\n"
-    ]
+    assert streamed[0].startswith("**Action denied**\nOperator denied `execute_capability`.")
+    assert any("Approval required" in item for item in streamed[1:])
+    assert m._controller_hitl_objective == "obtain administrative control of essos.local"
     assert "Autonomous_Controller" not in streamed[0]
+
+
+def test_supervised_controller_denial_replans_collection_with_fresh_card():
+    state = es.EngagementState(
+        objective="obtain administrative control of essos.local",
+        footholds=[_foothold("3", host="first"), _foothold("4", host="second")],
+        hops=[], graph_facts=[],
+    )
+    calls = []
+    m = _bare_model(json.dumps({"ok": True}), state, calls)
+    m.mode = "supervised"
+    m.command_name = "chat"
+    m._autonomous_solve = True
+    m.policy_mode = "symbolic"
+    m._controller_hitl_pending = None
+    m._controller_hitl_approved_key = ""
+    m._controller_hitl_approved_pending = None
+    m._controller_hitl_objective = ""
+
+    assert asyncio.run(m._run_autonomous_controller(state.objective)) == ""
+    first = dict(m._controller_hitl_pending)
+    assert first["kind"] == "collection"
+    assert asyncio.run(m.handle_controller_hitl_resume("deny")) == ""
+    second = m._controller_hitl_pending
+    assert second["kind"] == "collection"
+    assert first["args"]["callback_id"] != second["args"]["callback_id"]
+    assert calls == []
+    assert m._controller_hitl_objective == state.objective
+
+
+def test_supervised_controller_capability_denial_offers_alternative_card(monkeypatch):
+    state = _covered_remote_exec_state()
+    calls = []
+    m = _bare_model(json.dumps({"ok": True}), state, calls)
+    m.mode = "supervised"
+    m.command_name = "chat"
+    m._autonomous_solve = True
+    m.policy_mode = "hybrid"
+    m.provider = "test"
+    m.model = "selector"
+    m._controller_hitl_pending = None
+    m._controller_hitl_approved_key = ""
+    m._controller_hitl_approved_pending = None
+    m._controller_hitl_objective = ""
+    original_candidates = model._autonomous_policy_candidates
+
+    def two_candidates(actions):
+        candidates = original_candidates(actions)
+        return [*candidates, replace(candidates[0], target="alternate-host")]
+
+    monkeypatch.setattr(model, "_autonomous_policy_candidates", two_candidates)
+    requests = []
+
+    class ChooseFirst:
+        async def ainvoke(self, messages):
+            request = json.loads(messages[-1].content)
+            requests.append(request)
+            candidate = request["candidates"][0]
+            return type("Response", (), {"content": json.dumps({
+                "disposition": "select",
+                "candidate_id": candidate["candidate_id"],
+            })})()
+
+    m.llm = ChooseFirst()
+    assert asyncio.run(m._run_autonomous_controller(state.objective)) == ""
+    first = m._controller_hitl_pending
+    assert first["kind"] == "capability"
+    assert asyncio.run(m.handle_controller_hitl_resume(
+        "deny", operator_message="Use alternate-host for the next action",
+    )) == ""
+    second = m._controller_hitl_pending
+    assert second["kind"] == "capability"
+    assert second["args"]["action"]["target"] == "alternate-host"
+    assert second["args"]["action"]["target"] != first["args"]["action"]["target"]
+    assert len(requests) == 2
+    assert requests[1]["operator_steering"] == "Use alternate-host for the next action"
+    assert requests[1]["objective"] == state.objective
+    assert calls == []
+
+
+def test_objective_led_supervised_collection_requires_next_card_not_false_completion():
+    foothold_state = _state_with_remote_exec()
+    state = es.EngagementState(
+        objective=foothold_state.objective,
+        footholds=list(foothold_state.footholds),
+        hops=[], graph_facts=[],
+    )
+    current = {"state": state}
+    capability_calls = []
+    collection_calls = []
+    m = _install_supervised_contract(
+        _bare_model(json.dumps({"ok": True}), state, capability_calls),
+        request_id="request-objective-after-collection",
+        actions_complete=False,
+    )
+    assert m._request_contract.stop_condition.kind.value == "objective_proved"
+    m.policy_mode = "hybrid"
+    m.provider = "test"
+    m.model = "selector"
+    cards = []
+
+    async def observe():
+        return current["state"]
+
+    async def collect(_state, request=None):
+        collection_calls.append(request)
+        current["state"] = _covered_remote_exec_state()
+        return {"ok": True, "status": "ingested", "graph_verified": True}
+
+    class SelectAvailable:
+        async def ainvoke(self, messages):
+            request = json.loads(messages[-1].content)
+            candidates = request["candidates"]
+            selected = next(
+                (item for item in candidates if item["name"] == "collect-graph"),
+                candidates[0],
+            )
+            return type("Response", (), {"content": json.dumps({
+                "disposition": "select", "candidate_id": selected["candidate_id"],
+            })})()
+
+    async def emit(actions):
+        cards.append(actions)
+
+    m._build_current_engagement_state = observe
+    m._controller_collect = collect
+    m.llm = SelectAvailable()
+    m._hitl_card_emitter = emit
+    m._hitl_card_pending = False
+
+    assert asyncio.run(m._run_autonomous_controller(state.objective)) == ""
+    assert cards[0][0]["name"] == "collect_graph"
+    assert collection_calls == []
+    digest = _install_exact_card_claim(m, cards[0])
+    assert asyncio.run(m.handle_controller_hitl_resume(
+        "approve", expected_action_digest=digest,
+    )) == ""
+    assert len(collection_calls) == 1
+    assert len(cards) == 2
+    assert cards[1][0]["name"] == "execute_capability"
+    assert m._controller_hitl_pending["kind"] == "capability"
+    assert m._controller_hitl_pending["objective"] == state.objective
+    assert capability_calls == []
+    m.clear_approval_claim()
+    next_digest = _install_exact_card_claim(m, cards[1], "approval-after-collection")
+    asyncio.run(m.handle_controller_hitl_resume(
+        "approve", expected_action_digest=next_digest,
+    ))
+    assert len(collection_calls) == 1
+    assert len(capability_calls) == 1
+
+
+def test_supervised_two_capability_approvals_have_distinct_sink_transactions(monkeypatch):
+    objective = "Verify two declared offline checks from the current callback."
+    state = es.EngagementState(objective=objective, footholds=[
+        _foothold("3", agent="unsupported-test-agent"),
+    ], hops=[], graph_facts=[])
+    actions = [
+        capabilities.CapabilityAction(
+            name="offline-check", target=target,
+            effects=[f"checked:{target}"], intent={"callback_id": "3"},
+        )
+        for target in ("first", "second")
+    ]
+    effects = []
+    monkeypatch.setattr(capabilities, "actions_from_state", lambda _state: [
+        action for action in actions if action.target not in effects
+    ])
+    m = _install_supervised_contract(
+        _bare_model(json.dumps({"ok": True}), state, []),
+        request_id="request-two-capability-approvals",
+        actions_complete=False,
+    )
+    m.policy_mode = "symbolic"
+    m.mythic_client = mt.MythicTools(agent_task_id=1)
+    m.mythic_client.set_request_contract(m._request_contract)
+    cards = []
+    accepted = []
+
+    async def emit(actions_on_card):
+        cards.append(actions_on_card)
+
+    async def execute(action, inputs):
+        denial = m.mythic_client._require_request_contract_effect(
+            "execute_capability", {"action": action, "inputs": inputs},
+        )
+        assert denial is None
+        accepted.append((copy.deepcopy(action), copy.deepcopy(inputs)))
+        assert action["intent"]["transaction_id"] == inputs["transaction_id"]
+        assert inputs["transaction_id"] not in {
+            prior_inputs["transaction_id"] for _, prior_inputs in accepted[:-1]
+        }
+        effects.append(action["target"])
+        state.hops.append(es.Hop(
+            id=f"proof-{len(effects)}", technique="offline-observation",
+            target=action["target"], effect=action["effects"][0],
+            status="achieved", satisfied_effects=action["effects"],
+            evidence={"source": "inert test producer"}, preconditions=[],
+            source="test", timestamp="",
+        ))
+        return json.dumps({"ok": True, "verdict": "achieved"})
+
+    m._hitl_card_emitter = emit
+    m._hitl_card_pending = False
+    m.mythic_client.execute_capability = execute
+
+    assert asyncio.run(m._run_autonomous_controller(objective)) == ""
+    assert cards[0][0]["args"]["action"]["target"] == "first"
+    first_digest = _install_exact_card_claim(m, cards[0], "approval-first")
+    assert asyncio.run(m.handle_controller_hitl_resume(
+        "approve", expected_action_digest=first_digest,
+    )) == ""
+    assert effects == ["first"]
+    assert len(cards) == 2
+    assert cards[1][0]["args"]["action"]["target"] == "second"
+    first_tx = cards[0][0]["args"]["inputs"]["transaction_id"]
+    second_tx = cards[1][0]["args"]["inputs"]["transaction_id"]
+    assert first_tx != second_tx
+    assert cards[1][0]["args"]["inputs"]["policy_decision"]["selected_target"] == "second"
+    m.clear_approval_claim()
+    second_digest = _install_exact_card_claim(m, cards[1], "approval-second")
+    asyncio.run(m.handle_controller_hitl_resume(
+        "approve", expected_action_digest=second_digest,
+    ))
+    assert effects == ["first", "second"]
+    assert [item[1]["transaction_id"] for item in accepted] == [first_tx, second_tx]
+
+
+def test_controller_denial_identity_ignores_incidental_metadata_only():
+    m = object.__new__(model.Model)
+    capability = {
+        "kind": "capability",
+        "args": {
+            "action": {"name": "example", "target": "host", "intent": {
+                "route": "one", "policy_decision": {"decision_id": "one"},
+                "transaction_id": "transaction-one",
+            }},
+            "inputs": {"callback_id": "3", "transaction_id": "transaction-one"},
+        },
+    }
+    m._controller_hitl_denied_keys = {m._controller_hitl_semantic_key(capability)}
+    retry = copy.deepcopy(capability)
+    retry["args"]["action"]["intent"]["policy_decision"]["decision_id"] = "two"
+    retry["args"]["action"]["intent"]["transaction_id"] = "transaction-two"
+    retry["args"]["inputs"]["transaction_id"] = "transaction-two"
+    assert m._controller_hitl_denies(retry)
+    retry["args"]["action"]["intent"]["route"] = "two"
+    assert not m._controller_hitl_denies(retry)
+    retry["args"]["action"]["intent"]["route"] = "one"
+    retry["args"]["inputs"]["callback_id"] = "4"
+    assert not m._controller_hitl_denies(retry)
+
+    collection = {
+        "kind": "collection", "args": {
+            "collection_key": "collection:3", "scope_domain": "essos.local",
+            "callback_id": "3", "host": "first", "agent": "apollo", "identity": "user",
+            "reason": "baseline", "support": "first wording",
+            "policy_decision": {"decision_id": "one"},
+        },
+    }
+    m._controller_hitl_denied_keys = {m._controller_hitl_semantic_key(collection)}
+    retry = copy.deepcopy(collection)
+    retry["args"].update(reason="refresh", support="different wording")
+    retry["args"]["policy_decision"]["decision_id"] = "two"
+    assert m._controller_hitl_denies(retry)
+    retry["args"]["scope_domain"] = "westeros.local"
+    assert not m._controller_hitl_denies(retry)
+
+
+def test_controller_redirect_hands_back_when_symbolic_selection_skips_guidance():
+    state = es.EngagementState(
+        objective="obtain administrative control of essos.local",
+        footholds=[_foothold("3", host="first"), _foothold("4", host="second")],
+        hops=[], graph_facts=[],
+    )
+    m = _bare_model(json.dumps({"ok": True}), state, [])
+    m.mode = "supervised"
+    m.command_name = "chat"
+    m._autonomous_solve = True
+    m.policy_mode = "symbolic"
+    m._controller_hitl_pending = None
+    m._controller_hitl_approved_key = ""
+    m._controller_hitl_approved_pending = None
+    m._controller_hitl_objective = ""
+    messages = []
+
+    async def stream(text):
+        messages.append(text)
+        return True
+
+    m._stream_message_to_mythic = stream
+    assert asyncio.run(m._run_autonomous_controller(state.objective)) == ""
+    assert asyncio.run(m.handle_controller_hitl_resume(
+        "deny", operator_message="Use callback 4 instead",
+    )) == ""
+    assert m._controller_hitl_pending is None
+    assert "did not process your new instruction" in messages[-1]
+    assert m.controller_runtime_telemetry()["controller_status"] == "halted_no_action"
+
+
+def test_controller_respond_stop_does_not_replan_or_execute():
+    state = _state_with_remote_exec()
+    calls = []
+    m = _bare_model(json.dumps({"ok": True}), state, calls)
+    m.mode = "supervised"
+    m.command_name = "chat"
+    m.task_id = "offline-test"
+    m._autonomous_solve = True
+    m._controller_hitl_pending = {
+        "kind": "capability", "tool": "execute_capability",
+        "display_name": "example", "args": {
+            "action": {"name": "example", "target": "host", "intent": {}},
+            "inputs": {"callback_id": "3"},
+        },
+        "objective": state.objective,
+        "key": "pending-key",
+    }
+    m._controller_hitl_objective = state.objective
+    m._controller_runtime_telemetry = {"controller_status": "running"}
+    assert asyncio.run(m.handle_controller_hitl_resume(
+        "deny", operator_message="stop",
+    )) == ""
+    assert m._stop_requested is True
+    assert m._controller_hitl_pending is None
+    assert calls == []
+    assert m.controller_runtime_telemetry()["controller_status"] == "halted_aborted"
 
 
 def test_supervised_chat_controller_pauses_before_execute_capability():
@@ -745,7 +1252,9 @@ def test_supervised_chat_controller_pauses_before_execute_capability():
 
 
 def test_controller_exact_approval_reaches_real_final_sink_with_card_bytes_unchanged():
-    from ai.langgraph.request_contract import build_request_contract
+    from ai.langgraph.request_contract import (
+        StopCondition, StopConditionKind, build_request_contract,
+    )
     from sage_chat.hitl import (
         approval_action_digest,
         approval_action_fingerprint,
@@ -783,7 +1292,7 @@ def test_controller_exact_approval_reaches_real_final_sink_with_card_bytes_uncha
         mode="supervised",
         autonomous_solve=True,
         callback_ids=("3",),
-    ))
+    ).amend(stop_condition=StopCondition(StopConditionKind.ACTIONS_COMPLETE)))
     cards = []
     policy_requests = []
 
@@ -2107,6 +2616,13 @@ class _CollectMythic:
 
     async def issue_task_and_waitfor_task_output(self, command, parameters, callback_display_id, **kw):
         self.calls.append((command, parameters, callback_display_id))
+        receipt = mt._task_issuance_receipt_context.get()
+        if isinstance(receipt, dict):
+            receipt.update({
+                "task_id": len(self.calls), "task_completed": True,
+                "task_status": "completed", "output_success": True,
+                "callback_id": callback_display_id, "command": command,
+            })
         if command == "whoami":
             return self._whoami_output
         if command == "rev2self":
@@ -2114,8 +2630,8 @@ class _CollectMythic:
         if command == "ticket_cache_list":
             return self._ticket_output
         if command == "execute_assembly":
-            mt = re.search(r"--ZipFilename\s+(\S+)", parameters.get("assembly_arguments", ""))
-            self._zipname = mt.group(1) if mt else None
+            zip_match = re.search(r"--ZipFilename\s+(\S+)", parameters.get("assembly_arguments", ""))
+            self._zipname = zip_match.group(1) if zip_match else None
             return "SharpHound enumeration completed"
         if command == "ls":
             files = [{"name": "apollo.exe", "full_name": "C:\\Users\\Public\\apollo.exe", "is_file": True}]
@@ -2174,13 +2690,20 @@ class _MerlinCollectMythic(_CollectMythic):
 
     async def issue_task_and_waitfor_task_output(self, command, parameters, callback_display_id, **kw):
         self.calls.append((command, parameters, callback_display_id))
+        receipt = mt._task_issuance_receipt_context.get()
+        if isinstance(receipt, dict):
+            receipt.update({
+                "task_id": len(self.calls), "task_completed": True,
+                "task_status": "completed", "output_success": True,
+                "callback_id": callback_display_id, "command": command,
+            })
         if command == "token":
             return next(self._whoami_outputs)
         if command == "rev2Self":
             return "Successfully reverted to self and dropped the impersonation token"
         if command == "execute-assembly":
-            mt = re.search(r"--ZipFilename\s+(\S+)", parameters.get("arguments", ""))
-            self._zipname = mt.group(1) if mt else None
+            zip_match = re.search(r"--ZipFilename\s+(\S+)", parameters.get("arguments", ""))
+            self._zipname = zip_match.group(1) if zip_match else None
             return "SharpHound enumeration completed"
         if command == "ls":
             on_disk = f"20260101000000_{self._zipname}" if self._ts else self._zipname
@@ -2281,7 +2804,7 @@ def test_collect_verbose_streams_progress_to_parent_task():
     result = asyncio.run(_run())
 
     assert result["ok"] is True, result
-    assert any("**Collection started**" in item and "SharpHound collection" in item for item in streamed), streamed
+    assert any("**Collection runner completed**" in item and "SharpHound runner task" in item for item in streamed), streamed
     assert any("**Collection artifact**" in item and "fresh collection artifact" in item for item in streamed), streamed
     assert any("**Collection verified**" in item and "graph_verified=true" in item for item in streamed), streamed
     assert all("Autonomous_Controller" not in item for item in streamed), streamed
@@ -2619,6 +3142,87 @@ def test_supervised_collection_failed_runner_receipt_stops_successors():
     assert len(m.mythic_client.started) == 1
     assert m.mythic_client.started[0]["identity"] == "north\\admin"
     assert not any(call[0] in ("ls", "download", "ingest_collection") for call in m.mythic_client.calls)
+
+
+@pytest.mark.parametrize("stage", ("execute_assembly", "ls", "download"))
+@pytest.mark.parametrize("fault, expected", (
+    ("missing", "task_issue_failed"),
+    ("failed", "task_failed"),
+    ("pending", "task_nonterminal"),
+    ("output_failure", "task_failed"),
+    ("wrong_command", "task_issue_failed"),
+    ("wrong_callback", "task_issue_failed"),
+))
+def test_collection_requires_own_successful_task_receipt_before_successors(stage, fault, expected):
+    class ReceiptFault(_CollectMythic):
+        async def issue_task_and_waitfor_task_output(self, command, parameters, callback_display_id, **kw):
+            output = await super().issue_task_and_waitfor_task_output(command, parameters, callback_display_id, **kw)
+            if command == stage:
+                receipt = mt._task_issuance_receipt_context.get()
+                assert isinstance(receipt, dict)
+                if fault == "missing":
+                    receipt.clear()
+                    return "STOP — request contract denied Mythic task issue"
+                if fault == "failed":
+                    receipt.update(task_completed=True, task_status="error")
+                elif fault == "pending":
+                    receipt.update(task_completed=False, task_status="processing")
+                elif fault == "output_failure":
+                    receipt["output_success"] = False
+                elif fault == "wrong_command":
+                    receipt["command"] = "other-command"
+                else:
+                    receipt["callback_id"] = callback_display_id + 1
+            return output
+
+    m = object.__new__(model.Model)
+    m.mythic_client = ReceiptFault({"status": "ingested", "graph_verified": True})
+    result = asyncio.run(m._controller_collect(_live_foothold_state("2")))
+    assert result["ok"] is False and result["status"] == expected, result
+    commands = [call[0] for call in m.mythic_client.calls]
+    assert "ingest_collection" not in commands
+    if stage == "execute_assembly":
+        assert "ls" not in commands and "download" not in commands
+    elif stage == "ls":
+        assert "download" not in commands
+    if fault in {"missing", "pending", "wrong_command", "wrong_callback"}:
+        assert result["trajectory_repair"]["repair"]["retry_budget"] == 0
+
+
+@pytest.mark.parametrize("fault", ("missing", "pending"))
+def test_collection_issuance_denial_halts_controller_before_another_collection(fault):
+    class MissingRunnerReceipt(_CollectMythic):
+        async def issue_task_and_waitfor_task_output(self, command, parameters, callback_display_id, **kw):
+            output = await super().issue_task_and_waitfor_task_output(command, parameters, callback_display_id, **kw)
+            if command == "execute_assembly":
+                receipt = mt._task_issuance_receipt_context.get()
+                if fault == "missing":
+                    receipt.clear()
+                    return "STOP — request contract denied Mythic task issue"
+                receipt.update(task_completed=False, task_status="processing")
+            return output
+
+    state = _live_foothold_state("2")
+    m = object.__new__(model.Model)
+    m.mythic_client = MissingRunnerReceipt({"status": "ingested", "graph_verified": True})
+    attempts = []
+
+    async def collect(observed):
+        attempts.append(1)
+        return await m._controller_collect(observed)
+
+    c = controller.AutonomousController(
+        observe=lambda: state,
+        execute=lambda _action: {"ok": True},
+        frontier_fn=lambda _state: [],
+        needs_collection=lambda _state: {"collection_key": "scope:test"},
+        collect=collect,
+    )
+    result = asyncio.run(c.run())
+    assert result.status == controller.STATUS_BLOCKED, result.to_dict()
+    assert attempts == [1]
+    assert [call[0] for call in m.mythic_client.calls].count("execute_assembly") == 1
+    assert result.blocker["trajectory_repair"]["retry_budget"] == 0
 
 
 def test_supervised_collection_terminal_projection_is_exactly_once():
@@ -3719,6 +4323,7 @@ def test_autonomous_agent_topology_excludes_generic_mcp_and_sandbox_handoffs(mon
     def build(autonomous):
         captured.clear()
         m = object.__new__(model.Model)
+        m.mode = "auto" if autonomous else "conversation"
         m._autonomous_solve = autonomous
         m.mythic_client = FakeMythic()
         m.state = {

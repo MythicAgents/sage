@@ -337,6 +337,106 @@ async def reconcile_graph_position(
         return []
 
 
+_PATH_PROBE_MAX_HOPS = 12
+
+
+async def _run_path_probe(tool: Any, query: str) -> tuple[bool, list[str]]:
+    """Run a reachability/path Cypher and return ``(ran, names)``.
+
+    ``ran`` is ``True`` only when BloodHound actually executed the query (the response carries a
+    ``data`` object), so the caller can distinguish "the graph has data and there is no path" from
+    "the probe could not run" and NEVER assert a false "no path" on a tool/transport error. Fail-open.
+    """
+    try:
+        payload = await asyncio.wait_for(
+            tool.ainvoke({"info_type": "run", "query": query, "include_properties": False}),
+            timeout=_MCP_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        return False, []
+    try:
+        text = payload
+        if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+            text = payload[0].get("text", "")
+        data = json.loads(text) if isinstance(text, str) else (text or {})
+        if not isinstance(data, dict) or not isinstance(data.get("data"), dict):
+            # No `data` object (an errors envelope, null, or an unexpected shape) → treat as "did not
+            # run" so the caller stays silent rather than reporting a spurious "no path".
+            return False, []
+        literals = (data["data"].get("literals")) or []
+        names = [
+            literal["value"].strip()
+            for literal in literals
+            if isinstance(literal, dict)
+            and isinstance(literal.get("value"), str)
+            and literal["value"].strip()
+        ]
+        return True, names
+    except Exception:
+        return False, []
+
+
+async def probe_path_to_objective(
+    mcp_manager: Any,
+    controlled_principals: list[str],
+    objective_domains: list[str],
+    now: str,
+    ttl_seconds: int,
+    proof_envelope: dict[str, Any] | None = None,
+) -> list[GraphFact]:
+    """Ask BloodHound ONCE whether an attack path exists from any controlled principal to each named
+    objective domain (the pathfinding-first probe, cairn #58).
+
+    Emits ``objective-path-found:<domain>`` when a shortestPath exists, ``objective-no-path:<domain>``
+    when the graph has data but no path, and emits NOTHING for a domain whose probe could not run
+    (fail-open: never assert a false "no path"). Read-only — one bounded ``shortestPath`` per domain,
+    never collection, never mutation. The 15s per-query timeout bounds cost; any failure degrades to
+    the no-op behavior that exists today. Fail-open -> []."""
+    try:
+        tool = await asyncio.wait_for(
+            mcp_manager.get_tool_by_name(_CYPHER_TOOL), timeout=_MCP_TIMEOUT_SECONDS
+        )
+        if tool is None:
+            return []
+        principals = _normalized_unique(controlled_principals)
+        domains = _normalized_unique(objective_domains)
+        if not principals or not domains:
+            return []
+        principals = await _resolve_principal_aliases(tool, principals)
+        if not principals:
+            return []
+        inlist = _principal_in_list(principals)
+        proof = dict(proof_envelope) if isinstance(proof_envelope, dict) else {}
+        facts: list[GraphFact] = []
+        seen: set[str] = set()
+        for domain in domains:
+            safe_domain = domain.replace("\\", "").replace("'", "").strip()
+            if not safe_domain:
+                continue
+            # A controlled principal IS the domain's owner only via edges; shortestPath over any edge
+            # to the Domain node is BloodHound's own reachability notion. Bounded hop count keeps the
+            # traversal cheap; LIMIT 1 because we only need existence, not the enumeration.
+            query = (
+                f"MATCH (s) WHERE toLower(s.name) IN {inlist} "
+                f"MATCH (t:Domain) WHERE toLower(t.name) = '{safe_domain}' "
+                f"MATCH path = shortestPath((s)-[*1..{_PATH_PROBE_MAX_HOPS}]->(t)) "
+                "RETURN t.name AS name LIMIT 1"
+            )
+            ran, names = await _run_path_probe(tool, query)
+            if not ran:
+                continue
+            predicate = (
+                f"objective-path-found:{safe_domain}" if names
+                else f"objective-no-path:{safe_domain}"
+            )
+            if predicate not in seen:
+                seen.add(predicate)
+                facts.append(_graph_fact(predicate, now, ttl_seconds, proof_envelope=proof))
+        return facts
+    except Exception:
+        return []
+
+
 def _has_live_domain_authority(predicates: set[str], domain: str) -> bool:
     domain = access_reconciler.normalize_forest(_text(domain))
     return bool(

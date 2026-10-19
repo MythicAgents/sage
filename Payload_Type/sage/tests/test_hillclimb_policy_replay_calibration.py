@@ -11,7 +11,35 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from ai.hillclimb import policy_replay_calibration as calibration
+
+@pytest.fixture(scope="module", autouse=True)
+def isolate_calibration_imports():
+    """Keep this legacy calibration import out of later pilot tests."""
+    global calibration
+    from ai import hillclimb
+
+    missing = object()
+    module_names = (
+        "ai.hillclimb.policy_replay_calibration",
+        "ai.hillclimb.development_row_kernel",
+    )
+    child_names = ("policy_replay_calibration", "development_row_kernel")
+    modules_before = {name: sys.modules.get(name, missing) for name in module_names}
+    children_before = {name: vars(hillclimb).get(name, missing) for name in child_names}
+    try:
+        from ai.hillclimb import policy_replay_calibration as calibration
+        yield
+    finally:
+        for name, previous in modules_before.items():
+            if previous is missing:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+        for name, previous in children_before.items():
+            if previous is missing:
+                vars(hillclimb).pop(name, None)
+            else:
+                vars(hillclimb)[name] = previous
 
 
 def _sha256(path: Path) -> str:

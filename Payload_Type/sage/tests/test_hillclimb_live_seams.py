@@ -294,7 +294,7 @@ def test_near_match_wrapped_cause_is_not_completed_response_boundary(monkeypatch
     assert raised.value.provider_code is None
 
 
-def _native_chat_fake(monkeypatch, turn, *, fetched=None, stop=None):
+def _native_chat_fake(monkeypatch, turn, *, fetched=None, stop=None, cancellation_ack=False):
     module = types.ModuleType("native_chat")
     module.TERMINAL_STATUSES = {"completed", "complete", "error", "failed", "cancelled", "canceled"}
     class RequestWaitTimeout(TimeoutError):
@@ -306,6 +306,7 @@ def _native_chat_fake(monkeypatch, turn, *, fetched=None, stop=None):
         if isinstance(fetched, BaseException): raise fetched
         return fetched
     module.fetch_request_snapshot = fetch
+    module.request_cancellation_acknowledged = lambda _snapshot: cancellation_ack
     module.request_snapshot_result = lambda snapshot: {
         "chat_channel_id": snapshot["request"]["channel_id"],
         "chat_request_id": snapshot["request"]["id"],
@@ -452,6 +453,35 @@ def test_capture_native_returned_terminal_without_bound_request_is_unconfirmed(m
     assert solve("objective") == "completed"
     assert solve.last_result["producer_settlement"]["request_identity_bound"] is False
     assert solve.last_result["producer_settlement"]["native_producer_terminal"] is False
+
+
+@pytest.mark.parametrize("returned_status", ["cancelled", "streaming"])
+@pytest.mark.parametrize("cancellation_ack", [False, True])
+def test_capture_native_cancelled_database_requires_producer_ack(
+    monkeypatch, returned_status, cancellation_ack,
+):
+    async def turn(_client, _objective, *, progress_sink, **_kwargs):
+        progress_sink({"event": "request_started", "chat_channel_id": 7, "chat_request_id": 8})
+        return {"status": returned_status}
+
+    snapshot = {"request": {"id": 8, "channel_id": 7, "status": "cancelled"}}
+    native = _native_chat_fake(
+        monkeypatch, turn, fetched=snapshot, cancellation_ack=cancellation_ack,
+        stop={"remote_stop_confirmed": False},
+    )
+    stops = []
+
+    async def stop(*_args, **_kwargs):
+        stops.append(True)
+        return {"remote_stop_confirmed": False}
+
+    native.stop_native_chat_request = stop
+    solve = ls.make_native_chat_solver(object(), capture_settlement=True)
+    solve("objective")
+    settlement = solve.last_result["producer_settlement"]
+    assert settlement["native_producer_terminal"] is cancellation_ack
+    assert settlement["remote_stop_confirmed"] is cancellation_ack
+    assert len(stops) == (0 if cancellation_ack else 1)
 
 
 def test_capture_native_fetch_timeout_cannot_swallow_aggregate_cancellation(monkeypatch):

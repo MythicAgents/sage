@@ -59,7 +59,7 @@ from .session import (
     get_channel_session,
     put_channel_session,
 )
-from .slash import handle_slash
+from .slash import handle_slash, looks_like_tool_inventory_prompt, render_tool_inventory
 from .streaming import ChatStreamEmitter
 from .watcher_control import WatcherControlBoundaryError
 from .watcher_graph import build_watcher_graph, render_watcher_explanation
@@ -300,6 +300,73 @@ class SageChat(Chat):
     def _operation_memory(self) -> OperationMemoryRuntime:
         runtime = getattr(self, "_operation_memory_runtime", None)
         return runtime if runtime is not None else self._findings_watcher().runtime
+
+    async def _retain_report_collection(self, request: ChatRequest, model: Any) -> None:
+        """Admit only this native turn's paired task reads after checkpoint completion."""
+        if (getattr(model, "mode", None) not in {"conversation", "supervised"}
+                or not getattr(model, "_thread_id_override", None)):
+            return
+        getter = getattr(getattr(model, "graph", None), "aget_state", None)
+        collector = getattr(model, "native_report_collection", None)
+        if not callable(getter) or not callable(collector):
+            return
+        identity = f"chat:{request.ChannelID}:request:{request.RequestID}"
+        try:
+            snapshot = await getter(model._graph_run_config(model._session_thread_id()))
+            values = getattr(snapshot, "values", None)
+            if not isinstance(values, dict):
+                return
+            records = collector(values, identity)
+            if not records:
+                return
+            client = getattr(getattr(model, "mythic_client", None), "client", None)
+            from .report_identity import canonical_engagement_uuid
+            from .report_observations import admit_observations
+            engagement = await canonical_engagement_uuid(client, request.OperationID)
+            if engagement and engagement == getattr(model, "_report_engagement_at_turn", None):
+                await admit_observations(
+                    self._operation_memory().store, request.OperationID, engagement,
+                    channel_id=request.ChannelID, request_id=identity,
+                    checkpoint_thread=model._session_thread_id(), records=records)
+        except Exception as exc:
+            logger.warning("Retained report collection unavailable (%s)", type(exc).__name__)
+
+    async def handle_identity_report(self, request: ChatRequest, model: Any | None) -> str:
+        """Read the exact authenticated operation marker, then local retained sources."""
+        unavailable = (
+            "Retained task observations are unavailable. This report cannot establish identity or access."
+        )
+        mode = getattr(model, "mode", None)
+        if model is None:
+            try:
+                mode = build_model_kwargs(request)["mode"]
+            except Exception:
+                return unavailable
+        if mode not in {"conversation", "supervised"}:
+            return "`/report identity` is available only in conversation or supervised mode."
+        try:
+            client = getattr(getattr(model, "mythic_client", None), "client", None)
+            if client is None:
+                from ai.langgraph.mythic_tools import MythicTools
+                auth = MythicTools(operation_id=request.OperationID,
+                    channel_id=request.ChannelID, apitoken_id=request.APITokenID)
+                await auth.login()
+                client = auth.client
+            from .report_identity import canonical_engagement_uuid
+            from .report_observations import retained_observations
+            engagement = await canonical_engagement_uuid(client, request.OperationID)
+            if not engagement:
+                return unavailable
+            if model is not None and engagement != getattr(model, "_report_engagement_uuid", None):
+                return unavailable
+            records, omitted, capacity_reached = await retained_observations(
+                self._operation_memory().store, request.OperationID, engagement)
+            from ai.langgraph.assisted_reporting import render_identity_report
+            return render_identity_report(records, operation_scope=(request.OperationID, engagement),
+                                          omitted_sources=omitted, capacity_reached=capacity_reached)
+        except Exception as exc:
+            logger.warning("Identity report unavailable (%s)", type(exc).__name__)
+            return unavailable
 
     async def on_container_start(
         self, message: ContainerOnStartMessage
@@ -893,7 +960,20 @@ class SageChat(Chat):
                         complete_request=True,
                     )
                     return None
-            if existing_at_entry is None and (
+            slash = getattr(request, "SlashCommand", None)
+            read_only_state = (
+                slash is not None
+                and str(getattr(slash, "Name", "") or "").lower().lstrip("/") == "state"
+                and not str(getattr(slash, "Argument", "") or "").strip()
+            )
+            read_only_report = (
+                slash is not None
+                and str(getattr(slash, "Name", "") or "").lower().lstrip("/") == "report"
+            )
+            tool_discovery = (slash is not None and str(getattr(slash, "Name", "") or "").lower().lstrip("/") == "tools") or (
+                slash is None and looks_like_tool_inventory_prompt(prompt)
+            )
+            if existing_at_entry is None and not read_only_state and not read_only_report and not tool_discovery and (
                 (not first_channel_claim and not slash_only_new_channel)
                 or (first_channel_claim and _channel_has_prior_context(request))
             ) and recovery_state is None:
@@ -909,11 +989,23 @@ class SageChat(Chat):
                     complete_request=True,
                 )
                 return None
+            if slash is None and tool_discovery:
+                existing = await self._rotate_auth_changed_session(request, existing_at_entry)
+                if existing is not None:
+                    await self._refresh_auth_context(existing, request)
+                await self.send_complete(
+                    request, turn.response_key,
+                    content=render_tool_inventory(existing),
+                    complete_request=True,
+                )
+                if first_channel_claim and existing_at_entry is None:
+                    _NEW_CHANNEL_WITHOUT_SESSION.add(channel_identity)
+                return None
             # Slash commands dispatch first — they operate on the existing session (if any) and don't
             # need a fresh Model.initialize(). A handled command sends its own terminal → return None.
             # Unknown structured slash commands also terminate locally; control input is never
             # reinterpreted as a model prompt.
-            if getattr(request, "SlashCommand", None) is not None:
+            if slash is not None:
                 existing = await get_channel_session(request)
                 existing = await self._rotate_auth_changed_session(request, existing)
                 if existing is not None:
@@ -1026,6 +1118,18 @@ class SageChat(Chat):
                 # Compatibility for lightweight test/eval models. Production Model instances install
                 # the contract through the typed method above.
                 model._request_contract = request_contract
+            # Bind the engagement before the turn can read any target task output.
+            # A later marker change makes this turn's collection ineligible.
+            if getattr(model, "mode", None) in {"conversation", "supervised"}:
+                from .report_identity import canonical_engagement_uuid
+                current_engagement = await canonical_engagement_uuid(
+                    getattr(getattr(model, "mythic_client", None), "client", None),
+                    request.OperationID, create=True)
+                previous_engagement = getattr(model, "_report_engagement_uuid", None)
+                if previous_engagement is None:
+                    model._report_engagement_uuid = current_engagement
+                model._report_engagement_at_turn = (
+                    current_engagement if current_engagement == model._report_engagement_uuid else None)
             # Reassert on reused sessions too; older in-memory sessions created before this field was wired
             # should gain controller-native HITL without requiring a process restart.
             model.command_name = "chat"
@@ -1074,6 +1178,7 @@ class SageChat(Chat):
                 approval_context_store=lambda context: setattr(
                     model, "_pending_approval_context", dict(context)
                 ),
+                decision_context_lookup=getattr(model, "_hitl_decision_context", None),
             )
             model._hitl_card_pending = False
             set_active_agent = getattr(model, "set_active_agent", None)
@@ -1220,6 +1325,7 @@ class SageChat(Chat):
                                 expected_action_digest=str(
                                     approval_claim_context.get("action_digest") or ""
                                 ),
+                                operator_message=resume_steer_message_for_request(request),
                             )
                         )
                     elif has_input_response and hitl_pending:
@@ -1403,6 +1509,7 @@ class SageChat(Chat):
             # Refresh the header's live count chips (MCP servers/tools, rounds, BloodHound) now that the
             # turn's work is done. The publisher de-duplicates unchanged payloads.
             await publish_channel_metadata()
+            await self._retain_report_collection(request, model)
             if getattr(model, "_hitl_card_pending", False):
                 # A confirmation card already released this request (complete_request=False). Returning None
                 # tells run_chat_turn to send no terminal while the graph waits on disk.
@@ -1414,13 +1521,31 @@ class SageChat(Chat):
             terminal_metadata = {"channel_id": request.ChannelID}
             if runtime_telemetry:
                 terminal_metadata["runtime_telemetry"] = runtime_telemetry
-            response_key = stream_emitter.last_response_key or turn.response_key
+            # The terminal must land in the MAIN chat window. When the last streamed block was a
+            # delegation/event (sub-agent) stream, its response_key points at the sub-agent panel —
+            # collapsed by default — so keying the terminal there leaves the operator with no visible
+            # final (the channel-3 "nothing in the main window" defect: the whole request ended inside
+            # the Mythic_Operator panel). Reuse the last streamed key only when it is a main-window
+            # assistant block; otherwise force the main turn key.
+            _main_turn_key = f"assistant:{request.RequestID}:turn"
+            response_key = stream_emitter.last_response_key or turn.response_key or _main_turn_key
+            if not str(response_key).startswith("assistant:"):
+                response_key = _main_turn_key
             _last_streamed = stream_emitter.last_content
             if _last_streamed and _last_streamed.lstrip().startswith("Command("):
                 _last_streamed = ""
+            # A self-requested halt (loop-breaker, no-progress, step-budget, …) returns through this normal
+            # terminal path; its status must not be recorded as `complete`, and its fallback narrative must
+            # explain the halt rather than claim "Completed." (the channel-3 false-success defect).
+            terminal_status = "complete"
+            halt_notice = ""
+            disposition = getattr(model, "request_terminal_disposition", None)
+            if callable(disposition):
+                terminal_status, halt_notice = disposition()
             response_content = (
                 native_response_text
                 or _last_streamed
+                or halt_notice
                 or "Completed."
             )
             # ISC-71: model prose is not the provenance authority. Apply one deterministic
@@ -1458,7 +1583,7 @@ class SageChat(Chat):
                         "Request lifecycle reconciliation failed before terminal response."
                     )
                 if callable(record_terminal):
-                    record_terminal("complete")
+                    record_terminal(terminal_status)
                 lifecycle_event_id = record_final(
                     response_content,
                     response_key=response_key,
@@ -1475,13 +1600,28 @@ class SageChat(Chat):
                     )
             elif callable(finalize_visibility):
                 await finalize_visibility()
-            await self.send_complete(
-                request,
-                response_key,
-                metadata=turn._metadata(terminal_metadata),
-                content=response_content,
-                complete_request=True,
-            )
+            # A self-halt must not mark the Mythic request row `complete` — send_complete hardcodes
+            # status="complete", which is the operator-facing false success (the control-transition
+            # ledger already recorded the honest `stopped`/`blocked`). Send the terminal with the real
+            # disposition status; a genuine completion still goes through send_complete unchanged.
+            if terminal_status == "complete":
+                await self.send_complete(
+                    request,
+                    response_key,
+                    metadata=turn._metadata(terminal_metadata),
+                    content=response_content,
+                    complete_request=True,
+                )
+            else:
+                await self.send_response(
+                    request,
+                    response_key,
+                    content=response_content,
+                    complete=True,
+                    complete_request=True,
+                    status=terminal_status,
+                    metadata=turn._metadata(terminal_metadata),
+                )
             if lifecycle_event_id and callable(record_projection):
                 record_projection(
                     lifecycle_event_id,
@@ -1508,7 +1648,45 @@ class SageChat(Chat):
             key = channel_session_key(request)
             lock = _CHANNEL_TURN_LOCKS.setdefault(key, asyncio.Lock())
             async with lock:
-                return await _serialized_handler(turn)
+                try:
+                    return await _serialized_handler(turn)
+                except asyncio.CancelledError:
+                    # Cancellation can land after invoke() returns, while channel metadata
+                    # or the normal terminal response is still awaiting publication. That
+                    # bypasses the invoke-local cancellation handler above.
+                    model = await get_channel_session(request)
+                    emitter = getattr(model, "_response_emitter", None)
+                    ledger = getattr(model, "_request_event_ledger", None)
+                    terminal_events = (
+                        ledger.actual_events(kind="control_transition", phase="request_terminal")
+                        if callable(getattr(ledger, "actual_events", None)) else ()
+                    )
+                    if (
+                        model is not None
+                        and isinstance(emitter, ChatStreamEmitter)
+                        and emitter._request is request
+                        and not terminal_events
+                    ):
+                        async def finish_cancel() -> None:
+                            await self._stop_and_close_request_lifecycles(
+                                model, status="cancelled", reason="operator",
+                            )
+                            reconciler = getattr(model, "finalize_visibility_turn", None)
+                            if callable(reconciler):
+                                report = await reconciler(require_final=True)
+                                if not report.get("ok", False):
+                                    logger.error(
+                                        "Cancelled request lifecycle reconciliation failed: %s",
+                                        report,
+                                    )
+                            await drop_channel_session(request, expected_model=model)
+
+                        cleanup = asyncio.create_task(finish_cancel())
+                        try:
+                            await asyncio.shield(cleanup)
+                        except asyncio.CancelledError:
+                            await cleanup
+                    raise
 
         await self.run_chat_turn(
             request,

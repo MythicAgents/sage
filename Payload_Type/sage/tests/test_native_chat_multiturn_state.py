@@ -1,6 +1,6 @@
 """Request isolation regressions for checkpointed native-chat turns.
 
-These tests exercise the production ``Model.invoke`` seam and the real supervised gate with
+These tests exercise the production ``Model.invoke`` seam and the Supervisor wrapper with
 an in-memory checkpoint.  Only the leaf agent runnable is scripted; state reducers, request
 contracts, node wrapping, request reuse, and termination commands are production code.
 """
@@ -8,20 +8,25 @@ contracts, node wrapping, request reuse, and termination commands are production
 from __future__ import annotations
 
 import asyncio
+import copy
+import json
 import sys
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from ai.langgraph.model import Model, SageState  # noqa: E402
+from ai.langgraph.model import Model, SageState, _DigestToolUsesEdit  # noqa: E402
 from ai.langgraph.request_contract import build_request_contract  # noqa: E402
 from ai.langgraph.turn_authority import authority_from_request_contract  # noqa: E402
+from tests.test_scripted_handoff import _ScriptedModel  # noqa: E402
 
 
 _OLD_PROMPT = "Analyze the previous configuration."
@@ -145,7 +150,7 @@ def test_same_checkpoint_starts_a_fresh_supervisor_turn_with_prior_context_once(
     )
 
 
-def test_prior_request_completion_headers_do_not_consume_current_budget():
+def test_prior_request_completion_headers_do_not_block_current_assessment():
     async def run() -> tuple[Command | dict[str, Any], _RecordingAgent]:
         model = _new_model()
         _install_contract_without_graph_rebuild(model, "chat:channel-isolation:request:2")
@@ -180,12 +185,12 @@ def test_prior_request_completion_headers_do_not_consume_current_budget():
     assert any(message.content == _FRESH_FINAL for message in result["supervisor_messages"])
 
 
-def test_current_request_completion_headers_still_trigger_the_cap():
+def test_current_request_completion_headers_reach_supervisor_assessment():
     async def run() -> tuple[Command | dict[str, Any], _RecordingAgent]:
         model = _new_model()
         request_id = "chat:channel-isolation:request:2"
         _install_contract_without_graph_rebuild(model, request_id)
-        supervisor = _RecordingAgent("must not run")
+        supervisor = _RecordingAgent("The current specialist results need review.")
         wrapped = model._wrap_create_agent(supervisor, "supervisor_messages", "Supervisor")
         state = {
             "_request_id": request_id,
@@ -206,7 +211,123 @@ def test_current_request_completion_headers_still_trigger_the_cap():
 
     result, supervisor = asyncio.run(run())
 
-    assert isinstance(result, Command)
-    assert result.goto == END
-    assert supervisor.inputs == []
-    assert result.update["supervisor_messages"][0].content == "second current-request summary"
+    assert isinstance(result, dict)
+    assert len(supervisor.inputs) == 1
+    assert any(m.content == "second current-request summary" for m in supervisor.inputs[0])
+    assert any(m.content == "The current specialist results need review."
+               for m in result["supervisor_messages"])
+
+
+def test_same_channel_worker_sees_prior_command_schema_after_second_handoff(monkeypatch):
+    schema_marker = "DistinctiveParameterFromFirstRequest"
+    schema = json.dumps({
+        "command": "probe_command", "payload_type": "apollo",
+        "padding": "x" * 220,
+        "parameter_groups": {"Default": {"parameters": [{"name": schema_marker,
+            "type": "String", "required": True}]}}
+    })
+    reads = []
+
+    @tool
+    def get_all_command_args_for_payloadtype(payload: str, command: str) -> str:
+        """Return inert command arguments for a payload type and command."""
+        reads.append((payload, command))
+        return schema
+
+    def handoff(call_id: str) -> AIMessage:
+        return AIMessage(content="", tool_calls=[{
+            "name": "transfer_to_Mythic_Operator",
+            "args": {"handoff_title": "Inspect command metadata",
+                     "handoff_instruction": "Inspect the command schema."},
+            "id": call_id, "type": "tool_call",
+        }])
+
+    scripted = _ScriptedModel(messages=iter([
+        handoff("handoff-first"),
+        AIMessage(content="", tool_calls=[{
+            "name": "get_all_command_args_for_payloadtype",
+            "args": {"payload": "apollo", "command": "probe_command"},
+            "id": "schema-first", "type": "tool_call",
+        }]),
+        AIMessage(content="Schema inspected."),
+        AIMessage(content="The first request is complete."),
+        handoff("handoff-second"),
+        AIMessage(content="The prior schema remains available."),
+        AIMessage(content="The second request is complete."),
+    ]))
+    seen: list[list[Any]] = []
+    original_generate = _ScriptedModel._generate
+
+    def record_input(self, messages, *args, **kwargs):
+        seen.append(list(messages))
+        return original_generate(self, messages, *args, **kwargs)
+
+    monkeypatch.setattr(_ScriptedModel, "_generate", record_input)
+
+    def build_model(fake):
+        model = _new_model()
+        model.mythic_client = MagicMock()
+        model.mythic_client.get_tools.return_value = [get_all_command_args_for_payloadtype]
+        model._payload_names = []
+        model._get_base_chat_model = lambda: fake
+        model.graph = (
+            StateGraph(SageState)
+            .add_node("Supervisor", model._supervisor_agent())
+            .add_node("Mythic_Operator", model._mythic_operator_agent())
+            .add_edge(START, "Supervisor")
+            .add_edge("Mythic_Operator", "Supervisor")
+            .compile(checkpointer=model.memory, name="Sage")
+        )
+        return model
+
+    async def run():
+        model = build_model(scripted)
+        _install_contract_without_graph_rebuild(model, "chat:channel-isolation:request:1")
+        await model.invoke("Inspect probe_command arguments.", is_interactive=True)
+        checkpoint = await model.graph.aget_state(
+            model._graph_run_config(model._session_thread_id()))
+        first_worker = checkpoint.values["mythic_operator_messages"]
+        _install_contract_without_graph_rebuild(model, "chat:channel-isolation:request:2")
+        await model.invoke("Use the prior probe_command schema.", is_interactive=True)
+        fresh = build_model(_ScriptedModel(messages=iter([
+            handoff("handoff-fresh"),
+            AIMessage(content="No earlier schema in this generation."),
+            AIMessage(content="Fresh request complete."),
+        ])))
+        _install_contract_without_graph_rebuild(fresh, "chat:channel-isolation:request:2")
+        await fresh.invoke("Use the prior probe_command schema.", is_interactive=True)
+        return first_worker
+
+    first_worker = asyncio.run(run())
+    assert reads == [("apollo", "probe_command")]
+    assert sum(isinstance(message, ToolMessage) and message.name ==
+               "get_all_command_args_for_payloadtype" and message.content == schema
+               for message in first_worker) == 1
+    assert len(seen) == 10  # seven same-channel model calls, then three fresh-model calls
+    second_worker_input = seen[5]
+    fresh_worker_input = seen[8]
+    assert any(isinstance(message, HumanMessage)
+               and "Use the prior probe_command schema." in str(message.content)
+               for message in second_worker_input)
+    assert sum(isinstance(message, ToolMessage) and message.name ==
+               "get_all_command_args_for_payloadtype" and message.content == schema
+               for message in second_worker_input) == 1
+    assert all(schema_marker not in str(message.content) for message in fresh_worker_input)
+
+    # The scripted model records create_agent input, but the normal digest threshold is not
+    # forced during these turns. Apply the actual editor separately to the assembled input.
+    digested = copy.deepcopy(second_worker_input)
+    digested.extend([
+        AIMessage(content="", tool_calls=[{"name": "newer_read", "args": {},
+            "id": "newer-read", "type": "tool_call"}]),
+        ToolMessage(content="newer observation", name="newer_read", tool_call_id="newer-read"),
+    ])
+    editor = _DigestToolUsesEdit(trigger=1, keep=1, clear_tool_inputs=False,
+                                 placeholder="[elided]")
+    editor.apply(digested, count_tokens=lambda messages: sum(
+        len(str(message.content)) for message in messages))
+    assert all(schema_marker not in str(message.content) for message in digested)
+    assert any(isinstance(message, ToolMessage) and message.name ==
+               "get_all_command_args_for_payloadtype" and
+               message.response_metadata.get("context_editing", {}).get("cleared")
+               for message in digested)

@@ -112,12 +112,26 @@ def _validate_transcript_identity(transcript: dict[str, Any]) -> None:
 
     request_id = request.get("id")
     channel_id = request.get("channel_id")
+    request_message_id = request.get("request_message_id")
     for index, message in enumerate(transcript.get("messages") or []):
-        for field in ("id", "chat_request_id", "channel_id"):
+        for field in ("id", "channel_id"):
             if type(message.get(field)) is not int:
                 raise ValueError(
                     f"Transcript messages[{index}].{field} must be an exact integer."
                 )
+        if (
+            message.get("chat_request_id") is None
+            and request_message_id is not None
+            and message.get("id") == request_message_id
+        ):
+            # Mythic stores the initiating operator message without a request tag and
+            # carries its id on the request block as request_message_id; that single
+            # message is bound by id here, all others must carry the exact request id.
+            continue
+        if type(message.get("chat_request_id")) is not int:
+            raise ValueError(
+                f"Transcript messages[{index}].chat_request_id must be an exact integer."
+            )
         if (
             type(message.get("chat_request_id")) is not type(request_id)
             or message.get("chat_request_id") != request_id

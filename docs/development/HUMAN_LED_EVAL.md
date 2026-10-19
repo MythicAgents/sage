@@ -157,6 +157,56 @@ Distinguish SDK message metadata from the actual provider payload when assessing
 specialist's answer reached the Supervisor. A scripted capture proves the recorder works; it does
 not recover the unrecorded inputs of an earlier paid run.
 
+The shared measurement transport also retains provider HTTP error bodies and selected
+request IDs for diagnosis. It redacts the request's bearer credential if echoed in an
+error body and leaves the SDK's response bytes unchanged. An HTTP rejection does not
+establish zero token usage; missing usage still stops the next measured request.
+
+## Operator requests and reporting diagnostics
+
+The Payload handoff measurement helper (`run_payload_handoff_case.py`) uses the
+same `Payload_Type/sage/.env.local` provider profile as the other focused model
+runners. Its default invocation only prints the selected path and five-minute wall limit;
+it does not read credentials or contact the provider. A bounded `--run` reads that
+profile and records the selected path in the private case result. For a clean source
+checkout without its own local profile, pass `--config` with the intended existing
+`.env.local` path explicitly. This selects one profile for that run; it does not
+create a second credential store or copy credentials into the checkout. The handoff
+case has no aggregate provider call or token ceiling. It records each request and
+provider-reported input/output usage, stops before another request if earlier usage
+is missing, and marks final or interrupted usage as uncertain. It rejects a configured
+runtime resource ledger so that an inherited finite ledger cannot silently cap the case.
+The case seeds one locally approved Apollo build and returns synthetic Mythic metadata,
+including a matching callback and payload C2 configuration. A later Payload visit can
+list, inspect, and "download" that synthetic payload through mocked read-only responses;
+no payload bytes are built or downloaded. The ordinary uploaded-file inventory is empty,
+as production excludes Mythic payload files from that tool.
+
+Three development helpers isolate different questions. None is a production reporting gate:
+
+| Helper under `skills/sage-focused-capability-tests/scripts/` | Boundary exercised | What its results do not establish |
+| --- | --- | --- |
+| `run_operator_prompt_matrix.py` | Native headless chat and the assembled Supervised graph with Hybrid policy, Autonomous Solve off, synthetic callback/task records, and inert accept/reject decisions | Live target effects, reproduction on another model/deployment, or factual quality from structural completion alone |
+| `compare_reporting_context.py` | Paired report-only model requests from a supplied plan, with full versus reduced context and shared observations | Unchanged production behavior, action safety, or a causal explanation for any one context component |
+| `verify_report_claims.py` | Experimental model judgments on supplied claims, deterministic source/quote/declared-scope checks, then dependent report repair | Automatic claim-extraction completeness, semantic truth from valid citations, or production-ready verification |
+
+The matrix includes discovery, guarded requests, accept/reject, explanation without execution, ambiguous
+targets and continuation after selection, stored observations, and recommendations. It captures model
+inputs/outputs and visible messages. Review useful answer content and unsupported claims separately from
+tool/card/effect counts; an expected rejection and a model refusal are different outcomes.
+
+The reporting helpers receive a JSON plan and offer no executable tools. Their default invocation validates
+inputs without inference. The matrix also defaults to inspection without network access. Paid execution
+requires explicit `--run`, configured provider credentials, exact model/endpoint bindings, and separately
+established resource authority. Retain plans, source identity, raw attempts, usage, and independent labels
+privately; these helpers are not secret-redaction services.
+
+The claim checker is an experimental diagnostic. A source ID and an exact quotation establish that text
+exists, not that it entails the claim. Malformed judgments block dependent repairs and remain recorded;
+do not count skipped reports as successful corrections. Assess retained positive facts, unsupported claims,
+recommendation premises, and unanswered requests independently. Any format-only diagnostic must preserve
+the original result and cannot silently convert a rejected attempt into an accepted one.
+
 ## Basic approval checks
 
 From the repository root, run one decision at a time:
@@ -177,7 +227,30 @@ For a later separately authorized human-operated Sage session, bind the exact pr
 
 The command creates no prompt or task. It must fail before channel creation when local configuration differs from the contract or the name is too generic or already used, and fail closed if Mythic stores a different name, route, mode, or nonempty history. Record the returned channel ID and name, then open that **name** in normal Mythic Chat and confirm it before sending the prompt. Mythic may hide the numeric ID until after the first turn. If the UI name differs, stop and preserve the setup result; do not make a second channel or prompt under a one-attempt contract. `native_chat.py prepare` still prepares an **Auto** channel and is not the human-led setup command.
 
-Sage records each new native channel in its existing runtime database. If Sage restarts or replaces that channel's in-memory session, a later request on the marked channel stops before model tools run; its previous scope and evidence are not restored. Start a fresh channel and restate the current scope and evidence before continuing. At deployment, also start fresh channels for conversations created before this marker existed: if Mythic supplies no earlier message context, Sage cannot distinguish one of those legacy channels from a new channel.
+The default `prepare-supervised` channel has `mode=supervised` and `autonomous_solve=false`: it uses the
+ordinary LangGraph consultation path, with approval cards for guarded tools. For an objective that Sage
+should carry across successive decisions, append `--objective-led` to the same preparation command.
+This sets `mode=supervised` and `autonomous_solve=true`, selects the controller route, and verifies both
+stored values after channel creation. It does not submit an objective or accept any card. Send the declared
+objective as the first normal chat prompt. Each controller move still needs its own native approval.
+
+Use Hybrid or LLM policy for Respond guidance: Hybrid consults its model even for a singleton after
+redirection. Symbolic policy cannot interpret free text and hands control back without another action.
+Reject does not execute the proposal; an available alternative receives a fresh card. Objective completion
+requires evidence of the mission rather than success of one collection.
+
+In the first live examples, the operator chooses every card in Mythic. Agent-submitted decisions belong
+to a later workflow after the operator explicitly switches to it. Retain the decision-maker for each
+episode. An offline setup or scripted approval does not establish that Sage can complete the objective live.
+
+Sage records each new native channel in its existing runtime database. For ordinary Supervised chat with
+Autonomous Solve off, losing the in-memory session does not restore previous conversational scope and
+evidence: a later model request on that marked channel stops before tools run. Read-only `/state` and
+tool discovery remain available without restoring the agent session. Start a fresh channel and restate
+scope and evidence before continuing model work. The separately bound Auto-controller recovery path is
+not restoration of this Supervised conversation. At deployment, also start fresh channels for conversations
+created before the channel marker existed: without earlier Mythic message context, Sage cannot distinguish
+one of those legacy channels from a new channel.
 
 Use the same evaluation questions without assuming that a particular command is the only valid answer. Write down the exact operator request and mode, the callback binding, and the first action card **before** choosing. Judge whether the proposed action is relevant and proportionate to the request. While the card is pending, capture the exact request and messages privately, before accepting, rejecting, responding, stopping, or cleaning up:
 

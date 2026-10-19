@@ -26,10 +26,12 @@ usage_examples:
     args: "execute-bof adcs_enum.x64.o"
   - description: Enumerate with specific domain targeting
     args: "execute-bof adcs_enum_com.x64.o"
-  - description: Certify equivalent (Apollo - .NET assembly)
-    args: "Certify.exe find /vulnerable"
+  - description: Related Certify CA enumeration (Apollo - .NET assembly)
+    args: "Certify.exe enum-cas --filter-vulnerable"
+  - description: Related Certify template enumeration (Apollo - .NET assembly)
+    args: "Certify.exe enum-templates --filter-vulnerable"
 opsec_notes: |
-  adcs_enum BOF provides the same enumeration as Certify's `find` command but runs
+  adcs_enum BOF provides related CA/template discovery to Certify's enumeration verbs but runs
   entirely in-process via Athena's execute-bof — no new process creation, no AppDomain
   load. For Athena-based engagements, this is the preferred ADCS enumeration path.
   For Apollo: use Certify.exe via inline_assembly.
@@ -54,7 +56,7 @@ last_updated: 2026-05-29
 # ADCS Scan BOF (adcs_enum)
 
 The TrustedSec CS-Situational-Awareness-BOF's ADCS enumeration module. Provides the
-same data as Certify `find` but executed entirely in-process via Athena's execute-bof —
+related data to Certify enumeration, but entirely in-process via Athena's execute-bof —
 eliminating the AppDomain creation event that Certify's inline_assembly execution generates.
 
 ## Certify vs adcs_enum BOF Comparison
@@ -71,8 +73,8 @@ adcs_enum lists:
 - Certificate templates (name, permissions, flags)
 - Identifies high-level misconfiguration indicators
 
-For vulnerability classification (ESC1-13), follow up with Certify or Certipy after
-initial adcs_enum discovery.
+For vulnerability classification, follow up with a version-verified Certify or Certipy
+reference after initial adcs_enum discovery.
 
 ## Apollo-specific note
 BOF — requires Athena. For Apollo, use Certify.exe via inline_assembly.

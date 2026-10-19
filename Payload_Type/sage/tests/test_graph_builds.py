@@ -43,6 +43,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ai.langgraph.model import Model  # noqa: E402
+from ai.langgraph import model as model_module  # noqa: E402
 
 # Unroutable on purpose: if graph construction ever starts making a real call, it fails fast and
 # loudly here rather than silently depending on the operator's VPN.
@@ -119,6 +120,59 @@ def test_the_graph_builds_across_turn_configurations(kwargs):
         return model.graph
 
     assert asyncio.run(body()) is not None, f"graph failed to build for {kwargs}"
+
+
+@pytest.mark.parametrize("mode", ["conversation", "supervised", "auto"])
+def test_enrolled_schema_middleware_is_operator_only_and_cleared_on_rebuild(mode, monkeypatch):
+    original = model_module.create_agent
+    captured = {}
+
+    def capture_agent(*args, **kwargs):
+        captured[kwargs["name"]] = kwargs["middleware"]
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(model_module, "create_agent", capture_agent)
+
+    async def body():
+        instance = _hermetic_model(mode=mode)
+        instance._rebuild_graph()
+        instance._rebuild_graph()
+        return instance
+
+    instance = asyncio.run(body())
+    assert instance.mythic_client.clear_enrolled_issue_schema.call_count == 2
+    schema_middleware = model_module._EnrolledExecutableSchemaMiddleware
+    assert sum(isinstance(item, schema_middleware) for item in captured["Mythic_Operator"]) == 1
+    assert all(
+        not isinstance(item, schema_middleware)
+        for name, middleware in captured.items() if name != "Mythic_Operator"
+        for item in middleware
+    )
+
+
+@pytest.mark.parametrize("mode", ["conversation", "supervised", "auto"])
+def test_built_supervisor_offers_both_final_report_modes(mode, monkeypatch):
+    original = model_module.create_agent
+    offered = []
+
+    def capture_agent(*args, **kwargs):
+        if kwargs.get("name") == "Supervisor":
+            offered.extend(tool for tool in kwargs["tools"] if tool.name == "respond_to_user")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(model_module, "create_agent", capture_agent)
+
+    async def body():
+        instance = _hermetic_model(mode=mode)
+        instance._rebuild_graph()
+        return instance.graph
+
+    assert asyncio.run(body()) is not None
+    assert len(offered) == 1
+    fields = offered[0].tool_call_schema.model_fields
+    assert set(fields) == {"final_response", "reuse_latest_worker_answer", "outcome"}
+    assert not fields["final_response"].is_required()
+    assert not fields["outcome"].is_required()
 
 
 def test_the_hermetic_fixture_never_reaches_the_network():

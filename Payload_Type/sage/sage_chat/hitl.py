@@ -12,8 +12,9 @@ requests`):
 - **surface** — `build_approval_request` + `make_card_emitter`: emit the same normalized `input_requested`
   block as `send_approval_request`, with `complete_request=False`. That release (NOT a terminal `complete`)
   frees the channel while the graph waits on disk — so the chat handler returns None and adds no terminal.
-- **decision** — Accept approves all guarded actions in the batch; Reject denies all.
-  Default-deny: malformed and unknown responses are treated as reject.
+- **decision** — normal native supervised turns narrow simultaneous guarded proposals to one before
+  this card. If a batch reaches the approval emitter, Accept approves the whole displayed batch and
+  Reject denies it. Malformed and unknown responses deny by default.
 """
 
 from __future__ import annotations
@@ -227,13 +228,21 @@ def approval_selection_digest(
     ).hexdigest()
 
 
-def build_approval_request(action_requests: list[dict[str, Any]]) -> dict[str, Any]:
+def build_approval_request(
+    action_requests: list[dict[str, Any]],
+    decision_context: str = "",
+) -> dict[str, Any]:
     """Build the `send_approval_request` kwargs (title/prompt/description/data) for a guarded tool.
 
     `data` is echoed back verbatim in `InputResponse.InputRequest`. ``make_card_emitter`` augments it with
     a generation/turn/action correlation key so a delayed response to an older card cannot approve the
-    current pending action. If several guarded calls interrupt at once, the card exposes a typed exact-one
-    action choice rather than a batch-wide approval.
+    current pending action. Normal native supervised turns narrow guarded proposals to one before
+    emission. The current approval emitter treats any remaining multi-action batch as one approval.
+
+    `decision_context` (D10/D15) is extra PLAIN-TEXT decision content appended to the description —
+    planned capability inner tasks, expected verification, per-binary tool notes. It MUST be reproducible
+    at echo-validation time: `approval_response_matches` rebuilds the card and compares descriptions, so
+    any enrichment applied at emit time has to be applied at match time with the same lookup.
 
     Note on formatting: the Mythic input-request card renders `title`/`prompt`/`description` as PLAIN TEXT
     (not markdown — see `ChatInputRequestedEvent` in the React UI), so we format the args as a readable
@@ -259,15 +268,28 @@ def build_approval_request(action_requests: list[dict[str, Any]]) -> dict[str, A
     description_blocks = []
     for index, action in enumerate(actions, 1):
         action_args = action["arguments"]
+        display_args = dict(action_args)
+        context = display_args.get("visibility_context")
+        if isinstance(context, dict):
+            public_context = {key: value for key, value in context.items()
+                              if not key.startswith("_sage_prepared_")}
+            if public_context:
+                display_args["visibility_context"] = public_context
+            else:
+                display_args.pop("visibility_context", None)
         args_block = (
-            "\n".join(f"  • {key}: {_fmt(value)}" for key, value in action_args.items())
-            if action_args
+            "\n".join(f"  • {key}: {_fmt(value)}" for key, value in display_args.items())
+            if display_args
             else "  • (no arguments)"
         )
         description_blocks.append(
             f"Action {index}: {action['display_name']} (tool: {action['tool_name']})\n{args_block}"
         )
 
+    description = "\n\n".join(description_blocks)
+    decision_context = str(decision_context or "").strip()
+    if decision_context:
+        description = f"{description}\n\n{decision_context}"
     result = {
         "title": (
             f"Approve: {display_name}"
@@ -282,9 +304,21 @@ def build_approval_request(action_requests: list[dict[str, Any]]) -> dict[str, A
                     f"Sage proposed {count} guarded actions. "
                 )
             )
-            + "Accept approves; Reject denies."
+            + ("Accept approves; Reject denies without any reply; "
+               "Respond denies the action and sends your typed text to Sage as "
+               "steering guidance.")
+            + (
+                # A capability card covers a bundled multi-step effect (write + verify),
+                # so Reject means more than "not this exact tool call": the operator is
+                # declining the effect itself. Say so, so the model cannot treat the
+                # denial as "use a different tool for the same effect".
+                " Reject denies the whole bundled effect: Sage will not re-attempt it "
+                "through other tools in this request."
+                if count == 1 and tool_name == "execute_capability"
+                else ""
+            )
         ),
-        "description": "\n\n".join(description_blocks),
+        "description": description,
         "data": {
             "tool_name": tool_name,
             "display_name": display_name,
@@ -313,6 +347,7 @@ def make_card_emitter(
     delegation_lookup: Callable[[], tuple[str, str] | None] | None = None,
     approval_context_lookup: Callable[[], dict[str, Any]] | None = None,
     approval_context_store: Callable[[dict[str, Any]], None] | None = None,
+    decision_context_lookup: Callable[[list[dict[str, Any]]], str] | None = None,
 ) -> Callable[[list[dict[str, Any]]], Awaitable[None]]:
     """Return an async `(action_requests) -> None` that raises the approval request for this turn.
 
@@ -321,9 +356,20 @@ def make_card_emitter(
     — so repeated approvals never collide and each appends at the current timeline position. It sends with
     `complete_request=False` (channel-release, not a terminal `complete`), so the chat handler returns None
     while the graph waits on the operator.
+
+    `decision_context_lookup` (D10) receives the action requests and returns extra PLAIN-TEXT decision
+    content for the card description — planned capability inner tasks, intended effects, and the
+    expected verification for raw tasking. Lookup failures never block the card.
     """
     async def _emit(action_requests: list[dict[str, Any]]) -> None:
-        kwargs = build_approval_request(action_requests)
+        decision_context = ""
+        if decision_context_lookup is not None:
+            try:
+                decision_context = str(decision_context_lookup(action_requests) or "").strip()
+            except Exception as e:
+                logger.debug(f"decision context lookup failed (non-fatal): {e}")
+                decision_context = ""
+        kwargs = build_approval_request(action_requests, decision_context=decision_context)
         approval_context: dict[str, Any] = {}
         if approval_context_lookup is not None:
             try:
@@ -336,6 +382,10 @@ def make_card_emitter(
             "actions": approval_claim_actions(action_requests),
             "selection_mode": "single",
             "action_digest": kwargs["data"]["action_digest"],
+            # D10/D15: the card's decision-context enrichment rides inside the protocol
+            # context, so echo validation rebuilds the same description without any
+            # lookup threading for callers of approval_response_matches.
+            "decision_context": decision_context,
         })
         contract_digest = str(
             approval_context.get("request_contract_digest") or ""
@@ -379,6 +429,10 @@ def approval_response_matches(
     Mythic echoes the original input request in ``InputResponse.InputRequest``. The random approval id
     prevents a delayed card from generation N from approving a different action in generation N+1;
     thread/turn/tool fields make the binding inspectable and fail closed if any layer drops context.
+
+    The card's decision-context enrichment (D10/D15) is carried INSIDE the approval context as
+    ``decision_context`` and the rebuild reproduces it from the echoed context — self-contained
+    protocol, no lookup threading for callers.
     """
     if not isinstance(expected_context, dict) or not expected_context:
         return False
@@ -437,7 +491,10 @@ def approval_response_matches(
     # a card by copying the original request, changing its status, and appending response/resolver fields.
     # Anything else is a malformed protocol envelope and cannot grant authority.
     try:
-        card = build_approval_request(expected_actions)
+        card = build_approval_request(
+            expected_actions,
+            decision_context=str(expected_context.get("decision_context") or ""),
+        )
     except (TypeError, ValueError):
         return False
     selection_mode = str(expected_context.get("selection_mode") or "")

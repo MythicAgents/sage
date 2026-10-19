@@ -42,7 +42,8 @@ gotchas: |
   1. GenericWrite on the target user account
   2. Specific domain controller registry setting for weak certificate mapping
   
-  Both are Certipy-only — Certify does not implement ESC9/10.
+  This reference uses Certipy for the complete workflow. The pinned Certify v2 parser
+  has related template and request options, but full ESC9/10 execution is unverified.
 related_ttps: [certipy, certify-v2, adcs-esc7, adcs-esc8, rubeus, whisker]
 alternatives: [certify-v2]
 common_args: {}

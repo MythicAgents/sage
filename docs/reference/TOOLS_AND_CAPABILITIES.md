@@ -5,11 +5,16 @@
 > `GUARDED_TOOLS` in `mythic_tools.py` and the capability catalog in `capabilities.py`. When this page and the
 > code disagree, the code wins. Regenerate or amend this page when the tool surface changes.
 
-Sage exposes **32 Mythic tools** to its agents (22 read-only, 10 guarded/offensive) plus a **15-capability**
-generic attack-planning layer. BloodHound graph tools are **not** counted here — they come from the external
+This reference describes Sage's read-only and guarded tools, including the separate sandbox tool, plus its
+**15-capability** generic attack-planning layer. BloodHound graph tools come from the external
 [BloodHound MCP server](https://github.com/mwnickerson/bloodhound_mcp), not from Sage's own code.
 
-## Read-only tools (22)
+Use `/tools` or ask “list your tools” in ordinary Sage chat for the current shipped Mythic tool inventory,
+including descriptions and known session access restrictions. This is a deterministic response; it does
+not task a callback. `/mcp tools` lists connected MCP tools separately. Callback payload commands are
+discovered through Mythic's command metadata and are distinct from Sage's tool functions.
+
+## Read-only tools
 
 These never prompt for approval and cannot change target or Mythic state.
 
@@ -38,7 +43,12 @@ These never prompt for approval and cannot change target or Mythic state.
 | `get_ttp_full_reference` | Full reference section for a TTP |
 | `list_ttp_categories` | Sage's TTP library grouped by category |
 
-## Guarded / offensive tools (10)
+`get_ttp_guidance` labels library requirements, examples, and agent instructions as reference material.
+Its `reference_scope` metadata does not attest that a callback meets those requirements. A resolved payload
+type identifies an agent; an MCP connection status describes connectivity, not graph contents. Establish
+target applicability from separate observations and keep unobserved prerequisites unknown.
+
+## Guarded / offensive tools
 
 These are approval-gated in supervised mode and each requires a specific Mythic bot-token scope; a tool whose
 scope the channel token lacks is disabled up front.
@@ -56,12 +66,49 @@ scope the channel token lacks is disabled up front.
 | `ensure_tool_uploaded` | Ensure a tool binary is in Mythic's file store (uploads if missing) | `file.write` |
 | `sandbox_exec` | Run untrusted code in an isolated ephemeral sandbox container | `callback.write` |
 
+For a direct `issue_task_and_waitfor_task_output` proposal in native supervised chat, Sage resolves
+deterministic command aliases, parameter names, defaults, and supported context before it displays the
+approval card. The displayed command and arguments are the action held for checkpoint resume. At issue
+time, Sage rechecks the command schema, declared parameter group, and any selected registered file's
+Mythic identity; a changed binding stops the task and needs a fresh proposal and approval. A selected
+`token_id` is currently refused before the card because this task transport does not forward it to
+Mythic. File registration or upload is a separate guarded action; accepting a task card does not
+authorize a hidden upload.
+
 ## Tool drop zone
 
 `download_tool` and `ensure_tool_uploaded` operate on `Payload_Type/sage/tools/`, an operator drop zone. The
 directory ships **empty** (only a `.keep`) — Sage bundles no binaries. An operator drops in tools such as Rubeus,
 Certify, SharpHound, SharpGPOAbuse, SharpDPAPI, or Whisker; a binary placed there is staged into Mythic on
 demand, and `download_tool` fetches a pinned, sha256-verified binary from its TTP source into the same folder.
+
+## Payload adapters and command discovery
+
+Sage queries Mythic for commands and argument schemas, including parameter names, CLI aliases, groups and
+defaults. Automated capabilities also need a semantic mapping: which commands implement an operation, which
+authentication context they use, and how their output proves the intended effect. These mappings live in
+`Payload_Type/sage/ai/langgraph/mythic_capability_adapter.py`.
+
+The automated graph-collection controller currently selects only Apollo and Merlin profiles:
+
+| Payload type | Collection profile |
+|---|---|
+| Apollo | Uses the shared collection defaults: `execute_assembly` with `assembly_name` and `assembly_arguments`, plus `whoami` and `ticket_cache_list` for authentication checks. |
+| Merlin | Overrides the defaults: `execute-assembly` with `filename` and `arguments`, and `token` with `method: whoami` for identity. It does not use Apollo's ticket-cache command and has payload-specific transport and file-parameter mappings. |
+| Other payload types | No collection profile is selected. Command discovery may still be available, but the controller excludes these footholds from automated collection. |
+
+An adapter defines known execution semantics; the live schema supplies current argument syntax and validation.
+Adding another payload requires a suitable collection profile and verification of its assembled execution path.
+An existing profile does not imply support for every capability or live qualification. The beta's validated
+payload configuration is Apollo; see the [README limitations](../../README.md#limitations).
+
+Mythic parameters can have a native `name` and a different `cli_name`. For example, Apollo declares
+`assembly_name`/`assembly_arguments` with CLI aliases `Assembly`/`Arguments`. Sage's resolver translates
+these using the advertised schema. In an approved collection, Sage binds a lossless declared alias rename
+to the exact pending step and retains both representations. Changed values, added defaults, dropped fields
+and ambiguous aliases remain blocked by this boundary. Runner, listing and download steps require matching
+Mythic task receipts and successful completion evidence before collection advances. An issuance refusal or
+pending task prevents automatic reproposal of the collection approval.
 
 ## Generic capabilities (15)
 

@@ -31,7 +31,8 @@ from ssl_bootstrap import configure_sage_ssl_cert_file
 OUTPUT_CAP = 2048
 TIMEOUT_SECONDS = 90
 MAX_RESPONSE_BYTES = 4_000_000
-TRANSFORMS = {"none", "compact_specialist_system", "omit_duplicate_supervisor_answer"}
+TRANSFORMS = {"none", "compact_specialist_system", "omit_duplicate_supervisor_answer",
+              "payload_handoff_completion_last"}
 COMPACT_START = "### 4. Lowest detectable footprint, always\n"
 COMPACT_END = "**Handback contract (every return to the Supervisor):**"
 COMPACT_PREAMBLE = "Five rules govern every action. When they conflict, the lower-numbered one wins.\n\n"
@@ -40,6 +41,50 @@ COMPACT_PREAMBLE = "Five rules govern every action. When they conflict, the lowe
 def digest(value: object) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False,
                                      separators=(",", ":")).encode()).hexdigest()
+
+
+def _source_identity(source: dict) -> tuple[object, object, object]:
+    """Accept the retained payload case's native identity without rewriting it."""
+    if source.get("case") == "payload-handoff-apollo-v2":
+        route = source.get("route")
+        if not isinstance(route, dict):
+            raise ValueError("payload source route missing")
+        return source["case"], route.get("provider"), route.get("model")
+    return source.get("scenario"), source.get("provider"), source.get("model")
+
+
+def payload_handoff_completion_last(original: list[dict]) -> list[dict]:
+    """Move the repeated operator input before the completed return, then sanitize.
+
+    Use Sage's shipped message sanitizer and LangChain's installed OpenAI wire
+    converters. The final neutral user turn is required by the provider; it adds
+    no task or authority. Exact round trips fail closed if converter behavior drifts.
+    """
+    from langchain_openai.chat_models.base import (
+        _convert_dict_to_message, _convert_message_to_dict,
+    )
+    from ai.langgraph.model import Model
+
+    if (len(original) != 7 or
+            [message.get("role") for message in original] !=
+            ["system", "user", "assistant", "assistant", "tool", "assistant", "user"] or
+            original[1] != original[-1] or
+            original[2].get("name") != "Mythic_Payload" or
+            original[5].get("name") != "Mythic_Payload" or
+            not original[3].get("tool_calls") or
+            original[4].get("tool_call_id") != original[3]["tool_calls"][0].get("id")):
+        raise ValueError("payload return source shape changed")
+    messages = [_convert_dict_to_message(message) for message in original]
+    if [_convert_message_to_dict(message) for message in messages] != original:
+        raise ValueError("payload return cannot round-trip through LangChain")
+    reordered = messages[:2] + messages[-1:] + messages[2:-1]
+    sanitized = Model._sanitize_messages(Model.__new__(Model), reordered)
+    candidate = [_convert_message_to_dict(message) for message in sanitized]
+    if (candidate[:-1] != original[:2] + [original[-1]] + original[2:-1] or
+            candidate[-1] != {"role": "user", "content":
+                "Internal conversation continuation. The operator's request and authorization are unchanged."}):
+        raise ValueError("production sanitizer changed the payload return unexpectedly")
+    return candidate
 
 
 def read_profile(path: Path) -> dict[str, str]:
@@ -105,6 +150,10 @@ def _check_transform(source: dict, frozen: dict, transform: str, *, scenario: st
                 original[7].get("content") != original[4].get("content") or
                 candidate != original[:7] + original[8:]):
             raise ValueError("history candidate is not the exact duplicate removal")
+    elif transform == "payload_handoff_completion_last":
+        if (scenario != "payload-handoff-apollo-v2" or request_index != 0 or
+                candidate != payload_handoff_completion_last(original)):
+            raise ValueError("payload return candidate differs from production sanitizer")
     else:
         raise ValueError("unknown replay transform")
 
@@ -144,13 +193,16 @@ def freeze_case(source_path: Path, request_index: int, transform: str,
             original["messages"][0]["content"])
     elif transform == "omit_duplicate_supervisor_answer":
         del frozen["messages"][7]
+    elif transform == "payload_handoff_completion_last":
+        frozen["messages"] = payload_handoff_completion_last(original["messages"])
+    scenario, _, _ = _source_identity(source)
     case = {
         "source_path": str(source_path),
         "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
         "source_request_sha256": digest(original),
         "frozen_request_sha256": digest(frozen),
         "request_index": request_index,
-        "scenario": source.get("scenario"),
+        "scenario": scenario,
         "endpoint_sha256": hashlib.sha256(profile["API_ENDPOINT"].encode()).hexdigest(),
         "transform": transform,
         "request": frozen,
@@ -186,11 +238,19 @@ def _check_case(case: object, source_bytes: bytes | None,
     if hashlib.sha256(source_bytes).hexdigest() != case["source_sha256"]:
         raise ValueError("source artifact hash mismatch")
     source = json.loads(source_bytes)
+    if not isinstance(source, dict):
+        raise ValueError("source request provenance invalid")
     requests = source.get("provider_requests") if isinstance(source, dict) else None
     index = case["request_index"]
-    if (not isinstance(source, dict) or source.get("scenario") != case["scenario"] or
-            source.get("provider") != profile["provider"] or
-            source.get("model") != profile["model"] or source.get("protocol_valid") is not True or
+    source_scenario, source_provider, source_model = _source_identity(source)
+    if source_scenario == "payload-handoff-apollo-v2" and (
+        source["route"].get("endpoint_sha256") !=
+        hashlib.sha256(profile["API_ENDPOINT"].encode()).hexdigest()
+    ):
+        raise ValueError("payload source endpoint binding invalid")
+    if (not isinstance(source, dict) or source_scenario != case["scenario"] or
+            source_provider != profile["provider"] or
+            source_model != profile["model"] or source.get("protocol_valid") is not True or
             not isinstance(requests, list) or index >= len(requests) or
             not isinstance(requests[index], dict) or requests[index].get("status") != "returned" or
             requests[index].get("http_status") != 200 or

@@ -208,6 +208,79 @@ def delegated() -> dict[str, Any]:
     return {"result": result, "harness": harness}
 
 
+def test_empty_delegation_return_is_surfaced_to_the_supervisor(monkeypatch):
+    """D7: a specialist returning no text and no tool results must not look like a completion.
+
+    In the 2026-10-15 acceptance run (request 9) three consecutive delegation cycles ended on empty
+    handbacks: the empty return was invisible to the Supervisor (DEBUG log only), the delegation card
+    closed as "finished" with the filler text "Completed without a textual summary.", and the
+    Supervisor re-delegated identically because its context contained nothing about the failure.
+    The fix injects an explicit, actionable notice into the Supervisor channel and closes empty
+    cards as errors with honest content.
+    """
+    harness = _Harness([_handoff_call(), AIMessage(content=""), AIMessage(content=_FINAL_ANSWER)])
+
+    class _RecordingEmitter:
+        """D7: the stock harness emitter is a bare function without emit_subagent_status, so
+        `_open_delegation` skips card lifecycle entirely. This recording emitter exercises the
+        real open/close path so the test can assert how the empty delegation card was closed."""
+
+        def __init__(self) -> None:
+            self.statuses: list[dict[str, Any]] = []
+            self.texts: list[str] = []
+
+        async def __call__(self, text: str) -> bool:
+            self.texts.append(text)
+            return True
+
+        async def emit_subagent_status(self, **kwargs: Any) -> bool:
+            self.statuses.append(kwargs)
+            return True
+
+        async def emit_agent_text(self, **kwargs: Any) -> bool:
+            self.texts.append(str(kwargs.get("content", "")))
+            return True
+
+    emitter = _RecordingEmitter()
+    harness._emit = emitter  # type: ignore[method-assign]
+
+    import ai.langgraph.model as model_module
+    from ai.langgraph.model import Model
+
+    captured: list[dict[str, Any]] = []
+    original_emit = Model._emit_subagent_status
+
+    async def _emit_spy(self: Model, **kwargs: Any) -> bool:
+        captured.append(kwargs)
+        return await original_emit(self, **kwargs)
+
+    monkeypatch.setattr(Model, "_emit_subagent_status", _emit_spy)
+    result = asyncio.run(harness.run("Are any callbacks alive?"))
+    supervisor_channel = result.get("supervisor_messages") or []
+    notices = [
+        m for m in supervisor_channel
+        if getattr(m, "additional_kwargs", {}).get("_empty_delegation_return")
+    ]
+    assert notices, (
+        "the empty delegation return was not surfaced to the Supervisor; it would re-delegate "
+        f"identically: {_contents(supervisor_channel)}"
+    )
+    assert any("produced no text" in str(m.content) for m in notices), _contents(notices)
+    # The delegation card must close honestly: error status, real content, no filler.
+    closes = [c for c in emitter.statuses if c.get("complete")]
+    assert closes, f"no delegation close was emitted: {emitter.statuses}"
+    assert all(
+        "Completed without a textual summary" not in str(c.get("content"))
+        and "Completed without a textual summary" not in str(c.get("summary"))
+        for c in closes
+    ), [_contents([str(c.get("content")) for c in closes])]
+    operator_closes = [c for c in closes if c.get("delegation_name") == "Mythic_Operator"]
+    assert operator_closes, f"the Mythic_Operator card was never closed: {closes}"
+    assert all(c.get("status") == "error" for c in operator_closes), [
+        {"status": c.get("status"), "content": c.get("content")} for c in operator_closes
+    ]
+
+
 def test_the_handoff_reaches_the_specialists_own_channel(delegated):
     """The routing claim: a transfer_to_* tool call must actually move work to that agent.
 
@@ -412,6 +485,29 @@ def test_supervisor_can_reuse_one_worker_answer_verbatim_after_real_handoff():
     ]
     assert len(handbacks) == 1
     assert not getattr(harness.mythic, "issue_task", MagicMock()).called
+
+
+def test_supervised_graph_finishes_with_explicit_report_via_tool_runtime(monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "_RECURSION_LIMIT", 12)
+    report = "Task 3 reports two rights; elevation and group membership remain unverified."
+    finish = AIMessage(content="", tool_calls=[{
+        "name": "respond_to_user", "args": {"final_response": report},
+        "id": "supervised-explicit-final", "type": "tool_call",
+    }])
+
+    class SupervisedHarness(_Harness):
+        def _build(self, script):
+            instance = super()._build(script)
+            instance.mode = "supervised"
+            return instance
+
+    result = asyncio.run(SupervisedHarness([_handoff_call(),
+        AIMessage(content="Task 3 output shows two rights."), finish]).run(
+            "Summarize task 3 with evidence limits.", assisted=True))
+    finals = [message for message in result["messages"] if isinstance(message, AIMessage)
+              and message.additional_kwargs.get("_is_final_report")]
+    assert len(finals) == 1
+    assert finals[0].content == report
 
 
 def test_filtered_worker_answer_reuse_error_allows_supervisor_synthesis(monkeypatch):
@@ -819,17 +915,19 @@ def test_supervisor_can_continue_authorized_work_after_incomplete_specialist_ret
         AIMessage(content="First check incomplete; a second callback needs review."),
         next_handoff,
         AIMessage(content="The second callback is alive."),
+        AIMessage(content="One callback is alive; the first check remains incomplete."),
     ])
     result = asyncio.run(harness.run("Check all callbacks.", assisted=True))
 
-    # This graph's two-specialist cap ends the request after the second return.
-    assert len(seen) == 4
+    assert len(seen) == 5
     assert any(
         isinstance(message, HumanMessage)
         and message.content.startswith("Internal Supervisor continuation:")
         for message in seen[2]
     )
     assert "The second callback is alive." in _contents(result["mythic_operator_messages"])
+    assert "One callback is alive; the first check remains incomplete." in _contents(
+        result["supervisor_messages"])
     assert not getattr(harness.mythic, "issue_task", MagicMock()).called
 
 

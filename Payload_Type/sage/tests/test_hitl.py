@@ -520,7 +520,8 @@ def test_invoke_routes_controller_approval_before_seeding_new_objective():
     assert seen == {"response": "approve"}
 
 
-def test_controller_hitl_default_deny_executes_nothing_and_halts():
+@pytest.mark.parametrize("response", ["maybe", "deny"])
+def test_controller_hitl_default_deny_never_approves_and_replans(response):
     m = _controller_hitl_model()
     pending = _capability_pending(m)
     m._controller_hitl_pending = pending
@@ -531,15 +532,19 @@ def test_controller_hitl_default_deny_executes_nothing_and_halts():
         sent.append(msg)
         return True
 
-    async def _run_controller(_objective):
+    async def _run_controller(objective):
         ran["controller"] = True
-        return "should-not-run"
+        assert objective == pending["objective"]
+        assert m._controller_hitl_approved_key == ""
+        assert m._controller_hitl_approved_pending is None
+        assert m._controller_hitl_denies(pending)
+        return "replanned_without_effects"
 
     m._stream_message_to_mythic = _stream
     m._run_autonomous_controller = _run_controller
 
-    assert _run(m.handle_controller_hitl_resume("maybe")) == ""
-    assert ran["controller"] is False
+    assert _run(m.handle_controller_hitl_resume(response)) == "replanned_without_effects"
+    assert ran["controller"] is True
     assert m._controller_hitl_pending is None
     assert m._controller_hitl_approved_key == ""
     assert "Operator denied `gpo-controlled-system-exec`" in sent[0]

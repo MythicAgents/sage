@@ -107,3 +107,209 @@ if __name__ == "__main__":
             fn()
             print(f"PASS {name}")
     print("all circuit-breaker tests passed")
+
+
+def test_failure_key_treats_dcsync_argument_permutations_as_one_failure():
+    """Flag order, quoting, case, and user-principal spelling are cosmetic: the
+    cross-request circuit breaker must count them as the same failed signature."""
+    mt = _make_tools()
+    base = {
+        "pe_name": "mimikatz.exe",
+        "pe_arguments": '"lsadump::dcsync /domain:north.sevenkingdoms.local /user:krbtgt" exit',
+    }
+    permuted = {
+        "pe_name": "mimikatz.exe",
+        "pe_arguments": "'lsadump::dcsync /user:NORTH\\krbtgt /domain:NORTH.SEVENKINGDOMS.LOCAL' exit",
+    }
+    k1 = mt._task_failure_key("execute_pe", 1, base)
+    k2 = mt._task_failure_key("execute_pe", 1, permuted)
+    assert k1 == k2, (
+        f"cosmetic permutations must share one failure key:\n{k1}\n{k2}"
+    )
+
+
+def test_failure_key_still_distinguishes_material_targeting_changes():
+    """A different /dc, a different principal, or a different domain is a genuinely
+    new attempt and must keep its own failure key."""
+    mt = _make_tools()
+    base = {
+        "pe_name": "mimikatz.exe",
+        "pe_arguments": '"lsadump::dcsync /domain:north.sevenkingdoms.local /user:krbtgt" exit',
+    }
+    k_base = mt._task_failure_key("execute_pe", 1, base)
+    with_dc = {
+        "pe_name": "mimikatz.exe",
+        "pe_arguments": '"lsadump::dcsync /domain:north.sevenkingdoms.local '
+                        '/dc:winterfell.north.sevenkingdoms.local /user:krbtgt" exit',
+    }
+    other_user = {
+        "pe_name": "mimikatz.exe",
+        "pe_arguments": '"lsadump::dcsync /domain:north.sevenkingdoms.local /user:administrator" exit',
+    }
+    other_domain = {
+        "pe_name": "mimikatz.exe",
+        "pe_arguments": '"lsadump::dcsync /domain:essos.local /user:krbtgt" exit',
+    }
+    assert mt._task_failure_key("execute_pe", 1, with_dc) != k_base
+    assert mt._task_failure_key("execute_pe", 1, other_user) != k_base
+    assert mt._task_failure_key("execute_pe", 1, other_domain) != k_base
+
+
+def test_permuted_dcsync_retries_hit_the_circuit_breaker():
+    """The acceptance-run shape: the same failed dcsync re-attempted across requests
+    with cosmetically different arguments must be short-circuited on the second try."""
+    calls = {"n": 0}
+    fail = (
+        "[*] Using Mimikatz... lsadump::dcsync /domain:north.sevenkingdoms.local\n"
+        "ERROR kull_m_rpc_drsr_get_DRSRHandle; 0x000020f7 (5) - access denied"
+    )
+    mt = _make_tools()
+    with _split_issue(fail, on_issue=lambda p: calls.__setitem__("n", calls["n"] + 1)):
+        r1 = asyncio.run(mt.issue_task_and_waitfor_task_output(
+            "execute_pe",
+            {"pe_name": "mimikatz.exe",
+             "pe_arguments": '"lsadump::dcsync /domain:north.sevenkingdoms.local /user:krbtgt" exit'},
+            1))
+        r2 = asyncio.run(mt.issue_task_and_waitfor_task_output(
+            "execute_pe",
+            {"pe_name": "mimikatz.exe",
+             "pe_arguments": "'lsadump::dcsync /user:NORTH\\krbtgt /domain:NORTH.SEVENKINGDOMS.LOCAL' exit"},
+            1))
+    assert not r1.startswith("STOP"), "the first attempt must run"
+    assert r2.startswith("STOP"), (
+        f"the permuted re-attempt of a failed signature must be short-circuited: {r2[:200]}"
+    )
+    assert calls["n"] == 1, "Mythic must be called only once; the permuted retry is blocked locally"
+
+
+# --- issue #46: parameter rotation defeats the (command, callback, params) failure key ---
+# Live evidence (channel 4 morning session): make_token+ldap_query pairs with rotated
+# credentials failed at least four times INSIDE one long request, and no breaker text
+# appeared anywhere. Every rotation is a fresh failure key, so the param-keyed circuit
+# breaker never accumulated, and the D3 delegation repeat-failure flag never saw a repeat.
+
+_ROTATION_PARAMS = (
+    {"user": "sql_svc", "ldap_filter": "(objectClass=*)"},
+    {"user": "khal.drogo", "ldap_filter": "(objectClass=user)"},
+    {"user": "drogon", "ldap_filter": "(servicePrincipalName=*)"},
+    {"user": "jorah.mormont", "ldap_filter": "(objectClass=*)"},
+)
+
+_ROTATION_FAIL = (
+    "[-] failed to parse arguments for ldap_query: ldap_query takes no command line arguments."
+)
+
+
+def test_rotated_parameter_failures_trip_the_breaker_within_one_request():
+    """The same command on the same callback failing with a different parameter variant each
+    time must reach the shape cap: two rotated failures are real issues, and the third
+    rotated attempt is refused locally without issuing a task."""
+    seen = []
+    mt = _make_tools()
+    with _split_issue(_ROTATION_FAIL, on_issue=lambda params: seen.append(params)):
+        r1 = asyncio.run(mt.issue_task_and_waitfor_task_output(
+            "ldap_query", _ROTATION_PARAMS[0], 7))
+        r2 = asyncio.run(mt.issue_task_and_waitfor_task_output(
+            "ldap_query", _ROTATION_PARAMS[1], 7))
+        r3 = asyncio.run(mt.issue_task_and_waitfor_task_output(
+            "ldap_query", _ROTATION_PARAMS[2], 7))
+    assert "failed to parse" in r1, f"the first attempt must run: {r1[:200]}"
+    assert "failed to parse" in r2, (
+        f"the second rotated variant is a real attempt like the credential-reference"
+        f" rotation flow: {r2[:200]}"
+    )
+    assert r3.startswith("STOP"), (
+        f"the third rotated attempt must be refused before issuing: {r3[:200]}"
+    )
+    assert "different parameter/credential variant" in r3 or "in a row" in r3
+    assert len(seen) == 2, (
+        f"Mythic must see exactly two real attempts; the third is refused locally: {len(seen)}"
+    )
+
+
+def test_rotated_failure_shape_cap_is_callback_scoped_and_resets_on_success():
+    """A different callback keeps its own fresh shape count, a success on the failing pair
+    clears its streak, and the cap only counts consecutive failures of that pair."""
+    state = {"fail": True}
+    mt = _make_tools()
+    with _split_issue(
+        lambda: _ROTATION_FAIL if state["fail"] else "3 rows returned",
+    ):
+        # First failure on callback 7: one consecutive failure, still allowed.
+        r1 = asyncio.run(mt.issue_task_and_waitfor_task_output(
+            "ldap_query", _ROTATION_PARAMS[0], 7))
+        assert r1.startswith("[-] failed")
+        # Success on the pair (the working credential applied) clears its streak.
+        state["fail"] = False
+        ok = asyncio.run(mt.issue_task_and_waitfor_task_output(
+            "ldap_query", _ROTATION_PARAMS[1], 7))
+        assert not ok.startswith("STOP")
+        # The consecutive window re-arms from zero.
+        state["fail"] = True
+        r2 = asyncio.run(mt.issue_task_and_waitfor_task_output(
+            "ldap_query", _ROTATION_PARAMS[1], 7))
+        assert not r2.startswith("STOP")
+        # The second consecutive failure still runs (as the credential-reference rotation
+        # expects) but accumulates this pair's window to the cap.
+        r3 = asyncio.run(mt.issue_task_and_waitfor_task_output(
+            "ldap_query", _ROTATION_PARAMS[2], 7))
+        assert "failed to parse" in r3
+        # The next rotated attempt is refused: the shape cap has been reached.
+        r4 = asyncio.run(mt.issue_task_and_waitfor_task_output(
+            "ldap_query", _ROTATION_PARAMS[3], 7))
+        assert r4.startswith("STOP")
+        # A different callback always keeps its own fresh count.
+        other = asyncio.run(mt.issue_task_and_waitfor_task_output(
+            "ldap_query", _ROTATION_PARAMS[0], 8))
+        assert not other.startswith("STOP"), (
+            f"callback 8 must not inherit callback 7's cap: {other[:200]}"
+        )
+
+
+def test_fresh_request_clears_the_rotated_failure_shape_cap():
+    """The shape cap is a same-request window: binding a NEW request contract clears the
+    consecutive-failure accumulation, so operator steering in the next request starts clean."""
+    seen = []
+    mt = _make_tools()
+    with _split_issue(_ROTATION_FAIL, on_issue=lambda params: seen.append(params)):
+        asyncio.run(mt.issue_task_and_waitfor_task_output(
+            "ldap_query", _ROTATION_PARAMS[0], 7))
+        r2 = asyncio.run(mt.issue_task_and_waitfor_task_output(
+            "ldap_query", _ROTATION_PARAMS[1], 7))
+        assert "failed to parse" in r2, (
+            f"the second consecutive rotated failure still runs: {r2[:200]}"
+        )
+        r3 = asyncio.run(mt.issue_task_and_waitfor_task_output(
+            "ldap_query", _ROTATION_PARAMS[2], 7))
+        assert r3.startswith("STOP"), (
+            f"the third rotated attempt must hit the same-request cap: {r3[:200]}"
+        )
+        # Binding the NEXT request re-opens the window (set_request_contract calls this
+        # helper when a new contract binds; the window reset is what a fresh request does).
+        mt.reset_request_loop_guards()
+        assert getattr(mt, "_task_failure_shape_counts", {}) == {}, (
+            f"a fresh request must clear the shape window: {getattr(mt, '_task_failure_shape_counts', {})}"
+        )
+        fresh = asyncio.run(mt.issue_task_and_waitfor_task_output(
+            "ldap_query", _ROTATION_PARAMS[2], 7))
+    assert not fresh.startswith("STOP"), (
+        f"the new request must be allowed its own consecutive window: {fresh[:200]}"
+    )
+
+
+def test_repeat_failure_flag_counts_rotated_parameter_failures():
+    """D3 delegate containment reads _last_issued_task_is_repeat_failure at the issue
+    boundary. After one failed attempt of a (command, callback) shape, a rotated re-issue
+    must still read as a repeat of a known failure, not fresh progress."""
+    mt = _make_tools()
+    with _split_issue(_ROTATION_FAIL):
+        asyncio.run(mt.issue_task_and_waitfor_task_output(
+            "ldap_query", _ROTATION_PARAMS[0], 7))
+        first = mt._last_issued_task_is_repeat_failure
+        asyncio.run(mt.issue_task_and_waitfor_task_output(
+            "ldap_query", _ROTATION_PARAMS[1], 7))
+        second = mt._last_issued_task_is_repeat_failure
+    assert first is False
+    assert second is True, (
+        "the rotated re-issue must read as a repeat failure once the shape has already failed"
+    )

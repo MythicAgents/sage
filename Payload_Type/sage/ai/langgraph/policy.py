@@ -1248,6 +1248,16 @@ class HybridPolicy(LLMPolicy):
     mode = POLICY_HYBRID
     selection_contract = SELECTION_CONTRACT_HYBRID
 
+    def __init__(
+        self,
+        decide: Callable[[dict[str, Any]], Any | Awaitable[Any]] | None,
+        *,
+        consult_model_for_singleton: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(decide, **kwargs)
+        self.consult_model_for_singleton = bool(consult_model_for_singleton)
+
     async def select(
         self,
         *,
@@ -1258,7 +1268,7 @@ class HybridPolicy(LLMPolicy):
         history: list[PolicyDecision],
         budgets: dict[str, Any] | None = None,
     ) -> PolicyDecision:
-        if len(candidates) != 1:
+        if len(candidates) != 1 or self.consult_model_for_singleton:
             return await super().select(
                 episode_id=episode_id,
                 objective=objective,

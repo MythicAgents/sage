@@ -639,3 +639,27 @@ def test_stored_open_ended_objective_keeps_supervisor_graph_engine():
     assert contract.engine == "supervisor_graph"
     assert contract.approval_policy == "turn_hitl"
     assert contract.allows_capability("gpo-controlled-system-exec") is True
+
+
+@pytest.mark.parametrize("objective", [
+    "From our foothold, find an attack path to essos.local",
+    "Identify the shortest path from samwell to Domain Admins",
+    "escalate to domain admin in north.sevenkingdoms.local",
+    "compromise the essos.local domain",
+    "pivot from the current host and own the forest root",
+    "reach a privileged principal in corp.local",
+])
+def test_objective_seeks_attack_path_detects_path_shaped_asks(objective):
+    assert _load_contract().objective_seeks_attack_path(objective) is True
+
+
+@pytest.mark.parametrize("objective", [
+    "Collect and ingest the current graph, then read available credentials.",
+    "Explain how ESC1 abuse works",
+    "List the credentials in the Mythic store",
+    "Do not escalate privileges; just enumerate shares",
+    "Enumerate ADCS templates without compromising anything",
+    "",
+])
+def test_objective_seeks_attack_path_ignores_non_path_or_negated_asks(objective):
+    assert _load_contract().objective_seeks_attack_path(objective) is False

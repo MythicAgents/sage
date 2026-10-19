@@ -174,13 +174,17 @@ def test_analysis_only_delegations_are_neutral():
     Attempt 2 asserted the opposite — that any three non-tasking delegations should be surfaced as
     "no progress" — and that was a false-positive class, not a requirement. A delegation that never
     attempted a guarded action neither advances nor clears the streak.
+
+    The neutral soft-cap is now a hard stop at six consecutive analysis-only delegations
+    (a purely analytical loop used to run until an unrelated detector ended it), so this
+    window stays below the cap: below it, analysis is still fully neutral.
     """
     model = _fresh_model(_FakeMythicClient())
     agent = _AnalysisAgent()
 
-    for _ in range(_ZERO_PROGRESS_DELEGATION_CAP * 3):
+    for _ in range(5):
         assert not _stopped(_run_once(model, agent)), "analysis must never trip the backstop"
-    assert getattr(model, "_nonprogress_delegations", 0) == 0
+        assert getattr(model, "_nonprogress_delegations", 0) == 0
 
 
 def test_analysis_does_not_clear_a_real_stall():
@@ -361,3 +365,123 @@ def test_pair_bounce_resets_on_progress():
     assert not any("handing back to each other" in m.content for m in msgs), (
         "pair-bounce counter must reset after progress"
     )
+
+
+# ── D3: the neutral soft-cap is a hard stop; mixed ping-pong is a hard stop ───────────────────
+
+class _AlternateAgent:
+    """Alternates a blocked guarded attempt with an analysis cycle on the same node.
+
+    The counter-split shape from the acceptance run: a loop that rotates between
+    "tried and blocked" and "analysis-only" cycles keeps every class-specific
+    consecutive counter small while the request burns cycles.
+    """
+
+    def __init__(self, model):
+        self.calls = 0
+        self.model = model
+
+    async def ainvoke(self, payload, config=None):
+        self.calls += 1
+        if self.calls % 2 == 1:
+            self.model._guarded_attempt_pending = True
+        return {
+            "messages": list(payload["messages"])
+            + [AIMessage(content=f"cycle {self.calls} handback")]
+        }
+
+
+def test_mixed_pair_bounce_stops_the_request():
+    """Blocked/analysis alternation on one node must stop the request.
+
+    Pair-bounce counts every non-progressed cycle; a window containing a blocked
+    attempt is a hard stop. A pure-analysis window stays advisory (the neutral cap
+    is that class's stop) so legitimate multi-query analysis is not truncated.
+    """
+    model = _fresh_model(_FakeMythicClient())
+    agent = _AlternateAgent(model)
+
+    result = None
+    for _ in range(3):
+        result = _run_once(model, agent)
+
+    assert model._stop_requested is True, "mixed ping-pong must halt the request"
+    text = " ".join(m.content.lower() for m in _messages_of(result))
+    assert "routing loop" in text
+
+
+def test_pure_neutral_pairs_stay_advisory():
+    """A pure-analysis window contains no blocked attempt: the pair detector stays
+    advisory there; the neutral cap is that class's hard stop."""
+    model = _fresh_model(_FakeMythicClient())
+    agent = _AnalysisAgent()
+
+    for _ in range(3):
+        _run_once(model, agent)
+        assert not getattr(model, "_stop_requested", False), (
+            "pure-analysis pairs must remain advisory; the neutral cap stops that class"
+        )
+
+
+def test_neutral_cap_stops_the_request():
+    """Six consecutive analysis-only delegations halt the request with a reason."""
+    model = _fresh_model(_FakeMythicClient())
+    agent = _AnalysisAgent()
+
+    result = None
+    for _ in range(6):
+        result = _run_once(model, agent)
+
+    assert model._stop_requested is True, "the neutral cap must halt, not just warn"
+    text = _messages_of(result)[0].content.lower()
+    assert "no action" in text
+
+
+# ── D3: re-issuing a failed signature is not progress ─────────────────────────────────────────
+
+class _RepeatTaskingAgent:
+    """Issues a task each cycle; the client flags whether the signature already failed."""
+
+    def __init__(self, client, model, repeat):
+        self.calls = 0
+        self.client = client
+        self.model = model
+        self.repeat = repeat
+
+    async def ainvoke(self, payload, config=None):
+        self.calls += 1
+        self.model._guarded_attempt_pending = True
+        self.client._last_issued_task_display_id = self.calls
+        self.client._last_issued_task_is_repeat_failure = self.repeat
+        return {
+            "messages": list(payload["messages"])
+            + [AIMessage(content=f"issued task {self.calls}")]
+        }
+
+
+def test_repeat_failed_issuance_is_not_progress():
+    """A new task id whose signature already failed must not reset the stall streak."""
+    client = _FakeMythicClient()
+    model = _fresh_model(client)
+    agent = _RepeatTaskingAgent(client, model, repeat=True)
+
+    result = None
+    for _ in range(_ZERO_PROGRESS_DELEGATION_CAP):
+        result = _run_once(model, agent)
+
+    assert model._stop_requested is True, (
+        "re-issuing a failed signature is not progress; the streak must accumulate"
+    )
+
+
+def test_genuinely_new_task_is_still_progress():
+    """A new task with no prior failure on its signature is real progress."""
+    client = _FakeMythicClient()
+    model = _fresh_model(client)
+    agent = _RepeatTaskingAgent(client, model, repeat=False)
+
+    for _ in range(_ZERO_PROGRESS_DELEGATION_CAP * 3):
+        result = _run_once(model, agent)
+        assert not getattr(model, "_stop_requested", False), (
+            "genuinely new tasking is progress and must never trip the backstop"
+        )

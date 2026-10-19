@@ -3,6 +3,7 @@ import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from langchain_core.messages import ToolMessage
@@ -252,6 +253,238 @@ def test_middleware_caps_text_block_in_list_content_preserves_non_text_by_identi
 
     assert result.content[0]["text"].startswith("⟦TOON ") or "[truncated" in result.content[0]["text"]
     assert result.content[1] is image_block
+
+
+def _task_history(rows=25):
+    return [{
+        "id": number + 100, "display_id": number,
+        "callback": {"id": 70, "display_id": 7},
+        "command_name": "inline_assembly", "completed": True, "status": "success",
+        "timestamp": "2026-01-01T00:00:00",
+        "original_params": json.dumps({"Assembly": "Example.exe", "Arguments": "x" * 800}),
+        "display_params": "x" * 800,
+        "operator": {"username": "operator"}, "tasks": [],
+    } for number in range(1, rows + 1)]
+
+
+@pytest.mark.parametrize("completed,status", [
+    (False, "Fetching File Chunk 1..."), (False, "processing"),
+    (None, ""), (True, "success"), (True, "error"),
+])
+def test_task_history_compaction_keeps_latest_complete_state(completed, status):
+    rows = _task_history()
+    rows[-1].update(completed=completed, status=status)
+    original = ToolMessage(content=json.dumps(rows), tool_call_id="call-1")
+    middleware = _ToolResultCompactionMiddleware(model=object())
+
+    received = middleware.wrap_tool_call(_request("get_task_history_for_callback"), lambda _: original)
+
+    result = json.loads(received.content)
+    latest = result["tasks"][-1]
+    assert latest["display_id"] == 25
+    assert latest["id"] == 125
+    assert latest["callback"] == rows[-1]["callback"]
+    assert latest["command_name"] == "inline_assembly"
+    assert latest["completed"] is completed
+    assert latest["status"] == status
+    assert len(received.content) <= 16000
+    assert result["history_compaction"]["omitted_tasks"] == 0
+    assert result["history_compaction"]["task_details_omitted"] is True
+    assert json.loads(original.content) == rows
+
+
+def test_task_history_compaction_retains_whole_recent_rows_and_reports_omissions():
+    rows = _task_history(200)
+    # Display IDs, rather than input ordering or success, determine recency.
+    rows[-1].update(completed=False, status="Fetching File Chunk 1...")
+    rows.reverse()
+    middleware = _ToolResultCompactionMiddleware(model=object())
+    original = ToolMessage(content=json.dumps(rows), tool_call_id="call-1")
+
+    received = middleware.wrap_tool_call(_request("get_task_history_for_callback"), lambda _: original)
+
+    result = json.loads(received.content)
+    assert len(received.content) <= 16000
+    assert 0 < len(result["tasks"]) < 200
+    assert result["tasks"][-1]["display_id"] == 200
+    assert result["tasks"][-1]["completed"] is False
+    assert result["tasks"][-1]["status"] == "Fetching File Chunk 1..."
+    assert result["history_compaction"]["omitted_tasks"] == 200 - len(result["tasks"])
+    assert result["history_compaction"]["selection"] == "latest_task_display_ids"
+    assert all(set(("id", "display_id", "callback", "command_name", "completed", "status"))
+               <= set(row) for row in result["tasks"])
+    assert "[truncated" not in received.content
+
+
+def test_task_history_oversized_state_is_omitted_without_inventing_a_phase():
+    rows = _task_history(1)
+    rows[0]["status"] = "phase" * 4000
+    middleware = _ToolResultCompactionMiddleware(model=object())
+    original = ToolMessage(content=json.dumps(rows), tool_call_id="call-1")
+
+    received = middleware.wrap_tool_call(_request("get_task_history_for_callback"), lambda _: original)
+
+    result = json.loads(received.content)
+    assert result["tasks"] == []
+    assert result["history_compaction"]["omitted_tasks"] == 1
+    assert len(received.content) <= 16000
+
+
+def test_task_history_semantics_are_limited_to_the_named_tool():
+    rows = _task_history()
+    original = ToolMessage(content=json.dumps(rows), tool_call_id="call-1")
+    middleware = _ToolResultCompactionMiddleware(model=object())
+
+    received = middleware.wrap_tool_call(_request("cypher_query"), lambda _: original)
+
+    assert received.content == _transform_content(original.content)
+    assert "history_compaction" not in received.content
+
+
+def test_small_task_history_retains_full_existing_shape_and_parameters():
+    rows = _task_history(1)
+    original = ToolMessage(content=json.dumps(rows), tool_call_id="call-1")
+    middleware = _ToolResultCompactionMiddleware(model=object())
+
+    received = middleware.wrap_tool_call(_request("get_task_history_for_callback"), lambda _: original)
+
+    assert json.loads(received.content) == rows
+    assert received is original
+
+
+def test_task_parameter_truncation_marker_cannot_bypass_history_budget():
+    rows = [{"id": number, "display_id": number, "completed": False,
+             "status": "Fetching File Chunk 1...", "command_name": "inline_assembly",
+             "original_params": "[truncated"} for number in range(103)]
+    source = json.dumps(rows)
+    assert len(source) > 16000
+    assert len(json.dumps(rows, separators=(",", ":"), sort_keys=True)) <= 16000
+    original = ToolMessage(content=source, tool_call_id="call-1")
+    middleware = _ToolResultCompactionMiddleware(model=object())
+
+    received = middleware.wrap_tool_call(_request("get_task_history_for_callback"), lambda _: original)
+
+    assert len(received.content) <= 16000
+    assert json.loads(received.content) == rows
+
+
+@pytest.mark.parametrize("rows", [
+    [{"display_id": True, "note": "x" * 18000}],
+    [{"other_id": 1, "note": "x" * 18000}],
+    {"status": "unchanged", "note": "x" * 18000},
+    {"tasks": [{"display_id": True, "note": "x" * 18000}]},
+    {"task": [{"display_id": "25", "note": "x" * 18000}]},
+])
+def test_non_history_shapes_do_not_gain_projected_task_state(rows):
+    original = ToolMessage(content=json.dumps(rows), tool_call_id="call-1")
+    middleware = _ToolResultCompactionMiddleware(model=object())
+
+    received = middleware.wrap_tool_call(_request("get_task_history_for_callback"), lambda _: original)
+
+    assert received.content == _transform_content(original.content)
+    assert "history_compaction" not in received.content
+
+
+def test_task_history_missing_state_is_not_filled_from_other_rows():
+    rows = _task_history()
+    del rows[-1]["completed"]
+    del rows[-1]["status"]
+    original = ToolMessage(content=json.dumps(rows), tool_call_id="call-1")
+    middleware = _ToolResultCompactionMiddleware(model=object())
+
+    received = middleware.wrap_tool_call(_request("get_task_history_for_callback"), lambda _: original)
+
+    latest = json.loads(received.content)["tasks"][-1]
+    assert latest["display_id"] == 25
+    assert "completed" not in latest and "status" not in latest
+
+
+def test_task_history_text_blocks_preserve_state_and_non_text():
+    rows = _task_history()
+    rows[-1].update(completed=False, status="Fetching File Chunk 1...")
+    image = {"type": "image", "data": "untouched"}
+    content = [{"type": "text", "text": json.dumps(rows)}, image]
+    original = ToolMessage(content=content, tool_call_id="call-1")
+    object.__setattr__(original, "content", content)
+    middleware = _ToolResultCompactionMiddleware(model=object())
+
+    received = middleware.wrap_tool_call(_request("get_task_history_for_callback"), lambda _: original)
+
+    assert json.loads(received.content[0]["text"])["tasks"][-1]["status"] == "Fetching File Chunk 1..."
+    assert received.content[1] is image
+
+
+def test_registered_history_producer_and_async_middleware_preserve_provenance():
+    from ai.langgraph import mythic_tools
+
+    rows = _task_history()
+    rows[-1].update(completed=False, status="Fetching File Chunk 1...")
+    tools = mythic_tools.MythicTools(agent_task_id="offline-history")
+    tools.client = object()
+    registered = tools.get_tools(["get_task_history_for_callback"])[0]
+    middleware = _ToolResultCompactionMiddleware(model=object())
+
+    async def handler(_request):
+        body = await registered.ainvoke({"callback_display_id": 7})
+        return ToolMessage(content=body, tool_call_id="call-1", name="get_task_history_for_callback")
+
+    with patch.object(mythic_tools.mythic, "get_all_tasks", AsyncMock(return_value=rows)) as sdk:
+        received = asyncio.run(middleware.awrap_tool_call(_request("get_task_history_for_callback"), handler))
+
+    sdk.assert_awaited_once_with(mythic=tools.client, callback_display_id=7)
+    latest = json.loads(received.content)["tasks"][-1]
+    assert latest["status"] == "Fetching File Chunk 1..."
+    assert latest["request_provenance"]["issued_by_current_request"] is False
+    assert latest["request_provenance"]["task_id"] == 25
+    assert "request_provenance" not in rows[-1]
+
+
+@pytest.mark.parametrize("envelope_key", ["tasks", "task"])
+def test_registered_history_envelope_preserves_latest_state_and_marks_omitted_metadata(
+    envelope_key,
+):
+    from ai.langgraph import mythic_tools
+
+    rows = _task_history()
+    rows[-1].update(completed=False, status="Fetching File Chunk 1...")
+    source = {envelope_key: rows, "total_count": len(rows), "cursor": "next-page"}
+    tools = mythic_tools.MythicTools(agent_task_id="offline-history-envelope")
+    tools.client = object()
+    registered = tools.get_tools(["get_task_history_for_callback"])[0]
+    middleware = _ToolResultCompactionMiddleware(model=object())
+
+    async def handler(_request):
+        body = await registered.ainvoke({"callback_display_id": 7})
+        return ToolMessage(content=body, tool_call_id="call-1", name="get_task_history_for_callback")
+
+    with patch.object(mythic_tools.mythic, "get_all_tasks", AsyncMock(return_value=source)) as sdk:
+        received = asyncio.run(middleware.awrap_tool_call(_request("get_task_history_for_callback"), handler))
+
+    sdk.assert_awaited_once_with(mythic=tools.client, callback_display_id=7)
+    result = json.loads(received.content)
+    latest = result[envelope_key][-1]
+    assert latest["display_id"] == 25
+    assert latest["completed"] is False
+    assert latest["status"] == "Fetching File Chunk 1..."
+    assert latest["request_provenance"]["task_id"] == 25
+    assert result["history_compaction"]["source_envelope"] == envelope_key
+    assert result["history_compaction"]["omitted_envelope_fields"] == 2
+    assert result["history_compaction"]["envelope_metadata_omitted"] is True
+    assert "cursor" not in result and "total_count" not in result
+    assert len(received.content) <= 16000
+    assert "request_provenance" not in rows[-1]
+
+
+@pytest.mark.parametrize("envelope_key", ["tasks", "task"])
+def test_small_task_history_envelope_retains_all_fields(envelope_key):
+    source = {envelope_key: _task_history(1), "total_count": 1, "cursor": "next-page"}
+    original = ToolMessage(content=json.dumps(source), tool_call_id="call-1")
+    middleware = _ToolResultCompactionMiddleware(model=object())
+
+    received = middleware.wrap_tool_call(_request("get_task_history_for_callback"), lambda _: original)
+
+    assert received is original
+    assert json.loads(received.content) == source
 
 
 def test_middleware_skips_protected_tool_returns_identity():

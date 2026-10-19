@@ -358,7 +358,8 @@ def effective_case_arguments(arguments: object) -> dict | None:
 
 def report_netstat_effective_arguments(arguments: object) -> dict | None:
     """Accept only the one bounded callback-7 netstat action, not arbitrary shell."""
-    if (not isinstance(arguments, dict) or set(arguments) != set(REPORT_NETSTAT_ARGS) or
+    arguments = CASE.fixture_base_arguments(arguments)
+    if (arguments is None or set(arguments) != set(REPORT_NETSTAT_ARGS) or
             type(arguments.get("callback_display_id")) is not int or
             arguments["callback_display_id"] != 7 or arguments.get("command") != "shell"):
         return None
@@ -742,23 +743,37 @@ def _streamed_response_choices(body: bytes) -> dict | None:
     return {"model": response_model, "choices": [choices[i] for i in sorted(choices)]} if found else None
 
 
+def _capture_provider_response(body: bytes, row: dict, authorization: str = "") -> None:
+    if row.get("http_status", 200) >= 400:
+        # Keep provider errors as evidence, including non-JSON gateway responses.
+        # A rejected request is not evidence of zero usage. Never retain an echoed key.
+        content = body.decode("utf-8", errors="replace")
+        token = authorization.partition(" ")[2] or authorization
+        if token:
+            content = content.replace(token, "[REDACTED]")
+        row["error_response_body"] = content
+        return
+    parsed = _response_choices(body)
+    if parsed is not None:
+        row["response"] = parsed
+    else:
+        row["response_capture"] = "unparsed"
+
+
 class CapturingResponseStream(httpx.AsyncByteStream):
     """Observe bytes as the provider SDK consumes them, preserving its stream lifecycle."""
 
-    def __init__(self, inner: httpx.AsyncByteStream, row: dict):
+    def __init__(self, inner: httpx.AsyncByteStream, row: dict, authorization: str = ""):
         self.inner = inner
         self.row = row
+        self.authorization = authorization
 
     async def __aiter__(self):
         chunks = []
         async for chunk in self.inner:
             chunks.append(chunk)
             yield chunk
-        parsed = _response_choices(b"".join(chunks))
-        if parsed is not None:
-            self.row["response"] = parsed
-        else:
-            self.row["response_capture"] = "unparsed"
+        _capture_provider_response(b"".join(chunks), self.row, self.authorization)
 
     async def aclose(self):
         await self.inner.aclose()
@@ -766,15 +781,18 @@ class CapturingResponseStream(httpx.AsyncByteStream):
 
 class BoundedTransport(httpx.AsyncBaseTransport):
     def __init__(self, endpoint: str, model: str, tls_context: ssl.SSLContext | None = None,
-                 *, max_requests: int = MAX_REQUESTS, output_tokens: int = MAX_OUTPUT_TOKENS,
+                 *, max_requests: int | None = MAX_REQUESTS, output_tokens: int = MAX_OUTPUT_TOKENS,
                  usage_recorder: UsageRecorder | None = None,
                  max_observed_tokens: int | None = None,
                  monetary_guard: MonetaryGuard | None = None,
-                 request_seconds: float = REQUEST_SECONDS,
-                 utc_deadline: datetime | None = None):
-        if (not isinstance(request_seconds, (int, float)) or
-                not math.isfinite(request_seconds) or request_seconds <= 0 or
-                request_seconds > WALL_SECONDS):
+                 request_seconds: float | None = REQUEST_SECONDS,
+                 utc_deadline: datetime | None = None,
+                 require_complete_usage: bool = False):
+        if (request_seconds is None and utc_deadline is None) or (
+            request_seconds is not None and
+            (not isinstance(request_seconds, (int, float)) or
+             not math.isfinite(request_seconds) or request_seconds <= 0 or
+             request_seconds > WALL_SECONDS)):
             raise CaseError("invalid_request_seconds")
         self.endpoint = endpoint.rstrip("/") + "/chat/completions"
         self.model = model
@@ -789,6 +807,7 @@ class BoundedTransport(httpx.AsyncBaseTransport):
         self.monetary_guard = monetary_guard
         self.request_seconds = request_seconds
         self.utc_deadline = utc_deadline
+        self.require_complete_usage = require_complete_usage
 
     async def handle_async_request(self, request):
         remaining = remaining_utc_seconds(self.utc_deadline)
@@ -799,10 +818,32 @@ class BoundedTransport(httpx.AsyncBaseTransport):
             self.rejections.append({"reason": "unexpected_network_endpoint",
                                     "method": request.method, "path": request.url.path})
             raise CaseError("unexpected_network_endpoint")
-        if len(self.requests) >= self.max_requests:
+        if self.max_requests is not None and len(self.requests) >= self.max_requests:
             self.rejections.append({"reason": "model_request_limit"})
             raise CaseError("model_request_limit")
-        if self.max_observed_tokens is not None and self.requests:
+        if self.requests and self.require_complete_usage:
+            by_id = {}
+            for call in (self.usage_recorder.calls if self.usage_recorder else []):
+                by_id.setdefault(call.get("run_id"), []).append(call)
+            observed = 0
+            complete = True
+            for sent in self.requests:
+                matches = by_id.get(sent.get("callback_run_id"), [])
+                call = matches[0] if sent.get("callback_run_id") is not None and len(matches) == 1 else None
+                usage = call.get("usage", []) if call and call.get("status") == "completed" else []
+                if (sent.get("status") != "returned" or sent.get("http_status") != 200
+                        or len(usage) != 1 or any(
+                            type(usage[0].get(key)) is not int or usage[0][key] < 0
+                            for key in ("input_tokens", "output_tokens", "total_tokens"))
+                        or usage[0]["input_tokens"] + usage[0]["output_tokens"]
+                        != usage[0]["total_tokens"]):
+                    complete = False
+                    break
+                observed += usage[0]["total_tokens"]
+            if not complete:
+                self.rejections.append({"reason": "unknown_observed_usage"})
+                raise CaseError("unknown_observed_usage")
+        elif self.requests and self.max_observed_tokens is not None:
             completed = [row for row in (self.usage_recorder.calls if self.usage_recorder else [])
                          if row.get("status") == "completed"]
             totals = [item.get("total_tokens") for row in completed
@@ -812,6 +853,7 @@ class BoundedTransport(httpx.AsyncBaseTransport):
                 self.rejections.append({"reason": "unknown_observed_usage"})
                 raise CaseError("unknown_observed_usage")
             observed = sum(totals)
+        if self.max_observed_tokens is not None and self.requests:
             if observed >= self.max_observed_tokens:
                 self.rejections.append({"reason": "observed_token_limit",
                                         "observed_tokens": observed})
@@ -856,7 +898,9 @@ class BoundedTransport(httpx.AsyncBaseTransport):
         self.requests.append(row)
         try:
             async with asyncio.timeout(min(self.request_seconds, remaining)
-                                       if remaining is not None else self.request_seconds):
+                                       if self.request_seconds is not None and remaining is not None
+                                       else remaining if self.request_seconds is None
+                                       else self.request_seconds):
                 result = await self.inner.handle_async_request(request)
         except BaseException as exc:
             row.update(status="error", error_type=type(exc).__name__)
@@ -865,15 +909,15 @@ class BoundedTransport(httpx.AsyncBaseTransport):
         reported_response_cost = result.headers.get("x-litellm-response-cost")
         if reported_response_cost is not None:
             row["reported_response_cost_usd"] = reported_response_cost
-        if result.status_code < 400:
-            if result.is_stream_consumed:
-                parsed = _response_choices(result.content)
-                if parsed is not None:
-                    row["response"] = parsed
-                else:
-                    row["response_capture"] = "unparsed"
-            else:
-                result.stream = CapturingResponseStream(result.stream, row)
+        # Only correlation IDs are retained, never the full response headers.
+        for header in ("x-request-id", "request-id", "x-amzn-requestid"):
+            if result.headers.get(header):
+                row.setdefault("provider_request_ids", {})[header] = result.headers[header]
+        authorization = request.headers.get("authorization", "")
+        if result.is_stream_consumed:
+            _capture_provider_response(result.content, row, authorization)
+        else:
+            result.stream = CapturingResponseStream(result.stream, row, authorization)
         return result
 
     async def aclose(self):
@@ -1032,7 +1076,10 @@ async def run_episode(profile: dict[str, str], *, decision: str,
 
     @tool
     async def issue_task_and_waitfor_task_output(command: str, parameters: str,
-                                                  callback_display_id: int) -> str:
+                                                  callback_display_id: int,
+                                                  token_id: int | None = None,
+                                                  timeout: int | None = None,
+                                                  visibility_context: dict | None = None) -> str:
         """Issue a task on a callback and wait for its output."""
         nonlocal issued_task_source_request_id
         raw = {"command": command, "parameters": parameters,
@@ -1147,6 +1194,7 @@ async def run_episode(profile: dict[str, str], *, decision: str,
                           task_id=0, agent_task_id="real-model-human-led", mode="supervised",
                           operation_id=1, channel_id=1, apitoken_id=0)
             sink = MagicMock()
+            CASE.install_inert_supervised_preparation(sink)
             # No real Mythic task ledger exists in this mock-effects runner.
             sink._current_request_task_provenance_notice.return_value = ""
             def scoped_tools(names):

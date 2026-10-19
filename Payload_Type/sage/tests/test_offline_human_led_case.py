@@ -66,7 +66,7 @@ def test_shell_whoami_uses_the_same_native_approval_and_resume_path():
     assert result["terminal_count"] == 1
     assert result["effect_calls"] == [{"callback_display_id": 7,
                                        "command": "shell",
-                                       "parameters": '{"command": "whoami"}'}]
+                                       "parameters": "whoami"}]
 
 
 def test_redirect_uses_native_respond_and_stops_without_mock_effect():

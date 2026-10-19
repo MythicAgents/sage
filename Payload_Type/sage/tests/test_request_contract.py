@@ -195,6 +195,27 @@ def test_builder_has_no_prompt_or_classifier_authority_input():
         _contract(classifier_lane="autonomous_objective")
 
 
+@pytest.mark.parametrize("objective_led", [False, True])
+def test_supervised_objective_changes_termination_without_granting_approval(objective_led):
+    action = _action("guarded", name="issue_task")
+    contract = _contract(autonomous_solve=objective_led)
+    assert contract.lane == RequestLane.SUPERVISED_WORKFLOW
+    assert contract.stop_condition.kind == (
+        StopConditionKind.OBJECTIVE_PROVED
+        if objective_led else StopConditionKind.ACTIONS_COMPLETE
+    )
+    proposal = _proposal(contract, action)
+    assert not admit_action(contract, action, proposal=proposal).allowed
+    rejected = _approval(contract, proposal, action.action_id, decision="rejected")
+    assert not admit_action(contract, action, proposal=proposal, approval=rejected).allowed
+    accepted = _approval(contract, proposal, action.action_id)
+    admission = admit_action(contract, action, proposal=proposal, approval=accepted)
+    assert admission.allowed
+    assert not admit_action(
+        contract, action, proposal=proposal, approval=accepted, ledger=admission.ledger,
+    ).allowed
+
+
 def test_requested_and_prohibited_sets_are_distinct_and_subtractive():
     allowed = _action("allowed", name="list_callbacks")
     denied = _action("denied", name="issue_task")
@@ -486,6 +507,193 @@ def test_supervised_guarded_action_reservation_is_exact_and_single_use():
     assert model._reserve_supervised_request_action("b" * 64) is True
 
 
+def test_supervised_guarded_action_reissue_reopens_after_settled_execution():
+    """Issue #45: a continuation turn may re-issue an already-executed guarded action.
+
+    The reservation ledger admits the exact action once per SETTLED execution: while the
+    execution is in flight a duplicate reservation is refused (double-spend guard), but
+    once `_settle_supervised_request_action` records completion, a continuation re-issue
+    re-enters the guarded flow (fresh approval card) instead of dead-ending.
+    """
+    from ai.langgraph.model import Model
+
+    model = Model.__new__(Model)
+    contract = _contract()
+    model._request_contract = contract
+    model._request_admitted_action_digests = set()
+    model._request_settled_action_digests = set()
+
+    digest = "c" * 64
+    assert model._reserve_supervised_request_action(digest) is True
+    assert model._reserve_supervised_request_action(digest) is False
+
+    model._settle_supervised_request_action(digest)
+    assert digest not in model._request_admitted_action_digests
+    assert digest in model._request_settled_action_digests
+    assert model._reserve_supervised_request_action(digest) is True
+    assert digest in model._request_admitted_action_digests
+    assert digest not in model._request_settled_action_digests
+    assert model._reserve_supervised_request_action(digest) is False
+
+    # Unknown digests are unaffected.
+    assert model._reserve_supervised_request_action("d" * 64) is True
+
+
+def test_supervised_guarded_action_ledgers_reset_with_the_request_contract():
+    from ai.langgraph.model import Model
+    from ai.langgraph.mythic_tools import MythicTools
+
+    contract = _contract()
+    model = Model.__new__(Model)
+    model._request_contract = None
+    model.mythic_client = MythicTools(agent_task_id=1)
+    model.install_request_contract(contract)
+    model._request_execution_digest = contract.digest
+    model._request_admitted_action_digests = {"a" * 64}
+    model._request_settled_action_digests = {"b" * 64}
+
+    next_contract = replace(contract, request_id="request-2")
+    model.install_request_contract(next_contract)
+
+    assert model._request_admitted_action_digests == set()
+    assert model._request_settled_action_digests == set()
+
+
+def _turn_authority_model():
+    """Build a minimal supervised Model for wrapper-level turn-authority probes."""
+    from ai.langgraph.model import Model
+    from ai.langgraph.mythic_tools import MythicTools
+
+    model = Model.__new__(Model)
+    model.mythic_client = MythicTools(agent_task_id=1)
+    model.install_request_contract(_contract())
+    return model
+
+
+def _issue_task_call(call_id: str, callback: int = 7) -> dict:
+    return {
+        "name": "issue_task_and_waitfor_task_output",
+        "args": {
+            "command": "shell",
+            "parameters": "whoami",
+            "callback_display_id": callback,
+        },
+        "id": call_id,
+        "type": "tool_call",
+    }
+
+
+def test_guarded_action_continuation_reissue_requests_fresh_admission():
+    """Assembled issue #45 repro: after a handback, a same-request re-issue re-cards.
+
+    Before the settled-execution seam, the second reservation was refused with
+    "request contract already admitted this guarded action", the handler never ran,
+    and the arc had no legal action path.
+    """
+    from ai.langgraph.model import _TurnAuthorityToolMiddleware
+
+    model = _turn_authority_model()
+    middleware = _TurnAuthorityToolMiddleware(model, agent_name="Mythic_Operator")
+    executed: list[str] = []
+
+    async def handler(request):
+        executed.append(str(request.tool_call.get("id") or ""))
+        return SimpleNamespace(content="done")
+
+    async def run():
+        first = SimpleNamespace(tool_call=_issue_task_call("call-1"), state={})
+        first_result = await middleware.awrap_tool_call(first, handler)
+        assert executed == ["call-1"]
+        assert getattr(first_result, "content", "") == "done"
+
+        continuation = SimpleNamespace(tool_call=_issue_task_call("call-2"), state={})
+        reissue_result = await middleware.awrap_tool_call(continuation, handler)
+
+        assert executed == ["call-1", "call-2"]
+        assert getattr(reissue_result, "content", "") == "done"
+
+    asyncio.run(run())
+
+
+def test_guarded_action_inflight_duplicate_still_refused_with_remedy():
+    """A duplicate of an action whose execution has NOT settled stays blocked, and the
+    block names the remedy so the model has a legal move."""
+    import asyncio
+    import json as _json
+
+    from ai.langgraph.model import _TurnAuthorityToolMiddleware
+    from sage_chat.hitl import approval_action_fingerprint
+
+    model = _turn_authority_model()
+    middleware = _TurnAuthorityToolMiddleware(model, agent_name="Mythic_Operator")
+    executed: list[str] = []
+    release = asyncio.Event()
+
+    async def handler(request):
+        executed.append(str(request.tool_call.get("id") or ""))
+        await release.wait()
+        return SimpleNamespace(content="done")
+
+    async def run():
+        in_flight = SimpleNamespace(tool_call=_issue_task_call("call-1"), state={})
+        running = asyncio.ensure_future(middleware.awrap_tool_call(in_flight, handler))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not running.done()
+        assert executed == ["call-1"]
+
+        duplicate = SimpleNamespace(tool_call=_issue_task_call("call-2"), state={})
+        blocked = await middleware.awrap_tool_call(duplicate, handler)
+        assert executed == ["call-1"]
+        payload = _json.loads(blocked.content)
+        assert payload["ok"] is False
+        assert payload["verdict"] == "blocked"
+        assert payload["source"] == "turn_authority"
+        assert "already admitted" in str(payload["reason"])
+        assert "fresh approval card" in str(payload["reason"])
+
+        # Free the in-flight execution; it settles and unlocks the request.
+        release.set()
+        result = await running
+        assert getattr(result, "content", "") == "done"
+        assert executed == ["call-1"]
+        in_flight_digest = approval_action_fingerprint(_issue_task_call("call-1"))
+        assert in_flight_digest in model._request_settled_action_digests
+        assert model._request_admitted_action_digests == set()
+
+    asyncio.run(run())
+
+
+def test_guarded_action_error_executions_settle_for_retry():
+    """A raised guarded execution settles its reservation so a retry can re-card."""
+    import asyncio
+
+    from ai.langgraph.model import _TurnAuthorityToolMiddleware
+
+    model = _turn_authority_model()
+    middleware = _TurnAuthorityToolMiddleware(model, agent_name="Mythic_Operator")
+    executed: list[str] = []
+
+    async def failing_handler(request):
+        executed.append(str(request.tool_call.get("id") or ""))
+        raise RuntimeError("transport hiccup")
+
+    async def handler(request):
+        executed.append(str(request.tool_call.get("id") or ""))
+        return SimpleNamespace(content="done")
+
+    async def run():
+        original = SimpleNamespace(tool_call=_issue_task_call("call-1"), state={})
+        with pytest.raises(RuntimeError, match="transport hiccup"):
+            await middleware.awrap_tool_call(original, failing_handler)
+        assert executed == ["call-1"]
+        assert "call-1" not in model._request_admitted_action_digests
+
+        retried = SimpleNamespace(tool_call=_issue_task_call("call-2"), state={})
+        retry_result = await middleware.awrap_tool_call(retried, handler)
+        assert getattr(retry_result, "content", "") == "done"
+
+    asyncio.run(run())
 def test_mythic_issue_sink_requires_same_contract_projection_digest():
     from ai.langgraph.mythic_tools import MythicTools
     from ai.langgraph.turn_authority import authority_from_request_contract

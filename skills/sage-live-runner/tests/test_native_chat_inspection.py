@@ -188,6 +188,19 @@ def test_prepare_supervised_creates_and_reads_back_empty_channel(monkeypatch, tm
     assert sent["mode"] == "supervised" and sent["autonomous_solve"] is False
 
 
+def test_prepare_supervised_objective_led_verifies_supervised_controller_route(monkeypatch, tmp_path):
+    client, calls, kwargs, _ = _supervised_prepare_case(monkeypatch, tmp_path)
+    result = asyncio.run(native_chat.prepare_supervised_channel(
+        client, **kwargs, objective_led=True
+    ))
+    sent = calls[1][1]["metadata"]["config"]
+    assert sent["mode"] == "supervised"
+    assert sent["autonomous_solve"] is True
+    assert result["mode"] == "supervised"
+    assert result["autonomous_solve"] is True
+    assert result["empty"] is True
+
+
 @pytest.mark.parametrize("mismatch", ["expect_provider", "expect_model", "expect_endpoint_sha256"])
 def test_prepare_supervised_refuses_local_contract_mismatch_before_creation(
     monkeypatch, tmp_path, mismatch
@@ -238,6 +251,23 @@ def test_prepare_supervised_refuses_stored_drift_with_created_id(
     assert calls[-1][0] == native_chat.SUPERVISED_CHANNEL_READBACK_QUERY
 
 
+@pytest.mark.parametrize("change", [
+    lambda row: row["ai_metadata"]["config"].update(mode="auto"),
+    lambda row: row["ai_metadata"]["config"].update(autonomous_solve=False),
+    lambda row: row["ai_metadata"]["config"].pop("autonomous_solve"),
+    lambda row: row["ai_metadata"]["config"].update(provider="wrong"),
+])
+def test_prepare_objective_led_refuses_stored_route_drift(monkeypatch, tmp_path, change):
+    client, calls, kwargs, _ = _supervised_prepare_case(
+        monkeypatch, tmp_path, stored_change=change
+    )
+    with pytest.raises(RuntimeError, match="failed server readback"):
+        asyncio.run(native_chat.prepare_supervised_channel(
+            client, **kwargs, objective_led=True
+        ))
+    assert calls[-1][0] == native_chat.SUPERVISED_CHANNEL_READBACK_QUERY
+
+
 def test_prepare_supervised_parser_requires_contract_and_name():
     parser = native_chat.build_parser()
     with pytest.raises(SystemExit):
@@ -248,25 +278,39 @@ def test_prepare_supervised_parser_requires_contract_and_name():
         "--expect-endpoint-sha256", "a" * 64,
     ])
     assert args.max_steps == 12
+    assert args.objective_led is False
     assert args.command == "prepare-supervised"
+    objective_args = parser.parse_args([
+        "prepare-supervised", "--channel-name", "TRIAL 20260924",
+        "--expect-provider", "openai", "--expect-model", "test-model",
+        "--expect-endpoint-sha256", "a" * 64, "--objective-led",
+    ])
+    assert objective_args.objective_led is True
 
 
-def test_prepare_supervised_cli_prints_only_verified_fields(monkeypatch, tmp_path, capsys):
+@pytest.mark.parametrize("objective_led", [False, True])
+def test_prepare_supervised_cli_prints_only_verified_fields(
+    monkeypatch, tmp_path, capsys, objective_led
+):
     client, _calls, kwargs, endpoint = _supervised_prepare_case(monkeypatch, tmp_path)
 
     async def fake_login(**_kwargs):
         return client
 
     monkeypatch.setattr(native_chat, "login", fake_login)
-    args = native_chat.build_parser().parse_args([
+    argv = [
         "prepare-supervised", "--channel-name", kwargs["channel_name"],
         "--expect-provider", kwargs["expect_provider"],
         "--expect-model", kwargs["expect_model"],
         "--expect-endpoint-sha256", kwargs["expect_endpoint_sha256"],
-    ])
+    ]
+    if objective_led:
+        argv.append("--objective-led")
+    args = native_chat.build_parser().parse_args(argv)
     assert asyncio.run(native_chat._run(args)) == 0
     output = capsys.readouterr().out
     assert json.loads(output)["empty"] is True
+    assert json.loads(output)["autonomous_solve"] is objective_led
     assert endpoint not in output
     assert "secret-key" not in output
 

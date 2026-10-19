@@ -108,3 +108,17 @@ Then launch the retained payload and run:
 ```
 
 The baked Apollo import remains available through `--use-baked-apollo` for legacy snapshots only.
+
+## Post-rebuild payloads and GraphQL notes
+
+- `create-apollo` builds through the **currently running** apollo container. After a service rebuild
+  (e.g., a patched agent branch installed per `skills/sage-mythic-payload-deploy/SKILL.md`), every payload it
+  creates carries the patched agent version; confirm via Mythic GraphQL `payloadtype { name semver }`.
+  A new build parameters instance list (`buildparameterinstances { value buildparameter { name } }`) also
+  carries the build's C2 settings. Callback C2 parameters to mirror on a fresh payload can be read
+  (with keys redacted) from `export-callback-config`.
+- Mythic GraphQL schema differences worth knowing (v3.4.x): `filemeta` has no `sha256` field;
+  `payload` has no `build_parameters`/`buildparameter` relation — use `buildparameterinstances`;
+  `payloadtype` exposes the agent version as `semver` (not `agent_version`); task artifacts live in
+  `task.taskartifacts { base_artifact artifact_text }` (no `artifact_details`); `response_text` is
+  base64-encoded. Introspect `__type(name: "...")` before guessing fields.

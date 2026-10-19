@@ -7,7 +7,27 @@ description: Download an existing Mythic payload, stage it onto a Ludus Windows 
 
 ## Overview
 
-Use the bundled script for deterministic payload redeploys from Mythic into the Ludus GOAD range. Keep passwords out of scripts: Mythic auth resolves from `MYTHIC_ADMIN_PASSWORD`, then `MYTHIC_ENV_PATH` (no checkout-name default — see `.env.example`); Ludus API auth comes from `.mcp.json`; target run-as credentials come from `--run-as-password`, `SAGE_RUN_AS_PASSWORD`, or Mythic's credential store.
+Use the bundled script for deterministic payload redeploys from Mythic into the Ludus GOAD range. Keep passwords out of scripts: Mythic auth resolves from `MYTHIC_ADMIN_PASSWORD`, then `MYTHIC_ENV_PATH` (no checkout-name default — see `.env.example`); Ludus API auth comes from `.mcp.json`; target run-as credentials resolve in a fixed chain so a session never has to ask the operator twice:
+
+1. `--run-as-password` (explicit)
+2. `SAGE_RUN_AS_PASSWORD` (environment or `--run-as-password-env`)
+3. `~/.config/sage/runas.env` (per-user durable secrets file) — also checked by
+   `open_rdp_session.py`, which additionally reads the Mythic `.env`
+4. Mythic's credential store (`deploy` only, when the credential has been captured)
+5. **The GOAD benchmark referee fixture** — `Payload_Type/sage/.hillclimb/referee_ldap.json`: the
+   gitignored, operator-maintained per-domain ground-truth credential store for this range
+   (domain matched by casefolded key or first DNS label, so `NORTH\…` matches
+   `north.sevenkingdoms.local`). Both `open_rdp_session.py` and `deploy` fall back to it.
+
+If every link is empty the scripts fail closed with that chain spelled out. Never print or log the
+resolved value; never commit the fixture or the secret.
+
+RDP display: `open_rdp_session.py` defaults to `:0` — the running GNOME/Xwayland desktop. A
+dedicated `:99` Xvfb hung the client pre-logon here (no Xvfb installed); `Logon Info V2
+[NORTH\samwell.tarly …]` in the client log is the evidence the interactive logon registered, and
+the deploy census saying the session is "disconnected" is expected — the scheduled-task launch
+works from a logged-on (even disconnected) session. Keep the xfreerdp client alive while `deploy`
+runs; kill it only after the callback is observed.
 
 After rolling back the disk-only Apollo-staged snapshot and importing the retained callback config, open an RDP session as Samwell and run `launch-existing`. It starts the preserved `SageApolloBootstrap` task, waits for the retained callback check-in to advance, and disconnects the RDP session.
 
@@ -171,3 +191,50 @@ without an operator export.
 - The script writes downloads under `/tmp/sage_payloads` by default and stages remote files under `C:\Users\Public`. It never deletes local files, remote files, Mythic objects, or Sage/Phoenix databases.
 
 Read or patch `scripts/deploy_payload_via_ludus.py` only when the deployment mechanics need adjustment.
+
+## Installing a patched agent service (pre-build)
+
+The build step above starts **after** Mythic already has a patched agent service. To install a locally
+modified agent (e.g., a fork branch fixing an implant bug), use `mythic-cli install folder` — and note the
+following, learned during the October 2026 `run.cs` argument-preservation deployment:
+
+- **Pass the repository root, not the payload subdirectory.** The CLI requires `config.json` at the root of
+  the given path (`install folder <repo-root>`), then copies `Payload_Type/<name>` from there. Passing
+  `Payload_Type/apollo` fails with "Failed to find config.json".
+- **Stage a minimal install folder** from a fresh extraction of the exact committed tree
+  (`git archive <commit> Payload_Type/apollo | tar -x -C <stage>`), with a top-level `config.json` that sets
+  `"exclude_c2_profiles": true` and the documentation excludes, so an install scoped to one payload type
+  cannot touch the running C2 profiles or unrelated installed services. Verify the staged source hash equals
+  the commit before installing.
+- **`<service>_use_build_context` must be `true` or Mythic runs the pulled upstream image.** Check with
+  `mythic-cli config get apollo_use_build_context` first. `false` means the container is the official
+  registry image with no source/binary parity; `mythic-cli config set apollo_use_build_context true` is a
+  persistent config change and requires a container down/up to take effect. Record both the old and new value.
+- **A blocked removal makes the installer lie.** If the old install contains root-owned `__pycache__` files
+  (written by the container into the bind mount), `os.RemoveAll` fails, the installer logs "Continuing" and
+  then reports "Successfully installed service!" while the new source was never copied and the container was
+  left stopped. Verify after install: diff the installed payload source against the staged tree and
+  `docker inspect <service>` for a running state. Clean up root-owned remnants with a cached-image one-shot
+  (`docker run --rm --pull never -v <installed-services-dir>:/services alpine:latest sh -c 'rm -rf /services/<name>'`),
+  then re-run the install.
+- `install folder` stops the old container, copies source, and builds/starts in one step; a separate
+  `mythic-cli build <service>` is not required. Confirm the registered agent version changed by querying
+  Mythic GraphQL for `payloadtype { name semver container_running }`.
+- The fix lives in agent code compiled into **new payloads**. Existing callbacks keep the old agent until a
+  new payload is built, staged, and launched. Install/build/deploy each need their own explicit authority;
+  none is implied by the others.
+
+## Interactive-session prerequisites for `scheduled-task-interactive`
+
+- `deploy` waits for an active interactive session **before registering the scheduled task**. If it aborts
+  there, the staged file persists but the task is never created; a later `launch-existing` fails with
+  "No MSFT_ScheduledTask objects found". Open the interactive session, then re-run the full `deploy`
+  (not `launch-existing`).
+- `scripts/open_rdp_session.py` defaults to `DISPLAY :99` for an Xvfb that may not exist. On a host with a
+  live X display but no Xvfb, pass `--display :0` explicitly; the failure shows as
+  `failed to open display: :99` / `ERRCONNECT_PRE_CONNECT_FAILED` in the log file.
+- The script's password resolution is `SAGE_RUN_AS_PASSWORD` → `~/.config/sage/runas.env` → Sage `.env` →
+  Mythic `.env`. If none of those holds the run-as password (the Mythic credential store can also be empty),
+  source the retained foothold environment (e.g., `skills/sage-foothold-launch/.env`) into the environment
+  before invoking it. `list-credentials` is read-only and shows whether Mythic holds usable credential
+  metadata; an empty list means task-scoped launch credentials must come from the environment.

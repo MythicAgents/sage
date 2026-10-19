@@ -109,8 +109,67 @@ def test_happy_path_emits_exactly_one_terminal():
     terminals = chat.terminal_emissions
     assert len(terminals) == 1, f"expected exactly one terminal, got {chat.emissions}"
     assert terminals[0]["kind"] == "complete"
+    # The terminal lands in the MAIN window (assistant key), not a sub-agent/event stream.
+    assert terminals[0]["response_key"].startswith("assistant:")
     # prompt threaded through, first turn → is_interactive False
     assert model.invoked_with == ("do the thing", False)
+
+
+def test_self_halt_terminal_is_not_complete_and_lands_in_main_window():
+    """A self-halt must (1) record a non-`complete` request status (no operator-facing false success,
+    #50) and (2) surface the terminal in the MAIN chat window even when the last streamed block was a
+    collapsed sub-agent panel (#54 — channel 3 ended entirely inside the Mythic_Operator panel)."""
+
+    class _HaltModel(_FakeModel):
+        def request_terminal_disposition(self):
+            return "stopped", "🛑 Stopped — routing loop (test notice)."
+
+        async def invoke(self, prompt, is_interactive=False):
+            self.invoked_with = (prompt, is_interactive)
+            # Simulate a turn whose last streamed block was a delegation (sub-agent) stream and that
+            # produced no main-window final — exactly the channel-3 shape.
+            self._response_emitter.last_response_key = (
+                "agent_text:mythic_operator:chat:5:request:9:7"
+            )
+            self._response_emitter.last_content = ""
+            return ""  # recursion_handback / no main-window final text
+
+    model = _HaltModel(stream=(), return_value="")
+    chat = _DriverChat(model)
+    req = build_chat_request("do the thing", channel_id=5, request_id=9)
+    _run(chat.chat(req))
+
+    terminals = chat.terminal_emissions
+    assert len(terminals) == 1, f"expected exactly one terminal, got {chat.emissions}"
+    terminal = terminals[0]
+    # #50: the request row carries the real disposition, never a false `complete`.
+    assert terminal["kind"] == "response"
+    assert terminal["status"] == "stopped"
+    assert terminal.get("complete_request") is True
+    # #54: forced onto the main-window assistant key, not the sub-agent delegation stream.
+    assert terminal["response_key"].startswith("assistant:")
+    assert not terminal["response_key"].startswith("agent_text:")
+    # The operator sees the halt explanation rather than silence or "Completed.".
+    assert "routing loop (test notice)" in terminal["content"]
+    assert "Completed." not in terminal["content"]
+
+
+def test_genuine_completion_still_uses_send_complete_in_main_window():
+    """Guard the no-regression side: a real completion keeps the `complete` terminal path."""
+
+    class _CompleteModel(_FakeModel):
+        def request_terminal_disposition(self):
+            return "complete", ""
+
+    model = _CompleteModel(stream=("🤖> done",), return_value="all done")
+    chat = _DriverChat(model)
+    req = build_chat_request("do the thing", channel_id=5, request_id=9)
+    _run(chat.chat(req))
+
+    terminals = chat.terminal_emissions
+    assert len(terminals) == 1
+    assert terminals[0]["kind"] == "complete"
+    assert terminals[0]["response_key"].startswith("assistant:")
 
 
 def test_restarted_native_channel_refuses_lost_scope_before_model_invoke():
@@ -1324,6 +1383,47 @@ def test_cancel_reraises_and_cooperatively_stops():
     assert _run(get_channel_session(req)) is None
 
 
+def test_cancel_during_post_invoke_metadata_still_closes_request(monkeypatch):
+    import sage_chat.service as service
+
+    class _MetadataModel(_FakeModel):
+        def __init__(self):
+            super().__init__(stream=())
+            self._active_agent_label = ""
+            self.operator_stops = []
+
+        def set_active_agent(self, value):
+            self._active_agent_label = value
+
+        async def _emit_operator_stop(self, content, *, status):
+            self.operator_stops.append((content, status))
+
+        async def finalize_visibility_turn(self, *, require_final):
+            return {"ok": True}
+
+    class _MetadataChat(_DriverChat):
+        async def update_channel_metadata(self, request, metadata):
+            if metadata == {"agent": "Idle"}:
+                raise asyncio.CancelledError()
+            return await super().update_channel_metadata(request, metadata)
+
+    monkeypatch.setattr(service, "build_channel_metadata", lambda model: {
+        "agent": model._active_agent_label,
+    })
+    model = _MetadataModel()
+    chat = _MetadataChat(model, preexisted=True)
+    request = build_chat_request("run then cancel", channel_id=506, request_id=14)
+    _run(put_channel_session(request, model))
+    with pytest.raises(asyncio.CancelledError):
+        _run(chat.chat(request))
+
+    assert model.invoked_with is not None
+    assert model.stop_called is True
+    assert len(model.operator_stops) == 1
+    assert model.operator_stops[0][1] == "cancelled"
+    assert _run(get_channel_session(request)) is None
+
+
 def test_handler_exception_emits_one_error_terminal():
     model = _FakeModel(behavior="error")
     chat = _DriverChat(model)
@@ -2222,7 +2322,7 @@ def _slash_req(name, argument="", channel_id=5, request_id=1):
 
 
 def test_slash_commands_declared():
-    assert {c.Name for c in SLASH_COMMANDS} == {"findings", "watcher", "state", "list", "mode", "stop", "mcp", "bloodhound", "sandbox"}
+    assert {c.Name for c in SLASH_COMMANDS} == {"findings", "watcher", "state", "list", "tools", "mode", "stop", "mcp", "bloodhound", "sandbox", "report"}
 
 
 def test_slash_findings_is_canonical_with_hidden_singular_alias():
@@ -3068,9 +3168,12 @@ class _ControllerHitlModel(_HitlModel):
         super().__init__()
         self._controller_hitl_pending = {"tool": "execute_capability", "args": {"target": "DC01"}}
 
-    async def handle_controller_hitl_resume(self, decision, expected_action_digest=""):
+    async def handle_controller_hitl_resume(
+        self, decision, expected_action_digest="", operator_message="",
+    ):
         del expected_action_digest
         self.resumed_with = decision
+        self.resumed_operator_message = operator_message
         self._controller_hitl_pending = None
         await self._response_emitter(f"🤖> controller-resume:{decision}")
         return ""
@@ -3155,7 +3258,7 @@ def _install_pending_approval_context(
     return context
 
 
-def _input_response_for_context(action, context, choice=None):
+def _input_response_for_context(action, context, choice=None, response=""):
     card = build_approval_request(context["actions"])
     input_type = (
         "single_choice"
@@ -3190,6 +3293,8 @@ def _input_response_for_context(action, context, choice=None):
     }
     if action == "select":
         response_payload["choice"] = selected_choice
+    if response:
+        response_payload["response"] = response
     input_request = {
         "status": {
             "accept": "accepted",
@@ -3215,6 +3320,7 @@ def _input_response_for_context(action, context, choice=None):
     }
     return ChatInputResponse(
         action=action,
+        response=response,
         choice=selected_choice,
         input_request_message_id=input_request_message_id,
         input_request=input_request,
@@ -3238,6 +3344,18 @@ def test_approval_request_shape():
     assert req["data"]["display_name"] == "create_payload"
     assert req["data"]["arguments"] == {"os": "windows"}
     assert req["data"]["guarded_action_count"] == 1
+
+
+def test_approval_request_prompt_teaches_all_three_operator_affordances():
+    """Reject closes the card with no reply; Respond is the deny-with-guidance path.
+
+    Mythic's Reject button never collects text, so the card must not present a
+    two-affordance story: an operator who wants to deny with guidance must know
+    that Respond is the path that carries their text to Sage.
+    """
+    req = build_approval_request([{"name": "create_payload", "args": {"os": "windows"}}])
+    assert "Reject denies without any reply" in req["prompt"]
+    assert "Respond denies the action and sends your typed text to Sage as steering guidance" in req["prompt"]
 
 
 def test_approval_request_uses_capability_display_name_without_changing_guarded_tool():
@@ -3465,6 +3583,22 @@ def test_controller_hitl_card_response_resumes_controller_pending_move():
     _run(chat.chat(req))
     assert model.resumed_with == "approve"
     assert model._controller_hitl_pending is None
+    assert len(chat.terminal_emissions) == 1
+
+
+def test_controller_hitl_respond_denies_pending_action_and_carries_steering():
+    model = _ControllerHitlModel()
+    chat = _HitlDriverChat(model)
+    request = build_chat_request("", channel_id=5, request_id=4)
+    context = _install_pending_approval_context(model, request)
+    request.InputResponse = _input_response_for_context(
+        "respond", context, response="Use the other callback for the next proposal",
+    )
+
+    _run(chat.chat(request))
+
+    assert model.resumed_with == "deny"
+    assert model.resumed_operator_message == "Use the other callback for the next proposal"
     assert len(chat.terminal_emissions) == 1
 
 

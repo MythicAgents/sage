@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 import aiosqlite
+from runtime_db import assert_legacy_migrated, database_path
 
 
 def _utc_now() -> str:
@@ -365,11 +366,13 @@ class OperationMemoryStore:
 
     def __init__(
         self,
-        db_path: str | Path = "operation_memory.db",
+        db_path: str | Path | None = None,
         *,
         limits: OperationMemoryLimits | None = None,
     ) -> None:
-        self.db_path = Path(db_path)
+        self.db_path = Path(db_path) if db_path is not None else database_path()
+        if db_path is None:
+            assert_legacy_migrated(self.db_path)
         self.limits = limits or OperationMemoryLimits.from_env()
         self._db: aiosqlite.Connection | None = None
         self._lock = asyncio.Lock()

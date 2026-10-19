@@ -18,7 +18,7 @@ privilege_required: domain-user
 network_required: true
 detection_signal: |
   PowerShell queries to the PKI configuration container via the PSPKI PowerShell module.
-  LDAP queries to the Certificate Templates container — same detection as Certify find.
+  LDAP queries to the Certificate Templates container — related to Certify enumeration.
   Script block logging (Event 4104) captures the PSPKIAudit function calls if PS logging
   is enabled. AMSI must be bypassed before loading.
 usage_examples:
@@ -30,8 +30,8 @@ usage_examples:
     args: "Get-CertificateTemplateAcl | Find-CertificateTemplateVulnerability"
 opsec_notes: |
   PSPKIAudit is a PowerShell-based ADCS auditor — it complements Certify by providing
-  more detailed analysis of PKI configuration including CA-level settings that Certify
-  may not surface (ESC7 CA ACLs, unusual template permissions). Requires AMSI bypass
+  more detailed analysis of PKI configuration including CA ACLs and unusual template
+  permissions. Requires AMSI bypass
   before loading. PowerShell logging (Event 4104) captures the analysis if logging is
   active. For Apollo, use powershell_import with prior AMSI bypass.
 gotchas: |
@@ -40,7 +40,7 @@ gotchas: |
   if not available on the target: `Import-Module .\PSPKI.ps1`. Certify.exe is generally
   preferred for operational use (inline_assembly delivery, no AMSI concern, no module dependency).
   PSPKIAudit is most useful for comprehensive PKI auditing (defender perspective) and
-  for ESC misconfigurations that Certify doesn't surface (ESC7, CA-level audit flag checks).
+  when that module's documented CA-level audit output is specifically required.
 related_ttps: [certify, certipy, adcs-esc4, adcs-esc6, adcs-esc8]
 alternatives: [certify, certipy]
 common_args:
@@ -57,14 +57,13 @@ last_updated: 2026-05-29
 
 GhostPack's PowerShell-based AD CS auditing tool. Uses the PSPKI PowerShell module
 to perform a comprehensive security audit of Active Directory Certificate Services.
-Provides deeper analysis than Certify for some ESC categories, particularly ESC7
-(CA-level ACL abuse) and EDITF flag checks.
+Provides a distinct CA-level audit path, including CA ACLs and EDITF flag checks.
 
 ## PSPKIAudit vs Certify vs Certipy
 
 | Tool | Language | Delivery | ESC Coverage | Depth |
 |------|----------|---------|-------------|-------|
-| Certify | .NET | inline_assembly | ESC1-8 | Good; structures findings |
+| Certify | .NET | inline_assembly | Bound to verified binary/parser | Structured output varies by verb |
 | Certipy | Python | Infrastructure | ESC1-13 | Comprehensive; Linux-side |
 | PSPKIAudit | PowerShell | powershell_import | ESC1-8 + CA ACLs | Deep CA-level; needs PSPKI module |
 

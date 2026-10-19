@@ -60,18 +60,28 @@ class _State(TypedDict):
 
 
 class _SeqStub:
-    """Minimal stand-in for Model: the handler only needs a sequence counter."""
+    """Minimal stand-in for Model: the handler needs a sequence counter and card closes."""
 
     def __init__(self) -> None:
         self.seq = 0
+        self.delegation_closes: list[dict[str, Any]] = []
 
     def _next_seq(self) -> int:
         self.seq += 1
         return self.seq
 
+    async def _close_delegation(self, agent_name: str, content: str = "",
+                                status: str = "finished") -> None:
+        self.delegation_closes.append(
+            {"agent": agent_name, "content": content, "status": status})
 
-def _build_graph(failure: BaseException | None, calls: list[str]):
-    """A Supervisor + one failing specialist, wired exactly as _rebuild_graph wires them."""
+
+def _build_graph(failure: BaseException | None, calls: list[str]) -> tuple[Any, _SeqStub]:
+    """A Supervisor + one failing specialist, wired exactly as _rebuild_graph wires them.
+
+    Returns the compiled graph and the stub the failure handler was bound to, so tests can
+    assert on the delegation-card lifecycle the handler exercised.
+    """
     stub = _SeqStub()
     handler = Model._handle_node_failure.__get__(stub, Model)
 
@@ -85,7 +95,7 @@ def _build_graph(failure: BaseException | None, calls: list[str]):
         calls.append("supervisor")
         return {}
 
-    return (
+    graph = (
         StateGraph(_State)
         # Mirrors _rebuild_graph. Without this the stand-in cannot see sync/async node defects.
         .set_node_defaults(
@@ -97,6 +107,7 @@ def _build_graph(failure: BaseException | None, calls: list[str]):
         .add_edge("Mythic_Operator", "Supervisor")
         .compile()
     )
+    return graph, stub
 
 
 def _empty_state() -> _State:
@@ -106,7 +117,7 @@ def _empty_state() -> _State:
 def test_ordinary_failure_hands_back_to_supervisor():
     """A specialist blowing up must reach Supervisor with a description, not end the run."""
     calls: list[str] = []
-    graph = _build_graph(RuntimeError("mythic rpc exploded"), calls)
+    graph, _stub = _build_graph(RuntimeError("mythic rpc exploded"), calls)
 
     result = _invoke(graph, _empty_state())
 
@@ -121,7 +132,7 @@ def test_ordinary_failure_hands_back_to_supervisor():
 def test_handler_does_not_retry_the_failed_node():
     """9B reports a failure; retrying infrastructure errors is 9D and must not leak in here."""
     calls: list[str] = []
-    graph = _build_graph(RuntimeError("boom"), calls)
+    graph, _stub = _build_graph(RuntimeError("boom"), calls)
 
     _invoke(graph, _empty_state())
 
@@ -131,7 +142,7 @@ def test_handler_does_not_retry_the_failed_node():
 def test_healthy_node_is_untouched():
     """The control: with no failure the handler must not fire at all."""
     calls: list[str] = []
-    graph = _build_graph(None, calls)
+    graph, _stub = _build_graph(None, calls)
 
     result = _invoke(graph, _empty_state())
 
@@ -151,7 +162,7 @@ def test_healthy_node_is_untouched():
 def test_control_exceptions_are_never_absorbed(exc: BaseException):
     """The falsifier. Absorbing _OperatorStopRequested would disable the kill-switch."""
     calls: list[str] = []
-    graph = _build_graph(exc, calls)
+    graph, _stub = _build_graph(exc, calls)
 
     with pytest.raises(type(exc)):
         _invoke(graph, _empty_state())
@@ -164,7 +175,7 @@ def test_control_exceptions_are_never_absorbed(exc: BaseException):
 def test_operator_stop_reason_survives_the_handler():
     """The stop must arrive at invoke() carrying WHY it fired, not stripped to a bare exception."""
     calls: list[str] = []
-    graph = _build_graph(_OperatorStopRequested("step_limit", "detail here"), calls)
+    graph, _stub = _build_graph(_OperatorStopRequested("step_limit", "detail here"), calls)
 
     with pytest.raises(_OperatorStopRequested) as caught:
         _invoke(graph, _empty_state())
@@ -178,3 +189,36 @@ def test_control_exception_tuple_covers_the_kill_switch():
     assert _OperatorStopRequested in _NODE_FAILURE_CONTROL_EXCEPTIONS
     assert GraphRecursionError in _NODE_FAILURE_CONTROL_EXCEPTIONS
     assert NodeCancelledError in _NODE_FAILURE_CONTROL_EXCEPTIONS
+
+
+def test_failed_node_delegation_card_closes_as_error():
+    """D8/D13: a failed specialist's card must close as an error, not success-shaped.
+
+    The handler previously left the failed node's card open; the Supervisor's next invocation
+    swept it closed with the default finished status (and its streamed text as content), so a
+    failed delegation rendered as a completion. The handler must close the card itself, as an
+    error, with the exception summary — before handing back to Supervisor.
+    """
+    calls: list[str] = []
+    graph, stub = _build_graph(RuntimeError("mythic rpc exploded"), calls)
+
+    result = _invoke(graph, _empty_state())
+
+    closes = [c for c in stub.delegation_closes if c["agent"] == "Mythic_Operator"]
+    assert closes, f"the failed node's card was never closed: {stub.delegation_closes}"
+    assert all(c["status"] == "error" for c in closes), closes
+    assert all("RuntimeError" in c["content"] and "mythic rpc exploded" in c["content"]
+               for c in closes), closes
+    # The handback to Supervisor still carries the failure description.
+    handback = result["supervisor_messages"]
+    assert any("RuntimeError" in str(m.content) for m in handback)
+
+
+def test_healthy_node_delegation_card_is_not_closed_by_the_handler():
+    """The control: no failure, no card lifecycle interference from the handler."""
+    calls: list[str] = []
+    graph, stub = _build_graph(None, calls)
+
+    _invoke(graph, _empty_state())
+
+    assert stub.delegation_closes == [], stub.delegation_closes

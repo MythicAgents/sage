@@ -30,7 +30,7 @@ detection_signal: |
   sequences from the agent process. Specific BOFs that make network connections
   (netstat, arp) generate network telemetry.
 usage_examples:
-  - description: Enumerate ADCS CA and templates (BOF equivalent of Certify find)
+  - description: Enumerate ADCS CA and templates (related to Certify enumeration)
     args: "adcs_enum"
   - description: List domain controllers for the current domain
     args: "nslookup"
@@ -133,7 +133,7 @@ equivalent .NET assemblies via inline_assembly.
 |-----|-------------|-----------|-------|
 | `domaininfo` | Domain name, DCs, SID, functional level, trusts | domain-user | No LDAP required (uses DsGetDcName) |
 | `nslookup` | DNS resolution (forward and reverse) | domain-user | — |
-| `adcs_enum` | ADCS CAs and all certificate templates | domain-user | In-process LDAP; equiv to `Certify find` |
+| `adcs_enum` | ADCS CAs and all certificate templates | domain-user | In-process LDAP; related to Certify enumeration |
 | `adcs_enum_com` | ADCS enumeration via COM interface | domain-user | Alternative ADCS enum path |
 | `adcs_enum_com2` | ADCS cert template details via COM | domain-user | — |
 | `ldapsearch` | Generic LDAP query | domain-user | Full LDAP filter support |

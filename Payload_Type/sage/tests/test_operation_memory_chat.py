@@ -290,8 +290,8 @@ def _install_callback_b(recorded: RecordedMythic, operation_id: int = 7):
 
 
 def test_query_protocol_and_default_path_are_narrow():
-    assert default_operation_memory_path().name == "sage_operation_memory.db"
-    assert default_operation_memory_path().parent == Path(__file__).resolve().parents[1]
+    assert default_operation_memory_path().name == "sage.db"
+    assert default_operation_memory_path().is_absolute()
 
 
 def test_assess_protocol_is_exact_and_does_not_classify_near_match_prose():

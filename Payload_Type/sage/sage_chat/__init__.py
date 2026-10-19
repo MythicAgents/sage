@@ -6,5 +6,8 @@ the former PayloadType container is not co-registered.
 """
 
 from .service import SageChat
+from .cancel_adapter import install_paused_cancel_handler
+
+install_paused_cancel_handler()
 
 __all__ = ["SageChat"]

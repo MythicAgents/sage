@@ -1,0 +1,105 @@
+{
+  "contract_version": 1,
+  "binary": {
+    "filename": "Certify.exe",
+    "sha1": "7f949a895c51e747fa334b380a9511c4442ad5d0",
+    "display_version": "2.0.0",
+    "assembly_version": "1.0.0.0",
+    "clr_version": "v4.0.30319"
+  },
+  "identity_rule": "the filename identifies the contract; the SHA-1 from Mythic metadata is advisory provenance unless an accepted-hash allowlist is pinned",
+  "comparison_source": {
+    "repository": "https://github.com/GhostPack/Certify",
+    "commit": "ce9a4d27d2f18d391c141ebdc8cb82fa5f6b88e3",
+    "binding": "comparison only; exact compiled source commit unknown"
+  },
+  "evidence": {
+    "parser_registration": "compiled managed metadata and Program.ParseArguments IL",
+    "option_shapes": "compiled VerbAttribute, OptionAttribute, and property metadata",
+    "help_execution": "observed_off_target_four_enrolled_verbs_wine8_mono7.4; top_help_only_reports_unknown_verb",
+    "command_execution": "unverified_target_effects; enrolled_arguments_validated_and_rendered_for_supported_apollo_wrappers"
+  },
+  "global_options": {
+    "out-file": {"type": "string"},
+    "quiet": {"type": "boolean"}
+  },
+  "registered_verbs": [
+    {"name": "enum-cas", "options_type": "EnumCas.Options", "enrolled": true},
+    {"name": "enum-templates", "options_type": "EnumTemplates.Options", "enrolled": true},
+    {"name": "enum-pkiobjects", "options_type": "EnumPkiObjects.Options", "enrolled": false},
+    {"name": "request", "options_type": "CertRequest.Options", "enrolled": true},
+    {"name": "request-agent", "options_type": "CertRequestOnBehalf.Options", "enrolled": false},
+    {"name": "request-download", "options_type": "CertRequestDownload.Options", "enrolled": true},
+    {"name": "request-renew", "options_type": "CertRequestRenewal.Options", "enrolled": false},
+    {"name": "forge", "options_type": "CertForge.Options", "enrolled": false},
+    {"name": "manage-ca", "options_type": "ManageCa.Options", "enrolled": false},
+    {"name": "manage-template", "options_type": "ManageTemplate.Options", "enrolled": false},
+    {"name": "manage-self", "options_type": "ManageSelf.Options", "enrolled": false}
+  ],
+  "disabled_registered_verbs": [],
+  "legacy_unregistered_verbs": ["find", "cas", "download"],
+  "legacy_verb_aliases": {"find": "enum-templates", "cas": "enum-cas", "download": "request-download"},
+  "verbs": {
+    "enum-cas": {
+      "options": {
+        "ca": {"type": "string"},
+        "domain": {"type": "string"},
+        "ldap-server": {"type": "string"},
+        "current-user": {"type": "boolean", "set": "MarkCurrentUser"},
+        "target-user": {"type": "string", "set": "MarkTargetUser"},
+        "filter-vulnerable": {"type": "boolean"},
+        "hide-admins": {"type": "boolean"},
+        "show-all-perms": {"type": "boolean"},
+        "skip-web-checks": {"type": "boolean"}
+      }
+    },
+    "enum-templates": {
+      "options": {
+        "ca": {"type": "string"},
+        "template": {"type": "string"},
+        "domain": {"type": "string"},
+        "ldap-server": {"type": "string"},
+        "current-user": {"type": "boolean", "set": "MarkCurrentUser"},
+        "target-user": {"type": "string", "set": "MarkTargetUser"},
+        "filter-enabled": {"type": "boolean"},
+        "filter-vulnerable": {"type": "boolean"},
+        "filter-request-agent": {"type": "boolean"},
+        "filter-client-auth": {"type": "boolean"},
+        "filter-supply-subject": {"type": "boolean"},
+        "filter-manager-approval": {"type": "boolean"},
+        "hide-admins": {"type": "boolean"},
+        "show-all-perms": {"type": "boolean"}
+      }
+    },
+    "request": {
+      "required": ["ca", "template"],
+      "options": {
+        "ca": {"type": "string"},
+        "template": {"type": "string"},
+        "subject": {"type": "string"},
+        "upn": {"type": "string", "value_shape": "sequence"},
+        "dns": {"type": "string", "value_shape": "sequence"},
+        "email": {"type": "string", "value_shape": "sequence"},
+        "sid-url": {"type": "string"},
+        "sid": {"type": "string"},
+        "application-policy": {"type": "string", "value_shape": "sequence"},
+        "key-size": {"type": "integer", "default": 2048},
+        "machine": {"type": "boolean"},
+        "output-pem": {"type": "boolean"},
+        "output-csr": {"type": "boolean"},
+        "install": {"type": "boolean"}
+      }
+    },
+    "request-download": {
+      "required": ["ca", "id"],
+      "options": {
+        "ca": {"type": "string"},
+        "id": {"type": "integer"},
+        "private-key": {"type": "string"},
+        "output-pem": {"type": "boolean"},
+        "install-machine": {"type": "boolean", "set": "InstallMachine"},
+        "install-user": {"type": "boolean", "set": "InstallUser"}
+      }
+    }
+  }
+}

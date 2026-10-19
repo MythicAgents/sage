@@ -141,7 +141,9 @@ def test_receipt_is_not_failure_shaped():
     lowered = result.lower()
     assert result.startswith("DEFERRED"), result
     assert "timed out" not in lowered
-    assert "not an error" in lowered and "not failed" in lowered.replace("has not failed", "not failed")
+    assert "execution state and outcome are unconfirmed" in lowered
+    assert "has not failed" not in lowered
+    assert "will run" not in lowered
 
 
 def test_prefix_colliding_task_ids_are_distinguished_by_exact_comparison():
@@ -299,7 +301,11 @@ def test_the_receipt_record_cannot_serve_as_a_resumption_handle():
     with _defer_after_issue():
         _issue(tools)
     receipt = tools._deferred_task_receipt
-    assert set(receipt) == {"command", "callback_display_id", "task_display_id", "waited_seconds"}
+    assert set(receipt) == {
+        "command", "callback_display_id", "task_display_id", "waited_seconds",
+        "request_id", "observation_status", "parameters_text",
+    }
+    assert receipt["observation_status"] == "deferred"
     for value in receipt.values():
         assert isinstance(value, (str, int)), f"{value!r} is not inert data"
         assert not callable(value)

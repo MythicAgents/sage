@@ -350,8 +350,10 @@ def test_worker_handoff_prefers_terminal_execute_capability_report_over_narratio
     }
 
     wrapped = m._wrap_create_agent(FakeAgent(), "mythic_operator_messages", "Mythic_Operator")
-    update = asyncio.run(wrapped(state, {}))
-
+    result = asyncio.run(wrapped(state, {}))
+    assert isinstance(result, mod.Command)
+    assert result.goto == "Supervisor"
+    update = result.update
     summary = update["supervisor_messages"][1].content
     assert "Executor verdict: `achieved` for `ensure-kerberos-context`." in summary
     assert "Task IDs: 79 `run`, 80 `ls`" in summary
@@ -413,7 +415,10 @@ def test_worker_handback_copy_attaches_typed_metadata_from_authoritative_tool_re
         "sandbox_messages": [],
     }
 
-    update = asyncio.run(model._wrap_create_agent(FakeAgent(), "mythic_operator_messages", "Mythic_Operator")(state, {}))
+    result = asyncio.run(model._wrap_create_agent(FakeAgent(), "mythic_operator_messages", "Mythic_Operator")(state, {}))
+    assert isinstance(result, mod.Command)
+    assert result.goto == "Supervisor"
+    update = result.update
     summary = update["supervisor_messages"][1]
     assert summary.content == "DONE — x FAILED — y BLOCKER — need graph REMAINING — query graph"
     assert summary.additional_kwargs["_worker_outcome"]["source_worker"] == "Mythic_Operator"
@@ -1041,10 +1046,11 @@ def test_completed_worker_summary_hands_back_to_supervisor_without_emitting_fina
     }
 
     wrapped = m._wrap_create_agent(FakeAgent(), "mythic_operator_messages", "Mythic_Operator")
-    update = asyncio.run(wrapped(state, {}))
-
+    result = asyncio.run(wrapped(state, {}))
+    assert isinstance(result, mod.Command)
+    assert result.goto == "Supervisor"
+    update = result.update
     assert isinstance(update, dict)
-    assert getattr(update, "goto", None) is None
     assert len(update["supervisor_messages"]) == 2
     assert update["supervisor_messages"][0].additional_kwargs["_is_completion_header"] is True
     assert "_is_final_report" not in update["supervisor_messages"][1].additional_kwargs
@@ -2210,6 +2216,9 @@ def test_typed_worker_outcome_terminalizes_repeated_same_worker(outcome, tool_te
     assert command.update["messages"][0].content == tool_text
     assert command.update["messages"][1].content == final_text
     assert command.update["messages"][1].additional_kwargs["_is_final_report"] is True
+    assert command.update["messages"][1].additional_kwargs["_turn_outcome"] == (
+        "blocked" if outcome == "blocked" else "completed"
+    )
 
 
 def _typed_subgoal_runtime_state(request_id="request-subgoal"):

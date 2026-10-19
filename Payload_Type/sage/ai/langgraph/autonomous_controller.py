@@ -785,6 +785,14 @@ class AutonomousController:
                                 decision_id=str(getattr(decision, "decision_id", "") or ""),
                                 policy_mode=str(getattr(decision, "policy_mode", "") or ""),
                             ))
+                            zero_retry_blocker = _trajectory_zero_retry_blocker(res, progressed=False)
+                            if zero_retry_blocker is not None:
+                                blocker = {
+                                    "collection_key": request_key,
+                                    "attempts": attempts,
+                                    "trajectory_repair": zero_retry_blocker,
+                                }
+                                return done(STATUS_BLOCKED, "collection task issuance requires operator repair")
                             if not collection_ok and attempts >= self.config.max_collection_attempts_per_request:
                                 blocker = {
                                     "reason": note or "collection failed",

@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from mythic_container.ChatBase import ChatRequest
+from runtime_db import database_path
 
 try:  # package vs. flat import, matching the rest of ai/langgraph
     from ai.langgraph.model import add_session, get_session, remove_session
@@ -25,7 +26,7 @@ if TYPE_CHECKING:
 
 # Model.initialize() uses this same runtime SQLite file for LangGraph checkpoints. A tiny
 # channel marker survives process restarts without introducing a second state store.
-_CHANNEL_MARKER_DB_PATH = "sage.db"
+_CHANNEL_MARKER_DB_PATH: str | None = None
 
 
 async def claim_channel_marker(request: ChatRequest) -> bool:
@@ -35,7 +36,7 @@ async def claim_channel_marker(request: ChatRequest) -> bool:
     distinguish a restarted channel from a new channel even when Mythic sends empty
     Context. Database failures propagate and stop the request before Model invocation.
     """
-    async with aiosqlite.connect(_CHANNEL_MARKER_DB_PATH, timeout=5) as db:
+    async with aiosqlite.connect(_CHANNEL_MARKER_DB_PATH or database_path(), timeout=5) as db:
         await db.execute(
             "CREATE TABLE IF NOT EXISTS sage_chat_channel_markers ("
             "operation_id INTEGER NOT NULL, channel_id INTEGER NOT NULL, "

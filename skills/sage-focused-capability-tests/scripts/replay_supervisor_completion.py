@@ -35,6 +35,7 @@ OUTPUT_CAP = 1024
 TIMEOUT_SECONDS = 60
 HEADER = "            **CRITICAL: Streaming Output Context:**\n"
 NEXT_BULLET = "            - If exactly one specialist has returned"
+PARAGRAPH_END = "            - "
 RECORDED_CONTINUATION = (
     "Internal conversation continuation. The operator's request and authorization are unchanged."
 )
@@ -87,10 +88,10 @@ def candidate_messages(messages: list, prompt_path: Path) -> list:
         if value.count(HEADER) != 1:
             raise ValueError("streaming paragraph marker is not unique")
         tail = value.split(HEADER, 1)[1]
-        if NEXT_BULLET not in tail:
-            raise ValueError("reuse instruction after streaming paragraph missing")
-    old = recorded.split(HEADER, 1)[1].split(NEXT_BULLET, 1)[0]
-    new = candidate.split(HEADER, 1)[1].split(NEXT_BULLET, 1)[0]
+        if PARAGRAPH_END not in tail:
+            raise ValueError("completion instructions after streaming paragraph missing")
+    old = recorded.split(HEADER, 1)[1].split(PARAGRAPH_END, 1)[0]
+    new = candidate.split(HEADER, 1)[1].split(PARAGRAPH_END, 1)[0]
     if not old.strip() or not new.strip() or old == new:
         raise ValueError("candidate streaming paragraph is unchanged or empty")
     updated = recorded.replace(HEADER + old, HEADER + new, 1)
@@ -120,8 +121,9 @@ def supervisor_continuation_messages(messages: list) -> list:
 
 
 def supervisor_tools() -> list:
-    """Capture tools at the real Supervisor builder boundary; do not build/run graph."""
+    """Capture current Supervised tools at the real builder boundary, without running a graph."""
     model = Model.__new__(Model)
+    model.mode = "supervised"
     model.state = {"supervisor_messages": [SystemMessage(content="existing channel")]}
     with (
         patch.object(model_module, "create_agent", side_effect=lambda **kwargs: kwargs),

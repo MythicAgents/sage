@@ -729,3 +729,64 @@ def test_reconcile_graph_position_returns_empty_on_mcp_errors():
     )
 
     assert facts == []
+
+
+class _PathProbeTool:
+    """Fake cypher tool for probe_path_to_objective: resolves aliases to themselves and answers the
+    shortestPath existence query per `found`. `errors=True` returns an error envelope (no `data`)."""
+
+    def __init__(self, found: bool, errors: bool = False):
+        self.found = found
+        self.errors = errors
+        self.calls = []
+
+    async def ainvoke(self, args):
+        query = args.get("query", "")
+        self.calls.append(query)
+        if "u:User" in query:  # _resolve_principal_aliases probe
+            return json.dumps({"data": {"literals": []}})
+        if self.errors:
+            return json.dumps({"errors": ["query failed"]})
+        literals = [{"value": "essos.local", "key": "name"}] if self.found else []
+        return json.dumps({"info_type": "run", "success": True, "data": {"literals": literals}})
+
+
+def test_probe_path_to_objective_emits_found_when_a_path_exists():
+    facts = asyncio.run(graph_reconciler.probe_path_to_objective(
+        _FakeMCP(_PathProbeTool(found=True)),
+        ["samwell.tarly@north.sevenkingdoms.local"],
+        ["essos.local"],
+        NOW,
+        TTL_SECONDS,
+        proof_envelope=_bh_proof(),
+    ))
+    assert [f.predicate for f in facts] == ["objective-path-found:essos.local"]
+    assert facts[0].proof_envelope == _bh_proof()
+
+
+def test_probe_path_to_objective_emits_no_path_when_graph_has_data_but_no_path():
+    tool = _PathProbeTool(found=False)
+    facts = asyncio.run(graph_reconciler.probe_path_to_objective(
+        _FakeMCP(tool), ["samwell.tarly@north.sevenkingdoms.local"], ["essos.local"], NOW, TTL_SECONDS,
+    ))
+    assert [f.predicate for f in facts] == ["objective-no-path:essos.local"]
+    # the shortestPath query is bounded and existence-only (LIMIT 1), never an unbounded enumeration
+    path_query = next(q for q in tool.calls if "shortestPath" in q)
+    assert "shortestPath" in path_query and "LIMIT 1" in path_query and "[*1..12]" in path_query
+
+
+def test_probe_path_to_objective_stays_silent_when_the_probe_cannot_run():
+    # An error envelope (no `data` object) must NOT be reported as "no path" — fail-open to nothing.
+    facts = asyncio.run(graph_reconciler.probe_path_to_objective(
+        _FakeMCP(_PathProbeTool(found=False, errors=True)),
+        ["samwell.tarly@north.sevenkingdoms.local"], ["essos.local"], NOW, TTL_SECONDS,
+    ))
+    assert facts == []
+
+
+def test_probe_path_to_objective_requires_both_a_principal_and_a_domain():
+    tool = _PathProbeTool(found=True)
+    assert asyncio.run(graph_reconciler.probe_path_to_objective(
+        _FakeMCP(tool), [], ["essos.local"], NOW, TTL_SECONDS)) == []
+    assert asyncio.run(graph_reconciler.probe_path_to_objective(
+        _FakeMCP(tool), ["samwell.tarly@north.sevenkingdoms.local"], [], NOW, TTL_SECONDS)) == []

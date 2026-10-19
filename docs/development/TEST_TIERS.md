@@ -53,6 +53,12 @@ migrating them means changing both sides together. Until then, do not add new `P
 For a small change, run the directly affected modules first, then the full suite. Live range checks are a separate
 lifecycle and never substitute for offline tests.
 
+The [human-led evaluation guide](HUMAN_LED_EVAL.md#operator-requests-and-reporting-diagnostics)
+also describes inert operator-matrix, reporting-context, and experimental claim-checker helpers. Their
+offline tests check fixture, accounting, and producer/consumer behavior. Real-model runs use separate paid
+authority with synthetic observations and no target effects; they are not live-range tests. Mechanical
+completion or valid citations do not establish factual correctness, and incomplete repairs remain outcomes.
+
 Phoenix evaluation accounting has read-only SQLite/WAL, exact-trace pricing,
 changed-evidence replay, completed-call ceiling, and pre-client campaign refusal
 coverage in `test_phoenix_accounting.py`, `test_phoenix_report.py`, and

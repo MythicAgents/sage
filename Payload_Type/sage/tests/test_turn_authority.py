@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import replace
+import hashlib
 import importlib
 import inspect
 import io
@@ -100,6 +101,52 @@ def _resolve_collection_authority(authority, *, callback_id=7, payload_type="apo
     return replace(authority, objective_contract=contract)
 
 
+def _install_unenrolled_collection_file_fixture(monkeypatch, tools):
+    """Use an actual Apollo registered-file shape and positively downloaded unknown bytes."""
+    schema = [
+        {
+            "name": "assembly_name", "cli_name": "Assembly", "type": "ChooseOne",
+            "choices": ["SharpHound.exe"], "parameter_group_name": "Default", "required": True,
+        },
+        {
+            "name": "assembly_arguments", "cli_name": "Arguments", "type": "String",
+            "choices": [], "parameter_group_name": "Default", "required": False,
+        },
+        {
+            "name": "assembly_file", "cli_name": "New Assembly", "type": "File",
+            "choices": [], "parameter_group_name": "New Assembly", "required": True,
+        },
+        {
+            "name": "assembly_arguments", "cli_name": "Arguments", "type": "String",
+            "choices": [], "parameter_group_name": "New Assembly", "required": False,
+        },
+    ]
+    content = b"positively downloaded unenrolled SharpHound fixture"
+    row = {
+        "id": 1,
+        "agent_file_id": "00000000-0000-0000-0000-000000000001",
+        "filename_utf8": "SharpHound.exe",
+        "md5": hashlib.md5(content).hexdigest(),
+        "sha1": hashlib.sha1(content).hexdigest(),
+        "complete": True,
+    }
+
+    async def fetch(command, _callback_display_id, **_kwargs):
+        return schema if command in {"execute_assembly", "inline_assembly"} else []
+
+    async def find(filename):
+        return row if str(filename).casefold() == "sharphound.exe" else None
+
+    async def download(agent_file_id):
+        if agent_file_id != row["agent_file_id"]:
+            raise AssertionError("unexpected fixture artifact")
+        return content
+
+    monkeypatch.setattr(tools, "_fetch_command_schema", fetch)
+    monkeypatch.setattr(tools, "_find_uploaded_file_by_name", find)
+    monkeypatch.setattr(tools, "_download_registered_file_bytes_bounded", download)
+
+
 def _install_collection_issue_test_path(monkeypatch, tools, mythic_mod, *, liveness=None):
     """Keep public issue tests on the real engagement hook while stubbing external Mythic edges."""
     access_reconciler = importlib.import_module("ai.langgraph.access_reconciler")
@@ -142,7 +189,7 @@ def _install_collection_issue_test_path(monkeypatch, tools, mythic_mod, *, liven
     )
     monkeypatch.setattr(tools, "_authenticate_live_command", _available)
     monkeypatch.setattr(tools, "_ensure_registered_file_available", _none)
-    monkeypatch.setattr(tools, "_fetch_command_schema", _none)
+    _install_unenrolled_collection_file_fixture(monkeypatch, tools)
     monkeypatch.setattr(tools, "_validate_command_parameters", _none)
     monkeypatch.setattr(tools, "_action_footprint", _none)
     monkeypatch.setattr(tools, "_ledger_record", lambda *_args, **_kwargs: None)
@@ -2655,6 +2702,57 @@ def test_standalone_graph_refresh_reads_current_domain_metadata(assembled_ingest
     }
 
 
+def test_path_shaped_objective_fires_the_pathfinding_probe_once(
+    assembled_ingest_graph_path, monkeypatch,
+):
+    # #58: a path-shaped objective with BloodHound data present probes the graph for a path to the
+    # covered domain, surfaces the result, and fires AT MOST ONCE per objective/coverage horizon.
+    path = assembled_ingest_graph_path
+    graph_reconciler = importlib.import_module("ai.langgraph.graph_reconciler")
+    engagement = importlib.import_module("ai.langgraph.engagement_state")
+    monkeypatch.setattr(path.tools, "_engagement_objective",
+                        lambda: "From our foothold, find an attack path to corp.local")
+    calls = []
+
+    async def _spy(mcp, principals, domains, now, ttl, proof_envelope=None):
+        calls.append({"principals": list(principals), "domains": list(domains)})
+        return [engagement.GraphFact(
+            predicate="objective-path-found:corp.local", source="bloodhound:cypher",
+            timestamp=now, ttl_seconds=ttl, proof_envelope=dict(proof_envelope or {}))]
+
+    monkeypatch.setattr(graph_reconciler, "probe_path_to_objective", _spy)
+
+    asyncio.run(path.tools._refresh_graph_facts_if_stale("2026-09-17T00:01:00+00:00"))
+    assert len(calls) == 1
+    # target domain is derived from the objective's covered domains, not hardcoded topology
+    assert calls[0]["domains"] == ["corp.local"]
+    assert calls[0]["principals"]  # controlled principal projected from the live foothold
+    assert "objective-path-found:corp.local" in {
+        fact.predicate for fact in path.tools._engagement_graph_facts}
+
+    # Forced re-refresh (bypasses the TTL skip) must NOT re-probe: the once-per-objective guard holds.
+    asyncio.run(path.tools._refresh_graph_facts_if_stale("2026-09-17T00:02:00+00:00", force=True))
+    assert len(calls) == 1
+
+
+def test_non_path_shaped_objective_does_not_probe(assembled_ingest_graph_path, monkeypatch):
+    # The default stored objective ("Collect and ingest the current graph") is not path-shaped, so the
+    # probe stays a silent no-op — demonstrating the guard can withhold.
+    path = assembled_ingest_graph_path
+    graph_reconciler = importlib.import_module("ai.langgraph.graph_reconciler")
+    calls = []
+
+    async def _spy(*a, **k):
+        calls.append(1)
+        return []
+
+    monkeypatch.setattr(graph_reconciler, "probe_path_to_objective", _spy)
+    asyncio.run(path.tools._refresh_graph_facts_if_stale("2026-09-17T00:01:00+00:00"))
+    assert calls == []
+    assert not any(str(getattr(f, "predicate", "")).startswith("objective-")
+                   for f in path.tools._engagement_graph_facts)
+
+
 @pytest.mark.parametrize("resolution", ("uuid", "callback"))
 def test_contract_ingest_rejects_valid_token_alias_mismatch_before_any_downstream_side_effect(
     monkeypatch,
@@ -3541,6 +3639,7 @@ def test_public_issue_transformed_parameters_are_denied_at_later_exact_boundary(
     monkeypatch.setattr(tools, "_action_footprint", _none)
     monkeypatch.setattr(tools, "_ledger_record", _ledger)
     monkeypatch.setattr(mythic_mod.mythic, "issue_task", _issue)
+    _install_unenrolled_collection_file_fixture(monkeypatch, tools)
 
     result = asyncio.run(tools.issue_task_and_waitfor_task_output(
         task["command"],

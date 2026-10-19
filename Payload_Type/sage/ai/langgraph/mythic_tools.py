@@ -6,6 +6,7 @@ import contextvars
 import functools
 import inspect
 from pathlib import Path
+import ssl
 import sys
 
 try:
@@ -66,6 +67,29 @@ SAGE_MYTHIC_SLEEP_TIMEOUT_MULTIPLIER = _env_positive_int("SAGE_MYTHIC_SLEEP_TIME
 #: Seconds between graph heartbeats emitted while a Mythic task wait is legitimately outstanding.
 #: See `_graph_heartbeat` for why this exists at all.
 SAGE_TASK_HEARTBEAT_INTERVAL = _env_positive_int("SAGE_TASK_HEARTBEAT_INTERVAL", 30)
+
+_EXECUTABLE_CONTRACT_ROOT = Path(__file__).resolve().parents[2] / "ttps" / "contracts"
+_TOOL_NOTES_DIR = Path(__file__).resolve().parents[2] / "tool_notes"
+_TOOL_NOTE_MAX_CHARS = 1200
+_MAX_ENROLLED_EXECUTABLE_BYTES = 4 * 1024 * 1024
+
+
+def _strict_registered_file_identity_command(command) -> bool:
+    """True when a by-name registered-file selection must bind verified Mythic bytes.
+
+    The typed-executable wrappers are strict: their bytes are contract-verified before
+    tasking. Every other command's by-name executable reference may be agent-resolved
+    (embedded or loader-resolved on the target), so a missing Mythic file must not
+    block preparation — the same value passes whenever the schema cache is cold.
+    """
+    return str(command or "").strip().casefold() in {"execute_assembly", "inline_assembly"}
+
+
+def _task_schema_digest(schema) -> str:
+    """Bind every schema value while ignoring only top-level parameter row order."""
+    if isinstance(schema, list):
+        schema = sorted(schema, key=lambda row: json.dumps(row, sort_keys=True, default=str))
+    return hashlib.sha256(json.dumps(schema, sort_keys=True, default=str).encode()).hexdigest()
 
 
 def _resolve_graph_heartbeat():
@@ -135,6 +159,56 @@ _task_visibility_context: contextvars.ContextVar[dict | None] = contextvars.Cont
 _task_issuance_receipt_context: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "sage_mythic_task_issuance_receipt_context",
     default=None,
+)
+
+
+def _mythic_task_terminal_success(task_completed: Any, task_status: Any) -> bool:
+    return task_completed is True and str(task_status or "").strip().casefold() in {
+        "completed", "success",
+    }
+
+
+def _collection_task_receipt_failure(receipt: dict, callback_id: int, command: str) -> tuple[str, str]:
+    """Classify this collection child's own task receipt before consuming its output."""
+    task_id = receipt.get("task_id")
+    if type(task_id) is not int or task_id <= 0:
+        return "task_issue_failed", "no Mythic task was created"
+    if receipt.get("callback_id") != callback_id or receipt.get("command") != command:
+        return "task_issue_failed", "task receipt does not match command/callback"
+    status = str(receipt.get("task_status") or "").strip().casefold()
+    if not _mythic_task_terminal_success(receipt.get("task_completed"), status):
+        failed = receipt.get("task_completed") is True and status in {
+            "error", "failed", "cancelled", "canceled",
+        }
+        return ("task_failed" if failed else "task_nonterminal"), (
+            f"Mythic task {task_id} status={status or 'unknown'}"
+        )
+    if receipt.get("output_success") is not True:
+        return "task_failed", f"Mythic task {task_id} output did not classify as successful"
+    return "", ""
+
+
+class _CollectionProbeTaskError(RuntimeError):
+    def __init__(self, status: str, detail: str):
+        self.status = status
+        super().__init__(detail)
+
+
+_collection_schema_binding_context: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "sage_collection_schema_binding_context", default=None,
+)
+_collection_file_preflight_context: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "sage_collection_file_preflight_context",
+    default=None,
+)
+_capability_execution_context: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "sage_capability_execution_context", default=None,
+)
+_capability_command_context: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "sage_capability_command_context", default=None,
+)
+_capability_file_preflight_context: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "sage_capability_file_preflight_context", default=None,
 )
 _POLICY_EVIDENCE_FIELDS = (
     "episode_id",
@@ -446,13 +520,22 @@ import hashlib
 import inspect
 import re
 import uuid
-from typing import Annotated, Any, List, Dict, TypedDict
+from typing import Annotated, Any, List, Dict, Mapping, TypedDict
 import aiohttp
 from mythic import graphql_queries, mythic, mythic_classes, mythic_utilities
 from mythic_container.MythicGoRPC import SendMythicRPCAPITokenCreate, MythicRPCAPITokenCreateMessage
 from mythic_container.logging import logger
 from langchain.tools import tool, BaseTool
 from langchain_core.tools import StructuredTool
+try:
+    from ssl_bootstrap import configure_sage_ssl_cert_file
+except ModuleNotFoundError as exc:
+    if exc.name != "ssl_bootstrap":
+        raise
+    _SAGE_RUNTIME_ROOT = Path(__file__).resolve().parents[2]
+    if str(_SAGE_RUNTIME_ROOT) not in sys.path:
+        sys.path.insert(0, str(_SAGE_RUNTIME_ROOT))
+    from ssl_bootstrap import configure_sage_ssl_cert_file
 
 try:
     from . import ttp_library
@@ -463,6 +546,11 @@ try:
     from . import command_builder
 except ImportError:  # allow running this module directly for manual testing
     import command_builder
+
+try:
+    from . import executable_contracts
+except ImportError:  # allow running this module directly for manual testing
+    import executable_contracts
 
 try:
     from .footprint import footprint
@@ -1352,6 +1440,85 @@ class _PrivateCollectionTransaction:
     def _current_step(self) -> dict[str, Any] | None:
         return self._steps[-1] if self._steps else None
 
+    def bind_schema_resolution(
+        self, client: Any, command: str, original: dict[str, Any], resolved: dict[str, Any],
+        callback_display_id: Any, schema: list[dict[str, Any]], group: str | None,
+        reserved_step: dict[str, Any] | None,
+    ) -> str:
+        """Admit only a lossless name-to-CLI-alias rename of the reserved child."""
+        current = self._current_step()
+        if (
+            current is None or current is not reserved_step or current.get("task_id")
+            or current.get("resolved_parameters") is not None
+            or getattr(client, "_private_collection_transaction", None) is not self
+            or not self.active_for(client)
+            or current.get("command") != str(command or "")
+            or current.get("callback_id") != self._ascii_decimal(callback_display_id)
+            or current.get("parameters") != self._canonical(original)
+        ):
+            return "schema resolution has no exact active collection reservation"
+        if not isinstance(resolved, dict) or len(original) != len(resolved):
+            return "schema resolution changed collection parameter count"
+        selected = [row for row in schema if isinstance(row, dict)
+                    and str(row.get("parameter_group_name") or "Default") == str(group or "Default")]
+        mapped: dict[str, Any] = {}
+        for key, value in original.items():
+            matches = [row for row in selected
+                       if key in {str(row.get("name") or ""), str(row.get("cli_name") or "")}]
+            if len(matches) != 1:
+                return "schema resolution has an ambiguous or missing collection alias"
+            alias = str(matches[0].get("cli_name") or matches[0].get("name") or "")
+            if not alias or alias in mapped:
+                return "schema resolution has duplicate collection aliases"
+            mapped[alias] = value
+        if self._canonical(mapped) != self._canonical(resolved):
+            return "schema resolution changed collection parameter values"
+        current["resolved_parameters"] = self._canonical(resolved)
+        _collection_schema_binding_context.set({
+            "transaction": self, "step": current,
+            "original": current["parameters"], "resolved": current["resolved_parameters"],
+            "resolver_task": asyncio.current_task(), "issue_task": None,
+        })
+        return ""
+
+    def handoff_schema_resolution(self) -> None:
+        """Bind the copied context to the one wait_for child that reaches the issue seam."""
+        binding = _collection_schema_binding_context.get() or {}
+        if (
+            binding.get("transaction") is self
+            and binding.get("step") is self._current_step()
+            and binding.get("issue_task") is None
+        ):
+            binding["issue_task"] = asyncio.current_task()
+
+    def _issued_parameters(self, current: dict[str, Any]) -> str:
+        binding = _collection_schema_binding_context.get() or {}
+        if (
+            binding.get("transaction") is self
+            and binding.get("step") is current
+            and binding.get("original") == current.get("parameters")
+            and binding.get("resolved") == current.get("resolved_parameters")
+            and asyncio.current_task() is (
+                binding.get("issue_task") or binding.get("resolver_task")
+            )
+        ):
+            return str(current.get("resolved_parameters") or current.get("parameters") or "")
+        return str(current.get("parameters") or "")
+
+    def matches_runner_preflight(self, command: str, parameters: Any, callback_display_id: Any) -> bool:
+        """The registered-file prerequisite belongs only to the pending reserved runner."""
+        current = self._current_step()
+        return bool(
+            self._phase == "after_probe"
+            and current is not None
+            and current.get("kind") == "runner"
+            and not current.get("task_id")
+            and current.get("callback_id") == self.callback_id
+            and self._ascii_decimal(callback_display_id) == self.callback_id
+            and str(command or "") == current.get("command")
+            and self._canonical(parameters) == current.get("parameters")
+        )
+
     def _prior_step_blocker(self) -> str:
         current = self._current_step()
         if current is None:
@@ -1427,7 +1594,7 @@ class _PrivateCollectionTransaction:
             current is not None
             and not current.get("task_id")
             and str(command or "") == current.get("command")
-            and self._canonical(parameters) == current.get("parameters")
+            and self._canonical(parameters) in {current.get("parameters"), self._issued_parameters(current)}
         ):
             checks = list(current.get("authority_checks") or [])
             next_check = "recheck" if recheck else "top"
@@ -1503,7 +1670,7 @@ class _PrivateCollectionTransaction:
             current.get("task_id")
             or str(command or "") != current.get("command")
             or self._ascii_decimal(callback_display_id) != self.callback_id
-            or self._canonical(parameters) != current.get("parameters")
+            or self._canonical(parameters) != self._issued_parameters(current)
         ):
             return "collection child final task bytes diverged from the reservation"
         return ""
@@ -1515,7 +1682,7 @@ class _PrivateCollectionTransaction:
         if (
             str(command or "") != current.get("command")
             or self._ascii_decimal(callback_display_id) != self.callback_id
-            or self._canonical(parameters) != current.get("parameters")
+            or self._canonical(parameters) != self._issued_parameters(current)
         ):
             return
         task_id = str(task_display_id or "").strip()
@@ -1539,7 +1706,7 @@ class _PrivateCollectionTransaction:
         if (
             str(command or "") != current.get("command")
             or self._ascii_decimal(callback_display_id) != self.callback_id
-            or self._canonical(parameters) != current.get("parameters")
+            or self._canonical(parameters) != self._issued_parameters(current)
             or str(task_display_id or "").strip() != current.get("task_id")
         ):
             return
@@ -1684,6 +1851,14 @@ class MythicTools:
         # parameter permutations — the cause of the 2.47M-token context explosion on
         # 2026-06-01 (rev2self issued 7x, whoami 4x, all failing).
         self._task_failure_counts: dict[tuple, int] = {}
+        # Rotation-proof shape cap (issue #46): the param-keyed breaker above misses a command
+        # that keeps failing with a DIFFERENT parameter variant each time — the channel-4
+        # make_token+ldap_query rotation (every variant is a fresh key, so no count ever
+        # reached 2, and the D3 repeat-failure flag never saw a repeat). This shape counter
+        # counts failed attempts on the coarse (command, callback) key; reaching the limit
+        # refuses further variants and success on that pair clears it.
+        self._task_failure_shape_counts: dict[tuple, int] = {}
+        self._task_failure_shape_limit: int = 2
         self._artifact_ledger: list[dict] = []
         # Recent get_ttp_guidance goals — anti-cycle guard so the agent can't loop re-querying guidance
         # instead of executing (the 2026-06-07 BRAAVOS-LAPS run did this ~7×).
@@ -1715,6 +1890,10 @@ class MythicTools:
         self._last_issued_callback_id = None
         self._last_issued_task_terminal_status = ""
         self._last_issued_command = ""
+        # Set at the issue boundary: True when the just-issued task's failure key already
+        # carried a recorded failure, so the delegation wrapper counts the repeat as
+        # no-progress instead of letting the new task marker read as progress.
+        self._last_issued_task_is_repeat_failure = False
         # Presentation-only observer for deterministic capability child commands. The capability executor
         # remains the only execution boundary; this reports real callback tasks to the chat surface.
         self._capability_command_observer = None
@@ -1741,6 +1920,8 @@ class MythicTools:
         # in Mythic; no hidden agent task is required.
         self._registered_file_checks: set[str] = set()
         self._assembly_file_checks = self._registered_file_checks  # compatibility for older tests/helpers
+        self._enrolled_issue_selection: dict[str, Any] | None = None
+        self._enrolled_construction_failures: set[tuple] = set()
         # Forward-planner graph facts: BloodHound ACL edges (GenericWrite on GPOs, WriteDacl on domains,
         # etc.) projected into engagement predicates, cached here and refreshed after each verified ingest
         # so the per-turn injection can DIRECT the operator to the next available hop instead of letting it
@@ -1749,6 +1930,9 @@ class MythicTools:
         # hop (suggest-on-known; blocking stays conservative / unknown != false).
         self._engagement_graph_facts: list = []
         self._engagement_graph_facts_ts: str | None = None
+        # #58: objective+coverage key of the last path-shaped probe, so it fires at most once per
+        # objective/coverage horizon (re-fires only when the objective text or covered domains change).
+        self._objective_path_probe_key: str | None = None
         # Exact per-process Kerberos ticket forge command strings emitted by build_capability_commands. The
         # gate requires golden-ticket/SID-history tasks to match one of these keys so a model cannot handcraft
         # a command that merely looks builder-shaped or bypasses the isolated-context sequence.
@@ -1888,6 +2072,21 @@ class MythicTools:
             self._deferred_task_receipt = None
         self._turn_authority = authority
 
+    def _request_shape_counts(self) -> dict:
+        """The same-request rotation-cap counts, defensively materialized: harnesses may
+        construct MythicTools without running __init__ (mirror of model.py's getattr rule)."""
+        counts = getattr(self, "_task_failure_shape_counts", None)
+        if not isinstance(counts, dict):
+            counts = self._task_failure_shape_counts = {}
+        return counts
+
+    def reset_request_loop_guards(self) -> None:
+        """Same-request loop-guard window reset (issue #46). Called when a NEW request
+        contract binds (and directly by request-boundary harnesses): the rotation-proof
+        (command, callback) shape cap counts failures within the current request only,
+        so a fresh request — operator steering or a new objective — starts clean."""
+        self._request_shape_counts().clear()
+
     def set_request_contract(self, contract) -> None:
         """Bind the typed native request contract at the final effect sink."""
         try:
@@ -1899,6 +2098,10 @@ class MythicTools:
         prior = getattr(self, "_request_contract", None)
         if prior is None or getattr(prior, "digest", "") != contract.digest:
             self._active_approval_claim = None
+            # Same-request loop-guard window (issue #46): the rotation-proof shape cap counts
+            # failures of a (command, callback) pair within the CURRENT request only. A fresh
+            # request — operator steering or a new objective — starts it clean.
+            self.reset_request_loop_guards()
         self._request_contract_required = True
         self._request_contract = contract
 
@@ -2262,7 +2465,12 @@ class MythicTools:
             # way does not match and the denial stands. It therefore cannot let a material argument
             # change past the gate, which is the failure mode that kept ISC-67 held.
             _binding = getattr(self, "_last_argres_binding", None)
-            if isinstance(_binding, dict) and isinstance(values.get("parameters"), dict):
+            prepared_action = (
+                isinstance(values.get("visibility_context"), dict)
+                and values["visibility_context"].get("_sage_prepared_action") is True
+            )
+            if (not prepared_action and isinstance(_binding, dict)
+                    and isinstance(values.get("parameters"), dict)):
                 if (
                     _normalize_command_name(values.get("command")) == _binding.get("command")
                     and values.get("callback_display_id") == _binding.get("callback_display_id")
@@ -2331,6 +2539,19 @@ class MythicTools:
                 )
             if tool_name == "ingest_collection":
                 return not transaction.reserve_ingest(actual_args, visibility_context)
+            if tool_name == "ensure_tool_uploaded":
+                binding = _collection_file_preflight_context.get() or {}
+                return bool(
+                    binding.get("client") is self
+                    and binding.get("transaction") is transaction
+                    and binding.get("step") is transaction._current_step()
+                    and binding.get("task") is asyncio.current_task()
+                    and str((visibility_context or {}).get("capability") or "") == "collect-graph"
+                    and actual_args.get("binary_filename") == binding.get("filename")
+                    and transaction.matches_runner_preflight(
+                        binding.get("command"), binding.get("parameters"), binding.get("callback_id"),
+                    )
+                )
             return False
         # This map is a ONE-HOP declaration, so it must carry the transitive closure of what a
         # root actually reaches — not just its direct callees. `ensure_tool_uploaded` is reached
@@ -2377,6 +2598,35 @@ class MythicTools:
             return False
         root_callback = root_bindings.callback_id
         actual_callback = actual_bindings.callback_id
+        if tool_name == "ensure_tool_uploaded" and root_name == "execute_capability":
+            execution = _capability_execution_context.get() or {}
+            command = _capability_command_context.get() or {}
+            preflight = _capability_file_preflight_context.get() or {}
+            claim = getattr(self, "_active_approval_claim", None)
+            contract = getattr(self, "_request_contract", None)
+            return bool(
+                root_callback and root_bindings.capability
+                and execution.get("client") is self
+                and execution.get("task") is asyncio.current_task()
+                and execution.get("claim") is claim
+                and execution.get("contract") is contract
+                and execution.get("claim_id") == claim.get("approval_id")
+                and execution.get("request_id") == claim.get("request_id") == getattr(contract, "request_id", None)
+                and execution.get("contract_digest") == claim.get("request_contract_digest") == getattr(contract, "digest", None)
+                and execution.get("root_args") == root_args
+                and execution.get("callback_id") == root_callback
+                and execution.get("capability") == root_bindings.capability
+                and command.get("execution") is execution
+                and command.get("task") is asyncio.current_task()
+                and command.get("callback_id") == root_callback
+                and command.get("capability") == root_bindings.capability
+                and preflight.get("command") is command
+                and preflight.get("task") is asyncio.current_task()
+                and preflight.get("callback_id") == command.get("callback_id")
+                and preflight.get("filename") == actual_args.get("binary_filename")
+                and preflight.get("runner_command") == command.get("runner_command")
+                and preflight.get("runner_parameters") == command.get("runner_parameters")
+            )
         if tool_name == "ensure_tool_uploaded" and root_name != "execute_capability":
             # `ensure_tool_uploaded` registers a file in Mythic's operation-scoped filemeta and
             # takes no callback argument, so the generic callback binding below can never match a
@@ -2384,7 +2634,7 @@ class MythicTools:
             # to the approval instead: the child's binary_filename must be named verbatim in the
             # approved root's own parameters. That is strictly TIGHTER than a callback match — it
             # admits registering exactly the file the approved command runs, and nothing else.
-            # `execute_capability` keeps its existing capability-bound path below unchanged.
+            # Capability registration has its own immediate-command binding above.
             if not (root_callback or root_bindings.capability):
                 return False
             return self._registered_file_named_by_root(root_args, actual_args)
@@ -3531,11 +3781,27 @@ class MythicTools:
                                 result = await __method(*args, **kwargs)
                                 task_id = receipt.get("task_id")
                                 if type(task_id) is int and task_id > 0:
+                                    completed = receipt.get("task_completed")
+                                    native_completed = (
+                                        str(completed).lower() if type(completed) is bool else "null"
+                                    )
+                                    native_status = receipt.get("task_status")
+                                    native_status = (
+                                        json.dumps(native_status)
+                                        if type(native_status) is str and native_status else "null"
+                                    )
+                                    observation = receipt.get("observation_status") or (
+                                        "observed" if type(completed) is bool else "unknown"
+                                    )
                                     return (
                                         "[Mythic task issuance identity] "
                                         f"task_display_id={task_id} "
                                         f"callback_display_id={receipt.get('callback_id')} "
-                                        f"requested_command={receipt.get('command')}\n\n{result}"
+                                        f"requested_command={receipt.get('command')}\n"
+                                        "[Mythic task state] "
+                                        f"task_completed={native_completed} "
+                                        f"task_status={native_status} "
+                                        f"observation={observation}\n\n{result}"
                                     )
                                 return result
                             finally:
@@ -3955,6 +4221,223 @@ class MythicTools:
         except Exception as e:
             return f"Error downloading payload {payload_uuid}: {e}"
 
+    async def _prepare_supervised_issue_action(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Resolve a direct task proposal before its native approval card is built.
+
+        This uses only local normalization and Mythic/BloodHound control-plane reads.
+        A prerequisite that would register a file must receive separate authority.
+        The issue path still rechecks its live bindings and exact approved effect.
+        """
+        prepared = dict(args)
+        command = prepared.get("command")
+        callback_id = prepared.get("callback_display_id")
+        if not isinstance(command, str) or not command or type(callback_id) is not int:
+            raise ValueError("task command and exact callback are required before approval")
+        if prepared.get("token_id") is not None:
+            raise ValueError("explicit token_id tasking is unsupported by the Mythic task transport")
+        parameters = prepared.get("parameters")
+        parameters = self._qualify_dcsync_params(command, parameters)
+        parameters = await self._coerce_native_dcsync_to_working_form(command, parameters)
+        parameters = self._normalize_sharphound_assembly_params(command, parameters)
+        if parameters is None or parameters == {} or (
+            isinstance(parameters, str) and parameters.strip() in ("", "{}", '""', "''")
+        ):
+            parameters = ""
+        if isinstance(parameters, str):
+            stripped = parameters.strip()
+            if stripped.startswith("{") and stripped.endswith("}"):
+                try:
+                    parsed = json.loads(stripped)
+                    if isinstance(parsed, dict):
+                        parameters = parsed
+                except (TypeError, ValueError):
+                    pass
+        command, parameters = self._rewrite_shell_like_run(command, parameters)
+        parameters = await self._coerce_shell_parameters_from_schema(command, parameters, callback_id)
+        live = await self._authenticate_live_command(command, callback_id)
+        if live.get("status") == "missing":
+            raise ValueError(self._missing_live_command_message(
+                command, live.get("payload_type"), callback_id))
+        if live.get("status") == "available" and live.get("command"):
+            command = live["command"]
+        schema = await self._fetch_enrolled_executable_schema(command, callback_id)
+        if schema is None:
+            raise ValueError("task schema is unavailable; approval requires a known command schema")
+        executable_binding = None
+        selected_executable = getattr(self, "_enrolled_issue_selection", None)
+        if not (
+            isinstance(selected_executable, dict)
+            and selected_executable.get("command") == command
+            and selected_executable.get("callback_display_id") == callback_id
+        ):
+            selected_executable = None
+        parameters, executable_binding = await self._validated_executable_parameters(
+            command,
+            parameters,
+            callback_id,
+            schema,
+            selection=selected_executable,
+        )
+        resolved_group = None
+        if isinstance(parameters, dict) and parameters and schema:
+            resolved = command_builder.resolve_params(schema, parameters, command=command)
+            if not resolved.ok:
+                raise ValueError(resolved.repair or "task parameters do not match the live schema")
+            resolved_group = resolved.group
+            parameters = await self._bind_mythic_credential_parameters(
+                command, resolved.params, callback_id, param_schema=schema)
+        if isinstance(parameters, dict) and parameters:
+            error = await self._validate_command_parameters(command, parameters, callback_id)
+            if error:
+                raise ValueError(error)
+        parameters = self._bind_kerberos_ticket_artifact(command, parameters)
+        name = self._registered_file_name_from_schema(command, parameters, schema)
+        file_identity = await self._validated_inline_assembly_file_identity(
+            command, schema, parameters, resolved_group
+        )
+        if name and file_identity is not None:
+            raise ValueError("task contains both registered and uploaded file selections")
+        if name and not self._registered_file_available_in_schema(schema, name):
+            if _strict_registered_file_identity_command(command):
+                raise ValueError(self._registered_file_remedy_text(schema, name))
+            # Agent-resolved executable reference: the target agent resolves this name
+            # itself (embedded or loader-resolved), so no Mythic file binding exists.
+            # Drop the name here so the flow below keeps the binding file-less — the
+            # same prepared shape the cold-schema path has always produced.
+            name = ""
+        if name:
+            if (
+                isinstance(executable_binding, dict)
+                and executable_binding.get("file", {}).get("filename_utf8") == name
+            ):
+                file_identity = executable_binding["file"]
+            else:
+                file_identity = await self._find_uploaded_file_by_name(name)
+            if not isinstance(file_identity, dict) or not file_identity.get("agent_file_id"):
+                raise ValueError(
+                    f"registered file {name!r} is a registered choice for this command, "
+                    "but no uploaded file with that exact name exists in Mythic. "
+                    "Uploading it is an operator decision that needs its own approval; "
+                    "report this blocker to the operator instead of retrying, or "
+                    "re-task with a different registered identifier if one fits."
+                )
+            file_identity = {key: file_identity.get(key) for key in
+                             ("id", "agent_file_id", "filename_utf8", "md5", "sha1", "complete")}
+        if parameters == "" and isinstance(schema, list) and schema:
+            parameters = "{}"
+        prepared.update(command=command, parameters=parameters,
+                        callback_display_id=callback_id)
+        if prepared.get("timeout") is None:
+            prepared["timeout"] = self._derive_task_timeout(callback_id)
+        prepared.setdefault("token_id", None)
+        visibility = prepared.get("visibility_context")
+        if visibility is not None and not isinstance(visibility, dict):
+            raise ValueError("task visibility context must be an object")
+        prepared_action_binding = {
+            "schema_digest": _task_schema_digest(schema),
+            "group": self._parameter_group_to_declare(
+                resolved_group, parameters, command=command,
+                schema=schema, file_identity=file_identity,
+            ),
+            "file": file_identity,
+        }
+        if executable_binding is not None:
+            prepared_action_binding["executable"] = executable_binding
+        prepared["visibility_context"] = {
+            **(visibility or {}), "_sage_prepared_action": True,
+            "_sage_prepared_binding": prepared_action_binding,
+        }
+        return prepared
+
+    def _tool_note_advisory(self, command: Any, parameters: Any) -> str:
+        """Per-binary knowledge note for the binary this task invokes (D15).
+
+        Notes live in `Payload_Type/sage/tool_notes/<basename>.md` — operator-maintained,
+        public-committable knowledge about known-bad argument sequences, quirks, and
+        remedies. Advisory only: an empty result or a read failure never blocks tasking.
+        """
+        try:
+            candidates = self._invoked_binary_basenames(command, parameters)
+        except Exception:
+            return ""
+        for candidate in candidates:
+            variants = {candidate}
+            if candidate.endswith(".exe"):
+                variants.add(candidate[:-4])
+            for name in sorted(variants):
+                if not name:
+                    continue
+                path = _TOOL_NOTES_DIR / f"{name.casefold()}.md"
+                if not path.is_file():
+                    continue
+                try:
+                    text = path.read_text(encoding="utf-8").strip()
+                except Exception:
+                    continue
+                if not text:
+                    continue
+                if len(text) > _TOOL_NOTE_MAX_CHARS:
+                    cut = text[:_TOOL_NOTE_MAX_CHARS].rsplit("\n", 1)[0]
+                    text = f"{cut}\n…(note truncated; read tool_notes/{name.casefold()}.md for the full text)"
+                return f"⚠️ Tool note ({name}):\n{text}"
+        return ""
+
+    def _path_basename(self, value: Any) -> str:
+        """Basename across Windows and POSIX separators (notes are host-neutral)."""
+        parts = re.split(r"[/\\]", str(value or "").strip())
+        return parts[-1] if parts else ""
+
+    def _invoked_binary_basenames(self, command: Any, parameters: Any) -> list[str]:
+        """Candidate binary basenames the constructed task may invoke (D15 lookup keys).
+
+        Deliberately coarse: executable-shaped parameters, the first token of the freeform
+        payload text (the `shell certutil …` shape, JSON-decoded when the parameters arrive
+        as a JSON string), and the Mythic command name itself. Candidates that match no
+        note are inert.
+        """
+        candidates: list[str] = []
+        params = parameters if isinstance(parameters, dict) else {}
+        for key in ("executable", "assembly_name", "assembly", "tool", "binary"):
+            value = params.get(key)
+            if isinstance(value, str) and value.strip():
+                candidates.append(self._path_basename(value))
+        texts: list[str] = []
+        if isinstance(parameters, str):
+            text = parameters.strip()
+            if text.startswith("{") and text.endswith("}"):
+                try:
+                    parsed = json.loads(text)
+                except Exception:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    texts.extend(
+                        str(value) for value in parsed.values()
+                        if isinstance(value, str) and value.strip()
+                    )
+                else:
+                    texts.append(text)
+            else:
+                texts.append(text)
+        else:
+            for value in params.values():
+                if isinstance(value, str) and value.strip():
+                    texts.append(value)
+        for text in texts[:4]:
+            first = text.strip().split(maxsplit=1)[0] if text.strip() else ""
+            if first:
+                candidates.append(self._path_basename(first))
+        command_name = str(command or "").strip()
+        if command_name:
+            candidates.append(self._path_basename(command_name))
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            folded = candidate.strip().casefold()
+            if folded and folded not in seen:
+                seen.add(folded)
+                deduped.append(folded)
+        return deduped
+
     @tool_safety(TOOL_SAFETY_GUARDED)
     async def delete_payload(
         self,
@@ -4094,7 +4577,11 @@ class MythicTools:
     async def get_all_command_args_for_payloadtype(
             self, 
             payload: Annotated[str, "The name of the payload type (e.g., 'sage', 'apollo', 'poseidon') to get its available commands"],
-            command: Annotated[str, "The name of the command to get its arguments (e.g., 'ls', 'pwd', 'whoami')"]) -> str:
+            command: Annotated[str, "The name of the command to get its arguments (e.g., 'ls', 'pwd', 'whoami')"],
+            callback_display_id: Annotated[int | None, "Exact callback when selecting an enrolled executable"] = None,
+            executable_filename: Annotated[str, "Registered executable filename selected from the live command schema"] = "",
+            executable_verb: Annotated[str, "Enrolled executable operation to expose as typed arguments"] = "",
+    ) -> str:
         """Get all of a command's arguments for a specific payload type (agent).
         
         This tool retrieves all information about a command's arguments available for a given payload type.
@@ -4114,6 +4601,7 @@ class MythicTools:
         #
         # Command-level metadata stays on a separate parameterized query. `needs_admin` is not
         # decoration: footprint.py reads it out of schema items to score Mythic-native risk.
+        self._enrolled_issue_selection = None
         try:
             if self.client is None:
                 raise Exception("MythicAPIClient not initialized. Call create() first.")
@@ -4141,9 +4629,569 @@ class MythicTools:
                 result["needs_admin"] = True
             if metadata.get("help_cmd"):
                 result["help_cmd"] = metadata["help_cmd"]
+            requested = callback_display_id is not None or bool(executable_filename) or bool(executable_verb)
+            if requested:
+                if type(callback_display_id) is not int or not executable_filename or not executable_verb:
+                    result["executable_contract"] = {
+                        "status": "unsupported",
+                        "error": (
+                            "callback_display_id, executable_filename, and executable_verb are all required "
+                            "for typed executable selection"
+                        ),
+                    }
+                else:
+                    result["executable_contract"] = await self._select_enrolled_executable(
+                        payload, command, callback_display_id, executable_filename, executable_verb
+                    )
             return json.dumps(result, sort_keys=True)
         except Exception as e:
             return f"Error getting command {command} args for payload type {payload}: {e}"
+
+    @tool_safety(TOOL_SAFETY_READ_ONLY)
+    def get_enrolled_issue_schema(self) -> dict[str, Any] | None:
+        """Return the ephemeral typed issue schema selected by command discovery."""
+        selection = getattr(self, "_enrolled_issue_selection", None)
+        if not isinstance(selection, dict):
+            return None
+        schema = selection.get("issue_schema")
+        return copy.deepcopy(schema) if isinstance(schema, dict) else None
+
+    @tool_safety(TOOL_SAFETY_READ_ONLY)
+    def clear_enrolled_issue_schema(self) -> None:
+        """Clear the ephemeral per-turn executable selection before rebuilding tools."""
+        self._enrolled_issue_selection = None
+
+    async def _select_enrolled_executable(
+        self, payload: str, command: str, callback_display_id: int,
+        filename: str, verb: str,
+    ) -> dict[str, Any]:
+        try:
+            actual_payload = await self._resolve_payload_type(callback_display_id)
+            if not actual_payload or actual_payload.casefold() != str(payload).strip().casefold():
+                raise ValueError("callback does not expose the requested payload type")
+            live = await self._authenticate_live_command(command, callback_display_id)
+            if live.get("status") != "available" or not live.get("command"):
+                raise ValueError("command is not available on the exact callback")
+            canonical_command = str(live["command"])
+            schema = await self._fetch_enrolled_executable_schema(
+                canonical_command, callback_display_id, force_refresh=True
+            )
+            wrapper = self._executable_wrapper_binding(canonical_command, schema, filename)
+            if wrapper is None or not self._registered_file_available_in_schema(schema, filename):
+                raise ValueError("registered executable selector/group is absent or ambiguous")
+            contract, file_identity = await self._executable_contract_for_file(filename)
+            if contract is None:
+                raise ValueError("registered executable bytes have no enrolled contract")
+            contract._require_verb(verb)
+            invocation_schema = contract.strict_schema_for_verb(verb)
+            issue_schema = {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "enum": [canonical_command]},
+                    "callback_display_id": {"type": "integer", "enum": [callback_display_id]},
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            wrapper["selector_key"]: {
+                                "type": "string", "enum": [file_identity["filename_utf8"]]
+                            },
+                            wrapper["arguments_key"]: invocation_schema,
+                        },
+                        "required": [wrapper["selector_key"], wrapper["arguments_key"]],
+                        "additionalProperties": False,
+                    },
+                },
+                "required": ["command", "callback_display_id", "parameters"],
+                "additionalProperties": False,
+            }
+            self._enrolled_issue_selection = {
+                "payload": actual_payload,
+                "callback_display_id": callback_display_id,
+                "command": canonical_command,
+                "wrapper": wrapper,
+                "file": file_identity,
+                "contract": contract,
+                "verb": verb,
+                "issue_schema": issue_schema,
+            }
+            return {
+                "status": "enrolled",
+                "artifact_sha1": file_identity["sha1"],
+                "contract_sha256": contract.descriptor_sha256,
+                "contract_version": contract.descriptor.contract_version,
+                "filename": file_identity["filename_utf8"],
+                "verb": verb,
+                "invocation_schema": invocation_schema,
+                "instruction": (
+                    "Call issue_task_and_waitfor_task_output with exactly the typed parameters now exposed. "
+                    "Sage will render and independently revalidate the native argument string before task creation."
+                ),
+            }
+        except Exception as exc:
+            self._enrolled_issue_selection = None
+            return {"status": "unsupported", "error": str(exc)}
+
+    async def _fetch_enrolled_executable_schema(
+        self, command: str, callback_display_id: int, *, force_refresh: bool = False
+    ) -> Any:
+        """Add Mythic's current Apollo file choices to a transient wrapper schema."""
+        schema = (
+            await self._fetch_command_schema(
+                command, callback_display_id, force_refresh=True
+            ) if force_refresh else
+            await self._fetch_command_schema(command, callback_display_id)
+        )
+        if command not in {"execute_assembly", "inline_assembly"} or not isinstance(schema, list):
+            return schema
+        selectors = [
+            param for param in self._registered_file_selectors(schema)
+            if param.get("name") == "assembly_name"
+            and param.get("dynamic_query_function") == "get_files"
+        ]
+        if not selectors:
+            return schema
+        if self.client is None:
+            raise ValueError("Mythic client is unavailable for executable choices")
+        payload_type = await self._resolve_payload_type(callback_display_id)
+        if str(payload_type or "").casefold() != "apollo":
+            raise ValueError("dynamic executable choices require an Apollo callback")
+        if len(selectors) != 1:
+            raise ValueError("registered executable selector/group is ambiguous")
+        query = """
+            mutation SageExecutableChoices(
+                $callback_display_id: Int!, $command: String!, $payload_type: String!,
+                $parameter_name: String!, $other_parameters: jsonb
+            ) {
+                dynamicQueryFunction(
+                    callback_display_id: $callback_display_id, command: $command,
+                    payload_type: $payload_type, parameter_name: $parameter_name,
+                    other_parameters: $other_parameters
+                ) { status error choices parameter_name }
+            }
+        """
+        selector = selectors[0]
+        try:
+            response = await mythic.execute_custom_query(
+                self.client, query, variables={
+                    "callback_display_id": callback_display_id,
+                    "command": command,
+                    "payload_type": payload_type,
+                    "parameter_name": selector["name"],
+                    "other_parameters": {},
+                },
+            )
+        except Exception as exc:
+            raise ValueError("Mythic executable choices are unavailable") from exc
+        result = response.get("dynamicQueryFunction") if isinstance(response, dict) else None
+        choices = result.get("choices") if isinstance(result, dict) else None
+        if (
+            not isinstance(result, dict)
+            or result.get("status") != "success"
+            or result.get("parameter_name") != selector["name"]
+            or not isinstance(choices, list)
+            or not all(type(choice) is str and choice for choice in choices)
+        ):
+            raise ValueError("Mythic executable choices are unavailable or malformed")
+        hydrated = copy.deepcopy(schema)
+        hydrated[schema.index(selector)]["choices"] = choices
+        return hydrated
+
+    def _executable_wrapper_binding(
+        self, command: str, schema: Any, filename: str
+    ) -> dict[str, str] | None:
+        if str(command or "").strip() not in {"execute_assembly", "inline_assembly"}:
+            return None
+        if not isinstance(schema, list):
+            return None
+        wanted = str(filename or "").strip().casefold()
+        matches = []
+        for selector in self._registered_file_selectors(schema):
+            choice_match = any(str(choice or "").strip().casefold() == wanted for choice in selector.get("choices") or [])
+            if not choice_match:
+                continue
+            group = str(selector.get("parameter_group_name") or "Default")
+            arguments = [
+                param for param in schema
+                if isinstance(param, dict)
+                and str(param.get("parameter_group_name") or "Default") == group
+                and str(param.get("type") or "").casefold() == "string"
+                and param is not selector
+            ]
+            if len(arguments) == 1:
+                matches.append({
+                    "group": group,
+                    "selector_key": str(selector.get("cli_name") or selector.get("name") or ""),
+                    "selector_name": str(selector.get("name") or selector.get("cli_name") or ""),
+                    "arguments_key": str(arguments[0].get("cli_name") or arguments[0].get("name") or ""),
+                    "arguments_name": str(arguments[0].get("name") or arguments[0].get("cli_name") or ""),
+                })
+        valid = [
+            item for item in matches
+            if item["selector_key"] and item["arguments_key"] and item["selector_key"] != item["arguments_key"]
+        ]
+        return valid[0] if len(valid) == 1 else None
+
+    @staticmethod
+    def _exact_schema_value(parameters: Mapping[str, Any], keys: tuple[str, ...]) -> Any:
+        found = [parameters[key] for key in dict.fromkeys(keys) if key and key in parameters]
+        if len(found) != 1:
+            raise ValueError("executable wrapper uses a missing or ambiguous parameter alias")
+        return found[0]
+
+    def _registered_file_selection_from_schema(
+        self, parameters: Mapping[str, Any], schema: Any
+    ) -> str:
+        matches: list[str] = []
+        for selector in self._registered_file_selectors(schema):
+            values = []
+            for key in dict.fromkeys((selector.get("cli_name"), selector.get("name"))):
+                if key and key in parameters:
+                    values.append(parameters[key])
+            if len(values) > 1:
+                raise ValueError("registered executable selector uses ambiguous aliases")
+            if not values or type(values[0]) is not str or not values[0].strip():
+                continue
+            wanted = values[0].strip()
+            if any(
+                str(choice or "").strip().casefold() == wanted.casefold()
+                for choice in selector.get("choices") or []
+            ):
+                matches.append(wanted)
+        if len(matches) > 1:
+            raise ValueError("multiple registered executable selectors are present")
+        return matches[0] if matches else ""
+
+    @staticmethod
+    def _selected_inline_assembly_file_parameter(
+        command: str, schema: Any, parameters: Any, group: Any,
+    ) -> dict[str, str] | None:
+        """Return the one schema-typed inline-assembly File binding in the selected group."""
+        if str(command or "").strip() != "inline_assembly":
+            return None
+        if not isinstance(schema, list) or not isinstance(parameters, Mapping):
+            return None
+        selected_group = str(group or "").strip()
+        if not selected_group or selected_group == "Default":
+            return None
+        matches = []
+        for parameter in schema:
+            if (
+                not isinstance(parameter, dict)
+                or str(parameter.get("parameter_group_name") or "Default") != selected_group
+                or str(parameter.get("type") or "").casefold() != "file"
+            ):
+                continue
+            keys = tuple(dict.fromkeys(
+                key for key in (parameter.get("cli_name"), parameter.get("name")) if key
+            ))
+            values = [(str(key), parameters[key]) for key in keys if key in parameters]
+            if len(values) > 1:
+                raise ValueError("inline assembly File parameter uses ambiguous aliases")
+            if len(values) == 1:
+                if type(values[0][1]) is not str or not values[0][1]:
+                    raise ValueError("inline assembly File parameter is empty or invalid")
+                matches.append({
+                    "group": selected_group,
+                    "cli_name": str(parameter.get("cli_name") or parameter.get("name") or ""),
+                    "name": str(parameter.get("name") or parameter.get("cli_name") or ""),
+                    "value": values[0][1],
+                })
+        if len(matches) > 1:
+            raise ValueError("inline assembly group contains multiple selected File parameters")
+        return matches[0] if matches else None
+
+    async def _validated_inline_assembly_file_identity(
+        self, command: str, schema: Any, parameters: Any, group: Any,
+    ) -> dict[str, Any] | None:
+        """Bind one complete operator upload selected through inline_assembly's File group."""
+        binding = self._selected_inline_assembly_file_parameter(
+            command, schema, parameters, group
+        )
+        if binding is None:
+            return None
+        try:
+            parsed = uuid.UUID(binding["value"])
+        except (ValueError, AttributeError):
+            raise ValueError("inline assembly File value is not a valid Mythic file UUID")
+        if str(parsed).casefold() != binding["value"].casefold():
+            raise ValueError("inline assembly File value is not a canonical Mythic file UUID")
+        metadata = await self._get_file_metadata(binding["value"])
+        if not isinstance(metadata, dict) or metadata.get("agent_file_id") != binding["value"]:
+            raise ValueError("inline assembly File UUID has no exact Mythic metadata identity")
+        if metadata.get("complete") is not True or metadata.get("deleted") is not False:
+            raise ValueError("inline assembly File is incomplete or deleted")
+        if metadata.get("is_payload") is not False or metadata.get("is_download_from_agent") is not False:
+            raise ValueError("inline assembly File must be a complete operator upload")
+        if type(metadata.get("id")) is not int or metadata["id"] <= 0:
+            raise ValueError("inline assembly File metadata has no exact row identity")
+        if not all(
+            type(metadata.get(key)) is str and metadata[key]
+            for key in ("filename_utf8", "md5", "sha1")
+        ):
+            raise ValueError("inline assembly File metadata or hash identity is incomplete")
+        # Unmanaged inline-File bytes have no executable contract. Post-approval byte-drift is
+        # detected by comparing Mythic's own file metadata (md5 AND sha1, computed server-side on
+        # upload) at approve time vs execute time: a complete Mythic file row is content-fixed, so
+        # its stored md5/sha1 cannot diverge from the served bytes under the same UUID, and a swap
+        # for different bytes would land under a different UUID with a different md5/sha1. Both
+        # hashes are required present above and both are carried in the returned identity, so the
+        # drift comparison is a dual-hash match with no download. This mirrors the enrolled-contract
+        # path (filename identity on Mythic's SHA-1 metadata); Sage never downloads a file to hash it.
+        # Identity is the filename: an enrolled executable may not be smuggled through the inline File
+        # param regardless of its (rebuilt) bytes. If a contract claims this filename, it must go
+        # through the registered selector and typed schema.
+        if executable_contracts.recognizes_executable_filename(
+            _EXECUTABLE_CONTRACT_ROOT, metadata["filename_utf8"]
+        ):
+            raise ValueError(
+                "enrolled executable bytes must use the registered selector and typed "
+                "executable schema"
+            )
+        keys = (
+            "id", "agent_file_id", "filename_utf8", "md5", "sha1", "complete",
+            "deleted", "is_payload", "is_download_from_agent",
+        )
+        return {
+            **{key: metadata.get(key) for key in keys},
+            "parameter": binding,
+        }
+
+    async def _validated_executable_parameters(
+        self,
+        command: str,
+        parameters: Any,
+        callback_display_id: int,
+        schema: Any,
+        *,
+        selection: Mapping[str, Any] | None = None,
+    ) -> tuple[Any, dict[str, Any] | None]:
+        compatible_command = str(command or "").strip() in {
+            "execute_assembly", "inline_assembly"
+        }
+        if not compatible_command:
+            return parameters, None
+        if not isinstance(schema, list):
+            raise ValueError("compatible executable wrapper live schema is unavailable")
+        raw_outer = None
+        raw_outer_original = None
+        if isinstance(parameters, str):
+            if not parameters:
+                return parameters, None
+            raw_outer_original = parameters
+            normalized_outer = parameters.strip(" \t")
+            if not normalized_outer or any(
+                character in "\r\n\x00" for character in parameters
+            ):
+                raise ValueError("compatible executable wrapper raw parameters are malformed")
+            filename, separator, raw_outer = normalized_outer.partition(" ")
+            if not separator:
+                raw_outer = ""
+            possible = self._executable_wrapper_binding(command, schema, filename)
+            if possible is None:
+                selector_matches = [
+                    selector for selector in self._registered_file_selectors(schema)
+                    if any(
+                        str(choice or "").strip().casefold() == filename.casefold()
+                        for choice in selector.get("choices") or []
+                    )
+                ]
+                if len(selector_matches) == 1:
+                    contract, _identity = await self._executable_contract_for_file(filename)
+                    if contract is not None:
+                        raise ValueError(
+                            "known executable uses an ambiguous or unsupported Mythic wrapper"
+                        )
+                return parameters, None
+            # A raw outer command is the exact Apollo execute/inline-assembly parser
+            # form: registered filename, one space, then the untouched assembly argv.
+            parameters = {
+                possible["selector_key"]: filename,
+                possible["arguments_key"]: raw_outer,
+            }
+        if not isinstance(parameters, dict):
+            return parameters, None
+        if selection is not None:
+            if (
+                selection.get("command") != command
+                or selection.get("callback_display_id") != callback_display_id
+            ):
+                raise ValueError("typed executable selection changed before preparation")
+            expected_wrapper = selection.get("wrapper")
+            expected_file = selection.get("file")
+            if not isinstance(expected_wrapper, Mapping) or not isinstance(expected_file, Mapping):
+                raise ValueError("typed executable selection is incomplete")
+            selector_value = self._exact_schema_value(
+                parameters,
+                (str(expected_wrapper.get("selector_key") or ""), str(expected_wrapper.get("selector_name") or "")),
+            )
+            filename = str(selector_value or "").strip()
+            if filename.casefold() != str(expected_file.get("filename_utf8") or "").casefold():
+                raise ValueError("typed executable selector changed")
+        else:
+            filename = self._registered_file_selection_from_schema(parameters, schema)
+            if not filename:
+                return parameters, None
+
+        contract, file_identity = await self._executable_contract_for_file(filename)
+        if contract is None:
+            if selection is not None:
+                raise ValueError("selected executable bytes no longer match the enrolled contract")
+            return parameters if raw_outer_original is None else raw_outer_original, None
+        payload_type = await self._resolve_payload_type(callback_display_id)
+        if str(payload_type or "").casefold() != "apollo":
+            raise ValueError("enrolled executable transport is verified only for Apollo")
+        wrapper = self._executable_wrapper_binding(command, schema, filename)
+        if wrapper is None:
+            raise ValueError("known executable uses an ambiguous or unsupported Mythic wrapper")
+        selector_value = self._exact_schema_value(
+            parameters, (wrapper["selector_key"], wrapper["selector_name"])
+        )
+        if str(selector_value or "").strip().casefold() != filename.casefold():
+            raise ValueError("known executable selector changed during wrapper resolution")
+        arguments = self._exact_schema_value(
+            parameters, (wrapper["arguments_key"], wrapper["arguments_name"])
+        )
+        accepted_outer_keys = {
+            key for key in (
+                wrapper["selector_key"], wrapper["selector_name"],
+                wrapper["arguments_key"], wrapper["arguments_name"],
+            ) if key
+        }
+        if not set(parameters) <= accepted_outer_keys:
+            raise ValueError("known executable wrapper contains undeclared mixed parameters")
+        if isinstance(arguments, dict):
+            if set(arguments) != {"verb", "options"}:
+                raise ValueError("typed executable invocation must contain only verb and options")
+            prepared = contract.prepare(
+                arguments.get("verb"), arguments.get("options"),
+                artifact_sha1=file_identity["sha1"],
+            )
+        elif isinstance(arguments, str):
+            prepared = contract.parse_and_prepare(
+                arguments, artifact_sha1=file_identity["sha1"]
+            )
+        else:
+            raise ValueError("known executable arguments must be typed or a legacy raw string")
+        if selection is not None:
+            expected_file = selection["file"]
+            identity_keys = (
+                "id", "agent_file_id", "filename_utf8", "md5", "sha1", "complete"
+            )
+            if {key: file_identity.get(key) for key in identity_keys} != {
+                key: expected_file.get(key) for key in identity_keys
+            }:
+                raise ValueError("selected executable identity changed")
+            selected_contract = selection.get("contract")
+            if (
+                not isinstance(selected_contract, executable_contracts.ExecutableContract)
+                or selected_contract.descriptor_sha256 != contract.descriptor_sha256
+                or selection.get("verb") != prepared.verb
+            ):
+                raise ValueError("selected executable contract or verb changed")
+        canonical_parameters = {
+            wrapper["selector_key"]: file_identity["filename_utf8"],
+            wrapper["arguments_key"]: prepared.argument_string,
+        }
+        binding = {
+            "file": file_identity,
+            "wrapper": wrapper,
+            "invocation": prepared.as_binding(),
+        }
+        if prepared.repaired_from is not None:
+            # Provenance for a deterministic legacy-verb rewrite (e.g. cas -> enum-cas).
+            # The approval card already shows the corrected argument_string; this records
+            # what it was normalized from so the rewrite is auditable, never silent.
+            binding["repaired_from"] = prepared.repaired_from
+        if prepared.normalized_from is not None:
+            # Provenance for a deterministic legacy OPTION-syntax normalization
+            # (e.g. `/opt:<value>` -> `--opt <value>`). Same audit intent as repaired_from:
+            # the approval card shows the enrolled argument_string, this records the exact raw
+            # string it was normalized from.
+            binding["normalized_from"] = prepared.normalized_from
+        signature = "enrolled-executable:" + json.dumps({
+            "artifact_sha1": prepared.artifact_sha1,
+            "contract_sha256": prepared.contract_sha256,
+            "contract_version": prepared.contract_version,
+            "verb": prepared.verb,
+            "argv": list(prepared.argv),
+        }, sort_keys=True)
+        self._bound_failure_parameter_signatures[
+            _capability_command_key(command, canonical_parameters)
+        ] = signature
+        return canonical_parameters, binding
+
+    async def _download_registered_file_bytes_bounded(self, agent_file_id: str) -> bytes:
+        if self.client is None:
+            raise ValueError("Mythic client is unavailable")
+        if re.fullmatch(r"[0-9A-Fa-f-]{1,128}", str(agent_file_id or "")) is None:
+            raise ValueError("registered file UUID is invalid")
+        url = (
+            f"{self.client.http}{self.client.server_ip}:{self.client.server_port}"
+            f"/direct/download/{agent_file_id}"
+        )
+        ssl_context = None
+        if str(url).casefold().startswith("https://"):
+            configured_ca = configure_sage_ssl_cert_file() or None
+            ssl_context = ssl.create_default_context(cafile=configured_ca)
+        timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                url,
+                headers=mythic_utilities.get_headers(self.client),
+                ssl=ssl_context,
+                allow_redirects=False,
+            ) as response:
+                if response.status != 200:
+                    raise ValueError(f"registered file download returned HTTP {response.status}")
+                if response.content_length is not None and response.content_length > _MAX_ENROLLED_EXECUTABLE_BYTES:
+                    raise ValueError("registered executable exceeds the inspection byte limit")
+                output = bytearray()
+                async for chunk in response.content.iter_chunked(65536):
+                    output.extend(chunk)
+                    if len(output) > _MAX_ENROLLED_EXECUTABLE_BYTES:
+                        raise ValueError("registered executable exceeds the inspection byte limit")
+                if not output:
+                    raise ValueError("registered executable download was empty")
+                return bytes(output)
+
+    async def _executable_contract_for_file(
+        self, filename: str
+    ) -> tuple[executable_contracts.ExecutableContract | None, dict[str, Any]]:
+        row = await self._find_uploaded_file_by_name(filename)
+        if (
+            not isinstance(row, dict)
+            or not row.get("agent_file_id")
+            or row.get("complete") is not True
+            or str(row.get("filename_utf8") or "").casefold() != str(filename).casefold()
+        ):
+            raise ValueError("registered executable has no complete unambiguous Mythic identity")
+        identity = {
+            key: row.get(key) for key in
+            ("id", "agent_file_id", "filename_utf8", "md5", "sha1", "complete")
+        }
+        # An un-contracted filename is open by design (#56): no contract claims it, so it needs no
+        # hash identity and runs generic. Only a contracted name requires the observed-hash identity.
+        if not executable_contracts.recognizes_executable_filename(
+            _EXECUTABLE_CONTRACT_ROOT, filename
+        ):
+            return None, identity
+        # The observed binary hash is Mythic's own SHA-1 metadata — the binary is never downloaded
+        # and rehashed. Mythic stores md5/sha1 (not sha256), so SHA-1 is the hash available for free.
+        sha1 = str(row.get("sha1") or "")
+        if executable_contracts._SHA1_RE.fullmatch(sha1) is None:
+            raise ValueError("registered executable has no complete unambiguous Mythic identity")
+        try:
+            # Identity is the filename: a CI-rebuilt binary (new hash, same name) resolves its
+            # contract instead of being hard-blocked. A contract that pins an integrity allowlist
+            # still rejects off-list bytes.
+            contract = executable_contracts.load_contract_for_filename(
+                _EXECUTABLE_CONTRACT_ROOT, filename, sha1
+            )
+        except executable_contracts.ExecutableIdentityError as exc:
+            raise ValueError(
+                "enrolled executable bytes are not in this contract's accepted-hash allowlist"
+            ) from exc
+        return contract, identity
 
     async def _fetch_command_metadata(self, payload: str, command: str) -> dict:
         """Command-level fields the parameter resolver does not own.
@@ -4458,13 +5506,53 @@ class MythicTools:
     def _apply_task_result_class(self, fail_key, result_class: str) -> str:
         attempts = self._task_failure_counts.get(fail_key, 0)
         decision = command_builder.breaker_decision(result_class, attempts)
+        shape_key = self._failure_shape_key_from_fail_key(fail_key)
         if decision == "reset":
             self._task_failure_counts.pop(fail_key, None)
-        elif decision == "stop":
-            self._task_failure_counts[fail_key] = max(attempts, 2)
-        else:
+            if shape_key is not None:
+                self._request_shape_counts().pop(shape_key, None)
+            return decision
+        if decision == "retry":
             self._task_failure_counts[fail_key] = attempts + 1
+        else:  # stop
+            self._task_failure_counts[fail_key] = max(attempts, 2)
+        if shape_key is not None:
+            # The shape cap accumulates on EVERY failed attempt of this (command, callback)
+            # pair regardless of parameter/credential rotation; the pre-issue gates refuse
+            # further variants once the limit is reached. Success on the pair clears it.
+            counts = self._request_shape_counts()
+            counts[shape_key] = counts.get(shape_key, 0) + 1
         return decision
+
+    def _failure_shape_key_from_fail_key(self, fail_key) -> tuple | None:
+        """Derive the rotation-proof (command, callback) key from a (command, callback,
+        params) failure key. Enrolled-executable construction keys replace the command
+        slot, so they have no command+callback shape and keep their own breaker."""
+        try:
+            if isinstance(fail_key, tuple) and len(fail_key) >= 2 and fail_key[0] != "enrolled-executable":
+                return (fail_key[0], fail_key[1])
+        except Exception:
+            return None
+        return None
+
+    def _task_failure_shape_key(self, command: str, callback_display_id) -> tuple:
+        """Permutation-blind failure unit: the same command failing on the same callback
+        counts together even when parameters rotate (rotated credentials)."""
+        return (str(command), callback_display_id)
+
+    def _task_failure_shape_refusal(self, command: str, callback_display_id) -> str | None:
+        """Pre-issue refusal once the (command, callback) shape cap has been reached."""
+        shape_key = self._task_failure_shape_key(command, callback_display_id)
+        attempts = self._request_shape_counts().get(shape_key, 0)
+        if attempts < self._task_failure_shape_limit:
+            return None
+        return (
+            f"STOP — '{command}' on callback {callback_display_id} already failed {attempts} times in a row, "
+            f"each with a different parameter/credential variant (parameter rotation does not restart the "
+            f"count). Stop issuing this command on this callback with fresh parameter permutations. "
+            f"Report this to the operator, consult get_all_commands_for_payloadtype for the correct "
+            f"parameter schema, or choose a different approach."
+        )
 
     def _serialize_params_for_signature(self, parameters) -> str:
         """Stable serialization of command parameters for the loop-guard action signature."""
@@ -4762,15 +5850,35 @@ class MythicTools:
         def profile_value(key: str, default):
             return config[key] if key in config else default
 
+        async def probe_task(command: str, parameters):
+            if not self._private_collection_transaction_active():
+                return await self.issue_task_and_waitfor_task_output(
+                    command, parameters, callback_display_id,
+                )
+            receipt: dict = {}
+            token = _task_issuance_receipt_context.set(receipt)
+            try:
+                try:
+                    output = await self.issue_task_and_waitfor_task_output(
+                        command, parameters, callback_display_id,
+                    )
+                except Exception as exc:
+                    status = "task_failed" if receipt.get("task_id") else "task_issue_failed"
+                    raise _CollectionProbeTaskError(status, f"{command}: {type(exc).__name__}: {exc}") from exc
+            finally:
+                _task_issuance_receipt_context.reset(token)
+            status, detail = _collection_task_receipt_failure(
+                receipt, callback_display_id, command,
+            )
+            if status:
+                raise _CollectionProbeTaskError(status, f"{command}: {detail}; output={str(output or '')[:600]}")
+            return output
+
         identity_command = str(profile_value("collection_identity_command", "whoami") or "").strip()
         identity_parameters = profile_value("collection_identity_parameters", "")
         if not identity_command:
             raise ValueError("collection identity probe has no command")
-        identity_output = await self.issue_task_and_waitfor_task_output(
-            identity_command,
-            identity_parameters,
-            callback_display_id,
-        )
+        identity_output = await probe_task(identity_command, identity_parameters)
         ticket_command = str(profile_value("collection_ticket_command", "ticket_cache_list") or "").strip()
         ticket_parameters = profile_value(
             "collection_ticket_parameters",
@@ -4778,11 +5886,7 @@ class MythicTools:
         )
         ticket_output = ""
         if ticket_command:
-            ticket_output = await self.issue_task_and_waitfor_task_output(
-                ticket_command,
-                ticket_parameters,
-                callback_display_id,
-            )
+            ticket_output = await probe_task(ticket_command, ticket_parameters)
         authorities = set(self._known_domain_authorities.get(str(callback_display_id), set()))
         authorities.update(
             str(item or "").strip()
@@ -4872,19 +5976,97 @@ class MythicTools:
         except Exception:
             return {}
 
+    def _canonical_dcsync_argument_text(self, text: str) -> str:
+        """Canonical form of an `lsadump::dcsync` argument string for breaker keys ONLY.
+
+        Flag order, quoting, whitespace, case, and the user-principal spelling (bare,
+        NETBIOS-qualified, or UPN) are cosmetic permutations: in the acceptance run the
+        same failed DCSync re-attempted across requests produced a fresh failure key
+        every time, so the cross-request circuit breaker never fired. A /dc: choice is
+        material targeting and stays part of the key. Task parameters themselves are
+        never rewritten — this only merges failure-counting keys.
+        """
+        tokens = [token.strip() for token in str(text).split() if token.strip()]
+        flags: dict[str, str] = {}
+        tail: list[str] = []
+        index = 0
+        while index < len(tokens):
+            raw = tokens[index]
+            token = raw.strip("\"'")
+            match = re.fullmatch(r"/(domain|dc|user):(.+)", token, re.IGNORECASE)
+            if match:
+                flags[match.group(1).lower()] = match.group(2).strip().strip("\"'")
+                index += 1
+                continue
+            # A quoted flag value containing whitespace spans several raw tokens.
+            span_match = re.fullmatch(r"/(domain|dc|user):([\"'])(.*)", token, re.IGNORECASE)
+            if span_match and not raw.rstrip().endswith(span_match.group(2)):
+                quote = span_match.group(2)
+                collected = [span_match.group(3)]
+                index += 1
+                while index < len(tokens):
+                    collected.append(tokens[index].strip())
+                    if tokens[index].strip().endswith(quote):
+                        index += 1
+                        break
+                    index += 1
+                flags[span_match.group(1).lower()] = (
+                    " ".join(collected).rstrip(quote).strip().strip("\"'")
+                )
+                continue
+            tail.append(token)
+            index += 1
+        domain = (flags.get("domain") or "").casefold()
+        ordered: list[str] = []
+        if "domain" in flags:
+            ordered.append(f"/domain:{domain}")
+        if "dc" in flags:
+            ordered.append(f"/dc:{flags['dc'].casefold()}")
+        if "user" in flags:
+            ordered.append(f"/user:{self._normalize_dcsync_user(flags['user'], domain)}")
+        head = "lsadump::dcsync"
+        body = [token for token in tail if "lsadump::dcsync" not in token.casefold()]
+        return " ".join([head] + ordered + body)
+
+    def _canonical_task_failure_parameters(self, parameters):
+        """Breaker-key view of task parameters with dcsync argument permutations merged.
+
+        Returns the parameters unchanged unless a string value carries a dcsync
+        argument span; only the key view is canonicalized, never the tasking values.
+        """
+        if isinstance(parameters, dict) and parameters:
+            canonical: dict = {}
+            changed = False
+            for key, value in parameters.items():
+                new_value = value
+                if isinstance(value, str) and "lsadump::dcsync" in value.casefold():
+                    new_value = self._canonical_dcsync_argument_text(value)
+                    changed = changed or new_value != value
+                canonical[key] = new_value
+            return canonical if changed else parameters
+        if isinstance(parameters, str) and "lsadump::dcsync" in parameters.casefold():
+            return self._canonical_dcsync_argument_text(parameters)
+        return parameters
+
     def _task_failure_key(self, command: str, callback_display_id: int, parameters) -> tuple:
         try:
             serialized = self._bound_failure_parameter_signatures.get(
-                _capability_command_key(command, parameters),
-                (
-                    json.dumps(parameters, sort_keys=True)
-                    if isinstance(parameters, (dict, list))
-                    else str(parameters)
-                ),
+                _capability_command_key(command, parameters)
             )
+            if serialized is None:
+                canonical = self._canonical_task_failure_parameters(parameters)
+                serialized = (
+                    json.dumps(canonical, sort_keys=True)
+                    if isinstance(canonical, (dict, list))
+                    else str(canonical)
+                )
         except Exception:
             serialized = str(parameters)
-        key = (command, callback_display_id, serialized)
+        key = (
+            ("enrolled-executable", callback_display_id, serialized)
+            if str(serialized).startswith("enrolled-executable:")
+            else (command, callback_display_id, serialized)
+        )
         context = self._deterministic_capability_command_context(command, parameters)
         capability = self._capability_text(context.get("capability")).casefold()
         expected_probe = self._capability_text(context.get("expected_probe")).casefold()
@@ -4948,6 +6130,7 @@ class MythicTools:
         callback_display_id: int,
         task_display_id: Any,
         waited_seconds: int,
+        parameters_text: str = "",
     ) -> str:
         """Record the deferral for this turn and return the operator-facing receipt (ISC-2).
 
@@ -4960,6 +6143,9 @@ class MythicTools:
             "callback_display_id": int(callback_display_id),
             "task_display_id": task_display_id,
             "waited_seconds": int(waited_seconds),
+            "request_id": self._current_request_id(),
+            "observation_status": "deferred",
+            "parameters_text": str(parameters_text or "")[:2000],
         }
         if task_display_id is None:
             # The grace expired before the issue itself completed, so there is no id this call can
@@ -4967,14 +6153,13 @@ class MythicTools:
             return (
                 f"DEFERRED: '{command}' on callback {callback_display_id} did not confirm a task id "
                 f"within {waited_seconds}s, so it is unknown whether Mythic accepted the task. This "
-                f"is not a failure of the command. Check with get_task_history_for_callback before "
+                f"leaves the command outcome unknown. Check with get_task_history_for_callback before "
                 f"considering a re-issue, and do not re-issue blindly."
             )
         return (
-            f"DEFERRED: task {task_display_id} ('{command}') is issued and queued on callback "
-            f"{callback_display_id}, and did not return output within the {waited_seconds}s grace "
-            f"period. This is expected for an agent that sleeps longer than the grace period; it is "
-            f"NOT an error and the task has NOT failed. The agent will run it on its next check-in. "
+            f"DEFERRED: Mythic accepted task {task_display_id} ('{command}') on callback "
+            f"{callback_display_id}, but output was not observed within the {waited_seconds}s grace "
+            f"period. Its current execution state and outcome are unconfirmed. "
             f"Read the result later with get_task_output for task {task_display_id}, or "
             f"get_task_history_for_callback for callback {callback_display_id}. Do NOT re-issue it."
         )
@@ -5054,6 +6239,9 @@ class MythicTools:
                 f"{callback_display_id}; not retrying identical parameters.{hint}"
             )
         count = self._task_failure_counts.get(fail_key, 2)
+        _fail_shape_key = self._failure_shape_key_from_fail_key(fail_key)
+        if _fail_shape_key is not None:
+            count = max(count, self._request_shape_counts().get(_fail_shape_key, 0))
         return (
             f"STOP — command '{command}' on callback {callback_display_id} with these parameters has already "
             f"failed {count} times. Do NOT re-issue it "
@@ -5169,6 +6357,7 @@ class MythicTools:
         string using each parameter's cli_name (e.g. -path /etc/issue). token_id impersonates a tracked
         Windows token; timeout is in seconds.
         """
+        _collection_schema_binding_context.set(None)
         authority_blocker = self._turn_authority_issue_blocker(
             command,
             callback_display_id,
@@ -5181,6 +6370,18 @@ class MythicTools:
         if authority_blocker:
             self._pending_task_backed_transition = None
             return self._note_effect_denial(authority_blocker)
+        command_binding = _capability_command_context.get() or {}
+        if command_binding.get("task") is asyncio.current_task():
+            command_binding["entered_issue"] = False
+            command_binding.pop("runner_command", None)
+            command_binding.pop("runner_parameters", None)
+        if (
+            command_binding.get("task") is asyncio.current_task()
+            and command_binding.get("command") == command
+            and command_binding.get("parameters") == parameters
+            and command_binding.get("callback_id") == str(callback_display_id)
+        ):
+            command_binding["entered_issue"] = True
         deferral_blocker = self._deferred_task_issue_blocker(command, callback_display_id)
         if deferral_blocker:
             self._pending_task_backed_transition = None
@@ -5275,6 +6476,24 @@ class MythicTools:
                 command = live_command["command"]
         except Exception:
             pass
+        executable_binding = None
+        try:
+            executable_schema = (
+                await self._fetch_enrolled_executable_schema(command, callback_display_id)
+                if str(command or "").strip() in {"execute_assembly", "inline_assembly"}
+                else None
+            )
+            parameters, executable_binding = await self._validated_executable_parameters(
+                command, parameters, callback_display_id, executable_schema
+            )
+        except (
+            ValueError,
+            executable_contracts.ExecutableContractError,
+        ) as exc:
+            self._pending_task_backed_transition = None
+            return self._note_effect_denial(
+                f"STOP — known executable construction failure: {exc}"
+            )
         raw_gpo_blocker = self._raw_gpo_mutation_blocker(command, parameters)
         if raw_gpo_blocker:
             self._pending_task_backed_transition = None
@@ -5286,6 +6505,12 @@ class MythicTools:
         # unbounded retry loop (cosmetic param permutations) that explodes context and
         # exhausts the recursion limit.
         fail_key = self._task_failure_key(command, callback_display_id, parameters)
+        if executable_binding is not None and fail_key in self._enrolled_construction_failures:
+            return (
+                f"STOP — equivalent enrolled executable invocation for '{command}' on callback "
+                f"{callback_display_id} already produced a construction failure. Obtain new compatibility "
+                "evidence and select a revised contract before retrying."
+            )
         if self._task_failure_counts.get(fail_key, 0) >= 2:
             return (
                 f"STOP — command '{command}' on callback {callback_display_id} with these parameters has already "
@@ -5294,10 +6519,71 @@ class MythicTools:
                 f"likely wrong or the failure is environmental. Report this to the operator, consult "
                 f"get_all_commands_for_payloadtype for the correct parameter schema, or choose a different approach."
             )
+        _shape_refusal = self._task_failure_shape_refusal(command, callback_display_id)
+        if _shape_refusal:
+            return _shape_refusal
 
         # Registered-file commands often expose a ChooseOne selector whose choices are populated from Mythic
         # filemeta. Satisfy that control-plane prerequisite before argument resolution; otherwise the resolver
         # can reject an unregistered tool name before Sage gets a chance to register it.
+        if command_binding.get("entered_issue") and command_binding.get("task") is asyncio.current_task():
+            command_binding["runner_command"] = command
+            command_binding["runner_parameters"] = copy.deepcopy(parameters)
+        prepared_binding = (
+            visibility_context.get("_sage_prepared_binding")
+            if isinstance(visibility_context, dict)
+            and visibility_context.get("_sage_prepared_action") is True else None
+        )
+        current_schema = None
+        expected_inline_file = None
+        if prepared_binding is not None:
+            if not isinstance(prepared_binding, dict):
+                return self._note_effect_denial("STOP — prepared task binding is invalid")
+            try:
+                current_schema = await self._fetch_enrolled_executable_schema(
+                    command, callback_display_id, force_refresh=True)
+                current_digest = _task_schema_digest(current_schema)
+                if current_digest != prepared_binding.get("schema_digest"):
+                    return self._note_effect_denial("STOP — task schema changed after approval")
+                expected_file = prepared_binding.get("file")
+                expected_inline_file = (
+                    expected_file if isinstance(expected_file, dict)
+                    and isinstance(expected_file.get("parameter"), dict) else None
+                )
+                expected_executable = prepared_binding.get("executable")
+                if expected_executable is not None:
+                    if not isinstance(expected_executable, dict):
+                        return self._note_effect_denial(
+                            "STOP — prepared executable binding is invalid"
+                        )
+                    parameters, current_executable = await self._validated_executable_parameters(
+                        command, parameters, callback_display_id, current_schema
+                    )
+                    if current_executable != expected_executable:
+                        return self._note_effect_denial(
+                            "STOP — executable artifact, contract, or invocation changed after approval"
+                        )
+                elif expected_inline_file is None:
+                    selected_file = self._registered_file_name_from_schema(
+                        command, parameters, current_schema
+                    )
+                    if bool(selected_file) != bool(expected_file):
+                        return self._note_effect_denial(
+                            "STOP — registered file selection changed after approval"
+                        )
+                    if selected_file:
+                        current_file = await self._find_uploaded_file_by_name(selected_file)
+                        keys = ("id", "agent_file_id", "filename_utf8", "md5", "sha1", "complete")
+                        if not isinstance(current_file, dict) or {
+                            key: current_file.get(key) for key in keys
+                        } != {key: expected_file.get(key) for key in keys}:
+                            return self._note_effect_denial(
+                                "STOP — registered file identity changed after approval"
+                            )
+            except Exception as exc:
+                return self._note_effect_denial(
+                    f"STOP — prepared task binding could not be revalidated: {type(exc).__name__}"
+                )
         try:
             registered_file_blocker = await self._ensure_registered_file_available(
                 command,
@@ -5318,12 +6604,21 @@ class MythicTools:
         # the answer depends on the parameters as they stand at that moment: the credential repair
         # path can turn raw material into a reference between the first attempt and the retry.
         resolved_parameter_group = None
+        param_schema = current_schema
+        issue_inline_file = None
 
         # Deterministic pre-flight: first repair prior-key names and group mixes against the
         # live schema, then keep the existing validator as the conservative hard stop.
         if isinstance(parameters, dict) and parameters:
             try:
-                param_schema = await self._fetch_command_schema(command, callback_display_id)
+                transaction = getattr(self, "_private_collection_transaction", None)
+                reserved_step = (
+                    transaction._current_step()
+                    if isinstance(transaction, _PrivateCollectionTransaction) and transaction.active_for(self)
+                    else None
+                )
+                if param_schema is None:
+                    param_schema = await self._fetch_command_schema(command, callback_display_id)
                 if param_schema:
                     original_parameters = dict(parameters)
                     resolved = command_builder.resolve_params(param_schema, parameters, command=command)
@@ -5336,6 +6631,19 @@ class MythicTools:
                             callback_display_id,
                             param_schema=param_schema,
                         )
+                        if (
+                            parameters != original_parameters
+                            and isinstance(transaction, _PrivateCollectionTransaction)
+                            and transaction.active_for(self)
+                        ):
+                            alias_blocker = transaction.bind_schema_resolution(
+                                self, command, original_parameters, parameters,
+                                callback_display_id, param_schema, resolved.group, reserved_step,
+                            )
+                            if alias_blocker:
+                                return self._note_effect_denial(
+                                    f"STOP — supervised collection denied: {alias_blocker}"
+                                )
                         if parameters != original_parameters:
                             logger.debug(
                                 f"🛡️ ARGRES command={command} group={resolved.group} "
@@ -5367,6 +6675,9 @@ class MythicTools:
                                     f"likely wrong or the failure is environmental. Report this to the operator, consult "
                                     f"get_all_commands_for_payloadtype for the correct parameter schema, or choose a different approach."
                                 )
+                            _shape_refusal = self._task_failure_shape_refusal(command, callback_display_id)
+                            if _shape_refusal:
+                                return _shape_refusal
                     else:
                         result_class = command_builder.classify_result(command, resolved.repair or "")
                         decision = self._apply_task_result_class(fail_key, result_class)
@@ -5385,6 +6696,22 @@ class MythicTools:
                     logger.info(f"🛡️ ARGRES failed_open command={command} reason=exception:{e}")
                 except Exception:
                     pass
+            try:
+                issue_inline_file = await self._validated_inline_assembly_file_identity(
+                    command, param_schema, parameters, resolved_parameter_group
+                )
+            except ValueError as exc:
+                if expected_inline_file is not None:
+                    return self._note_effect_denial(
+                        "STOP — inline assembly File identity changed after approval"
+                    )
+                return self._note_effect_denial(
+                    f"STOP — known executable construction failure: {exc}"
+                )
+            if expected_inline_file is not None and issue_inline_file != expected_inline_file:
+                return self._note_effect_denial(
+                    "STOP — inline assembly File identity changed after approval"
+                )
             _validation_error = await self._validate_command_parameters(command, parameters, callback_display_id)
             if _validation_error:
                 result_class = command_builder.classify_result(command, _validation_error)
@@ -5401,7 +6728,20 @@ class MythicTools:
                 return _validation_error
 
         parameters = self._bind_kerberos_ticket_artifact(command, parameters)
+        if prepared_binding is not None:
+            declared_group = self._parameter_group_to_declare(
+                resolved_parameter_group, parameters, command=command,
+                schema=param_schema, file_identity=issue_inline_file,
+            )
+            if declared_group != prepared_binding.get("group"):
+                return self._note_effect_denial("STOP — task parameter group changed after approval")
         fail_key = self._task_failure_key(command, callback_display_id, parameters)
+        if executable_binding is not None and fail_key in self._enrolled_construction_failures:
+            return (
+                f"STOP — equivalent enrolled executable invocation for '{command}' on callback "
+                f"{callback_display_id} already produced a construction failure. Obtain new compatibility "
+                "evidence and select a revised contract before retrying."
+            )
         if self._task_failure_counts.get(fail_key, 0) >= 2:
             return (
                 f"STOP — command '{command}' on callback {callback_display_id} with these parameters has already "
@@ -5410,6 +6750,9 @@ class MythicTools:
                 f"likely wrong or the failure is environmental. Report this to the operator, consult "
                 f"get_all_commands_for_payloadtype for the correct parameter schema, or choose a different approach."
             )
+        _shape_refusal = self._task_failure_shape_refusal(command, callback_display_id)
+        if _shape_refusal:
+            return _shape_refusal
 
         logon_context_key = self._kerberos_logon_context_key(command, callback_display_id, parameters)
         if logon_context_key and logon_context_key in self._kerberos_logon_context_keys:
@@ -5470,9 +6813,13 @@ class MythicTools:
                 self._last_issued_task_display_id = None
                 self._last_issued_task_terminal_status = ""
                 self._last_issued_command = command
+                self._last_issued_task_is_repeat_failure = False
 
                 async def _issue_and_wait():
                     nonlocal parameters
+                    transaction = getattr(self, "_private_collection_transaction", None)
+                    if isinstance(transaction, _PrivateCollectionTransaction) and transaction.active_for(self):
+                        transaction.handoff_schema_resolution()
                     authority_blocker = self._turn_authority_issue_blocker(
                         command,
                         callback_display_id,
@@ -5513,6 +6860,14 @@ class MythicTools:
                                 "own defaults instead of failing to parse an empty string (ISC-65)"
                             )
                             parameters = "{}"
+                    if prepared_binding is not None:
+                        authority_blocker = self._turn_authority_issue_blocker(
+                            command, callback_display_id, parameters=parameters,
+                            token_id=token_id, timeout=timeout,
+                            visibility_context=visibility_context, recheck=True,
+                        )
+                        if authority_blocker:
+                            raise PermissionError(authority_blocker)
                     # Bind observer facts before the asynchronous issue/wait. A later
                     # request must not inherit an old task's approval or outcome.
                     execution_request_id = self._current_request_id()
@@ -5530,7 +6885,8 @@ class MythicTools:
                         task = await self._issue_mythic_task(
                             command, parameters, callback_display_id, timeout=timeout,
                             parameter_group_name=self._parameter_group_to_declare(
-                                resolved_parameter_group, parameters, command=command
+                                resolved_parameter_group, parameters, command=command,
+                                schema=param_schema, file_identity=issue_inline_file,
                             ),
                         )  # token_id=token_id
                     except Exception as exc:
@@ -5550,6 +6906,11 @@ class MythicTools:
                         if repaired == parameters:
                             raise
                         parameters = repaired
+                        if prepared_binding is not None and self._parameter_group_to_declare(
+                            resolved_parameter_group, parameters, command=command,
+                            schema=param_schema, file_identity=issue_inline_file,
+                        ) != prepared_binding.get("group"):
+                            raise PermissionError("STOP — task parameter group changed after approval")
                         authority_blocker = self._turn_authority_issue_blocker(
                             command,
                             callback_display_id,
@@ -5571,7 +6932,8 @@ class MythicTools:
                         task = await self._issue_mythic_task(
                             command, parameters, callback_display_id, timeout=timeout,
                             parameter_group_name=self._parameter_group_to_declare(
-                                resolved_parameter_group, parameters, command=command
+                                resolved_parameter_group, parameters, command=command,
+                                schema=param_schema, file_identity=issue_inline_file,
                             ),
                         )  # token_id=token_id
                     tdid = task.get("display_id") if isinstance(task, dict) else None
@@ -5585,6 +6947,19 @@ class MythicTools:
                             "command": command,
                         })
                     self._last_issued_task_display_id = tdid
+                    # D3 repeat-failure flag: parameter rotation must not hide a repeat.
+                    # A failed attempt of this (command, callback) shape already exists, so
+                    # the delegation loop containment sees a re-run of a known failure even
+                    # when the failure key itself is fresh (issue #46).
+                    self._last_issued_task_is_repeat_failure = (
+                        self._task_failure_counts.get(
+                            self._task_failure_key(command, callback_display_id, parameters),
+                            0,
+                        ) >= 1
+                        or self._request_shape_counts().get(
+                            self._task_failure_shape_key(command, callback_display_id), 0
+                        ) >= 1
+                    )
                     # ISC-71: task creation is the lineage boundary. Record before waiting so a timeout,
                     # subscription failure, or failed command cannot make an accepted Mythic task look manual.
                     self._record_current_request_task(tdid)
@@ -5625,6 +7000,19 @@ class MythicTools:
                             mythic=self.client, task_display_id=tdid, timeout=timeout,
                         )
                     except BaseException as exc:
+                        if isinstance(issuance_receipt, dict):
+                            issuance_receipt["observation_status"] = "wait_failed"
+                        contract = getattr(self, "_request_contract", None)
+                        if (not isinstance(exc, asyncio.CancelledError)
+                                and getattr(contract, "lane", None) == "supervised_workflow"):
+                            self._deferred_task_receipt = {
+                                "command": command,
+                                "callback_display_id": int(callback_display_id),
+                                "task_display_id": tdid,
+                                "request_id": execution_request_id,
+                                "observation_status": "wait_failed",
+                                "parameters_text": self._serialize_params_for_signature(parameters)[:2000],
+                            }
                         self._record_contract_task_terminal(
                             command,
                             parameters,
@@ -5637,7 +7025,7 @@ class MythicTools:
                             {
                                 **base_event,
                                 "status": "error",
-                                "terminal_status": "failed",
+                                "terminal_status": "wait_failed",
                                 "result_preview": f"{type(exc).__name__}: {exc}",
                                 "output": f"{type(exc).__name__}: {exc}",
                             }
@@ -5645,24 +7033,75 @@ class MythicTools:
                         raise
                     result_text = _task_output_text(result)
                     result_class = command_builder.classify_result(command, result_text, parameters=parameters)
+                    if (
+                        executable_binding is not None
+                        and command_builder.enrolled_executable_parser_failure(result_text)
+                    ):
+                        result_class = command_builder.ResultClass.CONSTRUCTION.value
                     self._last_issued_task_terminal_status = (
                         "completed"
                         if result_class == command_builder.ResultClass.SUCCESS.value
                         else "failed"
                     )
+                    # The SDK can return partial output after a subscription timeout.
+                    # Output classification alone therefore cannot prove completion.
+                    completion_evidence_required = bool(
+                        execution_approval_id
+                        or isinstance(issuance_receipt, dict)
+                        or self._private_collection_transaction_active()
+                    )
+                    task_state = (
+                        await self._supervised_task_state(
+                            tdid, callback_display_id, command, parameters
+                        )
+                        if completion_evidence_required else {}
+                    )
+                    if isinstance(issuance_receipt, dict):
+                        issuance_receipt.update(task_state)
+                        issuance_receipt["output_success"] = (
+                            result_class == command_builder.ResultClass.SUCCESS.value
+                        )
+                    task_proved = _mythic_task_terminal_success(
+                        task_state.get("task_completed"), task_state.get("task_status"),
+                    )
+                    contract = getattr(self, "_request_contract", None)
+                    if (completion_evidence_required
+                            and getattr(contract, "lane", None) == "supervised_workflow"
+                            and task_state.get("task_completed") is not True):
+                        self._deferred_task_receipt = {
+                            "command": command,
+                            "callback_display_id": int(callback_display_id),
+                            "task_display_id": tdid,
+                            "request_id": execution_request_id,
+                            "observation_status": (
+                                "pending" if task_state.get("task_completed") is False else "unknown"
+                            ),
+                            "parameters_text": self._serialize_params_for_signature(parameters)[:2000],
+                            "task_status": (
+                                str(task_state.get("task_status"))[:80]
+                                if task_state.get("task_completed") is False
+                                and isinstance(task_state.get("task_status"), str)
+                                else ""
+                            ),
+                        }
+                    if completion_evidence_required and not task_proved:
+                        self._last_issued_task_terminal_status = (
+                            str(task_state.get("task_status") or "unknown")[:80]
+                        )
                     self._record_contract_task_terminal(
                         command,
                         parameters,
                         callback_display_id,
                         tdid,
-                        success=result_class == command_builder.ResultClass.SUCCESS.value,
-                        status=self._last_issued_task_terminal_status,
-                    )
-                    # The SDK can return partial output after a subscription timeout.
-                    # Output classification alone therefore cannot prove completion.
-                    task_state = (
-                        await self._supervised_task_state(tdid, callback_display_id, command)
-                        if execution_approval_id else {}
+                        success=(
+                            result_class == command_builder.ResultClass.SUCCESS.value
+                            and (task_proved if completion_evidence_required else True)
+                        ),
+                        status=(
+                            str(task_state.get("task_status") or "unknown")
+                            if completion_evidence_required
+                            else self._last_issued_task_terminal_status
+                        ),
                     )
                     await self._notify_execution_observer({
                         **base_event,
@@ -5670,6 +7109,7 @@ class MythicTools:
                         "status": (
                             "completed"
                             if result_class == command_builder.ResultClass.SUCCESS.value
+                            and (task_proved if completion_evidence_required else True)
                             else "error"
                         ),
                         "terminal_status": self._last_issued_task_terminal_status,
@@ -5692,11 +7132,13 @@ class MythicTools:
                     results = await asyncio.wait_for(_issue_and_wait(), timeout=timeout + 20)
                 fail_key = self._task_failure_key(command, callback_display_id, parameters)
             except asyncio.TimeoutError:
-                # Grace expired. This is a normal operating condition with a receipt, not a failure:
-                # the task is queued and fine, and the agent will run it on its next check-in. So it
-                # deliberately does NOT go through classify_result/_apply_task_result_class — counting
-                # a healthy queued task as a failure would walk the circuit breaker toward STOP and
-                # teach the model that the command is broken.
+                issuance_receipt = _task_issuance_receipt_context.get()
+                if isinstance(issuance_receipt, dict):
+                    issuance_receipt["observation_status"] = "deferred"
+                # Grace expired without an observed outcome. Preserve the exact issuance receipt,
+                # but do not classify the task itself as failed or claim it is still queued.
+                # classify_result/_apply_task_result_class would turn an observation limit into
+                # a command failure and advance the circuit breaker without task evidence.
                 issued_task_id = getattr(self, "_last_issued_task_display_id", None)
                 if issued_task_id == task_id_before_wait:
                     issued_task_id = None
@@ -5705,6 +7147,7 @@ class MythicTools:
                     callback_display_id,
                     issued_task_id,
                     timeout,
+                    parameters_text=self._serialize_params_for_signature(parameters),
                 )
             if results is None:
                 result_class = command_builder.classify_result(command, "No output returned from task.")
@@ -5760,6 +7203,12 @@ class MythicTools:
             # Agent-side execution errors come back in the OUTPUT (not as exceptions); count
             # them toward the circuit breaker so blind retries are still capped.
             result_class = command_builder.classify_result(command, results_str, parameters=parameters)
+            if (
+                executable_binding is not None
+                and command_builder.enrolled_executable_parser_failure(results_str)
+            ):
+                result_class = command_builder.ResultClass.CONSTRUCTION.value
+                self._enrolled_construction_failures.add(fail_key)
             decision = self._apply_task_result_class(fail_key, result_class)
             # Loop-guard: detect a SUCCESSFUL-but-unproductive repeat (same command/params/normalized output)
             # that the failure breaker resets past. On the Nth identical success, surface a STOP nudge and flag
@@ -5839,7 +7288,16 @@ class MythicTools:
                 pass  # fail-open: a downgrade must never break the issue path
             return results_str
         except Exception as e:
-            error_result = f"Error issuing command '{command}' to agent {callback_display_id}: {e}"
+            issuance_receipt = _task_issuance_receipt_context.get()
+            issued_task_id = (
+                issuance_receipt.get("task_id") if isinstance(issuance_receipt, dict) else None
+            )
+            error_result = (
+                f"Error observing output for issued task {issued_task_id} "
+                f"('{command}' on callback {callback_display_id}): {e}"
+                if type(issued_task_id) is int and issued_task_id > 0
+                else f"Error issuing command '{command}' to agent {callback_display_id}: {e}"
+            )
             result_class = command_builder.classify_result(command, error_result, str(e))
             decision = self._apply_task_result_class(fail_key, result_class)
             if decision == "stop":
@@ -6357,11 +7815,12 @@ class MythicTools:
         )
         try:
             try:
-                from . import access_reconciler, engagement_state, graph_reconciler
+                from . import access_reconciler, engagement_state, graph_reconciler, objective_contract
             except ImportError:
                 import access_reconciler
                 import engagement_state
                 import graph_reconciler
+                import objective_contract
 
             # Need footholds to derive the controlled principals the cypher matches on. Use the gate's
             # cache if present; otherwise reconcile once (collection tools aren't classified, so the cache
@@ -6469,6 +7928,39 @@ class MythicTools:
                     self._persist_engagement_ledger()
                 except Exception:
                     pass
+
+            # #58 pathfinding-first: when BloodHound has data AND the objective is a path-shaped ask,
+            # ask the graph ONCE per objective whether a path exists from the controlled principals to
+            # each covered domain, and surface the answer (found / no-path) as an advisory fact the
+            # planner sees first. Strictly gated on data presence (covered_domains) and a path-shaped
+            # ask; otherwise it is a silent no-op. Read-only; never collects; derives its target from
+            # the objective's own covered domains (no hardcoded topology).
+            try:
+                if principals and objective_contract.objective_seeks_attack_path(state.objective):
+                    if not covered_domains:
+                        covered_domains = await _bloodhound_collected_domains()
+                    probe_key = f"{state.objective}|{','.join(sorted(covered_domains or []))}"
+                    if covered_domains and probe_key != getattr(self, "_objective_path_probe_key", None):
+                        probe_facts = list(await graph_reconciler.probe_path_to_objective(
+                            _SingleToolMCP(cypher_tool), principals, covered_domains, now,
+                            self._GRAPH_FACTS_TTL_SECONDS, proof_envelope=proof_envelope,
+                        ) or [])
+                        self._objective_path_probe_key = probe_key
+                        if probe_facts:
+                            existing = {
+                                getattr(fact, "predicate", "")
+                                for fact in self._engagement_graph_facts
+                            }
+                            for fact in probe_facts:
+                                if getattr(fact, "predicate", "") not in existing:
+                                    self._engagement_graph_facts.append(fact)
+                            try:
+                                self._persist_engagement_ledger()
+                            except Exception:
+                                pass
+            except Exception as probe_exc:
+                logger.info(f"🧭 [graph-facts] path probe skipped (fail-open): {probe_exc}")
+
             logger.info(
                 f"🧭 [graph-facts] refresh: principals={len(principals)} new_facts={len(facts)} "
                 f"cached={len(self._engagement_graph_facts)} "
@@ -8001,7 +9493,7 @@ class MythicTools:
         """
         if not isinstance(parameters, dict) or not parameters:
             return
-        schema = await self._fetch_command_schema(command, callback_display_id)
+        schema = await self._fetch_enrolled_executable_schema(command, callback_display_id)
         name = self._registered_file_name_from_schema(command, parameters, schema)
         if not name:
             return
@@ -8011,6 +9503,48 @@ class MythicTools:
         if self._registered_file_available_in_schema(schema, name):
             self._registered_file_checks.add(key)
             return
+        # collect_graph approves an ordered transaction, not an arbitrary tool filename.
+        # Carry this schema-selected prerequisite only across its exact runner preflight;
+        # a direct upload or another callback/step must not borrow that approval.
+        transaction = getattr(self, "_private_collection_transaction", None)
+        binding = None
+        if (
+            isinstance(transaction, _PrivateCollectionTransaction)
+            and transaction.active_for(self)
+            and transaction.matches_runner_preflight(command, parameters, callback_display_id)
+        ):
+            binding = {
+                "client": self,
+                "transaction": transaction,
+                "step": transaction._current_step(),
+                "task": asyncio.current_task(),
+                "command": command,
+                "parameters": transaction._canonical(parameters),
+                "callback_id": callback_display_id,
+                "filename": name,
+            }
+        command_binding = _capability_command_context.get() or {}
+        execution = command_binding.get("execution") or {}
+        capability_binding = None
+        if (
+            command_binding.get("task") is asyncio.current_task()
+            and execution.get("client") is self
+            and execution.get("task") is asyncio.current_task()
+            and command_binding.get("entered_issue") is True
+            and str(callback_display_id) == command_binding.get("callback_id")
+            and command == command_binding.get("runner_command")
+            and parameters == command_binding.get("runner_parameters")
+        ):
+            capability_binding = {
+                "command": command_binding,
+                "task": asyncio.current_task(),
+                "callback_id": str(callback_display_id),
+                "runner_command": command,
+                "runner_parameters": copy.deepcopy(parameters),
+                "filename": name,
+            }
+        context_token = _collection_file_preflight_context.set(binding)
+        capability_token = _capability_file_preflight_context.set(capability_binding)
         try:
             raw_upload = await self.ensure_tool_uploaded(name)
             up = json.loads(raw_upload) if isinstance(raw_upload, str) else raw_upload
@@ -8022,6 +9556,9 @@ class MythicTools:
             )
             logger.warning(blocker)
             return blocker
+        finally:
+            _capability_file_preflight_context.reset(capability_token)
+            _collection_file_preflight_context.reset(context_token)
         if not isinstance(up, dict):
             blocker = (
                 f"{_REGISTERED_FILE_PREFLIGHT_PREFIX} could not register {name!r} before {command!r}: "
@@ -8033,6 +9570,12 @@ class MythicTools:
         status = str(up.get("status") or "unknown")
         if status not in {"uploaded", "already_present"} or not up.get("file_uuid"):
             detail = str(up.get("error") or up.get("note") or "no Mythic file UUID returned")
+            if status == "missing" and not _strict_registered_file_identity_command(command):
+                # Agent-resolved executable reference: the binary is not in Mythic's
+                # store and not locally staged, so no upload is possible — but the
+                # target agent may resolve the name itself (embedded or loader-resolved).
+                # The operator approved this exact task; Mythic is the truth at runtime.
+                return None
             blocker = (
                 f"{_REGISTERED_FILE_PREFLIGHT_PREFIX} could not register {name!r} before {command!r}: "
                 f"ensure_tool_uploaded returned {status}: {detail}. "
@@ -8062,6 +9605,36 @@ class MythicTools:
                 if choice_text == wanted:
                     return True
         return False
+
+    def _registered_file_remedy_text(self, schema, name: str) -> str:
+        """Actionable remedy for a registered-file reference the guard could not verify.
+
+        A guard error that names no next step sends the model guessing — it assumed an
+        approval card would appear and looped registration checks for 11 cycles. Name
+        the exact registered identifiers instead, and say plainly that no card appears.
+        """
+        choices = sorted({
+            self._capability_text(choice).strip()
+            for param in self._registered_file_selectors(schema)
+            if isinstance(param, dict) and isinstance(param.get("choices"), list)
+            for choice in param["choices"]
+            if self._capability_text(choice).strip()
+        })
+        if choices:
+            listed = ", ".join(repr(choice) for choice in choices)
+            return (
+                f"registered file {name!r} is not among this command's registered-file "
+                f"choices ({listed}). Re-issue with one of those exact identifiers; do "
+                "not guess a filename, and no approval card will appear for a guessed "
+                "name. If the needed binary is genuinely absent from Mythic, report that "
+                "and stop instead of re-checking registrations."
+            )
+        return (
+            f"registered file {name!r} could not be confirmed against this command's "
+            "registered-file choices (the schema exposed no choice list). Use the exact "
+            "registered identifier from the command's own schema choices; do not guess "
+            "a filename or re-check registrations repeatedly."
+        )
 
     async def _invalidate_command_schema_cache(self, command: str, callback_display_id) -> None:
         try:
@@ -9610,10 +11183,55 @@ class MythicTools:
         replay a command list by hand. Currently materialization is implemented for
         `adcs-certificate-auth`; other builder-backed capabilities are executed from their adapter plan.
         """
-        self._require_request_contract_effect("execute_capability", {
-            "action": action,
-            "inputs": inputs,
-        })
+        args = {"action": action, "inputs": inputs}
+        self._require_request_contract_effect("execute_capability", args)
+        claim = getattr(self, "_active_approval_claim", None)
+        contract = getattr(self, "_request_contract", None)
+        execution = None
+        if isinstance(claim, dict):
+            approved = claim.get("approved_actions")
+            roots = []
+            if isinstance(approved, list):
+                for root in approved:
+                    if not isinstance(root, dict) or root.get("name") != "execute_capability":
+                        continue
+                    root_args = root.get("args")
+                    if not isinstance(root_args, dict):
+                        continue
+                    try:
+                        if self._effective_request_action_arguments(
+                            "execute_capability", root_args,
+                        ) == self._effective_request_action_arguments("execute_capability", args):
+                            roots.append(root_args)
+                    except (TypeError, ValueError):
+                        continue
+            if len(roots) == 1:
+                root_args = roots[0]
+                try:
+                    from .request_contract import action_binding_values
+                except ImportError:  # pragma: no cover
+                    from request_contract import action_binding_values  # type: ignore
+                bindings = action_binding_values(root_args)
+                execution = {
+                    "client": self, "task": asyncio.current_task(),
+                    "claim": claim, "contract": contract,
+                    "claim_id": claim.get("approval_id"),
+                    "request_id": claim.get("request_id"),
+                    "contract_digest": claim.get("request_contract_digest"),
+                    "root_args": copy.deepcopy(root_args),
+                    "callback_id": bindings.callback_id,
+                    "capability": bindings.capability,
+                }
+        token = _capability_execution_context.set(execution)
+        try:
+            return await self._execute_capability_impl(action, inputs)
+        finally:
+            _capability_execution_context.reset(token)
+
+    async def _execute_capability_impl(
+        self, action: dict | str, inputs: dict | str | None = None,
+    ) -> str:
+        """Run the implementation within the public tool's active execution binding."""
         try:
             if self.client is None:
                 return json.dumps({
@@ -10638,6 +12256,7 @@ class MythicTools:
             except (TypeError, ValueError):
                 timeout = None
             self._last_issued_task_display_id = None
+            self._last_issued_task_is_repeat_failure = False
             upload_visibility_context = dict(_task_visibility_context.get() or {})
             upload_visibility_context.update({
                 "capability": capability,
@@ -11242,7 +12861,7 @@ class MythicTools:
         }
         if timeout is not None:
             context_inputs["timeout"] = timeout
-        raw = await self.execute_capability(context_action, context_inputs)
+        raw = await self.execute_capability(asdict(context_action), context_inputs)
         try:
             payload = json.loads(raw)
         except Exception:
@@ -11472,6 +13091,23 @@ class MythicTools:
                 "authorization": authorization,
                 "bounded_delayed_proof_poll": self._capability_executor_allows_repeated_probe(command_obj),
             })
+            execution = _capability_execution_context.get() or {}
+            command_binding = None
+            if (
+                execution.get("client") is self
+                and execution.get("task") is asyncio.current_task()
+                and execution.get("capability") == capability_name
+                and execution.get("callback_id") == str(callback_id)
+            ):
+                command_binding = {
+                    "execution": execution,
+                    "task": asyncio.current_task(),
+                    "callback_id": str(callback_id),
+                    "capability": capability_name,
+                    "command": command_name,
+                    "parameters": copy.deepcopy(parameters),
+                }
+            command_token = _capability_command_context.set(command_binding)
             try:
                 output = await self.issue_task_and_waitfor_task_output(
                     command_name,
@@ -11480,6 +13116,7 @@ class MythicTools:
                     timeout=timeout,
                 )
             finally:
+                _capability_command_context.reset(command_token)
                 _task_visibility_context.reset(visibility_token)
         except Exception as exc:
             await self._notify_capability_command_observer(
@@ -16275,6 +17912,17 @@ class MythicTools:
             self._capability_text(domain).casefold(),
         )
 
+    def _current_account_context_keys(self) -> frozenset[tuple[str, str, str]]:
+        """Project only exact account contexts proven in this client process."""
+        logon = set(getattr(self, "_kerberos_logon_account_context_keys", set()) or set())
+        tickets = set(getattr(self, "_kerberos_account_context_keys", set()) or set())
+        return frozenset(
+            value for value in logon & tickets
+            if isinstance(value, tuple)
+            and len(value) == 3
+            and all(isinstance(item, str) and item for item in value)
+        )
+
     def _callback_current_identity_matches_account_context(
         self,
         callback_display_id,
@@ -16792,7 +18440,7 @@ class MythicTools:
                 # Preserve source identity in the existing output read, including for historical
                 # tasks from another callback. Command parameters are deliberately not fetched.
                 custom_return_attributes=(
-                    "id timestamp response_text task { id display_id status completed "
+                    "id timestamp response_text task { id operation_id display_id status completed "
                     "agent_task_id command_name timestamp callback { display_id } }"
                 ),
             )
@@ -16852,6 +18500,7 @@ class MythicTools:
 
     async def _supervised_task_state(
         self, task_display_id: int, callback_display_id: int, command: str,
+        parameters: str | dict | None = None,
     ) -> dict[str, Any]:
         """Observe one issued task's state; missing or mismatched metadata stays unknown."""
         unknown = {"task_completed": None, "task_status": ""}
@@ -16863,7 +18512,8 @@ class MythicTools:
             result = await asyncio.wait_for(mythic.execute_custom_query(
                 self.client,
                 "query supervisedTaskState($id:Int!){ task(where:{display_id:{_eq:$id}}){ "
-                "display_id completed status command_name callback { display_id } } }",
+                "display_id completed status command_name params original_params display_params "
+                "callback { display_id payload { payloadtype { name } } } } }",
                 variables={"id": task_id},
             ), timeout=5.0)
             rows = result.get("task", []) if isinstance(result, dict) else []
@@ -16871,11 +18521,78 @@ class MythicTools:
                 return unknown
             row = rows[0]
             callback = row.get("callback")
+            # Apollo's shell alias returns CommandName="run" during task creation. Bind
+            # that rewrite to the exact command line originally issued and displayed;
+            # no other shell command rename or absent parameter evidence is accepted.
+            command_matches = row.get("command_name") == command or (
+                command == "shell"
+                and row.get("command_name") == "run"
+                and isinstance(parameters, str)
+                and bool(parameters)
+                and row.get("original_params") == parameters
+                and row.get("display_params") == parameters
+            )
+            if not command_matches and command == "register_assembly" \
+                    and row.get("command_name") == "register_file":
+                def strict_object(value: object) -> dict[str, Any] | None:
+                    if isinstance(value, dict):
+                        return value
+                    if not isinstance(value, str) or not value.strip():
+                        return None
+                    try:
+                        def unique(pairs):
+                            result = {}
+                            for key, item in pairs:
+                                if key in result:
+                                    raise ValueError("duplicate key")
+                                result[key] = item
+                            return result
+                        decoded = json.loads(value, object_pairs_hook=unique)
+                    except (TypeError, ValueError):
+                        return None
+                    return decoded if isinstance(decoded, dict) else None
+
+                payload = callback.get("payload") if isinstance(callback, dict) else None
+                payloadtype = payload.get("payloadtype") if isinstance(payload, dict) else None
+                requested = strict_object(parameters)
+                original = strict_object(row.get("original_params"))
+                native = strict_object(row.get("params"))
+                native_file_id = (native or {}).get("file_id")
+                native_filename = (native or {}).get("file_name")
+                common_binding = bool(
+                    isinstance(payloadtype, dict)
+                    and str(payloadtype.get("name") or "").casefold() == "apollo"
+                    and requested is not None
+                    and requested == original
+                    and native is not None
+                    and isinstance(native_file_id, str) and bool(native_file_id)
+                    and isinstance(native_filename, str) and bool(native_filename)
+                    and row.get("display_params") == native_filename
+                )
+                default_selector = next(iter(requested), "") if requested is not None else ""
+                default_binding = bool(
+                    common_binding
+                    and default_selector in {"File", "file"}
+                    and set(requested) == {default_selector}
+                    and set(native) in (
+                        {"file_id", "file_name"},
+                        {"file", "file_id", "file_name"},
+                    )
+                    and requested[default_selector] == native_file_id
+                    and ("file" not in native or native["file"] == native_file_id)
+                )
+                existing_binding = bool(
+                    common_binding
+                    and set(requested) == {"existingFile"}
+                    and set(native) == {"file_id", "file_name"}
+                    and requested["existingFile"] == native_filename
+                )
+                command_matches = default_binding or existing_binding
             if (
                 self._exact_task_display_id(row.get("display_id")) != task_id
                 or not isinstance(callback, dict)
                 or self._exact_task_display_id(callback.get("display_id")) != callback_id
-                or row.get("command_name") != command
+                or not command_matches
                 or type(row.get("completed")) is not bool
             ):
                 return unknown
@@ -16942,8 +18659,8 @@ class MythicTools:
     async def _get_file_metadata(self, file_uuid: str) -> dict | None:
         """Look up filemeta for a Mythic file by its agent_file_id WITHOUT downloading the bytes.
 
-        Returns the filemeta dict (agent_file_id, complete, deleted, is_payload, filename_utf8,
-        chunks_received, total_chunks) or None if no file row matches the UUID. Used as a cheap
+        Returns the filemeta dict (id, agent_file_id, complete, deleted, is_payload, filename_utf8,
+        md5, sha1, chunks_received, total_chunks) or None if no file row matches the UUID. Used as a cheap
         pre-flight check so we don't pull multi-MB files into the agent process just to validate them.
         """
         if self.client is None:
@@ -16951,12 +18668,15 @@ class MythicTools:
         query = """
             query FileMetaByUuid($uuid: String!) {
                 filemeta(where: { agent_file_id: { _eq: $uuid } }, limit: 1) {
+                    id
                     agent_file_id
                     complete
                     deleted
                     is_payload
                     is_download_from_agent
                     filename_utf8
+                    md5
+                    sha1
                     chunks_received
                     total_chunks
                     task {
@@ -17794,7 +19514,7 @@ class MythicTools:
                           command {
                             cmd
                             commandparameters {
-                              name cli_name type description default_value choices parameter_group_name required
+                              name cli_name type description default_value choices dynamic_query_function parameter_group_name required verifier_regex
                             }
                             description
                             help_cmd
@@ -17846,8 +19566,10 @@ class MythicTools:
             description
             default_value
             choices
+            dynamic_query_function
             parameter_group_name
             required
+            verifier_regex
             }
             description
             help_cmd
@@ -18088,7 +19810,10 @@ class MythicTools:
         return False
 
     @classmethod
-    def _parameter_group_to_declare(cls, group, parameters, *, command: str = "") -> str | None:
+    def _parameter_group_to_declare(
+        cls, group, parameters, *, command: str = "", schema: Any = None,
+        file_identity: Mapping[str, Any] | None = None,
+    ) -> str | None:
         """The parameter group worth declaring to Mythic, or None when declaring it would hurt.
 
         Two independent reasons to stay silent, and the second is the important one.
@@ -18103,7 +19828,9 @@ class MythicTools:
         arguments`. Sage must keep the raw form available, because an agent whose credentials are
         not in Mythic's store (Merlin, unlike Apollo) can only be tasked that way. So the group is
         declared only when the blob actually carries a reference for Mythic to expand. Raw
-        material takes the same path it always took.
+        material takes the same path it always took. The other declaration case is a schema-typed
+        inline_assembly File parameter whose exact uploaded-file identity was already validated;
+        that group selects Mythic's intended File transport rather than a reference expansion.
         """
         name = str(group or "").strip()
         carries_reference = cls._carries_task_reference(parameters)
@@ -18119,7 +19846,17 @@ class MythicTools:
                     "and the reference may reach the agent unresolved"
                 )
             return None
-        if not carries_reference:
+        selected_file = cls._selected_inline_assembly_file_parameter(
+            command, schema, parameters, group
+        )
+        bound_file = isinstance(file_identity, Mapping) and file_identity.get("parameter")
+        carries_bound_file = bool(
+            selected_file is not None
+            and isinstance(bound_file, Mapping)
+            and selected_file == bound_file
+            and file_identity.get("agent_file_id") == selected_file.get("value")
+        )
+        if not carries_reference and not carries_bound_file:
             return None
         return name
 
@@ -18202,7 +19939,7 @@ class MythicTools:
             raise Exception(f"Failed to create task: {status.get('error')}")
         return status
 
-    async def _fetch_command_schema(self, command, callback_display_id):
+    async def _fetch_command_schema(self, command, callback_display_id, *, force_refresh=False):
         """Resolve the parameter-group schema for `command` on the callback's payload type.
 
         ISC-2.2: the fetch is delegated to the shared resolver, which removes the f-string-built
@@ -18210,7 +19947,7 @@ class MythicTools:
         could not distinguish from a real empty answer, so validation silently failed open.
 
         The RETURN CONTRACT is deliberately unchanged: a flat list of parameter dicts carrying the
-        same seven keys the old query selected, empty values included. That is not a preference —
+        original keys plus verifier and dynamic-selector metadata, empty values included. That is not a preference —
         this function has nine production callers and is stubbed in roughly seventy tests, all of
         which expect that shape. Grouping is consumed directly from the resolver by
         `_validate_command_parameters`, which is the one caller that wants it.
@@ -18228,12 +19965,15 @@ class MythicTools:
                 self._cmd_schema_cache = {}
 
             cache_key = (payload_type, command)
+            if force_refresh:
+                self._cmd_schema_cache.pop(cache_key, None)
             if cache_key not in self._cmd_schema_cache:
                 groups = await command_parameter_schema.get_command_schema(
                     self.client,
                     payload_type,
                     command,
                     include_example=False,
+                    use_cache=not force_refresh,
                     fields=command_parameter_schema.INTERNAL_SCHEMA_FIELDS,
                     drop_empty=False,
                 )
@@ -18497,6 +20237,11 @@ class MythicTools:
     ) -> str:
         """Match a plain-language goal to Sage's TTP library and return the tool's common_args/usage_examples + guidance, tailored to how the target callback's agent runs it. Consult this FIRST, before reaching for an offensive tool.
 
+        Library requirements and examples are reference material, not observed target state;
+        this lookup does not evaluate whether the callback meets technique prerequisites.
+        The resolved payload type identifies the agent only. An MCP connection status,
+        when returned, describes Sage's registry, not the contents of a graph.
+
         Caveat: progressive disclosure — rely on common_args/usage_examples; call
         get_ttp_full_reference(slug) only for an uncommon flag or exact output format.
         """
@@ -18526,6 +20271,22 @@ class MythicTools:
 
         result = {
             "slug": slug,
+            "reference_scope": {
+                "source": "local TTP and agent reference library",
+                "reference_fields": ["frontmatter", "guidance", "execution_on_agent"],
+                "prerequisites_evaluated": False,
+                "metadata_fields": {
+                    "payload_type": "Resolved callback agent type only.",
+                    "recommendation.connected": (
+                        "Sage MCP registry connection status, when present; graph contents are not queried."
+                    ),
+                },
+                "interpretation": (
+                    "Requirements and example identities describe the technique, not this callback. "
+                    "Establish applicability from separate observations; unobserved prerequisites remain unknown. "
+                    "A disconnected or unqueried data source does not establish that its contents are empty."
+                ),
+            },
             "alternatives": [s for s, _ in matches[1:]],
             "payload_type": payload_type,
             "frontmatter": frontmatter,

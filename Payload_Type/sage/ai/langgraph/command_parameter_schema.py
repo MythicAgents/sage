@@ -74,6 +74,7 @@ query SageCommandParameters($command_name: String!, $payload_type_name: String!)
         cli_name
         default_value
         description
+        dynamic_query_function
         name
         parameter_group_name
         required
@@ -111,7 +112,7 @@ VALIDATION_FIELDS = (
 _EMPTY = ("", [], {}, None)
 
 
-#: Exactly the seven fields the pre-consolidation internal query selected. `_fetch_command_schema`
+#: The pre-consolidation internal fields plus regex and dynamic-selector metadata. `_fetch_command_schema`
 #: has nine production callers and is stubbed in roughly seventy tests, all of which expect this
 #: shape, so it is a compatibility contract rather than a preference.
 INTERNAL_SCHEMA_FIELDS = (
@@ -122,9 +123,8 @@ INTERNAL_SCHEMA_FIELDS = (
     "required",
     "choices",
     "default_value",
-    # Eighth field, added for the ISC-4 rejection arm. Purely additive: no caller breaks by gaining
-    # a key, and validation reads its groups through this projection, so the arm cannot see a regex
-    # the internal path has stripped.
+    "dynamic_query_function",
+    # ISC-4's regex remains available to internal validation.
     "verifier_regex",
 )
 
@@ -138,7 +138,7 @@ def _select_fields(
     """Project a parameter onto `fields`.
 
     ``drop_empty`` exists for the internal path only. Dropping empties is most of the size win for
-    model-facing output, but the old internal query always returned all seven keys, and a caller
+    model-facing output, but the internal query returns its keys even when empty, and a caller
     doing `param["choices"]` rather than `param.get("choices")` would start raising KeyError if
     they vanished. Preserving them there costs nothing the model ever sees.
     """

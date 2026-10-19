@@ -90,6 +90,51 @@ a primary or impersonation token by duplication. See Microsoft's
 and [DuplicateTokenEx documentation](https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-duplicatetokenex).
 This is interpretation guidance, not a runtime fact checker or an instruction to issue extra tasks.
 
+## Bounded identity/access report
+
+In native conversation or supervised chat, `/report` (also `/report identity`) produces a runtime-authored
+report from matched task observations collected by assisted chats in the same operation
+engagement and persisted in dedicated operation-memory tables in `sage.db`. It performs a
+bounded read-only check of that exact operation's canonical engagement marker before local
+retrieval. It does not call a model, query live task output, or execute a target action.
+Only this explicit structured slash request selects
+the bounded report; ordinary exploratory answers retain their existing model-authored prose.
+
+The report recognizes a single qualified identity string from a matched `whoami` output,
+or its complete two-line `Primary Identity` / `Impersonation Identity` representation.
+The latter preserves both reported roles even when their strings match; it does not prove
+successful impersonation, authentication or access. The report also recognizes
+the explicit four-field host membership representation (`Host`, `PartOfDomain`, `Domain`,
+`Trust inventory`). Each observation requires a unique successful tool call/result pair and
+native collection-request metadata. Model prose, citations and evidence envelopes cannot
+replace a missing source. Collection request, callback, timestamps and partial/truncated
+limits remain visible; incomplete, conflicting and ambiguous observations cannot establish
+those fields. Bounded literal source excerpts are displayed separately from interpretation.
+
+An identity string does not establish account type; host membership does not establish access.
+Authentication/access remains unknown because this slice has no supported operation adapter.
+Unknown means unestablished in the supplied scope, not absent everywhere. The report's next
+checks are authored by runtime code based on supported observations and these unknowns.
+Arbitrary model reasons, prerequisites, headings and suggested actions are not interpolated.
+
+Collection reads the exact current session-generation checkpoint and admits only native
+matched task observations. Retrieval binds authenticated operation ID plus canonical Mythic
+engagement UUID, so another chat in the same engagement can report those observations without
+another task read, including after a Sage restart. Original collection channel/request/time
+remain provenance, not evidence of current execution. Exact repeats retain collection witnesses;
+conflicting revisions remain ambiguous, and explicit withdrawal cannot revive older revisions.
+Missing identity or a storage failure returns an unavailable notice instead of using mutable
+seed state or model text. At most eight bounded source records are displayed, with omitted
+history disclosed. Native action approvals remain independent of this read-only report.
+No finding type or execution prerequisite is added; shared observations do not restore chat
+scope, pending approvals or general model memory.
+
+This provides a narrow publication guarantee for `/report`, not a guarantee that
+general model-authored conversation is factually correct. Offline scripted tests exercise
+source binding and native publication; they do not establish live target state or general
+real-model reliability. The earlier broad advisory-wrapping candidate is superseded;
+`SAGE_ASSISTED_REPORTING` does not enable global wrapping.
+
 ## Research informing this design
 
 | Source | Design relevance | Limit of the evidence |

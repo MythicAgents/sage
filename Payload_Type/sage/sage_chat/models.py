@@ -123,8 +123,8 @@ _CONFIG_OPTIONS = [
         Type=OptType.Boolean,
         Description=(
             "Force deterministic multi-hop solving for this session. In supervised mode, controller moves "
-            "still require approval; off leaves scoped prompts on the supervisor while explicit objectives "
-            "still use approved solving. Equivalent to Mode=Autonomous when mode is auto."
+            "still require approval and completion requires objective evidence. Off keeps supervised "
+            "requests on the scoped graph workflow. Mode=Autonomous always enables objective solving."
         ),
         Required=False,
         DefaultValue=False,
@@ -135,7 +135,8 @@ _CONFIG_OPTIONS = [
         Type=OptType.Choice,
         Description=(
             "Hybrid is the default and has the model select from the complete deterministic admissible frontier "
-            "only at real branches. Symbolic keeps deterministic first-admissible selection. LLM calls the model "
+            "at real branches or after supervised Respond guidance. Symbolic keeps deterministic "
+            "first-admissible selection and cannot interpret Respond guidance. LLM calls the model "
             "on every nonempty frontier."
         ),
         Required=False,
