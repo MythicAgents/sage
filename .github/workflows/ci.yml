@@ -38,6 +38,18 @@ jobs:
           python-version: "3.14"
           cache: pip
           cache-dependency-path: Payload_Type/sage/requirements-dev.txt
+      - name: Install bubblewrap for sandboxed eval-gauge tests
+        # The sage-eval-gauge diagnostic scripts (diagnostic_isolation / capture_service_probe /
+        # phoenix_startup_probe) shell out to /usr/bin/bwrap to sandbox their child processes. It
+        # ships with desktop Linux but not the minimal runner, so without it those tests fail with
+        # FileNotFoundError on /usr/bin/bwrap. ubuntu-24.04 also restricts unprivileged user
+        # namespaces via AppArmor, which bwrap needs — relax it when the knob is present.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          fi
       - name: Create repo-root venv and install (dev deps + constraints pins)
         run: |
           python -m venv .venv
@@ -68,18 +80,20 @@ jobs:
         run: ./.venv/bin/python -m pytest tests/repo_hygiene -q
 
   # 2b. Secret scanner: catches what unit tests cannot — an accidentally committed credential or
-  #     .env value. Scans full history on push, the PR range on pull_request. Free for public repos,
-  #     uses the built-in GITHUB_TOKEN (no secret to add).
+  #     .env value. Uses TruffleHog, whose action needs no license on org-owned repos (gitleaks-action
+  #     gates orgs behind a paid GITLEAKS_LICENSE). verified,unknown keeps the signal high: confirmed
+  #     live secrets plus ones it could not disprove. fetch-depth: 0 gives it the commit range to scan.
   secret-scan:
-    name: Secret scan (gitleaks)
+    name: Secret scan (trufflehog)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: TruffleHog secret scan
+        uses: trufflesecurity/trufflehog@v3.98.0
+        with:
+          extra_args: --results=verified,unknown
 
   # 3. Payload image build lives in container.yml (build-only on PRs, publish to GHCR on main). It
   #    builds the image the way Mythic does — context Payload_Type/sage, runtime manifest + the
