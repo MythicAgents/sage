@@ -13,7 +13,7 @@ name: CI (offline boundary)
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
   workflow_dispatch:
 
