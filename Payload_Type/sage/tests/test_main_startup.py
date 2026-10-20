@@ -17,8 +17,9 @@ class _PhoenixReached(RuntimeError):
     pass
 
 
+@pytest.mark.parametrize("phoenix_override", [False, True])
 @pytest.mark.parametrize("metered", [False, True])
-def test_main_creates_absolute_phoenix_working_dir_before_launch(monkeypatch, tmp_path, metered):
+def test_main_creates_absolute_phoenix_working_dir_before_launch(monkeypatch, tmp_path, metered, phoenix_override):
     meter_calls = []
     if metered:
         monkeypatch.setenv("SAGE_RESOURCE_BUDGET_CONFIG", "fixture-config")
@@ -36,7 +37,14 @@ def test_main_creates_absolute_phoenix_working_dir_before_launch(monkeypatch, tm
     runtime_root.mkdir()
     runtime_main = runtime_root / "main.py"
     shutil.copy2(SAGE_ROOT / "main.py", runtime_main)
-    expected = runtime_root / ".phoenix"
+    # Default: the service dir's .phoenix. Override: an operator-set PHOENIX_WORKING_DIR must win so a
+    # deployment on a filesystem SQLite can't lock (e.g. a macOS bind mount) can relocate the DB.
+    if phoenix_override:
+        expected = tmp_path / "custom-phoenix"
+        monkeypatch.setenv("PHOENIX_WORKING_DIR", str(expected))
+    else:
+        monkeypatch.delenv("PHOENIX_WORKING_DIR", raising=False)
+        expected = runtime_root / ".phoenix"
 
     dotenv = ModuleType("dotenv_bootstrap")
     dotenv.load_sage_dotenv = lambda: ()

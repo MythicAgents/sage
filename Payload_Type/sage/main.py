@@ -71,9 +71,15 @@ if ssl_cert_file:
 else:
     logger.info(f"No custom SSL certificate bundle found at {certs_dir / 'bundle.pem'}, using system defaults")
 
-_phoenix_working_dir = Path(__file__).resolve().parent / ".phoenix"
-_phoenix_working_dir.mkdir(parents=True, exist_ok=True)
-os.environ["PHOENIX_WORKING_DIR"] = str(_phoenix_working_dir)
+# Phoenix's SQLite DB defaults to the service directory, which Mythic bind-mounts, so it persists
+# outside the container across restarts. Let an operator override the location, though: a deployment
+# whose service dir is on a filesystem SQLite cannot lock (e.g. a macOS Docker Desktop / OrbStack bind
+# mount, where SQLite fails with "unable to open database file") sets PHOENIX_WORKING_DIR to a writable
+# path instead. This mirrors how sage.db honors SAGE_DATABASE_PATH. Existing non-empty environment
+# wins; an empty value sets nothing, matching the project's .env precedence rules.
+if not os.environ.get("PHOENIX_WORKING_DIR", "").strip():
+    os.environ["PHOENIX_WORKING_DIR"] = str(Path(__file__).resolve().parent / ".phoenix")
+Path(os.environ["PHOENIX_WORKING_DIR"]).mkdir(parents=True, exist_ok=True)
 
 # Cap span attribute value size BEFORE the tracer provider is built (register() reads
 # OTel SpanLimits from env at SDK init). With register(batch=False) each span exports
