@@ -1,0 +1,30 @@
+name: Release version check
+
+# A hand-maintained version string (agent_capabilities.json "agent_version") inevitably drifts from
+# the actual release unless something enforces it. This gate fails a release tag whose value does not
+# match agent_version, so the field cannot silently rot. The git commit and source fingerprint remain
+# the discipline-free "which code is this" signal (see Payload_Type/sage/_version.py); this only keeps
+# the human-facing label honest at the moment it matters — tagging a release.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  version-match:
+    name: Tag matches agent_capabilities.json
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare release tag to declared agent_version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"                        # v1.0 -> 1.0
+          declared="$(jq -r '.agent_version' agent_capabilities.json)"
+          echo "release tag: $tag    agent_capabilities.json agent_version: $declared"
+          if [ "$tag" != "$declared" ]; then
+            echo "::error::Release tag '$tag' != agent_capabilities.json agent_version '$declared'. Bump agent_version to match before tagging."
+            exit 1
+          fi

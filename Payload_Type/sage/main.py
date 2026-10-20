@@ -26,6 +26,19 @@ if os.environ.get("SAGE_RESOURCE_BUDGET_CONFIG") or os.environ.get("SAGE_RESOURC
 
 import mythic_container
 from mythic_container.logging import logger
+
+# Log a version banner first thing so the container's logs always state exactly which Sage is running:
+# the declared version, the commit the image was built from (SAGE_GIT_COMMIT, "unknown" for a plain
+# mythic-cli build), and a fingerprint of the live source tree. This is the deployed-version signal
+# operators otherwise lack — it survives Mythic copying the source without usable git metadata, and
+# logging both the baked build commit and the live source fingerprint makes a stale-source / stale-image
+# mismatch visible at boot. Best-effort: a banner failure must never stop the service from starting.
+try:
+    from _version import startup_banner as _sage_startup_banner
+    logger.info(_sage_startup_banner())
+except Exception as _banner_exc:  # pragma: no cover - banner is best-effort, never fatal
+    logger.info(f"Sage version banner unavailable: {_banner_exc}")
+
 import sage_chat # Registers SageChat (native v4.0.0 chat container) via Chat.__subclasses__().
                  # Phase 4 complete: the PayloadType (`container`) has been removed — Sage is chat-only.
 if _observation_capture:

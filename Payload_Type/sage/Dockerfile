@@ -61,6 +61,19 @@ ENV SAGE_BLOODHOUND_MCP_DIR=/opt/bloodhound_mcp
 # value Mythic injects still wins over this, which keeps a per-deployment override possible.
 ENV LANGGRAPH_STRICT_MSGPACK=true
 
+# Build provenance: CI bakes the exact commit and the release version read from the repo-root
+# agent_capabilities.json (which is NOT copied into the service dir, so the container could not
+# otherwise know it). A plain `mythic-cli` build leaves both "unknown" — the live source fingerprint
+# still identifies the code. Baked as ENV so main.py logs them at startup, and as OCI labels for
+# `docker inspect`. Declared just before the app COPY so a change never busts the dependency layers
+# above.
+ARG SAGE_GIT_COMMIT=unknown
+ARG SAGE_AGENT_VERSION=unknown
+ENV SAGE_GIT_COMMIT=${SAGE_GIT_COMMIT}
+ENV SAGE_AGENT_VERSION=${SAGE_AGENT_VERSION}
+LABEL org.opencontainers.image.revision=${SAGE_GIT_COMMIT}
+LABEL org.opencontainers.image.version=${SAGE_AGENT_VERSION}
+
 WORKDIR /Mythic/
 
 COPY [".", "."]

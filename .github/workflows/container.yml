@@ -64,11 +64,20 @@ jobs:
             org.opencontainers.image.description=${{ github.repository }} container for use with Mythic
             org.opencontainers.image.licenses=GPL-3.0-or-later
 
+      - name: Read release version from agent_capabilities.json
+        id: ver
+        run: echo "agent_version=$(jq -r '.agent_version' agent_capabilities.json)" >> "$GITHUB_OUTPUT"
+
       - name: Build and (main only) push the Sage image
         uses: docker/build-push-action@v6
         with:
           context: Payload_Type/sage
           file: Payload_Type/sage/Dockerfile
+          # Bake the exact commit and release version into the image so `main.py`'s startup banner and
+          # `docker inspect` report the build provenance (see Payload_Type/sage/_version.py).
+          build-args: |
+            SAGE_GIT_COMMIT=${{ github.sha }}
+            SAGE_AGENT_VERSION=${{ steps.ver.outputs.agent_version }}
           # Both archs per project policy. arm64 builds under QEMU emulation (the image git-fetches
           # the BloodHound MCP and runs `uv sync`), so expect this job to be slow; the gha cache below
           # keeps repeat builds reasonable.
