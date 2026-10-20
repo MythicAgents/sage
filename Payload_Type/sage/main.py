@@ -71,6 +71,13 @@ if ssl_cert_file:
 else:
     logger.info(f"No custom SSL certificate bundle found at {certs_dir / 'bundle.pem'}, using system defaults")
 
+# Nothing else opens sage.db until the first chat turn, so an unusable location would otherwise surface
+# only as a bare "unable to open database file" in the channel. Fail here instead, naming the path and
+# SAGE_DATABASE_PATH. The probe also creates the parent directory of a configured path.
+from runtime_db import probe_database
+
+logger.info(f"Sage database: {probe_database()}")
+
 # Phoenix's SQLite DB defaults to the service directory, which Mythic bind-mounts, so it persists
 # outside the container across restarts. Let an operator override the location, though: a deployment
 # whose service dir is on a filesystem SQLite cannot lock (e.g. a macOS Docker Desktop / OrbStack bind

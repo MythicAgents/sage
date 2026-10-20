@@ -44,6 +44,7 @@ services, and Sage-local attack artifacts are not admissible proof of an objecti
 - [Repository layout](#repository-layout)
 - [Requirements](#requirements)
 - [Install and run Sage](#install-and-run-sage)
+- [SQLite on macOS Docker Desktop / OrbStack](#sqlite-on-macos-docker-desktop--orbstack)
 - [Using Sage in chat](#using-sage-in-chat)
 - [Tools and capabilities](#tools-and-capabilities)
 - [Configuration load order](#configuration-load-order)
@@ -278,6 +279,26 @@ see [Using Sage in chat](#using-sage-in-chat).
 
 BloodHound is the one exception to per-chat configuration: its connection is process-global, so you fill the
 `BLOODHOUND_*` fields in once and leave them blank in later chats. See [BloodHound](#bloodhound).
+
+### SQLite on macOS Docker Desktop / OrbStack
+
+Sage keeps two SQLite databases in its service directory (`InstalledServices/sage/`), which Mythic bind-mounts
+into the container: `sage.db` and `.phoenix/phoenix.db`. On macOS, Docker Desktop and OrbStack share that
+directory through a file-sharing layer that does not support SQLite's locking. SQLite then reports
+`unable to open database file`.
+
+Move both databases to a path inside the container. Add these lines to `InstalledServices/sage/.env`, either
+from the Mythic UI's container file browser or from your Mythic directory, then restart the Sage container:
+
+```bash
+echo 'PHOENIX_WORKING_DIR=/opt/sage_data' | sudo tee -a InstalledServices/sage/.env
+echo 'SAGE_DATABASE_PATH=/opt/sage_data/sage.db' | sudo tee -a InstalledServices/sage/.env
+```
+
+You must set both. Startup creates the directories, checks that `sage.db` can be opened and locked, and stops
+with an error that names the path if it cannot. The databases survive a container restart but are deleted when
+the container is recreated, for example by a rebuild or reinstall. Archive them first if you need the history
+(see [Runtime state and clean resets](#runtime-state-and-clean-resets)).
 
 ### Local development
 

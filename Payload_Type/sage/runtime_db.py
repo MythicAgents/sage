@@ -26,6 +26,40 @@ def database_path() -> Path:
     return _ROOT / "sage.db"
 
 
+class DatabaseUnavailable(sqlite3.OperationalError):
+    """sage.db cannot be opened or locked; the message names the path and the setting to change."""
+
+
+def unavailable_message(path: str | Path, error: BaseException) -> str:
+    # SQLite's own text ("unable to open database file") names neither the file nor the fix.
+    return (
+        f"Sage database {path}: {error}. If SQLite cannot create or lock files there (for example a "
+        f"macOS Docker Desktop or OrbStack bind mount), set {DATABASE_ENV} to an absolute path on a "
+        "filesystem that supports SQLite locking."
+    )
+
+
+def probe_database(path: str | Path | None = None) -> Path:
+    """Open sage.db the way the runtime will, so an unusable location fails at startup, not on a chat turn.
+
+    Creates the parent directory, then enables WAL (as the checkpointer and operation memory do) and
+    takes a write lock, which is where an unlockable filesystem fails.
+    """
+    target = Path(path) if path is not None else database_path()
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(target, timeout=5)
+        try:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("BEGIN IMMEDIATE")
+            connection.rollback()
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error) as exc:
+        raise DatabaseUnavailable(unavailable_message(target, exc)) from exc
+    return target
+
+
 def legacy_operation_memory_path(target: str | Path | None = None) -> Path:
     # The old store was fixed at the source root, even when Sage ran from a
     # different cwd. A configured destination must not conceal that file.

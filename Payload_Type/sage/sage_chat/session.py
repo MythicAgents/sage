@@ -9,11 +9,12 @@ container reuses the same registry the PayloadType path used, keyed by channel i
 from __future__ import annotations
 
 import aiosqlite
+import sqlite3
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from mythic_container.ChatBase import ChatRequest
-from runtime_db import database_path
+from runtime_db import DatabaseUnavailable, database_path, unavailable_message
 
 try:  # package vs. flat import, matching the rest of ai/langgraph
     from ai.langgraph.model import add_session, get_session, remove_session
@@ -36,19 +37,24 @@ async def claim_channel_marker(request: ChatRequest) -> bool:
     distinguish a restarted channel from a new channel even when Mythic sends empty
     Context. Database failures propagate and stop the request before Model invocation.
     """
-    async with aiosqlite.connect(_CHANNEL_MARKER_DB_PATH or database_path(), timeout=5) as db:
-        await db.execute(
-            "CREATE TABLE IF NOT EXISTS sage_chat_channel_markers ("
-            "operation_id INTEGER NOT NULL, channel_id INTEGER NOT NULL, "
-            "PRIMARY KEY (operation_id, channel_id))"
-        )
-        cursor = await db.execute(
-            "INSERT OR IGNORE INTO sage_chat_channel_markers "
-            "(operation_id, channel_id) VALUES (?, ?)",
-            (int(request.OperationID), int(request.ChannelID)),
-        )
-        await db.commit()
-        return cursor.rowcount == 1
+    path = _CHANNEL_MARKER_DB_PATH or database_path()
+    try:
+        async with aiosqlite.connect(path, timeout=5) as db:
+            await db.execute(
+                "CREATE TABLE IF NOT EXISTS sage_chat_channel_markers ("
+                "operation_id INTEGER NOT NULL, channel_id INTEGER NOT NULL, "
+                "PRIMARY KEY (operation_id, channel_id))"
+            )
+            cursor = await db.execute(
+                "INSERT OR IGNORE INTO sage_chat_channel_markers "
+                "(operation_id, channel_id) VALUES (?, ?)",
+                (int(request.OperationID), int(request.ChannelID)),
+            )
+            await db.commit()
+            return cursor.rowcount == 1
+    except sqlite3.OperationalError as exc:
+        # This is the first sage.db access on a chat turn; name the file in the operator-facing error.
+        raise DatabaseUnavailable(unavailable_message(path, exc)) from exc
 
 def channel_session_key(request: ChatRequest) -> str:
     return str(request.ChannelID)

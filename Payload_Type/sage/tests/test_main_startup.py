@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 import runpy
 import shutil
@@ -17,9 +18,12 @@ class _PhoenixReached(RuntimeError):
     pass
 
 
+@pytest.mark.parametrize("database", ["nested", "unusable"])
 @pytest.mark.parametrize("phoenix_override", [False, True])
 @pytest.mark.parametrize("metered", [False, True])
-def test_main_creates_absolute_phoenix_working_dir_before_launch(monkeypatch, tmp_path, metered, phoenix_override):
+def test_main_creates_absolute_phoenix_working_dir_before_launch(
+    monkeypatch, tmp_path, metered, phoenix_override, database
+):
     meter_calls = []
     if metered:
         monkeypatch.setenv("SAGE_RESOURCE_BUDGET_CONFIG", "fixture-config")
@@ -45,6 +49,12 @@ def test_main_creates_absolute_phoenix_working_dir_before_launch(monkeypatch, tm
     else:
         monkeypatch.delenv("PHOENIX_WORKING_DIR", raising=False)
         expected = runtime_root / ".phoenix"
+    # A configured sage.db in a missing directory is created and probed before Phoenix starts. One SQLite
+    # cannot open (here a directory) stops startup with an error that names the path.
+    sage_db = tmp_path / "data" / "nested" / "sage.db"
+    if database == "unusable":
+        sage_db.mkdir(parents=True)
+    monkeypatch.setenv("SAGE_DATABASE_PATH", str(sage_db))
 
     dotenv = ModuleType("dotenv_bootstrap")
     dotenv.load_sage_dotenv = lambda: ()
@@ -66,6 +76,7 @@ def test_main_creates_absolute_phoenix_working_dir_before_launch(monkeypatch, tm
         assert configured == expected
         assert configured.is_absolute()
         assert configured.is_dir()
+        assert sage_db.is_file()
         raise _PhoenixReached
 
     phoenix.launch_app = launch_app
@@ -87,8 +98,15 @@ def test_main_creates_absolute_phoenix_working_dir_before_launch(monkeypatch, tm
     monkeypatch.chdir(unrelated_cwd)
 
     try:
-        with pytest.raises(_PhoenixReached):
-            runpy.run_path(str(runtime_main), run_name="__main__")
+        if database == "unusable":
+            from runtime_db import DatabaseUnavailable
+
+            expected_error = re.escape(f"Sage database {sage_db}: ") + ".*SAGE_DATABASE_PATH"
+            with pytest.raises(DatabaseUnavailable, match=expected_error):
+                runpy.run_path(str(runtime_main), run_name="__main__")
+        else:
+            with pytest.raises(_PhoenixReached):
+                runpy.run_path(str(runtime_main), run_name="__main__")
     finally:
         if expected.exists():
             expected.rmdir()
