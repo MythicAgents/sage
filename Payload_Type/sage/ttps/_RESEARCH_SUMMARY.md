@@ -140,6 +140,5 @@ credential-hunting-checklist, acl-abuse-chain, ntlm-disable-check, roasting-with
 ---
 
 
-*Target from brief: 30-50 files. Actual: 169 files, ~18,400 lines.*
-*All Tier 1 complete with Full References. All Tier 2 complete. Tier 3+ comprehensive.*
-*BOF ecosystem documented across 9+ dedicated files with Athena/Apollo gap mapping.*
+*All Tier 1 entries include Full References. BOF coverage spans 9+ dedicated files with Athena/Apollo
+gap mapping.*

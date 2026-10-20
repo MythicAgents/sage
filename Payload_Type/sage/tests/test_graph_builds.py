@@ -11,17 +11,15 @@ That synthetic node inherits the node-default timeout, and LangGraph refuses to 
 a sync node. If the handler is `def` rather than `async def`, `_rebuild_graph` raises and every
 request fails — including "Hello" — before any model call, while the offline suite stays green.
 
-Why the existing tests could not catch it, which is the reusable lesson:
+Two kinds of test miss this, which is the reusable lesson:
 
-  * `test_node_failure_handler.py` does build a real `StateGraph`, but a HAND-BUILT stand-in that
-    omitted `set_node_defaults`. A representative graph drifts from the real graph, and the drift is
-    invisible precisely where the two features meet.
-  * `test_task_timeout_config.py::test_graph_build_applies_the_timeout_policy` asserts the STRINGS
-    `set_node_defaults` and `TimeoutPolicy` appear in the source of `_rebuild_graph`, parsed with
-    `ast`. A test that reads source text cannot fail for a reason that lives in behaviour.
+  * A HAND-BUILT stand-in `StateGraph` drifts from the real graph, and the drift is invisible
+    precisely where the two features meet.
+  * A test that asserts strings such as `set_node_defaults` and `TimeoutPolicy` appear in the
+    source of `_rebuild_graph` cannot fail for a reason that lives in behaviour.
 
 So the rule this file encodes: **assert on the artifact, not on a stand-in for it.** The cheapest
-possible test — "does the thing assemble?" — did not exist, and it is the one that mattered.
+possible test — "does the thing assemble?" — is the one that matters.
 
 Deliberately hermetic. `init_chat_model` builds a client object without contacting a provider, so a
 dummy key and an unroutable base URL are enough; the Mythic client is a mock that fails loudly if the

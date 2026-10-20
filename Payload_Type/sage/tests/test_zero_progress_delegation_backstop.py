@@ -1,10 +1,10 @@
 """The cause-agnostic no-progress delegation backstop.
 
-Regression for the supervised re-approval livelock: `Mythic_Operator` returned zero messages after
-a HITL-approved `whoami` that had already SUCCEEDED, so the Supervisor re-delegated the identical
-objective and the operator was re-carded ~12 times.
+Regression for the supervised re-approval livelock: when `Mythic_Operator` returns zero messages
+after a HITL-approved action that already SUCCEEDED, the Supervisor re-delegates the identical
+objective and the operator is re-carded over and over.
 
-Three distinct causes have produced this one symptom (dead callback, contract self-denial,
+Several distinct causes produce this one symptom (dead callback, contract self-denial,
 lost handback), so these tests assert the guard keys on the SYMPTOM — zero progress — and
 never on a cause. A guard that enumerates causes misses the fourth.
 """

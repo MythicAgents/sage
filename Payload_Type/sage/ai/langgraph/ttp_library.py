@@ -9,7 +9,7 @@ Schemas:
   - TTP files          -> see the schema documented in this module
   - Mythic-agent files -> see the schema documented in this module
 
-Progressive disclosure (mirrors Claude Code's SKILL.md pattern):
+Progressive disclosure (the SKILL.md pattern):
   - ``get_ttp_guidance``      returns frontmatter + body UP TO "## Full Reference"
   - ``get_ttp_full_reference`` returns ONLY the "## Full Reference" section
 """

@@ -2,9 +2,8 @@
 
 Maps a Mythic ``ChatRequest`` onto the exact keyword arguments the existing
 ``ai.langgraph.model.Model`` constructor already expects — so ``Model.__init__`` is
-reused unchanged. The legacy PayloadType path built the same
-``config["configurable"]`` dict in ``container/agent_functions/chat.py:262-279``; this
-module reproduces that shape from chat primitives instead of task args.
+reused unchanged. This module builds the ``config["configurable"]`` dict from chat
+primitives.
 
 Precedence: ``ChatRequest.Config`` (per-chat UI) → ``ChatSecretView``
 (Mythic user secret) → container environment variable. The first non-empty wins.

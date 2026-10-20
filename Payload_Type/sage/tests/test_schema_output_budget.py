@@ -4,9 +4,8 @@ Two different ceilings, and conflating them is the mistake this file exists to p
 
 `model.py:967` defines `_compact_tool_result_str(trigger=4000, ceiling=16000)`: 4,000 is where a
 tool result gets COMPACTED, 16,000 is where it gets hard-TRUNCATED. But all three schema tools sit
-in `_COMPACTION_PROTECTED_TOOLS`, so neither applies to them by the normal path — that exemption is
-itself a fix, added after a 75,650-char payload was truncated to 16,000 and the model
-started guessing parameters.
+in `_COMPACTION_PROTECTED_TOOLS`, so neither applies to them by the normal path. The exemption
+exists because a schema payload truncated to 16,000 chars leaves the model guessing parameters.
 
 So the operative limits are:
 

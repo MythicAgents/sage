@@ -2543,7 +2543,7 @@ class MythicTools:
         # This map is a ONE-HOP declaration, so it must carry the transitive closure of what a
         # root actually reaches — not just its direct callees. `ensure_tool_uploaded` is reached
         # from `issue_task_and_waitfor_task_output`'s own registered-file preflight
-        # (`_ensure_registered_file_available`, called at :4893), and the two roots below reach
+        # (`_ensure_registered_file_available`), and the two roots below reach
         # that preflight through it. Omitting those three edges deadlocked a live request: the
         # operator approved `issue_task_and_waitfor_task_output` for `execute_assembly`, its
         # preflight tried to register the assembly, coverage denied `ensure_tool_uploaded` as a
@@ -2814,11 +2814,12 @@ class MythicTools:
                     "supervised request lacks an exact active approval claim"
                 )
             if tool_name:
-                # Record approval-coverage denials the way authority (:4594) and liveness
-                # (:4631) already do. Without this `_last_effect_denial` stays unset, so
-                # `Model._handle_reproposal_after_denial` — the loop-breaker built for exactly this
-                # — is structurally blind to the whole approval-coverage denial class. Without this,
-                # an approval-coverage denial can re-card the same task until the operator stops it.
+                # Record approval-coverage denials the way the authority and liveness
+                # gates in the issue path already do. Without this `_last_effect_denial`
+                # stays unset, so `Model._handle_reproposal_after_denial` — the loop-breaker
+                # built for exactly this — is structurally blind to the whole approval-coverage
+                # denial class, and such a denial can re-card the same task until the operator
+                # stops it.
                 return self._note_effect_denial(
                     self._approval_effect_blocker(
                         tool_name,

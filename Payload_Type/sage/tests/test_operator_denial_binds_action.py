@@ -14,11 +14,11 @@ Two mechanisms already existed and both missed:
 2. That digest check is skipped entirely when a typed contract is installed — which is the supervised
    path, i.e. the only path where operator rejections happen at all.
 
-The fix keys denials on `_guarded_action_key` — (tool, command, callback), typed fields only, no
+Denials are keyed on `_guarded_action_key` — (tool, command, callback), typed fields only, no
 prose — and checks it regardless of the typed contract.
 
-This is Claude Code parity, deliberately: a denied action is closed, but the agent stays free to try
-a DIFFERENT approach. Rejection does not end the request.
+Deliberately: a denied action is closed, but the agent stays free to try a DIFFERENT approach.
+Rejection does not end the request.
 """
 import sys
 from pathlib import Path
