@@ -1439,9 +1439,9 @@ class SageChat(Chat):
                             operator_error_text,
                         )
                     # A DELIBERATE halt (step budget exhausted, operator stop) arrives here as an
-                    # argless exception, so it used to render the bare "Sage request failed." — an
-                    # intentional stop presented as an unexplained crash, once after the requested
-                    # work had already completed. When the exception states why it halted, render
+                    # argless exception, which would otherwise render as the bare "Sage request
+                    # failed." and present an intentional stop as an unexplained crash, even after
+                    # the requested work completed. When the exception states why it halted, render
                     # that reason through the same notice table `/stop` and session rotation use.
                     halt_reason = str(getattr(error, "stop_reason", "") or "")
                     if halt_reason:

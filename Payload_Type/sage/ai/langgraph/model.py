@@ -1493,9 +1493,9 @@ class _OperatorStopRequested(Exception):
     _StopCheckMiddleware at each model/tool boundary inside the agent, breaks out promptly; the outer
     invoke() try/except catches it and ends the session cleanly.
 
-    It carries WHY it halted, because the service's error path used to render every one of these as
-    the generic "Sage request failed." — a deliberate, fully-understood stop presented to the operator
-    as an unexplained crash, in one case after the requested work had already succeeded.
+    It carries WHY it halted, so the service's error path can show the reason. Without it every one
+    of these would render as the generic "Sage request failed.", presenting a deliberate stop to the
+    operator as an unexplained crash, even after the requested work had already succeeded.
 
     `super().__init__()` is called with NO arguments on purpose: the reason travels as attributes, so
     `str(exc)` stays empty and `operator_error_text` behaves exactly as before. A reason token like
