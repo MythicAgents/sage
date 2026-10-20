@@ -16,7 +16,7 @@ Subcommands:
   verify    report foothold readiness only (no mutation)
 
 All state-changing steps are explicit and named. Nothing here touches Mythic's records; the worst
-case is a range restorable by `ludus snapshots revert` (49R-03). Uniqueness is gated: if more than
+case is a range restorable by `ludus snapshots revert`. Uniqueness is gated: if more than
 one new live Apollo callback appears, the attempt is reported non-countable rather than guessed.
 
 Evidence discipline: readiness is probed by execution (native_chat inspect), never introspected.

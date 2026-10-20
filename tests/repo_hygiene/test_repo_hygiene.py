@@ -262,3 +262,112 @@ def test_no_layout_encoding_paths_outside_the_known_one_off_scripts():
         f"one-off-script debt grew to {len(one_off_debt)} (cap {_LAYOUT_PATH_DEBT}); "
         "new scripts must not hardcode a home directory: " + ", ".join(sorted(one_off_debt))
     )
+
+
+# Private-context leaks that coding assistants tend to write into comments, docstrings, and
+# messages: references to the private issue tracker, people and private reviewer handles,
+# private plan identifiers, and pointers to private planning documents. None resolve for a
+# reader of a public clone. Each rule is (pattern, path prefixes it does not apply to).
+#
+# The eval subsystem is exempt from the plan-identifier and Plans/ rules because there those
+# labels are still the names of protocols, CLI flags, ledger fields, and output paths implemented
+# in code. Renaming them is a code change, not a comment fix; shrink this list as that work lands.
+_EVAL_SUBSYSTEM = (
+    "Payload_Type/sage/ai/hillclimb/",
+    "Payload_Type/sage/evals/",
+    "skills/sage-eval-gauge/",
+    "skills/sage-canary-attestation/",
+    "ludus/",
+)
+_PRIVATE_CONTEXT_RULES = {
+    "private issue tracker": (re.compile(r"\bcairn\b|Ne0nd0g/cairn", re.IGNORECASE), ()),
+    "person or private reviewer": (
+        re.compile(
+            r"\bRussel\b|\bSilas\b|\bCato\b|\bCody\b|\bAdvisor (?:review|flag|case|Q\d)"
+            r"|\bForge (?:#\d|NEW-\d|finding|audit|caught|flagged|H\d|N\d|HIGH|MEDIUM|LOW)\b"
+            r"|Codex/Grok"
+        ),
+        (),
+    ),
+    # ISC40-Qnn are the tradecraft question keys of the eval data set (code, not commentary).
+    "private plan identifier": (
+        re.compile(r"\bISC-?(?!40-Q)\d+[a-z]?\b|\b49R-\d+\b|\bWP-?\d+\b"),
+        _EVAL_SUBSYSTEM,
+    ),
+    "pointer to a private plan document": (re.compile(r"\bPlans/[\w./-]+\.md\b"), _EVAL_SUBSYSTEM),
+}
+_PRIVATE_CONTEXT_EXEMPT = {
+    # This file: it must name the patterns in order to search for them.
+    "tests/repo_hygiene/test_repo_hygiene.py",
+    # Fixture for the review-lease contract, which still carries criterion IDs as data.
+    "skills/sage-architecture-governor/tests/test_review_lease.py",
+}
+
+
+def _private_context_offenders(relative_path: str, text: str) -> list[str]:
+    found = []
+    for label, (pattern, exempt_prefixes) in _PRIVATE_CONTEXT_RULES.items():
+        if relative_path.startswith(exempt_prefixes):
+            continue
+        for number, line in enumerate(text.splitlines(), 1):
+            if pattern.search(line):
+                found.append(f"{relative_path}:{number} ({label}): {line.strip()[:120]}")
+    return found
+
+
+def test_private_context_patterns_catch_leaks_and_spare_near_misses():
+    """The guard is only as good as its patterns: prove each can fail, and where it must not."""
+    leaks = [
+        "# Rotation-proof shape cap (cairn #58)",
+        "Shown once per session (Russel 2026-08-11)",
+        "global drift could fake progress — Forge #4",
+        "the cross-forest DCSync hazard Forge caught",
+        "# ISC-4: no further target-facing task issues in this turn",
+        "seals the 49R-16 decision record",
+        "Design points (Plans/SAGE_EVAL_GAUGE_PHASE0_ISA.md):",
+    ]
+    near_misses = [
+        "Forge a golden ticket with the child krbtgt",
+        "Steal or Forge Kerberos Tickets",
+        'expected = {"ISC40-Q03", "ISC40-Q07.1"}',
+        "Sealed evidence belongs under .sage_history/, never Plans/",
+        "the cairn of stones",  # still caught: the tracker name is never safe in this repo
+    ]
+    for leak in leaks:
+        assert _private_context_offenders("Payload_Type/sage/x.py", leak), f"missed leak: {leak}"
+    for text in near_misses[:-1]:
+        assert not _private_context_offenders("Payload_Type/sage/x.py", text), (
+            f"false positive: {text}"
+        )
+    assert _private_context_offenders("Payload_Type/sage/x.py", near_misses[-1])
+    assert not _private_context_offenders(
+        "Payload_Type/sage/ai/hillclimb/x.py", "# ISC-11 canary contract identity"
+    ), "the eval subsystem keeps its protocol names"
+
+
+def test_no_private_context_in_tracked_files():
+    """No tracked file names the private tracker, a person, a private reviewer, a private plan
+    identifier, or a private plan document. Comments, docstrings, messages, and docs all count:
+    a public reader can resolve none of them."""
+    listing = subprocess.run(
+        ["git", "ls-files"], cwd=REPO_ROOT, capture_output=True, text=True
+    )
+    tracked = listing.stdout.split() if listing.returncode == 0 else []
+    assert len(tracked) >= 300, (
+        f"git ls-files returned {len(tracked)} paths (rc={listing.returncode}); this test needs a "
+        "real git checkout, and a green result without one would prove nothing"
+    )
+
+    offenders = []
+    for relative_path in tracked:
+        if relative_path in _PRIVATE_CONTEXT_EXEMPT:
+            continue
+        path = REPO_ROOT / relative_path
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        offenders.extend(_private_context_offenders(relative_path, text))
+    assert not offenders, "private context in tracked files:\n" + "\n".join(offenders)

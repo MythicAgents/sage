@@ -131,7 +131,7 @@ def test_genuine_completion_is_the_only_complete_disposition():
 
 
 def test_routing_loop_halt_is_not_reported_as_complete():
-    # The exact channel-3 case: ISC-3b sets a no-progress halt, the graph ends through the normal path.
+    # A same-agent bounce sets a no-progress halt, and the graph ends through the normal path.
     status, notice = _disposition(True, STOP_REASON_NO_PROGRESS)
     assert status == "stopped"
     assert status != "complete"

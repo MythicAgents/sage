@@ -681,7 +681,7 @@ def test_reproposal_after_effect_denial_terminalises_blocked_and_does_not_recard
 
     assert handled is True
     assert terminal == ["blocked"]          # terminalised blocked
-    assert closed == ["blocked"]            # lifecycle closed → seals the 49R-16 decision record
+    assert closed == ["blocked"]            # lifecycle closed → seals the kernel decision record
     assert emitted and "Blocked" in emitted[0] and "not taskable" in emitted[0]
     assert m.mythic_client._last_effect_denial is None   # flag cleared, no re-trigger next cycle
 

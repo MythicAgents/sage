@@ -68,7 +68,7 @@ The terminal ledger snapshot binds that file by arm, operation, query, and SHA-2
 replaced. These evaluator files can contain sensitive material; keep them under private history, outside model
 context and public artifacts.
 
-Recompute a completed v4 matched pair or ISC-8 pair locally:
+Recompute a completed v4 matched pair or improvement pair locally:
 
 ```bash
 .venv/bin/python skills/sage-eval-gauge/scripts/run_trust_walker_pilot.py replay-pair --artifact-dir <private-pair-directory>
