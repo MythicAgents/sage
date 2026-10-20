@@ -225,11 +225,10 @@ def main() -> int:
     # Claude Code reads `hookSpecificOutput.permissionDecision == "deny"` from stdout JSON.
     # Codex reads the EXIT CODE: 2 blocks, and stderr is shown to the model as the reason.
     #
-    # Until 2026-08-29 this function discarded run_hook's code and returned 0 unconditionally, so
-    # every deny was emitted in Claude Code's dialect and then handed to Codex as a clean exit.
-    # Codex is ~99% of Sage development. The gate could not have blocked anything there, and its
-    # own self-test could not see the defect because `_verdict()` inspects the payload and never
-    # asserts the exit code. That is the class this gate exists to prevent, shipped inside the gate.
+    # Returning 0 unconditionally would emit every deny in Claude Code's dialect and hand it to
+    # Codex as a clean exit, so the gate could block nothing there — and its own self-test would
+    # not see that, because `_verdict()` inspects the payload and never asserts the exit code.
+    # That is the class this gate exists to prevent, so run_hook's exit code is propagated.
     if code == 2:
         specific = payload.get("hookSpecificOutput") or {}
         print(specific.get("permissionDecisionReason") or "architecture gate: denied", file=sys.stderr)

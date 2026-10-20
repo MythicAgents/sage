@@ -1,11 +1,10 @@
 """Child→parent (forest-root) SID-history escalation: classifier + gate model.
 
-Regression for the gate bug exposed by the essos-DA solve (2026-06-07): a SID-history / ExtraSIDs golden
-ticket forged from the CHILD krbtgt to reach the forest ROOT was classified identically to a plain child
-golden ticket (technique golden-ticket, target=child, effect da:child) — so once the child golden ticket
-was achieved, the gate SKIPped the parent climb, silently blocking it. Fix: a distinct
-`sid-history-escalation` technique keyed by the `/sids` flag, effect da:{parent}, precondition
-krbtgt-hash:{child}.
+A SID-history / ExtraSIDs golden ticket forged from the CHILD krbtgt to reach the forest ROOT must
+not classify identically to a plain child golden ticket (technique golden-ticket, target=child,
+effect da:child); otherwise, once the child golden ticket is achieved, the gate SKIPs the parent
+climb, silently blocking it. A distinct `sid-history-escalation` technique is keyed by the `/sids`
+flag, with effect da:{parent} and precondition krbtgt-hash:{child}.
 """
 
 import sys

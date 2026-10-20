@@ -1,8 +1,8 @@
 """Tests for the deliberation-drain guards in MythicTools.
 
-Root cause covered: a 2026-06-09 clean solve made 330 internal tool calls to do ONE productive Mythic
-task before hitting the 300-step limit — issue_task ×168 (gate-DEFERred re-proposals re-fired), and
-get_all_commands_for_payloadtype ×27 re-dumping the full schema into context. These pin the two fixes:
+Failure mode covered: re-firing gate-DEFERred issue_task re-proposals and re-dumping the full
+command schema via get_all_commands_for_payloadtype can exhaust the step limit while doing almost
+no productive Mythic work. These pin the two guards:
   1. command schemas cache per payloadtype -> a repeat returns a terse pointer, not the full schema
   2. a hop the gate keeps blocking is STOPped after 3 tries (reset when a task actually passes the gate)
 Run: cd Payload_Type/sage && python3 -m pytest tests/test_deliberation_drain.py -q

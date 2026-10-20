@@ -1,9 +1,8 @@
 """A halt must say why it happened, and must never blame the operator for Sage's own decision.
 
-Found live 2026-08-03: a repeated prompt tripped the Supervisor's no-progress backstop, which set
-`_stop_requested` internally, and the operator was told "Session stopped by operator" for a halt he had
-no part in. The backstop had already composed an honest explanation; the generic operator wording
-buried it.
+An internal halt, such as the Supervisor's no-progress backstop tripping on a repeated prompt, sets
+`_stop_requested` internally. Reporting it as "Session stopped by operator" blames the operator for
+a halt they had no part in and buries the honest explanation the backstop already composed.
 
 The load-bearing assertion here is the *negative* one — `test_no_internal_reason_blames_the_operator`
 — because any future halt path that forgets to label itself must land on neutral wording rather than

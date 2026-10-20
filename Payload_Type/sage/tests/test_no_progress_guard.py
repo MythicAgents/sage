@@ -33,8 +33,8 @@ _BROAD = (
 
 
 def test_broad_signatures_are_read_scope_only_not_breaker_scope():
-    """Cato finding (2026-06-01): broad phrases must NOT feed the issue_task circuit breaker (a
-    success output quoting them would false-trip it). They live in the read-guard scope only."""
+    """Broad phrases must NOT feed the issue_task circuit breaker (a success output quoting them
+    would false-trip it). They live in the read-guard scope only."""
     for sig in _BROAD:
         assert sig in _READ_FAILURE_SIGNATURES
         assert _is_failed_read_output(sig.upper())          # read-guard detects (case-insensitive)

@@ -4,14 +4,12 @@ Slicing `updated_channel[initial_agent_input_length:]` is sound only if the retu
 (input + new). Identifying the agent's output by identity rather than by arithmetic is
 unconditionally sounder, and these tests pin that property.
 
-SCOPE (corrected 2026-07-28, round 9): these are HARDENING tests, not a regression for the
-channel-56/57 zero-return. The original docstring claimed Sage's history-rewriting middleware
-shortens the returned list; that is refuted for this runtime — ContextEditingMiddleware's
-_DigestToolUsesEdit only does `messages[idx] = ...` (length invariant), and SummarizationMiddleware
-has never fired (247 no-op before_model spans, zero LLM descendants, 150k trigger vs an all-time
-peak of 80,839 prompt tokens). The shortened-list cases below are therefore SYNTHETIC: they prove
-the function behaves correctly IF a rewrite ever shortens a list, not that one ever did. The real
-mechanism of the live defect is unknown. Do not cite this file as evidence that it is fixed.
+SCOPE: these are HARDENING tests. Sage's history-rewriting middleware does not shorten the
+returned list in this runtime — ContextEditingMiddleware's _DigestToolUsesEdit only does
+`messages[idx] = ...` (length invariant), and SummarizationMiddleware's 150k trigger sits far
+above observed prompt sizes. The shortened-list cases below are therefore SYNTHETIC: they prove
+the function behaves correctly IF a rewrite ever shortens a list, not that one does. Do not cite
+this file as evidence that a zero-message agent return is fixed.
 """
 import sys
 from pathlib import Path

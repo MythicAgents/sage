@@ -151,9 +151,9 @@ def test_ludus_creds_selects_named_mcp_server_without_changing_default(monkeypat
 # --- WinRM auth readiness ---------------------------------------------------------------------
 #
 # A rolled-back guest reports its IP through the Ludus agent well before AD can authenticate a
-# domain account. On 2026-08-01 the reset waited only for IPs, then synced, and DC01 answered
-# `InvalidCredentialsError: 401` with perfectly correct credentials; a read-only check minutes
-# later reached all five hosts. The wait below is on the condition that actually gates the sync.
+# domain account. A reset that waits only for IPs and then syncs gets `InvalidCredentialsError: 401`
+# from a DC whose credentials are perfectly correct. The wait below is on the condition that
+# actually gates the sync.
 
 
 def _hosts(*names):

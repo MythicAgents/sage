@@ -1,9 +1,9 @@
 """User-specific DCSync vs domain krbtgt DCSync.
 
-Regression for the 2026-06-07 essos run: the agent tried to DCSync `lord.varys` (a SMALL COUNCIL member, to
-forge his REAL TGT for the cross-forest LAPS read) but the gate SKIPped it — a user DCSync classified
-identically to the domain krbtgt DCSync (`("dcsync", domain)` → `krbtgt-hash:{domain}`), which was already
-achieved. Fix: a distinct `dcsync-user` technique keyed on the target user, effect `creds:{user@domain}`.
+A user DCSync (e.g. `lord.varys`, to forge that user's REAL TGT) must not classify identically to
+the domain krbtgt DCSync (`("dcsync", domain)` → `krbtgt-hash:{domain}`); otherwise, once the
+krbtgt hash is achieved, the gate SKIPs it. A distinct `dcsync-user` technique is keyed on the
+target user, with effect `creds:{user@domain}`.
 """
 
 import sys

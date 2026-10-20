@@ -64,9 +64,9 @@ machine use. Exit status is 0 only on `TRACED`, so it can gate a check.
 | `UNTRACED` | no `sage.kernel.*` spans; the autonomous path emitted nothing of its own |
 | `EMPTY` | no spans in scope — check `--since`, or whether the run wrote to this database |
 
-Worked contrast, both reproducible today: the 2026-08-01 database reports `UNTRACED`, 101 spans / 101 roots /
-0 kernel spans; a current autonomous run reports `TRACED`, 32 spans / 1 root / 17 kernel spans / 0 parentless
-tool spans.
+Worked contrast: a database from before the kernel emitted first-party spans reports `UNTRACED`, 101 spans /
+101 roots / 0 kernel spans; a current autonomous run reports `TRACED`, 32 spans / 1 root / 17 kernel spans / 0
+parentless tool spans.
 
 ## Callback Dispatch Probe
 

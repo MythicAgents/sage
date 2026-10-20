@@ -605,10 +605,10 @@ def test_domain_admin_membership_check_alone_does_not_imply_kerberos_context():
 
     assert "da:north.sevenkingdoms.local" in state.achieved_effects()
     assert "kerberos-context:north.sevenkingdoms.local@callback:9" not in state.achieved_effects()
-    # ds-replication-rights IS now implied (intentional 2026-06-20): the foothold is a LIVE IN-DOMAIN callback
-    # and DA-group membership grants replication rights (in-domain arm of _expand_implications). It still does
-    # NOT fabricate a kerberos-context effect (asserted above) — selection is unblocked; execution proves the
-    # live token, and the stall detector recovers if it is not yet DA-privileged.
+    # ds-replication-rights IS implied: the foothold is a LIVE IN-DOMAIN callback and DA-group
+    # membership grants replication rights (in-domain arm of _expand_implications). It still does
+    # NOT fabricate a kerberos-context effect (asserted above) — selection is unblocked; execution
+    # proves the live token, and the stall detector recovers if it is not yet DA-privileged.
     assert state.satisfies_predicate("ds-replication-rights:north.sevenkingdoms.local")
 
 
@@ -769,11 +769,12 @@ def test_objective_completion_candidate_accepts_live_certificate_auth_proof():
 
 
 def test_in_domain_da_implies_replication_rights_without_kerberos_context():
-    # Intentional change (2026-06-20): DA from a LIVE IN-DOMAIN foothold implies ds-replication-rights even
-    # without a recorded kerberos-context — DA-group membership grants replication, usable from your own
-    # in-domain foothold. This unblocks the DA->DCSync selection loop. (Cross-forest keeps the kerberos-context
-    # gate — covered by test_cross_forest_da_without_context_or_in_domain_foothold_keeps_gate.) If the live
-    # token is not actually DA-privileged yet, dcsync fails at execution and the stall detector recovers.
+    # DA from a LIVE IN-DOMAIN foothold implies ds-replication-rights even without a recorded
+    # kerberos-context — DA-group membership grants replication, usable from your own in-domain
+    # foothold. This unblocks the DA->DCSync selection loop. (Cross-forest keeps the
+    # kerberos-context gate — covered by
+    # test_cross_forest_da_without_context_or_in_domain_foothold_keeps_gate.) If the live token is
+    # not actually DA-privileged yet, dcsync fails at execution and the stall detector recovers.
     foothold = _foothold(host="castelblack", forest="north.sevenkingdoms.local")
     state = engagement_state.record_hop_result(
         engagement_state.EngagementState(objective="trust path", footholds=[foothold]),

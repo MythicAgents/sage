@@ -907,11 +907,11 @@ def scenario_preconditions(cfg: "Config", scenario_name: str) -> list:
     "remember to add it to preflight" after the next incident."""
     scn = _scenario(cfg, scenario_name)
     checks: list = [("objective-recognizable", "offline", lambda: objective_recognizable(scn.objective))]
-    # 'smoke' tier: needs Mythic/BloodHound UP (but NOT the GOAD range), so still hoistable before the
-    # expensive reset+solve. Fail-CLOSED validity checks that run the EXACT probe queries against the live
-    # schema — a GraphQL field typo / down service fails in ~5s here instead of after a ~2h solve (the
-    # 2026-06-21 `responses{response}` bug). All scenarios score KRBTGT_DUMPED (Mythic); only graph-scoring
-    # scenarios use the BloodHound REST path.
+    # 'smoke' tier: needs Mythic/BloodHound UP (but NOT the GOAD range), so still hoistable before
+    # the expensive reset+solve. Fail-CLOSED validity checks that run the EXACT probe queries
+    # against the live schema — a GraphQL field typo (e.g. `responses{response}`) or a down service
+    # fails in ~5s here instead of after a ~2h solve. All scenarios score KRBTGT_DUMPED (Mythic);
+    # only graph-scoring scenarios use the BloodHound REST path.
     checks.append(("mythic-queries-valid", "smoke", lambda: live_seams.mythic_queries_valid()))
     if cfg.model_provider or cfg.model_id:
         route = _resolved_harness_model_route(cfg)

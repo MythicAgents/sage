@@ -18,8 +18,8 @@ Legitimate uses:
 Capability must always be measured with this reference NOT in context. See
 ttps/ad-attack-path-planning.md for the de-GOAD'd, generalizable methodology.
 
-Provenance: relocated 2026-06-17 from prompts/demo_autonomous_solve.md, where it had been
-a flag-gated prompt overlay. Preserved verbatim below as ground truth.
+Provenance: formerly prompts/demo_autonomous_solve.md, a flag-gated prompt overlay.
+Preserved verbatim below as ground truth.
 ========================================================================================
 -->
 

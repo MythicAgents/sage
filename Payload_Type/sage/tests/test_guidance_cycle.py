@@ -1,9 +1,9 @@
 """Anti-cycle guard for get_ttp_guidance.
 
-Regression for the 2026-06-07 BRAAVOS-LAPS run, where the agent called get_ttp_guidance ~7× with near-identical
-goals ("read LAPS password … controlled group context") instead of executing — burning the budget to the
-deadline. The guard returns an escalating "stop planning, execute or handback" nudge on the 3rd near-identical
-request. Distinct exploration goals must NOT trip it.
+Failure mode covered: an agent calling get_ttp_guidance repeatedly with near-identical goals
+("read LAPS password … controlled group context") instead of executing burns the budget to the
+deadline. The guard returns an escalating "stop planning, execute or handback" nudge on the 3rd
+near-identical request. Distinct exploration goals must NOT trip it.
 """
 
 import sys

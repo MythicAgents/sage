@@ -1,11 +1,13 @@
-"""Regression: provider-agnostic empty/blank-block guard on create_agent's internal react loop (2026-07-10).
+"""Regression: provider-agnostic empty/blank-block guard on create_agent's internal react loop.
 
-Extends the bug-2 fix. The reported `ValidationException: system: text content blocks must be non-empty` fired
-on a native `ChatBedrock` (InvokeModel) call INSIDE create_agent's react loop (Phoenix trace: Sage → Supervisor
-→ model → ChatBedrock). Neither prior defense reached that path:
-  - `_sanitize_messages` only cleans the channel lists the graph passes in, not create_agent's internal messages;
-  - the langchain_openai `_convert_message_to_dict` monkeypatch only affects the ChatOpenAI/proxy provider — it
-    is a no-op for langchain-aws AND every other native provider (ollama, anthropic, google_genai).
+`ValidationException: system: text content blocks must be non-empty` can fire on a native
+`ChatBedrock` (InvokeModel) call INSIDE create_agent's react loop (Sage → Supervisor → model →
+ChatBedrock). Neither of the other defenses reaches that path:
+  - `_sanitize_messages` only cleans the channel lists the graph passes in, not create_agent's
+    internal messages;
+  - the langchain_openai `_convert_message_to_dict` monkeypatch only affects the ChatOpenAI/proxy
+    provider — it is a no-op for langchain-aws AND every other native provider (ollama,
+    anthropic, google_genai).
 
 `_MessageSanitizerMiddleware` fires at `wrap_model_call`, which wraps the model invocation for ALL providers, and
 normalizes the outgoing request. This test drives it with a fake ModelRequest/handler (no live provider needed),

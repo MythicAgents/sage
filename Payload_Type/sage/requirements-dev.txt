@@ -22,9 +22,9 @@ pydantic==2.13.4
 
 # Operator-skill dependency, not a runtime one. `skills/sage-goad-reset/scripts/sync_range_time.py`
 # imports `winrm` to set Windows guest clocks over WinRM after a range rollback — a step AGENTS.md
-# calls mandatory after *every* rollback. It went undeclared until 2026-08-01, so a clean checkout
-# hit `ModuleNotFoundError: No module named 'winrm'` on a documented-required command.
-# `tests/repo_hygiene/test_skill_dependencies.py` now fails on any undeclared skill import.
+# calls mandatory after *every* rollback. Undeclared, a clean checkout hits
+# `ModuleNotFoundError: No module named 'winrm'` on a documented-required command.
+# `tests/repo_hygiene/test_skill_dependencies.py` fails on any undeclared skill import.
 pywinrm==0.5.0
 
 # `skills/sage-goad-reset/scripts/pkinit_padata_probe.py` imports pyasn1 directly to decode KDC

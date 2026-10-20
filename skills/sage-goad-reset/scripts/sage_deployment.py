@@ -5,11 +5,10 @@
 container up whether or not it is wanted. If a tmux Sage is also running, both register as the
 `sage` service, one wins the RabbitMQ queue, and Mythic requests are answered by whichever won.
 
-That is not a theoretical race. On 2026-08-01 the container answered an autonomous chat request
-using its baked image rather than the working tree, and failed with `BloodHound MCP is not
-connected` because it had no `SAGE_BLOODHOUND_MCP_DIR`. The losing tmux process logged
-`Another instance of this service, sage, is running` on a loop, and the readiness contract still
-reported `ready: true` because nothing looked for a second instance.
+If the container wins, it answers chat requests from its baked image rather than the working tree,
+and fails with `BloodHound MCP is not connected` when it has no `SAGE_BLOODHOUND_MCP_DIR`. The
+losing tmux process logs `Another instance of this service, sage, is running` on a loop, and a
+readiness check that does not look for a second instance still reports `ready: true`.
 
 Mode comes from `--mode`, else `SAGE_DEPLOYMENT_MODE`, else `local` — the mode this repo's
 workflow uses (see `AGENTS.md`: Sage runs locally in the `sage` tmux session).

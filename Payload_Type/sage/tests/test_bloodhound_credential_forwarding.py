@@ -1,9 +1,8 @@
 """BloodHound MCP credential resolution and forwarding.
 
-Regression cover for the container defect found 2026-07-30: a Mythic-installed Sage could not
-authenticate BloodHound, because the MCP server reads credentials from a `.env` in its own
-directory and the container's freshly-cloned `/opt/bloodhound_mcp` has none. Sage forwarded
-nothing — `bloodhound_mcp_config` passed `env={}` unconditionally.
+A Mythic-installed Sage must forward BloodHound credentials to the MCP server: the server reads
+them from a `.env` in its own directory, and the container's freshly-cloned `/opt/bloodhound_mcp`
+has none, so passing `env={}` unconditionally leaves BloodHound unauthenticated.
 
 The load-bearing premise is exercised here rather than assumed: the MCP stdio client inherits only
 a safe subset of the parent environment, so setting `BLOODHOUND_DOMAIN` on the Sage container does

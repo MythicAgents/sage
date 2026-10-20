@@ -29,12 +29,10 @@ operational tooling (per `CLAUDE.md` / `AGENTS.md`); do **not** put helper scrip
 > Keep this index in sync when adding/removing a skill: a skill is a directory under `skills/` with a `SKILL.md`
 > (frontmatter `name` + `description`) and a `scripts/` directory. Update the row here when you add one.
 >
-> Two rows above were added on 2026-08-11 after a count found 13 rows against 14 directories.
-> `sage-canary-attestation` had simply never been indexed. `phoenix-traces` is the newer arrival: it lived at
-> `.claude/skills/phoenix-traces/` — inside a gitignored directory — so it was untracked, absent from every
-> clone, and reachable by Claude Code alone. Moving it here made it one source both assistants link to, which is
-> the whole point of this directory. It is also the one skill whose entry point is a top-level `analyze.ts`
-> rather than a `scripts/` directory; that is a deviation from the convention above, not a licence to add more.
+> `phoenix-traces` is the one skill whose entry point is a top-level `analyze.ts` rather than a `scripts/`
+> directory; that is a deviation from the convention above, not a licence to add more. It lives here rather
+> than in the gitignored `.claude/skills/` so it is tracked, present in every clone, and one source both
+> assistants link to.
 >
 > If you move a skill in or out of here, **its depth changes and relative paths move with it.** `analyze.ts`
 > resolved its default database with `../../../`, correct at three levels deep and wrong at two. Run the skill

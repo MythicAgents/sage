@@ -74,8 +74,8 @@ def test_probe_via_reader_propagates_reader_errors():
 
 
 def test_probe_settles_on_delayed_escalation():
-    """A real-but-delayed escalation (GPO/SYSTEM-on-DC propagation) is caught by the settling window,
-    not missed by an immediate read — the exact false-negative seen on the first live run."""
+    """A real-but-delayed escalation (GPO/SYSTEM-on-DC propagation) is caught by the settling
+    window, not missed by an immediate read, which would report a false negative."""
     base = {"administrator", "eddard.stark"}
     calls = {"n": 0}
     def delayed(_d):

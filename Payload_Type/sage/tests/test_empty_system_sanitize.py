@@ -1,15 +1,10 @@
-"""Regression: empty `system` content block crashes Bedrock (bug 2, 2026-07-10).
+"""Regression: an empty `system` content block must never reach Bedrock.
 
-THE BUG: `ValidationException: system: text content blocks must be non-empty`.
-In chat mode `system_prompt` defaults to "" (sage_chat/config.py) and `Model.__init__` seeded
-`SystemMessage(content="")` as the FIRST message of the supervisor channel. `_sanitize_messages` KEPT
-that empty first system message, so an empty `system` block reached Bedrock. The only sanitizer,
-`_apply_bedrock_patch`, (a) rescued empty content only for role=="assistant" (never an empty system
-string) and (b) monkeypatched langchain_openai, which the native `init_chat_model(model_provider="bedrock")`
-(langchain-aws) provider never touches — so it was a no-op on the live path.
-
-PRE-FIX BEHAVIOR: `_sanitize_messages([SystemMessage(content=""), HumanMessage("hi")])` returned the
-empty SystemMessage unchanged (kept as the first system message) -> empty `system` forwarded -> crash.
+Bedrock rejects it with `ValidationException: system: text content blocks must be non-empty`.
+In chat mode `system_prompt` defaults to "" (sage_chat/config.py), so the supervisor channel can
+start with `SystemMessage(content="")`. `_apply_bedrock_patch` does not cover this: it rescues
+empty content only for role=="assistant", and it monkeypatches langchain_openai, which the native
+`init_chat_model(model_provider="bedrock")` (langchain-aws) provider never touches.
 
 THE FIX (provider-agnostic, at the message boundary):
   1. `_nonempty_system` normalizes a blank top-level system prompt to a minimal default at construction.

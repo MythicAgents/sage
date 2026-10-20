@@ -1,8 +1,8 @@
 """Recon re-read guard.
 
-Regression for the 2026-06-07 essos run that hit the 250-step recursion limit while issuing only ~2 Mythic
-commands: the budget was burned on redundant recon — get_task_history_for_callback 98×, list_callbacks 29×.
-The guard returns a "stop re-reading, act" nudge after repeated identical reads within one task epoch, and
+Failure mode covered: redundant recon (repeated get_task_history_for_callback and list_callbacks
+reads) can exhaust the recursion limit while only a couple of Mythic commands are issued. The guard
+returns a "stop re-reading, act" nudge after repeated identical reads within one task epoch, and
 resets when a command is issued (epoch bump) so a legitimate post-action re-read is always allowed.
 """
 

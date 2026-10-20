@@ -1,11 +1,11 @@
 """Tests for the operator kill switch (request_stop) and the continuation-intent classifier.
 
-Covers two fixes from 2026-06-01:
+Covers two behaviors:
   - request_stop() sets the cooperative flag and cancels the active invoke task (so `exit`/`stop`
     interrupts waits/proof polling instead of letting delayed Mythic tasks fire after stop).
   - _classify_continuation_intent() maps an operator reply to CONTINUE / STOP / REDIRECT so a
     natural-language inhibit ("don't run any tasks, just give me a summary") is honored as STOP
-    instead of being run as a new task (the post-recursion-handback runaway).
+    instead of being run as a new task.
 
 Uses Model.__new__ to exercise the units without the heavy __init__ (sqlite + chat model).
 Run: cd Payload_Type/sage && python3 -m pytest tests/test_stop_and_intent.py -q

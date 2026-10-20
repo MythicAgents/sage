@@ -1,12 +1,12 @@
 """Verify-on-record: a credential hop is recorded `achieved` ONLY when the task output actually
 contains a usable secret.
 
-Regression for the 2026-06-08 false-achieved bug: a `dcsync-user` DCSync of cersei/lord.varys that
-failed with 8439 DS_DRA_BAD_DN (Mythic task "succeeds", returns no key) was recorded
-`creds:X achieved` because the record path gated only on the absence of a known failure signature.
-The agent then forged with a placeholder key. The fix feeds a deterministic probe dict (from
-`credential_artifacts.extract_credential_probe`) into the existing `engagement_state.verify_effect`
-seam, scoped to credential techniques; non-credential techniques are unchanged.
+A `dcsync-user` DCSync that fails with 8439 DS_DRA_BAD_DN still "succeeds" as a Mythic task while
+returning no key. Gating only on the absence of a known failure signature would record
+`creds:X achieved`, and the agent would then forge with a placeholder key. A deterministic probe
+dict (from `credential_artifacts.extract_credential_probe`) feeds the existing
+`engagement_state.verify_effect` seam, scoped to credential techniques; non-credential techniques
+are unchanged.
 
 No live Mythic required — MythicTools.__init__ does no network. Mirrors the repo's no-pytest-asyncio
 convention.
@@ -368,7 +368,7 @@ def test_credential_techniques_matches_verify_schema():
 
 
 # ---------------------------------------------------------------------------
-# Verify-on-record for dcsync-rights-grant (2026-06-09 false-achieved-grant bug)
+# Verify-on-record for dcsync-rights-grant (no false-achieved grant)
 # ---------------------------------------------------------------------------
 
 GRANT_DOM = "north.sevenkingdoms.local"
@@ -456,7 +456,7 @@ def test_verified_achieved_grant_not_downgraded(mt):
 
 
 # ---------------------------------------------------------------------------
-# Verify-on-record for golden-ticket / SID-history (2026-06-11 false-achieved ticket bug)
+# Verify-on-record for golden-ticket / SID-history (no false-achieved ticket)
 # ---------------------------------------------------------------------------
 
 CHILD_DOM = "north.sevenkingdoms.local"
@@ -561,8 +561,8 @@ def test_record_sid_history_group_proof_achieved(mt):
     assert hop.evidence["artifact_present"] is True
 
 
-# --- Negative tests (2026-06-12 audit): the forgeable-proof holes, now closed. Each of these would have
-#     recorded ACHIEVED (false-achieved) under the pre-fix substring proof; they must now NOT be achieved. ---
+# --- Negative tests: forgeable proofs. Each would record ACHIEVED (false-achieved) under a bare
+#     substring proof; none may be achieved. ---
 
 CHILD_DA_LINE = """
 GROUP INFORMATION
@@ -689,9 +689,9 @@ def test_redact_secretsdump_line_redacts_nt_not_lm_when_equal():
     assert out == f"krbtgt:502:{h}:<redacted>:::"
 
 
-# --- 2026-06-12 live false-achieved: a NO-PROBE technique (gpo-abuse) recorded achieved off a Mythic task
-#     that errored AT CREATION ("no assembly by that name" — SharpGPOAbuse never registered, never ran). The
-#     narrow breaker list missed the creation-error traceback, so it fell through to the achieved default. ---
+# --- A NO-PROBE technique (gpo-abuse) must not record achieved off a Mythic task that errored AT
+#     CREATION ("no assembly by that name" — the assembly is not registered and never ran). A
+#     creation-error traceback must not fall through to the achieved default. ---
 
 GPO_ABUSE_CREATION_ERROR = (
     "Traceback (most recent call last):\n"

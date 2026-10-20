@@ -38,15 +38,15 @@ logon session for samwell. On a host with no display, or under a tool wrapper wi
 terminal, `xfreerdp3` dies pre-auth (exit 144). The scheduled-task **batch** logon needs none of that:
 `schtasks /RU 'NORTH\samwell.tarly' /RP <password>` runs Apollo over the WinRM admin session, no desktop.
 
-**Why launching a *domain* user non-interactively is "the real problem" (measured 2026-07-28).** Two
+**Why launching a *domain* user non-interactively is "the real problem".** Two
 non-interactive WinRM paths fail out of the box: `scheduled-task-s4u` cannot even register a task for a
 domain principal as the local WinRM admin (`Register-ScheduledTask: Access is denied`, 0x80070005); the
 plain batch task *registers* but never starts because a member server denies **"Log on as a batch job"**
 (`SeBatchLogonRight`) to a standard domain account (`the task is registered, but may fail to start. Batch
-logon privilege needs to be enabled`). This is exactly why the prior author used RDP-interactive. This skill
+logon privilege needs to be enabled`). That is why the RDP-interactive path exists. This skill
 closes it the pure-WinRM way: it **grants `SeBatchLogonRight` to the run-as user via `secedit`** over the
 admin session before the batch launch (reversible, range-local), then the batch task starts and Apollo
-checks in. Verified 2026-07-28: reset → grant → batch launch → unique live foothold, unaided.
+checks in.
 
 Trade-off: the resulting Apollo runs under a **batch** logon. That is sufficient for
 bounded native canaries (which only need a live, taskable Apollo as samwell). If a specific attack path
@@ -124,8 +124,8 @@ trigger a second deploy (which would create a duplicate lane).
 - **DC netlogon warm-up.** A domain scheduled task can fail to register while the DC is still servicing
   netlogon after a cold boot; `rebuild` waits for VMs ON and clock-ready, and the launch retries a bounded
   number of times, re-probing between attempts to avoid duplicate footholds.
-- **Re-verify `foothold.ready == true` immediately before any effect-intending canary** (standing process
-  rule from the 2026-07-26 operator error) — `verify` is the one-line way to do it.
+- **Re-verify `foothold.ready == true` immediately before any effect-intending canary** — `verify` is
+  the one-line way to do it.
 
 ## Interactive staged benchmark path
 

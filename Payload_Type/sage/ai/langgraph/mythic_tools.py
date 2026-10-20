@@ -595,24 +595,25 @@ _TASK_FAILURE_SIGNATURES = (
     "takes no command line arguments",
 )
 
-# Read-guard signatures: the breaker set PLUS broader runtime-execution failures (the no-progress
-# re-read spiral on 2026-06-01 was a .NET assembly exception + a jump_wmi traceback). These are scoped
-# to the get_all_task_output_by_task_id re-read clamp ONLY — never to the breaker — because the broader
-# phrases ("unexpected error", "traceback...") can appear as legitimate DATA in a successful task's
-# output; the worst case here is merely a clamped 2nd re-read of one task, not a blocked command.
+# Read-guard signatures: the breaker set PLUS broader runtime-execution failures (e.g. a .NET
+# assembly exception or a jump_wmi traceback, which drive a no-progress re-read spiral). These are
+# scoped to the get_all_task_output_by_task_id re-read clamp ONLY — never to the breaker — because
+# the broader phrases ("unexpected error", "traceback...") can appear as legitimate DATA in a
+# successful task's output; the worst case here is merely a clamped 2nd re-read of one task, not a
+# blocked command.
 _READ_FAILURE_SIGNATURES = _TASK_FAILURE_SIGNATURES + (
     "exception has been thrown by the target of an invocation",
     "unexpected error",
     "traceback (most recent call last)",
 )
 
-# Recording-gate signatures: BROADER than the breaker, used ONLY to decide whether a no-probe (legacy)
-# technique may record `achieved`. Includes Mythic/agent INFRASTRUCTURE errors — a task that errored at
-# CREATION ("error: creating task"), a .NET assembly that was never registered ("no assembly by that name"),
-# an unknown callback/payload — plus tracebacks and the breaker set. These are produced by Mythic/the agent,
-# NOT the target, so they are a trustworthy "this task did not run/succeed" signal. (2026-06-12: SharpGPOAbuse
-# errored "no assembly by that name" at task creation; the narrow breaker missed it, so gpo-abuse recorded
-# achieved off a task that never ran.)
+# Recording-gate signatures: BROADER than the breaker, used ONLY to decide whether a no-probe
+# (legacy) technique may record `achieved`. Includes Mythic/agent INFRASTRUCTURE errors — a task
+# that errored at CREATION ("error: creating task"), a .NET assembly that was never registered ("no
+# assembly by that name"), an unknown callback/payload — plus tracebacks and the breaker set. These
+# are produced by Mythic/the agent, NOT the target, so they are a trustworthy "this task did not
+# run/succeed" signal. The narrow breaker set misses them, so without this list a technique could
+# record achieved off a task that never ran.
 _RECORD_FAILURE_SIGNATURES = _READ_FAILURE_SIGNATURES + (
     "no assembly by that name",
     "error: creating task",
@@ -1849,13 +1850,14 @@ class MythicTools:
         self._task_failure_shape_counts: dict[tuple, int] = {}
         self._task_failure_shape_limit: int = 2
         self._artifact_ledger: list[dict] = []
-        # Recent get_ttp_guidance goals — anti-cycle guard so the agent can't loop re-querying guidance
-        # instead of executing (the 2026-06-07 BRAAVOS-LAPS run did this ~7×).
+        # Recent get_ttp_guidance goals — anti-cycle guard so the agent can't loop re-querying
+        # guidance instead of executing.
         self._ttp_guidance_goals: list[str] = []
-        # Recon re-read guard: a "task epoch" bumped each time a real command is issued, plus a per-(tool,
-        # target, epoch) call counter. Re-polling unchanged recon (get_task_history_for_callback ran 98× in
-        # the 2026-06-07 run, list_callbacks 29×) burns the recursion budget without progress; the guard
-        # returns a curt "stop re-reading, act" after repeats within an epoch, and resets when a command runs.
+        # Recon re-read guard: a "task epoch" bumped each time a real command is issued, plus a
+        # per-(tool, target, epoch) call counter. Re-polling unchanged recon
+        # (get_task_history_for_callback, list_callbacks) burns the recursion budget without
+        # progress; the guard returns a curt "stop re-reading, act" after repeats within an epoch,
+        # and resets when a command runs.
         self._recon_epoch: int = 0
         self._recon_call_log: dict[tuple, int] = {}
         # Last successful compact recon snapshot per tool/target. The reread guard can then return the
@@ -1914,7 +1916,7 @@ class MythicTools:
         # Forward-planner graph facts: BloodHound ACL edges (GenericWrite on GPOs, WriteDacl on domains,
         # etc.) projected into engagement predicates, cached here and refreshed after each verified ingest
         # so the per-turn injection can DIRECT the operator to the next available hop instead of letting it
-        # re-collect (the 2026-06-09 loop). SUGGESTION-ONLY: these feed available_hops / the injected
+        # re-collect in a loop. SUGGESTION-ONLY: these feed available_hops / the injected
         # render, NOT the gate's enforcement state — so a reconciliation miss can never newly DEFER a real
         # hop (suggest-on-known; blocking stays conservative / unknown != false).
         self._engagement_graph_facts: list = []
@@ -1970,8 +1972,8 @@ class MythicTools:
         # of being silently satisfied from history. This state is reset by Model.invoke() for each real user
         # turn and never set by synthetic autonomous nudges.
         self._operator_collection_request: dict | None = None
-        # Deliberation-drain guards. Command schemas are STATIC per payloadtype -> cache (a 2026-06-09 solve
-        # re-fetched + re-dumped them 27×, bloating context).
+        # Deliberation-drain guards. Command schemas are STATIC per payloadtype -> cache
+        # (re-fetching and re-dumping them on every lookup bloats context).
         self._command_schema_cache: dict = {}
         self._callback_command_surface_cache: dict[str, tuple[str, list[dict]]] = {}
         # One bounded model-assisted mechanic substitution may be attempted for an unresolved deterministic
@@ -2012,11 +2014,11 @@ class MythicTools:
             except Exception:
                 pass
         # No-progress guard: count how many times each task_id has been fetched and come back FAILED
-        # this session. On the 2nd+ failed re-read we return a short escalation directive instead of the
-        # full (unchanged) failed output — the 2026-06-01 e45ae3d3 recursion death was the agent
-        # re-reading a statically-failed task (Rubeus dcsync / jump_wmi) 3x at ~240K tokens/call until
-        # the 75-step budget was exhausted. First failed fetch returns the full output so the agent sees
-        # the error once. This is independent of the issue_task circuit breaker (do not touch that).
+        # this session. On the 2nd+ failed re-read we return a short escalation directive instead of
+        # the full (unchanged) failed output — re-reading a statically-failed task at hundreds of
+        # thousands of tokens per call can exhaust the step budget. First failed fetch returns the
+        # full output so the agent sees the error once. This is independent of the issue_task
+        # circuit breaker (do not touch that).
         self._failed_read_counts: dict[int, int] = {}
         # Plain-text capability cache used by deterministic verifiers. Keep it separate from the
         # structured read-tool cache below: sharing one string cache let a verifier's flattened text
@@ -5244,8 +5246,8 @@ class MythicTools:
         Returns:
             str: JSON string containing all commands and their detailed information
         """
-        # Command schemas are STATIC per payloadtype — serve repeats from cache as a terse pointer instead
-        # of re-dumping the full schema (27× re-fetches bloated context + burned steps in a 2026-06-09 solve).
+        # Command schemas are STATIC per payloadtype — serve repeats from cache as a terse pointer
+        # instead of re-dumping the full schema (repeated re-fetches bloat context and burn steps).
         cached = self._command_schema_cache.get(payload)
         if cached is not None:
             names = sorted(c.get("cmd") for c in cached if isinstance(c, dict) and c.get("cmd"))
@@ -6417,10 +6419,10 @@ class MythicTools:
             # above established that this specific callback sleeps longer than that base allows.
             timeout = self._derive_task_timeout(callback_display_id)
 
-        # Normalize "no arguments" to an empty string. Trace evidence (2026-06-01) shows
-        # argument-less Apollo commands (rev2self, whoami) SUCCEED with parameters="" but
-        # FAIL with parameters={} ("rev2self takes no command line arguments") because an
-        # empty dict serializes to a non-empty argument. Collapse every empty form to "".
+        # Normalize "no arguments" to an empty string. Argument-less Apollo commands (rev2self,
+        # whoami) SUCCEED with parameters="" but FAIL with parameters={} ("rev2self takes no command
+        # line arguments") because an empty dict serializes to a non-empty argument. Collapse every
+        # empty form to "".
         if parameters is None or parameters == {} or (
             isinstance(parameters, str) and parameters.strip() in ("", "{}", '""', "''")
         ):
@@ -7433,9 +7435,9 @@ class MythicTools:
             self._pending_engagement_hop = None
             return None
 
-        # Lazily refresh graph facts (TTL-bounded; retries while the cache is empty) so an async-completed
-        # ingest is picked up on a later gate call — without it the chain never sees the graph if ingest
-        # reported "pending" (the 2026-06-09 false-negative).
+        # Lazily refresh graph facts (TTL-bounded; retries while the cache is empty) so an
+        # async-completed ingest is picked up on a later gate call — without it the chain never sees
+        # the graph if ingest reported "pending".
         try:
             await self._refresh_graph_facts_if_stale(now)
         except Exception:
@@ -7505,8 +7507,8 @@ class MythicTools:
 
     @staticmethod
     def _dcsync_rights_guidance(dom: str) -> str:
-        """Constructive, unambiguous block message for a premature DCSync — frames it as a RIGHTS problem
-        (not command syntax, the 2026-06-09 misread) and names the corrective path."""
+        """Constructive, unambiguous block message for a premature DCSync — frames it as a RIGHTS
+        problem (not command syntax, an easy misreading) and names the corrective path."""
         return (
             f"[engagement-precheck] DCSync of {dom} not attempted: per the BloodHound graph and the "
             f"credentials you currently hold, NO principal you control has DS-Replication rights on {dom}, "
@@ -9021,13 +9023,13 @@ class MythicTools:
                         f"(verdict={verdict}) — recording FAILED, not achieved (prevents placeholder forgery)."
                     )
             elif technique in credential_artifacts.GRANT_TECHNIQUES:
-                # Verify-on-record for the DS-Replication rights grant (2026-06-09 false-achieved-grant bug):
-                # the legacy path recorded `achieved` for a StandIn `--grant` whenever the output lacked a
-                # known failure signature, so an `Access is denied` grant (samwell, medium integrity) and the
-                # GPO/SYSTEM task that NEVER FIRED (empty output) both recorded `ds-replication-rights achieved`
-                # — contradicted by the agent's own zero-ACE enumeration. With the gate demoted to advisor, the
-                # achieved-dedup SKIP would then SKIP re-attempting a grant that never landed. Gate the record
-                # on a real grant-application artifact via the existing verify_effect seam.
+                # Verify-on-record for the DS-Replication rights grant: recording `achieved` for a
+                # StandIn `--grant` whenever the output lacks a known failure signature would mark
+                # an `Access is denied` grant (medium integrity) and a GPO/SYSTEM task that NEVER
+                # FIRED (empty output) as `ds-replication-rights achieved`. With the gate demoted to
+                # advisor, the achieved-dedup SKIP would then SKIP re-attempting a grant that never
+                # landed. Gate the record on a real grant-application artifact via the existing
+                # verify_effect seam.
                 probe = credential_artifacts.extract_grant_probe(results_str)
                 verdict = engagement_state.verify_effect(technique, target_key, probe)
                 status = "achieved" if verdict == "achieved" else "failed"
@@ -9051,7 +9053,7 @@ class MythicTools:
                         f"task output (verdict={verdict}) — recording FAILED, not achieved (the grant did not land)."
                     )
             elif technique in credential_artifacts.TICKET_TECHNIQUES:
-                # Strict ticket verification (2026-06-11 false-achieved SID-history bug): Rubeus/Mimikatz
+                # Strict ticket verification (blocks false-achieved SID-history): Rubeus/Mimikatz
                 # can return Mythic "success" while the ticket forge failed, or while only a forge/inject
                 # attempt occurred. A ticket hop achieves da:<domain> only when a usable-ticket/access proof is
                 # present (Domain/Enterprise Admin membership, explicit valid-ticket proof, or service access).
@@ -9171,12 +9173,12 @@ class MythicTools:
                             "artifact_present": False,
                         }
             elif _record_output_is_failure(results_str):
-                # Legacy / no-probe technique: with NO artifact to verify, record `achieved`
-                # ONLY when the task produced clean output. Empty output or a Mythic/agent error (task errored
-                # at CREATION, .NET assembly not registered, traceback, arg-format failure) is NOT success —
-                # record nothing so the hop can be retried. Closes the 2026-06-12 gpo-abuse false-achieved:
-                # SharpGPOAbuse errored "no assembly by that name" (task never ran) yet recorded achieved,
-                # because the narrow breaker list missed the Mythic creation-error traceback.
+                # Legacy / no-probe technique: with NO artifact to verify, record `achieved` ONLY
+                # when the task produced clean output. Empty output or a Mythic/agent error (task
+                # errored at CREATION, .NET assembly not registered, traceback, arg-format failure)
+                # is NOT success — record nothing so the hop can be retried. The narrow breaker list
+                # misses Mythic creation-error tracebacks (e.g. SharpGPOAbuse "no assembly by that
+                # name"), so it alone would record achieved off a task that never ran.
                 logger.warning(
                     f"🔒 [verify-on-record] {technique} {target_key}: task output empty/failed for a no-probe "
                     f"technique (preview={str(results_str)[:120]!r}) — NOT recording achieved."

@@ -22,7 +22,7 @@ Payload_Type/sage/sage*.db*
 # `.codex/config.toml`. Without it a Claude Code contributor gets no architecture gate and no
 # retention guard at all.
 #
-# `skills/` is committed as of 2026-08-11, reversing the original call. It holds one symlink per
+# `skills/` is committed. It holds one symlink per
 # entry in this repo's own `skills/` tree, so committing it means a Linux or macOS clone has every
 # Sage skill discoverable the moment Claude Code starts, with no setup step. That was the whole
 # point of putting them in `skills/` in the first place, and a link loop a contributor has to find

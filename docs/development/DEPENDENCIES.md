@@ -21,9 +21,9 @@ The `-c` flag is what makes your environment match the one the tests passed on, 
 pip resolves transitive dependencies fresh every install, so two clones a week apart can end up with different
 transitive versions — and a transitive bump can remove or rename a module Sage imports.
 
-That is not hypothetical. A rebuild on 2026-07-29 moved 83 transitive packages, one of which
-(`mcp` 1.25.0 → 2.0.0) removed a module Sage imports and produced 24 test-collection errors from a manifest
-nobody had edited. Pinning transitives with `constraints.txt` is what prevents that class of silent breakage.
+A single transitive bump is enough: `mcp` 2.0.0 removed a module Sage imports, which breaks test collection
+even though no manifest changed. Pinning transitives with `constraints.txt` is what prevents that class of silent
+breakage.
 
 ## Regenerating `constraints.txt`
 

@@ -8,9 +8,9 @@ and the operator simply finds that something else stopped existing.
 
 The real seam is `Model._build_bloodhound_agent`, which computes `mcp_tools` from the connected
 servers and then, when there are none, **still constructs the agent** with its TTP and handback tools.
-That "still" is the whole property. This file asserts it against the REAL graph rather than a stand-in,
-because the 2026-08-10 outage was caused precisely by a hand-built stand-in that had drifted from the
-graph it stood in for.
+That "still" is the whole property. This file asserts it against the REAL graph rather than a
+stand-in, because a hand-built stand-in drifts from the graph it stands in for, and the drift hides
+exactly the failures that matter.
 
 Hermetic: dummy key, unroutable endpoint, mocked Mythic client — the same harness as
 `test_graph_builds.py`, deliberately copied rather than reinvented per `AGENTS.md`.

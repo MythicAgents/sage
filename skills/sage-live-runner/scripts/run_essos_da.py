@@ -3,7 +3,7 @@
 
 Command-construction layer (slices 1/2/2b/2c) is loaded in the restarted Sage and validated live, so command
 construction should be reliable across the chain. Drives the documented Trust Walker. The NORTH hop escalates
-via the DC-scoped GPO (SYSTEM-on-DC adds the controlled principal to NORTH Domain Admins — a 2026-06-09
+via the DC-scoped GPO (SYSTEM-on-DC adds the controlled principal to NORTH Domain Admins — a
 graph-confirmed primitive, NOT a doomed DS-Replication self-grant). The ESSOS hop uses the GOLDEN-TICKET /
 ADCS route because adding a foreign-forest principal to DOMAIN ADMINS@ESSOS is structurally impossible (global
 group cannot hold a foreign member) — that dead-end applies to the cross-forest hop ONLY. Read results from Phoenix.

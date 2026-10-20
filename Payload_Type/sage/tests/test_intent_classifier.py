@@ -36,8 +36,8 @@ def test_standin_guid_domain_dn_dict_derives_fqdn():
 
 
 def test_standin_grant_prefixed_dn_keeps_first_component():
-    # 2026-06-09 BUG: a DN embedded behind a prefix ("distinguishedname=DC=north,...") had its FIRST
-    # label dropped by the old (?:^|,) anchor -> the NORTH grant was filed under sevenkingdoms.local.
+    # A DN embedded behind a prefix ("distinguishedname=DC=north,...") must keep its FIRST label; a
+    # (?:^|,) anchor drops it and files the NORTH grant under sevenkingdoms.local.
     assert intent_classifier.classify_tool_call(
         "standin",
         {"object": "distinguishedname=DC=north,DC=sevenkingdoms,DC=local", "grant": "samwell.tarly"},

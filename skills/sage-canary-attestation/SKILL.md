@@ -118,7 +118,7 @@ Ludus range egress deny-rule.
   *externally effectful* Mythic operations, i.e. tasks. `list_callbacks`, `get_task_history_for_callback`,
   and `get_all_task_output_by_task_id` create no Mythic row by design, so requiring them to have a
   corresponding effect fires `no_allow_without_effect` spuriously on exactly the cases whose required
-  event is `external.control_plane_read`. This failed C03 and C06 in the 2026-07-26 scored session.
+  event is `external.control_plane_read`.
   `classify_tool_events` discriminates on evidence rather than a hardcoded name list. Count only
   `completed` invocations — counting `started` too double-counts every call.
 - **The effect binding lives in `tool_call_id`, not `metadata.task_id` — the ledger has no `task_id`.**

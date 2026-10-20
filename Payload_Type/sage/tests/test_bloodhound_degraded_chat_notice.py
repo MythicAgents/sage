@@ -6,9 +6,9 @@ first degraded turn, and Mythic already renders a live BloodHound chip at the to
 repeating it per turn would be a third copy of a fact that is on screen.
 
 Three properties, and the third is the one that matters most: a notice about a degraded OPTIONAL
-dependency must never be the thing that breaks a working turn. Sage went fully down on 2026-08-10
-because two individually-correct features were fatally incompatible in combination, with 3955 tests
-green — so the failure mode this file guards is "the helpful message took the product out".
+dependency must never be the thing that breaks a working turn. Two individually-correct features can
+be fatally incompatible in combination while every test stays green, so the failure mode this file
+guards is "the helpful message took the product out".
 """
 
 from __future__ import annotations

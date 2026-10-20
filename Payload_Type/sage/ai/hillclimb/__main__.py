@@ -229,10 +229,10 @@ def _orchestrate_reset_fn():
     Lazily imports the operator skill (outside the package) so the package stays decoupled; raises a clear,
     actionable error if it isn't importable.
 
-    TOKEN/CONFIG SEAM (wired 2026-06-20): the reset restarts Sage with SAGE_ENGAGEMENT_ID=<token> AND the
-    config's env, so (a) Sage writes its ledger under the token the gauge reads (closing the empty-ground-truth
-    hole), and (b) per-config settings actually reach Sage. Which config keys change behavior depends on what
-    Sage reads at startup; SAGE_ENGAGEMENT_ID always takes effect."""
+    TOKEN/CONFIG SEAM: the reset restarts Sage with SAGE_ENGAGEMENT_ID=<token> AND the config's
+    env, so (a) Sage writes its ledger under the token the gauge reads (otherwise the gauge reads
+    empty ground truth), and (b) per-config settings actually reach Sage. Which config keys change
+    behavior depends on what Sage reads at startup; SAGE_ENGAGEMENT_ID always takes effect."""
     scripts = Path(__file__).resolve().parents[4] / "skills" / "sage-eval-gauge" / "scripts"
     if not (scripts / "orchestrate.py").exists():
         raise SystemExit(f"reset orchestrator not found at {scripts}/orchestrate.py — cannot reset between configs")

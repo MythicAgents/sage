@@ -27,8 +27,7 @@ def state_dir() -> str:
 
 
 # Ledger filename prefix. Named `state_` (the operator-facing `state` command) and keyed per Mythic
-# OPERATION — e.g. `state_Operation_Chimera_1.json`. (Was `engagement_<SAGE_ENGAGEMENT_ID>` pre-2026-06-08;
-# clean break, old files orphaned/untouched.)
+# OPERATION — e.g. `state_Operation_Chimera_1.json`.
 _LEDGER_PREFIX = "state_"
 
 

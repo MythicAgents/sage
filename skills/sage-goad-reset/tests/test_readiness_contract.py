@@ -631,8 +631,8 @@ def test_channel_status_can_defer_chat_creation_to_operator():
 #
 # `mythic-cli start` starts every registered service, so a Mythic reset brings the Sage container
 # up alongside a tmux Sage. Both register as `sage`, one wins the RabbitMQ queue, and requests are
-# answered by whichever won. On 2026-08-01 that was the container, running its baked image instead
-# of the working tree and with no BloodHound MCP directory, while readiness reported `ready: true`.
+# answered by whichever won — possibly a container running its baked image instead of the working
+# tree and with no BloodHound MCP directory, while readiness reports `ready: true`.
 
 
 def _deployment(**kwargs):

@@ -1,8 +1,8 @@
 """Tests for the issue_task circuit breaker + empty-parameter normalization in MythicTools.
 
-Root cause covered: on 2026-06-01 a single Sage run hit 2.47M tokens because argument-less
-Apollo commands (rev2self/whoami) failed for every empty-parameter encoding and the model
-re-issued them in an unbounded loop. These tests pin the two fixes:
+Failure mode covered: argument-less Apollo commands (rev2self/whoami) can fail for every
+empty-parameter encoding, and without a bound the model re-issues them in an unbounded loop.
+These tests pin the two guards:
   1. empty params ({}, '', '""', None) normalize to ""
   2. a command that fails twice is short-circuited on the 3rd identical attempt
 Run: cd Payload_Type/sage && python3 -m pytest tests/test_circuit_breaker.py -q

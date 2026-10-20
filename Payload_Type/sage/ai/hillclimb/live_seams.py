@@ -454,8 +454,7 @@ def make_tool_executor(
 ) -> Callable[[dict], str]:
     """Raw Mythic command execution for the bare model — issue a command to the callback, return output.
 
-    VALIDATED 2026-06-18: this is exactly the path `sage_task.py task-callback` uses, which returned real
-    Apollo output (`whoami` -> 'NORTH\\samwell.tarly') from cb4. issue_task(wait_for_complete=False) then
+    Same path `sage_task.py task-callback` uses: issue_task(wait_for_complete=False) then
     waitfor_for_task_output."""
     from mythic import mythic  # type: ignore
 
@@ -510,7 +509,7 @@ def parse_domain_count(text: str) -> int:
 
 def bloodhound_domain_count(*, timeout: int = 60) -> int:
     """Read-only count of BloodHound domains via the MCP's signed client (reuses bh_reset.py status).
-    VALIDATED 2026-06-18: returns 0 on a freshly-wiped graph (`available-domains: 200 count=0`)."""
+    Returns 0 on a freshly-wiped graph (`available-domains: 200 count=0`)."""
     cmd = [
         "uv", "--directory", _bloodhound_dir(), "run", "python",
         str(_REPO / "skills" / "sage-goad-reset" / "scripts" / "bh_reset.py"), "status",
@@ -578,7 +577,7 @@ _CURATED_APOLLO = [
 
 def apollo_command_catalog(*, timeout: int = 60) -> list:
     """Live-query Apollo's command catalog from Mythic (read-only). [] on failure.
-    VALIDATED 2026-06-18: returns the real Apollo command set (shell, run, mimikatz, ticket_*, ...)."""
+    Returns the real Apollo command set (shell, run, mimikatz, ticket_*, ...)."""
     from mythic import mythic  # type: ignore
 
     async def _q():
@@ -988,9 +987,10 @@ def _dcsync_realm_matches(candidate: str | None, requested: str | None) -> bool:
     return _realms_match(raw_candidate, raw_requested)
 
 
-# Probe query strings as module constants so the preflight smoke validates the EXACT query each probe runs.
-# A GraphQL field typo here (e.g. the 2026-06-21 `responses { response }` bug — `response` is not a field on
-# Mythic's response type) otherwise fails open at scoring time and is only discovered after a ~2h live solve.
+# Probe query strings as module constants so the preflight smoke validates the EXACT query each
+# probe runs. A GraphQL field typo here (e.g. `responses { response }` — `response` is not a field
+# on Mythic's response type) otherwise fails open at scoring time and surfaces only after a ~2h live
+# solve.
 _CREDENTIAL_QUERY = "query Creds {credential {account realm}}"
 _KRBTGT_DCSYNC_TASK_QUERY = """
         query KrbtgtDcsyncTasks($limit: Int!) {

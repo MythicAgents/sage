@@ -6,13 +6,12 @@ technique's ``verify`` schema. This is the **verify-on-record** seam: a credenti
 recorded ``achieved`` when the task output actually contains a *usable* secret (a real NTLM/AES/
 RC4 key), not merely because the task did not emit a known failure signature.
 
-Why this exists (2026-06-08): the record path (`mythic_tools._record_engagement_success`) recorded
-a hop ``achieved`` whenever the output was not a *known failure signature*. A ``dcsync-user`` DCSync
-of a SMALL COUNCIL member that failed with **8439 DS_DRA_BAD_DN** (the Mythic task "succeeds" but no
-key is returned) is not a known failure signature, so ``creds:cersei.lannister@…`` was recorded
-ACHIEVED — a false-achieved ledger. The agent then forged a ticket with a PLACEHOLDER key. This
-module supplies the missing string→struct step so the existing ``verify_effect`` seam can gate the
-record on a real artifact.
+Why this exists: recording a hop ``achieved`` whenever the output is not a *known failure
+signature* is unsafe. A ``dcsync-user`` DCSync that fails with **8439 DS_DRA_BAD_DN** (the Mythic
+task "succeeds" but no key is returned) is not a known failure signature, so the credential would be
+recorded ACHIEVED — a false-achieved ledger that lets the agent forge a ticket with a PLACEHOLDER
+key. This module supplies the string→struct step so the existing ``verify_effect`` seam can gate
+the record on a real artifact.
 
 Design notes:
   * ``engagement_state.py`` stays pure (it interprets structured dicts, never parses error strings).
@@ -296,10 +295,10 @@ _GRANT_FAILURE_TOKENS = (
 def extract_grant_probe(output) -> dict:
     """Map free-form StandIn `--grant` output to the structured probe dict ``verify_effect`` consumes for
     ``dcsync-rights-grant``. ``ds_replication_rights`` (the achieved_all anchor) is True ONLY when the
-    output shows an explicit ACE-applied success marker AND names a replication right AND carries NO failure
-    signature. This kills the 2026-06-09 false-achieved-grant bug: a grant that returned ``Access is denied``
-    (samwell, medium integrity) or produced NO output (the GPO SYSTEM task that never fired) was recorded
-    ``achieved`` because the legacy path only checked for a known failure signature."""
+    output shows an explicit ACE-applied success marker AND names a replication right AND carries NO
+    failure signature. Checking only for a known failure signature would record a grant ``achieved``
+    when it returned ``Access is denied`` (e.g. a medium-integrity principal) or produced NO output
+    (a SYSTEM task that never fired)."""
     text = output if isinstance(output, str) else ("" if output is None else str(output))
     low = text.lower()
     denied = (not low.strip()) or any(tok in low for tok in _GRANT_FAILURE_TOKENS)

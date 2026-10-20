@@ -308,8 +308,7 @@ def wait_for_winrm_auth(
     A rolled-back guest reports its IP through the Ludus agent well before AD is ready to
     authenticate a domain account, so a caller that waits only for IPs and then syncs gets
     `InvalidCredentialsError: 401` from a machine whose credentials are perfectly correct.
-    Observed 2026-08-01: `sync` died on DC01 that way, and a read-only `check` minutes later
-    authenticated to all five hosts. This waits on the condition that actually matters.
+    This waits on the condition that actually matters: WinRM authentication, not an IP.
     """
     expected = {host.get("inventory_hostname"): host.get("ansible_host") for host in hosts}
     if len(expected) != len(hosts) or not all(expected) or not all(expected.values()):

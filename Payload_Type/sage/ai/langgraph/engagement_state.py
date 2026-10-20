@@ -658,9 +658,9 @@ TECHNIQUE_MODEL: dict[str, dict] = {
     # Intra-forest child→parent (forest-root) escalation via an ExtraSIDs / SID-history golden ticket.
     # Forged from the CHILD krbtgt we already hold (precondition krbtgt-hash:{domain} = the child domain),
     # injecting the root Enterprise Admins SID; it yields DA over the forest ROOT (effect da:{parent}).
-    # This MUST be a distinct technique+effect from a plain child golden ticket: otherwise the classifier
-    # labels a SID-history climb "golden-ticket" on the child with effect da:{child} — which is already
-    # achieved — and the gate SKIPs it, silently blocking the child→parent hop (the essos-solve bug, 2026-06-07).
+    # This MUST be a distinct technique+effect from a plain child golden ticket: otherwise the
+    # classifier labels a SID-history climb "golden-ticket" on the child with effect da:{child} —
+    # which is already achieved — and the gate SKIPs it, silently blocking the child→parent hop.
     # No SID filtering applies WITHIN a forest, so there is no graph-ACL precondition here.
     "sid-history-escalation": {
         "target_type": "domain",

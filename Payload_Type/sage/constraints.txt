@@ -5,10 +5,10 @@
 # Neither replaces the other: edit requirements.txt to change what Sage depends on, regenerate this
 # to record what that resolved to.
 #
-# Why this exists: on 2026-07-29 a rebuilt venv drifted 83 packages from the previous resolution,
-# and one of them (mcp 1.25.0 -> 2.0.0, which removed `mcp.server.fastmcp`) broke every module that
-# reaches ai/mcp.py — 24 collection errors from a manifest nobody had edited. A measurement the next
-# day showed 6 more packages moving in a single day. Direct pins alone do not bound that.
+# Why this exists: a rebuilt venv resolves transitives fresh and can drift many packages from the
+# previous resolution without any manifest edit. One such bump (mcp 2.0.0, which removed
+# `mcp.server.fastmcp`) breaks every module that reaches ai/mcp.py at collection time. Direct pins
+# alone do not bound that.
 #
 # Use:
 #   pip install -r Payload_Type/sage/requirements.txt -c Payload_Type/sage/constraints.txt

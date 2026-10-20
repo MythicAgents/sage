@@ -296,10 +296,9 @@ container up whether or not it is wanted. If a tmux Sage is also running, both r
 one wins the RabbitMQ queue, and Mythic requests are answered by whichever won. The loser logs
 `Another instance of this service, sage, is running` on a loop.
 
-That is not theoretical. On 2026-08-01 the container answered an autonomous chat request using its
-baked image rather than the working tree, and failed with `BloodHound MCP is not connected` because
-it had no `SAGE_BLOODHOUND_MCP_DIR` — while the readiness contract still reported `ready: true`,
-because nothing looked for a second instance.
+If the container wins, it answers chat requests from its baked image rather than the working tree,
+and fails with `BloodHound MCP is not connected` when it has no `SAGE_BLOODHOUND_MCP_DIR` — while a
+readiness contract that does not look for a second instance still reports `ready: true`.
 
 `SAGE_DEPLOYMENT_MODE` names the intended deployment: `local` (default, this repo's workflow) or
 `container`. `mythic_reset.sh` enforces it automatically after `mythic-cli start`. To check or
@@ -347,8 +346,8 @@ that path. Two consequences:
 `parity` asks the container, never the host, and checks two independent things: that the files it
 sees match the working tree, and that none is newer than the process that imported them. Python
 does not reload changed modules, so matching files plus an older start time still means stale code
-is executing. Both failure modes have happened — a container answering an autonomous run from a
-stale tree on 2026-08-01, and a fixed defect sitting undeployed while the repo was green.
+is executing. Either failure mode leaves a container answering from a stale tree, or a fixed defect
+undeployed while the repo is green.
 
 Two mechanical notes. The sync excludes every database spelling, because the container writes its
 live `sage.db` into that same directory and `rsync --delete` would otherwise be destructive

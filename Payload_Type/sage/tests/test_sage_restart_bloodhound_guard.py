@@ -1,17 +1,16 @@
 """`sage_restart.sh` must refuse OUT LOUD when SAGE_BLOODHOUND_MCP_DIR is unresolvable.
 
 The launcher carries a three-line error naming the files to set and the flag to pass. Under
-`set -euo pipefail` that message was unreachable in the exact case it was written for, by two
-independent routes:
+`set -euo pipefail` two independent routes can make that message unreachable in the exact case it
+is written for:
 
-* the `grep | tail | cut` pipeline fails when `grep` matches nothing, so the assignment fails and
+* a `grep | tail | cut` pipeline fails when `grep` matches nothing, so the assignment fails and
   the shell exits;
 * a trailing `[[ -n "$configured" ]] && append_snapshot_override ...` returns 1 when the test is
   false, which `set -e` also treats as fatal.
 
-Either way the operator saw `exit 1` and nothing else, on the one path where the script knew the
-answer and had written it down. Found 2026-08-11 while bringing local Sage up; the same
-diagnostic-never-reaches-the-human shape the BloodHound connect work is about.
+Either way the operator sees `exit 1` and nothing else, on the one path where the script knows the
+answer and has written it down.
 
 The guard runs the REAL function text extracted from the real script, so it fails when someone
 reintroduces a fragile pipeline or drops a `|| true` — not merely when someone deletes a line. It

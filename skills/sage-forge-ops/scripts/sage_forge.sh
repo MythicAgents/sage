@@ -3,9 +3,9 @@
 #
 # Why this exists: Sage's owner account is cyber-flagged, so offensive-security code must run on
 # `gpt-5.5-cyber-preview`. Routing that choice through the Forge *agent* is fragile — the agent has
-# its own "pinned model" judgment and once refused the override as a jailbreak (2026-06-04), running
-# plain gpt-5.5 instead. This wrapper removes the agent's discretion: the model is a hardcoded flag,
-# not an instruction anything can reinterpret. Probe-confirmed real: `--model gpt-5.5-cyber-preview`
+# its own "pinned model" judgment and can refuse the override as a jailbreak, running plain gpt-5.5
+# instead. This wrapper removes the agent's discretion: the model is a hardcoded flag, not an
+# instruction anything can reinterpret. Probe-confirmed real: `--model gpt-5.5-cyber-preview`
 # ran and returned (codex v0.135.0) on 2026-06-04.
 #
 # Usage:

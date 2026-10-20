@@ -2234,12 +2234,10 @@ async def _run(args: argparse.Namespace) -> int:
         )
     else:
         # `run` drives an Auto channel with autonomous_solve=true — SKILL.md: "The existing `run`
-        # command remains Auto and autonomous by default." On 2026-07-28 it was invoked as a
-        # "read-only probe" with a prompt saying "do not task any callback" and executed a full
-        # autonomous solve against the live GOAD range: 46 Mythic tasks including SharpGPOAbuse,
-        # mimikatz, Rubeus, and `ticket_cache_purge --all`. A prose warning in SKILL.md and in
-        # AGENTS.md ("Do not start expensive live GOAD/inference runs without clear user intent")
-        # both already existed and neither stopped it. This refusal is the deterministic version.
+        # command remains Auto and autonomous by default." Invoked as a "read-only probe" with a
+        # prompt saying "do not task any callback", it still executes a full autonomous solve
+        # against the live range. Prose warnings in SKILL.md and AGENTS.md do not stop that; this
+        # refusal is the deterministic version.
         if not getattr(args, "autonomous", False):
             print(json.dumps({
                 "error": "refused",

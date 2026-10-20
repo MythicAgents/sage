@@ -71,9 +71,8 @@ require_bloodhound_dir() {
   # Every pipeline below carries `|| true`, and the append is a full `if` rather than a
   # `[[ ... ]] && cmd` one-liner. Both are load-bearing under this script's `set -euo pipefail`: a
   # non-matching `grep` fails its pipeline, and a trailing `&&` list whose test is false returns 1,
-  # and either one made the shell exit **silently, before reaching the error message below**. That
-  # is exactly the failure the message exists to prevent, so the guard was mute in the one case it
-  # was written for (found 2026-08-11: an operator sees only `exit 1` and no reason).
+  # and either one would make the shell exit **silently, before reaching the error message below**
+  # — the operator would see only `exit 1` and no reason, in exactly the case the message is for.
   local configured=""
   local env_file
   configured="$(snapshot_last_value SAGE_BLOODHOUND_MCP_DIR || true)"

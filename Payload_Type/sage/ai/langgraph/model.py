@@ -2496,8 +2496,8 @@ class _EngagementStateMiddleware(AgentMiddleware):
 class _MessageSanitizerMiddleware(AgentMiddleware):
     """Provider-agnostic message-integrity guard on EVERY model call inside create_agent's react loop.
 
-    WHY THIS EXISTS (2026-07-10): the reported `ValidationException: system: text content blocks must be
-    non-empty` fired on a native `ChatBedrock` (InvokeModel) call under the Supervisor. Two prior defenses do
+    WHY THIS EXISTS: a native `ChatBedrock` (InvokeModel) call under the Supervisor can fail with
+    `ValidationException: system: text content blocks must be non-empty`. Two other defenses do
     NOT cover that path: (1) `_sanitize_messages` only cleans the channel lists the graph passes in — it never
     sees the messages create_agent assembles internally across a multi-step react loop; (2) the
     `langchain_openai._convert_message_to_dict` monkeypatch only affects the ChatOpenAI/LiteLLM-proxy provider,
@@ -5044,11 +5044,11 @@ class Model:
         # and cancelled so a stop interrupts long awaits inside tools before they can issue delayed
         # follow-up tasks.
         self._stop_requested = False
-        # WHY the stop was requested. `_stop_requested` alone is a boolean with no provenance, so three
-        # different halts — an operator pressing stop, the no-progress backstop, the loop-breaker's
-        # terminal blocker — all reached the same emitter and told the operator *they* stopped the
-        # session. Found 2026-08-03: a repeated prompt tripped the backstop and the operator was blamed
-        # for a halt he had no part in, which sends someone hunting for their own mistake.
+        # WHY the stop was requested. `_stop_requested` alone is a boolean with no provenance, so
+        # three different halts — an operator pressing stop, the no-progress backstop, the
+        # loop-breaker's terminal blocker — would all reach the same emitter and tell the operator
+        # *they* stopped the session. Blaming the operator for a halt they had no part in sends them
+        # hunting for their own mistake.
         self._stop_reason = ""
         self._running_tasks = set()
         self._max_steps = int(max_steps) if max_steps else 0  # 0 = unlimited
@@ -5638,11 +5638,11 @@ class Model:
             or prior.stop_condition != contract.stop_condition
         ):
             self._request_dynamic_proposals = not bool(contract.requested_actions)
-            # A NEW request clears any halt left by the previous one. Native chat reuses a per-channel
-            # Model and `_stop_requested` was otherwise set to False exactly once, in __init__, so a
-            # single halt poisoned every later request on that channel: the node's kill-switch check
-            # breaks before `result` is assigned, and the request either crashed (pre-guard) or did
-            # nothing at all (post-guard). Observed live 2026-08-03 as a repeating four-turn cycle.
+            # A NEW request clears any halt left by the previous one. Native chat reuses a
+            # per-channel Model, and `_stop_requested` is otherwise set to False only in __init__,
+            # so a single halt would poison every later request on that channel: the node's
+            # kill-switch check breaks before `result` is assigned, and the request does nothing at
+            # all.
             #
             # This sits inside the changed-request branch deliberately. Clearing only when the request
             # id or stop condition actually changes means an operator stop landing mid-request is NOT
@@ -9156,14 +9156,13 @@ class Model:
 
             # Progress is the effect boundary and NOTHING ELSE.
             #
-            # Attempt 1 also treated "this delegation returned different content than last time" as
-            # progress, to avoid truncating legitimate non-tasking work. A live rejection loop
-            # refuted it immediately: the model paraphrases its own refusal, so the returned content
-            # alternates ("[turn-authority] issue_task…" / "Let me issue the ticket_cache_list…" /
-            # "[turn-authority] mode is `supervised_action`…") and the streak resets every second or
-            # third cycle. The guard reached 2/3 and never fired while the request looped to the
-            # global step limit. Widening the comparison to a set of seen digests does not fix it —
-            # genuinely new phrasing still reads as new.
+            # Treating "this delegation returned different content than last time" as progress does
+            # not work: the model paraphrases its own refusal, so the returned content alternates
+            # ("[turn-authority] issue_task…" / "Let me issue the ticket_cache_list…" /
+            # "[turn-authority] mode is `supervised_action`…") and a content-based streak resets
+            # every second or third cycle, never firing while the request loops to the global step
+            # limit. Widening the comparison to a set of seen digests does not fix it — genuinely
+            # new phrasing still reads as new.
             #
             # That is AGENTS.md's rule in a different costume: do not encode control authority by
             # classifying open-ended natural-language prose when protocol state carries the same
@@ -9870,9 +9869,9 @@ class Model:
                     update["supervisor_messages"] = [empty_notice]
 
             # `result` is the node's return value and CAN be None — a node that halts (e.g. the
-            # no-progress backstop) returns nothing, and `flag in None` raises
-            # `TypeError: argument of type 'NoneType' is not iterable`. Observed live 2026-08-03 on the
-            # Supervisor node, which turned a clean halt into an operator-facing crash.
+            # no-progress backstop) returns nothing, and `flag in None` raises `TypeError: argument
+            # of type 'NoneType' is not iterable`, which would turn a clean halt into an
+            # operator-facing crash.
             if result is None:
                 logger.warning(
                     f"⚠️ [{node_name}] node returned None — the turn produced no output. "

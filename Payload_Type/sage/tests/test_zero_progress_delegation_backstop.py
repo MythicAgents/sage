@@ -111,7 +111,7 @@ def test_counter_is_per_node_not_global():
 
 
 def test_backstop_message_tells_the_operator_the_work_may_have_run():
-    """The 2026-07-28 case: the whoami DID execute. The message must not imply otherwise."""
+    """The delegated work (here, a whoami) may have run. The message must not imply otherwise."""
     model = _FakeModel()
     out = []
     for _ in range(_ZERO_PROGRESS_DELEGATION_CAP):
@@ -131,7 +131,7 @@ from ai.langgraph.model import Model
 
 
 class _ZeroProgressAgent:
-    """An agent that completes but hands nothing back — the 2026-07-28 symptom."""
+    """An agent that completes but hands nothing back — the zero-progress symptom."""
 
     def __init__(self):
         self.calls = 0

@@ -1,6 +1,6 @@
 """Sage's per-node error handler.
 
-Before this handler existed, any exception out of a specialist unwound `graph.astream` and ended the
+Without this handler, any exception out of a specialist unwinds `graph.astream` and ends the
 run. `Model._handle_node_failure` turns a recoverable failure into a Supervisor handback instead.
 
 The safety property is the one worth testing hardest: Sage's operator kill-switch is raised as a

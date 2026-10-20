@@ -8253,9 +8253,10 @@ def test_gate_failure_fails_open_and_issues_normally():
 
 
 def test_capability_effects_achieved_requires_specific_effect_not_coarse_da():
-    # adcs-certificate-auth declares BOTH da:{domain} (coarse) AND certificate-auth:{acct}@{domain} (specific).
-    # If da:{domain} was already achieved by some OTHER technique, the cert-auth capability must NOT short-circuit
-    # as already-achieved — its specific proof was never gathered (2026-06-12 audit, MED any-overlap dedup).
+    # adcs-certificate-auth declares BOTH da:{domain} (coarse) AND
+    # certificate-auth:{acct}@{domain} (specific). If da:{domain} was already achieved by some
+    # OTHER technique, the cert-auth capability must NOT short-circuit as already-achieved — its
+    # specific proof was never gathered.
     mt = _make_tools()
     action = capabilities.CapabilityAction(
         name="adcs-certificate-auth",

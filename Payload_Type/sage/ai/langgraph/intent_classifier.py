@@ -50,7 +50,7 @@ def classify_tool_call(command: str, params, callback_host: str | None = None) -
             # DCSyncing a SPECIFIC non-krbtgt principal (to recover THAT user's key, e.g. a SMALL COUNCIL
             # member for cross-forest LAPS) is a DISTINCT op from the domain krbtgt DCSync. Without this they
             # both collapse to ("dcsync", domain) → krbtgt-hash:{domain}, so once the krbtgt is dumped the gate
-            # wrongly SKIPs every user DCSync (the 2026-06-07 lord.varys block).
+            # wrongly SKIPs every user DCSync.
             if user and not _is_krbtgt_dcsync_target(user):
                 return ("dcsync-user", f"{user}@{domain}")
             return ("dcsync", domain)
@@ -278,10 +278,11 @@ def _fqdn_from_dn(value: str) -> str:
     try:
         text = _text(value)
         # Anchor on the FIRST DC= component, even when the DN is embedded behind a prefix such as
-        # "distinguishedname=DC=north,DC=sevenkingdoms,DC=local". That leading DC= is preceded by '='
-        # (not '^'/','), so the old (?:^|,) anchor silently DROPPED the first label (north) and the NORTH
-        # grant was filed under sevenkingdoms.local (2026-06-09 BUG). Find the first DC= run, then parse
-        # only its contiguous ,DC= components so an unrelated later DC= in some other attribute can't leak in.
+        # "distinguishedname=DC=north,DC=sevenkingdoms,DC=local". That leading DC= is preceded by
+        # '=' (not '^'/','), so a (?:^|,) anchor would silently DROP the first label (north) and
+        # file the NORTH grant under sevenkingdoms.local. Find the first DC= run, then parse only
+        # its contiguous ,DC= components so an unrelated later DC= in some other attribute can't
+        # leak in.
         match = re.search(r"DC=[^,]+(?:\s*,\s*DC=[^,]+)*", text, re.IGNORECASE)
         if not match:
             return ""

@@ -19,7 +19,7 @@ against current code. Keeping them in the tree would force a permanent exclusion
 quietly means "the parts we still expect to work."
 
 The portfolios are rejected evaluation evidence. `AGENTS.md` (Repository map and artifacts) names `.sage_history/`
-as the home for rejected and accepted evidence, so they now live at:
+as the home for rejected and accepted evidence, so they live at:
 
 ```
 .sage_history/evaluation/architecture-policy/rejected-successor-portfolios/
@@ -282,12 +282,12 @@ the handler. A stand-in only tests the parts of the real thing you remembered to
 matching the moment the real one changes. Prefer building the actual artifact; when a stand-in is genuinely
 necessary, say in its docstring what it mirrors and keep the mirroring explicit.
 
-## The incident this encodes (2026-08-10)
+## The failure mode this encodes
 
 `set_node_defaults(timeout=TimeoutPolicy(...))` applies to every node. `error_handler=` makes LangGraph register
 a synthetic `__error_handler__Mythic_Operator` node, which inherits that default. LangGraph rejects node timeouts
-on sync callables, and the handler shipped as `def`. Result: `_rebuild_graph` raised, so **every** request failed
-at build time in about five seconds, before reaching a model — including a bare "Hello". Both features had passing
-tests. The suite was 3955 green. The defect was found by a human typing into the chat window.
+on sync callables, so a handler written as `def` makes `_rebuild_graph` raise: **every** request fails at build
+time in about five seconds, before reaching a model — including a bare "Hello". Both features can pass their own
+tests while the assembled graph cannot be built.
 
-The fix was one keyword. The gap was that the cheapest possible test — *does it assemble?* — did not exist.
+The fix is one keyword. The guard is the cheapest possible test — *does it assemble?*

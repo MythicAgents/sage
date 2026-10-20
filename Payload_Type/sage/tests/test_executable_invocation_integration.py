@@ -202,11 +202,11 @@ def test_legacy_certify_verb_is_repaired_through_supervised_preparation(tmp_path
 
 
 def test_legacy_certify_option_syntax_is_normalized_through_supervised_preparation(tmp_path, monkeypatch):
-    # The channel-3 (2026-10-18) residual: the Operator proposed a raw Certify argument string using
-    # legacy slash-option syntax `/domain:essos.local`, which looped on an "unexpected executable
-    # argument" rejection (verb-only aliasing did not cover options). The Normalizer rewrites the
-    # legacy option syntax to the enrolled `--domain essos.local` before the approval card, with
-    # auditable provenance, so the action prepares instead of looping.
+    # A raw Certify argument string using legacy slash-option syntax (`/domain:essos.local`) must
+    # not loop on an "unexpected executable argument" rejection (verb-only aliasing does not cover
+    # options). The Normalizer rewrites the legacy option syntax to the enrolled
+    # `--domain essos.local` before the approval card, with auditable provenance, so the action
+    # prepares instead of looping.
     client, _, _, _, _ = _fixture(tmp_path, monkeypatch)
     client._issue_mythic_task = AsyncMock()
     raw = "enum-cas /domain:essos.local --filter-vulnerable"

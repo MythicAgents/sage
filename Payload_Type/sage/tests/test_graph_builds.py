@@ -1,17 +1,15 @@
 """Tier 0: Sage's REAL graph must assemble. No model, no network, no credentials.
 
-This file exists because of a total outage on 2026-08-10. Two commits that were each green on their
-own tests were fatally incompatible in combination:
+This file guards against a total outage from two changes that are each green on their own tests
+but fatally incompatible in combination:
 
-  * `6d9ec69` put `set_node_defaults(timeout=TimeoutPolicy(...))` on the graph, which applies to
-    EVERY node.
-  * `af5c490` registered `error_handler=self._handle_node_failure` on `Mythic_Operator`, which makes
-    LangGraph create a synthetic `__error_handler__Mythic_Operator` node.
+  * `set_node_defaults(timeout=TimeoutPolicy(...))` on the graph applies to EVERY node.
+  * `error_handler=self._handle_node_failure` on `Mythic_Operator` makes LangGraph create a
+    synthetic `__error_handler__Mythic_Operator` node.
 
-That synthetic node inherited the node-default timeout, and the handler was `def` rather than
-`async def`. LangGraph refuses to apply a timeout to a sync node, so `_rebuild_graph` raised and
-every single request failed — including "Hello" — in about five seconds, before any model call.
-The offline suite was 3955 green throughout.
+That synthetic node inherits the node-default timeout, and LangGraph refuses to apply a timeout to
+a sync node. If the handler is `def` rather than `async def`, `_rebuild_graph` raises and every
+request fails — including "Hello" — before any model call, while the offline suite stays green.
 
 Why the existing tests could not catch it, which is the reusable lesson:
 
@@ -71,7 +69,7 @@ def _hermetic_model(**kwargs) -> Model:
 
 
 def test_the_real_graph_builds():
-    """The falsifier for the 2026-08-10 outage. Reverting the handler to `def` turns this red."""
+    """Falsifier for the sync-error-handler build failure: reverting the handler to `def` fails."""
 
     async def body() -> object:
         model = _hermetic_model()

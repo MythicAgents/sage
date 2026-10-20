@@ -98,7 +98,7 @@ Create a fresh supervised, non-autonomous channel and stop at the first native a
 
 The canary never reuses a prepared Auto channel and never posts an approval response. It may still perform
 control-plane reads needed to construct the proposed action. Approval or rejection remains an explicit Mythic UI
-action. The existing `run` command remains Auto and autonomous by default, and since 2026-07-28 it **refuses without an explicit `--autonomous` acknowledgement** (exit 2) and points at `canary`. That guard exists because this warning, and the matching one in `AGENTS.md`, were both already written and neither prevented a `run` invoked as a "read-only probe" from executing a full autonomous solve against the live range.
+action. The existing `run` command remains Auto and autonomous by default, and it **refuses without an explicit `--autonomous` acknowledgement** (exit 2) and points at `canary`. That guard exists because prose warnings like this one, and the matching one in `AGENTS.md`, do not prevent a `run` invoked as a "read-only probe" from executing a full autonomous solve against the live range.
 
 For an explicitly authorized engineering check of real-provider invocation and same-channel memory, use
 `scripts/live_model_smoke.py --live-test`. It creates one fresh supervised/non-autonomous channel, posts two
@@ -133,7 +133,7 @@ action **`respond`**, not `reject`. That distinction is load-bearing: Sage's
 `resume_steer_message_for_request` reads `InputResponse.Response` only on `respond`/`select` and returns `""`
 for `accept`/`reject`, so a `reject` carrying text drops it silently — the agent sees only the default
 `[DENIED by operator] <tool> was not executed.` Omitting `--response` sends a bare `reject`, which is the
-shape that produced the 2026-07-28 re-proposal loop. Use the bare form when deliberately exercising the
+shape that can leave the agent in a re-proposal loop. Use the bare form when deliberately exercising the
 loop-guard or the post-denial path. Either form: the guarded action is never executed.
 
 `approve-pending` and `reject-pending` share one implementation and one set of fail-closed preconditions: the

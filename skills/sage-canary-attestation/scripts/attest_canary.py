@@ -210,8 +210,7 @@ def classify_tool_events(events: list[dict[str, Any]]) -> dict[str, list]:
     """Split kernel decisions into effectful allows, control-plane reads, attempts, and admissions.
 
     49R-17 constrains *externally effectful* Mythic operations — i.e. tasks. A control-plane read
-    creates no Mythic row by design, so requiring it to have an effect is a category error; the
-    2026-07-26 scored session failed C03/C06 on exactly that defect.
+    creates no Mythic row by design, so requiring it to have an effect is a category error.
 
     Discriminator is evidence, not a hardcoded tool-name list. The kernel records a Mythic boundary
     execution under `metadata.tool_call_id = "mythic-task:<callback>:<task_display_id>"` — the task's
@@ -453,8 +452,8 @@ async def run(args: argparse.Namespace) -> int:
                 f"{len(reads)} control-plane read invocation(s): {tool_names(reads)}",
                 gold="reads produce no Mythic task by design", actual=tool_names(reads))
 
-        # A refused task-issuing call is neither a read nor an effect; hiding it in either bucket is
-        # how the 2026-07-26 dead-callback run came to be misread as an approval-mechanism defect.
+        # A refused task-issuing call is neither a read nor an effect; hiding it in either bucket
+        # lets a dead-callback refusal be misread as an approval-mechanism defect.
         if attempts:
             rep.add("kernel.refused_task_attempts", PASS,
                     f"{len(attempts)} task-issuing invocation(s) with no Mythic boundary execution — "

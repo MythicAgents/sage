@@ -4163,14 +4163,13 @@ _EXPECTED_CONFIG_OPTIONS = {
     "system_prompt", "API_ENDPOINT", "API_KEY", "SAGE_REASONING_EFFORT",
     "SAGE_PROVIDER_RETRY_POLICY",
     "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_DEFAULT_REGION",
-    # BloodHound MCP connection (added 2026-07-30). Kept in this exact-equality inventory rather
-    # than relaxing the assertion to a subset: the point of the set is that every option Mythic
-    # renders is deliberate, so an accidental addition should fail here just as a removal does.
-    # One address field, not three. BLOODHOUND_DOMAIN/PORT/SCHEME were collapsed into
-    # BLOODHOUND_URL (2026-08-11): they expressed a single fact, and DOMAIN was a HOSTNAME, which is
-    # a confusing name inside a tool whose subject is Active Directory domains. Sage still expands
-    # the URL into those three at the subprocess boundary, so the MCP server is unaffected — what
-    # changed is what a human is asked to fill in. Removals here are as deliberate as additions.
+    # BloodHound MCP connection. Kept in this exact-equality inventory rather than relaxing the
+    # assertion to a subset: the point of the set is that every option Mythic renders is
+    # deliberate, so an accidental addition should fail here just as a removal does.
+    # One address field, not three: BLOODHOUND_URL expresses a single fact, and a separate DOMAIN
+    # field would hold a HOSTNAME, a confusing name inside a tool whose subject is Active Directory
+    # domains. Sage expands the URL into BLOODHOUND_DOMAIN/PORT/SCHEME at the subprocess boundary,
+    # so the MCP server is unaffected. Removals here are as deliberate as additions.
     "BLOODHOUND_URL", "BLOODHOUND_TOKEN_ID", "BLOODHOUND_TOKEN_KEY",
 }
 

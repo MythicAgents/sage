@@ -852,10 +852,10 @@ def sage_deployment_status(
 
     `mythic-cli start` starts EVERY registered service, so resetting Mythic silently brings the
     Sage container up alongside a tmux Sage. Both register as `sage`, one wins the RabbitMQ queue,
-    and requests are answered by whichever won. Observed 2026-08-01: the container answered a chat
-    request using code that was not the working tree and had no BloodHound MCP directory, while the
-    losing tmux process logged `Another instance of this service, sage, is running` on a loop.
-    Nothing in this contract could see that, so it reported `ready: true`.
+    and requests are answered by whichever won — possibly a container running code that is not the
+    working tree and has no BloodHound MCP directory, while the losing tmux process logs
+    `Another instance of this service, sage, is running` on a loop. Without this check the contract
+    cannot see a second instance and reports `ready: true`.
     """
     resolved = resolve_sage_deployment_mode(mode)
     if container_running is _UNSET:

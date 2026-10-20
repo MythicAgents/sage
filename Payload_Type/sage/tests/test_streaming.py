@@ -45,7 +45,7 @@ MODEL_AST = ast.parse(MODEL_SOURCE)
 # Chat-turn handling lives in sage_chat/service.py.
 CHAT_PY = SAGE_ROOT / "sage_chat" / "service.py"
 CHAT_SOURCE = CHAT_PY.read_text()
-# Chat-turn session persistence moved to the channel-keyed adapter sage_chat/session.py.
+# Chat-turn session persistence lives in the channel-keyed adapter sage_chat/session.py.
 SESSION_SOURCE = (SAGE_ROOT / "sage_chat" / "session.py").read_text()
 
 
