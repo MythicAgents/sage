@@ -682,7 +682,7 @@ def test_objective_completion_candidate_renders_admin_control_proof_chain():
         "key_effect": "krbtgt-hash:essos.local",
         "key_task_id": "664",
     }]
-    # ... but Stage B: the observed-state render no longer emits any planning/completion output.
+    # ... but the observed-state render emits no planning/completion output.
     assert "Phase:" not in rendered
     assert "OBJECTIVE SATISFIED CANDIDATES" not in rendered
     assert "NEXT CAPABILITY ACTIONS" not in rendered
@@ -762,8 +762,8 @@ def test_objective_completion_candidate_accepts_live_certificate_auth_proof():
         "auth_effect": "certificate-auth:administrator@essos.local",
         "auth_task_id": "150",
     }]
-    # Stage B: completion candidates are still derived by the kept function (above), but the
-    # observed-state render no longer emits the OBJECTIVE SATISFIED CANDIDATES planning block.
+    # Completion candidates are derived by the function above, but the observed-state render
+    # does not emit the OBJECTIVE SATISFIED CANDIDATES planning block.
     assert "OBJECTIVE SATISFIED CANDIDATES" not in rendered
     assert "NEXT CAPABILITY ACTIONS" not in rendered
 

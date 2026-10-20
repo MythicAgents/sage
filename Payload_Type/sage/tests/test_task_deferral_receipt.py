@@ -99,7 +99,7 @@ def test_every_recorded_sleep_bounds_at_the_same_configured_deadline():
 
 
 def test_a_four_hour_sleep_no_longer_produces_a_multi_hour_wait():
-    """The exact defect, stated as the number it used to produce."""
+    """Pinned against the uncapped sleep-scaled formula, which yields ~12 hours for this sleep."""
     tools = _make_tools()
     tools._record_callback_sleep(7, {
         "effective_sleep_seconds": 4 * 60 * 60,
@@ -317,15 +317,15 @@ def test_the_receipt_record_cannot_serve_as_a_resumption_handle():
 
 
 def test_a_long_sleeping_callback_no_longer_holds_the_turn_open():
-    """The terminal-turn precondition, which is the half that was actually broken.
+    """The terminal-turn precondition.
 
-    The composer unlocks when the owning `chat_request` reaches a terminal status, and it reaches one
-    when the turn completes. Before the grace cap the turn could not complete: the graph sat inside
-    `asyncio.wait_for` under `_graph_heartbeat` for the whole derived budget, and for a four-hour
-    sleep that budget was ~12 hours. So the falsifier worth testing is the tool call not returning.
+    The composer unlocks when the owning `chat_request` reaches a terminal status, and it reaches
+    one when the turn completes. Without the grace cap the turn cannot complete: the graph sits
+    inside `asyncio.wait_for` under `_graph_heartbeat` for the whole derived budget, and for a
+    four-hour sleep the uncapped sleep-scaled budget is ~12 hours. So the falsifier worth testing is
+    the tool call not returning.
 
-    The callback here has a four-hour sleep recorded, which is exactly the case that used to produce
-    the ~12-hour wait, and the whole call is given one second.
+    The callback here has a four-hour sleep recorded, and the whole call is given one second.
 
     Scope limit, stated rather than papered over: `chat_request.status` is written by
     `sage_chat/service.py` against live Mythic, so the status field itself is a live-layer assertion

@@ -164,11 +164,10 @@ def main() -> int:
     )
     parser.add_argument("--max-mythic-operator-lines", type=int, default=430)
     # Ratchet, not a researched cognitive limit: the intent (AGENTS.md: avoid adding prompts, tool
-    # surfaces, or planning layers when a thinner fix suffices) is direction, not an absolute, and nothing distinguishes 25
-    # from 30. Raised 24 -> 25 on 2026-08-01 because the tree had been at 25 for some time and the
-    # check was therefore permanently failing — a gate that is always red cannot tell you whether
-    # your change broke something, which is worse than no gate. Keep this equal to the current
-    # count so a failure means "this change added a tool", and say why in the commit when raising.
+    # surfaces, or planning layers when a thinner fix suffices) is direction, not an absolute, and
+    # nothing distinguishes 25 from 30. Keep this equal to the current count so a failure means
+    # "this change added a tool": a gate that is always red cannot tell you whether your change
+    # broke something, which is worse than no gate. Say why in the commit when raising.
     parser.add_argument("--max-mythic-operator-tools", type=int, default=25)
     args = parser.parse_args()
     if args.self_test:

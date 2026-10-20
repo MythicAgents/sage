@@ -45,10 +45,8 @@ BLOODHOUND_URL_KEY = "BLOODHOUND_URL"
 
 
 #: Internal key → the key an operator can actually set. The resolver expands one `BLOODHOUND_URL`
-#: into the address triple, so reporting a missing `BLOODHOUND_DOMAIN` would send someone looking for
-#: a field that no longer exists in the chat configuration, the `.env`, or any document. Found by the
-#: documentation guard rather than by review: the sample diagnostic copied into README named a
-#: retired key, which was true of the code and wrong for the reader.
+#: into the address triple, so reporting a missing `BLOODHOUND_DOMAIN` would send someone looking
+#: for a field that the chat configuration, the `.env`, and the documentation do not expose.
 _OPERATOR_KEY_ALIASES = {
     "BLOODHOUND_DOMAIN": BLOODHOUND_URL_KEY,
     "BLOODHOUND_PORT": BLOODHOUND_URL_KEY,
@@ -326,14 +324,14 @@ def bloodhound_tool_admission() -> dict[str, Any]:
     }
 
 
-#: What an operator can actually SET, which is no longer the same list as what reaches the MCP
-#: server. `BLOODHOUND_CREDENTIAL_KEYS` stays the subprocess allowlist — DOMAIN/PORT/SCHEME plus the
-#: two tokens — because that is what the server reads and the pre-connect guard admits. This tuple is
+#: What an operator can actually SET, which is not the same list as what reaches the MCP server.
+#: `BLOODHOUND_CREDENTIAL_KEYS` stays the subprocess allowlist — DOMAIN/PORT/SCHEME plus the two
+#: tokens — because that is what the server reads and the pre-connect guard admits. This tuple is
 #: the operator-facing half, and the two are bound together deliberately: the resolver
 #: (`sage_chat/config.py`), the UI declaration (`sage_chat/models.py`) and the guard test all read
 #: THIS list, so a key added to one side and not the other fails rather than silently going
-#: unreachable. That exact gap shipped once: all five keys resolved correctly while nothing declared
-#: them, so Mythic rendered no fields and the working credential path could not be reached.
+#: unreachable. Keys that resolve but are not declared render no Mythic fields, which leaves a
+#: working credential path unreachable.
 BLOODHOUND_OPERATOR_CONFIG_KEYS = (
     BLOODHOUND_URL_KEY,
     "BLOODHOUND_TOKEN_ID",

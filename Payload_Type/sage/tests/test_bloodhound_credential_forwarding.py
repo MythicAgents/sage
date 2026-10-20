@@ -36,8 +36,8 @@ def test_config_beats_secret_beats_env(monkeypatch):
     """Per-chat Config → Mythic user Secret → container env, first non-empty wins.
 
     Precedence is asserted on the OPERATOR key (`BLOODHOUND_URL`) and observed through the expanded
-    output, because the collapse means the thing a human sets and the thing the MCP server reads are
-    no longer the same key.
+    output, because the URL is expanded into the keys the MCP server reads, so the thing a human
+    sets and the thing the MCP server reads are not the same key.
     """
     monkeypatch.setenv("BLOODHOUND_URL", "http://from-env:9999")
     monkeypatch.setenv("BLOODHOUND_TOKEN_ID", "env-token-id")
@@ -134,17 +134,17 @@ def test_caller_dict_is_copied_not_aliased():
 def test_every_resolved_key_is_declared_to_mythic():
     """Resolution without declaration is invisible to the operator.
 
-    The 2026-07-30 miss: `build_bloodhound_env` read all five keys correctly, but nothing declared
-    them in `ChatModelMetadata`, so Mythic rendered no fields and never populated `request.Config`.
-    The credential path worked and could not be reached. This ties the two sides together — a key
-    added to the resolver but not to the UI declaration (or vice versa) fails here.
+    If `build_bloodhound_env` reads a key that nothing declares in `ChatModelMetadata`, Mythic
+    renders no field and never populates `request.Config`: the credential path works and cannot be
+    reached.
+    This ties the two sides together — a key added to the resolver but not to the UI declaration (or
+    vice versa) fails here.
 
-    Iterates the OPERATOR-settable keys rather than the subprocess allowlist, because as of the
-    URL collapse those are no longer the same list. `BLOODHOUND_CREDENTIAL_KEYS` is what reaches the
-    MCP server (DOMAIN/PORT/SCHEME plus the tokens); `BLOODHOUND_OPERATOR_CONFIG_KEYS` is what a
-    human types (URL plus the tokens). Asserting the old list here after the collapse would demand a
-    UI field for `BLOODHOUND_DOMAIN`, which is exactly the three-fields-for-one-address problem the
-    collapse removed. The invariant is unchanged: whatever an operator can set must be reachable.
+    Iterates the OPERATOR-settable keys rather than the subprocess allowlist, because those are
+    different lists. `BLOODHOUND_CREDENTIAL_KEYS` is what reaches the MCP server (DOMAIN/PORT/SCHEME
+    plus the tokens); `BLOODHOUND_OPERATOR_CONFIG_KEYS` is what a human types (URL plus the tokens).
+    Asserting the subprocess list here would demand a UI field for `BLOODHOUND_DOMAIN` — three
+    fields for one address. The invariant: whatever an operator can set must be reachable.
     """
     from sage_chat.models import SAGE_MODELS, _CONFIG_OPTIONS
 
@@ -165,9 +165,8 @@ def test_every_resolved_key_is_declared_to_mythic():
 def test_slash_bloodhound_forwards_resolved_credentials(monkeypatch):
     """The `/bloodhound` command is what an operator reaches for when BloodHound is not connected.
 
-    It previously called `ensure_bloodhound_connected(directory)` with no credentials at all, so it
-    could never fix the condition it exists to fix — the auto-connect path had been wired but this
-    one had not.
+    It must forward the resolved credentials to `ensure_bloodhound_connected`; called with none, it
+    can never fix the condition it exists to fix.
     """
     import asyncio
 
@@ -257,10 +256,9 @@ def test_bloodhound_arg_parser_splits_force_from_directory():
 class _ProbeTool:
     """A `domain_info` that answers, so a mocked connect also passes the reachability read.
 
-    Since 2026-08-11 a successful handshake is not on its own a successful connect: Sage calls one
-    real read before claiming BloodHound is usable. A fixture that returns bare tool NAMES therefore
-    describes a server that connected and cannot answer, which is now correctly reported as not
-    connected.
+    A successful handshake is not on its own a successful connect: Sage calls one real read before
+    claiming BloodHound is usable. A fixture that returns bare tool NAMES therefore describes a
+    server that connected and cannot answer, which is correctly reported as not connected.
     """
 
     name = "domain_info"

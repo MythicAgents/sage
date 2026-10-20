@@ -1349,9 +1349,9 @@ _HITL_GUARDED_REQUEST_UNAVAILABLE = "The exact guarded request is unavailable an
 STOP_REASON_OPERATOR = "operator"
 STOP_REASON_NO_PROGRESS = "no_progress"
 STOP_REASON_TERMINAL_BLOCKER = "terminal_blocker"
-# The service's request lifecycle also ends sessions, and none of those endings is an operator action:
-# a changed Mythic token/operation or Sage config rotates the session, and a fresh prompt arriving over
-# a pending approval drops it rather than silently resuming. Both used to report an operator stop.
+# The service's request lifecycle also ends sessions, and none of those endings is an operator
+# action: a changed Mythic token/operation or Sage config rotates the session, and a fresh prompt
+# arriving over a pending approval drops it rather than silently resuming.
 STOP_REASON_SESSION_ROTATED = "session_rotated"
 STOP_REASON_RESUME_REFUSED = "resume_refused"
 # A graph/runtime exception also tears the lifecycle down. Its status is `error`, so this wording is
@@ -2137,11 +2137,11 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
                     and not self._model._request_contract_block_reason("list_callbacks")
                     else ""
                 )
-                # Tier 2: force one more model turn to re-pick a valid verb, but only while the bounded,
-                # request-scoped repair budget remains. The budget is counted on the durable event ledger,
-                # so a Supervisor↔Operator handoff or turn restart no longer consumes the single retry the
-                # old volatile one-shot flag allowed; it is never spent unless an actual re-run fires (the
-                # claim is the last, short-circuited condition), and request_id is already "" when a terminal
+                # Tier 2: force one more model turn to re-pick a valid verb, but only while the
+                # bounded, request-scoped repair budget remains. The budget is counted on the
+                # durable event ledger, so a Supervisor↔Operator handoff or turn restart does not
+                # consume it; it is never spent unless an actual re-run fires (the claim is the
+                # last, short-circuited condition), and request_id is already "" when a terminal
                 # blocker halt is pending, so a tripped loop-breaker suppresses the re-run.
                 if (request_id
                         and not prepared_message.tool_calls
@@ -3451,34 +3451,28 @@ def _messages_added_by_agent(
 ) -> list:
     """Return the messages the agent ADDED, identified by message id rather than list position.
 
-    This is HARDENING — not the established fix for the observed live zero-return defect.
-    `_ainvoke` used to slice `updated_channel[initial_agent_input_length:]`, which is sound only when
-    the returned list is (input + new). Identifying the agent's output by identity rather than by
-    arithmetic is unconditionally sounder, so this stays. What it does NOT do is explain the observed
-    live defect — see below before attributing a zero-return to it.
+    A positional slice `updated_channel[initial_agent_input_length:]` is sound only when the
+    returned list is (input + new); identifying the agent's output by identity rather than by
+    arithmetic is unconditionally sounder. This is HARDENING, not an explanation of the observed
+    live zero-return defect — read below before attributing a zero-return to it.
 
-    ATTRIBUTION WITHDRAWN. This function landed on the theory that Sage's
-    history-rewriting middleware shortens the returned list, so a rewrite dropping as many messages
-    off the front as the model added to the back makes the positional slice return EMPTY. That
-    theory is refuted for this runtime:
+    Do not attribute a zero-return to history-rewriting middleware shortening the returned list (a
+    rewrite dropping as many messages off the front as the model added to the back). For this
+    runtime:
 
     - `ContextEditingMiddleware(_DigestToolUsesEdit)` CANNOT shorten a list. Sage's subclass and
-      langchain's `ClearToolUsesEdit.apply` both only do `messages[idx] = ...` — length is invariant.
-    - `SummarizationMiddleware` is the only list-shortener, and it has never fired: all 247
-      `SummarizationMiddleware.before_model` spans in Phoenix are <=2ms with zero child spans and
-      zero LLM descendants. Its `trigger=("tokens", 150000)` was never approachable — the all-time
-      peak per-call prompt is 80,839, and the affected runs peaked at 37,510 and 18,594.
-    - `keep=("messages", 12)` would have collapsed an affected 20-message input to ~13, not the
-      observed 20.
+      langchain's `ClearToolUsesEdit.apply` both only do `messages[idx] = ...` — length is
+      invariant.
+    - `SummarizationMiddleware` is the only list-shortener, and Phoenix traces show it has not
+      fired: its `trigger=("tokens", 150000)` is far above the observed per-call prompt sizes.
+    - `keep=("messages", 12)` would collapse an affected 20-message input to ~13, not the observed
+      20.
 
-    A hermetic probe reproduced the symptom shape with a synthetic middleware emitting
-    `RemoveMessage` that Sage does not run. The real mechanism of the observed zero-return is
-    UNKNOWN (third refuted attribution, after interrupt/resume replay and create_agent jump-to-end).
-    Note the leading hypothesis would defeat this function too: `add_messages` dedupes by id, so a
-    returned message whose id already exists REPLACES in place, which leaves both the positional
-    slice and this id-diff returning empty.
-
-    Falls back to the positional slice when any message lacks an id, so behaviour is byte-identical
+    A synthetic middleware emitting `RemoveMessage` reproduces the symptom shape, but Sage runs no
+    such middleware. The real mechanism is UNKNOWN; interrupt/resume replay and create_agent
+    jump-to-end are also ruled out. The leading hypothesis would defeat this function too:
+    `add_messages` dedupes by id, so a returned message whose id already exists REPLACES in place,
+    which leaves both the positional slice and this id-diff returning empty.
     on transcripts this cannot reason about.
     """
     try:
@@ -6903,9 +6897,9 @@ class Model:
         if callable(clear_enrollment):
             clear_enrollment()
         start_node = self._graph_start_node_for_turn()
-        # The only relationship this value must still respect: it has to survive the gap between two
-        # heartbeats, or a legitimately waiting node is cancelled between beats. It no longer needs to
-        # clear the Mythic budget — that is what the heartbeat decoupled.
+        # The only relationship this value must respect: it has to survive the gap between two
+        # heartbeats, or a legitimately waiting node is cancelled between beats. It does not need to
+        # cover the Mythic task budget — the heartbeat keeps a waiting node alive.
         heartbeat_floor = SAGE_TASK_HEARTBEAT_INTERVAL * 2
         if SAGE_NODE_IDLE_TIMEOUT <= heartbeat_floor:
             logger.warning(
@@ -7823,9 +7817,9 @@ class Model:
 
         Resolution order: the agent's prompt-file frontmatter ``color:`` (operator-editable),
         then a fixed fallback palette, then ``""`` — which lets Mythic auto-derive a color.
-        Auto-derivation is the OLD behavior: it hashes per-card, so every card for the same
-        agent came out a different color. Returning one deterministic color per agent_name is
-        what pins each specialist to a single, stable color (e.g. BloodHound = red).
+        Mythic's auto-derivation hashes per card, so every card for the same agent would come out a
+        different color. Returning one deterministic color per agent_name pins each specialist to a
+        single, stable color (e.g. BloodHound = red).
         """
         fallback = {
             "BloodHound": "#E5484D",       # red (operator request)
@@ -8365,11 +8359,12 @@ class Model:
                             await self._stream_message_to_mythic(f"\n\n{formatted}")
                     elif str(msg.content).strip() and not (getattr(msg, "tool_calls", None) or []):
                         # Supervisor DIRECT answer: plain text, no tool call, not routed through
-                        # respond_to_user. This happens when the Supervisor handles a trivial prompt inline
-                        # instead of delegating — previously suppressed here (and in on_llm_end), so the
-                        # operator saw nothing. Surface it as the turn's response. Routing/handoff/
-                        # respond_to_user messages (all carry tool_calls or the _is_final_report tag) are
-                        # unaffected, so the delegation path does not double-stream.
+                        # respond_to_user. This happens when the Supervisor handles a trivial prompt
+                        # inline instead of delegating; suppressing it here (or in on_llm_end)
+                        # leaves the operator seeing nothing. Surface it as the turn's response.
+                        # Routing/handoff/ respond_to_user messages (all carry tool_calls or the
+                        # _is_final_report tag) are unaffected, so the delegation path does not
+                        # double-stream.
                         formatted = self._format_message_for_streaming(msg, agent_name="Supervisor")
                         if formatted:
                             await self._stream_message_to_mythic(formatted)
@@ -8811,11 +8806,10 @@ class Model:
     def _empty_delegation_return_notice(self, node_name: str) -> AIMessage:
         """The explicit, actionable notice a Supervisor receives when a delegation returns nothing.
 
-        An empty delegation return (no text, no tool results) used to be invisible to the Supervisor —
-        DEBUG-logged only, with the delegation card closed as "finished" and filler text — so the
-        Supervisor re-delegated identically (a live run showed three consecutive empty
-        handbacks). This notice is the "specific, actionable statement of
-        the blocker" that turn endings require.
+        Without it, an empty delegation return (no text, no tool results) is invisible to the
+        Supervisor — DEBUG-logged only, with the delegation card closed as "finished" and filler
+        text — and the Supervisor re-delegates identically. This notice is the "specific, actionable
+        statement of the blocker" that turn endings require.
         """
         return AIMessage(
             content=(
@@ -9127,25 +9121,23 @@ class Model:
 
             # ── No-progress delegation backstop, keyed on PROGRESS ─────────────────────────────
             # This guard triggers on the SYMPTOM (no progress), never on a cause — a guard that
-            # enumerates known causes misses the next one. Four distinct causes have now produced the
-            # same operator-visible livelock.
+            # enumerates known causes misses the next one. Several distinct causes produce the same
+            # operator-visible livelock.
             #
-            # This counter's signal was replaced. It used to count consecutive ZERO-MESSAGE
-            # returns, which a refusal loop walks straight past: every cycle emits a refusal message,
-            # so the streak resets forever and only the global step limit ends the request — leaving
-            # the operator an `error` with no explanation.
-            # Messages moving is not progress. Progress is the EFFECT BOUNDARY being crossed, or the
-            # delegation handing back something it had not handed back before. That definition already
-            # existed in this file — the identical-re-proposal card guard resets on
-            # `_last_issued_task_display_id` moving — but it was wired into one call site and never
-            # applied here. This lifts it to request scope rather than adding a seventh guard.
+            # Do not key it on consecutive ZERO-MESSAGE returns: a refusal loop walks straight past
+            # that, because every cycle emits a refusal message, so the streak resets forever and
+            # only the global step limit ends the request — leaving the operator an `error` with no
+            # explanation. Messages moving is not progress. Progress is the EFFECT BOUNDARY being
+            # crossed, or the delegation handing back something it had not handed back before. The
+            # identical-re-proposal card guard uses the same definition (it resets on
+            # `_last_issued_task_display_id` moving); this applies it at request scope rather than
+            # adding another guard.
             #
-            # Zero-message returns are a strict subset of no-progress returns, so the zero-message behaviour
-            # this replaces still fires at the same cap.
+            # Zero-message returns are a strict subset of no-progress returns, so they still trip
+            # this guard at the same cap.
             #
-            # Fetched defensively: tests construct Model instances without running __init__, which is
-            # why the sibling guard-message read above uses getattr too. Direct attribute access here
-            # broke previously-green tier tests.
+            # Fetched defensively: tests construct Model instances without running __init__, which
+            # is why the sibling guard-message read above uses getattr too.
             _task_marker = str(getattr(
                 getattr(self, "mythic_client", None), "_last_issued_task_display_id", "",
             ) or "")
@@ -9185,9 +9177,10 @@ class Model:
 
             if not new_messages_from_agent:
                 # Zero-return instrument: the empty slice is the thing we cannot yet explain. The
-                # history-rewrite attribution was refuted, so lengths alone are no longer enough —
-                # the second line reports message IDENTITY, which is what distinguishes an
-                # add_messages collision-replace from a genuine drop. See _zero_return_id_forensics.
+                # history-rewrite attribution is ruled out (see _messages_added_by_agent), so
+                # lengths alone are not enough — the second line reports message IDENTITY, which is
+                # what distinguishes an add_messages collision-replace from a genuine drop. See
+                # _zero_return_id_forensics.
                 logger.warning(
                     f"🔁 [{node_name}] ZERO-PROGRESS return — "
                     f"len(channel)={len(channel)} initial_agent_input_length={initial_agent_input_length} "
@@ -9402,9 +9395,9 @@ class Model:
                 # One bounded read before declaring the observation incomplete. The
                 # deferral exists because the result was unobserved; if the task finished in the
                 # meantime, the honest handback is the real result and the turn continues (the
-                # no-stacking rationale no longer holds once the result is in hand, and any
+                # no-stacking rationale does not hold once the result is in hand, and any
                 # next action still passes its own HITL card). A genuinely pending/failed-read
-                # task keeps today's designed turn cap.
+                # task keeps the designed turn cap.
                 reconcile = await self._reconcile_deferred_task_receipt(pending_receipt)
                 if reconcile is not None and reconcile.get("completed") is True:
                     reconcile_status = str(reconcile.get("status") or "")
@@ -13752,11 +13745,10 @@ class Model:
             """
             Sanitize message list for LLM invocation:
             1. Repair invalid tool-call adjacency and remove orphan ToolMessages
-            2. Keep only the FIRST NON-EMPTY SystemMessage; drop empty/blank ones and all later ones (prevents
-               both "multiple non-consecutive system messages" AND the Bedrock
-               "system: text content blocks must be non-empty" ValidationException — an empty first system
-               block was previously kept and forwarded verbatim). Bedrock treats `system` as optional, so
-               dropping a blank system message entirely is valid.
+            2. Keep only the FIRST NON-EMPTY SystemMessage; drop empty/blank ones and all later ones
+               (prevents both "multiple non-consecutive system messages" AND the Bedrock
+               "system: text content blocks must be non-empty" ValidationException). Bedrock treats
+               `system` as optional, so dropping a blank system message entirely is valid.
             Note: this is the provider-agnostic empty-block guard on the live invoke path. The legacy
             `_patch_model_for_bedrock` / `_apply_bedrock_patch` monkeypatch ONLY affects the
             langchain_openai (OpenAI-compatible / LiteLLM proxy) path and is a no-op for the native
@@ -14149,11 +14141,11 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             )
         ]
         if rejected_actions:
-            # Bind the action ONLY on a bare reject. A steer (`respond`/`select`) still denies
-            # the guarded call — the operator's text becomes its rejection message — but it is the
-            # operator ENGAGING, and their words routinely read as conditional approval:
-            # "approved, but also do this on callback 2". Binding there would permanently block the
-            # very action they just said yes to, which is worse than the loop this fix exists to stop.
+            # Bind the action ONLY on a bare reject. A steer (`respond`/`select`) still denies the
+            # guarded call — the operator's text becomes its rejection message — but it is the
+            # operator ENGAGING, and their words routinely read as conditional approval: "approved,
+            # but also do this on callback 2". Binding there would permanently block the very action
+            # they just said yes to, which is worse than the re-proposal loop binding prevents.
             # A bare reject carries no such ambiguity: no guidance, nothing to replan from, and a
             # re-proposal of the identical action is exactly the pathology.
             #
@@ -15853,8 +15845,8 @@ def _create_handback_to_supervisor_tool(mythic_client=None, *, autonomous: bool 
     """
     Let a specialist yield control to the Supervisor WITHOUT ending the run, so the Supervisor can route
     to another agent (BloodHound for graph work, Mythic_Payload for a build) or finalize. This is the
-    explicit autonomous handback path: with the keep-going continue-loop a plain turn-end no longer reaches
-    the Supervisor, so the Operator MUST call this to hand off across agents. Distinct from
+    explicit autonomous handback path: with the keep-going continue-loop a plain turn-end does not
+    reach the Supervisor, so the Operator MUST call this to hand off across agents. Distinct from
     summarize_and_handback (which ends the run and waits for the user at the recursion limit).
     """
     @tool("handback_to_supervisor")

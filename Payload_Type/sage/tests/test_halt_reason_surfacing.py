@@ -221,7 +221,7 @@ def test_async_tool_seam_carries_the_reason():
 
 
 def test_the_reason_token_never_leaks_as_raw_error_text():
-    """str(exc) must stay empty so operator_error_text is untouched by this change."""
+    """str(exc) must stay empty so operator_error_text never renders the reason token."""
 
     exc = _OperatorStopRequested(STOP_REASON_STEP_LIMIT, detail="Step budget: 21 used, limit 20.")
     assert str(exc) == ""

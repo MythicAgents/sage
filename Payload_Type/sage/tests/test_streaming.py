@@ -42,7 +42,7 @@ MODEL_PY = SAGE_ROOT / "ai" / "langgraph" / "model.py"
 MODEL_SOURCE = MODEL_PY.read_text()
 MODEL_AST = ast.parse(MODEL_SOURCE)
 
-# The PayloadType chat.py command was removed; its chat-turn successor is sage_chat/service.py.
+# Chat-turn handling lives in sage_chat/service.py.
 CHAT_PY = SAGE_ROOT / "sage_chat" / "service.py"
 CHAT_SOURCE = CHAT_PY.read_text()
 # Chat-turn session persistence moved to the channel-keyed adapter sage_chat/session.py.
@@ -693,14 +693,7 @@ class TestRegressionChecks:
         In the streaming branch, invoke() returns '' and all output is already
         streamed. chat.py should NOT send the return value as a response.
         """
-        # The old pattern was: llm_resp = await llm.invoke(prompt)
-        #                      SendMythicRPCResponseCreate(..., llm_resp.encode())
-        # New pattern: await llm.invoke(prompt, is_interactive=...)
-        #              (no response variable used for output)
-
         # Check that invoke result is not being sent via RPC
-        # Old code: llm_resp = await llm.invoke(prompt)
-        #           llm_resp += "\n👤> "
         assert "llm_resp" not in CHAT_SOURCE or "llm_resp.encode" not in CHAT_SOURCE, (
             "chat.py must NOT send invoke() return value as RPC output. "
             "All output is streamed during invoke(). The return value is empty string."

@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
 """Run the Sage offline test suite.
 
-There is exactly one tier. There used to be two: `supported` ran the tree minus four rejected
-successor-portfolio suites, and `retired` ran just those four. That split existed because the
-rejected portfolios' frozen hash contracts describe older product bytes, so they can never go green
-against current source and would have made the unfiltered command permanently red.
+There is exactly one tier: no exclusions, no tier argument to get wrong, and a green run means the
+tree is green.
 
-Those portfolios are rejected *evaluation evidence*, and `AGENTS.md` § Repository map and
-artifacts names `.sage_history/` as the home for exactly that. They now live under
-`.sage_history/evaluation/architecture-policy/rejected-successor-portfolios/`, preserved append-only
-as the doctrine requires, but out of the product tree — where 28k lines of rejected candidates were
-five times the weight of the working instruments they were candidates for.
-
-With them relocated, the plain command is honest again: no exclusions, no tier argument to get
-wrong, and a green run means the tree is green.
+Rejected successor-portfolio suites freeze hash contracts that describe older product bytes, so they
+can never go green against current source and would make the unfiltered command permanently red.
+They are rejected *evaluation evidence*, and `AGENTS.md` § Repository map and artifacts names
+`.sage_history/` as the home for exactly that, so they live under
+`.sage_history/evaluation/architecture-policy/rejected-successor-portfolios/`, preserved
+append-only, out of the product tree.
 """
 
 from __future__ import annotations

@@ -178,7 +178,7 @@ def _run(coro):
 
 def test_surface_hitl_interrupt_detects_and_prompts():
     """An __interrupt__ event must produce a user-facing approve/deny prompt naming the tool+args
-    (the task-595 fix: previously the run halted on the raw tool-call with no prompt)."""
+    (without it the run halts on the raw tool-call with no prompt)."""
     m = _bare_model("supervised")
     sent = []
     async def _stub(msg):

@@ -1,9 +1,8 @@
 """Regression coverage for MythicTools._validate_command_parameters.
 
-The validation layer previously referenced an undefined `payload_type` in its ARGVAL log
-lines, so EVERY validation path raised NameError and was swallowed by the fail-open handler —
-silently disabling all parameter validation. These tests pin the contract: validation must
-resolve, not raise, on both the accept and reject paths (the reject path is what regressed).
+A NameError in the validation layer (for example, an undefined name in its ARGVAL log lines) is
+swallowed by the fail-open handler and silently disables all parameter validation. These tests pin
+the contract: validation must resolve, not raise, on both the accept and reject paths.
 """
 import asyncio
 import sys

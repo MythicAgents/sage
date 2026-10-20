@@ -560,10 +560,10 @@ class SageChat(Chat):
     ) -> None:
         """End a session's request lifecycle and tell the operator why.
 
-        `reason` defaults to session rotation rather than to an operator stop, because **no caller of
-        this helper is an operator pressing stop** — they are identity/config rotation and refused
-        resumes. It previously emitted "Session stopped by operator" on all of them, which sent
-        operators looking for a stop they never issued.
+        `reason` defaults to session rotation rather than to an operator stop, because **no caller
+        of this helper is an operator pressing stop** — they are identity/config rotation and
+        refused resumes. Reporting "Session stopped by operator" here sends operators looking for a
+        stop they never issued.
         """
         try:
             from ai.langgraph.model import stop_notice_for
@@ -667,10 +667,10 @@ class SageChat(Chat):
                         )
                     )
             else:
-                # Fail-soft keep-warm. Previously only the autonomous branch attempted this, so a
-                # reused conversation/supervised session never tried to connect BloodHound at all —
-                # an operator who configured it and kept chatting saw nothing happen, not even an
-                # error. Idempotent when already connected. Note this cannot retro-fit tools into
+                # Fail-soft keep-warm, in every mode, not only autonomous: without it a reused
+                # conversation/supervised session never tries to connect BloodHound, and an operator
+                # who configured it and kept chatting sees nothing happen, not even an error.
+                # Idempotent when already connected. Note this cannot retro-fit tools into
                 # THIS session's graph (Model.initialize() already resolved its tool list); the
                 # signature change above is what rebuilds the session when configuration changes.
                 await self._ensure_bloodhound_connected(request=request)
@@ -695,9 +695,8 @@ class SageChat(Chat):
         model._native_chat_explicit_hitl = True
         bind_channel_thread_id(request, model)
         # Auto-connect the BloodHound MCP BEFORE the graph is built — Model.initialize() wires the
-        # BloodHound agent's tools from the currently-connected MCP servers, so a later connect wouldn't
-        # be seen by this session's graph. Mirrors the legacy task path's ensure_bloodhound_task_preflight
-        # (which sage_chat previously omitted, so chat sessions never auto-connected BloodHound at all).
+        # BloodHound agent's tools from the currently-connected MCP servers, so a later connect
+        # wouldn't be seen by this session's graph.
         admitted_at_initialize = await self._ensure_bloodhound_connected(
             autonomous_required=bool(kwargs.get("autonomous_solve")), request=request
         )

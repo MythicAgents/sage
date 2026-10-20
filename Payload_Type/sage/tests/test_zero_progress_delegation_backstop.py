@@ -195,16 +195,14 @@ def test_real_wrapper_fires_backstop_on_third_zero_return():
 
 
 def test_real_wrapper_survives_model_without_init():
-    """Regression: direct attribute access here once broke 19 tier tests.
+    """The guard must not read its bookkeeping attributes with direct attribute access.
 
     Model.__new__ never runs __init__, so the guard's bookkeeping attributes do not exist. The
     guard must tolerate that exactly as the sibling _pending_guard_message read does.
 
-    This test was retargeted deliberately. The guard no longer keeps a per-node
-    `_zero_progress_returns` count; it keeps a REQUEST-scoped `_nonprogress_delegations` streak plus
-    a per-node `_delegation_result_digests` map, because counting messages missed a live loop
-    entirely. The property under test is unchanged and is the reason this test exists: none of these
-    attributes may be read with direct attribute access.
+    The guard keeps a REQUEST-scoped `_nonprogress_delegations` streak plus a per-node
+    `_delegation_result_digests` map rather than a per-node message count, because counting messages
+    misses a live loop. None of these attributes may be read with direct attribute access.
     """
     model = _fresh_model()
     for attr in ("_nonprogress_delegations", "_last_progress_task_marker"):

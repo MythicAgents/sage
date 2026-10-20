@@ -22,10 +22,8 @@ USER = "mythic_admin"
 # `MYTHIC_ENV_PATH` and nothing else. No directory-name fallback: guessing a Mythic checkout name
 # would bake one machine's layout into the repo and silently read the wrong install where two
 # exist. Empty when the variable is unset, and `resolve_password` then fails closed naming both
-# variables. Mirrors `Payload_Type/sage/evals/harness.py`, which reads the same variable — this
-# resolver previously read neither, so every caller that passes no argument (eleven focused
-# capability scripts) died with `Authentication Failed` unless the operator had already exported
-# the secret by hand, which inverts the order AGENTS.md documents.
+# variables. Mirrors `Payload_Type/sage/evals/harness.py`, which reads the same variable. Callers
+# that pass no argument (the focused capability scripts) rely on this read.
 MYTHIC_ENV_PATHS: tuple[Path, ...] = (
     (Path(os.environ["MYTHIC_ENV_PATH"]),)
     if os.environ.get("MYTHIC_ENV_PATH", "").strip()

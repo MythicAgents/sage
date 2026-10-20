@@ -1,12 +1,10 @@
 """Turn-end taxonomy: a turn end classifies as completed, blocked, or checkpoint.
 
-Across a series of live acceptance requests every turn end rendered the same
-"📊 Final Report" banner whether the objective was complete, blocked, or merely
-checkpointed after one step. The banner is now derived from a `_turn_outcome`
-classification stamped where the cause is structurally known (wrapper paths) or
-declared through `respond_to_user(outcome=...)`. `_is_final_report` keeps its
-meaning — "this is the turn's single closing user-facing message" — and no longer
-implies the Final Report banner.
+A single "📊 Final Report" banner on every turn end hides whether the objective was complete,
+blocked, or merely checkpointed after one step. The banner is derived from a `_turn_outcome`
+classification stamped where the cause is structurally known (wrapper paths) or declared through
+`respond_to_user(outcome=...)`. `_is_final_report` means "this is the turn's single closing
+user-facing message" and does not imply the Final Report banner.
 """
 
 import asyncio

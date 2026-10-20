@@ -1,9 +1,8 @@
-"""Observed-state projection + classifier tests (STRIPS forward-planner retired).
+"""Observed-state projection + classifier tests.
 
-The forward planner (candidate_targets_from_state / available_hops / gate_decision) was removed in the
-planner-as-gate retirement; what remains here covers the still-live observed-state surface:
-controlled_principals_from_state projection, the reconcile -> graph-fact chain, render (observed-state
-only), engagement_phase classification, access-context keying, and the SharpHound/SharpGPOAbuse classifier.
+Covers the observed-state surface: controlled_principals_from_state projection, the reconcile ->
+graph-fact chain, render (observed-state only), engagement_phase classification, access-context
+keying, and the SharpHound/SharpGPOAbuse classifier.
 """
 
 import json

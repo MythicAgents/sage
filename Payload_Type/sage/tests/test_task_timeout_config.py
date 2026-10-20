@@ -90,12 +90,11 @@ def test_short_sleep_never_lowers_the_operator_base():
 
 
 def test_long_sleep_no_longer_raises_the_budget():
-    """INVERTED by the bounded task-deferral grace period, and the inversion IS the fix.
+    """A long sleep does not raise the budget; the bounded task-deferral grace period caps it.
 
-    This test used to assert `3600 * multiplier + 60`, and passed for as long as the defect existed:
-    nothing bounded how far the derivation raised, so a four-hour sleep produced a ~12-hour wait that
-    held the Mythic chat composer disabled for the whole time. A long sleep is now answered by
-    deferring with a receipt naming the task, not by waiting for it.
+    Unbounded, the sleep-scaled derivation (`sleep * multiplier + 60`) lets a four-hour sleep
+    produce a ~12-hour wait that holds the Mythic chat composer disabled for the whole time. A long
+    sleep is answered by deferring with a receipt naming the task, not by waiting for it.
     """
     tools = _tools()
     tools._record_callback_sleep(7, {"effective_sleep_seconds": 3600, "sleep_source": "sleep_task"})
@@ -106,10 +105,9 @@ def test_long_sleep_no_longer_raises_the_budget():
 
 
 def test_the_budget_is_the_same_for_every_callback():
-    """INVERTED with the test above: a per-callback budget was the mechanism that ran away.
+    """A per-callback budget is the mechanism that runs away.
 
-    Previously two callbacks with different sleeps got different budgets, and the assertion was that
-    the sleepier one waited longer. One configured grace period now bounds every callback.
+    One configured grace period bounds every callback, whatever its sleep.
     """
     tools = _tools()
     tools._record_callback_sleep(1, {"effective_sleep_seconds": 3600, "sleep_source": "sleep_task"})
@@ -146,11 +144,10 @@ def test_unusable_sleep_readings_are_not_cached(liveness):
 def test_node_idle_timeout_is_independent_of_the_mythic_budget():
     """The idle timeout is a stall detector and must NOT track how long a wait is allowed to be.
 
-    An earlier revision set it to `SAGE_MYTHIC_TASK_TIMEOUT + 120`. That looked safe and was not: the
-    Mythic budget is raised per call for a slow-sleeping callback, so a callback sleeping past roughly
-    87 seconds produced a budget the fixed node timeout could no longer cover, and the graph cancelled
-    the node while the wait was still legitimate. Coupling them the other way is worse — a six-hour
-    sleeper would buy a six-hour blindness window on every node in the session.
+    Deriving it from the Mythic budget (e.g. `SAGE_MYTHIC_TASK_TIMEOUT + 120`) couples a stall
+    detector to a wait allowance: whenever a legitimate wait outlasts the fixed node timeout, the
+    graph cancels the node while the wait is still legitimate. Coupling them the other way is
+    worse — a six-hour sleeper would buy a six-hour blindness window on every node in the session.
 
     `_graph_heartbeat` is what makes independence correct: a deliberate wait announces itself, so
     silence past this window means stalled rather than patient.

@@ -81,7 +81,7 @@ def test_probe_settles_on_delayed_escalation():
     def delayed(_d):
         calls["n"] += 1
         return base if calls["n"] < 3 else (base | {"intruder"})   # 'propagates' on the 3rd read
-    # immediate (settle_timeout=0): one read sees clean -> False (old behavior, preserved)
+    # immediate (settle_timeout=0): one read sees clean -> False
     calls["n"] = 0
     assert ls.ad_domain_admins_probe_via_reader(delayed, "north.sevenkingdoms.local",
                baseline=base, settle_timeout=0)() is False

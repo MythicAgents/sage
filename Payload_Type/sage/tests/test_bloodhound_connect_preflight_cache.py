@@ -69,7 +69,7 @@ def spy(monkeypatch: pytest.MonkeyPatch) -> ConnectSpy:
     monkeypatch.setattr(bloodhound_config.MCPManager, "connect_server", connect_spy)
     # A `domain_info` that answers, so a scripted SUCCESS also passes the reachability read.
     # Without it a "successful" connect is correctly reported as unusable, since the handshake alone
-    # no longer earns the claim.
+    # does not earn the claim.
     monkeypatch.setattr(
         bloodhound_config.MCPManager, "get_tools_by_server", lambda _name: [_ProbeTool()]
     )

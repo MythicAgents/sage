@@ -5179,10 +5179,10 @@ class MythicTools:
     async def _fetch_command_metadata(self, payload: str, command: str) -> dict:
         """Command-level fields the parameter resolver does not own.
 
-        Parameterized rather than interpolated: this used to be built with `.replace("COMMAND", ...)`
-        on model-influenced input, where a malformed query returns nothing and the caller cannot
-        tell that from a real empty answer. Failure here is non-fatal — the parameters are the
-        point, and losing `needs_admin` should degrade the response, not fail the tool.
+        Parameterized, not string-substituted: substituting model-influenced input into the query
+        text is injectable, and a malformed query returns nothing, which the caller cannot tell from
+        a real empty answer. Failure here is non-fatal — the parameters are the point, and losing
+        `needs_admin` should degrade the response, not fail the tool.
         """
         query = """
             query SageCommandMetadata($command_name: String!, $payload_type_name: String!) {
@@ -6078,19 +6078,18 @@ class MythicTools:
     def _derive_task_timeout(self, callback_display_id: int) -> int:
         """The one configured grace period for every task. Nothing derived may extend it.
 
-        This used to be a floor-raiser: it started at the configured base and multiplied a callback's
-        observed sleep on top, never lowering. The reasoning was that a misread sleep should fail in
-        the safe direction, and a longer wait looked like the safe direction. It was not. Nothing
-        bounded how far it raised, `_graph_heartbeat` keeps the node alive for the whole wait, and
-        Mythic disables the chat composer for a request in `pending` or `streaming` — so a callback
-        sleeping four hours produced a ~12-hour wait and locked the operator out of the channel for
-        that entire time over a single "enumerate this host".
+        Do not raise it from a callback's observed sleep. Multiplying the sleep on top of the base
+        looks like failing in the safe direction, but nothing bounds how far it raises,
+        `_graph_heartbeat` keeps the node alive for the whole wait, and Mythic disables the chat
+        composer for a request in `pending` or `streaming` — so a callback sleeping four hours would
+        produce a ~12-hour wait and lock the operator out of the channel for that entire time over a
+        single "enumerate this host".
 
-        A long sleep is now answered by deferring with a receipt naming the task, not by waiting. The
-        receipt is strictly more useful than the wait was: the operator learns the task id immediately
-        and keeps the channel, and the task itself is untouched and still queued on the agent.
+        A long sleep is answered by deferring with a receipt naming the task, not by waiting: the
+        operator learns the task id immediately and keeps the channel, and the task itself is
+        untouched and still queued on the agent.
 
-        The cached sleep is kept and still read, but only to say so out loud. It no longer moves the
+        The cached sleep is read only to log the wait it would have implied; it never moves the
         deadline.
         """
         base = SAGE_MYTHIC_TASK_TIMEOUT
@@ -9993,8 +9992,9 @@ class MythicTools:
             "could not be found",
             "not recognized",
         ))
-        # Domain-correlated, deny-only-filtered group detection (drops the benign "command completed
-        # successfully" marker that previously let any successful command pass as a DA group query).
+        # Domain-correlated, deny-only-filtered group detection. The benign "command completed
+        # successfully" marker is not counted: it would let any successful command pass as a DA
+        # query.
         try:
             from . import credential_artifacts as _ca
         except ImportError:
@@ -19436,10 +19436,9 @@ class MythicTools:
         already in hand. Seeding turns those into cache hits.
 
         Entries are built through the shared field policy rather than by storing the raw rows, so
-        they are byte-identical to what `_fetch_command_schema` would produce for the same key.
-        Previously only the fallback branch seeded, and it stored raw rows — meaning the cached
-        shape depended on which branch ran first. Never raises: this is an optimisation, and a
-        failure here must not take down command enumeration.
+        they are byte-identical to what `_fetch_command_schema` would produce for the same key,
+        whichever branch ran first. Never raises: this is an optimisation, and a failure here must
+        not take down command enumeration.
         """
         try:
             if not payload_type or not isinstance(commands, list):

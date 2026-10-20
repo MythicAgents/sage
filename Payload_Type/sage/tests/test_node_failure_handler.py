@@ -11,14 +11,13 @@ that control exceptions propagate unchanged while ordinary failures are handled.
 Wired against a real `StateGraph` rather than by calling the handler directly, so the registration in
 `_rebuild_graph` is exercised, not just the function body.
 
-**Corrected 2026-08-11 after the outage this file failed to catch.** The graph below used to omit
-`set_node_defaults(timeout=TimeoutPolicy(...))` and run synchronously. That made it a stand-in that
-had drifted from the real graph in exactly the place where two features collided: the real graph
-gives every node a timeout, LangGraph registers the error handler as its own node, and a node with a
-timeout must be async. The handler shipped sync, every request died at build time, and these tests
-stayed green because their graph never set the default. The stand-in now mirrors the real graph's
-node defaults, and invocation is async via `asyncio.run` (the repo's no-pytest-asyncio convention).
-`tests/test_graph_builds.py` is the belt to this file's braces: it builds the ACTUAL graph.
+The graph below mirrors the real graph's node defaults, including
+`set_node_defaults(timeout=TimeoutPolicy(...))`, and invokes asynchronously via `asyncio.run` (the
+repo's no-pytest-asyncio convention). This is where two features collide: the real graph gives every
+node a timeout, LangGraph registers the error handler as its own node, and a node with a timeout
+must be async — so a sync handler fails every request at build time, and a stand-in graph without
+the timeout default stays green through it. `tests/test_graph_builds.py` is the belt to this file's
+braces: it builds the ACTUAL graph.
 """
 
 from __future__ import annotations
@@ -194,10 +193,10 @@ def test_control_exception_tuple_covers_the_kill_switch():
 def test_failed_node_delegation_card_closes_as_error():
     """A failed specialist's card must close as an error, not success-shaped.
 
-    The handler previously left the failed node's card open; the Supervisor's next invocation
-    swept it closed with the default finished status (and its streamed text as content), so a
-    failed delegation rendered as a completion. The handler must close the card itself, as an
-    error, with the exception summary — before handing back to Supervisor.
+    If the handler leaves the failed node's card open, the Supervisor's next invocation sweeps it
+    closed with the default finished status (and its streamed text as content), so a failed
+    delegation renders as a completion. The handler must close the card itself, as an error, with
+    the exception summary — before handing back to Supervisor.
     """
     calls: list[str] = []
     graph, stub = _build_graph(RuntimeError("mythic rpc exploded"), calls)

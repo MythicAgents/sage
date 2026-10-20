@@ -1,11 +1,10 @@
 """One resolver for every Mythic command-parameter-schema fetch in Sage.
 
-Sage previously built this schema four separate ways — two LLM-facing tools and two internal call
-sites — each with its own query string, its own field subset, and its own idea of the return shape.
-Two of the four interpolated model-influenced values into GraphQL text, where a malformed query
-returns nothing, the fetch returns ``None``, and `_validate_command_parameters` logs
-``failed_open ... reason=no_schema`` and permits the task. Consolidating removes that class by
-construction rather than patching its instances.
+Every schema fetch — the LLM-facing tools and the internal call sites — goes through this one
+resolver, with one query, one field subset, and one return shape. Interpolating model-influenced
+values into GraphQL text is the failure class this prevents: a malformed query returns nothing, the
+fetch returns ``None``, and `_validate_command_parameters` logs ``failed_open ... reason=no_schema``
+and permits the task. A single resolver removes that class by construction.
 
 Three properties this module owes its callers:
 

@@ -145,7 +145,7 @@ def test_strip_blank_text_blocks():
 
 
 def test_sanitize_preserves_assistant_message_behavior_unchanged():
-    """Existing rescue path for assistant content is out of scope for this fix — do not alter it."""
+    """This sanitizer leaves the assistant-content rescue path alone — do not alter it."""
     m = _bare()
     ai = AIMessage(content="did the thing")
     out = m._sanitize_messages([SystemMessage(content="s"), HumanMessage(content="hi"), ai])

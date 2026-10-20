@@ -829,10 +829,11 @@ def _objective_required_effects(objective, domain) -> set[str]:
 
 
 def _effect_satisfied(required_effect: str, achieved: set[str]) -> bool:
-    """Whether `required_effect` (a `prefix:domain` predicate) is met by `achieved`, tolerating domain-form
-    differences (NetBIOS vs FQDN) between the demand and the recorded effect — otherwise a consistent objective
-    is silently never-completed when two record paths spell the same domain differently (an under-reach that
-    re-creates exactly the klist-loop this change kills)."""
+    """Whether `required_effect` (a `prefix:domain` predicate) is met by `achieved`, tolerating
+    domain-form differences (NetBIOS vs FQDN) between the demand and the recorded effect — otherwise
+    a consistent objective is silently never-completed when two record paths spell the same domain
+    differently, an under-reach that leaves the controller looping on verification (e.g.
+    `klist`)."""
     if required_effect in achieved:
         return True
     prefix, sep, dom = required_effect.partition(":")

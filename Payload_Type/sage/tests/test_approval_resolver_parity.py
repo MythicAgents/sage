@@ -5,10 +5,10 @@ defaults) BETWEEN the operator's approval and the effect boundary. The approval 
 PRE-ARGRES proposal; the effect path carries the POST-ARGRES arguments. Comparing them denies the
 operator's own approval whenever the resolver changed anything.
 
-Confirmed live: an approved `cat` was refused with "approved proposal does not cover this
-exact effect" after ARGRES logged `notes=["mapped 'path' to 'Path'"]` — a pure key rename, no value
-change. Note this is NOT the shape the original design anticipated (it assumed *defaulted
-keys*), which is why the fix is resolver parity rather than an exclusion list.
+Example: an approved `cat` was refused with "approved proposal does not cover this exact effect"
+after ARGRES logged `notes=["mapped 'path' to 'Path'"]` — a pure key rename, no value change. The
+resolver changes more than *defaulted keys*, which is why the gate uses resolver parity rather than
+an exclusion list.
 
 **This is the approval boundary, so the tests that matter most are the adversarial ones.** The
 mechanism is a lookup of one exact recorded (input -> output) pair for one command and callback, not
@@ -109,7 +109,7 @@ def test_partial_match_of_the_recorded_original_does_not_substitute():
 
 
 def test_no_binding_leaves_behaviour_unchanged():
-    """Absent a recorded resolution the gate behaves exactly as before this change."""
+    """Absent a recorded resolution the gate compares the arguments exactly as given."""
     tools = _tools()
     assert _eff(tools, {"path": "C:\\x.txt"}) != _eff(tools, {"Path": "C:\\x.txt"})
 

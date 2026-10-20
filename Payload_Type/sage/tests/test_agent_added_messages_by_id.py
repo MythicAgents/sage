@@ -1,8 +1,8 @@
 """The agent's output is identified by message id, never by list position.
 
-`_ainvoke` used to slice `updated_channel[initial_agent_input_length:]`, which is sound only if the
-returned list is (input + new). Identifying the agent's output by identity rather than by arithmetic
-is unconditionally sounder, and these tests pin that property.
+Slicing `updated_channel[initial_agent_input_length:]` is sound only if the returned list is
+(input + new). Identifying the agent's output by identity rather than by arithmetic is
+unconditionally sounder, and these tests pin that property.
 
 SCOPE (corrected 2026-07-28, round 9): these are HARDENING tests, not a regression for the
 channel-56/57 zero-return. The original docstring claimed Sage's history-rewriting middleware

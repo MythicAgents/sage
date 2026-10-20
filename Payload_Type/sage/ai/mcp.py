@@ -36,10 +36,9 @@ ALLOWED_MCP_EXECUTION_CLASSES = frozenset({
 
 # The ONLY environment variables admissible into the canonical BloodHound MCP subprocess.
 #
-# The canonical check previously required `env == {}` outright. That forbade the credential
-# forwarding the MCP server needs, because the stdio client passes a subprocess only a fixed safe
-# subset of the parent environment — so a BLOODHOUND_* variable set on the Sage container never
-# reaches the server on its own and must be handed over explicitly.
+# An `env == {}` check would forbid the credential forwarding the MCP server needs: the stdio client
+# passes a subprocess only a fixed safe subset of the parent environment, so a BLOODHOUND_* variable
+# set on the Sage container never reaches the server on its own and must be handed over explicitly.
 #
 # Allowlisting these five keeps the property the guard actually defends. What makes injected
 # environment dangerous is variables that redirect execution — PATH, PYTHONPATH, LD_PRELOAD,

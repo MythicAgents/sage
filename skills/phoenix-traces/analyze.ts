@@ -23,9 +23,8 @@ import { Database } from "bun:sqlite";
 import { join } from "node:path";
 import { existsSync } from "node:fs";
 
-// Two levels up, not three: this skill lives at skills/phoenix-traces/ like every other repo skill.
-// It used to sit at .claude/skills/phoenix-traces/, one level deeper, and the relative depth moved with
-// it. import.meta.dir resolves the real file, not the symlink used to invoke it, so this stays correct
+// Two levels up: this skill lives at skills/phoenix-traces/ like every other repo skill.
+// import.meta.dir resolves the real file, not the symlink used to invoke it, so this stays correct
 // whether it is run through .claude/skills/ or $CODEX_HOME/skills/.
 const DEFAULT_DB = join(import.meta.dir, "../../Payload_Type/sage/.phoenix/phoenix.db");
 

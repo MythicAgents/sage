@@ -53,7 +53,7 @@ import mythic_tools  # noqa: E402
 SERVER = "127.0.0.1"
 USER = "mythic_admin"
 
-# The two signatures this fix exists to eliminate, quoted from the observed Apollo rejection.
+# Apollo rejection signatures, quoted verbatim, that the reference-mode binding must not produce.
 FAILURE_SIGNATURES = (
     "supplied arguments, []",
     "match more than one parameter group",
@@ -112,7 +112,7 @@ async def run(args: argparse.Namespace) -> int:
     )
 
     # The raw shape Sage's capability adapter builds. In `reference` mode the binder rewrites this
-    # to `@cred:<id>` before it reaches the wire — the same rewrite that used to break the task.
+    # to `@cred:<id>` before it reaches the wire; this probe exercises that rewrite.
     parameters = {
         "credential": {
             "id": str(args.credential_id),

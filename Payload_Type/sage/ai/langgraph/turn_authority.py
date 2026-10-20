@@ -1270,7 +1270,7 @@ def compile_turn_authority(
             )
 
     # Typed bounded collection contracts outrank the broad objective classifier. They preserve the
-    # existing graph engine and exact HITL but no longer collapse to observe merely because the
+    # existing graph engine and exact HITL but do not collapse to observe merely because the
     # prose does not match the open-ended compromise grammar.
     direct_objective_contract = compile_objective_contract(
         text,

@@ -2162,7 +2162,7 @@ def test_cross_forest_objective_is_target_matched_after_rewording():
 # --- manifest-driven preflight: derived from declared preconditions, not a hand-maintained allowlist ---
 
 def test_preflight_manifest_has_no_direct_ldap_proof_dependency():
-    # Direct LDAP is no longer an admitted proof origin, so no scenario may quietly retain its credential
+    # Direct LDAP is not an admitted proof origin, so no scenario may quietly retain its credential
     # precondition or target-facing evaluator read.
     from scenarios import goad_scenarios  # noqa: E402
     cfg = rgl.Config()

@@ -59,7 +59,7 @@ def test_caller_supplied_foothold_has_explicit_local_adapter_cost(foothold_seen,
 
 
 def test_missing_probe_is_unmeasured_not_disproven():
-    scn = goad_scenarios()[2]  # cross-forest-objective still scores GRAPH_COLLECTED (child-da no longer does)
+    scn = goad_scenarios()[2]  # cross-forest-objective scores GRAPH_COLLECTED (child-da does not)
     graph = pr.registered_probe(
         Milestone.GRAPH_COLLECTED, lambda: True,
         origin=er.ProofOrigin.PAYLOAD_BLOODHOUND_FACT, proof_kind="graph_fact",

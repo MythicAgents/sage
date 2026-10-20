@@ -171,13 +171,13 @@ def test_zero_return_loop_still_caught():
 def test_analysis_only_delegations_are_neutral():
     """A BloodHound-style request issues no Mythic task and is NOT a stall.
 
-    Attempt 2 asserted the opposite — that any three non-tasking delegations should be surfaced as
-    "no progress" — and that was a false-positive class, not a requirement. A delegation that never
-    attempted a guarded action neither advances nor clears the streak.
+    Surfacing any three non-tasking delegations as "no progress" is a false-positive class, not a
+    requirement. A delegation that never attempted a guarded action neither advances nor clears the
+    streak.
 
-    The neutral soft-cap is now a hard stop at six consecutive analysis-only delegations
-    (a purely analytical loop used to run until an unrelated detector ended it), so this
-    window stays below the cap: below it, analysis is still fully neutral.
+    The neutral soft-cap is a hard stop at six consecutive analysis-only delegations (otherwise a
+    purely analytical loop runs until an unrelated detector ends it), so this window stays below the
+    cap: below it, analysis is still fully neutral.
     """
     model = _fresh_model(_FakeMythicClient())
     agent = _AnalysisAgent()

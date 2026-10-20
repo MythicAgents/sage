@@ -81,9 +81,9 @@ Payload_Type/sage/evals/results/
 .sage_engagement/
 .hillclimb/
 **/.trajectory/
-# Residual guard. The HITL audit writer was removed (model.py `_write_hitl_audit`), so nothing
-# creates this any more — but a Sage process still running the older code keeps appending until it
-# is restarted, and the file reached 12.8MB. Cheap insurance against committing that.
+# Residual guard. Nothing in the current code writes this file, but a Sage process still running an
+# older build that wrote a HITL audit log keeps appending to it until restarted, and it grows large.
+# Cheap insurance against committing it.
 **/MEMORY/audit.jsonl
 .r5_preflight/
 

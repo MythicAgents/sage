@@ -1,16 +1,15 @@
-"""Run a full autonomous Sage solve IN-PROCESS — the replacement for the PayloadType path.
+"""Run a full autonomous Sage solve IN-PROCESS.
 
-The eval/gauge harness used to run a solve by tasking the PayloadType `query` command on a virtual Sage
-callback (`issue_task(command_name="query", callback_display_id=sage_cb)`). The PayloadType was removed,
-so the harness instead runs the SAME Model the chat service builds, in-process, here.
+The eval/gauge harness drives a solve by running the SAME Model the chat service builds, in-process,
+here.
 
-Auth: inject a pre-authenticated `mythic` client (the harness's admin login) so the Model's
-tools task real callbacks + query BloodHound with no chat channel and no Mythic task; pin the engagement
-key (`SAGE_ENGAGEMENT_ID`) to the run's operation so the durable ledger doesn't misfile (an admin client
-can see many operations). See `MythicTools.__init__(preauth_client=...)`.
+Auth: inject a pre-authenticated `mythic` client (the harness's admin login) so the Model's tools
+task real callbacks + query BloodHound with no chat channel and no Mythic task; pin the engagement
+key (`SAGE_ENGAGEMENT_ID`) to the run's operation so the durable ledger doesn't misfile (an admin
+client can see many operations). See `MythicTools.__init__(preauth_client=...)`.
 
-Scoring is unchanged — it stays out-of-band (BloodHound/Mythic ground-truth probes); this only replaces
-"how the solve is driven", returning the terminal status string the harness already expects
+Scoring stays out-of-band (BloodHound/Mythic ground-truth probes); this module only drives the
+solve, returning the terminal status string the harness expects
 ("completed" / "timeout" / "error: ...").
 """
 
@@ -105,7 +104,7 @@ async def run_headless_solve(
 ) -> str | dict[str, Any]:
     """Run one full autonomous solve in-process; return the terminal status string.
 
-    :param objective: the solve objective (the prompt the PayloadType `query` command used to receive).
+    :param objective: the solve objective prompt.
     :param client: a pre-authenticated ``mythic`` client (the harness admin login) — injected into the
         Model's tools; no token mint, no channel/task context needed.
     :param operation_id: the Mythic operation id for this run.

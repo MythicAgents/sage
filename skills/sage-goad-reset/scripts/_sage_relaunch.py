@@ -29,18 +29,18 @@ def _load_module(path: Path, name: str):
 def identity_env(exec_env: dict[str, str], sage_dir: str) -> dict[str, str]:
     """Exec env plus whatever `main.py` will load from `.env` — for identity recording only.
 
-    The recorder used to see the exec environment alone, but `main.py` calls `load_sage_dotenv()`
-    AFTER this process execs it. So `provider`, `model` and `API_ENDPOINT` set in
-    `Payload_Type/sage/.env` — the documented way to configure a local Sage — were absent by
-    construction, and readiness reported "provider is not recorded" on every such run. A gate that
-    cannot observe the thing it gates is not evidence, and one that cries wolf trains you past it.
+    `main.py` calls `load_sage_dotenv()` AFTER this process execs it, so the exec environment
+    alone lacks `provider`, `model` and `API_ENDPOINT` set in `Payload_Type/sage/.env` — the
+    documented way to configure a local Sage — and readiness would report "provider is not
+    recorded" on every such run. A gate that cannot observe the thing it gates is not evidence,
+    and one that cries wolf trains you past it.
 
     Returns a COPY. The exec environment is deliberately left byte-identical: `main.py` does its own
     loading with the same precedence, so injecting the values here would change nothing except our
     ability to tell the two paths apart if they ever diverge.
 
     Fails soft on purpose. Identity bookkeeping must never be the reason Sage does not come back up,
-    so any problem reading `.env` degrades to the old behaviour rather than raising.
+    so any problem reading `.env` degrades to the exec environment alone rather than raising.
     """
     merged = dict(exec_env)
     try:

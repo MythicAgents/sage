@@ -12,14 +12,11 @@ No suite is excluded. A green run means the tree is green — which is the point
 below. The runner still accepts a trailing `supported` argument and ignores it, so older handoff docs and muscle
 memory keep working.
 
-## What changed, and why
+## Why there is one tier
 
-This file previously documented two tiers. `supported` ran the tree minus four append-only rejected
-successor-portfolio suites; `retired` ran only those four and "is not expected to be green."
-
-Those suites froze source hashes of an older product surface, so they could never pass against current code. The
-exclusion was therefore permanent, and the default command's name — "supported" — quietly meant "the parts we
-still expect to work."
+Rejected successor-portfolio suites freeze source hashes of an older product surface, so they can never pass
+against current code. Keeping them in the tree would force a permanent exclusion, and a default command that
+quietly means "the parts we still expect to work."
 
 The portfolios are rejected evaluation evidence. `AGENTS.md` (Repository map and artifacts) names `.sage_history/`
 as the home for rejected and accepted evidence, so they now live at:

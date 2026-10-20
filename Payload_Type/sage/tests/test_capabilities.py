@@ -281,8 +281,8 @@ def test_render_engagement_state_includes_capability_actions_before_legacy_hops(
         ],
     )
 
-    # Stage B: capability actions are no longer RENDERED (planning is retired). The capability
-    # FUNCTION still surfaces the action for the kept consumers; the observed-state render omits it.
+    # Capability actions are not RENDERED in the observed-state view. The capability FUNCTION still
+    # surfaces the action for its consumers; the observed-state render omits it.
     capability_lines = capabilities.render_capability_actions(state)
     assert any("gpo-controlled-system-exec -> gpo=workstation-policy;domain=lab.local" in line for line in capability_lines)
 
@@ -317,8 +317,8 @@ def test_render_engagement_state_keeps_next_capability_when_history_is_long():
         ],
     )
 
-    # Stage B: the observed-state render still bounds (truncates) long history; capability actions
-    # are no longer rendered, but the capability FUNCTION still surfaces the next action directly.
+    # The observed-state render bounds (truncates) long history and does not render capability
+    # actions; the capability FUNCTION surfaces the next action directly.
     rendered = es.render_engagement_state(state)
     assert "… (truncated)" in rendered
     assert "NEXT CAPABILITY ACTIONS" not in rendered
@@ -479,8 +479,8 @@ def test_render_includes_grant_after_system_exec():
         hops=[_hop("system-exec:gpo:workstation-policy@lab.local")],
     )
 
-    # Stage B: planning lines (incl. grant-after-system-exec) are no longer rendered; the capability
-    # FUNCTION still surfaces the grant action for the kept consumers.
+    # Planning lines (incl. grant-after-system-exec) are not rendered; the capability FUNCTION
+    # still surfaces the grant action for its consumers.
     capability_lines = capabilities.render_capability_actions(state)
     assert any("grant-directory-rights -> domain=lab.local;source=gpo-system-exec:workstation-policy" in line for line in capability_lines)
 

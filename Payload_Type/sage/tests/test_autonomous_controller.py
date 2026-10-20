@@ -551,7 +551,7 @@ def test_distinct_collection_requests_are_not_blocked_by_a_low_global_cap():
 
 
 def test_collection_retry_budget_is_per_request():
-    """A broken request retries once and then halts; it no longer consumes a solve-wide three-collection budget."""
+    """A broken request retries once and then halts; its retry budget is per request."""
     w = World(set())
     attempts = []
 

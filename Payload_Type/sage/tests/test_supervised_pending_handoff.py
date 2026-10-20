@@ -328,11 +328,11 @@ def _operator_wrapped(model: Model, operator_final: str):
 def test_completed_deferred_task_is_reconciled_at_handback_and_the_turn_continues():
     """The deferred task completed by handback time — deliver the real result, keep the turn.
 
-    The old behavior force-ended the request with 'Observation is incomplete … inspect that exact
-    task in a fresh request' even when the task had already finished, inserting an operator
-    round-trip ('Proceed.') between every deferred step. The deferral cap still applies while the
-    task is genuinely unobserved; once the one bounded read resolves it, the Supervisor receives
-    the typed outcome and the request continues.
+    Force-ending the request with 'Observation is incomplete … inspect that exact task in a fresh
+    request' when the task has already finished inserts an operator round-trip ('Proceed.') between
+    every deferred step. The deferral cap still applies while the task is genuinely unobserved; once
+    the one bounded read resolves it, the Supervisor receives the typed outcome and the request
+    continues.
     """
     async def run():
         model, tools = _handback_model("chat:pending-handback:request:1")

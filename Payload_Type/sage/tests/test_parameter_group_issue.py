@@ -15,8 +15,8 @@ parameter sits in `credential_store`.
 
 The group is sent only when it is neither blank nor `"Default"`. Because the server already
 substitutes `"Default"` for a task that declares none, declaring it explicitly is a no-op, so every
-other task keeps the exact call it made before this fix — which is what the legacy-path tests below
-pin.
+other task keeps the exact call it makes without a group — which is what the legacy-path tests
+below pin.
 """
 import asyncio
 import json

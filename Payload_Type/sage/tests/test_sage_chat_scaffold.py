@@ -4488,7 +4488,7 @@ def _begin_request_lifecycle(model, request_id="request:test"):
 
 
 def test_close_all_delegations_marks_open_cards_stopped():
-    """Operator stop closes every still-open card with status 'stopped' (was: stuck 'running')."""
+    """Operator stop closes every still-open card with status 'stopped', never 'running'."""
     emitter = _RecEmitter()
     m = _bare_model_with(emitter, {
         "Mythic_Operator": {"id": "mythic_operator:1", "name": "Mythic_Operator", "title": "t",
