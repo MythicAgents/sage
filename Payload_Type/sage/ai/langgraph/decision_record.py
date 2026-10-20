@@ -7,9 +7,8 @@ event, and every failure path is swallowed and logged rather than raised. Fail-s
 fail-closed for evidence, because a missing record is exactly 49R-16's falsifier and the attester reports
 it as a FAIL.
 
-Shape deliberately mirrors the accepted `engagement_state._trace_rights_decision` emitter: same
-`.sage_engagement` home, same never-affects-behavior contract, same `PYTEST_CURRENT_TEST` guard so test
-runs cannot pollute the live artifact.
+It lives under `.sage_engagement`, never affects behaviour, and honours the `PYTEST_CURRENT_TEST` guard
+so test runs cannot pollute the live artifact.
 
 Why a chain and not just the per-event digest: `RequestEventLedger._append` already binds each event's
 `record_id` to its content *and* its sequence, which detects edits in place. It cannot detect a deleted,

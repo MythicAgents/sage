@@ -490,23 +490,6 @@ def test_operator_objective_overrides_prior_autonomous_seed_mid_run(tmp_path, mo
     assert el.load("seed-op-override")["objective"] == "obtain administrative control of essos.local"
 
 
-# --- eid propagation contract: the frozen engagement key reaches the rights-trace diagnostic ---
-
-def test_explicit_engagement_id_publishes_active_id_at_construction(tmp_path, monkeypatch):
-    """CONTRACT: an explicit SAGE_ENGAGEMENT_ID (the gate-experiment `restart_env` path) freezes the key in
-    __init__, so `_ensure_engagement_key` early-returns and never runs its publish. The active-id MUST
-    therefore be published at construction, or the rights-trace `eid` stays empty for explicit-key runs."""
-    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
-    monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "Operation_Gate_42")
-    monkeypatch.setattr(el, "_ACTIVE_ENGAGEMENT_ID", "", raising=False)  # auto-restored after test
-    assert el.active_engagement_id() == ""
-
-    mt = mythic_tools.MythicTools(agent_task_id="solve-gate")
-
-    assert mt._engagement_key == "Operation_Gate_42"
-    assert el.active_engagement_id() == "Operation_Gate_42"  # published for the trace at the reachable freeze point
-
-
 # --- knob A: coerce a free-handed native dcsync into the only form proven to dump a hash in-lab ---
 
 def _dcsync_mt(monkeypatch, tmp_path, dc="WINTERFELL.north.sevenkingdoms.local"):

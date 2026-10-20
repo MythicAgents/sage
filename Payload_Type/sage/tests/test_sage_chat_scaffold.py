@@ -5216,7 +5216,6 @@ def test_state_objective_uses_current_client_engagement_key_and_clears_pending_r
         },
     )()
 
-    monkeypatch.setattr(engagement_ledger, "active_engagement_id", lambda: "Operation_Chimera_1_wrong")
     monkeypatch.setattr(
         engagement_ledger,
         "load",

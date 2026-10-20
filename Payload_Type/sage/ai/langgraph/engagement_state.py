@@ -81,9 +81,7 @@ class EngagementState:
         implications (e.g. da/ea plus a live Kerberos context implies that domain's replication rights)."""
         predicates = self.achieved_effects() | foothold_predicates(self)
         filtered = _filter_live_kerberos_context_predicates(predicates)
-        expanded = _expand_implications(filtered)
-        _trace_rights_decision(filtered, expanded)  # DIAGNOSTIC: remove after krbtgt-variance root-caused
-        return expanded
+        return _expand_implications(filtered)
 
     def satisfies_predicate(self, predicate: str) -> bool:
         """Return whether a predicate is satisfied by the current state."""
@@ -405,65 +403,6 @@ def foothold_predicates(state: "EngagementState") -> set[str]:
 _DA_EFFECT_PREFIXES = ("da:", "ea:")
 _KERBEROS_CONTEXT_PREFIX = "kerberos-context:"
 _KERBEROS_CONTEXT_CALLBACK_MARKER = "@callback:"
-
-
-_RIGHTS_TRACE_SEEN: set = set()
-
-
-def _trace_rights_decision(input_preds: set, expanded: set) -> None:
-    """DIAGNOSTIC (temporary; remove after the krbtgt-variance root-cause is confirmed).
-
-    When DA/EA is held, snapshot whether `_expand_implications` granted ds-replication-rights, plus the
-    Fix-A-relevant predicates — captured from the RUNTIME set (incl. live-callback/authenticated footholds
-    that the stored ledger does NOT persist as hops, which is why offline ledger replay couldn't reproduce
-    Fix A's behavior). Deduped per-process on the (DA, rights, relevant-preds) tuple; fail-safe; never
-    affects behavior. Writes `.sage_engagement/rights_trace.jsonl`."""
-    try:
-        import os
-        # Test-pollution guard: pytest exercises satisfied_predicates() with synthetic predicates, which would
-        # otherwise append junk (empty-eid, fixture preds) to the real .sage_engagement/rights_trace.jsonl.
-        # PYTEST_CURRENT_TEST is set by pytest for the duration of every test; skip the write entirely there.
-        if os.environ.get("PYTEST_CURRENT_TEST"):
-            return
-        da = sorted(p for p in input_preds if p.startswith(("da:", "ea:")))
-        if not da:
-            return
-        rights = sorted(p for p in expanded if p.startswith("ds-replication-rights:"))
-        rel = sorted(p for p in input_preds if p.startswith((
-            "da:", "ea:", "system:", "gpo-domain:", "kerberos-context:", "kerberos-account-context:",
-            "authenticated:", "live-foothold:", "live-callback:", "krbtgt-hash:", "graph-built:")))
-        key = (tuple(da), tuple(rights), tuple(rel))
-        if key in _RIGHTS_TRACE_SEEN:
-            return
-        _RIGHTS_TRACE_SEEN.add(key)
-        import json
-        from datetime import datetime, timezone
-        eid = ""
-        try:
-            try:
-                from . import engagement_ledger as _el
-            except ImportError:  # ai/langgraph on sys.path directly (tests, some runtimes)
-                import engagement_ledger as _el
-            d = _el.state_dir()
-            # The live Sage process publishes its frozen engagement key here; the SAGE_ENGAGEMENT_ID env lives
-            # on the harness, NOT this process, so prefer the published value (fall back to env, then "").
-            eid = _el.active_engagement_id() or os.environ.get("SAGE_ENGAGEMENT_ID", "")
-        except Exception:
-            d = os.path.join(os.getcwd(), ".sage_engagement")
-            eid = os.environ.get("SAGE_ENGAGEMENT_ID", "")
-        os.makedirs(d, exist_ok=True)
-        rec = {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "eid": eid,
-            "da": da,
-            "rights_granted": bool(rights),
-            "ds_replication_rights": rights,
-            "predicates": rel,
-        }
-        with open(os.path.join(d, "rights_trace.jsonl"), "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, sort_keys=True) + "\n")
-    except Exception:
-        pass
 
 
 def _expand_implications(predicates: set[str]) -> set[str]:

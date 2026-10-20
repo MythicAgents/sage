@@ -493,17 +493,6 @@ def _engagement_ledger_mod():
     return engagement_ledger
 
 
-def _publish_active_engagement_id(key: str | None) -> None:
-    """Publish the frozen engagement key to the shared ledger module so process-local diagnostics (e.g. the
-    rights-trace) can attribute records to this seed. The harness sets SAGE_ENGAGEMENT_ID on ITSELF, not on
-    the persistent Sage process, so this published value — not the env — is the reliable in-process source.
-    Best-effort; never raises into the engagement-key resolution path."""
-    try:
-        _engagement_ledger_mod().set_active_engagement_id(key)
-    except Exception:
-        pass
-
-
 def _engagement_state_dir() -> str:
     """Directory for the durable per-engagement ledger (delegated). SAGE_ENGAGEMENT_STATE_DIR overrides."""
     return _engagement_ledger_mod().state_dir()
@@ -2018,10 +2007,6 @@ class MythicTools:
         # would let stale default state drive planning before the first gated task.
         if SAGE_ENGAGEMENT_ID and SAGE_ENGAGEMENT_ID != "default":
             self._engagement_key = SAGE_ENGAGEMENT_ID
-            # This is the REACHABLE explicit-override freeze point: with the key set here, _ensure_engagement_key
-            # early-returns, so the published-id for diagnostics (rights-trace eid) must happen here too — the
-            # gate-experiment restarts Sage with SAGE_ENGAGEMENT_ID=<token>, which takes this path.
-            _publish_active_engagement_id(self._engagement_key)
             try:
                 self._load_engagement_ledger(replace=True)
             except Exception:
@@ -18184,7 +18169,6 @@ class MythicTools:
             return
         if SAGE_ENGAGEMENT_ID and SAGE_ENGAGEMENT_ID != "default":
             self._engagement_key = SAGE_ENGAGEMENT_ID   # explicit override wins; pin it, never query
-            _publish_active_engagement_id(self._engagement_key)
             try:
                 self._load_engagement_ledger(replace=True)
             except Exception:
@@ -18203,7 +18187,6 @@ class MythicTools:
                 key = None
             if key:
                 self._engagement_key = key
-                _publish_active_engagement_id(key)
                 # Reload under the operation key before any planner/gate decision uses durable state.
                 try:
                     self._load_engagement_ledger(replace=True)
