@@ -1,7 +1,7 @@
-"""ISC-69 — the identical-re-proposal guard.
+"""The identical-re-proposal guard.
 
-Replaces the round-2 backstop, which counted consecutive ZERO-MESSAGE node returns. The 2026-07-28
-channel-57 loop emitted a denial ToolMessage plus a fresh AIMessage every cycle, so that counter
+Replaces an earlier backstop, which counted consecutive ZERO-MESSAGE node returns. A live
+re-approval loop emitted a denial ToolMessage plus a fresh AIMessage every cycle, so that counter
 reset each time and nine approval cards went past it. Progress is not "messages moved"; it is "the
 effect boundary was crossed". These tests drive the real `_surface_hitl_interrupt`.
 """
@@ -56,7 +56,7 @@ def _surface(m, event):
 
 
 def test_third_identical_card_is_refused():
-    """The channel-57 shape: same action, re-carded, no task ever issued."""
+    """The live-loop shape: same action, re-carded, no task ever issued."""
     m = _model()
     for _ in range(_ZERO_PROGRESS_DELEGATION_CAP - 1):
         assert _surface(m, _event()) is True
@@ -79,7 +79,7 @@ def test_a_different_action_resets_the_streak():
 
 
 def test_real_progress_resets_the_streak():
-    """ISC-61: three legitimate identical runs must not be truncated.
+    """Three legitimate identical runs must not be truncated.
 
     A moving Mythic task display id means the effect boundary was actually crossed.
     """
@@ -104,7 +104,7 @@ def test_guard_counts_only_consecutive_repeats_without_execution():
 
 
 def test_guard_survives_arguments_that_drift_between_proposals():
-    """ISC-69a: the channel-57 loop did NOT repeat identical arguments.
+    """The live re-approval loop did NOT repeat identical arguments.
 
     Recorded coverage denials showed `luid: ""` on one cycle and `luid: "0"` on a later one. Keyed on
     the full canonical argument dict (the original implementation), the streak reset every cycle and

@@ -1,4 +1,4 @@
-"""Live channel-metadata chips for the Mythic chat header (Phase 2).
+"""Live channel-metadata chips for the Mythic chat header.
 
 Static config chips (Provider / Model / Max Steps) are declared on the config options via
 ``DisplayAsChip=True`` (see ``models.py``). This module builds the DYNAMIC set — controls and counts that
@@ -44,7 +44,7 @@ def _mythic_tool_universe() -> set[str]:
 
 
 def scope_usable_mythic_tools(model: Any) -> int:
-    """Count of Mythic tools the CURRENT bot token can actually invoke (Phase 2, option b): the declared
+    """Count of Mythic tools the CURRENT bot token can actually invoke: the declared
     Mythic tool universe minus the scope-gated (`disabled_tools`) set on the live model's client. The
     universe is static; `disabled_tools` is per-session (set by the token's scope preflight), so this
     number reflects the operator's real reach. No client yet → the full universe (nothing gated)."""
@@ -149,7 +149,7 @@ def build_channel_metadata(model: Any) -> dict[str, Any]:
     autonomous_color = "warning" if autonomous else "neutral"
 
     items = [
-        # ISC-68: Mythic's UI surfaces no readable channel id, which makes "stay in chat 57" an
+        # Mythic's UI surfaces no readable channel id, which makes "stay in this chat" an
         # un-followable instruction and makes log correlation guesswork — every Sage thread key is
         # `<channel>:generation:<uuid>`. order=0 puts it leftmost, ahead of Agent.
         {"key": "channel_id", "label": "Channel", "value": _channel_id(model), "order": 0,

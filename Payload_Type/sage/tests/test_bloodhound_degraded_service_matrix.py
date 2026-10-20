@@ -9,8 +9,8 @@ one cell somebody happened to try.
 The rule the matrix pins:
 
 * **conversation and supervised never raise.** Ordinary chat survives a missing optional dependency;
-  degradation is scoped to the graph, never widened to the product (ISC-16, ISC-17, ISC-19).
-* **autonomous always raises, and the message names BloodHound and how to enable it** (ISC-18, D6).
+  degradation is scoped to the graph, never widened to the product.
+* **autonomous always raises, and the message names BloodHound and how to enable it**.
   A solve reasons over the attack graph to choose and verify each step, so it fails closed rather
   than acting blind.
 

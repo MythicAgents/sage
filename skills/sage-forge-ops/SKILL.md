@@ -6,7 +6,7 @@ description: Repo-local Sage Forge/Codex helper workflow. Use when Codex, Claude
 # Sage Forge Ops
 
 Use only for Sage development helper workflows. Sage offensive-security code must use the cyber-capable model
-configuration documented in `CLAUDE.md`; do not change global Forge defaults from this skill.
+that `scripts/sage_forge.sh` pins; do not change global Forge defaults from this skill.
 
 ## Bundled Scripts
 

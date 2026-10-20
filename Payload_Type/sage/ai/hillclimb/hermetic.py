@@ -1,4 +1,4 @@
-"""C5 — the hermetic inner-loop evaluator (Phase 0/1 of SAGE_HILL_CLIMBING_SPEC.md §5, §C5).
+"""C5 — the hermetic inner-loop evaluator.
 
 The two-tier gauge needs a CHEAP, deterministic, no-lab inner loop where the optimizer iterates, with the
 expensive ground-truth range run reserved for the rare promotion gate. "A loop with week-long iterations is
@@ -103,7 +103,7 @@ def replay_repair_fitness(train_records: Iterable, eval_records: Iterable) -> di
     """Hermetic repair-policy fitness over recorded transitions (wraps trajectory.replay.replay_score): does a
     frequency repair policy learned on `train_records` choose the historically-correct repair on `eval_records`?
     Pure, deterministic, no lab. This legacy fitness wrapper is explicitly diagnostic: historical text exports
-    remain useful for smoke-testing repair retrieval, but Phase 3 never treats them as positive training evidence.
+    remain useful for smoke-testing repair retrieval, but they are never treated as positive training evidence.
     `*_records` are `trajectory.schema.TransitionRecord` (use schema.load_jsonl)."""
     result = replay_score(list(train_records), list(eval_records), include_diagnostic=True)
     return {

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ISC-49R 49R-20 range egress probe.
+49R-20 range egress probe.
 
 Falsifier of 49R-20: "a successful connection from the range to an undeclared destination during a
 scored canary." This probe measures, from a range host over WinRM (the Ludus ansible-inventory admin

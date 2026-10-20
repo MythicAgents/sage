@@ -4,7 +4,7 @@ Tests for Sage streaming feature (streaming-chat branch).
 Validates that LLM messages, tool calls, and agent handoffs are streamed
 to the Mythic web UI in real-time via SendMythicRPCResponseCreate.
 
-Each test class maps to an ISC section from the streaming feature PRD.
+Each test class covers one area of the streaming behavior.
 Tests use AST inspection and mocking to avoid requiring a live Mythic instance.
 
 Run: cd Payload_Type/sage && python -m pytest tests/test_streaming.py -v
@@ -42,10 +42,10 @@ MODEL_PY = SAGE_ROOT / "ai" / "langgraph" / "model.py"
 MODEL_SOURCE = MODEL_PY.read_text()
 MODEL_AST = ast.parse(MODEL_SOURCE)
 
-# Phase 4: the PayloadType chat.py command was removed; its chat-turn successor is sage_chat/service.py.
+# The PayloadType chat.py command was removed; its chat-turn successor is sage_chat/service.py.
 CHAT_PY = SAGE_ROOT / "sage_chat" / "service.py"
 CHAT_SOURCE = CHAT_PY.read_text()
-# Phase 4: chat-turn session persistence moved to the channel-keyed adapter sage_chat/session.py.
+# Chat-turn session persistence moved to the channel-keyed adapter sage_chat/session.py.
 SESSION_SOURCE = (SAGE_ROOT / "sage_chat" / "session.py").read_text()
 
 
@@ -98,14 +98,14 @@ def get_method_source(method_name: str, class_name: str = "Model") -> str:
 
 
 # ============================================================================
-# ISC-1 through ISC-7: Core Streaming Functionality
+# Core Streaming Functionality
 # ============================================================================
 
 class TestCoreStreaming:
-    """Tests for ISC-1 through ISC-7: Core streaming functionality."""
+    """Tests for core streaming functionality."""
 
     def test_isc1_invoke_uses_astream(self):
-        """ISC-1: invoke() uses graph.astream() instead of graph.ainvoke()."""
+        """invoke() uses graph.astream() instead of graph.ainvoke()."""
         invoke_src = get_method_source("invoke")
         assert "astream" in invoke_src, "invoke() must call graph.astream()"
         # Verify ainvoke is NOT used (except possibly in comments)
@@ -114,7 +114,7 @@ class TestCoreStreaming:
         assert "ainvoke" not in code_only, "invoke() must NOT call graph.ainvoke()"
 
     def test_isc2_ai_messages_streamed_via_callback(self):
-        """ISC-2: AIMessages streamed to Mythic UI via callback on_llm_end."""
+        """AIMessages streamed to Mythic UI via callback on_llm_end."""
         cls = find_class(MODEL_AST, "MessageCaptureCallback")
         assert cls is not None, "MessageCaptureCallback class must exist"
         on_llm_end = find_method(cls, "on_llm_end")
@@ -125,7 +125,7 @@ class TestCoreStreaming:
         assert "_format_func" in src, "on_llm_end must call _format_func for formatting"
 
     def test_isc3_tool_messages_streamed_via_callback(self):
-        """ISC-3: ToolMessages streamed to Mythic UI via callback on_tool_end."""
+        """ToolMessages streamed to Mythic UI via callback on_tool_end."""
         cls = find_class(MODEL_AST, "MessageCaptureCallback")
         assert cls is not None
         on_tool_end = find_method(cls, "on_tool_end")
@@ -136,14 +136,14 @@ class TestCoreStreaming:
         assert "_format_func" in src, "on_tool_end must call _format_func for formatting"
 
     def test_isc4_human_messages_streamed_via_process_stream_event(self):
-        """ISC-4: HumanMessages (handoffs) streamed via _process_stream_event."""
+        """HumanMessages (handoffs) streamed via _process_stream_event."""
         src = get_method_source("_process_stream_event")
         assert src, "_process_stream_event method must exist"
         assert "HumanMessage" in src, "_process_stream_event must handle HumanMessages"
         assert "_stream_message_to_mythic" in src, "Must call _stream_message_to_mythic"
 
     def test_isc4_only_human_messages_in_process_stream_event(self):
-        """ISC-4 (anti-duplicate): _process_stream_event only streams HumanMessages."""
+        """Anti-duplicate: _process_stream_event only streams HumanMessages."""
         src = get_method_source("_process_stream_event")
         # Verify it checks for HumanMessage specifically and doesn't stream AI/Tool messages
         assert "isinstance(msg, HumanMessage)" in src, (
@@ -152,7 +152,7 @@ class TestCoreStreaming:
         )
 
     def test_isc5_stream_message_uses_mythic_rpc(self):
-        """ISC-5: _stream_message_to_mythic sends via SendMythicRPCResponseCreate."""
+        """_stream_message_to_mythic sends via SendMythicRPCResponseCreate."""
         src = get_method_source("_stream_message_to_mythic")
         assert src, "_stream_message_to_mythic method must exist"
         assert "SendMythicRPCResponseCreate" in src, "Must use SendMythicRPCResponseCreate"
@@ -161,7 +161,7 @@ class TestCoreStreaming:
         assert ".encode()" in src, "Must encode message to bytes"
 
     def test_isc6_user_prompt_shown_for_non_interactive(self):
-        """ISC-6: User prompt shown for non-interactive first turn only."""
+        """User prompt shown for non-interactive first turn only."""
         invoke_src = get_method_source("invoke")
         assert "not is_interactive" in invoke_src or "not self.is_interactive" in invoke_src, (
             "invoke() must check is_interactive to decide prompt streaming"
@@ -171,7 +171,7 @@ class TestCoreStreaming:
         )
 
     def test_isc7_user_prompt_hidden_for_interactive(self):
-        """ISC-7: User prompt NOT shown for interactive turns (Mythic echoes it)."""
+        """User prompt NOT shown for interactive turns (Mythic echoes it)."""
         fmt_src = get_method_source("_format_message_for_streaming")
         assert "is_interactive" in fmt_src, (
             "_format_message_for_streaming must check is_interactive"
@@ -183,17 +183,17 @@ class TestCoreStreaming:
 
 
 # ============================================================================
-# ISC-8 through ISC-12: Message Formatting
+# Message Formatting
 # ============================================================================
 
 class TestMessageFormatting:
-    """Tests for ISC-8 through ISC-12: Message formatting."""
+    """Tests for message formatting."""
 
     def _get_format_source(self) -> str:
         return get_method_source("_format_message_for_streaming")
 
     def test_isc8_ai_text_format(self):
-        """ISC-8: AI text responses formatted as robot-emoji[AgentName]> text."""
+        """AI text responses formatted as robot-emoji[AgentName]> text."""
         src = self._get_format_source()
         # Check for the robot emoji format pattern
         assert "🤖" in src, "Must use robot emoji for AI messages"
@@ -202,25 +202,25 @@ class TestMessageFormatting:
         )
 
     def test_isc9_tool_request_format(self):
-        """ISC-9: Tool requests formatted as wrench-emoji[AgentName:ToolID]> Tool Request..."""
+        """Tool requests formatted as wrench-emoji[AgentName:ToolID]> Tool Request..."""
         src = self._get_format_source()
         assert "🛠️" in src or "🛠" in src, "Must use tool emoji for tool requests"
         assert "Tool Request" in src, "Must include 'Tool Request' label"
 
     def test_isc10_tool_response_format(self):
-        """ISC-10: Tool responses formatted as wrench-emoji[AgentName:ToolID]> Tool Response..."""
+        """Tool responses formatted as wrench-emoji[AgentName:ToolID]> Tool Response..."""
         src = self._get_format_source()
         assert "🔧" in src, "Must use wrench emoji for tool responses"
         assert "Tool Response" in src, "Must include 'Tool Response' label"
 
     def test_isc11_agent_handoff_format(self):
-        """ISC-11: Agent handoffs formatted as clipboard-emoji[Task -> AgentName]> instruction."""
+        """Agent handoffs formatted as clipboard-emoji[Task -> AgentName]> instruction."""
         src = self._get_format_source()
         assert "📋" in src, "Must use clipboard emoji for handoff messages"
         assert "Task" in src and "→" in src, "Must show 'Task -> AgentName' for handoffs"
 
     def test_isc12_system_messages_skipped(self):
-        """ISC-12: System messages skipped in streaming output."""
+        """System messages skipped in streaming output."""
         src = self._get_format_source()
         assert "SystemMessage" in src, "Must check for SystemMessage"
         assert 'return ""' in src, "Must return empty string for SystemMessage"
@@ -255,14 +255,14 @@ class TestMessageFormatting:
 
 
 # ============================================================================
-# ISC-13 through ISC-15: chat.py Integration
+# chat.py Integration
 # ============================================================================
 
 class TestChatIntegration:
-    """Tests for ISC-13 through ISC-15: chat.py integration."""
+    """Tests for chat.py integration."""
 
     def test_isc13_chat_passes_is_interactive(self):
-        """ISC-13: chat.py passes is_interactive parameter to invoke()."""
+        """chat.py passes is_interactive parameter to invoke()."""
         assert "is_interactive" in CHAT_SOURCE, (
             "chat.py must pass is_interactive to invoke()"
         )
@@ -274,7 +274,7 @@ class TestChatIntegration:
 
 
     def test_isc15_error_handling_streams_then_raises(self):
-        """ISC-15: Error handling streams error message then raises exception."""
+        """Error handling streams error message then raises exception."""
         # Check that chat.py catches exceptions from invoke and streams error
         assert "except Exception" in CHAT_SOURCE, (
             "chat.py must catch exceptions from invoke()"
@@ -293,14 +293,14 @@ class TestChatIntegration:
 
 
 # ============================================================================
-# ISC-16 through ISC-18: State Management
+# State Management
 # ============================================================================
 
 class TestStateManagement:
-    """Tests for ISC-16 through ISC-18: State management during streaming."""
+    """Tests for state management during streaming."""
 
     def test_isc16_state_updated_incrementally(self):
-        """ISC-16: self.state channels updated incrementally during astream loop."""
+        """self.state channels updated incrementally during astream loop."""
         invoke_src = get_method_source("invoke")
         # Must extend channels (not replace) since astream yields deltas
         assert ".extend(" in invoke_src, (
@@ -317,7 +317,7 @@ class TestStateManagement:
             assert channel in invoke_src, f"invoke() must update {channel} channel"
 
     def test_isc17_message_seq_synchronized(self):
-        """ISC-17: _message_seq counter synchronized between Model and state."""
+        """_message_seq counter synchronized between Model and state."""
         invoke_src = get_method_source("invoke")
         assert "_message_seq" in invoke_src, (
             "invoke() must update _message_seq from stream events"
@@ -329,7 +329,7 @@ class TestStateManagement:
         )
 
     def test_isc18_deduplication_works(self):
-        """ISC-18: Deduplication via _msg_id works across merged channels post-stream."""
+        """Deduplication via _msg_id works across merged channels post-stream."""
         invoke_src = get_method_source("invoke")
         assert "_msg_id" in invoke_src, (
             "invoke() must use _msg_id for deduplication"
@@ -377,14 +377,14 @@ class TestStateManagement:
 
 
 # ============================================================================
-# ISC-19 through ISC-21: Recursion Handling
+# Recursion Handling
 # ============================================================================
 
 class TestRecursionHandling:
-    """Tests for ISC-19 through ISC-21: Recursion limit handling."""
+    """Tests for recursion limit handling."""
 
     def test_isc19_recursion_error_caught_and_streamed(self):
-        """ISC-19: GraphRecursionError caught and continuation message streamed."""
+        """GraphRecursionError caught and continuation message streamed."""
         invoke_src = get_method_source("invoke")
         assert "GraphRecursionError" in invoke_src, (
             "invoke() must catch GraphRecursionError"
@@ -397,7 +397,7 @@ class TestRecursionHandling:
         )
 
     def test_isc20_continuation_resumes_with_higher_limit(self):
-        """ISC-20: handle_continuation_response resumes with configured recursion budget."""
+        """handle_continuation_response resumes with configured recursion budget."""
         continuation_src = get_method_source("handle_continuation_response")
         assert continuation_src, "handle_continuation_response must exist"
         assert "_graph_run_config" in continuation_src, (
@@ -412,7 +412,7 @@ class TestRecursionHandling:
         )
 
     def test_isc21_checkpoint_recovery_after_recursion(self):
-        """ISC-21: Checkpoint recovery restores agent channel state after recursion limit."""
+        """Checkpoint recovery restores agent channel state after recursion limit."""
         invoke_src = get_method_source("invoke")
         assert "memory.alist" in invoke_src or "checkpoint" in invoke_src.lower(), (
             "Must access checkpoints for recovery after recursion limit"
@@ -425,14 +425,14 @@ class TestRecursionHandling:
 
 
 # ============================================================================
-# ISC-22 through ISC-24: Code Health
+# Code Health
 # ============================================================================
 
 class TestCodeHealth:
-    """Tests for ISC-22 through ISC-24: Code health issues."""
+    """Tests for code health issues."""
 
     def test_isc22_is_interactive_initialized_before_use(self):
-        """ISC-22: No uninitialized attributes accessed before invoke() is called.
+        """No uninitialized attributes accessed before invoke() is called.
 
         self.is_interactive is used in _format_message_for_streaming() but only
         set in invoke(). If _format_message_for_streaming is ever called outside
@@ -454,7 +454,7 @@ class TestCodeHealth:
         )
 
     def test_isc23_no_dead_code_is_first_turn(self):
-        """ISC-23: Dead code (_is_first_turn) should be cleaned up.
+        """Dead code (_is_first_turn) should be cleaned up.
 
         _is_first_turn is SET at lines 1922, 1926, 2211 but never READ.
         """
@@ -480,7 +480,7 @@ class TestCodeHealth:
             pass  # Already cleaned up - good
 
     def test_isc23_no_dead_code_current_turn_prompt_seq(self):
-        """ISC-23: Dead code (_current_turn_prompt_seq) should be cleaned up.
+        """Dead code (_current_turn_prompt_seq) should be cleaned up.
 
         _current_turn_prompt_seq is SET at line 1814 but never READ.
         """
@@ -503,7 +503,7 @@ class TestCodeHealth:
             )
 
     def test_isc24_verbose_flag_respected(self):
-        """ISC-24: verbose flag respected in streaming path (tool visibility control).
+        """Verbose flag respected in streaming path (tool visibility control).
 
         In the main branch, verbose controls whether tool calls are shown.
         In the streaming branch, _format_message_for_streaming always shows tool calls
@@ -522,14 +522,14 @@ class TestCodeHealth:
 
 
 # ============================================================================
-# ISC-A-1 through ISC-A-3: Anti-Criteria
+# Anti-Criteria
 # ============================================================================
 
 class TestAntiCriteria:
     """Tests for anti-criteria: things that must NOT happen."""
 
     def test_isca1_no_duplicate_streaming_paths(self):
-        """ISC-A-1: Anti: No duplicate messages appear in Mythic UI output.
+        """No duplicate messages appear in Mythic UI output.
 
         Callbacks stream AI/Tool messages during execution.
         _process_stream_event must NOT also stream AI/Tool messages.
@@ -543,7 +543,7 @@ class TestAntiCriteria:
         )
 
     def test_isca2_session_management_preserved(self):
-        """ISC-A-2: Anti: Existing multi-turn conversation persistence not broken."""
+        """Existing multi-turn conversation persistence not broken."""
         # Verify session management functions still exist and are used
         assert "add_session" in SESSION_SOURCE, "sage_chat/session.py must use add_session"
         assert "get_session" in SESSION_SOURCE, "sage_chat/session.py must use get_session"
@@ -554,7 +554,7 @@ class TestAntiCriteria:
         assert "get_session" in MODEL_SOURCE, "model.py must define get_session"
 
     def test_isca3_no_attribute_errors_on_format(self):
-        """ISC-A-3: Anti: No AttributeError from uninitialized instance variables.
+        """No AttributeError from uninitialized instance variables.
 
         Check that all self.X accessed in _format_message_for_streaming are
         either set in __init__ or always set before the method is called.

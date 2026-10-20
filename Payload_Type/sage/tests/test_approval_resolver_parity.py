@@ -1,13 +1,13 @@
-"""ISC-67 — the approval gate compares like with like.
+"""The approval gate compares like with like.
 
 ARGRES rewrites command parameters against the live schema (key renames, group repair, declared
 defaults) BETWEEN the operator's approval and the effect boundary. The approval claim stores the
 PRE-ARGRES proposal; the effect path carries the POST-ARGRES arguments. Comparing them denies the
 operator's own approval whenever the resolver changed anything.
 
-Confirmed live 2026-07-29: an approved `cat` was refused with "approved proposal does not cover this
+Confirmed live: an approved `cat` was refused with "approved proposal does not cover this
 exact effect" after ARGRES logged `notes=["mapped 'path' to 'Path'"]` — a pure key rename, no value
-change. Note this is NOT the shape the original ISC-67 design anticipated (it assumed *defaulted
+change. Note this is NOT the shape the original design anticipated (it assumed *defaulted
 keys*), which is why the fix is resolver parity rather than an exclusion list.
 
 **This is the approval boundary, so the tests that matter most are the adversarial ones.** The

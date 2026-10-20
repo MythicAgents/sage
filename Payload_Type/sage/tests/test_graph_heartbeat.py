@@ -1,4 +1,4 @@
-"""Graph heartbeat during deliberate Mythic waits (ISA 9A follow-up).
+"""Graph heartbeat during deliberate Mythic waits.
 
 `TimeoutPolicy.idle_timeout` was answering two questions with one number. "Has this node stalled?"
 wants a short window; "is this node allowed to still be waiting?" wants a window as long as the wait.

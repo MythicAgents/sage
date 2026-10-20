@@ -6,8 +6,8 @@ successor-portfolio suites, and `retired` ran just those four. That split existe
 rejected portfolios' frozen hash contracts describe older product bytes, so they can never go green
 against current source and would have made the unfiltered command permanently red.
 
-Those portfolios are rejected *evaluation evidence*, and `AGENTS.md` § Durable Artifact Retention
-names `.sage_history/` as the home for exactly that. They now live under
+Those portfolios are rejected *evaluation evidence*, and `AGENTS.md` § Repository map and
+artifacts names `.sage_history/` as the home for exactly that. They now live under
 `.sage_history/evaluation/architecture-policy/rejected-successor-portfolios/`, preserved append-only
 as the doctrine requires, but out of the product tree — where 28k lines of rejected candidates were
 five times the weight of the working instruments they were candidates for.

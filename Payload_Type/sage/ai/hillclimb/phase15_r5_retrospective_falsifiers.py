@@ -8,7 +8,7 @@ model, mutate runtime policy, or turn post-hoc evidence into a promotion gate.
 The R5 packet history contains repeated live rows with volatile prior-decision
 IDs. Phase 15 therefore keeps two views separate:
 
-* retained occurrence view: reproduce the reviewer-called-out 18/18 Hybrid
+* retained occurrence view: reproduce the retained reviewer result of 18/18 Hybrid
   model-owned choices without dropping repeated observed decisions; and
 * canonical unique-case view: remove only volatile prior-decision IDs and score
   every reconstructable frontier permutation without inflating uncertainty.

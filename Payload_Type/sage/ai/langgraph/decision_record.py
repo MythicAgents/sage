@@ -1,10 +1,10 @@
-"""Sealed, hash-chained kernel decision record (ISC-49R criterion 49R-16).
+"""Sealed, hash-chained kernel decision record.
 
 EVALUATOR EVIDENCE ONLY. This module serialises the *existing* `RequestEventLedger` at request
 terminalisation so an independent reader can prove the kernel mediated a run. It is a pure read over a
 ledger the kernel has already finished writing: it never records, mutates, reorders, or suppresses an
 event, and every failure path is swallowed and logged rather than raised. Fail-safe for behaviour;
-fail-closed for evidence, because a missing record is exactly 49R-16's falsifier and the attester reports
+fail-closed for evidence, because a missing record falsifies kernel mediation and the attester reports
 it as a FAIL.
 
 It lives under `.sage_engagement`, never affects behaviour, and honours the `PYTEST_CURRENT_TEST` guard
@@ -136,7 +136,7 @@ def _atomic_write(path: str, text: str) -> None:
 def verify_decision_record(record_path: str, seal_path: str) -> dict[str, Any]:
     """Recompute the chain and compare against the seal. Independent of Sage runtime state.
 
-    This is what makes the record re-verifiable by a third party (49R-13).
+    This is what makes the record re-verifiable by a third party.
     """
     result: dict[str, Any] = {"ok": False, "errors": [], "event_count": 0}
     try:

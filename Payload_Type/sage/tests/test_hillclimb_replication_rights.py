@@ -1,4 +1,4 @@
-"""Offline M1 ISC5 receipt/parser coverage."""
+"""Offline M1 replication-rights receipt/parser coverage."""
 from __future__ import annotations
 
 import sys

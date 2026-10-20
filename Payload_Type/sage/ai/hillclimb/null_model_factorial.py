@@ -128,7 +128,7 @@ def _row_failures(row: dict[str, Any]) -> list[str]:
     executions = row["executed_capabilities"]
     failures: list[str] = []
 
-    # Phase 1 Hybrid v2 is branch-only: a singleton is kernel-owned and must
+    # Hybrid v2 is branch-only: a singleton is kernel-owned and must
     # execute even when the model seam is absent. Pure LLM still fails closed
     # because it owns every nonempty frontier, including singletons.
     expected_transactions = 0 if mode == policy.POLICY_LLM else 1

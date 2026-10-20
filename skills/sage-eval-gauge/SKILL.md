@@ -7,8 +7,7 @@ description: Repo-local Sage eval-gauge / hill-climbing Phase-0 toolkit. Use whe
 
 **Package:** `Payload_Type/sage/ai/hillclimb/` — gauge modules, additive offline benchmarks, and a live driver. Hermetic tests across `tests/test_hillclimb_*.py`, `test_gate_live.py`, `test_hermetic.py`, `test_clean_stop_signal.py`, `test_probe_completeness.py`, `test_completion_recognition_phase1.py`, `test_unproductive_loop_guard.py` (full offline suite green).
 **Why:** substring-match eval scores are gameable, so the gauge is validated against real range state
-via the Gate Experiment rather than against trace text. The original design and spec documents are
-maintainer-private.
+via the Gate Experiment rather than against trace text.
 
 ## What it is
 A measurement instrument: VERIFIED milestones (ground truth) → a vector `ScoreCard` (C2) carrying a Goodhart gap + a `verifier_hash`; a noise floor (C3, `min_detectable_effect`); the **Gate Experiment** (Spearman ρ of eval-vs-ground-truth + the high-eval/low-truth count, with a PASS/FAIL verdict); ledger-independent **probes** (so a non-Sage agent is scoreable); a **bare-model runner**; and a **live driver**.
@@ -233,7 +232,7 @@ Before reset, preflight validates the 18-to-31 one-way subset, the complete 31-r
 installed-SDK call signatures/async kinds, all 9 exact raw GraphQL documents against the live schema, the exact nine
 BloodHound query names, the hidden upload adapter's schema, and one real SDK download of a complete, non-deleted,
 task-produced collection ZIP. It rejects payload-build records, missing or malformed task/callback lineage, empty
-storage paths, noncollection files, invalid ZIP bytes, and SDK download failures. Cody's separate payload-build
+storage paths, noncollection files, invalid ZIP bytes, and SDK download failures. The separate upstream payload-build
 download defect is not a collection-ingest prerequisite and has no local workaround here. Raw Cypher, a standalone
 model-visible MCP file-upload tool, composite BloodHound management, general direct-file download, TTP guidance,
 host-side waiting, capability/planner abstractions, and Sage-local inventory/artifact state remain excluded.

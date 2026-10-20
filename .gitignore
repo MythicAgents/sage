@@ -32,11 +32,11 @@ Payload_Type/sage/sage*.db*
 # without Developer Mode — git materializes each link as a small text file containing its target
 # path, silently. A Windows contributor sees 15 inert files rather than 15 skills. The fix there is
 # to delete `.claude/skills/` and re-create the links, which needs Developer Mode or an elevated
-# shell; `AGENTS.md` carries the loop. Every other platform pays nothing.
+# shell. Every other platform pays nothing.
 #
 # `settings.local.json` stays ignored, and this is the load-bearing half of the rule. It accretes
 # personal absolute paths, private model pins, and hundreds of one-off command approvals — real
-# violations of the Publishable-By-Default Contract in `AGENTS.md`, not merely noise. Claude Code's
+# violations of the public-files rule in `AGENTS.md` (Repository map and artifacts), not merely noise. Claude Code's
 # own convention already draws this line: `settings.json` is shared, `settings.local.json` is not.
 # It needs no rule of its own; the `.claude/*` wildcard below already excludes it, and the two
 # negations deliberately do not bring it back.

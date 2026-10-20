@@ -105,7 +105,7 @@ def test_reader_does_not_mutate_state(tmp_path, monkeypatch):
     before = rs.ledger_state_hash("run1")
     rs.read_ground_truth(_scenario("run1"))
     after = rs.ledger_state_hash("run1")
-    assert before == after  # ISC-4: a reader that mutates what it measures is a corrupted gauge
+    assert before == after  # a reader that mutates what it measures is a corrupted gauge
 
 
 def test_typed_direct_negative_is_measured_disproven(tmp_path, monkeypatch):

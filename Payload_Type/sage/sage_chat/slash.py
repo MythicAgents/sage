@@ -1,7 +1,7 @@
-"""Phase 3 slash commands for the chat container.
+"""Slash commands for the chat container.
 
 The server natively parses `/state`, `/list`, ... against the model's declared commands and delivers a
-structured `ChatRequest.SlashCommand{Name, Argument, Raw, Source}` (PRD Section 8). Sage declares its
+structured `ChatRequest.SlashCommand{Name, Argument, Raw, Source}`. Sage declares its
 commands in `ChatModelMetadata.SlashCommands` (see models.py) and dispatches on `Name` here. An unknown
 structured slash command terminates locally instead of being reinterpreted as a model prompt.
 

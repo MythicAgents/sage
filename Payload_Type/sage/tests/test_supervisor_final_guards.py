@@ -1,6 +1,6 @@
 """Supervisor argument guards on respond_to_user recover with a remedy, not a crash.
 
-The live release-blocker defect (channel 4, 2026-10-16, request 29): the Supervisor
+The live release-blocker defect: the Supervisor
 called respond_to_user with a blank final_response; the guard raised ValueError
 straight out of the tool, the tool node re-raised it, and the whole graph errored
 instead of delivering the report. Blank final reports must still be refused — but

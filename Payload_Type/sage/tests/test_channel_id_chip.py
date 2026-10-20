@@ -1,4 +1,4 @@
-"""ISC-68 — the chat header exposes the Mythic channel ID.
+"""The chat header exposes the Mythic channel ID.
 
 Mythic's UI surfaces no readable channel id, which makes "stay in this chat" an instruction an
 operator cannot act on, and makes log correlation guesswork (thread keys are `<channel>:generation:<uuid>`).

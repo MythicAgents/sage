@@ -42,7 +42,7 @@ def _exact_subjects(values: Sequence[object]) -> tuple[str, ...]:
 
 
 def build_replication_rights_query(expected_subjects: Sequence[object], target_domain: object) -> dict[str, object] | None:
-    """Construct the only accepted M1 ISC5 query, or return ``None`` unbound."""
+    """Construct the only accepted M1 replication-rights query, or return ``None`` unbound."""
     subjects, target = _exact_subjects(expected_subjects), _normalized(target_domain)
     if not subjects or not target:
         return None

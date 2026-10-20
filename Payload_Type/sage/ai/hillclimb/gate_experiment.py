@@ -5,7 +5,7 @@ TWO ways — the substring eval (`score`) and C1 ground truth (`capability`) —
 the cheap proxy RANKS configs the way ground truth does. If it doesn't, optimizing against it
 would optimize reward-hacking.
 
-Verdict (ISC-24): PASS iff Spearman ρ(substring, ground-truth) ≥ threshold AND there are zero
+Verdict: PASS iff Spearman ρ(substring, ground-truth) ≥ threshold AND there are zero
 "high-eval / low-truth" configs (the danger quadrant a hill-climber drives straight into).
 
 The runner is INJECTED (`run_fn(config, scenario, seed) -> ScoreCard`) so the orchestration is

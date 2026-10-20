@@ -1,4 +1,4 @@
-"""Native-card HITL (Option C) for the chat container — Phase 2 scope.
+"""Native-card HITL for the chat container.
 
 Reuses sage's existing LangGraph interrupt/resume core (`model.py`): a guarded tool trips
 `HumanInTheLoopMiddleware`, the graph pauses on disk under a generation-bound channel thread id, and
@@ -239,7 +239,7 @@ def build_approval_request(
     current pending action. Normal native supervised turns narrow guarded proposals to one before
     emission. The current approval emitter treats any remaining multi-action batch as one approval.
 
-    `decision_context` (D10/D15) is extra PLAIN-TEXT decision content appended to the description —
+    `decision_context` is extra PLAIN-TEXT decision content appended to the description —
     planned capability inner tasks, expected verification, per-binary tool notes. It MUST be reproducible
     at echo-validation time: `approval_response_matches` rebuilds the card and compares descriptions, so
     any enrichment applied at emit time has to be applied at match time with the same lookup.
@@ -247,7 +247,7 @@ def build_approval_request(
     Note on formatting: the Mythic input-request card renders `title`/`prompt`/`description` as PLAIN TEXT
     (not markdown — see `ChatInputRequestedEvent` in the React UI), so we format the args as a readable
     aligned key/value list rather than a markdown table or raw JSON braces. A true markdown/table approval
-    card would need a Mythic UI change (render `description` via markdown), which is Cody's side.
+    card would need a Mythic UI change (render `description` via markdown), which is upstream Mythic work.
     """
     actions = _normalized_approval_actions(action_requests)
     action_digest = approval_action_digest(action_requests)
@@ -357,7 +357,7 @@ def make_card_emitter(
     `complete_request=False` (channel-release, not a terminal `complete`), so the chat handler returns None
     while the graph waits on the operator.
 
-    `decision_context_lookup` (D10) receives the action requests and returns extra PLAIN-TEXT decision
+    `decision_context_lookup` receives the action requests and returns extra PLAIN-TEXT decision
     content for the card description — planned capability inner tasks, intended effects, and the
     expected verification for raw tasking. Lookup failures never block the card.
     """
@@ -382,7 +382,7 @@ def make_card_emitter(
             "actions": approval_claim_actions(action_requests),
             "selection_mode": "single",
             "action_digest": kwargs["data"]["action_digest"],
-            # D10/D15: the card's decision-context enrichment rides inside the protocol
+            # The card's decision-context enrichment rides inside the protocol
             # context, so echo validation rebuilds the same description without any
             # lookup threading for callers of approval_response_matches.
             "decision_context": decision_context,
@@ -430,7 +430,7 @@ def approval_response_matches(
     prevents a delayed card from generation N from approving a different action in generation N+1;
     thread/turn/tool fields make the binding inspectable and fail closed if any layer drops context.
 
-    The card's decision-context enrichment (D10/D15) is carried INSIDE the approval context as
+    The card's decision-context enrichment is carried INSIDE the approval context as
     ``decision_context`` and the rebuild reproduces it from the echoed context — self-contained
     protocol, no lookup threading for callers.
     """
@@ -629,7 +629,7 @@ def resume_decision_for_request(request: ChatRequest) -> str:
 
 
 def resume_steer_message_for_request(request: ChatRequest) -> str:
-    """The operator's free-text steering message from a `respond`/`select` input response (Phase 3).
+    """The operator's free-text steering message from a `respond`/`select` input response.
 
     On `respond`/`select`, `InputResponse.Response` carries what the operator typed or chose. We hand it
     to the agent as the guarded action's REJECTION message, so the agent replans WITH the guidance — the

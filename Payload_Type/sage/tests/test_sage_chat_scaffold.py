@@ -1,8 +1,8 @@
-"""Unit tests for the sage_chat scaffold (Phase 1 MVP).
+"""Unit tests for the sage_chat scaffold.
 
 Covers the safety-critical always-terminal invariant, response_key discipline, cancel re-raise,
 error path, the config precedence shim, the channel session key, and the streaming emitter — all
-with a stubbed Model (no live LLM), per PRD Section 13.
+with a stubbed Model (no live LLM).
 """
 
 import asyncio
@@ -127,7 +127,7 @@ def test_self_halt_terminal_is_not_complete_and_lands_in_main_window():
         async def invoke(self, prompt, is_interactive=False):
             self.invoked_with = (prompt, is_interactive)
             # Simulate a turn whose last streamed block was a delegation (sub-agent) stream and that
-            # produced no main-window final — exactly the channel-3 shape.
+            # produced no main-window final — exactly the shape seen in a live run.
             self._response_emitter.last_response_key = (
                 "agent_text:mythic_operator:chat:5:request:9:7"
             )
@@ -696,7 +696,7 @@ def test_autonomous_native_chat_fails_closed_without_exact_bloodhound_tools(monk
     chat = SageChat()
 
     # Matches the operator-facing wording, not the old internal phrase "exact-tool admission".
-    # D6 (2026-08-11) kept this fail-closed behaviour exactly and changed only what the refusal
+    # A later change kept this fail-closed behaviour exactly and changed only what the refusal
     # SAYS: a message naming an internal invariant left an operator unable to tell that BloodHound
     # was the subject. `test_bloodhound_autonomous_refusal.py` pins the message's full contract.
     with pytest.raises(RuntimeError, match="BloodHound is not connected"):
@@ -2308,7 +2308,7 @@ def test_channel_checkpoint_generations_are_stable_per_model_and_unique_across_r
 
 
 # --------------------------------------------------------------------------------------
-# Phase 3 — slash commands
+# Slash commands
 # --------------------------------------------------------------------------------------
 
 from mythic_container.ChatBase import ChatSlashCommandInvocation
@@ -2970,7 +2970,7 @@ def test_slash_sandbox_dispatched_via_chat_without_creating_model(monkeypatch):
 
 
 # --------------------------------------------------------------------------------------
-# Phase 2 P0 — MythicTools chat-token auth rewrite
+# MythicTools chat-token auth rewrite
 # --------------------------------------------------------------------------------------
 
 def test_build_model_kwargs_threads_channel_auth():
@@ -3053,7 +3053,7 @@ def test_login_task_branch_unchanged(monkeypatch):
 
 
 # --------------------------------------------------------------------------------------
-# Phase 2 — native-card HITL (Option C)
+# Native-card HITL
 # --------------------------------------------------------------------------------------
 
 from sage_chat.hitl import (
@@ -3995,7 +3995,7 @@ def test_multi_action_selection_rejects_every_malformed_typed_envelope():
 
 
 # --------------------------------------------------------------------------------------
-# Phase 2 P1 — scope preflight gating
+# Scope preflight gating
 # --------------------------------------------------------------------------------------
 
 def test_tools_missing_scope_unknown_gates_nothing():
@@ -5237,7 +5237,7 @@ def test_state_objective_uses_current_client_engagement_key_and_clears_pending_r
 
 
 # --------------------------------------------------------------------------------------
-# HITL Respond/Select steering (Phase 3)
+# HITL Respond/Select steering
 # --------------------------------------------------------------------------------------
 
 def test_hitl_respond_select_steer_deny_and_carry_text():
@@ -5273,7 +5273,7 @@ def test_hitl_respond_select_steer_deny_and_carry_text():
 
 
 # --------------------------------------------------------------------------------------
-# Phase 2 header chips — live channel metadata
+# Header chips — live channel metadata
 # --------------------------------------------------------------------------------------
 
 def test_mythic_tools_preauth_client_adopts_without_mint():

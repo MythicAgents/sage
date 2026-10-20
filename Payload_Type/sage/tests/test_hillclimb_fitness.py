@@ -1,8 +1,8 @@
 """C2 vector-fitness tests (eval gauge Phase 0).
 
-Pins: capability comes from ground truth and orders runs correctly (ISC-11); the
-Goodhart gap fires when substring eval disagrees with ground truth (ISC-8); verifier_hash
-versions the gauge (ISC-9); the scalar's productivity gate rejects do-nothing runs (ISC-10).
+Pins: capability comes from ground truth and orders runs correctly; the
+Goodhart gap fires when substring eval disagrees with ground truth; verifier_hash
+versions the gauge; the scalar's productivity gate rejects do-nothing runs.
 """
 import sys
 from pathlib import Path
@@ -28,7 +28,7 @@ _RUN = {"score": 0.9, "status": "pass", "tool_calls": 10, "model_calls": 20,
 def test_capability_from_ground_truth_orders_runs():
     hi = fitness.score(_RUN, _gt(Milestone.KRBTGT_DUMPED, Milestone.KRBTGT_DUMPED))
     lo = fitness.score(_RUN, _gt(Milestone.GRAPH_COLLECTED, Milestone.GRAPH_COLLECTED))
-    assert hi.capability > lo.capability                      # ISC-11: ground truth, not substring
+    assert hi.capability > lo.capability                      # ground truth, not substring
     assert fitness.to_scalar(hi) > fitness.to_scalar(lo)
 
 

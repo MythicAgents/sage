@@ -1,4 +1,4 @@
-"""D15: per-binary knowledge notes ride on the approval card and the deferred-task
+"""Per-binary knowledge notes ride on the approval card and the deferred-task
 triage — operator-maintained markdown in `tool_notes/<binary>.md`, advisory only.
 
 Fail-before where the behavior replaces a designed one: the card and the forced-end
@@ -99,7 +99,7 @@ def test_card_decision_context_includes_tool_note(certutil_note):
 
 
 def test_tool_note_rides_on_the_real_card(certutil_note):
-    """The emitter seam carries the note into the card description (D10 + D15 together)."""
+    """The emitter seam carries the note into the card description."""
     chat = types.SimpleNamespace(kwargs=None)
 
     async def _send(_request, **kwargs):
@@ -125,7 +125,7 @@ def test_tool_note_rides_on_the_real_card(certutil_note):
 
 
 def test_forced_end_triage_carries_the_tool_note(certutil_note):
-    """A deferred certutil task's forced-end triage names the remedy (D6 + D15)."""
+    """A deferred certutil task's forced-end triage names the remedy."""
     from ai.langgraph.mythic_tools import MythicTools as _MT
 
     tools = _MT(agent_task_id=1)

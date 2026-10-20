@@ -255,7 +255,7 @@ def test_bloodhound_arg_parser_splits_force_from_directory():
 
 
 class _ProbeTool:
-    """A `domain_info` that answers, so a mocked connect also passes the ISC-27 reachability read.
+    """A `domain_info` that answers, so a mocked connect also passes the reachability read.
 
     Since 2026-08-11 a successful handshake is not on its own a successful connect: Sage calls one
     real read before claiming BloodHound is usable. A fixture that returns bare tool NAMES therefore

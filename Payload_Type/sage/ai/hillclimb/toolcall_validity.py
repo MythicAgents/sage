@@ -8,8 +8,8 @@ with two-tailed Fisher p = 1.0 at n=1. The fixed-budget result is valid but extr
 `bias_bounds.py` separately shows that eventual success after the shared budget boundary is
 unidentified.
 
-Per-capability verifier outcomes cannot fix this. They are Sage-internal (`ISA.md:126` names the
-planner, capability catalog and private ledgers as treatment-side), so the control arm scores
+Per-capability verifier outcomes cannot fix this. They are Sage-internal (the planner,
+capability catalog and private ledgers are treatment-side), so the control arm scores
 structurally UNDEFINED rather than zero -- measuring the harness with the harness's own ruler.
 
 Tool calls are the right unit. Both arms reach the range only through Mythic and BloodHound; the

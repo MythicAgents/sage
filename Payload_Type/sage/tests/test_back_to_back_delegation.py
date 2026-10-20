@@ -1,6 +1,6 @@
 """A supervised Supervisor may not re-delegate to the agent that just executed.
 
-Channel 78: the operator asked for one SharpHound collection. `Mythic_Operator` ran it end to end
+In a live session the operator asked for one SharpHound collection. `Mythic_Operator` ran it end to end
 — execute_assembly, ls, download, ingest_collection, eleven cypher queries — and reported "## DONE".
 The Supervisor immediately handed the same objective back to `Mythic_Operator`, which started the
 whole job again from scratch. The operator cancelled it.
@@ -84,7 +84,7 @@ def test_back_to_back_redelegation_is_refused():
 
     refusal = model._supervised_back_to_back_refusal(subgoal, "Mythic_Operator")
 
-    assert refusal is not None, "channel 78's A->A shape was admitted again"
+    assert refusal is not None, "the back-to-back A->A delegation shape was admitted again"
     assert "SharpHound collected and ingested" in refusal
 
 
@@ -143,7 +143,7 @@ def test_an_unreadable_contract_allows_rather_than_blocks():
 
 
 def test_refusal_reads_no_instruction_text():
-    """Channel 78's two instructions shared almost no wording. The decision must not depend on
+    """That session's two instructions shared almost no wording. The decision must not depend on
     wording at all, so the same (owner, subgoal) pair decides identically regardless."""
 
     import ast
@@ -175,7 +175,7 @@ def test_refusal_reads_no_instruction_text():
 
 
 def test_handback_does_not_terminate_and_terminates_only_at_the_cap():
-    """ISC-2 and ISC-6 read straight off the production branch.
+    """Hand-back and cap termination read straight off the production branch.
 
     Below the cap the tool returns a plain `Command(update=...)` — no goto, no PARENT, no
     `_is_final_report` — so the Supervisor keeps control. At the cap it closes the request with

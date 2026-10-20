@@ -1,4 +1,4 @@
-"""ISC-2.4 and ISC-2.5: live-surface reuse, and no interpolated GraphQL left in the schema path.
+"""Live-surface reuse, and no interpolated GraphQL left in the schema path.
 
 Both are anti-criteria — they assert the absence of something — so both are written to be able to
 fail for the right reason. The interpolation check walks the AST rather than matching source text,
@@ -88,7 +88,7 @@ def _query_arguments(node):
 
 @pytest.mark.parametrize("function_name", SCHEMA_PATH_FUNCTIONS)
 def test_no_schema_path_query_is_built_by_interpolation(function_name):
-    """ISC-2.5 as a class, one case per function, so a failure names the offender.
+    """No interpolated query, as a class, one case per function, so a failure names the offender.
 
     Scoped to what is passed AS a query, not to every f-string in the function. An earlier version
     asserted no `JoinedStr` anywhere and failed on `logger.debug(f"...")` and error-return strings,
@@ -168,7 +168,7 @@ def test_no_function_in_mythic_tools_passes_an_interpolated_query():
     about the next one someone adds.
 
     This caught `get_c2_profiles_for_payload`, which was outside the schema path and therefore
-    outside ISC-2.5, but carried the identical `query.replace("PLACEHOLDER", ...)` pattern. A guard
+    unchecked, but carried the identical `query.replace("PLACEHOLDER", ...)` pattern. A guard
     scoped to the functions already fixed would have been green while the defect sat two thousand
     lines away.
     """
@@ -211,7 +211,7 @@ def test_every_schema_path_query_uses_graphql_variables():
 
 
 def test_seeded_cache_entries_match_a_direct_fetch_shape():
-    """ISC-2.4 — one surface fetch seeds every loaded command's schema.
+    """One surface fetch seeds every loaded command's schema.
 
     The entries must be built through the same field policy `_fetch_command_schema` uses. Before
     this, only the fallback branch seeded and it stored raw rows, so the cached shape depended on

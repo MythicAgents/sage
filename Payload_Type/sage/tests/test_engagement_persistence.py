@@ -250,7 +250,7 @@ def test_opaque_ledger_objective_is_not_treated_as_human_goal(tmp_path, monkeypa
 
 
 # ---------------------------------------------------------------------------
-# 3. Gate-OFF no-op on the load side (ISC-21)
+# 3. Gate-OFF no-op on the load side
 # ---------------------------------------------------------------------------
 
 
@@ -547,7 +547,7 @@ def test_coercer_ignores_non_dcsync_command(tmp_path, monkeypatch):
     assert asyncio.run(mt._coerce_native_dcsync_to_working_form("shell", "whoami /all")) == "whoami /all"
 
 
-# --- control-state P0: collection-ingest idempotency by content hash (no re-ingest of the identical zip) ---
+# --- collection-ingest idempotency by content hash (no re-ingest of the identical zip) ---
 
 def test_collection_ingest_idempotency_by_content_hash(tmp_path, monkeypatch):
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))

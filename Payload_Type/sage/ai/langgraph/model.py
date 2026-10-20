@@ -94,7 +94,7 @@ SAGE_NODE_IDLE_TIMEOUT = _env_positive_int("SAGE_NODE_IDLE_TIMEOUT", 300)
 
 SUPERVISOR_COPY_TOOL_RESULT_CAP = 2000  # max chars of a ToolMessage's string content when copied to OTHER agents' channels
 _AUTONOMOUS_OPERATOR_CONTINUE_CAP = 6  # max autonomous re-invocations of Mythic_Operator per node entry
-# ISC-59: consecutive zero-message returns from one delegated node before the no-progress backstop
+# Consecutive zero-message returns from one delegated node before the no-progress backstop
 # fires. A node that returns nothing gives the Supervisor nothing to act on, so it re-delegates the
 # identical objective forever (the supervised re-approval livelock). N=3 tolerates one genuinely empty-but-legitimate cycle, still bounds the loop to seconds.
 _ZERO_PROGRESS_DELEGATION_CAP = 3
@@ -130,11 +130,11 @@ _COMPACTION_PROTECTED_TOOLS = frozenset((
     "transfer_to_Supervisor", "transfer_to_Generalist", "transfer_to_Mythic_Operator",
     "transfer_to_Mythic_Payload", "transfer_to_BloodHound", "transfer_to_MCP_Manager",
     "transfer_to_Sandbox",
-    # ISC-72: command schema is not chatter — truncating it makes the model guess parameters, which
-    # is exactly how `ticket_cache_list` went out with empty params on 2026-07-28 (75,650 chars head-
+    # Command schema is not chatter — truncating it makes the model guess parameters, which
+    # is exactly how `ticket_cache_list` once went out with empty params (75,650 chars head-
     # truncated to 16,000, losing ~79%). These three were already excluded from ContextEditingMiddleware
     # via _STATIC_SCHEMA_TOOLS but not from result compaction. The truncation notice told the model to
-    # "re-query narrower", which was impossible until the narrow tools were registered this same day.
+    # "re-query narrower", which was impossible before the narrow tools were registered.
     "get_all_commands_for_payloadtype",
     "get_all_command_args_for_payloadtype",
     "get_all_command_names_for_payloadtype",
@@ -1416,7 +1416,7 @@ _STOP_NOTICE_BY_REASON = {
 
 # Terminal lifecycle status for a self-requested halt that ends the turn through the NORMAL terminal path.
 # The invariant that matters: a halt is NEVER `complete`. Recording a routing-loop/no-progress/blocker halt
-# as `complete` (with the bare "Completed." fallback narrative) is the false-success defect from channel 3 —
+# as `complete` (with the bare "Completed." fallback narrative) is a false-success defect seen live —
 # the request reported an achieved objective it never reached. Any reason absent here defaults to `stopped`
 # (a deliberate self-halt), never `complete`; only a genuine completion (no stop requested) is `complete`.
 _TERMINAL_STATUS_BY_STOP_REASON = {
@@ -1460,7 +1460,7 @@ def _collect_hitl_action_requests(snapshot) -> list:
 
     The middleware requires EXACTLY one resume decision per hanging tool call. `snapshot.interrupts`
     already aggregates interrupts across tasks, and `snapshot.tasks[].interrupts` repeats the same
-    objects — unioning them double-counts (the 2026-06-01 task-598 bug: "Number of human decisions (2)
+    objects — unioning them double-counts (a live bug: "Number of human decisions (2)
     does not match number of hanging tool calls (1)"). Use the aggregated list when present, fall back
     to per-task only when it is empty, and dedupe defensively by interrupt id.
     """
@@ -1488,7 +1488,7 @@ class _OperatorStopRequested(Exception):
     The outer graph.astream only checks Model._stop_requested between top-level super-steps
     (Supervisor↔specialist handoffs). A specialist mid-turn — e.g. Mythic_Operator looping over
     many tool calls, or blocked in issue_task_and_waitfor_task_output — never yields to that check,
-    so `exit` appeared to do nothing until the whole turn finished (task-626: exit issued twice, no
+    so `exit` appeared to do nothing until the whole turn finished (observed live: exit issued twice, no
     stop, manual kill; the log shows request_stop DID fire). This exception, raised by
     _StopCheckMiddleware at each model/tool boundary inside the agent, breaks out promptly; the outer
     invoke() try/except catches it and ends the session cleanly.
@@ -1931,7 +1931,7 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
             denied = False
             denied_reason = "turn authority denied a previously rejected guarded action"
             if name in GUARDED_TOOLS:
-                # ISC-75/76: this MUST come before the request-contract check below, which ends in a
+                # This MUST come before the request-contract check below, which ends in a
                 # `continue`. The first cut sat after it and was therefore dead on the live path —
                 # every re-proposal was short-circuited by the contract reason, so neither the
                 # operator's decision nor the attempt flag was ever recorded, and the loop looked
@@ -1989,7 +1989,7 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
                 continue
             blocked_reasons.append(f"{name or 'unknown_tool'}: {reason}")
             if name in GUARDED_TOOLS:
-                # ISC-75: this delegation TRIED to cross the effect boundary and was stopped. That is
+                # This delegation TRIED to cross the effect boundary and was stopped. That is
                 # what distinguishes a stall from ordinary analysis, and it is what the no-progress
                 # backstop counts. Without it the backstop also fires on legitimate non-tasking work
                 # — a BloodHound-only request that runs three graph queries in a row never issues a
@@ -2075,7 +2075,7 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
                         if recoverable_verb_error:
                             # Tier 3: a task-preparation rejection never becomes an issued task, so it was
                             # invisible to the control-state loop-breaker — the Supervisor could re-delegate
-                            # the identical unenrolled verb forever (channel-3 Certify `cas`). Feed it in as a
+                            # the identical unenrolled verb forever (seen live with Certify `cas`). Feed it in as a
                             # blocked outcome keyed on the rejection reason; the per-blocker fingerprint means
                             # the SAME bad verb recurring with no progress trips a clean stop (this sets
                             # `_stop_requested`, which zeroes the retry request_id below), while a different
@@ -2677,7 +2677,7 @@ class _BoundedExecuteCapabilityStopMiddleware(AgentMiddleware):
         terminal_payload = _terminal_execute_capability_payload(messages)
         if terminal_payload is None:
             return None
-        # Control-state P0: feed the terminal capability outcome to the loop-breaker. The fresh execute_capability
+        # Control-state loop-breaker: feed the terminal capability outcome to the loop-breaker. The fresh execute_capability
         # tool-call id is the per-turn dedup key (re-delegations get a new id, so cross-turn repeats still count).
         try:
             _calls = _latest_ai_tool_calls(messages)
@@ -3451,13 +3451,13 @@ def _messages_added_by_agent(
 ) -> list:
     """Return the messages the agent ADDED, identified by message id rather than list position.
 
-    ISC-56, and it is HARDENING — not the established fix for the channel-56/57 zero-return.
+    This is HARDENING — not the established fix for the observed live zero-return defect.
     `_ainvoke` used to slice `updated_channel[initial_agent_input_length:]`, which is sound only when
     the returned list is (input + new). Identifying the agent's output by identity rather than by
     arithmetic is unconditionally sounder, so this stays. What it does NOT do is explain the observed
     live defect — see below before attributing a zero-return to it.
 
-    ATTRIBUTION WITHDRAWN 2026-07-28 (round 9). This function landed on the theory that Sage's
+    ATTRIBUTION WITHDRAWN. This function landed on the theory that Sage's
     history-rewriting middleware shortens the returned list, so a rewrite dropping as many messages
     off the front as the model added to the back makes the positional slice return EMPTY. That
     theory is refuted for this runtime:
@@ -3467,12 +3467,12 @@ def _messages_added_by_agent(
     - `SummarizationMiddleware` is the only list-shortener, and it has never fired: all 247
       `SummarizationMiddleware.before_model` spans in Phoenix are <=2ms with zero child spans and
       zero LLM descendants. Its `trigger=("tokens", 150000)` was never approachable — the all-time
-      peak per-call prompt is 80,839, and the channel-56/57 hours peaked at 37,510 and 18,594.
-    - `keep=("messages", 12)` would have collapsed channel 57's 20-message input to ~13, not the
+      peak per-call prompt is 80,839, and the affected runs peaked at 37,510 and 18,594.
+    - `keep=("messages", 12)` would have collapsed an affected 20-message input to ~13, not the
       observed 20.
 
-    The round-8 hermetic probe reproduced the symptom shape with a synthetic middleware emitting
-    `RemoveMessage` that Sage does not run. The real mechanism of the channel-56/57 zero-return is
+    A hermetic probe reproduced the symptom shape with a synthetic middleware emitting
+    `RemoveMessage` that Sage does not run. The real mechanism of the observed zero-return is
     UNKNOWN (third refuted attribution, after interrupt/resume replay and create_agent jump-to-end).
     Note the leading hypothesis would defeat this function too: `add_messages` dedupes by id, so a
     returned message whose id already exists REPLACES in place, which leaves both the positional
@@ -3498,13 +3498,13 @@ def _messages_added_by_agent(
 
 
 def _zero_return_id_forensics(updated_channel: list, agent_input: list) -> str:
-    """ISC-53 round 10: describe a zero-return by message IDENTITY, not just by length.
+    """Describe a zero-return by message IDENTITY, not just by length.
 
-    The round-9 refutation left the mechanism unknown, and the leading hypothesis is an
+    The refutation above left the mechanism unknown, and the leading hypothesis is an
     `add_messages` id collision: create_agent's state channel uses the `add_messages` reducer, which
     REPLACES a message in place when the incoming id already exists instead of appending. That
     leaves `len(updated) == len(input)` with the model having produced real messages — the exact
-    channel-56/57 signature — and it defeats both the positional slice and `_messages_added_by_agent`.
+    observed zero-return signature — and it defeats both the positional slice and `_messages_added_by_agent`.
 
     The three numbers the old instrument logged cannot tell that apart from a plain drop. These can:
 
@@ -3540,9 +3540,9 @@ def _zero_return_id_forensics(updated_channel: list, agent_input: list) -> str:
             return [str(i)[-12:] for i in ids[:5]]
 
         verdict = (
-            "COLLISION-REPLACE (round-10 hypothesis CONFIRMED)"
+            "COLLISION-REPLACE (id-collision hypothesis CONFIRMED)"
             if (not new_ids and not dropped_ids and mutated_ids)
-            else "no-collision (round-10 hypothesis does NOT explain this one)"
+            else "no-collision (id-collision hypothesis does NOT explain this one)"
             if not mutated_ids
             else "mixed"
         )
@@ -3561,8 +3561,8 @@ def _guarded_action_key(action: Any) -> str:
     """Coarse identity of a guarded action: the ACTION and its TARGET, not its exact arguments.
 
     `approval_action_fingerprint` hashes the full canonical argument dict, which is right for binding
-    one approval to one exact proposal but wrong for recognising a re-proposal. ISC-69a already had to
-    learn this: the observed loop went `luid: ""` then `luid: "0"` then `luid: "0x5b16c"`, so every
+    one approval to one exact proposal but wrong for recognising a re-proposal. The identical-re-proposal guard
+    already had to learn this: the observed loop went `luid: ""` then `luid: "0"` then `luid: "0x5b16c"`, so every
     cycle produced a different fingerprint and any full-argument key stayed silent.
 
     "The same command against the same target" is what an operator means when they reject an action,
@@ -4421,7 +4421,7 @@ def _terminal_execute_capability_report(
     return "\n".join(lines)
 
 
-# D9 turn-end taxonomy: how a turn ended, distinct from the fact that it ended.
+# Turn-end taxonomy: how a turn ended, distinct from the fact that it ended.
 # Stamped where the cause is structurally known or declared via respond_to_user;
 # the native-chat banner is derived from it. Unknown values classify as nothing.
 _TURN_OUTCOME_COMPLETED = "completed"
@@ -4439,7 +4439,7 @@ def _closing_content_is_proposals_json(content: Any) -> bool:
     """True when the closing report is exactly the machine-parseable proposals JSON.
 
     The report-projection surface audits Supervisor final chunks as ``{"proposals": …}``
-    blocks; the D12 engagement-state table must not corrupt that contract, so it rides
+    blocks; the engagement-state table must not corrupt that contract, so it rides
     only on prose closings.
     """
     if isinstance(content, (list, tuple)):
@@ -4497,10 +4497,9 @@ def _capability_name_from_request_args(args: dict[str, Any]) -> str:
 
 
 def _capability_rejection_message(tool_name: str, args: dict[str, Any]) -> str:
-    """Rejection decision message for a guarded tool call (D10).
+    """Rejection decision message for a guarded tool call.
 
-    A bare reject of a capability card declines the whole bundled effect (2026-10-14 Q1,
-    settled 2026-10-17): the model may NOT re-attempt it through issue_task or any other
+    A bare reject of a capability card declines the whole bundled effect: the model may NOT re-attempt it through issue_task or any other
     tool in this request. Without the policy statement the model reads a bare denial as
     "use a different tool for the same effect" and the declined effect lands anyway.
     Raw tasking keeps the generic message — a denied command is not an effect refusal.
@@ -4842,7 +4841,7 @@ class MessageCaptureCallback(AsyncCallbackHandler):
                     #      top-level fields. The startswith("error") case is only the last-resort fallback for a
                     #      genuinely unstructured plain-string tool error.
                     errored = getattr(output, "status", None) == "error" or _tool_result_is_error(content_str)
-                    # Phase 3 — keep the card lean. Small results stay fully inline as result_preview; large
+                    # Keep the card lean. Small results stay fully inline as result_preview; large
                     # ones show a short preview and ship the full raw result via tool_use.output, which Mythic
                     # stores separately (chat_message.tool_output), strips from metadata, and serves lazily via
                     # "View output" — so a big result never inflates the chat message / page rendering.
@@ -4965,9 +4964,9 @@ class Model:
             to Mythic's chat_response queue instead of the PayloadType task RPC. When None (the legacy
             PayloadType path), _stream_message_to_mythic falls back to SendMythicRPCResponseCreate.
         :param operation_id: Chat-path OperationID, threaded explicitly since a chat request has no task
-            to infer it from (Section 7). None on the legacy task path, where operation is task-derived.
+            to infer it from. None on the legacy task path, where operation is task-derived.
         """
-        # Native-chat streaming seam (Section 7): the single egress (_stream_message_to_mythic) prefers
+        # Native-chat streaming seam: the single egress (_stream_message_to_mythic) prefers
         # this when set. Kept as a plain attribute so a chat turn can swap it per-request if ever needed.
         self._response_emitter = response_emitter
         self._active_delegations: dict[str, dict[str, Any]] = {}
@@ -4978,13 +4977,13 @@ class Model:
         self._streamed_supervisor_message_keys: set[str] = set()
         self._request_event_ledger: RequestEventLedger | None = None
         self.operation_id = operation_id
-        # Chat-path Mythic auth context (Section 7 / 8A-P0): the numeric channel id and the per-channel
+        # Chat-path Mythic auth context: the numeric channel id and the per-channel
         # bot API token id, threaded so MythicTools can mint a channel-scoped token via
         # ChatAPITokenProvider instead of the task's AgentTaskID. None/0 on the legacy task path.
         self.channel_id = channel_id
         self.apitoken_id = apitoken_id
         self._mythic_preauth_client = mythic_preauth_client  # headless/eval: pre-authenticated mythic client
-        # Chat-path checkpointer thread key (Section 7 / 8A-P1). The legacy task path derives the
+        # Chat-path checkpointer thread key. The legacy task path derives the
         # LangGraph thread_id from f"{agent_task_id}-{task_id}", but a chat channel has no task and must
         # persist multi-turn state under a channel-stable key (str(ChannelID)). sage_chat sets this so
         # _session_thread_id() returns it; None keeps the task-derived key for the PayloadType path.
@@ -4998,7 +4997,7 @@ class Model:
         )
         self._autonomous_solve = bool(autonomous_solve)
         self._turn_authority = TurnAuthority(mode="observe")
-        # ISC-59/60: per-node consecutive zero-message-return counter for the cause-agnostic
+        # Per-node consecutive zero-message-return counter for the cause-agnostic
         # no-progress backstop. Keyed by node name; reset to 0 whenever that node returns work.
         self._zero_progress_returns: dict[str, int] = {}
         self._request_contract = None
@@ -5074,7 +5073,7 @@ class Model:
         self._autonomous_stall_progress = None
         self._autonomous_stall_count = 0
         self._autonomous_stall_sig = None
-        # Control-state loop-breaker (P0): see _note_capability_outcome. The per-solve state object is (re)created
+        # Control-state loop-breaker: see _note_capability_outcome. The per-solve state object is (re)created
         # in invoke() so a prior objective's blockers never leak into the next solve (a Sage session reuses one
         # Model across invoke() calls — the same reuse hazard as the stall counters).
         self._loop_breaker = None
@@ -5144,7 +5143,7 @@ class Model:
 
         Task path: f"{agent_task_id}-{task_id}" (unchanged). Chat path: the channel-stable override
         set by sage_chat (str(ChannelID)), so multi-turn SageState survives across one-shot chat
-        requests (Section 7). Centralizing this is the P1 "thread key" re-source from Section 8A.
+        requests.
         """
         if getattr(self, "_thread_id_override", None):
             return self._thread_id_override
@@ -5557,9 +5556,9 @@ class Model:
         return receipt
 
     async def _reconcile_deferred_task_receipt(self, receipt: dict[str, Any]) -> dict[str, Any] | None:
-        """D6 slice A: one control-plane read of a deferred task's actual outcome.
+        """One control-plane read of a deferred task's actual outcome.
 
-        The deferral bounds a turn because the result was unobserved (ISC-4: no stacking of tasks
+        The deferral bounds a turn because the result was unobserved (no stacking of tasks
         the operator has not seen the result of). By the time the wrapper builds the handback the
         task has often already completed; a single bounded read at that boundary either delivers
         the real outcome — removing both the false "unconfirmed" label and the pointless forced
@@ -5581,12 +5580,12 @@ class Model:
                 timeout=15,
             )
         except Exception as e:
-            logger.warning(f"D6 receipt reconciliation read failed for task {task_id}: {type(e).__name__}: {e}")
+            logger.warning(f"Deferred-task receipt reconciliation read failed for task {task_id}: {type(e).__name__}: {e}")
             return None
         try:
             rows = json.loads(raw) if isinstance(raw, str) else raw
         except (TypeError, ValueError) as e:
-            logger.warning(f"D6 receipt reconciliation read returned unparseable output for task {task_id}: {e}")
+            logger.warning(f"Deferred-task receipt reconciliation read returned unparseable output for task {task_id}: {e}")
             return None
         if not isinstance(rows, list) or not rows:
             return None
@@ -5611,7 +5610,7 @@ class Model:
                 mythic_client.set_turn_authority(authority)
             except Exception:
                 pass
-        # 49R-19 authority.* witness: emit the installed turn-authority mode into the request ledger so the
+        # authority.* witness: emit the installed turn-authority mode into the request ledger so the
         # sealed decision record carries `authority.<mode>` and the attester can witness it. Behaviour-neutral
         # — a new observation, no control change. record_once keyed on the mode dedupes a constant lane and
         # records a transition when the mode changes.
@@ -6286,7 +6285,7 @@ class Model:
         execution settles (`_settle_supervised_request_action`), a continuation turn may
         re-issue the same action — the re-issue re-enters the normal guarded flow and gets
         its own approval card instead of dead-ending here with no legal action path.
-        (Live 2026-10-16, channel 4 Rubeus PKINIT continuation: a contract-admitted action
+        (Observed live in a Rubeus PKINIT continuation: a contract-admitted action
         re-issued after a handback was refused with no card and no remedy.)
         """
         from .request_contract import RequestContract, RequestLane
@@ -6561,7 +6560,7 @@ class Model:
 
             repeat_summary = self._supervised_back_to_back_refusal(candidate, owner)
             if repeat_summary is not None:
-                # Persist the handback that genuinely happened, but admit no execution — ISC-7.
+                # Persist the handback that genuinely happened, but admit no execution.
                 self._subgoal_authority = candidate
                 self._subgoal_evidence_records = evidence_records
                 self._record_subgoal_control_events(candidate)
@@ -6857,7 +6856,7 @@ class Model:
         exception, and absorbing it would mean `exit` silently resumed the run.
 
         Deliberately NOT a retry: this reports the failure once and returns authority to Supervisor.
-        Retrying infrastructure blips is a separate concern (ISA 9D) and must not be smuggled in here,
+        Retrying infrastructure blips is a separate concern and must not be smuggled in here,
         because a handler that retries turns a hard blocker into a loop.
         """
         exc = error.error
@@ -6868,7 +6867,7 @@ class Model:
             f"Node {error.node} failed; handing back to Supervisor: {type(exc).__name__}: {exc}",
             exc_info=exc,
         )
-        # D8/D13: close the failed node's delegation card as an error NOW, with the exception
+        # Close the failed node's delegation card as an error NOW, with the exception
         # summary. Leaving it open handed the card to the Supervisor's finished-sweep, which
         # closed a failed delegation as a success-shaped card (finished + streamed text).
         try:
@@ -7458,11 +7457,11 @@ class Model:
             return
         self._observe_supervised_execution_event({**event, "source": source,
                                                   "tool_name": tool_name, "status": status})
-        # D8: the operator-facing status label must not contradict Mythic's own task state.
+        # The operator-facing status label must not contradict Mythic's own task state.
         # The execution event carries the authoritative task terminal state (task_completed /
         # task_status). When Mythic says the task completed successfully, the card and the
         # request-ledger phase say completed — even when Sage's output classification reads the
-        # command output as a failure (observed live: Mythic task 45 `run success` while the card
+        # command output as a failure (observed live: a Mythic `run` task reported success while the card
         # said "Tool `shell` failed." because certutil printed "command FAILED"). The
         # classification nuance is preserved as a note in the preview, never dropped and never
         # promoted to the status label. An event WITHOUT Mythic task truth (e.g., an observation
@@ -7533,10 +7532,10 @@ class Model:
         summary["failed"] = len(summary["errors"])
         summary["missing_event_ids"] = list(summary["errors"])
         if require_final:
-            # ISC-49R 49R-16: seal the kernel decision record once the request is terminal. Evidence
+            # Seal the kernel decision record once the request is terminal. Evidence
             # only — a pure read of this ledger that cannot raise into the request path. Guarded because
             # the success path reaches this twice (service.py:780 and :793), and reached on every
-            # terminal outcome (complete/cancelled/error) so 49R-14 keeps failed canaries as failures.
+            # terminal outcome (complete/cancelled/error) so failed canaries stay recorded as failures.
             sealed = getattr(self, "_sealed_decision_record_ids", None)
             if sealed is None:
                 sealed = self._sealed_decision_record_ids = set()
@@ -7610,7 +7609,7 @@ class Model:
 
         A self-halt (loop-breaker, no-progress backstop, step-budget, session rotation, …) ends the graph
         and returns through the SAME normal terminal path as a genuine completion. Recording that path as
-        `complete` with the bare "Completed." fallback is a FALSE SUCCESS — the channel-3 routing-loop halt
+        `complete` with the bare "Completed." fallback is a FALSE SUCCESS — a routing-loop halt seen live
         that reported an objective it never reached. When a stop was requested this turn, the request did not
         complete: map the recorded reason to a non-`complete` terminal status and hand back the reason's own
         halt notice so the fallback narrative explains the stop instead of claiming success."""
@@ -8031,7 +8030,7 @@ class Model:
             # must therefore not be repeated as card-close content.
             summary = explicit_content or final_summary or last_text
             if status == "finished" and not summary:
-                # D7: a delegation that ends without any text or tool output completed nothing.
+                # A delegation that ends without any text or tool output completed nothing.
                 # Closing it as "finished" with filler text hid the empty return from both the
                 # operator and the Supervisor. Close it honestly as an error instead.
                 status = "error"
@@ -8170,7 +8169,7 @@ class Model:
         terminal_status = str(status or "").strip().casefold()
         if terminal_status not in {"stopped", "cancelled", "error"}:
             raise ValueError("request stop status is invalid")
-        # D12: the reconciled engagement ledger rides INSIDE the stop notice — the
+        # The reconciled engagement ledger rides INSIDE the stop notice — the
         # terminal must stay one response, and a stopped request is exactly the
         # operator decision moment. Non-fatal by contract.
         try:
@@ -8277,7 +8276,7 @@ class Model:
                 # pane). The message streamed to Mythic is NOT stamped: Mythic's chat UI renders its own
                 # native timestamp, so Sage must not prepend its own [HH:MM:SS] to the outbound content.
                 logger.info(f"📤 {formatted_message.rstrip()}")
-            # Native-chat seam (Section 7): when a response_emitter is injected (sage_chat path), route
+            # Native-chat seam: when a response_emitter is injected (sage_chat path), route
             # this — the ONLY egress — to the chat_response queue instead of the PayloadType task RPC.
             # Same empty-guard so a blank block never streams (mirrors the "actual bytes" RPC guard).
             if self._response_emitter is not None:
@@ -8340,11 +8339,11 @@ class Model:
                     if msg.additional_kwargs.get("_is_final_report"):
                         # Keep the agent prefix first (nothing before it); the turn-end banner
                         # goes AFTER the prefix: 🤖[Supervisor]> 📊 **Final Report**\n<content>
-                        # The banner classifies the ending (D9): completed / blocked /
+                        # The banner classifies the ending: completed / blocked /
                         # checkpoint. Undeclared endings stream without a banner.
                         banner = _turn_end_banner(msg.additional_kwargs.get("_turn_outcome"))
                         content = f"{banner}\n{msg.content}" if banner else msg.content
-                        # D12: the reconciled engagement ledger rides INSIDE the closing
+                        # The reconciled engagement ledger rides INSIDE the closing
                         # content — the terminal must stay one response (a post-final
                         # stream would merge into it), and the operator decides what next
                         # with the current hop table in view. Proposals-JSON reports keep
@@ -8660,7 +8659,7 @@ class Model:
         if self._request_contract is not None:
             self.mythic_client.set_request_contract(self._request_contract)
         await self.mythic_client.login()
-        # Scope preflight (Section 8A P1): learn the bot token's granted scopes and disable guarded tools
+        # Scope preflight: learn the bot token's granted scopes and disable guarded tools
         # it can't use BEFORE the graph attaches them (get_tools skips disabled ones). No-op on the task
         # path and whenever scopes are unknown (whoami_scopes returns None). Never blocks initialize().
         try:
@@ -8810,12 +8809,12 @@ class Model:
         await self.tool_cache.invalidate(tool_name, params)
 
     def _empty_delegation_return_notice(self, node_name: str) -> AIMessage:
-        """D7: the explicit, actionable notice a Supervisor receives when a delegation returns nothing.
+        """The explicit, actionable notice a Supervisor receives when a delegation returns nothing.
 
         An empty delegation return (no text, no tool results) used to be invisible to the Supervisor —
         DEBUG-logged only, with the delegation card closed as "finished" and filler text — so the
-        Supervisor re-delegated identically (observed three consecutive empty handbacks in the
-        2026-10-15 acceptance run, request 9). This notice is the "specific, actionable statement of
+        Supervisor re-delegated identically (a live run showed three consecutive empty
+        handbacks). This notice is the "specific, actionable statement of
         the blocker" that turn endings require.
         """
         return AIMessage(
@@ -8997,7 +8996,7 @@ class Model:
             _continue_count = 0
             _agent_input = sanitized_channel
             updated_channel = sanitized_channel  # safe default if stopped before invocation
-            result: Any = None  # same reason: the ISC-53 zero-progress instrument reads it below
+            result: Any = None  # same reason: the zero-progress instrument reads it below
             while True:
                 # Cooperative kill switch INSIDE the autonomous continue-loop: an operator `stop`/`exit` set
                 # _stop_requested, but the outer astream only checks it between top-level super-steps — so
@@ -9028,7 +9027,7 @@ class Model:
                     break
                 if result.get("recursion_handback"):
                     break  # explicit handback — let upstream flag handling end/route
-                # ISC-56: same reason as the return path below — position is not identity.
+                # Same reason as the return path below — position is not identity.
                 _new_msgs = _messages_added_by_agent(
                     updated_channel, _agent_input, initial_agent_input_length
                 )
@@ -9086,8 +9085,8 @@ class Model:
                 break
 
             # With operator.add reducer, we only pass the NEW messages, not the full list
-            # ISC-56 (hardening): identify what the agent added by message id, not by list position.
-            # Identity beats arithmetic regardless of cause. This does NOT close the channel-56/57
+            # Hardening: identify what the agent added by message id, not by list position.
+            # Identity beats arithmetic regardless of cause. This does NOT close the observed live
             # zero-return — that mechanism is unknown; see _messages_added_by_agent.
             returned_messages = [
                 msg for msg in _messages_added_by_agent(
@@ -9126,33 +9125,32 @@ class Model:
                     new_messages_from_agent = [_guard_msg]
                     logger.info(f"🩸 [{node_name}] surfaced pending guard message (agent produced no messages)")
 
-            # ── ISC-59/60/75: no-progress delegation backstop, keyed on PROGRESS ───────────────
+            # ── No-progress delegation backstop, keyed on PROGRESS ─────────────────────────────
             # This guard triggers on the SYMPTOM (no progress), never on a cause — a guard that
             # enumerates known causes misses the next one. Four distinct causes have now produced the
             # same operator-visible livelock.
             #
-            # ISC-75 replaced this counter's signal. It used to count consecutive ZERO-MESSAGE
+            # This counter's signal was replaced. It used to count consecutive ZERO-MESSAGE
             # returns, which a refusal loop walks straight past: every cycle emits a refusal message,
             # so the streak resets forever and only the global step limit ends the request — leaving
             # the operator an `error` with no explanation.
             # Messages moving is not progress. Progress is the EFFECT BOUNDARY being crossed, or the
             # delegation handing back something it had not handed back before. That definition already
-            # existed in this file — the ISC-69a card guard resets on `_last_issued_task_display_id`
-            # moving — but it was wired into one call site and never applied here. This lifts it to
-            # request scope rather than adding a seventh guard (RCA: ISC-53 plan, "why loop
-            # containment keeps failing").
+            # existed in this file — the identical-re-proposal card guard resets on
+            # `_last_issued_task_display_id` moving — but it was wired into one call site and never
+            # applied here. This lifts it to request scope rather than adding a seventh guard.
             #
-            # Zero-message returns are a strict subset of no-progress returns, so the ISC-59 behaviour
+            # Zero-message returns are a strict subset of no-progress returns, so the zero-message behaviour
             # this replaces still fires at the same cap.
             #
             # Fetched defensively: tests construct Model instances without running __init__, which is
             # why the sibling guard-message read above uses getattr too. Direct attribute access here
-            # broke 19 previously-green tier tests on 2026-07-28.
+            # broke previously-green tier tests.
             _task_marker = str(getattr(
                 getattr(self, "mythic_client", None), "_last_issued_task_display_id", "",
             ) or "")
             # A re-issued task whose signature already failed is not progress: the marker
-            # moved, but the attempt repeats a known failure (D3). The typed flag is set
+            # moved, but the attempt repeats a known failure. The typed flag is set
             # by the issue path when the failure key already carried a failure.
             _repeat_failure = bool(getattr(
                 getattr(self, "mythic_client", None), "_last_issued_task_is_repeat_failure",
@@ -9186,8 +9184,8 @@ class Model:
             _progressed = _effect_crossed
 
             if not new_messages_from_agent:
-                # ISC-53 instrument: the empty slice is the thing we cannot yet explain. Round 9
-                # refuted the history-rewrite attribution, so lengths alone are no longer enough —
+                # Zero-return instrument: the empty slice is the thing we cannot yet explain. The
+                # history-rewrite attribution was refuted, so lengths alone are no longer enough —
                 # the second line reports message IDENTITY, which is what distinguishes an
                 # add_messages collision-replace from a genuine drop. See _zero_return_id_forensics.
                 logger.warning(
@@ -9201,7 +9199,7 @@ class Model:
                     f"🔁 [{node_name}] ZERO-PROGRESS forensics — "
                     f"{_zero_return_id_forensics(updated_channel, _agent_input)}"
                 )
-            # ISC-75: only a delegation that TRIED to act and failed counts against the streak.
+            # Only a delegation that TRIED to act and failed counts against the streak.
             # Effect-only progress on its own would fire on legitimate non-tasking work — three
             # consecutive BloodHound graph queries issue no Mythic task and are not a stall. An
             # analysis delegation is therefore NEUTRAL: it neither advances the streak nor clears it.
@@ -9211,7 +9209,7 @@ class Model:
             self._guarded_attempt_pending = False
             # A delegation that hands back NOTHING is a stall under every definition — there is no
             # analysis result either, and the Supervisor has nothing to act on. That is the original
-            # ISC-53/56 symptom, so the neutral exemption must not swallow it.
+            # zero-return symptom, so the neutral exemption must not swallow it.
             _returned_something = bool(new_messages_from_agent)
 
             # The streak is REQUEST-scoped, not per node. A loop that alternates nodes is still a
@@ -9224,7 +9222,7 @@ class Model:
                 self._pair_bounce_mixed = False
             else:
                 # Class accounting first. Analysis-only delegations stay neutral to the
-                # no-progress streak (ISC-75), but the neutral cap now STOPS the request
+                # no-progress streak, but the neutral cap now STOPS the request
                 # instead of only warning: advisories let a purely analytical loop run
                 # until an unrelated detector happened to end it.
                 if not _attempted_effect and _returned_something:
@@ -9264,7 +9262,7 @@ class Model:
                         self._nonprogress_delegations = 0
                         self._pair_bounce_node = ""
                         self._pair_bounce_count = 0
-                        # ISC-1b: distinguish denial-driven halts from genuine stalls. When the
+                        # Distinguish denial-driven halts from genuine stalls. When the
                         # operator repeatedly declined proposed actions, use a collaborative tone
                         # instead of "no progress."
                         if _attempted_effect:
@@ -9298,10 +9296,10 @@ class Model:
                         self._stop_reason = STOP_REASON_NO_PROGRESS
                         logger.warning(
                             f"🛑 [{node_name}] no-progress backstop fired after {_streak} consecutive "
-                            f"non-progressing delegations — halting the request (ISC-59/ISC-75)"
+                            f"non-progressing delegations — halting the request"
                         )
                 if not getattr(self, "_stop_requested", False):
-                    # ISC-3b (widened): every non-progressed delegation counts toward the
+                    # Widened: every non-progressed delegation counts toward the
                     # same-node ping-pong detector, regardless of class. The hard stop needs
                     # at least one blocked attempt in the window — a PURE-analysis window
                     # stays advisory there (legitimate multi-query analysis must not be
@@ -9334,7 +9332,7 @@ class Model:
                             self._stop_reason = STOP_REASON_NO_PROGRESS
                             logger.warning(
                                 f"🛑 [{node_name}] same-agent bounce {_bounces} with a blocked attempt "
-                                "in the window — halting the request (ISC-3b)"
+                                "in the window — halting the request"
                             )
                         else:
                             logger.warning(
@@ -9391,7 +9389,7 @@ class Model:
                 "messages": new_messages_from_agent,  # keep legacy/global mirror
             }
 
-            # D6 slice A: set when a deferred-task receipt was reconciled at this handback; carried
+            # Set when a deferred-task receipt was reconciled at this handback; carried
             # into the summary metadata below so the Supervisor-facing copy traces its provenance.
             reconciled_deferred: dict[str, Any] | None = None
             pending_receipt = (
@@ -9401,10 +9399,10 @@ class Model:
                 task_id = pending_receipt.get("task_display_id")
                 callback_id = pending_receipt.get("callback_display_id")
                 command = pending_receipt.get("command")
-                # D6 slice A: one bounded read before declaring the observation incomplete. The
+                # One bounded read before declaring the observation incomplete. The
                 # deferral exists because the result was unobserved; if the task finished in the
                 # meantime, the honest handback is the real result and the turn continues (the
-                # ISC-4 stacking rationale no longer holds once the result is in hand, and any
+                # no-stacking rationale no longer holds once the result is in hand, and any
                 # next action still passes its own HITL card). A genuinely pending/failed-read
                 # task keeps today's designed turn cap.
                 reconcile = await self._reconcile_deferred_task_receipt(pending_receipt)
@@ -9504,7 +9502,7 @@ class Model:
                             "seen. Inspect that exact task (get_all_task_output_by_task_id) in a "
                             "fresh request before deciding what to do next."
                         )
-                        # D15: the per-binary knowledge note rides on the forced-end
+                        # The per-binary knowledge note rides on the forced-end
                         # triage — the model replans with the remedy, not just the
                         # observation. Advisory only; no note renders nothing.
                         try:
@@ -9872,7 +9870,7 @@ class Model:
                         _tag_msg(empty_notice, self._next_seq())
                         update["supervisor_messages"] = [empty_notice]
                 else:
-                    # D7: a delegation that returned ZERO messages (not even non-substantive
+                    # A delegation that returned ZERO messages (not even non-substantive
                     # ones) is the same empty-return defect and needs the same explicit notice.
                     empty_notice = self._empty_delegation_return_notice(node_name)
                     _tag_msg(empty_notice, self._next_seq())
@@ -10120,11 +10118,11 @@ class Model:
         )
 
     def _note_capability_outcome(self, payload, turn_key: str = "") -> None:
-        """Observe a terminal execute_capability result (control-state P0 loop-breaker).
+        """Observe a terminal execute_capability result (control-state loop-breaker).
 
         When the SAME blocker (capability + reason) recurs with NO progress since last seen, request a clean
-        stop instead of letting the supervisor re-delegate the identical blocked action — the 1116 461K-token
-        loop. Keyed on the worker's blocker, so it is immune to the supervisor's paraphrasing (which defeated the
+        stop instead of letting the supervisor re-delegate the identical blocked action — a loop observed
+        live to burn 461K tokens. Keyed on the worker's blocker, so it is immune to the supervisor's paraphrasing (which defeated the
         action-signature stall detector). `turn_key` dedups multiple middleware fires WITHIN one worker turn (the
         execute_capability tool-call id is fresh per re-delegation, so cross-turn repeats still count). Fail-open:
         never raises into the agent loop."""
@@ -10144,7 +10142,7 @@ class Model:
                 self._stop_reason = STOP_REASON_TERMINAL_BLOCKER
                 logger.warning(
                     "🛑 [terminal-blocker] same blocker recurred with no progress — halting the solve instead of "
-                    "re-delegating it (control-state P0; kills the supervisor↔worker loop).")
+                    "re-delegating it (breaks the supervisor↔worker loop).")
         except Exception:
             pass
 
@@ -12600,7 +12598,7 @@ class Model:
     async def _controller_collect(self, state, request=None) -> dict:
         """Deterministic collect-once for the controller: run SharpHound -> download the ZIP
         -> ingest the FRESH artifact. Polling/waiting is deterministic (issue_task_and_waitfor_task_output), OFF
-        the model path (the 'remove polling from model reasoning' P1 win). Range-agnostic: canonical SharpHound
+        the model path (removing polling from model reasoning). Range-agnostic: canonical SharpHound
         2.x args + canonical output path; no range literals.
 
         FAIL-CLOSED on a failed collection: issue_task_and_waitfor_task_output returns a failure STRING without
@@ -13163,7 +13161,7 @@ class Model:
             "transfer_to_Sandbox",
         )
         # Static, run-constant schema the Mythic_Operator needs constantly — protect its tool output from the
-        # DIGEST so it is fetched ONCE per payload type and kept, not elided-and-re-fetched (run 2058: 16×).
+        # DIGEST so it is fetched ONCE per payload type and kept, not elided-and-re-fetched (one run re-fetched it 16×).
         # NOT added to compaction protection on purpose: the >4k compaction cap (~16k ceiling) keeps the
         # retained copy bounded instead of flooding every call with the full ~30k schema. The cheap
         # names+summaries index already lives un-trimmed in the prompt ({commands_text}); this keeps the
@@ -13172,7 +13170,7 @@ class Model:
         mw = [
             _ProviderFilterMiddleware(),
             # Kill-switch honored INSIDE each agent loop (not just at top-level handoffs) — see
-            # _StopCheckMiddleware / task-626. Its before_model hook gates the model call.
+            # _StopCheckMiddleware. Its before_model hook gates the model call.
             _StopCheckMiddleware(self),
             # Cap oversized tool results BEFORE the context-editing size trigger evaluates them,
             # at the awrap_tool_call seam that provably fires (unlike the v1 tool wrapper).
@@ -13183,8 +13181,8 @@ class Model:
                 edits=[_DigestToolUsesEdit(
                     trigger=50000,
                     # keep is a lab-tunable knob: higher = fewer re-fetches (less churn) but more
-                    # retained context/call. Raised 3→5 after the 2026-06-01 trace showed the agent
-                    # re-fetching cleared task output (task 301 x3, 296 x2). Re-measure tokens/call
+                    # retained context/call. Raised 3→5 after a trace showed the agent re-fetching
+                    # cleared task output (one task three times, another twice). Re-measure tokens/call
                     # after a fresh run before tuning further.
                     keep=5,
                     clear_tool_inputs=False,
@@ -13225,10 +13223,10 @@ class Model:
                 # nothing reads the model's real limit: `model.profile` is None here, and behind a
                 # LiteLLM proxy the configured model name is a label rather than a fact about the
                 # backend actually serving the request. Deriving the trigger was considered and
-                # rejected 2026-08-10 (ISA 9E) because a wrong-but-confident context window is worse
+                # rejected because a wrong-but-confident context window is worse
                 # than a fixed one: too low summarizes every step, too high never fires at all.
                 #
-                # It is a safety net that has never been reached. Phoenix evidence 2026-07-28: 247
+                # It is a safety net that has never been reached. Phoenix evidence: 247
                 # SummarizationMiddleware.before_model spans, zero LLM descendants, all-time peak
                 # per-call prompt 80,839 tokens. The 50k digest below is what actually holds the line.
                 trigger=("tokens", 150000),
@@ -14099,7 +14097,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
     ) -> str:
         """Resume a graph paused on a guarded-tool approval interrupt with a DEFAULT-DENY decision map.
 
-        Steering (Phase 3): when ``operator_message`` is non-empty (the operator hit Respond/Select with
+        Steering: when ``operator_message`` is non-empty (the operator hit Respond/Select with
         free-text), the guarded action is still rejected — never blind-run — but the operator's text becomes
         the rejection message, so the agent replans WITH the guidance instead of seeing a bare denial.
 
@@ -14122,7 +14120,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
 
         # Collect the pending HITLRequest action_requests, counted ONCE (single authoritative source +
         # dedupe). Unioning snapshot.interrupts with snapshot.tasks[].interrupts double-counts and breaks
-        # the middleware's one-decision-per-hanging-tool-call check (task-598 ValueError).
+        # the middleware's one-decision-per-hanging-tool-call check (ValueError).
         action_requests = _collect_hitl_action_requests(snapshot)
         approved = _hitl_is_approved(response)
         if not action_requests:
@@ -14151,7 +14149,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             )
         ]
         if rejected_actions:
-            # ISC-76: bind the action ONLY on a bare reject. A steer (`respond`/`select`) still denies
+            # Bind the action ONLY on a bare reject. A steer (`respond`/`select`) still denies
             # the guarded call — the operator's text becomes its rejection message — but it is the
             # operator ENGAGING, and their words routinely read as conditional approval:
             # "approved, but also do this on callback 2". Binding there would permanently block the
@@ -14200,7 +14198,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                     decisions.append({"type": "reject", "message": message})
         logger.info(f"HITL resume on thread {thread_id}: {decision_word} for {len(decisions)} tool call(s)")
 
-        # ISC-74: a REJECTED guarded tool never executes, so LangGraph emits no tool-end callback and
+        # A REJECTED guarded tool never executes, so LangGraph emits no tool-end callback and
         # its `started` tool event never receives a terminal. The request-event ledger then reports
         # `tool terminal count=0`, pre-terminal reconciliation raises, and a request that behaved
         # correctly surfaces to the operator as `status=error`.
@@ -14288,7 +14286,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                 self.state["recursion_handback"] = True
                 break
 
-        # ISC-74: terminalize the rejected tool events (see the snapshot note above).
+        # Terminalize the rejected tool events (see the snapshot note above).
         # `_close_open_tool_lifecycles` filters against the ledger's CURRENTLY-open lifecycles, so an
         # approved call that already completed or errored is skipped rather than double-terminalized.
         if _open_at_decision:
@@ -14302,7 +14300,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         """Minimal loop-breaker (staged ahead of full denial-routing). When the just-approved supervised
         action was refused at the effect boundary, the model re-proposes it and the resume loop would
         surface a fresh approval card — the livelock. Instead, surface the denial reason to the operator
-        and terminalise the request `blocked` (ISC-30), which also seals the 49R-16 decision record that a
+        and terminalise the request `blocked`, which also seals the kernel decision record that a
         never-terminalising request would starve. Returns True when it handled a denial (caller must break).
 
         Fires ONLY when a denial was recorded this resume cycle, so the legitimate path — an approved action
@@ -14334,7 +14332,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         return True
 
     def _hitl_decision_context(self, action_requests: list[Any]) -> str:
-        """Extra PLAIN-TEXT decision content for the approval card (D10).
+        """Extra PLAIN-TEXT decision content for the approval card.
 
         Capability actions get the planned inner-task sequence, the intended effects,
         and the operational cost; raw tasking gets the expected verification when the
@@ -14415,7 +14413,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
 
     def _issue_task_card_verification_text(self, args: dict[str, Any]) -> str:
         """Expected-verification line for a raw issue_task card when the command maps
-        to a modeled technique (D10: the card should state what evidence proves the
+        to a modeled technique (the card should state what evidence proves the
         effect). Unknown commands render nothing — no prose is invented."""
         try:
             from . import intent_classifier
@@ -14447,7 +14445,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         return f"Intended effect: {effect}{detail}"
 
     def _issue_task_card_tool_note(self, args: dict[str, Any]) -> str:
-        """Per-binary knowledge note for the binary a raw task invokes (D15).
+        """Per-binary knowledge note for the binary a raw task invokes.
 
         Notes live in `tool_notes/<basename>.md` (operator-maintained, public). Advisory
         only: no note, no read failure, or no client renders nothing and never blocks
@@ -14465,7 +14463,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             return ""
 
     async def _engagement_state_turn_summary_text(self) -> str:
-        """D12: build the compact reconciled engagement ledger for a turn end.
+        """Build the compact reconciled engagement ledger for a turn end.
 
         Status-only reconciliation runs first (bounded: only when a new Mythic task was
         issued since the last reconcile), so a hop whose verified task history proves the
@@ -14553,12 +14551,12 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         """If an astream event carries a HumanInTheLoopMiddleware approval interrupt, stream a clear
         approve/deny prompt to the operator and return True. The graph stays paused (checkpointed) so
         the operator's next message resumes it via handle_hitl_resume. Without this, supervised mode
-        halts on the raw tool-call request with no prompt (the 2026-06-01 task-595 symptom: 'stop had
+        halts on the raw tool-call request with no prompt (an observed symptom: 'stop had
         no text back to the user, last text showing as the tool call request')."""
         interrupts = event.get("__interrupt__") if isinstance(event, dict) else None
         if not interrupts:
             return False
-        # Chat path (Option C): a native confirmation card replaces the text approve/deny prompt. sage_chat
+        # Chat path: a native confirmation card replaces the text approve/deny prompt. sage_chat
         # injects _hitl_card_emitter per turn; it emits an input_requested card with complete_request=False,
         # releasing the channel while the graph waits on disk. _hitl_card_pending tells the chat handler a
         # card already released the request, so it must NOT send a terminal completion.
@@ -14568,21 +14566,21 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                 val = getattr(itr, "value", None)
                 if isinstance(val, dict) and isinstance(val.get("action_requests"), list):
                     action_requests.extend(val["action_requests"])
-            # ── ISC-69: identical-re-proposal guard ────────────────────────────────────────────
-            # My first backstop counted consecutive ZERO-MESSAGE node returns. The 2026-07-28
-            # channel-57 loop emitted a denial ToolMessage plus a fresh AIMessage every cycle, so the
+            # ── Identical-re-proposal guard ────────────────────────────────────────────────────
+            # The first backstop counted consecutive ZERO-MESSAGE node returns. A live re-proposal
+            # loop emitted a denial ToolMessage plus a fresh AIMessage every cycle, so the
             # counter reset each time and nine cards flew past it. Progress is not "messages moved";
             # it is "the effect boundary was crossed". This counts consecutive cards carrying the SAME
             # action fingerprint and refuses to surface the Nth, which is the loop-guard spec's own
             # invariant: never blindly re-propose the identical action into the identical gate.
-            # ISC-69a: key on the ACTION and its TARGET, not on exact argument equality.
-            # `approval_action_fingerprint` hashes the full canonical argument dict, and the
-            # channel-57 loop did not repeat identical arguments — it went `luid: ""` on one cycle and
+            # Key on the ACTION and its TARGET, not on exact argument equality.
+            # `approval_action_fingerprint` hashes the full canonical argument dict, and that
+            # live loop did not repeat identical arguments — it went `luid: ""` on one cycle and
             # `luid: "0"` on a later one. Under a full-argument key the streak reset every cycle and
             # the guard would have sat silent through all nine cards. "Never blindly re-propose the
             # identical action into the identical gate" means the same command at the same target;
             # a cosmetically different retry is the same re-proposal. The Mythic task-id progress
-            # reset below is what keeps this from truncating a healthy run (ISC-61).
+            # reset below is what keeps this from truncating a healthy run.
             def _action_key(a: dict) -> str:
                 args = a.get("args") if isinstance(a, dict) else None
                 args = args if isinstance(args, dict) else {}
@@ -14599,7 +14597,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             except Exception:  # pragma: no cover - never break the approval path on bookkeeping
                 fingerprint = ""            # A real Mythic task id moving is the progress signal — it means the effect boundary was
             # actually crossed. Without it, an operator legitimately running the same command three
-            # times in a row would trip the guard (ISC-61: never truncate a healthy run).
+            # times in a row would trip the guard (never truncate a healthy run).
             task_marker = str(
                 getattr(getattr(self, "mythic_client", None), "_last_issued_task_display_id", "") or ""
             )
@@ -14617,7 +14615,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                     self._repeat_card_count = 0
                     logger.warning(
                         f"🛑 [identical-reproposal] refusing card #{repeats} for the same action "
-                        f"fingerprint — terminating the approval loop (ISC-69)"
+                        f"fingerprint — terminating the approval loop"
                     )
                     await self._stream_message_to_mythic(
                         f"🛑 **Stopped — the same action was proposed {repeats} times.**\n\n"
@@ -14634,10 +14632,10 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                 # is refused. Starting at 0 here would ask three times and refuse the fourth.
                 self._last_card_fingerprint = fingerprint
                 self._repeat_card_count = 1
-            # D10: a capability proposal whose plan cannot be built must not consume an
+            # A capability proposal whose plan cannot be built must not consume an
             # approval round-trip — the card would offer an action that cannot run. Deny
             # pre-approval with the missing fields named (same paused-graph resume path
-            # as the ISC-69 refusal: the operator's next message replans).
+            # as the identical-re-proposal refusal: the operator's next message replans).
             if len(action_requests) == 1:
                 single = action_requests[0]
                 if (
@@ -14674,7 +14672,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                     "This tool call was blocked. Tell me how you'd like to proceed."
                 )
                 return True
-            # ISC-75: surfacing a card is an attempt to cross the effect boundary — the delegation
+            # Surfacing a card is an attempt to cross the effect boundary — the delegation
             # asked to act and is waiting on the operator. Counts the same as a blocked guarded call.
             self._guarded_attempt_pending = True
             logger.info(f"HITL interrupt surfaced as native card ({len(action_requests)} action(s))")
@@ -15414,10 +15412,10 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             error_msg = operator_error_text(e)
             error_type = type(e).__name__
 
-            # ISA 9F: name a context-window overflow for what it is. Both langchain-openai and
+            # Name a context-window overflow for what it is. Both langchain-openai and
             # langchain-anthropic raise provider subclasses of `ContextOverflowError`
             # (`OpenAIContextOverflowError`, `AnthropicContextOverflowError`), so this is live on the
-            # LiteLLM-proxy path and the native Anthropic path alike. Measured 2026-08-10 across all
+            # LiteLLM-proxy path and the native Anthropic path alike. Measured across all
             # six installed providers: openai and anthropic translate; langchain-aws, -groq, -ollama
             # and -xai do not, so a context error on those falls through to the generic guidance
             # below — correct rather than misleading. `test_context_overflow_reporting.py` pins that
@@ -16308,7 +16306,7 @@ def _create_handoff_tool(
         input_payload: str = "",
         input_type: str = "",
     ) -> Command:
-        # ISC-70 / ISC-70a: the Supervisor chooses the worker, but its generated prose is not
+        # The Supervisor chooses the worker, but its generated prose is not
         # operator authority. The exact current assisted input is rebound after every redirect
         # below, at the final worker-channel boundary.
         assisted_operator_input = (
@@ -17155,7 +17153,7 @@ def _eval_forced_capability_prefix_frontier(
     """Preserve the pre-intervention frontier for exact-target forced eval rows.
 
     Legacy prefix fixtures use `target_contains` to narrow the actual frontier and keep
-    their historical behavior. Phase 6 exact-target rows need a different contract:
+    their historical behavior. Exact-target forced rows need a different contract:
     the policy packet must still contain the real admissible frontier, while the
     executed action is a label-only forced intervention. The existing prefix helper
     already identifies and annotates that one exact action; this function only

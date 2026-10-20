@@ -669,7 +669,7 @@ def test_credential_file_requires_bounded_material_and_supported_type(
 
 
 def test_sysvol_credential_file_is_one_honest_non_a2_finding(tmp_path):
-    """A4/A8: a useful single-file finding stays distinct from cross-record ISC-7."""
+    """A4/A8: a useful single-file finding stays distinct from the cross-record A2 join."""
 
     async def scenario():
         groups_xml = _source_record(

@@ -1,4 +1,4 @@
-"""ISC-59/60/61 — the cause-agnostic no-progress delegation backstop.
+"""The cause-agnostic no-progress delegation backstop.
 
 Regression for the supervised re-approval livelock: `Mythic_Operator` returned zero messages after
 a HITL-approved `whoami` that had already SUCCEEDED, so the Supervisor re-delegated the identical
@@ -49,7 +49,7 @@ def test_cap_is_three():
 
 
 def test_backstop_fires_on_the_third_consecutive_zero_return():
-    """ISC-59: an unbounded zero-progress cycle must not be possible."""
+    """An unbounded zero-progress cycle must not be possible."""
     model = _FakeModel()
     assert _apply_backstop(model, "Mythic_Operator", []) == []
     assert _apply_backstop(model, "Mythic_Operator", []) == []
@@ -64,7 +64,7 @@ def test_backstop_fires_on_the_third_consecutive_zero_return():
     ["lost_handback", "guard_short_circuit", "contract_self_denial", "some_future_cause"],
 )
 def test_backstop_is_cause_agnostic(cause):
-    """ISC-60: the trigger is zero progress, whatever produced it.
+    """The trigger is zero progress, whatever produced it.
 
     The cause is not passed to the guard at all — that is the property under test. Each
     parametrization stands for a different upstream reason the node returned nothing.
@@ -77,7 +77,7 @@ def test_backstop_is_cause_agnostic(cause):
 
 
 def test_progress_resets_the_counter():
-    """ISC-61: a healthy run must never be truncated."""
+    """A healthy run must never be truncated."""
     model = _FakeModel()
     _apply_backstop(model, "Mythic_Operator", [])
     _apply_backstop(model, "Mythic_Operator", [])
@@ -92,7 +92,7 @@ def test_progress_resets_the_counter():
 
 
 def test_healthy_multi_step_run_is_never_truncated():
-    """ISC-61: many consecutive productive delegations must pass through untouched."""
+    """Many consecutive productive delegations must pass through untouched."""
     model = _FakeModel()
     for step in range(25):
         msgs = [AIMessage(content=f"step {step} result")]
@@ -181,7 +181,7 @@ def _messages_of(result):
 
 
 def test_real_wrapper_fires_backstop_on_third_zero_return():
-    """ISC-59 against the shipped closure, not a transcription."""
+    """The unbounded-cycle backstop against the shipped closure, not a transcription."""
     model = _fresh_model()
     agent = _ZeroProgressAgent()
 
@@ -195,14 +195,14 @@ def test_real_wrapper_fires_backstop_on_third_zero_return():
 
 
 def test_real_wrapper_survives_model_without_init():
-    """Regression: direct attribute access here broke 19 tier tests on 2026-07-28.
+    """Regression: direct attribute access here once broke 19 tier tests.
 
     Model.__new__ never runs __init__, so the guard's bookkeeping attributes do not exist. The
     guard must tolerate that exactly as the sibling _pending_guard_message read does.
 
-    ISC-75 (2026-07-28) retargeted this test deliberately. The guard no longer keeps a per-node
+    This test was retargeted deliberately. The guard no longer keeps a per-node
     `_zero_progress_returns` count; it keeps a REQUEST-scoped `_nonprogress_delegations` streak plus
-    a per-node `_delegation_result_digests` map, because counting messages missed the request-4 loop
+    a per-node `_delegation_result_digests` map, because counting messages missed a live loop
     entirely. The property under test is unchanged and is the reason this test exists: none of these
     attributes may be read with direct attribute access.
     """

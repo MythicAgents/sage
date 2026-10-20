@@ -1,11 +1,11 @@
 """Sage ships no BloodHound address, and says so plainly when it has none.
 
-ISC-24 / D10. The tempting alternative was a default like `http://127.0.0.1:8083` shipped live in the
+The tempting alternative was a default like `http://127.0.0.1:8083` shipped live in the
 tracked `.env`. Rejected for three reasons, and this file is what keeps the rejection true:
 
 * The tokens are mandatory anyway, so an operator edits the file regardless. A default saves nothing.
 * A present-but-wrong address converts a clear "not configured" into a connection failure, which is
-  strictly worse diagnostics — the subject of this entire ISA.
+  strictly worse diagnostics.
 * `127.0.0.1` is only correct under host networking. On a bridge network it points the container at
   itself, and the parser is deliberately neutral about reachability.
 
@@ -69,7 +69,7 @@ def test_zero_configuration_fails_closed_naming_the_variable():
 
 @pytest.mark.parametrize("path", ["ai/bloodhound_config.py", "sage_chat/config.py", "sage_chat/models.py"])
 def test_no_module_hardcodes_a_bloodhound_address(path):
-    """The code default D10 rejected. Example addresses in help text and comments are fine."""
+    """The rejected code default. Example addresses in help text and comments are fine."""
     source = (REPO_ROOT / "Payload_Type" / "sage" / path).read_text(encoding="utf-8")
 
     assignments = re.findall(r"BLOODHOUND_URL_KEY\s*[:,]?\s*=\s*[\"'](https?://[^\"']+)[\"']", source)

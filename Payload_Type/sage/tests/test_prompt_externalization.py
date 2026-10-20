@@ -1,4 +1,4 @@
-"""Tests for ROADMAP Phase 3 — externalized agent system prompts (prompt_loader).
+"""Tests for externalized agent system prompts (prompt_loader).
 
 The migration moved LangGraph agent system prompts out of model.py inline
 f-strings into editable markdown files under Payload_Type/sage/prompts/, loaded
@@ -17,7 +17,7 @@ The core guarantee these tests pin:
   5. filter_tools_by_frontmatter keeps/drops/orders tools per frontmatter.
   6. The MCP passthrough pattern (mcp_tools + filtered static tools) preserves
      runtime-discovered MCP tools that are not in frontmatter.
-  7. Prompts are read per call (T3.3 / ISC-26-27) — editing a file and rebuilding
+  7. Prompts are read per call — editing a file and rebuilding
      the agent picks up the change with no code edit or process restart.
 
 model.py is deliberately NOT imported (it pulls the mythic_container runtime);
@@ -269,7 +269,7 @@ def test_bloodhound_passthrough_keeps_runtime_tools_and_static_set():
 
 
 # ---------------------------------------------------------------------------
-# 8. Reload-at-call-time (T3.3 / ISC-26-27) — files read per call, not cached.
+# 8. Reload-at-call-time — files read per call, not cached.
 # ---------------------------------------------------------------------------
 def test_prompts_are_read_per_call_not_cached_at_import(tmp_path, monkeypatch):
     monkeypatch.setattr(prompt_loader, "PROMPTS_DIR", tmp_path)

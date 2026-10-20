@@ -180,7 +180,7 @@ def test_list_engagements_scans_state_prefix(monkeypatch, tmp_path):
 
 
 def test_hostile_operation_name_no_path_traversal(monkeypatch, tmp_path):
-    # An operator-controlled operation name must not escape the state dir (Advisor flag).
+    # An operator-controlled operation name must not escape the state dir.
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     key = oc.operation_key("../../etc/evil", 1)
     p = Path(el.ledger_path(key))

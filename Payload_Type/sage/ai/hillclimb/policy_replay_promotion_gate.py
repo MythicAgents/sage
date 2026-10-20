@@ -1,6 +1,6 @@
 """Synthetic-consistency and promotion gate for the first replay hill-climb candidate.
 
-The old report mislabeled a known census surface as held-out transfer.  Phase 3 keeps
+The old report mislabeled a known census surface as held-out transfer.  This gate keeps
 the row for diagnostic consistency only: every exercised family counts as exposure,
 and a modeled census row cannot become transfer evidence or authorize promotion.
 """

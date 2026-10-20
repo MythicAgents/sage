@@ -40,7 +40,7 @@ except Exception as _banner_exc:  # pragma: no cover - banner is best-effort, ne
     logger.info(f"Sage version banner unavailable: {_banner_exc}")
 
 import sage_chat # Registers SageChat (native v4.0.0 chat container) via Chat.__subclasses__().
-                 # Phase 4 complete: the PayloadType (`container`) has been removed — Sage is chat-only.
+                 # The PayloadType (`container`) has been removed — Sage is chat-only.
 if _observation_capture:
     from ai.observation_channel import emit as _emit_observation
     from sage_chat import findings_slack as _findings_slack

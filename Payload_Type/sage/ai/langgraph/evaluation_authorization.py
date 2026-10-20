@@ -5,7 +5,7 @@ exists only to make prospective evaluation rows countable: a frozen manifest, a
 trusted cell binding, one post-normalization action envelope, and one deterministic
 allow/deny/unknown decision. It does not call models, inspect outcomes, or mediate
 runtime effects by itself. A frozen manifest selector binds exact host/domain/identity
-fields; Phase 17 later binds the fresh runtime callback ID inside the trusted cell
+fields; the evaluation run later binds the fresh runtime callback ID inside the trusted cell
 binding and action envelope.
 """
 
@@ -125,8 +125,8 @@ class CallbackSelector:
     def matches_runtime_callback(self, callback: "CallbackSelector") -> bool:
         """Match a frozen manifest selector to one freshly bound runtime callback.
 
-        A Phase 16 manifest can freeze exact host/domain/identity selectors before
-        Phase 17 rediscovers the live callback ID. The trusted cell binding and
+        A frozen manifest can fix exact host/domain/identity selectors before
+        the evaluation run rediscovers the live callback ID. The trusted cell binding and
         action envelope still require and compare the exact runtime callback ID.
         """
         if not isinstance(callback, CallbackSelector) or not callback.is_runtime_bound:

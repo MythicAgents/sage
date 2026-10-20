@@ -521,10 +521,10 @@ async def login(
     password: str | None = None,
     env_path: str | Path | None = None,
 ) -> Any:
-    # ISC-49R 49R-18 option 1: when SAGE_DRIVER_APITOKEN is set, the driver authenticates with a
+    # When SAGE_DRIVER_APITOKEN is set, the driver authenticates with a
     # SCOPED api token (no task.write) instead of the admin password, so the driver itself cannot
     # issue a Mythic task. The channel is still bound to a tasking-capable backing token
-    # (SAGE_BACKING_APITOKEN_ID), so the KERNEL can task — closing 49R-18 by credential placement.
+    # (SAGE_BACKING_APITOKEN_ID), so the KERNEL can task — enforced by credential placement.
     # The value must be the secret returned by the createAPIToken *mutation response* (the apitokens
     # table column is masked and does NOT authenticate). Opt-in: absent this env, the admin-password
     # path is unchanged, so every existing flow (inspect/prepare/run) is unaffected.
@@ -685,7 +685,7 @@ async def create_locked_channel(
     metadata: dict[str, Any] | None = None,
     token_name: str = "Sage native chat",
 ) -> dict[str, Any]:
-    # ISC-49R 49R-18 option 1: under a scoped driver token, the session cannot run the wildcard-token
+    # Under a scoped driver token, the session cannot run the wildcard-token
     # readiness query (it lacks apitoken.read). When SAGE_BACKING_APITOKEN_ID is set, bind the channel
     # directly to that tasking-capable backing token id, using SAGE_CHAT_CONTAINER_ID for the container
     # so no privileged read is needed. The kernel tasks via the backing token; the driver cannot.
@@ -1912,7 +1912,7 @@ def write_canary_manifest(
     max_steps: int,
     case_id: str | None = None,
 ) -> Path:
-    """Write the durable record of one bounded canary (ISC-49R 49R-06).
+    """Write the durable record of one bounded canary.
 
     Records only what the driver itself observed. This is untrusted self-report by design — the
     attester re-derives the same facts from Mythic and never reads this file as its gold side.
@@ -1953,7 +1953,7 @@ def record_canary_manifest(path: str | Path, request_id: int) -> dict[str, Any]:
         resolved,
         category="evidence/isc49r-canary",
         artifact_type="native-chat-canary-manifest",
-        context=f"ISC-49R bounded canary, Mythic native chat request {request_id}",
+        context=f"Bounded native chat canary, Mythic request {request_id}",
         root=REPO_ROOT,
     )
     return {
@@ -2210,7 +2210,7 @@ async def _run(args: argparse.Namespace) -> int:
             stop_on_input_requested=True,
         )
         if args.manifest_path:
-            # ISC-49R 49R-06: a canary's evidence must survive a reboot in the durable private
+            # A canary's evidence must survive a reboot in the durable private
             # history, not live only in /tmp or an ad-hoc directory. Deliberately NOT gated on
             # --runtime-dbs-archived: that gate exists for clean-solve demo provenance, and a
             # bounded canary makes no clean-solve claim, so requiring it would block the very
@@ -2353,7 +2353,7 @@ def build_parser() -> argparse.ArgumentParser:
     canary.add_argument("--max-steps", type=int, default=20)
     canary.add_argument("--manifest-path",
                         help="durable manifest destination; allocate with sage-artifact-retention "
-                             "so it lands under .sage_history/ (ISC-49R 49R-06)")
+                             "so it lands under .sage_history/")
     canary.add_argument("--case-id",
                         help="frozen ConversationCase id this canary runs, recorded in the manifest")
     canary.add_argument("--session-mode", choices=("supervised", "conversation"), default="supervised",

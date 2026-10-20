@@ -1211,8 +1211,8 @@ def verify_adcs_certificate_auth(probe_result: dict[str, Any]) -> CapabilityVeri
     # Schannel LDAP bind that reads the account's own group membership, and a bare `base64(ticket.kirbi)`
     # TGT marker, are both self-reported auth evidence — a real TGT must be *used* (service access) or
     # accompanied by the credential material to count.
-    # RCA 2026-08-01: a bind-only self-read certified da:essos.local with no usable credential
-    # (PKINIT had failed KDC_ERR_PADATA_TYPE_NOSUPP); a follow-up `dir \\DC\C$` was Access Denied.
+    # A bind-only self-read once certified domain admin with no usable credential (PKINIT had
+    # failed KDC_ERR_PADATA_TYPE_NOSUPP); a follow-up `dir \\DC\C$` was Access Denied.
     control_signal = _any_true(
         probe_result,
         (
@@ -2492,8 +2492,8 @@ def extract_adcs_certificate_auth_probe(
     # Genuine privileged service access only — a reproducible action proof (DC C$ listing, remote
     # exec, DC-side write) surfaced by the ticket probe. The Schannel script's own CERT_AUTH_STATUS=OK
     # and CERT_AUTH_LDAP_BIND=True are self-reports of a successful bind + directory read; they are
-    # authentication, not service access, and must not stand in for a privileged action (RCA
-    # 2026-08-01). They still drive `auth_specific` and `schannel_ldap_bind` below.
+    # authentication, not service access, and must not stand in for a privileged action.
+    # They still drive `auth_specific` and `schannel_ldap_bind` below.
     service_access = bool(ticket_probe.get("service_access_proven"))
     schannel_domain_admin = bool(
         cert_auth_domain_admin is True
@@ -2538,7 +2538,7 @@ def extract_adcs_certificate_auth_probe(
         # Proven == usable control: credential material, a privileged action, or a DA-only read
         # confirmed by the deny/allow negative control. NOT a directory self-read or a bare TGT
         # marker. `domain_admin` here is a membership attestation and `pkinit_tgt` a self-reported
-        # marker; neither makes certificate-auth "proven" on its own (RCA 2026-08-01).
+        # marker; neither makes certificate-auth "proven" on its own.
         "certificate_auth_proven": bool(
             auth_specific
             and (service_access or ntlm_hash_present or da_only_read_proven)

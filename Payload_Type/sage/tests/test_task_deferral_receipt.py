@@ -1,4 +1,4 @@
-"""sage-task-deferral-receipt (ISC-1..6) — bounded grace, and a receipt naming the task.
+"""Task deferral receipt — bounded grace, and a receipt naming the task.
 
 The defect: `_derive_task_timeout` multiplied a callback's observed sleep on top of the configured
 base and only ever raised, with nothing bounding the result. A callback sleeping four hours produced
@@ -77,7 +77,7 @@ def _issue(tools, command="shell", parameters="hostname", callback=11):
 
 
 # --------------------------------------------------------------------------------------------
-# ISC-1 — one configured grace period; nothing sleep-derived may extend it
+# One configured grace period; nothing sleep-derived may extend it
 # --------------------------------------------------------------------------------------------
 
 
@@ -122,7 +122,7 @@ def test_a_long_sleep_is_still_reported_even_though_it_no_longer_moves_the_deadl
 
 
 # --------------------------------------------------------------------------------------------
-# ISC-2 — grace expiry returns a terminal, non-failure-shaped receipt naming the exact task
+# Grace expiry returns a terminal, non-failure-shaped receipt naming the exact task
 # --------------------------------------------------------------------------------------------
 
 
@@ -194,7 +194,7 @@ def test_deferral_does_not_advance_the_failure_counter():
 
 
 # --------------------------------------------------------------------------------------------
-# ISC-4 — no further target-facing task in that logical request
+# No further target-facing task in that logical request
 # --------------------------------------------------------------------------------------------
 
 
@@ -271,7 +271,7 @@ def test_the_golden_is_not_vacuous():
 
 
 # --------------------------------------------------------------------------------------------
-# ISC-6 — no late result may acquire authority or continue a plan
+# No late result may acquire authority or continue a plan
 # --------------------------------------------------------------------------------------------
 
 
@@ -312,15 +312,15 @@ def test_the_receipt_record_cannot_serve_as_a_resumption_handle():
 
 
 # --------------------------------------------------------------------------------------------
-# ISC-3 — the turn goes terminal at grace expiry (verify-first per D4)
+# The turn goes terminal at grace expiry (verify first)
 # --------------------------------------------------------------------------------------------
 
 
 def test_a_long_sleeping_callback_no_longer_holds_the_turn_open():
-    """ISC-3's precondition, which is the half that was actually broken.
+    """The terminal-turn precondition, which is the half that was actually broken.
 
     The composer unlocks when the owning `chat_request` reaches a terminal status, and it reaches one
-    when the turn completes. Before ISC-1 the turn could not complete: the graph sat inside
+    when the turn completes. Before the grace cap the turn could not complete: the graph sat inside
     `asyncio.wait_for` under `_graph_heartbeat` for the whole derived budget, and for a four-hour
     sleep that budget was ~12 hours. So the falsifier worth testing is the tool call not returning.
 

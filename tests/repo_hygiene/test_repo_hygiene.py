@@ -5,7 +5,7 @@ dead documentation link, or leaked private tooling, which is why they belong in 
 than in someone's local setup. They were split out of `Payload_Type/sage/tests/` because nothing here
 tests Sage's runtime behaviour — that suite keeps the two genuine product-boundary tests.
 
-Contract they enforce: AGENTS.md § Publishable-By-Default Contract.
+Contract they enforce: the public-files rule in AGENTS.md § Repository map and artifacts.
 """
 from __future__ import annotations
 

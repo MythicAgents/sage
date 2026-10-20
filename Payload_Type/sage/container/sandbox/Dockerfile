@@ -1,10 +1,9 @@
-# Sage sandbox image — minimal environment for isolated arbitrary code execution (Phase 1 T1.2).
+# Sage sandbox image — minimal environment for isolated arbitrary code execution.
 #
 # This image is intentionally bare: just shell + python3 and a non-root user. ALL of the
 # isolation is applied by the CALLER (mythic_tools.sandbox_exec) at container-create time:
 # no privileges, all caps dropped, no-new-privileges, read-only rootfs, a size-capped tmpfs
 # at /sandbox/work, network disabled, mem/pids/cpu caps, and a hard timeout + force-remove.
-# See Plans/SANDBOX_DESIGN.md.
 #
 # Built on first use by sandbox_exec (docker-py images.build) if absent, tagged sage-sandbox:latest.
 FROM python:3.14-slim-bookworm

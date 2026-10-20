@@ -35,9 +35,9 @@ class ConversationCase:
 #: Placeholder for the live foothold callback in a frozen case prompt.
 #:
 #: Frozen case text must never name a range-specific callback ID. The corpus outlived four
-#: rebindings — ``callback 7 -> 1 -> 3 -> 4`` — and every one was an edit to text that is supposed
-#: to be immutable: a rollback or a foothold rebuild silently invalidated the case, and ISC-49R
-#: S4-01 was launched against a callback that had died. The case now carries a symbol; the runner
+#: callback rebindings, and every one was an edit to text that is supposed to be immutable: a
+#: rollback or a foothold rebuild silently invalidated the case, and a run was once launched
+#: against a callback that had died. The case now carries a symbol; the runner
 #: binds it at freeze time via :func:`render_prompt` and records the resolved bytes in the frozen
 #: tuple, so exactly what was sent is still pinned without the corpus rotting.
 FOOTHOLD_TOKEN = "{foothold}"

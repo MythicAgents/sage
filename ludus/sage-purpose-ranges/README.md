@@ -131,7 +131,7 @@ That variant leaves the auto-created `SAGEREPL` default range unused.
   partner-forest LAPS/CA lane and a nested-child DCSync lane.
 
 `topology.capabilities` in the range profile catalog is the union available across
-known routes. It is not an ISC-10 required set. `required_capabilities` is always
+known routes. It is not a required set. `required_capabilities` is always
 derived as the intersection of `required_routes`, never copied from the union. A
 profile receives a structural identity only when its route coverage is complete for
 the exact `required_route_scenario`, source-pinned start, objective and proof protocol.

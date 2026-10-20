@@ -1,6 +1,6 @@
-"""D9 turn-end taxonomy: a turn end classifies as completed, blocked, or checkpoint.
+"""Turn-end taxonomy: a turn end classifies as completed, blocked, or checkpoint.
 
-Across WP7 Phase 2 acceptance requests 2-9 every turn end rendered the same
+Across a series of live acceptance requests every turn end rendered the same
 "📊 Final Report" banner whether the objective was complete, blocked, or merely
 checkpointed after one step. The banner is now derived from a `_turn_outcome`
 classification stamped where the cause is structurally known (wrapper paths) or

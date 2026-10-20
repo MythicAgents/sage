@@ -1,6 +1,6 @@
-"""D8: the operator-facing execution-event status label must not contradict Mythic state.
+"""The operator-facing execution-event status label must not contradict Mythic state.
 
-Observed live in the 2026-10-15 acceptance run: Mythic recorded task 45 (`certutil -TCAInfo`) as
+Observed live: Mythic recorded a `certutil -TCAInfo` task as
 `run success`/completed while the operator-facing card said "Tool `shell` failed." — because Sage's
 output classification read the command output (`CertUtil: -TCAInfo command FAILED: ...`) as a
 failure. Three different facts were conflated into one status word: Mythic's task terminal state,

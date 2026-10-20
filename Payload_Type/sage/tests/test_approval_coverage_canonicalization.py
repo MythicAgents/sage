@@ -1,4 +1,4 @@
-"""Regression tests for the ISC-49R S4-01 approval-coverage defect.
+"""Regression tests for the shell-parameter approval-coverage defect.
 
 An approved guarded shell action could never execute. The approval claim captured the model's
 structured proposal (``parameters={"command": "whoami"}``) while the effect path passed the
@@ -7,8 +7,8 @@ sides for exact equality, so the shape difference read as a scope change: the ef
 the agent re-proposed, the operator approved again, and the request livelocked without ever
 issuing a Mythic task.
 
-Live evidence: channel 40 / request 55 — three byte-identical approvals (one ``action_digest``),
-zero Mythic tasks, request never terminalised. Fixed by canonicalizing ``parameters`` through the
+A live run showed three byte-identical approvals (one ``action_digest``), zero Mythic tasks,
+and a request that never terminalised. Fixed by canonicalizing ``parameters`` through the
 product's existing ``_shell_parameter_text`` on BOTH sides of the comparison.
 
 These tests pin the canonicalization *and* its limits: the fix must not make genuinely different
@@ -39,7 +39,7 @@ def _effective(tools: MythicTools, **arguments):
 
 
 def test_structured_and_flattened_shell_parameters_canonicalize_identically(tools):
-    """The exact S4-01 failure: the approved proposal's shape must not be a scope change."""
+    """The exact livelock failure: the approved proposal's shape must not be a scope change."""
     approved = _effective(
         tools, callback_display_id=3, command="shell", parameters={"command": "whoami"}
     )

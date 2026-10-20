@@ -6,8 +6,8 @@ execution — lives below the milestone grain. C1b reads it from the trajectory
 store (the runtime failure log), producing a SEPARATE, DIAGNOSTIC family of the
 score vector.
 
-Discipline (ISC-38): these signals are diagnostic/credit ONLY. They never feed
-the acceptance reward — capability (C1 ground truth) is the sole acceptance gate.
+Discipline: these signals are diagnostic/credit ONLY. They never feed
+the acceptance reward — capability (the C1 ground truth) is the sole acceptance gate.
 Optimizing tradecraft metrics directly would reward good-looking tradecraft that
 owns nothing (Goodhart).
 
@@ -17,7 +17,7 @@ Grounded scope, Phase 0:
     `execute_capability` FAILS, so this store is a FAILURE LOG. That cleanly
     yields failure-class counts and `unclassified_rate` (the measured blind-spot
     size) — but NOT a total-action denominator.
-  * Therefore the **productive-action ratio** (ISC-35) is NOT computed here: its
+  * Therefore the **productive-action ratio** is NOT computed here: its
     denominator (all tool actions) needs the full action log (harness schema-v2 /
     Phoenix spans). It is computed in C2 as (C1 milestones) ÷ (harness tool-call
     count). See GAP_REGISTER.
@@ -49,7 +49,7 @@ def default_store_path() -> Path:
 
 
 # Known tradecraft dimensions the gauge does NOT yet measure. Making blind spots
-# explicit (ISC-37) is the honest alternative to a gauge that silently can't see them.
+# explicit is the honest alternative to a gauge that silently can't see them.
 GAP_REGISTER: tuple[str, ...] = (
     "wrong_execution_locus / wrong-target-host (e.g. `gpupdate /force` on the local host instead of "
     "the DC): no labeler signature today; the action succeeds and advances nothing, so it is invisible "

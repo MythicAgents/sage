@@ -1,7 +1,7 @@
 """Phase-1 objective-completion recognition: an in-domain DA hop should complete WITHOUT a separately-recorded
 kerberos-context effect, while cross-forest objectives stay strict and under-reach is prevented.
 
-Negative cases are first-class (Advisor review): a low-priv in-domain callback, DA-without-krbtgt, a cross-forest
+Negative cases are first-class: a low-priv in-domain callback, DA-without-krbtgt, a cross-forest
 objective without an in-domain foothold, and a parent-domain foothold must all NOT complete.
 """
 
@@ -70,7 +70,7 @@ def test_in_domain_da_without_krbtgt_does_not_complete():
 
 
 def test_low_priv_in_domain_callback_without_da_does_not_complete():
-    # Advisor case 2: a live in-domain callback with NO verifier-proven da:/ea: must not complete.
+    # A live in-domain callback with NO verifier-proven da:/ea: must not complete.
     state = es.EngagementState(
         objective=CHILD_DA_OBJECTIVE,
         footholds=[_foothold()],

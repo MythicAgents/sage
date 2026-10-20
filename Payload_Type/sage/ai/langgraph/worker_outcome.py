@@ -1,6 +1,6 @@
-"""Typed worker-outcome contract for supervisor/worker control-state (P0 of the control-state reprioritization).
+"""Typed worker-outcome contract for supervisor/worker control-state.
 
-THE PROBLEM (the `1116` 461K-token loop): a worker's bounded-stop is a LOCAL stop, invisible to the supervisor.
+THE PROBLEM (a live run burned 461K tokens in this loop): a worker's bounded-stop is a LOCAL stop, invisible to the supervisor.
 The supervisor reads "worker did not act" as "delegate again" and re-issues the identical instruction 48 times.
 Both components behave correctly in isolation and form a global infinite loop.
 
@@ -54,7 +54,7 @@ class Decision(str, Enum):
     PROCEED = "proceed"               # progress/complete -> continue normally
     RETRY_WORKER = "retry_worker"     # new blocker or state changed -> one admissible (re)attempt
     ROUTE_TO_OWNER = "route_to_owner" # blocked/handoff with a prerequisite/owner -> advance the work there
-    STOP = "stop"                     # same blocker at same state, no route -> terminal (kills the 1116 loop)
+    STOP = "stop"                     # same blocker at same state, no route -> terminal (kills the redelegation loop)
 
 
 @dataclass(frozen=True)
@@ -113,7 +113,7 @@ def action_fingerprint(action: str, state_revision: str, impl_version: str = "")
 
     Two attempts are 'the same' (suppressible) ONLY when all three match. A changed `state_revision` (new creds,
     fresh graph, new callback context) or a bumped `impl_version` (a capability fix) yields a NEW fingerprint, so
-    a legitimate retry is never suppressed (the Codex §4 over-suppression guard)."""
+    a legitimate retry is never suppressed (the over-suppression guard)."""
     return f"{_norm(action)}|rev={state_revision}|impl={impl_version}"
 
 
@@ -121,7 +121,7 @@ def supervisor_decision(history: list[WorkerOutcome], new: WorkerOutcome) -> Dec
     """Deterministic supervisor decision over the outcome history + the newest worker outcome.
 
     Core anti-loop rule: after the SAME blocker fingerprint has already been seen at the SAME state revision, the
-    supervisor must NOT re-delegate — it STOPs. That single rule makes the 1116 461K-token redelegation tail
+    supervisor must NOT re-delegate — it STOPs. That single rule makes the 461K-token redelegation tail
     impossible. Before that, a blocked worker with a prerequisite/owner is ROUTED (advance the work); a
     first-seen blocker with no route gets one admissible retry; progress/complete proceed.
     """

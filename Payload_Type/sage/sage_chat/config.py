@@ -2,14 +2,14 @@
 
 Maps a Mythic ``ChatRequest`` onto the exact keyword arguments the existing
 ``ai.langgraph.model.Model`` constructor already expects — so ``Model.__init__`` is
-reused unchanged (PRD Section 9 / 11). The legacy PayloadType path built the same
+reused unchanged. The legacy PayloadType path built the same
 ``config["configurable"]`` dict in ``container/agent_functions/chat.py:262-279``; this
 module reproduces that shape from chat primitives instead of task args.
 
-Precedence (PRD Section 9): ``ChatRequest.Config`` (per-chat UI) → ``ChatSecretView``
+Precedence: ``ChatRequest.Config`` (per-chat UI) → ``ChatSecretView``
 (Mythic user secret) → container environment variable. The first non-empty wins.
 
-Caveat (Cody, c): ``Config`` and ``APITokenID`` can change on *any* request, so callers
+Caveat: ``Config`` and ``APITokenID`` can change on *any* request, so callers
 re-resolve these every turn and never cache them across turns.
 """
 
@@ -375,7 +375,7 @@ def build_model_kwargs(request: ChatRequest) -> dict[str, Any]:
     A chat request has no task, so ``task_id``/``agent_task_id`` are neutral placeholders
     (0 / "") — the streaming egress is redirected through ``response_emitter`` and the
     checkpointer thread key through ``_thread_id_override``, so neither placeholder is used
-    for I/O. ``operation_id`` is threaded explicitly (Section 7).
+    for I/O. ``operation_id`` is threaded explicitly.
     """
     config = ChatConfigView.from_request(request)
     secrets = ChatSecretView.from_request(request)
@@ -452,7 +452,7 @@ def build_model_kwargs(request: ChatRequest) -> dict[str, Any]:
         "eval_arm_deadline_epoch": eval_arm_deadline_epoch,
         "max_steps": max_steps,
         "operation_id": request.OperationID,
-        # Chat auth context (Section 8A P0): MythicTools mints a channel-scoped bot token from these.
+        # Chat auth context: MythicTools mints a channel-scoped bot token from these.
         "channel_id": request.ChannelID,
         "apitoken_id": request.APITokenID,
     }

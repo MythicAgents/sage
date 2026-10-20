@@ -9,7 +9,7 @@ no sudo. That file in the installed copy is therefore operator-owned state, exac
 fully commented out. Without an exclusion it overwrites the operator's file with a blank one, and it
 does so **silently**: the container comes back healthy, chat still answers, and BloodHound has simply
 vanished with nothing in the log to say why. That is the failure this file exists to prevent, and it
-is the same shape as the defect the rest of this ISA is about — a real loss with no signal.
+is the same shape as the degraded-BloodHound defects — a real loss with no signal.
 
 The seeding half matters as much as the exclusion. The shipped `.env` is not merely a template: it
 carries `LANGGRAPH_STRICT_MSGPACK=true`, a security default that is unsafe when ABSENT rather than

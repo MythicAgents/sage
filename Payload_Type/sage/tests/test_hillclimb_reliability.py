@@ -1,8 +1,8 @@
 """C3 noise-floor / reliability tests (eval gauge Phase 0).
 
 Pins: zero spread for identical runs; non-zero MDE + per-milestone label-agreement for
-varying runs (ISC-12/13/14); refusal to mix verifier_hashes (ISC-9); injectable measure();
-append-only record write (ISC-15).
+varying runs; refusal to mix verifier_hashes; injectable measure();
+append-only record write.
 """
 import json
 import sys

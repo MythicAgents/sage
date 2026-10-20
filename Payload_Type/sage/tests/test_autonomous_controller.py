@@ -1,4 +1,4 @@
-"""Tests for the deterministic AutonomousController (control-state P0).
+"""Tests for the deterministic AutonomousController.
 
 Run: cd Payload_Type/sage && python3 -m pytest tests/test_autonomous_controller.py -q
 

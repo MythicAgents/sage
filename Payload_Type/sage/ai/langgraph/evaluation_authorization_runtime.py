@@ -1,7 +1,7 @@
 """Eval-only runtime mediation for the frozen evaluation authorization boundary.
 
 The pure decision function lives in :mod:`evaluation_authorization`.  This module
-adds only the runtime bookkeeping needed by Phase 17/18 evaluation sessions:
+adds only the runtime bookkeeping needed by evaluation sessions:
 
 * load one private frozen manifest + trusted cell binding;
 * build an envelope from already-normalized adapter arguments;
@@ -119,7 +119,7 @@ class RuntimeAuthorizationOutcome:
 
 @dataclass
 class EvaluationAuthorizationRuntime:
-    """Mutable runtime holder around the immutable Phase 16 authorization inputs."""
+    """Mutable runtime holder around the immutable frozen authorization inputs."""
 
     enabled: bool
     manifest: auth.EvaluationAuthorizationManifest | None = None

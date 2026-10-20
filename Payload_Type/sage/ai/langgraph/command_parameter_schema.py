@@ -96,7 +96,7 @@ VALIDATION_FIELDS = (
     "required",
     "choices",
     "parameter_group_name",
-    # Carried for the ISC-4 rejection arm, which is off by default. Measured 2026-08-01: empty on
+    # Carried for the verifier-regex rejection arm, which is off by default. Measured: empty on
     # all 192 parameters of every installed payload type, so it costs nothing today and is here for
     # the agent-agnostic case rather than for Apollo.
     "verifier_regex",
@@ -124,7 +124,7 @@ INTERNAL_SCHEMA_FIELDS = (
     "choices",
     "default_value",
     "dynamic_query_function",
-    # ISC-4's regex remains available to internal validation.
+    # The verifier regex remains available to internal validation.
     "verifier_regex",
 )
 

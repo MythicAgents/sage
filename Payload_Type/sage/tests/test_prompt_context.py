@@ -1,4 +1,4 @@
-"""Tests for ROADMAP Phase 3 Layer 1 — prompt_context providers.
+"""Tests for the prompt_context providers.
 
 The refactor extracted four prompt-variable producers out of model.py's agent
 builders into ai/langgraph/prompt_context.py. Each provider is ``(model) -> str``
@@ -49,10 +49,10 @@ class FakeModel:
 # commands_text
 # --------------------------------------------------------------------------- #
 
-# ISC-72: repointed from the all-commands dump to the per-command schema tool. The broad tool
-# returns 75,650 chars for Apollo and was head-truncated to 16,000 by _compact_tool_result_str, so
-# the schema the model was told to trust arrived ~79% missing — that is how `ticket_cache_list` was
-# issued with empty parameters on 2026-07-28.
+# Repointed from the all-commands dump to the per-command schema tool. The broad tool returns
+# 75,650 chars for Apollo and was head-truncated to 16,000 by _compact_tool_result_str, so the
+# schema the model was told to trust arrived ~79% missing — that is how a live run issued
+# `ticket_cache_list` with empty parameters.
 NOTE_TAIL = (
     "\n**Note:** This is an index only. Before issuing any command that takes parameters, call "
     "get_all_command_args_for_payloadtype('<payload>', '<command>') for that ONE command's exact "

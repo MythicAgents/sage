@@ -88,7 +88,7 @@ class Scenario:
     spec_overrides: dict[Milestone, MilestoneSpec] = field(default_factory=dict)
     # Which milestones this scenario can prove; default = all keys in the merged spec + FOOTHOLD.
     milestone_subset: tuple[Milestone, ...] | None = None
-    # Independent cross-checks (ISC-3): milestone -> callable returning real-world truth.
+    # Independent cross-checks: milestone -> callable returning real-world truth.
     # e.g. {Milestone.GRAPH_COLLECTED: lambda: bloodhound_domain_info_nonempty()}
     direct_probes: dict[Milestone, Callable[[], bool]] = field(default_factory=dict)
     # Probe-able milestones deliberately scored from ledger self-report only.
@@ -413,7 +413,7 @@ def read_ground_truth(
     )
 
 
-# --- no-mutation guard (ISC-4) ------------------------------------------------------------------------
+# --- no-mutation guard --------------------------------------------------------------------------------
 
 def ledger_state_hash(engagement_id: str | None = None) -> str:
     """SHA-256 over the on-disk ledger bytes for an engagement (or the whole state dir).

@@ -272,7 +272,7 @@ def test_explicit_cancel_does_not_install_pending_handoff_receipt():
     assert tools._deferred_task_receipt is None
 
 
-# ── D6 slice A: reconcile the deferred receipt at the Operator handback ──────────────
+# ── Reconcile the deferred receipt at the Operator handback ─────────────────────────
 
 _LATE_COMPLETED_OUTPUT = json.dumps([{
     "id": 99, "response_text": "late identity result", "task": {
@@ -326,11 +326,11 @@ def _operator_wrapped(model: Model, operator_final: str):
 
 
 def test_completed_deferred_task_is_reconciled_at_handback_and_the_turn_continues():
-    """D6: the deferred task completed by handback time — deliver the real result, keep the turn.
+    """The deferred task completed by handback time — deliver the real result, keep the turn.
 
     The old behavior force-ended the request with 'Observation is incomplete … inspect that exact
     task in a fresh request' even when the task had already finished, inserting an operator
-    round-trip ('Proceed.') between every deferred step. The ISC-4 cap still applies while the
+    round-trip ('Proceed.') between every deferred step. The deferral cap still applies while the
     task is genuinely unobserved; once the one bounded read resolves it, the Supervisor receives
     the typed outcome and the request continues.
     """
@@ -348,7 +348,7 @@ def test_completed_deferred_task_is_reconciled_at_handback_and_the_turn_continue
     result, tools, reader = asyncio.run(run())
     reader.assert_awaited_once()
     assert tools._deferred_task_receipt is None, (
-        "a reconciled receipt must be cleared so the ISC-4 cap does not leak into the continued turn"
+        "a reconciled receipt must be cleared so the deferral cap does not leak into the continued turn"
     )
     assert isinstance(result, Command)
     assert result.goto == "Supervisor", (
@@ -398,7 +398,7 @@ def test_failed_deferred_task_is_reconciled_at_handback_and_the_turn_continues()
 
 
 def test_still_pending_deferred_task_keeps_the_forced_turn_end():
-    """The ISC-4 cap holds while the task is genuinely unobserved: forced END, honest wording."""
+    """The deferral cap holds while the task is genuinely unobserved: forced END, honest wording."""
     async def run():
         model, tools = _handback_model("chat:pending-handback:request:3")
         reader = AsyncMock(return_value=json.dumps([{
@@ -417,7 +417,7 @@ def test_still_pending_deferred_task_keeps_the_forced_turn_end():
 
     result, tools = asyncio.run(run())
     assert tools._deferred_task_receipt is not None, (
-        "an unresolved task must keep its receipt: the ISC-4 cap is still load-bearing"
+        "an unresolved task must keep its receipt: the deferral cap is still load-bearing"
     )
     assert isinstance(result, Command) and result.goto == END
     update = result.update or {}
@@ -436,7 +436,7 @@ def test_still_pending_deferred_task_keeps_the_forced_turn_end():
     assert "No further target task may be issued in this turn" in content
     assert final_msgs[0].additional_kwargs.get("_turn_outcome") == "checkpoint", (
         "a pending-task forced end is a mid-objective pause and must classify as a "
-        "checkpoint, not a final report (D9)"
+        "checkpoint, not a final report"
     )
 
 

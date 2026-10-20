@@ -136,7 +136,7 @@ def test_loaded_hop_becomes_durable_and_is_not_silently_skipped(monkeypatch):
 
 
 def test_footholds_are_never_persisted_so_corroboration_is_live_only(monkeypatch):
-    # Advisor (a): the highest-priority independence check. The durable ledger must persist ONLY hops,
+    # The highest-priority independence check. The durable ledger must persist ONLY hops,
     # never footholds — otherwise a stale replayed foothold could corroborate a stale hop (the original
     # bug, back at the persistence layer). Corroboration draws on self._engagement_footholds, which is
     # set ONLY from live reconcile_access; this proves it is never written to / read from disk.
@@ -167,14 +167,14 @@ def test_durable_to_run_upgrade_on_reachieve():
 
 
 def test_ttl_keeps_hop_with_missing_timestamp():
-    # Advisor (c2): unparseable/legacy timestamp must fail-open to KEEP (drop is safe but a throw breaks load).
+    # Unparseable/legacy timestamp must fail-open to KEEP (drop is safe but a throw breaks load).
     hops = es.hops_from_dicts([{"technique": "gpo-abuse", "target": "x", "status": "achieved", "timestamp": ""}])
     kept, dropped = es.filter_hops_by_ttl(hops, "2026-06-07T00:00:00+00:00", 24)
     assert dropped == 0 and len(kept) == 1
 
 
 def test_ttl_naive_timestamp_treated_as_utc_no_crash():
-    # Advisor (c1): a naive (tz-less) timestamp must not crash the tz-aware comparison; treat as UTC.
+    # A naive (tz-less) timestamp must not crash the tz-aware comparison; treat as UTC.
     old = es.hops_from_dicts([{"technique": "gpo-abuse", "target": "x", "status": "achieved",
                                "timestamp": "2026-06-01T00:00:00"}])
     kept, dropped = es.filter_hops_by_ttl(old, "2026-06-07T00:00:00+00:00", 24)

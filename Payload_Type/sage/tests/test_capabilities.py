@@ -4472,8 +4472,8 @@ def test_adcs_certificate_auth_probe_requires_service_proof():
 
 def test_adcs_certificate_auth_probe_rejects_schannel_ldap_self_read_as_control():
     """A Schannel bind that only authenticates and reads the account's own group membership is
-    authentication, not usable domain control. It must NOT close the da: effect (RCA 2026-08-01:
-    a bind-only self-read certified da:essos.local with no usable credential)."""
+    authentication, not usable domain control. It must NOT close the da: effect (a
+    bind-only self-read once certified da:essos.local with no usable credential)."""
     output = "\n".join([
         "SAGE_CERT_AUTH_PROOF_administrator_lab_local_13",
         "CERT_AUTH_METHOD=schannel-ldap",

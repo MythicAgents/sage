@@ -1,4 +1,4 @@
-"""D10 + D12: the approval card is the operator's decision instrument, and the engagement
+"""The approval card is the operator's decision instrument, and the engagement
 ledger surfaces (reconciled) at every turn end.
 
 Fail-before where the behavior replaces a designed one:
@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from sage_chat import hitl as hitl_mod  # noqa: E402
 
 
-# ── D10: the card prompt teaches capability-specific Reject semantics ────────────────
+# ── The card prompt teaches capability-specific Reject semantics ─────────────────────
 
 
 def test_capability_card_prompt_teaches_effect_refusal():
@@ -47,11 +47,11 @@ def test_raw_task_card_prompt_still_teaches_the_three_affordances():
     assert "Accept approves" in request["prompt"]
     assert "Reject denies without any reply" in request["prompt"]
     assert "Respond denies the action" in request["prompt"]
-    # The effect-refusal teaching is capability-specific; raw cards keep D11's wording.
+    # The effect-refusal teaching is capability-specific; raw cards keep their existing wording.
     assert "bundled effect" not in request["prompt"]
 
 
-# ── D10: the decision-context seam on the emitter ────────────────────────────────────
+# ── The decision-context seam on the emitter ─────────────────────────────────────────
 
 
 class _FakeChat:
@@ -88,7 +88,7 @@ def test_make_card_emitter_appends_decision_context():
     assert chat.kwargs is not None
     assert "Planned inner tasks (2)" in chat.kwargs["description"]
     assert "gpo-wait" in chat.kwargs["description"]
-    # D10/D15: the enrichment text rides INSIDE the approval context, so echo validation
+    # The enrichment text rides INSIDE the approval context, so echo validation
     # (approval_response_matches) rebuilds the same description without any caller-side
     # lookup threading.
     assert chat.kwargs["data"]["sage_approval_context"]["decision_context"].startswith(
@@ -148,7 +148,7 @@ def test_make_card_emitter_without_lookup_keeps_plain_description():
     assert "Approve: issue_task" == chat.kwargs["title"]
 
 
-# ── D10: the model-side plan render ──────────────────────────────────────────────────
+# ── The model-side plan render ───────────────────────────────────────────────────────
 
 
 def _bare_model(monkeypatch: pytest.MonkeyPatch, mythic_client):
@@ -232,7 +232,7 @@ def test_issue_task_card_unknown_command_renders_nothing():
     assert model._hitl_decision_context([{"name": "issue_task_and_waitfor_task_output", "args": args}]) == ""
 
 
-# ── D12: proposals-JSON reports keep their machine-parseable format ─────────────────
+# ── Proposals-JSON reports keep their machine-parseable format ──────────────────────
 
 
 def test_closing_content_guard_classifies_proposals_json():
@@ -248,7 +248,7 @@ def test_closing_content_guard_classifies_proposals_json():
     assert not model_mod._closing_content_is_proposals_json("{not json")
 
 
-# ── D10: a bare capability reject teaches the effect-refusal policy to the model ─────
+# ── A bare capability reject teaches the effect-refusal policy to the model ──────────
 
 
 def test_capability_rejection_message_names_effect_policy():
@@ -271,7 +271,7 @@ def test_raw_task_rejection_keeps_generic_message():
     assert "[DENIED by operator] issue_task was not executed." in message
 
 
-# ── D12: the reconciled ledger surfaces at turn ends, changed-only ───────────────────
+# ── The reconciled ledger surfaces at turn ends, changed-only ────────────────────────
 
 
 class _FakeMythicClient:

@@ -383,7 +383,7 @@ def parse_bloodhound_url(value: str) -> dict[str, str]:
         if present:
             # The offending part is NAMED but the value is never echoed. A URL can carry a password
             # in its userinfo or a token in its query string, and this message goes to the log and
-            # the chat surface — the two places this ISA is deliberately putting more detail. A
+            # the chat surface — the two places that deliberately carry more detail. A
             # rejection that leaks the secret it rejected is worse than the misconfiguration.
             raise BloodHoundURLError(
                 f"{BLOODHOUND_URL_KEY} must be scheme://host:port only, but it carries {label}. "
@@ -646,7 +646,7 @@ async def ensure_bloodhound_connected(
     resolvable = resolvable_credential_keys(directory, env)
     missing = [k for k in BLOODHOUND_REQUIRED_CREDENTIAL_KEYS if k not in resolvable]
 
-    # F2: a knowably-doomed attempt is not made. The MCP server refuses to start without these three
+    # A knowably-doomed attempt is not made. The MCP server refuses to start without these three
     # and exits during startup, which Sage can only report as `McpError: Connection closed`. Spawning
     # `uv run main.py` to rediscover a fact already visible here costs a subprocess, a 30s stdio
     # timeout on the turn, and two tracebacks in the log — per request, forever, because the missing
@@ -666,7 +666,7 @@ async def ensure_bloodhound_connected(
             f"would exit during startup.\n\n{credential_diagnostic(env)}{lost}"
         )
 
-    # F3: an unchanged credential set that already failed is not retried. Keyed on the exact inputs,
+    # An unchanged credential set that already failed is not retried. Keyed on the exact inputs,
     # so correcting a token invalidates it immediately; a successful connect clears it outright.
     if not force and _failed_credential_signature == signature:
         return False, (
@@ -682,7 +682,7 @@ async def ensure_bloodhound_connected(
         return False, f"BloodHound MCP connect raised: {e}\n\n{credential_diagnostic(env)}{lost}"
     if success:
         # The handshake succeeded, which says the subprocess started. It does NOT say BloodHound
-        # answered — so the claim is withheld until one real read proves it (ISC-27).
+        # answered — so the claim is withheld until one real read proves it.
         reachable, probe_detail = await probe_bloodhound_reachable()
         if not reachable:
             _failed_credential_signature = signature

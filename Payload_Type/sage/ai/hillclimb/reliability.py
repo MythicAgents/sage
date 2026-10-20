@@ -16,8 +16,8 @@ It also test-retests the VERIFIER itself: `label_agreement` per milestone = how 
 repeats agreed on that milestone's boolean. < 1.0 means the gauge (not just the agent) is
 non-deterministic on that milestone — a different, more alarming kind of noise.
 
-Refuses to mix `verifier_hash`es: comparing across gauge versions is apples-to-oranges (ISC-9).
-Reliability records append to a gitignored results dir (ISC-15).
+Refuses to mix `verifier_hash`es: comparing across gauge versions is apples-to-oranges.
+Reliability records append to a gitignored results dir.
 """
 from __future__ import annotations
 
@@ -93,8 +93,8 @@ class ReliabilityReport:
     capability_stdev: float
     capability_min: float
     capability_max: float
-    # The threshold a later (candidate - best) capability difference must EXCEED to be real (ISC-14).
-    # Heuristic: mde_sigma * stdev. Phase 1's acceptor refines this with bootstrap CIs over paired seeds.
+    # The threshold a later (candidate - best) capability difference must EXCEED to be real.
+    # Heuristic: mde_sigma * stdev. Bootstrap CIs over paired seeds would refine this.
     min_detectable_effect: float
     # Per-milestone test-retest agreement over the repeats; 1.0 = perfectly stable, 0.5 = coin-flip.
     label_agreement: dict[str, float] = field(default_factory=dict)
@@ -171,7 +171,7 @@ def write_reliability_record(
     *,
     results_dir: str | os.PathLike | None = None,
 ) -> str:
-    """Append the report as a JSONL line keyed by verifier_hash (ISC-15). Returns the path."""
+    """Append the report as a JSONL line keyed by verifier_hash. Returns the path."""
     directory = Path(results_dir) if results_dir is not None else default_results_dir()
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "reliability.jsonl"

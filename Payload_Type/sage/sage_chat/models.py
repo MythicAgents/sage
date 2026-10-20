@@ -2,7 +2,7 @@
 
 Mirrors the legacy ``ChatArguments`` (``container/agent_functions/chat.py``) as typed,
 operator-facing chat config: provider/model/mode/max_steps/system_prompt move from CLI args to
-UI fields (PRD Section 9). A single ``Sage`` model carries a ``mode`` Choice
+UI fields. A single ``Sage`` model carries a ``mode`` Choice
 (supervised/auto) rather than shipping two near-identical models.
 """
 
@@ -23,10 +23,9 @@ from .slash import SAGE_SLASH_COMMANDS, WATCHER_SLASH_COMMANDS
 # The Watcher role has its own explicit inventory below; this alias must never become a union.
 SLASH_COMMANDS = SAGE_SLASH_COMMANDS
 
-# Declarative: the channel bot-token scopes Sage's action tools need (PRD Section 8A P1 / 14k).
-# In Phase 1 tools are unauthenticated (fork [F1]) so nothing enforces these yet; Phase 2 adds the
-# `whoami` preflight that disables guarded tools whose scope isn't granted. `chat-ai.write` is the
-# one hard requirement even for MVP — it's needed to post responses (Section 5).
+# Declarative: the channel bot-token scopes Sage's action tools need. The `whoami` scope
+# preflight disables guarded tools whose scope isn't granted. `chat-ai.write` is the one hard
+# requirement — it's needed to post responses.
 _CHANNEL_TOKEN_SCOPES = [
     "chat-ai.write",
     "callback.write",

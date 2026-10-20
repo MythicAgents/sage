@@ -1,4 +1,4 @@
-"""Request-bound Mythic task-result provenance (ISC-71)."""
+"""Request-bound Mythic task-result provenance."""
 
 from __future__ import annotations
 

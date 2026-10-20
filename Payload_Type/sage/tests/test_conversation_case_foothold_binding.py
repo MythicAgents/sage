@@ -1,9 +1,9 @@
 """The frozen corpus must not name a range-specific callback ID.
 
-Case text is supposed to be immutable, but the corpus outlived four rebindings —
-``callback 7 -> 1 -> 3 -> 4``. Each was an edit to frozen text forced by the environment moving:
-a Ludus rollback or a foothold rebuild silently invalidated the case. ISC-49R S4-01 was launched
-against a callback that had been dead for hours, and the resulting livelock was initially
+Case text is supposed to be immutable, but the corpus outlived four callback-ID rebindings. Each
+was an edit to frozen text forced by the environment moving: a Ludus rollback or a foothold rebuild
+silently invalidated the case. One canary was launched against a callback that had been dead for
+hours, and the resulting livelock was initially
 misdiagnosed as a kernel defect.
 
 The corpus now carries a symbol and the runner binds it at freeze time. These tests keep it that

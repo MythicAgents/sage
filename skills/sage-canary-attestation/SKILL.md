@@ -17,7 +17,7 @@ property being asserted. Do not add an import of driver or product code to it.
 
 ## Governing criteria
 
-the ISC49R native-canary attestation criteria 49R-07 through 49R-10, 49R-16 through
+The 49R native-canary attestation criteria 49R-07 through 49R-10, 49R-16 through
 49R-18, and 49R-21.
 
 ## Credential
@@ -111,7 +111,7 @@ Ludus range egress deny-rule.
   `certs/combined-bundle.pem` and setting `SSL_CERT_FILE` at runtime — so the live Sage process is fine
   and **every script invoked outside `main.py` is not**. Prefix such runs with
   `SSL_CERT_FILE=Payload_Type/sage/certs/combined-bundle.pem` to match the product's own trust store.
-  Confirmed 2026-07-26: this failed the ISC-49R five-trial gate and looked exactly like an endpoint
+  In practice this failed the five-trial canary gate and looked exactly like an endpoint
   outage. Note `/proc/<pid>/environ` will **not** show the variable, because it is set after the process
   environment is captured — do not read its absence there as proof the process lacks it.
 - **A control-plane read is not an "effect" — never assert 49R-17 against one.** The invariant governs
@@ -127,10 +127,10 @@ Ludus range egress deny-rule.
   `mythic-task:<callback_display_id>:<task_display_id>` (built at `mythic_tools.py:4860`); model-tool calls
   carry `tooluse_…` and MCP calls carry `mcp:<server>:<tool>:<n>`. Checking for `metadata.task_id` finds
   nothing, so the first task-producing canary would report **"Mythic effect with no kernel allow — bypass
-  signature"** against a kernel that mediated correctly. Caught 2026-07-27 before the session-4 freeze; it
-  would have been a false high-severity alarm on the single most important claim in the ISC.
+  signature"** against a kernel that mediated correctly. That would have been a false high-severity alarm
+  on the single most important claim in the attestation criteria.
 - **A task-issuing call with no boundary execution is a refusal, not a read.** Bucketing it as a read hides
-  "the agent tried and was stopped", which is how the 2026-07-26 dead-callback run was misdiagnosed.
+  "the agent tried and was stopped", which is how a dead-callback run was once misdiagnosed.
 - **Bound the effect window above as well as below.** `--since-task-id` alone leaves the window open-ended,
   so a report re-run after the operation moved on reads later unrelated tasks as the canary's effects.
   Session 3's C01 replayed as a false FAIL for exactly this reason. Bound it by the request's

@@ -6,13 +6,13 @@ Composes the three measurement sources into one ScoreCard:
     substring `score` (the gameable proxy).
   * C1b (process_state.ProcessSignals) — tradecraft diagnostics + gauge health.
 
-Design points (Plans/SAGE_EVAL_GAUGE_PHASE0_ISA.md):
-  * Capability comes from C1 ground truth, NEVER the substring eval (ISC-7).
+Design points:
+  * Capability comes from the C1 ground truth, NEVER the substring eval.
   * `metric_capability_gap = |substring_score - capability|` is first-class — the
-    Goodhart alarm: when the cheap eval and ground truth disagree, this is loud (ISC-8).
-  * `verifier_hash` versions the gauge; ScoreCards are only comparable within one hash (ISC-9).
+    Goodhart alarm: when the cheap eval and ground truth disagree, this is loud.
+  * `verifier_hash` versions the gauge; ScoreCards are only comparable within one hash.
   * The scalar reduction (`to_scalar`) is DEFINED and documented but NOT wired to any
-    acceptance loop — no optimizer exists in Phase 0 (ISC-10).
+    acceptance loop — no optimizer exists in Phase 0.
   * The productive-action ratio (re-homed from C1b) = verified milestones ÷ harness
     tool-call count. It is a proxy: there is no per-action milestone attribution yet
     (a documented gap), so read it as "milestones won per tool action", not literal
@@ -179,7 +179,7 @@ class ScoreCard:
     # discriminating signal once capability saturates: reach-the-objective-and-stop (status "stopped") beats
     # reach-the-objective-and-loop-to-timeout, and stopping BEFORE the objective earns nothing (no under-reach
     # reward). The ground-truth half is Goodhart-safe (probe-derived milestone, never the agent's self-report).
-    # LIMITATION (Forge audit 2026-06-20): the "clean status" half is NOT yet recognition-gated — on the harness
+    # LIMITATION: the "clean status" half is NOT yet recognition-gated — on the harness
     # path a normal solve ends with Mythic's default "success"/"stopped" whether Sage RECOGNIZED the objective
     # or merely terminated (step-limit, wandered-then-ended). It currently discriminates "finished before the
     # wall-clock" vs "timeout", which catches the present over-reach bug but is NOT safe to OPTIMIZE against until
@@ -1156,7 +1156,7 @@ def to_scalar(card: ScoreCard, *, opsec_penalty: float = 0.0, require_productive
     term — so "do nothing" cannot win on low detection because it fails the gate.
 
     DEFINED for completeness and to pin the reduction policy. It is NOT wired to any
-    acceptance/climbing loop in Phase 0 — no optimizer exists yet (ISC-10). When the
+    acceptance/climbing loop in Phase 0 — no optimizer exists yet. When the
     loop is built, it consumes this; capability (ground truth) remains the sole basis,
     tradecraft signals stay diagnostic.
     """

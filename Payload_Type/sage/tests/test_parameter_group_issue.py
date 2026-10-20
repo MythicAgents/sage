@@ -109,7 +109,7 @@ def _issue(mt, command, parameters, schema):
     return seen
 
 
-# --- ISC-1.1 / ISC-1.5 -------------------------------------------------------------------------
+# --- a non-Default group is declared on the create_task mutation ------------------------------
 
 
 def test_parameter_group_declared_for_non_default_group():
@@ -137,7 +137,7 @@ def test_posts_upstream_create_task_mutation():
     assert json.loads(variables["params"])["Credential"] == "@cred:12"
 
 
-# --- ISC-1.2 / ISC-1.3 / ISC-1.6: the untouched path stays untouched ---------------------------
+# --- the untouched path stays untouched --------------------------------------------------------
 
 
 def test_default_group_uses_legacy_issue_path():
@@ -232,7 +232,7 @@ def test_reference_without_a_resolvable_group_is_logged_not_silent(caplog):
         "a reference that cannot be scoped must not fail silently"
 
 
-# --- ISC-3: the rejection predicate ------------------------------------------------------------
+# --- the rejection predicate -------------------------------------------------------------------
 
 
 def test_credential_rejection_matches_real_mythic_text():

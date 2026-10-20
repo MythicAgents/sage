@@ -1,4 +1,4 @@
-"""The shared Mythic command-parameter-schema resolver (ISC-1, ISC-7.2, ISC-9.2).
+"""The shared Mythic command-parameter-schema resolver.
 
 Hermetic: upstream is monkeypatched, no Mythic required. Async tests drive explicit event loops
 because the suite deliberately does not configure pytest-asyncio.
@@ -82,7 +82,7 @@ def upstream(monkeypatch):
 
 
 def test_groups_expose_example_and_parameters(resolver, upstream):
-    """ISC-1.1 — the grouped shape is the whole point; a flat list would defeat the change."""
+    """The grouped shape is the whole point; a flat list would defeat the change."""
     upstream["state"]["result"] = _grouped(AES128=[_param("domain")], Kerberos=[_param("ticket")])
 
     result = asyncio.run(resolver.get(_Client(), PAYLOAD, "pth"))
@@ -93,7 +93,7 @@ def test_groups_expose_example_and_parameters(resolver, upstream):
 
 
 def test_unknown_command_returns_none_without_raising(resolver, upstream, monkeypatch):
-    """ISC-1.2 — upstream raises a bare Exception naming the command; callers must see None.
+    """Upstream raises a bare Exception naming the command; callers must see None.
 
     Exercises the REAL fallback rather than stubbing it out. An earlier version of this test
     monkeypatched `_fetch_parameters_only` to raise, which made it agree with the assumption it was
@@ -168,13 +168,13 @@ def test_fallback_rebuilds_groups_from_parameter_group_name(resolver, upstream, 
     ],
 )
 def test_missing_inputs_return_none(resolver, upstream, client, payload_type, command):
-    """ISC-1.3 — covered as a class: any absent input is 'schema unavailable', never an exception."""
+    """Covered as a class: any absent input is 'schema unavailable', never an exception."""
     assert asyncio.run(resolver.get(client, payload_type, command)) is None
     assert upstream["calls"] == [], "an unresolvable request must not reach Mythic at all"
 
 
 def test_zero_parameter_command_keeps_its_empty_group(resolver, upstream):
-    """ISC-1.4 — an empty parameter list is a command's single valid tasking form, not an absence.
+    """An empty parameter list is a command's single valid tasking form, not an absence.
 
     Shape taken from live Apollo `exit`, not from upstream's docstring, which still describes rc6.
     """
@@ -186,7 +186,7 @@ def test_zero_parameter_command_keeps_its_empty_group(resolver, upstream):
 
 
 def test_results_are_cached_per_payload_type_and_command(resolver, upstream):
-    """ISC-1.5 — `_fetch_live_command_surface` walks every loaded command; without a cache that is
+    """`_fetch_live_command_surface` walks every loaded command; without a cache that is
     dozens of identical round trips."""
     client = _Client()
     asyncio.run(resolver.get(client, PAYLOAD, "pth"))
@@ -207,7 +207,7 @@ def test_results_are_cached_per_payload_type_and_command(resolver, upstream):
 
 
 def test_only_selected_fields_reach_the_model(resolver, upstream):
-    """ISC-7.2 — the raw 19-field payload peaks at 11,741 chars against a 4,000-char trigger."""
+    """The raw 19-field payload peaks at 11,741 chars against a 4,000-char trigger."""
     upstream["state"]["result"] = _grouped(Default=[_param("domain")])
 
     result = asyncio.run(resolver.get(_Client(), PAYLOAD, "pth"))
@@ -219,7 +219,7 @@ def test_only_selected_fields_reach_the_model(resolver, upstream):
 
 
 def test_llm_help_survives_field_selection(resolver, upstream):
-    """ISC-3 depends on this: LLM_Help is the reference-format text the whole change exists to
+    """Reference-format exposure depends on this: LLM_Help is the reference-format text the whole change exists to
     surface, so a field allowlist that dropped it would defeat the purpose silently."""
     upstream["state"]["result"] = _grouped(
         Default=[_param("credential", "CredentialJson", LLM_Help="expects @cred:<id>")]
@@ -243,7 +243,7 @@ def test_empty_values_are_dropped(resolver, upstream):
 
 
 def test_example_can_be_suppressed(resolver, upstream):
-    """ISC-9.3's lever: one Apollo command (`sc`, five groups, 1,772 chars of prose) breaches the
+    """The size lever: one Apollo command (`sc`, five groups, 1,772 chars of prose) breaches the
     ceiling only because of example text."""
     result = asyncio.run(resolver.get(_Client(), PAYLOAD, "pth", include_example=False))
 
@@ -262,7 +262,7 @@ def test_example_can_be_suppressed(resolver, upstream):
 def test_renderer_exception_degrades_to_parameters_without_example(
     resolver, upstream, monkeypatch, renderer_exception
 ):
-    """ISC-9.2 — a universal over the failure class, not an example.
+    """A universal over the failure class, not an example.
 
     The renderer has shipped a call-killing exception in every release that contained it, a
     different type each time. An example-shaped assertion would have passed at rc8 while the code

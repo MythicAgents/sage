@@ -1,6 +1,6 @@
 """The operator learns BloodHound is unavailable in the chat, once, without the turn breaking.
 
-The diagnostic this ISA raised to WARNING lands in the container log, which an operator has to go
+The WARNING-level degraded-BloodHound diagnostic lands in the container log, which an operator has to go
 looking for. This notice puts it where they already are, once per session: they saw it on the
 first degraded turn, and Mythic already renders a live BloodHound chip at the top of the chat, so
 repeating it per turn would be a third copy of a fact that is on screen.
@@ -77,7 +77,7 @@ def test_a_degraded_session_is_told_in_the_chat(service, unavailable):
 
 
 def test_it_is_said_once_per_session_not_once_per_turn(service, unavailable):
-    """D5. Four turns in the same session produce one notice."""
+    """Four turns in the same session produce one notice."""
     session = _Session()
     for _ in range(4):
         _notify(service, session)

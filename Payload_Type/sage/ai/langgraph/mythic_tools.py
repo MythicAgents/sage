@@ -1283,10 +1283,10 @@ GUARDED_TOOLS: set[str] = {
 _CHAT_TOKEN_MINT_TIMEOUT = 15
 
 
-# Chat bot-token scope required per guarded tool (Section 8A P1). A chat channel's bot token is
+# Chat bot-token scope required per guarded tool. A chat channel's bot token is
 # operator-scoped at setup, so a guarded tool whose scope isn't granted is preflight-disabled (fail cheap)
 # rather than erroring mid-run. All scope strings verified against auth-adjustments
-# `authentication/mythicjwt/scopes.go` (incl. `credential.write` — PRD §14k resolved).
+# `authentication/mythicjwt/scopes.go` (incl. `credential.write`).
 SCOPE_REQUIREMENTS: dict[str, str] = {
     "issue_task_and_waitfor_task_output": "callback.write",
     "upload_file_by_file_uuid": "callback.write",
@@ -1820,9 +1820,9 @@ class MythicTools:
         self._turn_authority = None
         self._turn_authority_sink_reservation = ""
         # Set when a task's grace period expires and the turn deferred with a receipt. While it is
-        # set, no further target-facing task issues in this turn (ISC-4). It is state about THIS
+        # set, no further target-facing task issues in this turn. It is state about THIS
         # turn's tasking, not a handle on the deferred task: nothing reads it to adjudicate a late
-        # result, and nothing may (ISC-6).
+        # result, and nothing may.
         self._deferred_task_receipt: dict[str, Any] | None = None
         self._request_contract = None
         # Native chat makes this explicit through ``set_request_contract``/``require_request_contract``.
@@ -1830,20 +1830,20 @@ class MythicTools:
         self._request_contract_required = False
         self._active_approval_claim: dict[str, Any] | None = None
         self._private_collection_transaction: _PrivateCollectionTransaction | None = None
-        # Guarded tools disabled by scope preflight (Section 8A P1). Populated by apply_scope_gating()
+        # Guarded tools disabled by scope preflight. Populated by apply_scope_gating()
         # after login when the channel bot token's granted scopes are known; empty otherwise (no gating).
         self.disabled_tools: set[str] = set()
         # Circuit breaker for repeated identical task failures. Keyed by
         # (command, callback_display_id, normalized_params); incremented on each failed
         # issue_task_and_waitfor_task_output, reset on success. Prevents the agent from
         # burning the recursion budget by re-issuing a failing command with cosmetic
-        # parameter permutations — the cause of the 2.47M-token context explosion on
-        # 2026-06-01 (rev2self issued 7x, whoami 4x, all failing).
+        # parameter permutations — the cause of a 2.47M-token context explosion in a live
+        # run (rev2self issued 7x, whoami 4x, all failing).
         self._task_failure_counts: dict[tuple, int] = {}
         # Rotation-proof shape cap: the param-keyed breaker above misses a command
-        # that keeps failing with a DIFFERENT parameter variant each time — the channel-4
+        # that keeps failing with a DIFFERENT parameter variant each time — a live
         # make_token+ldap_query rotation (every variant is a fresh key, so no count ever
-        # reached 2, and the D3 repeat-failure flag never saw a repeat). This shape counter
+        # reached 2, and the repeat-failure flag never saw a repeat). This shape counter
         # counts failed attempts on the coarse (command, callback) key; reaching the limit
         # refuses further variants and success on that pair clears it.
         self._task_failure_shape_counts: dict[tuple, int] = {}
@@ -1887,7 +1887,7 @@ class MythicTools:
         # remains the only execution boundary; this reports real callback tasks to the chat surface.
         self._capability_command_observer = None
         self._capability_command_trace_seq = 0
-        # Phase 17/18 evaluation-only authorization mediation. The runtime wrapper
+        # Evaluation-only authorization mediation. The runtime wrapper
         # is lazy-loaded from private env/file context and remains disabled for
         # ordinary Sage sessions.
         self._evaluation_authorization_runtime_state = None
@@ -1989,7 +1989,7 @@ class MythicTools:
         self._domain_sid_cache: dict[str, str] = {}
         # Idempotency for collection ingest: sha256(content) -> bloodhound job id of a VERIFIED ingest. Prevents
         # re-uploading + re-ingesting the identical SharpHound zip (observed 4x in one window) even when
-        # supervisor control loops. Per-process; a lab reset + Sage restart clears it. (control-state P0)
+        # supervisor control loops. Per-process; a lab reset + Sage restart clears it.
         self._ingested_collection_hashes: dict[str, str] = {}
         self._last_bloodhound_ingest_proof_envelope: dict = {}
         # The durable-ledger key. Defaults to the explicit SAGE_ENGAGEMENT_ID (env/test override); when
@@ -2429,12 +2429,12 @@ class MythicTools:
                 # string (`"whoami"`). Both denote the same effect, so canonicalize to the
                 # product's existing shell form on BOTH sides of the coverage comparison. Without
                 # this an approved shell action can never execute: coverage denies on the shape
-                # difference, the agent re-proposes, and the request livelocks (ISC-49R S4-01,
-                # channel 40 / request 55 — three identical approvals, zero Mythic tasks).
+                # difference, the agent re-proposes, and the request livelocks (a live run
+                # produced three identical approvals and zero Mythic tasks).
                 shell_text = _shell_parameter_text(values.get("parameters"))
                 if shell_text:
                     values["parameters"] = shell_text
-            # ISC-67 — resolver parity, applied identically to BOTH sides of the coverage
+            # Resolver parity, applied identically to BOTH sides of the coverage
             # comparison, exactly like the shell case above and for the same reason: an approved
             # action that can never execute livelocks the request.
             #
@@ -2448,7 +2448,7 @@ class MythicTools:
             # produced, for the same command and callback, recorded in this turn. It is a lookup of
             # one recorded pair, not a rule: a proposal that differs from that recorded input in any
             # way does not match and the denial stands. It therefore cannot let a material argument
-            # change past the gate, which is the failure mode that kept ISC-67 held.
+            # change past the gate.
             _binding = getattr(self, "_last_argres_binding", None)
             prepared_action = (
                 isinstance(values.get("visibility_context"), dict)
@@ -2728,7 +2728,7 @@ class MythicTools:
                 recheck=recheck,
             ):
                 return ""
-        # ISC-49R S4-01: an approved action that never executes livelocks the request, and the
+        # An approved action that never executes livelocks the request, and the
         # blocker string alone cannot distinguish "contract forbids this root" from "arguments
         # differ". Log-only; the return value below is unchanged.
         try:
@@ -2812,7 +2812,7 @@ class MythicTools:
                     "supervised request lacks an exact active approval claim"
                 )
             if tool_name:
-                # ISC-66: record approval-coverage denials the way authority (:4594) and liveness
+                # Record approval-coverage denials the way authority (:4594) and liveness
                 # (:4631) already do. Without this `_last_effect_denial` stays unset, so
                 # `Model._handle_reproposal_after_denial` — the loop-breaker built for exactly this
                 # — is structurally blind to the whole approval-coverage denial class. Without this,
@@ -3637,11 +3637,11 @@ class MythicTools:
         return None
 
     async def login(self):
-        """Create the Mythic API client connection asynchronously (Section 8A P0).
+        """Create the Mythic API client connection asynchronously.
 
         Two auth paths, selected by which context was supplied:
         - **Chat path** (``channel_id`` set): mint a channel-scoped bot token via ``ChatAPITokenProvider``
-          (keyed on ``ChatChannelID``), not the task's AgentTaskID. This is the P0 rewrite — all 28 tools
+          (keyed on ``ChatChannelID``), not the task's AgentTaskID. All 28 tools
           authenticate through this one chokepoint, so re-sourcing it here fixes the whole tool surface.
         - **Task path** (``agent_task_id`` set, no channel): unchanged — mint from the AgentTaskID.
 
@@ -3656,8 +3656,7 @@ class MythicTools:
             return
         api_key = None
         if self.channel_id is not None:
-            # Chat bot-token path — the primary consumer of ChatAPITokenProvider (corrects the earlier
-            # PRD claim that sage's tools didn't need it; they are its primary consumer).
+            # Chat bot-token path — Sage's tools are the primary consumer of ChatAPITokenProvider.
             # Time-box the mint: the underlying SendMythicRPCAPITokenCreate connects to RabbitMQ with an
             # UNBOUNDED retry loop, so if Mythic is unreachable/misconfigured this would hang forever
             # instead of degrading. Bound it and fail closed on timeout (fixes headless/eval + a
@@ -3696,7 +3695,7 @@ class MythicTools:
         self.client = await mythic.login(apitoken=api_key, server_ip=ip, server_port=port, ssl=ssl)
 
     async def whoami_scopes(self) -> "set[str] | None":
-        """Introspect the token's granted scopes for preflight tool-gating (Section 8A P1).
+        """Introspect the token's granted scopes for preflight tool-gating.
 
         Queries the `whoami` Hasura action, which on the auth-adjustments branch exposes
         `effective_scopes` (the server-side `*`/wildcard/includes-expanded set) — verified against
@@ -3749,7 +3748,7 @@ class MythicTools:
         disabled = getattr(self, "disabled_tools", set())
         for method_name in method_names:
             if method_name in disabled:
-                # Scope preflight (Section 8A P1): the bot token lacks the scope this tool needs. Skip it
+                # Scope preflight: the bot token lacks the scope this tool needs. Skip it
                 # so the LLM never sees a tool it can't use — fail cheap, not mid-run.
                 logger.debug(f"Scope-gated: omitting `{method_name}` (required scope not granted)")
                 continue
@@ -4334,7 +4333,7 @@ class MythicTools:
         return prepared
 
     def _tool_note_advisory(self, command: Any, parameters: Any) -> str:
-        """Per-binary knowledge note for the binary this task invokes (D15).
+        """Per-binary knowledge note for the binary this task invokes.
 
         Notes live in `Payload_Type/sage/tool_notes/<basename>.md` — operator-maintained,
         public-committable knowledge about known-bad argument sequences, quirks, and
@@ -4372,7 +4371,7 @@ class MythicTools:
         return parts[-1] if parts else ""
 
     def _invoked_binary_basenames(self, command: Any, parameters: Any) -> list[str]:
-        """Candidate binary basenames the constructed task may invoke (D15 lookup keys).
+        """Candidate binary basenames the constructed task may invoke (tool-note lookup keys).
 
         Deliberately coarse: executable-shaped parameters, the first token of the freeform
         payload text (the `shell certutil …` shape, JSON-decoded when the parameters arrive
@@ -4535,7 +4534,7 @@ class MythicTools:
         Returns:
             str: JSON string containing all commands and their detailed information
         """
-        # ISC-2.5: parameterized. This was the last schema-path query built by substituting a
+        # Parameterized. This was the last schema-path query built by substituting a
         # model-influenced value into query text, where a malformed result is indistinguishable
         # from a payload type that genuinely has no commands.
         query = """
@@ -5297,7 +5296,7 @@ class MythicTools:
                     self._command_schema_cache[payload] = results
             except Exception:
                 pass
-            # ISC-2.6: the model sees parameters GROUPED, through the resolver's field selection, so
+            # The model sees parameters GROUPED, through the resolver's field selection, so
             # there is one definition of what reaches it. Deliberately no extra fetch — the upstream
             # call above already returned every command's rows, and routing 81 Apollo commands
             # through the per-command resolver would be 81 round trips to re-learn what one call
@@ -6116,7 +6115,7 @@ class MythicTools:
         waited_seconds: int,
         parameters_text: str = "",
     ) -> str:
-        """Record the deferral for this turn and return the operator-facing receipt (ISC-2).
+        """Record the deferral for this turn and return the operator-facing receipt.
 
         Shape matters as much as content. The old text opened with "Timed out" and read as a failure
         for a task that is queued and healthy, which is both wrong and actively misleading to the
@@ -6149,7 +6148,7 @@ class MythicTools:
         )
 
     def _deferred_task_issue_blocker(self, command: str, callback_display_id: int) -> str:
-        """ISC-4: after a deferral, no further target-facing task issues in this turn.
+        """After a deferral, no further target-facing task issues in this turn.
 
         Load-bearing rather than tidy. Blocking on the wait was the ONLY pre-issue cap in the general
         supervised path: the circuit breaker keys on a classified result and the loop guard on
@@ -6633,7 +6632,7 @@ class MythicTools:
                                 f"🛡️ ARGRES command={command} group={resolved.group} "
                                 f"params={sorted(parameters.keys())} notes={resolved.notes}"
                             )
-                            # ISC-67: record the EXACT input->output of this resolution so the
+                            # Record the EXACT input->output of this resolution so the
                             # approval gate can compare like with like. The gate runs microseconds
                             # after this line and is synchronous, so it cannot re-run the resolver
                             # itself (schema fetch is async). Without this the gate compares the
@@ -6822,11 +6821,11 @@ class MythicTools:
                     )
                     if contract_binding_blocker:
                         raise PermissionError(contract_binding_blocker)
-                    # ISC-65: an empty parameter blob is only safe for commands that take a raw command
+                    # An empty parameter blob is only safe for commands that take a raw command
                     # line. Apollo's parameterized commands parse with
                     # `if self.command_line[0] != "{": raise` and no length check, so "" is
-                    # `string index out of range` — Mythic task 23 (ticket_cache_list, 2026-07-28) died
-                    # exactly there while the operator's identical no-argument task 24 succeeded,
+                    # `string index out of range` — a live ticket_cache_list task died exactly there
+                    # while the operator's identical no-argument task succeeded,
                     # because the UI submits a dict and the agent then applies its own declared
                     # default_values. `{}` reproduces that. This is deliberately SCHEMA-AWARE: a first
                     # attempt at this rewrote every empty blob to `{}` and was reverted, because for a
@@ -6841,7 +6840,7 @@ class MythicTools:
                             logger.info(
                                 f"🧩 [empty-params] {command} on callback {callback_display_id} declares "
                                 f"{len(_schema)} parameter(s) — sending '{{}}' so the agent applies its "
-                                "own defaults instead of failing to parse an empty string (ISC-65)"
+                                "own defaults instead of failing to parse an empty string"
                             )
                             parameters = "{}"
                     if prepared_binding is not None:
@@ -6931,7 +6930,7 @@ class MythicTools:
                             "command": command,
                         })
                     self._last_issued_task_display_id = tdid
-                    # D3 repeat-failure flag: parameter rotation must not hide a repeat.
+                    # Repeat-failure flag: parameter rotation must not hide a repeat.
                     # A failed attempt of this (command, callback) shape already exists, so
                     # the delegation loop containment sees a re-run of a known failure even
                     # when the failure key itself is fresh.
@@ -6944,7 +6943,7 @@ class MythicTools:
                             self._task_failure_shape_key(command, callback_display_id), 0
                         ) >= 1
                     )
-                    # ISC-71: task creation is the lineage boundary. Record before waiting so a timeout,
+                    # Task creation is the lineage boundary. Record before waiting so a timeout,
                     # subscription failure, or failed command cannot make an accepted Mythic task look manual.
                     self._record_current_request_task(tdid)
                     self._commit_task_backed_transition(command, parameters, callback_display_id, tdid)
@@ -8724,7 +8723,7 @@ class MythicTools:
         """Inject one private eval authorization context for tests or an eval driver.
 
         This is intentionally not a model-facing tool.  Production sessions leave
-        the runtime disabled; Phase 17/18 drivers may inject a frozen manifest and
+        the runtime disabled; evaluation drivers may inject a frozen manifest and
         trusted callback-bound cell after their preflight completes.
         """
         if isinstance(value, evaluation_authorization_runtime.EvaluationAuthorizationRuntime):
@@ -14060,7 +14059,7 @@ class MythicTools:
             # Control == usable domain control (credential material or a privileged action), NOT a
             # Schannel bind + directory membership self-read and NOT a bare TGT marker. Mirrors
             # verify_adcs_certificate_auth and extract_adcs_certificate_auth_probe so no copy of this
-            # formula can certify a self-read as proven (RCA 2026-08-01).
+            # formula can certify a self-read as proven.
             control_signal = (
                 bool(merged.get("service_access_proven"))
                 or bool(merged.get("ntlm_hash_present"))
@@ -19029,7 +19028,7 @@ class MythicTools:
             }, sort_keys=True)
         # Idempotency at the EXECUTION boundary: if this EXACT collection (by content hash) was already ingested
         # and verified this engagement, do NOT re-upload/re-ingest — short-circuit with the prior job. Prevents
-        # the duplicate external work the supervisor loop otherwise triggers (the 4x-identical-zip case). P0.
+        # the duplicate external work the supervisor loop otherwise triggers (the 4x-identical-zip case).
         content_hash, prior_job = self._collection_already_ingested(file_content)
         collection_transaction_id = self._current_transaction_id() or f"bloodhound-ingest:{source_task_id}:{content_hash}"
         authorization_outcome = self._evaluation_authorize_bloodhound_ingest(
@@ -19430,7 +19429,7 @@ class MythicTools:
         }
 
     def _seed_command_schema_cache(self, payload_type: str, commands) -> None:
-        """ISC-2.4: reuse one surface fetch as the per-command schema for every loaded command.
+        """Reuse one surface fetch as the per-command schema for every loaded command.
 
         Both branches of `_fetch_live_command_surface` already return every command's parameters,
         so a later `_fetch_command_schema` for any of them is a round trip to re-learn what is
@@ -19479,7 +19478,7 @@ class MythicTools:
                 if isinstance(cached_surface, list):
                     return self._capability_text(cached_payload), cached_surface, ""
             if self.client is not None:
-                # ISC-2.4 / ISC-2.5: parameterized, not interpolated. This one was never injectable
+                # Parameterized, not interpolated. This one was never injectable
                 # — `int()` coerced the only substituted value — but it was the last f-string-built
                 # query in the schema path, and the failure mode being removed is a class rather
                 # than an injection: a malformed query returns nothing, which the caller cannot
@@ -19924,7 +19923,7 @@ class MythicTools:
     async def _fetch_command_schema(self, command, callback_display_id, *, force_refresh=False):
         """Resolve the parameter-group schema for `command` on the callback's payload type.
 
-        ISC-2.2: the fetch is delegated to the shared resolver, which removes the f-string-built
+        The fetch is delegated to the shared resolver, which removes the f-string-built
         GraphQL this used to carry — a malformed query there returned nothing, which the caller
         could not distinguish from a real empty answer, so validation silently failed open.
 
@@ -19973,7 +19972,7 @@ class MythicTools:
         except Exception:
             return None
 
-    #: ISC-4.3. `advisory` surfaces `verifier_regex` to the model and rejects nothing; `reject`
+    #: `advisory` surfaces `verifier_regex` to the model and rejects nothing; `reject`
     #: additionally refuses a mismatch. Advisory is the default, and an unrecognised value falls
     #: back to it rather than erroring, because a typo in an env var must not silently arm a gate
     #: that blocks live tasks.
@@ -19990,17 +19989,17 @@ class MythicTools:
     def _verifier_regex_rejection(
         self, command, parameters, supplied, selected_params, payload_type
     ) -> str | None:
-        """ISC-4.2: the rejection arm. Returns a correction string, or None to permit.
+        """The rejection arm. Returns a correction string, or None to permit.
 
         Off unless `SAGE_VERIFIER_REGEX_MODE=reject`. It is off by default deliberately: Mythic
         does **not** enforce this field on the task-creation path — the only implementation in the
         product is the React task dialog — so an armed Sage is *stricter* than Mythic rather than
-        aligned with it. Evidence: `.sage_history/2026/08/evidence/isc-5-verifier-regex-enforcement.md`.
+        aligned with it.
 
         Matching mirrors that one implementation exactly. The UI does
         `RegExp(verifier_regex).test(value)`, which is an UNANCHORED search, so this uses
         `re.search` rather than `re.fullmatch`. Anchoring would reject values Mythic's own UI
-        accepts, which is the failure ISC-4.5 exists to forbid.
+        accepts, which must not happen.
 
         Fails open on a malformed pattern. A regex an agent author typed wrong is not a reason to
         block an operator's task.
@@ -20062,7 +20061,7 @@ class MythicTools:
                 logger.info(f"🛡️ ARGVAL failed_open command={command} reason=no_schema")
                 return None
 
-            # ISC-2.3: consume the grouped structure from the shared resolver's policy instead of
+            # Consume the grouped structure from the shared resolver's policy instead of
             # re-deriving it here. Mythic already knows which parameters are mutually exclusive;
             # this function had its own copy of that partitioning, which is a second definition
             # able to drift from the one the model is shown. `drop_empty=False` keeps every key the
@@ -20814,7 +20813,7 @@ class MythicTools:
         a read-only rootfs + small tmpfs work dir, memory/pid caps, a non-root user, and a hard timeout.
         Use this for ad-hoc parsing/scripting that should NOT run in the Sage container or on the host.
 
-        # HITL: guarded  (code execution — supervised mode must gate this; Phase 2 reads this tag)
+        # HITL: guarded  (code execution — supervised mode must gate this)
 
         Args:
             code_or_command: The code/command to execute.

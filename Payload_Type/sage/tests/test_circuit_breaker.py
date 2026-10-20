@@ -183,10 +183,10 @@ def test_permuted_dcsync_retries_hit_the_circuit_breaker():
 
 
 # --- parameter rotation defeats the (command, callback, params) failure key ---
-# Live evidence (channel 4 morning session): make_token+ldap_query pairs with rotated
+# Live evidence: make_token+ldap_query pairs with rotated
 # credentials failed at least four times INSIDE one long request, and no breaker text
 # appeared anywhere. Every rotation is a fresh failure key, so the param-keyed circuit
-# breaker never accumulated, and the D3 delegation repeat-failure flag never saw a repeat.
+# breaker never accumulated, and the delegation repeat-failure flag never saw a repeat.
 
 _ROTATION_PARAMS = (
     {"user": "sql_svc", "ldap_filter": "(objectClass=*)"},
@@ -298,7 +298,7 @@ def test_fresh_request_clears_the_rotated_failure_shape_cap():
 
 
 def test_repeat_failure_flag_counts_rotated_parameter_failures():
-    """D3 delegate containment reads _last_issued_task_is_repeat_failure at the issue
+    """Delegate containment reads _last_issued_task_is_repeat_failure at the issue
     boundary. After one failed attempt of a (command, callback) shape, a rotated re-issue
     must still read as a repeat of a known failure, not fresh progress."""
     mt = _make_tools()

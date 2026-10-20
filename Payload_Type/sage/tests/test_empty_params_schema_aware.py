@@ -1,9 +1,9 @@
-"""ISC-65 — an empty parameter blob is only safe for raw-command-line commands.
+"""An empty parameter blob is only safe for raw-command-line commands.
 
-Mythic task 23 (`ticket_cache_list`, 2026-07-28) was issued by Sage with `params=''` and died with
+A live `ticket_cache_list` task was issued by Sage with `params=''` and died with
 `failed to parse arguments: string index out of range` — Apollo's parameterized commands parse via
 `if self.command_line[0] != "{": raise` with no length check. The operator's identical no-argument
-task 24 succeeded because the UI submits a dict and the agent then applies its own declared
+task succeeded because the UI submits a dict and the agent then applies its own declared
 `default_value`s.
 
 A first attempt rewrote EVERY empty blob to `{}` and was reverted: for a raw-command-line command
@@ -67,7 +67,7 @@ def test_schema_lookup_raising_never_breaks_the_issue_path():
 
 
 def test_non_empty_parameters_are_never_replaced_by_the_empty_object():
-    """The ISC-65 rewrite must fire ONLY on an empty blob.
+    """The empty-blob rewrite must fire ONLY on an empty blob.
 
     With a schema present the resolver legitimately enriches the operator's value with declared
     defaults (`getSystemTickets` arrives from `default_value`), so the assertion is that the

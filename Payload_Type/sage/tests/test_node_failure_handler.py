@@ -1,4 +1,4 @@
-"""Sage's per-node error handler (ISA 9B, ISC-35/ISC-36).
+"""Sage's per-node error handler.
 
 Before this handler existed, any exception out of a specialist unwound `graph.astream` and ended the
 run. `Model._handle_node_failure` turns a recoverable failure into a Supervisor handback instead.
@@ -192,7 +192,7 @@ def test_control_exception_tuple_covers_the_kill_switch():
 
 
 def test_failed_node_delegation_card_closes_as_error():
-    """D8/D13: a failed specialist's card must close as an error, not success-shaped.
+    """A failed specialist's card must close as an error, not success-shaped.
 
     The handler previously left the failed node's card open; the Supervisor's next invocation
     swept it closed with the default finished status (and its streamed text as content), so a

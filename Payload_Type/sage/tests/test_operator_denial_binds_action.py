@@ -9,8 +9,8 @@ Two mechanisms already existed and both missed:
 
 1. `TurnAuthority.denies_action_digest` is keyed on `approval_action_fingerprint`, which hashes the
    FULL canonical argument dict. The observed loop varied its arguments (`luid: ""` -> `"0"` ->
-   `"0x5b16c"`), so every re-proposal produced a different digest and matched nothing. ISC-69a already
-   had to learn this for the card guard; the denial path never got the same treatment.
+   `"0x5b16c"`), so every re-proposal produced a different digest and matched nothing. The card guard
+   had already learned this; the denial path never got the same treatment.
 2. That digest check is skipped entirely when a typed contract is installed — which is the supervised
    path, i.e. the only path where operator rejections happen at all.
 
@@ -102,7 +102,7 @@ def test_steer_does_not_bind_the_action():
 
     Operators routinely phrase a steer as conditional approval — "approved, but also do this on
     callback 2". Binding there would permanently block the action they just said yes to, which is a
-    worse failure than the loop ISC-76 exists to stop. Only a bare reject binds.
+    worse failure than the loop this binding exists to stop. Only a bare reject binds.
     """
     model = Model.__new__(Model)
     action = _action(command="ticket_cache_list", callback_display_id=1)

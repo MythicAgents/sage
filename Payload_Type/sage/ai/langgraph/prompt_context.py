@@ -1,5 +1,5 @@
 """
-prompt_context — runtime values injected into agent prompts (ROADMAP Phase 3, Layer 1).
+prompt_context — runtime values injected into agent prompts (Layer 1).
 
 This is the ONE place that defines every variable a prompt file may interpolate and how it is
 computed from the live Model. Each provider takes the Model instance and returns the string that
@@ -12,8 +12,8 @@ its ``{name}`` in the prompt body, and list it under that file's ``variables:`` 
 
 DEFERRED (Layer 2, post-demo): a pluggable system that auto-discovers operator-supplied provider
 functions from a drop-in location. That is arbitrary code execution inside the Sage container and
-needs a deliberate security model + context contract — see the
-Phase-3 ISA. For now the provider set is fixed and code-reviewed.
+needs a deliberate security model + context contract. For now the provider set is fixed and
+code-reviewed.
 """
 
 try:  # match model.py's logger so warnings surface in Sage logs

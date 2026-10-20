@@ -1,4 +1,4 @@
-"""ISC-56 — the agent's output is identified by message id, never by list position.
+"""The agent's output is identified by message id, never by list position.
 
 `_ainvoke` used to slice `updated_channel[initial_agent_input_length:]`, which is sound only if the
 returned list is (input + new). Identifying the agent's output by identity rather than by arithmetic

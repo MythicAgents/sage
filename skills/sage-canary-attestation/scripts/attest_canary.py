@@ -5,7 +5,7 @@ Reconstructs a canary run from Mythic's own records using a read-only Spectator 
 diffs those records against the frozen conversation-case expected trace. The driver's manifest is
 an optional third input that is checked, never used as the standard.
 
-Governing criteria: the ISC49R native-canary attestation criteria (maintainer-private).
+Governing criteria: the 49R native-canary attestation criteria.
   49R-07 independence · 49R-08/08a/08b write incapability · 49R-09 gold side is the frozen case
   49R-10 unattested disclosure · 49R-21 visibility precondition
 

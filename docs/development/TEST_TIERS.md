@@ -21,8 +21,8 @@ Those suites froze source hashes of an older product surface, so they could neve
 exclusion was therefore permanent, and the default command's name — "supported" — quietly meant "the parts we
 still expect to work."
 
-The portfolios are rejected evaluation evidence. `AGENTS.md` § Durable Artifact Retention names `.sage_history/`
-as the home for "accepted or rejected evaluation evidence," so they now live at:
+The portfolios are rejected evaluation evidence. `AGENTS.md` (Repository map and artifacts) names `.sage_history/`
+as the home for rejected and accepted evidence, so they now live at:
 
 ```
 .sage_history/evaluation/architecture-policy/rejected-successor-portfolios/

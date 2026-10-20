@@ -1,4 +1,4 @@
-"""Operator-configurable timeouts (ISA 9A, ISC-33/ISC-34).
+"""Operator-configurable timeouts.
 
 The defaults Sage shipped were lab numbers. A callback on a range answers in seconds, so the
 hardcoded 300s Mythic budget was never exercised; an agent sleeping for OPSEC reasons on a real
@@ -90,7 +90,7 @@ def test_short_sleep_never_lowers_the_operator_base():
 
 
 def test_long_sleep_no_longer_raises_the_budget():
-    """INVERTED 2026-08-12 by sage-task-deferral-receipt ISC-1, and the inversion IS the fix.
+    """INVERTED by the bounded task-deferral grace period, and the inversion IS the fix.
 
     This test used to assert `3600 * multiplier + 60`, and passed for as long as the defect existed:
     nothing bounded how far the derivation raised, so a four-hour sleep produced a ~12-hour wait that

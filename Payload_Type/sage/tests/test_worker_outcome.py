@@ -1,4 +1,4 @@
-"""Offline tests for the typed worker-outcome control contract (P0). No live range; pure decision logic.
+"""Offline tests for the typed worker-outcome control contract. No live range; pure decision logic.
 
 The load-bearing tests are these two:
   - after the same blocker repeats at the same state, the supervisor must NOT re-delegate (kills the 1116 loop);
@@ -41,7 +41,7 @@ def test_same_blocker_same_state_repeats_must_stop_not_redelegate():
 
 
 def test_blocker_with_changed_state_is_not_over_suppressed():
-    # OVER-SUPPRESSION GUARD (Codex §4): same blocker fingerprint, but the observed state advanced (r1 -> r2,
+    # OVER-SUPPRESSION GUARD: same blocker fingerprint, but the observed state advanced (r1 -> r2,
     # e.g. the CA key was exported) -> this is a legitimate fresh attempt, NOT a loop.
     first = _blocked(rev="r1", route_cap="adcs-ca-private-key-export")
     later = _blocked(rev="r2", route_cap="adcs-ca-private-key-export")
@@ -93,7 +93,7 @@ def test_outcome_serialization_roundtrip():
     assert WorkerOutcome.from_dict(d) == out
 
 
-# --- capability-result mapping + the archived 1116 replay (completion-criterion #1) ---
+# --- capability-result mapping + the archived 1116 replay ---
 
 def test_outcome_from_capability_result_maps_ok_and_blocked():
     assert wo.outcome_from_capability_result("x", {"ok": True}, "0").outcome == Outcome.PROGRESS

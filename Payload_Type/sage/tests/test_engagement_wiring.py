@@ -499,8 +499,8 @@ def test_existing_gpo_effect_no_longer_short_circuits_issue_path():
 
 
 def test_gate_demotes_missing_preconditions_to_advisory_and_proceeds():
-    """RCA 2026-06-09: a missing-precondition would-DEFER is ADVISORY, not a veto. The hand-built STRIPS
-    precondition model produced fatal false-negatives — it refused 167/168 correct hops in solve #37 and
+    """A missing-precondition would-DEFER is ADVISORY, not a veto. The hand-built STRIPS
+    precondition model produced fatal false-negatives — it refused 167/168 correct hops in one solve and
     deadlocked every run after hop 1 (the StandIn rights-grant DEFERd for `write-dacl:domain`, which nothing
     in the model emits from GPO control; `dcsync` DEFERd for the `ds-replication-rights` only that grant
     produces). The agent cannot route around Sage's own refusal, so each modeling gap = a fatal deadlock.
@@ -8307,7 +8307,7 @@ def test_capability_effects_achieved_canonicalizes_netbios_credential_effects():
     ) is True
 
 
-# --- D2: upload hash-dedup (refuse re-upload of an unchanged binary) ---
+# --- upload hash-dedup (refuse re-upload of an unchanged binary) ---
 
 def test_register_file_dedup_reuses_on_hash_match(monkeypatch):
     mt = _make_tools()
@@ -8453,7 +8453,7 @@ def test_ensure_tool_uploaded_uploads_same_name_when_hash_changed(monkeypatch, t
     assert result["superseded_file_uuid"] == "old-uuid"
 
 
-# --- D3: contradiction-downgrade (a refuted precondition reopens instead of looping) ---
+# --- contradiction-downgrade (a refuted precondition reopens instead of looping) ---
 
 _DCSYNC_PARAMS = '{"Command":"mimikatz","Arguments":"lsadump::dcsync /domain:north.sevenkingdoms.local /user:NORTH\\\\krbtgt"}'
 

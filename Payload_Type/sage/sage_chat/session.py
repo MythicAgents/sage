@@ -1,7 +1,7 @@
 """Channel-keyed adapter over ``Model``'s session registry.
 
 The session key is ``str(ChannelID)`` — the only stable per-conversation id (``RequestID``
-changes per turn; PRD Section 7). This is a thin wrapper over the existing
+changes per turn). This is a thin wrapper over the existing
 ``add_session``/``get_session``/``remove_session`` in ``ai.langgraph.model`` so the chat
 container reuses the same registry the PayloadType path used, keyed by channel instead of task.
 """

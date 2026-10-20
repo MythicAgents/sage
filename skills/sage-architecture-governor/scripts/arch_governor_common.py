@@ -41,7 +41,7 @@ HIGH_RISK_PATTERNS = (
 # Everything else in HIGH_RISK_PATTERNS is advisory at edit time: the hook names the subsystem and
 # asks the doctrine's real question ("is this the third tactical patch here?") without blocking.
 #
-# Why the split (decision D1, 2026-08-11): the gate was a no-op under Claude Code for weeks of
+# Why the split: the gate was a no-op under Claude Code for weeks of
 # substantial work — commit recovery, Mythic schema consolidation, the cred-reference fix — and the
 # failure it exists to prevent (tactical prompt growth, planner sprawl) did not recur in that window.
 # That natural experiment is evidence that a 20-glob toll booth over most of the actively-worked

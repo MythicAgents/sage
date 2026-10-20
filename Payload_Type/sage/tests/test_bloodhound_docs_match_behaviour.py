@@ -6,7 +6,7 @@ behaviour change documented in one and not the other is worse than documenting n
 stale page still reads as authoritative.
 
 `AGENTS.md` already warns that `README.md` has been stale before and that safety claims in it must be
-verified against source. This is that warning turned into a test for the claims this ISA changed:
+verified against source. This is that warning turned into a test for the BloodHound claims:
 degraded-without-BloodHound behaviour, the single `BLOODHOUND_URL`, where credentials can be set, and
 what an autonomous channel does when the graph is unavailable.
 
@@ -61,7 +61,7 @@ def test_each_operator_document_states_the_claim(doc: Path, label: str, spelling
 
 
 def test_the_two_documents_do_not_disagree_on_the_configuration_surface():
-    """ISC-26's falsifier: the Mythic page and the README describing different configuration.
+    """The falsifier: the Mythic page and the README describing different configuration.
 
     Compared on the retired key names rather than on wording, because that is the disagreement that
     actually misleads — one page telling an operator to set a variable the other retired.

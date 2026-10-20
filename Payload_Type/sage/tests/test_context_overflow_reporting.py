@@ -1,4 +1,4 @@
-"""Context-window overflow is named for what it is (ISA 9F, ISC-43).
+"""Context-window overflow is named for what it is.
 
 Sage's graph-execution handler catches everything and renders one generic operator message ending in
 "adjust your approach". That advice is unactionable for a context overflow: the operator needs to know

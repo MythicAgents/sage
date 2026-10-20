@@ -135,7 +135,7 @@ def test_mythic_operator_prompt_is_route_neutral_but_keeps_safety_invariants():
 
 
 def test_per_agent_files_retired():
-    # The per-agent mythic_agents/*.md files were RETIRED 2026-06-05 (sage-tradecraft-doctrine ISC-13):
+    # The per-agent mythic_agents/*.md files were RETIRED:
     # Sage operates ANY agent by SELF-DESCRIBING enumeration (get_all_commands_for_payloadtype now
     # surfaces parameter groups + footprint), not hand-written per-agent cheat-sheets. This guards the
     # retirement: load_mythic_agent degrades to (None, None) and the execution_hint join no-ops, so

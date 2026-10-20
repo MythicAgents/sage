@@ -13,8 +13,8 @@ Lab-verification notes (cannot be validated without the range — verify on firs
     name; `mythic_tools._ensure_engagement_key` resolves it). We set SAGE_ENGAGEMENT_ID as a hint,
     but the operation name wins — confirm the produced `state_<key>.json` matches.
   * A "config" is an ENV overlay (LiveConfig.env). For it to change agent behavior, the keys must be
-    ones the harness/model already honors. New prompt-overlay knobs are Phase-1 work (touch model.py
-    -> architecture-governor gated) and are out of scope for this runner.
+    ones the harness/model already honors. New prompt-overlay knobs touch model.py (architecture-governor
+    gated) and are out of scope for this runner.
   * Per-batch trajectory run_id: all seeds in one harness invocation share it, so C1b tradecraft is
     batch-granular, not per-seed (acceptable for Phase 0; diagnostic only).
 """

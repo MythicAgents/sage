@@ -1,7 +1,7 @@
-"""ISC-53 round 10 — the zero-return instrument reports message IDENTITY, not just lengths.
+"""The zero-return instrument reports message IDENTITY, not just lengths.
 
-Round 9 refuted the history-rewrite attribution for the channel-56/57 zero-return, leaving the
-mechanism unknown. Lengths alone cannot distinguish the leading hypothesis (an `add_messages`
+An earlier investigation refuted the history-rewrite attribution for a live zero-return, leaving
+the mechanism unknown. Lengths alone cannot distinguish the leading hypothesis (an `add_messages`
 id collision, which REPLACES in place and so leaves len(updated) == len(input)) from a genuine
 drop. These tests pin the three quantities that can:
 
@@ -30,7 +30,7 @@ def _channel(n=20):
 
 
 def test_collision_replace_is_named_as_the_confirming_verdict():
-    """The channel-57 shape: 20 in, 20 out, model produced 3 — via id collision."""
+    """The observed live shape: 20 in, 20 out, model produced 3 — via id collision."""
     agent_input = _channel(20)
     colliding = [
         AIMessage(content="I'll check callbacks", id="m17"),
@@ -68,7 +68,7 @@ def test_clean_append_is_not_reported_as_collision():
 
 
 def test_genuine_drop_is_distinguished_from_collision():
-    """A real shortening rewrite — the round-8 theory — reports dropped>0, not mutated."""
+    """A real shortening rewrite — an earlier theory — reports dropped>0, not mutated."""
     agent_input = _channel(20)
     updated = list(agent_input[3:])  # three removed off the front, nothing added
 

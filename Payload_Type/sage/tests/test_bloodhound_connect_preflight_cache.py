@@ -2,11 +2,11 @@
 
 Two behaviours, one test file because they share every fixture:
 
-* **Pre-flight (F2).** The BloodHound MCP server refuses to start without `BLOODHOUND_DOMAIN`,
+* **Pre-flight.** The BloodHound MCP server refuses to start without `BLOODHOUND_DOMAIN`,
   `BLOODHOUND_TOKEN_ID` and `BLOODHOUND_TOKEN_KEY`. When none of them resolve, spawning
   `uv run main.py` to rediscover that costs a subprocess, a stdio timeout on the operator's turn,
   and two tracebacks — to learn what was already knowable.
-* **Negative cache (F3).** The missing configuration is static, so three chat requests in ninety
+* **Negative cache.** The missing configuration is static, so three chat requests in ninety
   seconds produced three identical doomed attempts. One is enough until something changes.
 
 The trap this file exists to guard is the *safe* half. Credentials do not only arrive through Sage:
@@ -67,7 +67,7 @@ def _reset() -> None:
 def spy(monkeypatch: pytest.MonkeyPatch) -> ConnectSpy:
     connect_spy = ConnectSpy()
     monkeypatch.setattr(bloodhound_config.MCPManager, "connect_server", connect_spy)
-    # A `domain_info` that answers, so a scripted SUCCESS also passes the ISC-27 reachability read.
+    # A `domain_info` that answers, so a scripted SUCCESS also passes the reachability read.
     # Without it a "successful" connect is correctly reported as unusable, since the handshake alone
     # no longer earns the claim.
     monkeypatch.setattr(
@@ -99,7 +99,7 @@ def _write_dir_env(directory: Path, values: dict[str, str]) -> None:
 
 
 def test_no_credentials_anywhere_skips_the_spawn(tmp_path: Path, spy: ConnectSpy) -> None:
-    """ISC-4: nothing resolved means no subprocess, and a message saying which keys are missing."""
+    """Nothing resolved means no subprocess, and a message saying which keys are missing."""
     connected, message = _connect(tmp_path)
 
     assert connected is False
@@ -141,7 +141,7 @@ def test_empty_value_in_directory_env_does_not_count_as_configured(
 def test_unchanged_failing_credentials_attempt_once(
     tmp_path: Path, spy: ConnectSpy, attempts: int
 ) -> None:
-    """ISC-5, over a range of call counts rather than one hand-picked pair."""
+    """Unchanged failing credentials attempt once, over a range of call counts, not one pair."""
     _write_dir_env(tmp_path, FULL_CREDENTIALS)
 
     for _ in range(attempts):
@@ -152,7 +152,7 @@ def test_unchanged_failing_credentials_attempt_once(
 
 
 def test_changed_credential_value_invalidates_the_cache(tmp_path: Path, spy: ConnectSpy) -> None:
-    """ISC-6: fixing a typo'd token changes no key NAME, and must still trigger a fresh attempt."""
+    """Fixing a typo'd token changes no key NAME, and must still trigger a fresh attempt."""
     _write_dir_env(tmp_path, FULL_CREDENTIALS)
     _connect(tmp_path)
     _connect(tmp_path)

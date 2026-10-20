@@ -1,4 +1,4 @@
-"""ISC-75 — a delegation that TRIED to act and failed is a stall; analysis is not.
+"""A delegation that TRIED to act and failed is a stall; analysis is not.
 
 Regression for the live rejection loop: one ordinary operator rejection made the Supervisor
 re-delegate 8-9 times, every cycle returned messages, and only the global step limit ended it —
@@ -6,9 +6,9 @@ leaving the operator `status=error` with no explanation.
 
 Two earlier signals were refuted and both refutations are pinned here:
 
-1. **Message counting** (original ISC-59) — the loop emits a message every cycle, so the streak reset
+1. **Message counting** (the original signal) — the loop emits a message every cycle, so the streak reset
    forever. `test_paraphrasing_refusal_loop_is_caught` fails under it.
-2. **Content digest** (ISC-75 attempt 1) — the model paraphrases its own refusal
+2. **Content digest** (attempt 1) — the model paraphrases its own refusal
    (`[turn-authority] issue_task…` / `Let me issue the ticket_cache_list…` /
    `[turn-authority] mode is supervised_action…`), so the digest never stabilises. Refuted live: the
    guard reached 2/3 and the request still hit the step limit. Content is prose, and prose cannot
@@ -131,7 +131,7 @@ def _stopped(result, key="mythic_operator_messages"):
     return "no progress" in content or "weren't approved" in content
 
 
-# ── A1: an attempted-and-blocked loop is caught even when its wording changes ─────────────────
+# ── An attempted-and-blocked loop is caught even when its wording changes ─────────────────────
 
 def test_paraphrasing_refusal_loop_is_caught():
     """The exact shape that refuted attempt 1. Preconditions asserted so it cannot pass vacuously."""
@@ -150,7 +150,7 @@ def test_paraphrasing_refusal_loop_is_caught():
 
 
 def test_zero_return_loop_still_caught():
-    """ISC-59's original case must not regress."""
+    """The original zero-return case must not regress."""
 
     class _Silent:
         def __init__(self, model):
@@ -166,7 +166,7 @@ def test_zero_return_loop_still_caught():
     assert _stopped(out[-1])
 
 
-# ── The item-3 correction: analysis is neutral ────────────────────────────────────────────────
+# ── Analysis is neutral ───────────────────────────────────────────────────────────────────────
 
 def test_analysis_only_delegations_are_neutral():
     """A BloodHound-style request issues no Mythic task and is NOT a stall.
@@ -201,10 +201,10 @@ def test_analysis_does_not_clear_a_real_stall():
     assert model._nonprogress_delegations == 2
 
 
-# ── A2/A4: effect crossings reset; tasking runs are never truncated ───────────────────────────
+# ── Effect crossings reset; tasking runs are never truncated ──────────────────────────────────
 
 def test_effect_boundary_crossing_resets_the_streak():
-    """ISC-61: the same command issued repeatedly, each one executing, is NOT a loop."""
+    """The same command issued repeatedly, each one executing, is NOT a loop."""
     client = _FakeMythicClient()
     model = _fresh_model(client)
     agent = _TaskingAgent(client, model)
@@ -227,7 +227,7 @@ def test_streak_resets_after_progress_interrupts_a_stall():
     assert model._nonprogress_delegations == 0
 
 
-# ── A3: termination is a halt with a reason ───────────────────────────────────────────────────
+# ── Termination is a halt with a reason ───────────────────────────────────────────────────────
 
 def test_cap_halts_the_request_and_explains_why():
     """A3: injecting text is not enough — the live Supervisor re-delegated straight past it."""
@@ -246,7 +246,7 @@ def test_cap_halts_the_request_and_explains_why():
     assert "start a new request" in text or "how to proceed" in text
 
 
-# ── A5: request-scoped, not per node ──────────────────────────────────────────────────────────
+# ── Request-scoped, not per node ──────────────────────────────────────────────────────────────
 
 def test_streak_is_request_scoped_not_per_node():
     """A5: a loop that rotates nodes is still a loop."""
@@ -270,7 +270,7 @@ def test_streak_does_not_leak_between_requests():
     assert not _stopped(_run_once(model_b, _BlockedActionAgent(model_b)))
 
 
-# ── ISC-8: neutral delegation soft cap ──────────────────────────────────────────────────────────
+# ── Neutral delegation soft cap ─────────────────────────────────────────────────────────────────
 
 def test_neutral_soft_cap_warns_at_six():
     """After 6 consecutive neutral delegations, a warning is appended to the output."""
@@ -312,7 +312,7 @@ def test_neutral_soft_cap_resets_on_progress():
         )
 
 
-# ── ISC-3b: same-agent pair-bounce detection ────────────────────────────────────────────────────
+# ── Same-agent pair-bounce detection ────────────────────────────────────────────────────────────
 
 def test_pair_bounce_warns_at_three():
     """When the same node is delegated 3 times in a row without progress, a warning fires."""
@@ -367,7 +367,7 @@ def test_pair_bounce_resets_on_progress():
     )
 
 
-# ── D3: the neutral soft-cap is a hard stop; mixed ping-pong is a hard stop ───────────────────
+# ── The neutral soft-cap is a hard stop; mixed ping-pong is a hard stop ───────────────────────
 
 class _AlternateAgent:
     """Alternates a blocked guarded attempt with an analysis cycle on the same node.
@@ -437,7 +437,7 @@ def test_neutral_cap_stops_the_request():
     assert "no action" in text
 
 
-# ── D3: re-issuing a failed signature is not progress ─────────────────────────────────────────
+# ── Re-issuing a failed signature is not progress ─────────────────────────────────────────────
 
 class _RepeatTaskingAgent:
     """Issues a task each cycle; the client flags whether the signature already failed."""

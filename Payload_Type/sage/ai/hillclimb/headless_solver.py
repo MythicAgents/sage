@@ -1,10 +1,10 @@
-"""Run a full autonomous Sage solve IN-PROCESS — the Option-A replacement for the PayloadType path.
+"""Run a full autonomous Sage solve IN-PROCESS — the replacement for the PayloadType path.
 
 The eval/gauge harness used to run a solve by tasking the PayloadType `query` command on a virtual Sage
-callback (`issue_task(command_name="query", callback_display_id=sage_cb)`). Phase 4 removes the PayloadType,
+callback (`issue_task(command_name="query", callback_display_id=sage_cb)`). The PayloadType was removed,
 so the harness instead runs the SAME Model the chat service builds, in-process, here.
 
-Auth is option (a): inject a pre-authenticated `mythic` client (the harness's admin login) so the Model's
+Auth: inject a pre-authenticated `mythic` client (the harness's admin login) so the Model's
 tools task real callbacks + query BloodHound with no chat channel and no Mythic task; pin the engagement
 key (`SAGE_ENGAGEMENT_ID`) to the run's operation so the durable ledger doesn't misfile (an admin client
 can see many operations). See `MythicTools.__init__(preauth_client=...)`.

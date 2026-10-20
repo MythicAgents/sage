@@ -1,6 +1,6 @@
-"""ISC-49R 49R-16: sealed kernel decision record.
+"""Sealed kernel decision record.
 
-These tests assert the two properties the criterion actually rests on: the record faithfully carries the
+These tests assert the two properties the record actually rests on: the record faithfully carries the
 kernel's decision stream, and the seal makes post-hoc mutation detectable — including the deletion,
 reordering, and truncation that a per-event digest cannot catch on its own.
 """
@@ -289,7 +289,7 @@ def test_emitter_does_not_change_the_reconcile_summary_or_ledger(tmp_path, monke
 
 
 def test_real_seam_seals_even_when_reconciliation_fails(active):
-    """49R-14: a failed request must still leave evidence, not vanish from the bundle."""
+    """A failed request must still leave evidence, not vanish from the bundle."""
     ledger = RequestEventLedger("req-failed")
     ledger.record(
         event_id="ct:install",

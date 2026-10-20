@@ -1,6 +1,6 @@
 """Reconcile verified effects + credential material from completed Mythic task history.
 
-Re-homed (Phase 4) from the deleted PayloadType ``state`` command's ``reconcile`` action so the
+Re-homed from the deleted PayloadType ``state`` command's ``reconcile`` action so the
 chat ``/state reconcile`` slash command can drive it. Pure logic over the Mythic scripting client +
 the durable ledger — no PayloadType/task context. The autonomous solve imports credentials on its
 own via ``MythicTools._import_capability_credential_material``; this is the operator-facing manual

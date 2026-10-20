@@ -1,7 +1,7 @@
 """Losing BloodHound must cost exactly the attack graph, and nothing else.
 
-ISC-19. The rest of this ISA proves Sage survives without BloodHound; this proves the survival is not
-partial. The failure it guards is subtle and would be easy to ship: a `not connected` check placed one
+The other degraded-BloodHound tests prove Sage survives without BloodHound; this proves the survival
+is not partial. The failure it guards is subtle and would be easy to ship: a `not connected` check placed one
 level too high — around the agent instead of around its MCP tools — silently removes an agent, a
 slash command, or an unrelated tool along with the graph. Chat still answers, so nothing looks broken,
 and the operator simply finds that something else stopped existing.

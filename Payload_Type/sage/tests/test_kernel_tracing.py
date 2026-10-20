@@ -196,16 +196,16 @@ class _EmptyState:
 
 
 def test_an_export_failure_is_loud_not_silent(caplog):
-    """Anti-ISC-4b: a span that cannot be exported must produce a visible log line.
+    """Anti-criterion: a span that cannot be exported must produce a visible log line.
 
-    The whole ISA started from a trace that looked populated while missing what mattered, so a *silent*
+    This tracing exists because a trace looked populated while missing what mattered, so a *silent*
     export failure is the failure mode worth guarding. The OpenTelemetry SDK already logs one — this
     pins that behaviour so it cannot be quietly wrapped in a swallowing `except`, and so a future
     custom processor cannot regress it.
 
     Uses a raising exporter rather than a genuinely oversized span: the 4 MB gRPC limit needs a real
     collector, and what is being asserted is that *any* export failure is audible. Span-size headroom
-    is ISC-12's job, separately.
+    is covered separately.
     """
     import logging
 
@@ -266,7 +266,7 @@ def _looping_controller():
 
 
 def test_cycle_span_is_emitted_and_parents_its_seams(spans):
-    """ISC-3: one span per controller cycle, with that cycle's seams nested beneath it."""
+    """One span per controller cycle, with that cycle's seams nested beneath it."""
     asyncio.run(_looping_controller().run())
     finished = spans.get_finished_spans()
 

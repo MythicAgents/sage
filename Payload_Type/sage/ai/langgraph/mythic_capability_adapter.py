@@ -3253,7 +3253,7 @@ def _certificate_schannel_ldap_powershell(
             # SeSecurityPrivilege (admins only). Run the identical read on the cert-authenticated
             # DA session AND on a Negotiate-bound foothold session. DA_ONLY_READ_PROVEN is True only
             # when the DA session retrieves the SACL and an authenticated non-admin is denied it —
-            # a differential a self-read cannot fake (RCA 2026-08-01).
+            # a differential a self-read cannot fake.
             "$lines.Add('DA_ONLY_READ_OP=domain-sacl');"
             "$saclProbe={param($connection,$baseDn) try{"
             "$req=New-Object System.DirectoryServices.Protocols.SearchRequest($baseDn,'(objectClass=*)',[System.DirectoryServices.Protocols.SearchScope]::Base,[string[]]@('nTSecurityDescriptor'));"

@@ -1,10 +1,10 @@
 """``SageChat`` — the native Mythic v4.0.0 chat container fronting Sage's ``Model`` runtime.
 
 Singleton (instantiated once at startup); all per-conversation state lives in the channel-keyed
-session registry, never on ``self`` (PRD Section 5). One ``chat()`` call = one Mythic request =
+session registry, never on ``self``. One ``chat()`` call = one Mythic request =
 exactly one terminal status.
 
-Always-terminal (the safety-critical invariant, Section 6): every request path ends with a
+Always-terminal (the safety-critical invariant): every request path ends with a
 terminal status so the channel never wedges. This is guaranteed in layers —
 the handler finalizes the last visible assistant block with ``complete(complete_request=True)``;
 ``run_chat_turn`` provides a non-empty fallback when no assistant block was emitted and sends
@@ -262,7 +262,7 @@ def _bloodhound_unavailable_message(reason: str | None = None) -> str:
 
     Lazy import to match this module's convention of keeping `ai.*` off the import path. The
     fallback matters: if the import fails, the refusal must still say what is wrong rather than
-    reverting to an internal phrase like "exact-tool admission", which is the defect D6 fixes.
+    reverting to an internal phrase like "exact-tool admission", which would be a defect.
     """
     try:
         from ai.bloodhound_config import autonomous_unavailable_message
@@ -713,9 +713,9 @@ class SageChat(Chat):
     async def _notify_bloodhound_degraded_once(self, model: Any, request: ChatRequest) -> None:
         """Tell the operator, in the chat, that the attack graph is unavailable. Once per session.
 
-        The diagnostic this ISA raised to WARNING lands in the container log, which an operator has
+        The diagnostic logged at WARNING lands in the container log, which an operator has
         to go and look for. This puts it where they already are. Once per session rather than per
-        turn (D5): they saw it on the first degraded turn, and Mythic renders a live
+        turn: they saw it on the first degraded turn, and Mythic renders a live
         BloodHound-connected chip at the top of the chat, so repeating it would be the third copy of
         a fact already on screen.
 
@@ -1330,9 +1330,9 @@ class SageChat(Chat):
                         )
                     elif has_input_response and hitl_pending:
                         # A prior turn raised a confirmation card and finished; this request is the operator's
-                        # answer. Resume the paused graph in place (Section 6): Confirm → approve; Reject →
+                        # answer. Resume the paused graph in place: Confirm → approve; Reject →
                         # default-deny; Respond/Select → deny the guarded action but steer the replan with the
-                        # operator's free-text (Phase 3).
+                        # operator's free-text.
                         native_response_text = _nonempty_native_response_text(
                             await model.handle_hitl_resume(
                                 approval_decision,
@@ -1377,7 +1377,7 @@ class SageChat(Chat):
                         )
             except asyncio.CancelledError:
                 # Operator cancel: cooperatively stop the graph so it stops issuing tasks, then re-raise
-                # so the SDK emits the terminal `cancelled` status (Cody, f). Never swallow this.
+                # so the SDK emits the terminal `cancelled` status. Never swallow this.
                 await self._stop_and_close_request_lifecycles(
                     model,
                     status="cancelled",
@@ -1548,7 +1548,7 @@ class SageChat(Chat):
                 or halt_notice
                 or "Completed."
             )
-            # ISC-71: model prose is not the provenance authority. Apply one deterministic
+            # Model prose is not the provenance authority. Apply one deterministic
             # request/task-lineage composer to every service-owned terminal narrative, including
             # normal, handled-error, and lifecycle stop/cancel paths.
             response_content = _with_task_provenance(model, response_content)
@@ -1562,7 +1562,7 @@ class SageChat(Chat):
             finalize_visibility = getattr(model, "finalize_visibility_turn", None)
             lifecycle_event_id = ""
             if callable(record_final) and callable(finalize_visibility):
-                # ISC-74: a guarded tool that never executes never receives a tool-end callback, so
+                # A guarded tool that never executes never receives a tool-end callback, so
                 # its `started` ledger event has no terminal and reconciliation below fails — turning
                 # a request that behaved correctly into `status=error` for the operator. Two paths
                 # produce one: an operator rejection, and a call the turn-authority gate strips before

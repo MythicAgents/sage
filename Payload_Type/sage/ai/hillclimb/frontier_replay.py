@@ -1,4 +1,4 @@
-"""Spike 0 — frontier-correctness replay (autonomous-controller design gate).
+"""Frontier-correctness replay (autonomous-controller design gate).
 
 Forward-replays a recorded engagement ledger's ACHIEVED hop chain (in causal/timestamp
 order) through `capabilities.actions_from_state()` and checks whether the deterministic
@@ -7,11 +7,10 @@ frontier CONTAINS and RANKS the correct next capability hop at the top.
 WHY: the autonomous controller's `select` step is `actions_from_state(state)[0]`
 (top-priority admissible action; bounded-LLM rank only on priority ties). This proves the
 already-declared precondition/effect model can carry the proven ESSOS route BEFORE we build
-the controller loop or spend a live run. It is the cheap test of falsifier F3 in
-`Plans/SAGE_AUTONOMOUS_CONTROLLER_DESIGN_2026-06-22.md` ("the deterministic frontier is
+the controller loop or spend a live run. It is the cheap test of falsifier F3 ("the deterministic frontier is
 empty at a wall autonomous Sage should cross -> the capability model is under-declared").
 
-HONESTY NOTE (the 2026-06-21 trap, recorded in Plans/RESUME.md): the persisted ledger does
+HONESTY NOTE: the persisted ledger does
 NOT store footholds, so the runtime live-callback/live-foothold/authenticated predicates are
 absent on replay. `actions_from_state` gates most actions on a live callback, so replaying
 from the bare ledger would UNDER-produce the frontier and yield a falsely pessimistic verdict

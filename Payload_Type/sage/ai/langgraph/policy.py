@@ -108,7 +108,7 @@ def _candidate_payload(candidate: Any) -> dict[str, Any]:
 
 
 def _semantic_candidate_payload(candidate: Any) -> dict[str, Any]:
-    """Return the stable action identity payload used by Phase 1 policy evidence.
+    """Return the stable action identity payload used by policy evidence.
 
     `reason` is intentionally excluded: it is explanatory text, not part of the
     selected action semantics. Preconditions and effects are sets semantically, so
@@ -526,8 +526,8 @@ def _decision_identity_fields(
         "selection_contract": str(selection_contract or ""),
         "selection_contract_hash": selection_contract_hash(selection_contract),
         "decision_owner": str(decision_owner or ""),
-        # `actions_from_state()` is the current safe/admissible policy seam. Until Phase 2 adds
-        # rejection-reason instrumentation, raw and admissible counts are identical at this seam.
+        # `actions_from_state()` is the current safe/admissible policy seam. Until rejection-reason
+        # instrumentation exists, raw and admissible counts are identical at this seam.
         "raw_candidate_count": len(candidates),
         "admissible_candidate_count": len(candidates),
         "semantic_candidate_ids": ids,

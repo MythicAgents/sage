@@ -1,4 +1,4 @@
-"""Headless driver for evals / trajectory (PRD Section 8, deliverable #2).
+"""Headless driver for evals / trajectory.
 
 Removing the PayloadType deletes the interactive ``chat`` command the eval harness drove. This
 replaces it with an in-process driver: a ``SageChat`` subclass whose ``send_*`` surface records

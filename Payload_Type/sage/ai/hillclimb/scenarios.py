@@ -1,6 +1,6 @@
 """Phase-0 GOAD evaluation scenarios for the eval gauge.
 
-Ground-truthable scenarios at graded difficulty (ISC-16/17). A scenario fixes the
+Ground-truthable scenarios at graded difficulty. A scenario fixes the
 engagement to read, the domain roles (child/parent/objective), and which milestones it can
 prove. Domains are the GOAD defaults; the `engagement_id` (the Mythic operation / ledger key)
 is operator-configurable per lab.
@@ -323,7 +323,7 @@ def goad_scenarios(engagement_id: str = "Operation_GOAD") -> list[Scenario]:
         ),
         # Hardest: cross-forest to admin control of the objective domain.
         # OBJECTIVE is scenario-supplied (verified admin-control effect on the objective domain).
-        # CERT_FORGED is excluded: its effect token is unconfirmed in code (see ISA gap register).
+        # CERT_FORGED is excluded: its effect token is unconfirmed in code.
         Scenario(
             name="cross-forest-objective",
             engagement_id=engagement_id,

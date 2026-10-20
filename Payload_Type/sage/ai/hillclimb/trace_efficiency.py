@@ -1,7 +1,6 @@
 """Offline trace-efficiency scorer for archived Phoenix windows.
 
-Step 0a of the control-state reprioritization (Plans/SAGE_HILLCLIMB_REPRIORITIZATION_2026-06-22.md):
-score archived traces for DELIBERATION WASTE without touching the live gauge or `verifier_hash`. The capability
+Score archived traces for DELIBERATION WASTE without touching the live gauge or `verifier_hash`. The capability
 gauge is blind to looping/repetition (a 461K-token supervisor↔worker loop scores the same as a clean run, and
 Phoenix `status_code=OK` hides operational failure). This module makes that waste a number so terminal-blocker
 propagation can be tested against a measurable target BEFORE any expensive live run.

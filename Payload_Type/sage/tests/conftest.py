@@ -21,8 +21,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Payload_Type/sag
 # model calls, achieved effects from specific dated runs — not a synthesisable fixture.
 #
 # A clone therefore does not have it, and 16 tests across 7 modules failed there while passing on the
-# maintainer's machine. That is the same defect class as the Phase 16R evidence problem: private
-# evidence acting as a hard test dependency. Unlike Phase 16R, these modules are living code — they are
+# maintainer's machine. That is the defect class of private evidence acting as a hard test
+# dependency. Unlike archived evaluation modules, these modules are living code — they are
 # wired into the `ai.hillclimb` CLI and pin no hashes of their own — so the fix is to skip honestly when
 # the evidence is absent, not to archive the modules.
 #

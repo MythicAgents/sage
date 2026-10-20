@@ -48,7 +48,7 @@ def test_validate_rejects_unknown_param_instead_of_failing_open():
     assert "bogus_key" in result
 
 
-# --- ISC-2.2 / ISC-2.3: consolidation onto the shared resolver -------------------------------
+# --- consolidation onto the shared resolver ---------------------------------------------------
 #
 # `_fetch_command_schema` delegates its fetch to the resolver but keeps the flat return contract,
 # because it has nine production callers and is stubbed in roughly seventy tests. Validation takes
@@ -67,7 +67,7 @@ _MULTI_GROUP_SCHEMA = [
 
 
 def test_validation_accepts_a_cli_named_parameter():
-    """ISC-2.3 regression guard for the field that nearly broke this path.
+    """Regression guard for the field that nearly broke this path.
 
     Validation builds its accepted-key set from BOTH `name` and `cli_name`. The model-facing
     projection deliberately drops `cli_name` as bookkeeping, so routing validation through that
@@ -124,7 +124,7 @@ def test_validation_fails_open_when_schema_is_unavailable():
 
 
 def test_advisory_arm_never_rejects_on_verifier_regex():
-    """ISC-4.1 — the advisory arm surfaces `verifier_regex` and rejects nothing on it.
+    """The advisory arm surfaces `verifier_regex` and rejects nothing on it.
 
     This is the default arm and must stay inert. Measured against live Mythic on 2026-08-01,
     `verifier_regex` is empty on all 192 parameters across every installed payload type, so the
@@ -146,7 +146,7 @@ def test_advisory_arm_never_rejects_on_verifier_regex():
     )
 
 
-# --- ISC-4.2 / 4.3 / 4.5: the verifier_regex rejection arm ------------------------------------
+# --- the verifier_regex rejection arm ---------------------------------------------------------
 
 _REGEX_SCHEMA = [
     {"name": "host", "cli_name": "host", "type": "String", "parameter_group_name": "Default",
@@ -164,7 +164,7 @@ def _validate(schema, params, mode=None, monkeypatch=None):
 
 
 def test_rejection_arm_rejects_a_mismatch(monkeypatch):
-    """ISC-4.2 — armed, a value failing the declared pattern gets an actionable correction."""
+    """Armed, a value failing the declared pattern gets an actionable correction."""
     result = _validate(_REGEX_SCHEMA, {"host": "lowercase"}, mode="reject", monkeypatch=monkeypatch)
     assert isinstance(result, str)
     assert "must match the pattern" in result
@@ -181,7 +181,7 @@ def test_rejection_arm_permits_a_match(monkeypatch):
     [None, "", "advisory", "ADVISORY", "true", "1", "yes", "on", "enforce", "strict", "garbage"],
 )
 def test_anything_that_is_not_the_word_reject_leaves_the_gate_inert(monkeypatch, mode):
-    """ISC-4.3 — default is advisory, and any other word falls back to it.
+    """Default is advisory, and any other word falls back to it.
 
     Covered as a class rather than one case. `true`, `1`, `on`, `enforce` and `strict` are the
     plausible guesses an operator makes when they have not read the docs, and every one of them
@@ -205,11 +205,11 @@ def test_the_word_reject_arms_the_gate_regardless_of_case_or_whitespace(monkeypa
 
 
 def test_arm_uses_unanchored_search_like_mythics_own_ui(monkeypatch):
-    """ISC-4.5 — matching semantics must mirror the ONE implementation that exists.
+    """Matching semantics must mirror the ONE implementation that exists.
 
     Mythic's React dialog does `RegExp(verifier_regex).test(value)`, which is an unanchored search.
     Using `re.fullmatch` here would reject values Mythic's own UI accepts, which is precisely the
-    class ISC-4.5 forbids: being stricter than the system we are mirroring.
+    class of error this forbids: being stricter than the system we are mirroring.
     """
     schema = [
         {"name": "host", "cli_name": "host", "type": "String", "parameter_group_name": "Default",
@@ -221,7 +221,7 @@ def test_arm_uses_unanchored_search_like_mythics_own_ui(monkeypatch):
 
 
 def test_arm_never_fires_on_an_empty_regex(monkeypatch):
-    """ISC-4.5 — the field is empty on all 192 live parameters, so this is the case that governs
+    """The field is empty on all 192 live parameters, so this is the case that governs
     every real task today. An armed Sage must still be a no-op on an unpopulated field."""
     schema = [
         {"name": "host", "cli_name": "host", "type": "String", "parameter_group_name": "Default",
@@ -241,7 +241,7 @@ def test_arm_fails_open_on_an_unusable_pattern(monkeypatch):
 
 
 def test_fetch_command_schema_no_longer_builds_interpolated_graphql():
-    """ISC-2.2 — the f-string query is what let a malformed query read as an empty answer.
+    """The f-string query is what let a malformed query read as an empty answer.
 
     AST-based so it cannot be tripped by a comment that merely mentions the old pattern.
     """

@@ -1,7 +1,7 @@
 """Headless LIVE Gate Experiment orchestration (Phase 0).
 
 The Gate Experiment (`gate_experiment.py`) decides whether the gauge MEANS anything: run several
-known-different-quality configs and check that the cheap substring eval RANKS them the way C1 ground
+known-different-quality configs and check that the cheap substring eval RANKS them the way the C1 ground
 truth does (Spearman ρ ≥ threshold, zero high-eval/low-truth). `gate_experiment.run_gate_experiment`
 is the pure scorer; this module is the LIVE driver that `__main__` was missing — it wires:
 

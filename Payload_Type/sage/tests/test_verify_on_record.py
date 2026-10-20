@@ -57,7 +57,7 @@ BARE_HEX = f"objectGUID value is {NTLM} in the directory listing"
 
 
 # ---------------------------------------------------------------------------
-# Extractor truth table (ISC-1..15)
+# Extractor truth table
 # ---------------------------------------------------------------------------
 
 def test_credential_techniques_set():
@@ -114,7 +114,7 @@ def test_real_key_plus_placeholder_real_wins():
 
 
 def test_bare_hex_no_label_is_not_a_credential():
-    # Anti (ISC-14): a 32-hex token with no field label / secretsdump shape must not count.
+    # Anti: a 32-hex token with no field label / secretsdump shape must not count.
     assert ca.extract_credential_probe(BARE_HEX)["credentials_dumped"] is False
 
 
@@ -125,7 +125,7 @@ def test_dump_started_partial_signal():
 
 
 # ---------------------------------------------------------------------------
-# verify_effect integration (ISC-16..19)
+# verify_effect integration
 # ---------------------------------------------------------------------------
 
 def test_verify_dcsync_user_with_key_achieved():
@@ -153,7 +153,7 @@ def test_verify_lsass_with_key_achieved():
 
 
 # ---------------------------------------------------------------------------
-# Record-path wiring (ISC-20..28, 34)
+# Record-path wiring
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
@@ -193,7 +193,7 @@ def test_record_dcsync_user_with_key_achieved(mt):
     assert hop.technique == "dcsync-user" and hop.status == "achieved"
     assert hop.evidence.get("verify_verdict") == "achieved"
     assert hop.evidence.get("verified_on_record") is True
-    assert mt._pending_engagement_hop is None          # cleared in finally (ISC-27)
+    assert mt._pending_engagement_hop is None          # cleared in finally
 
 
 def test_stage_b_dcsync_key_records_verified_credential_without_gate_flag(mt):
@@ -214,7 +214,7 @@ def test_record_dcsync_user_no_key_failed_not_achieved(mt):
     mt._pending_engagement_hop = ("dcsync-user", USER, TS)
     _record_success(mt, DCSYNC_8439)
     hop = _last(mt)
-    assert hop.status == "failed"                       # the false-achieved lie is dead (ISC-21)
+    assert hop.status == "failed"                       # the false-achieved lie is dead
     assert hop.evidence.get("verify_verdict") != "achieved"   # "partial" (ran, no key) or "failed"
     assert hop.evidence.get("artifact_present") is False
 
@@ -222,7 +222,7 @@ def test_record_dcsync_user_no_key_failed_not_achieved(mt):
 def test_failed_credential_hop_persists(mt):
     mt._pending_engagement_hop = ("dcsync-user", USER, TS)
     _record_success(mt, DCSYNC_8439)
-    # Durable trail so `state show` surfaces the honest failure (ISC-23).
+    # Durable trail so `state show` surfaces the honest failure.
     assert Path(mt._engagement_ledger_path()).exists()
 
 
@@ -252,7 +252,7 @@ def test_non_credential_failure_signature_records_nothing(mt):
 
 
 # ---------------------------------------------------------------------------
-# Purity (ISC-26)
+# Purity
 # ---------------------------------------------------------------------------
 
 def test_engagement_state_does_not_import_mythic_tools():
@@ -262,7 +262,7 @@ def test_engagement_state_does_not_import_mythic_tools():
 
 
 # ---------------------------------------------------------------------------
-# lsass-dump shape (Advisor Q3) — sekurlsa::logonpasswords uses `* NTLM : <hex>`
+# lsass-dump shape — sekurlsa::logonpasswords uses `* NTLM : <hex>`
 # ---------------------------------------------------------------------------
 
 LSASS_OK = """
@@ -285,7 +285,7 @@ def test_lsass_logonpasswords_shape_detected():
 
 
 # ---------------------------------------------------------------------------
-# Degenerate constants (Advisor Q3) — empty-LM / blank-NT / all-zero are NOT usable secrets
+# Degenerate constants — empty-LM / blank-NT / all-zero are NOT usable secrets
 # ---------------------------------------------------------------------------
 
 def test_blank_nt_constant_rejected():
@@ -308,7 +308,7 @@ def test_all_zero_aes_rejected():
 
 
 # ---------------------------------------------------------------------------
-# Stickiness (Advisor Q1) — a no-key re-probe must NOT downgrade a verified achieved
+# Stickiness — a no-key re-probe must NOT downgrade a verified achieved
 # ---------------------------------------------------------------------------
 
 def test_verified_achieved_not_downgraded_same_run(mt):
@@ -353,7 +353,7 @@ def test_legacy_false_achieved_overwritten_by_verified_failed(mt):
 
 
 # ---------------------------------------------------------------------------
-# Schema invariant (Advisor Q2) — CREDENTIAL_TECHNIQUES == techniques declaring a credential key
+# Schema invariant — CREDENTIAL_TECHNIQUES == techniques declaring a credential key
 # ---------------------------------------------------------------------------
 
 def test_credential_techniques_matches_verify_schema():

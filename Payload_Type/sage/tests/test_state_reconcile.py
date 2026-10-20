@@ -1,4 +1,4 @@
-"""Credential reconcile from Mythic task history — re-homed (Phase 4) from the deleted PayloadType
+"""Credential reconcile from Mythic task history — re-homed from the deleted PayloadType
 `state` command into `ai/langgraph/state_reconcile.py`, now driven by the chat `/state reconcile`.
 
 Security-critical behavior preserved: dry-run is the DEFAULT (task output is attacker-influenceable),

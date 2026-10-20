@@ -267,7 +267,7 @@ def test_collection_binding_accepts_declared_aliases_for_listing_and_download(co
 def test_mythic_success_terminal_state_completes_collection_with_real_aliases(collection, monkeypatch, success_at):
     case = collection
     _install_apollo_alias_schema(case, monkeypatch, other_aliases=True)
-    # Captured human-03 task 9 used completed=true/status=success.
+    # A captured live task used completed=true/status=success.
     # Only the command and display ID vary across subsequent tasks in this inert fixture.
     actual_task_state = {"command_name": "whoami", "completed": True, "status": "success"}
     monkeypatch.setattr(case.client, "_supervised_task_state", mt.MythicTools._supervised_task_state.__get__(case.client))

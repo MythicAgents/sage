@@ -74,7 +74,7 @@ def test_a_distinct_reason_is_preserved():
 
 
 def test_setup_steps_warn_that_the_baked_directory_is_not_durable():
-    """ISC-9: offering the image's baked `.env` as a peer option without this is offering a trap."""
+    """Offering the image's baked `.env` as a peer option without this is offering a trap."""
     assert "/opt/bloodhound_mcp" in BLOODHOUND_SETUP_STEPS
     lost_on_rebuild = "lost on the next rebuild" in BLOODHOUND_SETUP_STEPS
     assert lost_on_rebuild, "the baked directory is not on the bind mount and the text must say so"

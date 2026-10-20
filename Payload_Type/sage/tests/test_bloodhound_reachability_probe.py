@@ -1,6 +1,6 @@
 """"Connected" must mean BloodHound answered, and a failure must name the variable to fix.
 
-ISC-27. The MCP handshake proves a subprocess started and lists 13 statically-declared `@mcp.tool`
+The MCP handshake proves a subprocess started and lists 13 statically-declared `@mcp.tool`
 functions; `BloodhoundAPI.__init__` validates only that credentials are PRESENT and makes no network
 call. So an unreachable host, a wrong port and a revoked token were all invisible — Sage logged
 "Connected to BloodHound MCP (13 tools)" for every one of them, and the operator found out on their

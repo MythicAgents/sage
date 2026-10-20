@@ -1,8 +1,8 @@
-"""Empirical pre-DCSync rights precheck (2026-06-10).
+"""Empirical pre-DCSync rights precheck.
 
-The 2026-06-09 RCA demoted the engagement gate to a silent advisor (it stopped vetoing missing
+The engagement gate was demoted to a silent advisor (it stopped vetoing missing
 preconditions because the static STRIPS model produced fatal false-negatives). Side effect: the agent
-fired DCSync without replication rights and burned steps on 8453 (solve #134). This precheck re-blocks the
+fired DCSync without replication rights and burned steps in a live solve. This precheck re-blocks the
 premature DCSync — but EMPIRICALLY (only when the graph is populated and shows the right absent) and CAPPED
 (per-domain), so it can never re-create the permanent deadlock that demoted the gate.
 

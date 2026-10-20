@@ -209,9 +209,9 @@ def delegated() -> dict[str, Any]:
 
 
 def test_empty_delegation_return_is_surfaced_to_the_supervisor(monkeypatch):
-    """D7: a specialist returning no text and no tool results must not look like a completion.
+    """A specialist returning no text and no tool results must not look like a completion.
 
-    In the 2026-10-15 acceptance run (request 9) three consecutive delegation cycles ended on empty
+    In a live acceptance run three consecutive delegation cycles ended on empty
     handbacks: the empty return was invisible to the Supervisor (DEBUG log only), the delegation card
     closed as "finished" with the filler text "Completed without a textual summary.", and the
     Supervisor re-delegated identically because its context contained nothing about the failure.
@@ -221,7 +221,7 @@ def test_empty_delegation_return_is_surfaced_to_the_supervisor(monkeypatch):
     harness = _Harness([_handoff_call(), AIMessage(content=""), AIMessage(content=_FINAL_ANSWER)])
 
     class _RecordingEmitter:
-        """D7: the stock harness emitter is a bare function without emit_subagent_status, so
+        """The stock harness emitter is a bare function without emit_subagent_status, so
         `_open_delegation` skips card lifecycle entirely. This recording emitter exercises the
         real open/close path so the test can assert how the empty delegation card was closed."""
 

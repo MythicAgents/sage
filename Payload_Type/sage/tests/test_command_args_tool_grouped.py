@@ -1,6 +1,6 @@
-"""`get_all_command_args_for_payloadtype` after consolidation (ISC-2.1, ISC-3.1–3.3).
+"""`get_all_command_args_for_payloadtype` after consolidation.
 
-The live probe on 2026-08-01 showed the real thing working — `link` carrying LLM_Help on
+A live probe showed the real thing working — `link` carrying LLM_Help on
 `connection_info`, `unlink` on `link_info`, `pth` returning its four real groups. These tests exist
 so a future refactor cannot quietly undo that: a criterion closed on a one-off probe has nothing
 watching it afterwards.
@@ -44,7 +44,7 @@ def _call(tool, payload="apollo", command="pth"):
 
 
 def test_tool_output_is_group_keyed(monkeypatch):
-    """ISC-2.1 — groups are mutually exclusive tasking forms; a flat list makes the model
+    """Groups are mutually exclusive tasking forms; a flat list makes the model
     re-derive the partition it was handed the answer to."""
     tool = _tool(
         monkeypatch,
@@ -70,7 +70,7 @@ def test_tool_output_is_group_keyed(monkeypatch):
     ],
 )
 def test_llm_help_reaches_model_visible_output(monkeypatch, param_type, param_name, help_text):
-    """ISC-3.1–3.3 — the reference format has to be in front of the model while it chooses a value.
+    """The reference format has to be in front of the model while it chooses a value.
 
     Parametrised over all three reference types together because they fail as a class: a field
     allowlist that drops `LLM_Help` breaks every one of them at once, and the live census found
@@ -164,7 +164,7 @@ def test_metadata_failure_does_not_fail_the_tool(monkeypatch):
 
 
 def test_commands_tool_grouped_view_does_not_mutate_the_cached_results():
-    """ISC-2.6 — the plural tool's grouped view must be a copy.
+    """The plural tool's grouped view must be a copy.
 
     `results` is stored in `_command_schema_cache`, which `_fetch_live_command_surface` reads and
     `mechanic_repair.compact_command_surface` walks looking for the flat `commandparameters` key.
@@ -206,7 +206,7 @@ def test_commands_tool_grouped_view_passes_unexpected_shapes_through(results):
 
 
 def test_no_interpolated_graphql_remains_in_the_args_tool():
-    """ISC-2.5, scoped to this tool: the old body built its query by substituting model-influenced
+    """No interpolated GraphQL, scoped to this tool: the old body built its query by substituting model-influenced
     values into query text. A malformed query returns nothing, which the caller cannot distinguish
     from a real empty answer, so validation silently fails open — the class consolidation removes.
 
@@ -250,7 +250,7 @@ def test_no_interpolated_graphql_remains_in_the_args_tool():
 
 
 def test_needs_admin_reaches_footprints_scoring_through_the_plural_tool(monkeypatch):
-    """ISC-2.6 — `needs_admin` is carried so footprint can score from it, not for decoration.
+    """`needs_admin` is carried so footprint can score from it, not for decoration.
 
     The command-level flag lives *outside* `commandparameters`, which makes it exactly the kind of
     field a regrouping drops without anything noticing. Asserting the key is present would not

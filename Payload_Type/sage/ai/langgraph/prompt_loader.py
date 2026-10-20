@@ -1,5 +1,5 @@
 """
-prompt_loader — externalized agent system prompts (ROADMAP Phase 3, T3.1-T3.4).
+prompt_loader — externalized agent system prompts.
 
 Each Sage agent's system prompt lives in `Payload_Type/sage/prompts/<agent>.md` as a
 markdown file with a YAML frontmatter block:
@@ -21,7 +21,7 @@ bodies were lifted verbatim from the original f-strings in model.py.
 
 Design notes:
 - Files are read at agent-build time (each ``_*_agent()`` call), so editing a prompt file +
-  restarting Sage changes behavior with no code edit (T3.3).
+  restarting Sage changes behavior with no code edit.
 - ``load_prompt`` renders the template and ``.strip()``s the result — this matches today's
   ``SystemMessage(content=prompt.strip())`` byte-for-byte; the only delta vs the old
   ``create_agent(system_prompt=prompt)`` sink is leading/trailing whitespace, which is inert.
@@ -111,8 +111,8 @@ def filter_tools_by_frontmatter(name: str, candidate_tools: list) -> list:
 
         tools = mcp_tools + filter_tools_by_frontmatter("mcp_manager", static_tools)
 
-    Logs a warning on any frontmatter↔code mismatch so ISC-31 (frontmatter matches actual
-    tool set) is self-checking.
+    Logs a warning on any frontmatter↔code mismatch so the contract that frontmatter
+    matches the actual tool set is self-checking.
     """
     allowed = set(get_prompt_tools(name))
     candidate_names = {getattr(t, "name", None) for t in candidate_tools}
