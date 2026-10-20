@@ -96,8 +96,7 @@ SUPERVISOR_COPY_TOOL_RESULT_CAP = 2000  # max chars of a ToolMessage's string co
 _AUTONOMOUS_OPERATOR_CONTINUE_CAP = 6  # max autonomous re-invocations of Mythic_Operator per node entry
 # ISC-59: consecutive zero-message returns from one delegated node before the no-progress backstop
 # fires. A node that returns nothing gives the Supervisor nothing to act on, so it re-delegates the
-# identical objective forever (the supervised re-approval livelock). N=3 chosen by Russel 2026-07-28:
-# tolerates one genuinely empty-but-legitimate cycle, still bounds the loop to seconds.
+# identical objective forever (the supervised re-approval livelock). N=3 tolerates one genuinely empty-but-legitimate cycle, still bounds the loop to seconds.
 _ZERO_PROGRESS_DELEGATION_CAP = 3
 # Halt the autonomous solve after this many consecutive capability steps that add NO new achieved effect
 # (the ledger doesn't grow) — a stall detector so a dead/unsatisfiable hop (e.g. a dcsync that keeps failing)
@@ -1373,8 +1372,7 @@ _STOP_NOTICE_BY_REASON = {
     STOP_REASON_OPERATOR: "\n🛑 Session stopped by operator.\n",
     # Self-contained ON PURPOSE. The backstop composes a fuller explanation at the Supervisor node,
     # but the halt ends the graph before it streams, so an operator sees only this. A first version
-    # said "see the explanation above" and pointed at nothing — Russel caught it in channel 23. A
-    # halt notice cannot depend on another message surviving a code path that just terminated.
+    # said "see the explanation above" and pointed at nothing. A halt notice cannot depend on another message surviving a code path that just terminated.
     STOP_REASON_NO_PROGRESS: (
         "\n🛑 **Halted: no progress.** The last three delegations issued no new Mythic task, which is "
         "how Sage detects a stalled loop. Nothing was executed on the target by those attempts.\n\n"
@@ -11622,7 +11620,7 @@ class Model:
             state = await self._build_current_engagement_state()
             # _build_current_engagement_state intentionally omits graph_facts, but actions_from_state derives
             # GPO/credential/managed-secret/ADCS actions FROM graph_facts — without them the frontier is falsely
-            # empty at exactly those walls (Forge HIGH). Refresh-if-stale (so post-collect ingestion is visible)
+            # empty at exactly those walls. Refresh-if-stale (so post-collect ingestion is visible)
             # then attach the cached facts. Fail-open: graph-fact errors must not break the loop.
             if state is not None and self.mythic_client is not None:
                 try:
@@ -11929,7 +11927,7 @@ class Model:
                 targets = list(_es._objective_target_domains(getattr(state, "objective", "") or ""))
                 if targets:
                     # domain-equivalence (lab == lab.example.local), matching real completion semantics — raw
-                    # casefold equality would drop a valid candidate and MISS completion -> over-reach (Forge MEDIUM).
+                    # casefold equality would drop a valid candidate and MISS completion -> over-reach.
                     cands = [c for c in cands
                              if any(_es._domains_equivalent(str(c.get("domain", "")), t) for t in targets)]
                 return bool(cands)
@@ -12326,7 +12324,7 @@ class Model:
             attempted=bool(snap["private_collection_attempted"]),
         )
         # Persist the assistant turn to state so a reused Model on a later interactive turn does not see a
-        # human prompt with no recorded reply (Forge MEDIUM: dangling-turn hazard).
+        # human prompt with no recorded reply (dangling-turn hazard).
         report_msg = AIMessage(content=report, name="Supervisor")
         try:
             _tag_msg(report_msg, self._next_seq())
@@ -12379,10 +12377,10 @@ class Model:
     def _controller_collection_target(self, state):
         """The SPECIFIC live SUPPORTED-AGENT foothold whose CURRENT authority epoch has no verified collection.
         Aligned with `current_access_collection_missing` (scans ALL footholds, not just the first) so we don't
-        re-collect an already-covered authority epoch forever while the missing one is never collected (Forge H3) — but
+        re-collect an already-covered authority epoch forever while the missing one is never collected — but
         ADDITIONALLY filtered to payloads with a collector profile. Selecting an
         unsupported-agent foothold and then rejecting it would burn collection slots and starve a collectable
-        foothold (Forge N2). Returns a Foothold or None."""
+        foothold. Returns a Foothold or None."""
         try:
             from . import engagement_state as _es
         except ImportError:
@@ -12611,7 +12609,7 @@ class Model:
         then DISCOVER the real path via the payload's `ls` output filtered to our token, and download
         THAT exact path. If no token-bearing ZIP exists, SharpHound failed -> no artifact ingested. Ingest is by
         the resolved `file_uuid` (the exact artifact), with `callback_display_id` so `_record_graph_built` flips
-        the collection gate. `ok` is driven by `graph_verified` (Forge H2): only `ingested`/`already_ingested`
+        the collection gate. `ok` is driven by `graph_verified`: only `ingested`/`already_ingested`
         set it True; `ingest_failed`/`uploaded_pending_ingest`/`error` are NOT success, so the collection stays
         'missing' and the controller's per-request retry budget may re-run it (self-heal by composition)."""
         try:
@@ -12674,7 +12672,7 @@ class Model:
 
         if foothold is None:
             # No supported foothold needs collection. (An unsupported-agent foothold that is missing
-            # collection is deliberately not selected — see _controller_collection_target / Forge N2.)
+            # collection is deliberately not selected — see _controller_collection_target.)
             return outcome(False, "no_target", "no supported foothold needs collection")
         adapter = self._controller_collection_adapter(foothold)
         if adapter is None:
@@ -12788,7 +12786,7 @@ class Model:
             token = objective_contract.collection_token
         else:
             import secrets as _secrets
-            token = _secrets.token_hex(8)  # 64-bit anchor (Forge LOW: avoid same-token stale-row collision)
+            token = _secrets.token_hex(8)  # 64-bit anchor (avoid same-token stale-row collision)
         zip_name = f"bloodhound_{token}.zip"
         args = _mt.build_sharphound_arguments(zip_filename=zip_name, domain=scope_domain)
         out_dir = _mt.SHARPHOUND_CANONICAL_OUTPUT_DIRECTORY
@@ -14796,7 +14794,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         self._pair_bounce_count = 0
         self._pair_bounce_mixed = False
         # Fresh control-state loop-breaker per solve (same Model-reuse hazard as the stall counters above) so a
-        # prior objective's blockers never carry into this solve (Forge-caught cross-solve leak).
+        # prior objective's blockers never carry into this solve (cross-solve leak).
         try:
             from . import worker_outcome as _wo_init
         except ImportError:

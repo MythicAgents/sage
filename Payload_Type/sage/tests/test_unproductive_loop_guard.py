@@ -48,7 +48,7 @@ def test_drifting_timestamps_are_normalized_before_hashing():
 
 
 def test_guid_and_ipport_drift_is_normalized():
-    # Outputs that drift only in GUIDs or ephemeral IP:port pairs must normalize identically (Forge D-i).
+    # Outputs that drift only in GUIDs or ephemeral IP:port pairs must normalize identically.
     g = _guard()
     a = g._normalize_volatile_output("session 1A2B3C4D-1111-2222-3333-444455556666 from 10.4.10.22:51514")
     b = g._normalize_volatile_output("session 9F8E7D6C-9999-8888-7777-666655554444 from 10.4.10.22:60001")

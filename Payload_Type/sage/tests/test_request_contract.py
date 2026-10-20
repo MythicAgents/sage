@@ -508,7 +508,7 @@ def test_supervised_guarded_action_reservation_is_exact_and_single_use():
 
 
 def test_supervised_guarded_action_reissue_reopens_after_settled_execution():
-    """Issue #45: a continuation turn may re-issue an already-executed guarded action.
+    """A continuation turn may re-issue an already-executed guarded action.
 
     The reservation ledger admits the exact action once per SETTLED execution: while the
     execution is in flight a duplicate reservation is refused (double-spend guard), but
@@ -584,7 +584,7 @@ def _issue_task_call(call_id: str, callback: int = 7) -> dict:
 
 
 def test_guarded_action_continuation_reissue_requests_fresh_admission():
-    """Assembled issue #45 repro: after a handback, a same-request re-issue re-cards.
+    """Assembled repro: after a handback, a same-request re-issue re-cards.
 
     Before the settled-execution seam, the second reservation was refused with
     "request contract already admitted this guarded action", the handler never ran,

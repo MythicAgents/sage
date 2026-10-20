@@ -104,7 +104,7 @@ def test_anti_no_empty_system_block_survives_sanitize():
 # ---- helper units ------------------------------------------------------------------------------
 def test_sanitize_preserves_cache_control_on_kept_system_block():
     """Anthropic-on-Bedrock prompt caching rides on cache_control breakpoints; stripping blank text blocks must
-    not drop cache_control on a REAL text block (Forge finding)."""
+    not drop cache_control on a REAL text block."""
     m = _bare()
     content = [{"type": "text", "text": "You are Sage", "cache_control": {"type": "ephemeral"}}]
     out = m._sanitize_messages([SystemMessage(content=content), HumanMessage(content="hi")])

@@ -200,7 +200,7 @@ def test_no_progress_halt_on_changing_useless_actions():
 
 
 def test_string_failure_result_is_blocker_not_silent_success():
-    """THE critical wiring landmine (Forge #1): the real execute_capability returns a JSON STRING. A blocked
+    """THE critical wiring landmine: the real execute_capability returns a JSON STRING. A blocked
     capability returned as a string must be parsed as a FAILURE and reach STATUS_BLOCKED — never coerced to a
     silent success. (Unit fakes returning dicts hid this; this fake returns the real string shape.)"""
     import json as _json
@@ -222,7 +222,7 @@ def test_string_failure_result_is_blocker_not_silent_success():
 
 
 def test_ok_false_but_verified_effect_counts_as_progress():
-    """Over-suppression guard (Forge #3): verify-by-probe overrides self-report. An action reporting ok=False
+    """Over-suppression guard: verify-by-probe overrides self-report. An action reporting ok=False
     whose expected effect DOES land is PROGRESS — the loop-breaker must not STOP it as a repeated blocker."""
     w = World({"da:north"})
     plan = [("da:north", "dcsync-krbtgt", "krbtgt-hash:north"),
@@ -346,7 +346,7 @@ def test_malformed_zero_retry_trajectory_payload_is_advisory_only():
 
 
 def test_route_discovery_candidate_must_pass_preconditions():
-    """Forge #2: an LLM route-discovery candidate is precondition-checked before execute, so a bad suggestion
+    """An LLM route-discovery candidate is precondition-checked before execute, so a bad suggestion
     cannot start a loop. Unmet precondition -> rejected -> clean halt, execute never called."""
     w = World({"da:north"})  # krbtgt-hash:north is ABSENT
     executed = []
@@ -401,7 +401,7 @@ def test_explicit_policy_cannot_fall_back_to_route_discovery():
 
 
 def test_execute_exception_is_clean_blocker_not_crash():
-    """Forge #5: a throwing live seam becomes a diagnostic halt, never a traceback escaping run()."""
+    """A throwing live seam becomes a diagnostic halt, never a traceback escaping run()."""
     w = World({"remote-exec:braavos@essos.local"})
 
     def boom(action):
@@ -733,7 +733,7 @@ def test_collection_peer_invalid_policy_selection_has_no_effect(disposition, sel
 
 
 def test_no_op_success_is_no_progress_not_blocked():
-    """Forge NEW-4 regression: a self-reported SUCCESS that verifies no effect must halt as NO_PROGRESS (at the
+    """Regression: a self-reported SUCCESS that verifies no effect must halt as NO_PROGRESS (at the
     no-effect ceiling), NOT be mislabeled a terminal blocker. (Decoupling epoch from outcome classification.)"""
     w = World({"da:north"})
 
@@ -751,7 +751,7 @@ def test_no_op_success_is_no_progress_not_blocked():
 
 
 def test_async_seam_timeout_halts_cleanly():
-    """Forge NEW-2: a hung ASYNC execute is bounded by seam_timeout_s and becomes a clean blocker, never an
+    """A hung ASYNC execute is bounded by seam_timeout_s and becomes a clean blocker, never an
     unbounded hang. Exercises the timeout path that the default (None) config leaves untested."""
     import asyncio as _asyncio
     w = World({"remote-exec:braavos@essos.local"})
@@ -789,7 +789,7 @@ def test_absolute_wall_deadline_clamps_a_longer_async_seam_timeout():
 
 
 def test_budget_meter_failure_fails_closed():
-    """Forge NEW-5: if the token/clock meter raises, the ceiling must fail CLOSED (halt), never silently
+    """If the token/clock meter raises, the ceiling must fail CLOSED (halt), never silently
     disable the last-resort runaway guard."""
     w = World({"da:north"})
 
@@ -853,7 +853,7 @@ def test_unbounded_config_still_times_out_a_hung_seam():
 
 
 def test_route_candidate_with_no_preconditions_rejected():
-    """Forge NEW-1: an LLM route candidate with empty/missing preconditions is rejected (all([]) is vacuously
+    """An LLM route candidate with empty/missing preconditions is rejected (all([]) is vacuously
     true), so an unconditional ad-hoc action cannot be admitted and start a loop."""
     w = World({"da:north"})
     executed = []

@@ -13,7 +13,7 @@ blindly re-delegating.
 This module is PURE and OFFLINE — no Sage runtime imports, no live range, no I/O. The langgraph supervisor and
 worker wire into it in a later step; this is the testable contract + decision logic first.
 
-Design notes baked in from the Codex/Grok reviews of the reprioritization plan:
+Design notes:
   - Outcome typing is a VERSIONED contract (CONTRACT_VERSION), serialized across the agent boundary — not an
     internal enum. A future field add bumps the version.
   - The fingerprint is designed WITH the revision model (not after): a fingerprint is

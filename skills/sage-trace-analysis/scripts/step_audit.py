@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Throwaway (gitignored) — reconstruct converged run #2's action sequence to find step-inefficiency.
-Pulls Mythic tasks issued during the run window and summarizes the command sequence + redundancy."""
+"""Reconstruct a run's Mythic action sequence to find step-inefficiency.
+Pulls Mythic tasks issued after a given task id and summarizes the command sequence + redundancy."""
+import argparse
 import asyncio
 import sys
 from pathlib import Path
@@ -10,10 +11,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "Payload_Type" / "s
 from evals.harness import resolve_password, login_to_mythic  # noqa: E402
 from mythic import mythic  # noqa: E402
 
-# Run #2 was task 1872; its sub-tasks on the footholds have higher ids. Grab everything after ~1872.
+# A run's sub-tasks on the footholds have higher ids than the task that started it.
 Q = """
-query RunTasks {
-  task(where: {id: {_gt: 1872}}, order_by: {id: asc}, limit: 200) {
+query RunTasks($after: Int!, $limit: Int!) {
+  task(where: {id: {_gt: $after}}, order_by: {id: asc}, limit: $limit) {
     display_id
     command_name
     status
@@ -25,11 +26,11 @@ query RunTasks {
 """
 
 
-async def main():
+async def main(after_task: int, limit: int):
     c = await login_to_mythic(resolve_password())
-    r = await mythic.execute_custom_query(c, Q)
+    r = await mythic.execute_custom_query(c, Q, {"after": after_task, "limit": limit})
     tasks = r.get("task", [])
-    print(f"=== {len(tasks)} Mythic sub-tasks issued during run #2 ===\n")
+    print(f"=== {len(tasks)} Mythic sub-tasks issued after task {after_task} ===\n")
     cmd_counts = Counter()
     status_counts = Counter()
     for t in tasks:
@@ -51,4 +52,9 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--after-task", type=int, required=True,
+                        help="Mythic task id that started the run; tasks with higher ids are audited")
+    parser.add_argument("--limit", type=int, default=200, help="maximum tasks to fetch (default 200)")
+    args = parser.parse_args()
+    asyncio.run(main(args.after_task, args.limit))

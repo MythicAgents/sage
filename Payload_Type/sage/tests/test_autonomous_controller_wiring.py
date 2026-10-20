@@ -5,7 +5,7 @@ Run: cd Payload_Type/sage && python3 -m pytest tests/test_autonomous_controller_
 These prove the RUNTIME boundary the controller's own unit tests (which use dict-returning fakes) cannot:
 the real `execute_capability` returns a JSON *string*, and the seam adapters must build a dict payload/inputs
 from a CapabilityAction and parse the string result as a real outcome — NOT coerce a failure into a silent
-success (Forge finding #1). We instantiate a bare Model via object.__new__ and inject only the attributes the
+success. We instantiate a bare Model via object.__new__ and inject only the attributes the
 method touches, so no live Mythic/RabbitMQ is needed.
 """
 import asyncio
@@ -2545,7 +2545,7 @@ def test_invoke_keeps_reused_supervised_prose_on_typed_supervised_graph(monkeypa
 
 
 def test_observe_attaches_graph_facts():
-    """Forge HIGH: the observe seam must attach graph_facts (refresh-if-stale then read the cache) so the
+    """The observe seam must attach graph_facts (refresh-if-stale then read the cache) so the
     frontier can derive GPO/ADCS actions; without them the frontier is falsely empty at those walls."""
     calls = []
 
@@ -2979,7 +2979,7 @@ def test_collect_stops_immediately_when_registered_file_preflight_fails():
 
 
 def test_collect_ingest_failed_is_not_ok():
-    """Forge H2: ingest_failed (graph_verified False) must be ok=False, not a false success."""
+    """Ingest_failed (graph_verified False) must be ok=False, not a false success."""
     m = object.__new__(model.Model)
     m.mythic_client = _CollectMythic({"status": "ingest_failed", "graph_verified": False})
     result = asyncio.run(m._controller_collect(_live_foothold_state("2")))
@@ -2987,7 +2987,7 @@ def test_collect_ingest_failed_is_not_ok():
 
 
 def test_collect_pending_ingest_is_not_ok():
-    """Forge H2: uploaded_pending_ingest (graph_verified False) must be ok=False so the gate stays missing."""
+    """Uploaded_pending_ingest (graph_verified False) must be ok=False so the gate stays missing."""
     m = object.__new__(model.Model)
     m.mythic_client = _CollectMythic({"status": "uploaded_pending_ingest", "graph_verified": False})
     result = asyncio.run(m._controller_collect(_live_foothold_state("2")))
@@ -3086,7 +3086,7 @@ def test_collect_merlin_uses_profiled_revert_command_for_local_token():
 
 
 def test_collect_skips_unprofiled_foothold(monkeypatch):
-    """Forge N2: an unprofiled missing foothold is NOT selected (so no slot is burned). With only a beacon
+    """An unprofiled missing foothold is NOT selected (so no slot is burned). With only a beacon
     foothold, the target resolver yields nothing -> no_target, and SharpHound is never even issued."""
     monkeypatch.setattr(model.asyncio, "sleep", _nosleep)
     m = object.__new__(model.Model)
@@ -3294,7 +3294,7 @@ def test_find_token_zip_path_token_absent_returns_empty():
 
 
 def test_find_token_zip_path_ignores_non_matching_zip():
-    """Token disambiguation (Forge LOW): a different run's ZIP on the same dir must NOT be selected."""
+    """Token disambiguation: a different run's ZIP on the same dir must NOT be selected."""
     two_zips = ('{"files":[{"name":"20260622_bloodhound_OTHER999.zip","full_name":'
                 '"C:\\\\Users\\\\Public\\\\20260622_bloodhound_OTHER999.zip","is_file":true},'
                 '{"name":"20260622_bloodhound_ab12cd34.zip","full_name":'
@@ -3320,7 +3320,7 @@ def test_find_token_zip_path_handles_merlin_text_listing():
 
 
 def test_collection_target_picks_the_missing_foothold_not_the_first():
-    """Forge H3: when foothold A's forest is already collected and B's distinct forest is missing, the target
+    """When foothold A's forest is already collected and B's distinct forest is missing, the target
     must be B — not the first live foothold A. Same-forest same-authority footholds now intentionally dedupe."""
     a = _foothold(callback_id="2", host="hostA", identity="north\\a")
     b = _foothold(callback_id="3", host="hostB", identity="other\\b", forest="other.local")

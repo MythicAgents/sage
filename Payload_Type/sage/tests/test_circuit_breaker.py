@@ -182,7 +182,7 @@ def test_permuted_dcsync_retries_hit_the_circuit_breaker():
     assert calls["n"] == 1, "Mythic must be called only once; the permuted retry is blocked locally"
 
 
-# --- issue #46: parameter rotation defeats the (command, callback, params) failure key ---
+# --- parameter rotation defeats the (command, callback, params) failure key ---
 # Live evidence (channel 4 morning session): make_token+ldap_query pairs with rotated
 # credentials failed at least four times INSIDE one long request, and no breaker text
 # appeared anywhere. Every rotation is a fresh failure key, so the param-keyed circuit

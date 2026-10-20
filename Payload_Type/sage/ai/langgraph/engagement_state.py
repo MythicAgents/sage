@@ -1703,7 +1703,7 @@ def render_engagement_state(state: EngagementState) -> str:
             elif status in {"failed", "blocked", "legacy_unverified"}:
                 blocked_hops.append((sort_key, f"- {status}: {technique} → {target}: {effect}"))
 
-        # #58 pathfinding-first: surface the read-only BloodHound path probe (does a path to the
+        # Pathfinding-first: surface the read-only BloodHound path probe (does a path to the
         # objective domain exist from what we control?) so the plan anchors on the graph, not recalled
         # tradecraft. Advisory only — these facts carry no enforcement weight.
         path_lines: list[tuple[str, str]] = []

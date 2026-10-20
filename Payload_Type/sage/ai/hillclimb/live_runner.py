@@ -164,7 +164,7 @@ class LiveRunner:
         # from the SAME clean range. It receives BOTH the config AND the run's engagement token so the operator
         # can restart Sage with the per-config settings (the prompt/model-overlay knob) AND with
         # SAGE_ENGAGEMENT_ID=token — required, because the harness subprocess env never reaches the persistent
-        # Sage process (Forge 2026-06-20). If it returns a callback id, that becomes the new sage_cb. None = no
+        # Sage process. If it returns a callback id, that becomes the new sage_cb. None = no
         # reset (dry/test, or caller resets externally).
         self.reset_fn = reset_fn
 
@@ -182,7 +182,7 @@ class LiveRunner:
         token = token or self._mint_token(config, scenario)
         env = dict(os.environ)
         env.update(getattr(config, "env", {}) or {})
-        # The token keys this run's ledger + trajectory store. CRITICAL (Forge 2026-06-20): these env vars sit
+        # The token keys this run's ledger + trajectory store. CRITICAL: these env vars sit
         # on the HARNESS subprocess, which is only a Mythic CLIENT — they do NOT reach the persistent Sage
         # process that actually writes the ledger (Sage freezes its own SAGE_ENGAGEMENT_ID at its startup). For
         # C1 ground truth to read THIS run's ledger, the RESET must restart Sage with SAGE_ENGAGEMENT_ID=token

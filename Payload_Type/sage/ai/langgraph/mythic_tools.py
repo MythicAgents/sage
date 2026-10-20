@@ -1851,7 +1851,7 @@ class MythicTools:
         # parameter permutations — the cause of the 2.47M-token context explosion on
         # 2026-06-01 (rev2self issued 7x, whoami 4x, all failing).
         self._task_failure_counts: dict[tuple, int] = {}
-        # Rotation-proof shape cap (issue #46): the param-keyed breaker above misses a command
+        # Rotation-proof shape cap: the param-keyed breaker above misses a command
         # that keeps failing with a DIFFERENT parameter variant each time — the channel-4
         # make_token+ldap_query rotation (every variant is a fresh key, so no count ever
         # reached 2, and the D3 repeat-failure flag never saw a repeat). This shape counter
@@ -1930,7 +1930,7 @@ class MythicTools:
         # hop (suggest-on-known; blocking stays conservative / unknown != false).
         self._engagement_graph_facts: list = []
         self._engagement_graph_facts_ts: str | None = None
-        # #58: objective+coverage key of the last path-shaped probe, so it fires at most once per
+        # Objective+coverage key of the last path-shaped probe, so it fires at most once per
         # objective/coverage horizon (re-fires only when the objective text or covered domains change).
         self._objective_path_probe_key: str | None = None
         # Exact per-process Kerberos ticket forge command strings emitted by build_capability_commands. The
@@ -2081,7 +2081,7 @@ class MythicTools:
         return counts
 
     def reset_request_loop_guards(self) -> None:
-        """Same-request loop-guard window reset (issue #46). Called when a NEW request
+        """Same-request loop-guard window reset. Called when a NEW request
         contract binds (and directly by request-boundary harnesses): the rotation-proof
         (command, callback) shape cap counts failures within the current request only,
         so a fresh request — operator steering or a new objective — starts clean."""
@@ -2098,7 +2098,7 @@ class MythicTools:
         prior = getattr(self, "_request_contract", None)
         if prior is None or getattr(prior, "digest", "") != contract.digest:
             self._active_approval_claim = None
-            # Same-request loop-guard window (issue #46): the rotation-proof shape cap counts
+            # Same-request loop-guard window: the rotation-proof shape cap counts
             # failures of a (command, callback) pair within the CURRENT request only. A fresh
             # request — operator steering or a new objective — starts it clean.
             self.reset_request_loop_guards()
@@ -2830,9 +2830,8 @@ class MythicTools:
                 # ISC-66: record approval-coverage denials the way authority (:4594) and liveness
                 # (:4631) already do. Without this `_last_effect_denial` stays unset, so
                 # `Model._handle_reproposal_after_denial` — the loop-breaker built for exactly this
-                # — is structurally blind to the whole approval-coverage denial class. That is what
-                # let channel 57 re-card `ticket_cache_list` nine times on 2026-07-28 before Russel
-                # force-stopped it.
+                # — is structurally blind to the whole approval-coverage denial class. Without this,
+                # an approval-coverage denial can re-card the same task until the operator stops it.
                 return self._note_effect_denial(
                     self._approval_effect_blocker(
                         tool_name,
@@ -5169,7 +5168,7 @@ class MythicTools:
             key: row.get(key) for key in
             ("id", "agent_file_id", "filename_utf8", "md5", "sha1", "complete")
         }
-        # An un-contracted filename is open by design (#56): no contract claims it, so it needs no
+        # An un-contracted filename is open by design: no contract claims it, so it needs no
         # hash identity and runs generic. Only a contracted name requires the observed-hash identity.
         if not executable_contracts.recognizes_executable_filename(
             _EXECUTABLE_CONTRACT_ROOT, filename
@@ -6950,7 +6949,7 @@ class MythicTools:
                     # D3 repeat-failure flag: parameter rotation must not hide a repeat.
                     # A failed attempt of this (command, callback) shape already exists, so
                     # the delegation loop containment sees a re-run of a known failure even
-                    # when the failure key itself is fresh (issue #46).
+                    # when the failure key itself is fresh.
                     self._last_issued_task_is_repeat_failure = (
                         self._task_failure_counts.get(
                             self._task_failure_key(command, callback_display_id, parameters),
@@ -7804,7 +7803,7 @@ class MythicTools:
         gate's enforcement state, so this can never newly DEFER a real hop. Best-effort, fail-open."""
         # A forced refresh follows a verified ingest (topology may have changed — e.g. a parent domain's DC
         # just became visible). Invalidate the per-domain DC + domain-SID caches so a stale pre-collection
-        # result (e.g. a child DC cached for a parent domain, or a pre-rebuild SID) is never served (Forge #2/#5).
+        # result (e.g. a child DC cached for a parent domain, or a pre-rebuild SID) is never served.
         if force:
             self._domain_controller_cache = {}
             self._domain_sid_cache = {}
@@ -7929,7 +7928,7 @@ class MythicTools:
                 except Exception:
                     pass
 
-            # #58 pathfinding-first: when BloodHound has data AND the objective is a path-shaped ask,
+            # Pathfinding-first: when BloodHound has data AND the objective is a path-shaped ask,
             # ask the graph ONCE per objective whether a path exists from the controlled principals to
             # each covered domain, and surface the answer (found / no-path) as an advisory fact the
             # planner sees first. Strictly gated on data presence (covered_domains) and a path-shaped
@@ -9316,7 +9315,7 @@ class MythicTools:
         """True ONLY for DS_DRA_ACCESS_DENIED (a real replication-RIGHTS denial): hresult 0x2105 / 8453, or
         explicit access-denied text. NOTE: 0x20f7 / 8439 is DS_DRA_BAD_DN (a malformed DN / name-resolution
         error — fix the /user DN, e.g. qualify with the NETBIOS short name), NOT a rights denial, so it must
-        NOT downgrade a rights hop. (Forge 2026-06-12: the first version keyed on the wrong hresult.)"""
+        NOT downgrade a rights hop."""
         if "0x00002105" in low or "0x2105" in low or "ds_dra_access_denied" in low:
             return True
         if "replication access was denied" in low:
@@ -17063,7 +17062,7 @@ class MythicTools:
         # c.domain / g.domain == the queried domain. The previous `c.name ENDS WITH '.<domain>'` clause also
         # matched CHILD-subdomain DCs (e.g. DC01.CHILD.ROOT.EXAMPLE.LOCAL matched 'root.example.local'),
         # so resolving a PARENT domain could return the child DC and break cross-domain dcsync/proof. Range-
-        # agnostic (Silas/Forge confirmed).
+        # agnostic.
         query = (
             "MATCH (c:Computer)-[:MemberOf*1..]->(g:Group) "
             "WHERE g.objectid ENDS WITH '-516' AND ("
@@ -19096,7 +19095,7 @@ class MythicTools:
             # verified earlier, but if this is a NEW access key (e.g. host re-collected after a privilege
             # change, identical graph bytes), the graph-built hop for THIS key may not exist yet — without
             # recording it the collection gate stays 'missing' and the caller re-collects the identical ZIP in
-            # a loop (Forge N3). Best-effort, fail-open.
+            # a loop. Best-effort, fail-open.
             covered_domains = await _bloodhound_collected_domains()
             try:
                 await self._record_graph_built(
@@ -20461,7 +20460,7 @@ class MythicTools:
         SAME name, so we reuse the existing registration instead of uploading a duplicate. A recompiled
         binary has a new hash and still uploads. Mythic tracks md5/sha1 on `filemeta`."""
         # Require BOTH md5 AND sha1 to match (not OR — a single-hash match widens the collision/poison
-        # surface, Forge 2026-06-12), and require the file to be COMPLETE (a partial/interrupted upload
+        # surface), and require the file to be COMPLETE (a partial/interrupted upload
         # carries the hash but its bytes aren't fully on the server — reusing it breaks a later execute) and
         # NOT a payload (is_payload) or agent-download.
         if self.client is None or not (md5 and sha1):

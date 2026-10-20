@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Throwaway (gitignored) — board state before the converged run: active callbacks + liveness."""
+"""Board state before a run: active callbacks + liveness."""
 import asyncio
 from pathlib import Path
 import sys

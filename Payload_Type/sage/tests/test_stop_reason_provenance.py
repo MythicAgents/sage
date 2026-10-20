@@ -218,7 +218,7 @@ def _request_contract(request_id):
 
 
 def test_a_new_request_clears_a_stale_halt():
-    """The cycle Russel hit: a halt on one turn silently disabled every later turn on that channel.
+    """A halt on one turn silently disabled every later turn on that channel.
 
     `_stop_requested` was set to False in exactly one place — `__init__` — so a per-channel Model that
     halted once stayed halted forever, and the next request either crashed on the unassigned `result`

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Throwaway (gitignored) — mine ALL Phoenix issue_task tool spans → per-command failure table.
+"""Mine ALL Phoenix issue_task tool spans → per-command failure table.
 
 Answers: across every run, which Mythic command invocations fail, with what failure CLASS, so we can
 size the deterministic command-construction layer against real data instead of running more solves.

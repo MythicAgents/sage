@@ -1,6 +1,6 @@
 """Offline tests for the typed worker-outcome control contract (P0). No live range; pure decision logic.
 
-The load-bearing tests are the two the Codex/Grok reviews demanded:
+The load-bearing tests are these two:
   - after the same blocker repeats at the same state, the supervisor must NOT re-delegate (kills the 1116 loop);
   - a fingerprint must NOT over-suppress a legitimate retry after observable state changed.
 """
@@ -141,7 +141,7 @@ def test_progress_between_blockers_is_not_over_suppressed():
     assert d2 != Decision.STOP    # different epoch -> legitimate fresh attempt, not over-suppressed
 
 
-# --- LoopBreakerState: per-solve state machine (the Model glue; covers the two Forge-caught edges) ---
+# --- LoopBreakerState: per-solve state machine (the Model glue; covers two edge cases) ---
 
 def _blocked_result():
     return {"ok": False, "capability": "adcs-certificate-auth", "reason": "needs CA key"}
@@ -157,7 +157,7 @@ def test_loop_breaker_halts_on_repeated_blocker_with_fresh_turn_keys():
 
 
 def test_loop_breaker_ignores_empty_turn_key():
-    # Forge finding 2: an unkeyed observation must never be counted (else a same-turn double-fire false-halts).
+    # An unkeyed observation must never be counted (else a same-turn double-fire false-halts).
     st = wo.LoopBreakerState()
     assert wo.observe_capability_outcome(st, "x", {"ok": False, "reason": "r"}, "") is False
     assert wo.observe_capability_outcome(st, "x", {"ok": False, "reason": "r"}, "") is False
@@ -172,7 +172,7 @@ def test_loop_breaker_dedups_same_turn_key():
 
 
 def test_loop_breaker_fresh_state_has_no_cross_solve_leak():
-    # Forge finding 1: a new solve gets a fresh LoopBreakerState, so the first block in solve 2 must NOT halt.
+    # A new solve gets a fresh LoopBreakerState, so the first block in solve 2 must NOT halt.
     st1 = wo.LoopBreakerState()
     wo.observe_capability_outcome(st1, "x", _blocked_result(), "a")
     assert wo.observe_capability_outcome(st1, "x", _blocked_result(), "b") is True   # halts in solve 1

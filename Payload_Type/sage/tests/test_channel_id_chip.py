@@ -1,7 +1,7 @@
 """ISC-68 — the chat header exposes the Mythic channel ID.
 
-Mythic's UI surfaces no readable channel id, which made "stay in chat 57" an instruction Russel
-could not follow, and makes log correlation guesswork (thread keys are `<channel>:generation:<uuid>`).
+Mythic's UI surfaces no readable channel id, which makes "stay in this chat" an instruction an
+operator cannot act on, and makes log correlation guesswork (thread keys are `<channel>:generation:<uuid>`).
 """
 import sys
 from pathlib import Path

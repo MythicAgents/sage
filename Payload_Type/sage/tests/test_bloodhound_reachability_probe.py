@@ -9,9 +9,8 @@ first real question.
 Two properties:
 
 * A read actually happens before the claim is made, and its failure withholds the claim.
-* The failure says WHICH part of the configuration is wrong. Russel's requirement when he asked for
-  this: "Connection closed" and "HTTPError" are technically accurate and operationally useless, which
-  is the same defect this whole ISA is about.
+* The failure says WHICH part of the configuration is wrong. "Connection closed" and "HTTPError"
+  are technically accurate and operationally useless.
 
 The probe goes through the MCP session rather than Sage calling BloodHound CE directly, because when
 the server reads credentials from its own directory `.env` Sage never sees them — a direct probe

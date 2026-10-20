@@ -2705,7 +2705,7 @@ def test_standalone_graph_refresh_reads_current_domain_metadata(assembled_ingest
 def test_path_shaped_objective_fires_the_pathfinding_probe_once(
     assembled_ingest_graph_path, monkeypatch,
 ):
-    # #58: a path-shaped objective with BloodHound data present probes the graph for a path to the
+    # A path-shaped objective with BloodHound data present probes the graph for a path to the
     # covered domain, surfaces the result, and fires AT MOST ONCE per objective/coverage horizon.
     path = assembled_ingest_graph_path
     graph_reconciler = importlib.import_module("ai.langgraph.graph_reconciler")

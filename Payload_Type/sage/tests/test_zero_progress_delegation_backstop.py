@@ -1,9 +1,8 @@
 """ISC-59/60/61 — the cause-agnostic no-progress delegation backstop.
 
-Regression for the supervised re-approval livelock Russel force-stopped on 2026-07-28
-(Mythic channel 56): `Mythic_Operator` returned zero messages after a HITL-approved `whoami`
-that had already SUCCEEDED, so the Supervisor re-delegated the identical objective and the
-operator was re-carded ~12 times.
+Regression for the supervised re-approval livelock: `Mythic_Operator` returned zero messages after
+a HITL-approved `whoami` that had already SUCCEEDED, so the Supervisor re-delegated the identical
+objective and the operator was re-carded ~12 times.
 
 Three distinct causes have produced this one symptom (dead callback, contract self-denial,
 lost handback), so these tests assert the guard keys on the SYMPTOM — zero progress — and
@@ -44,8 +43,8 @@ def _apply_backstop(model, node_name: str, new_messages_from_agent: list):
     return new_messages_from_agent
 
 
-def test_cap_is_three_per_russel():
-    """N=3, chosen by Russel 2026-07-28. Guards against a silent retune."""
+def test_cap_is_three():
+    """N=3 is deliberate. Guards against a silent retune."""
     assert _ZERO_PROGRESS_DELEGATION_CAP == 3
 
 

@@ -155,7 +155,7 @@ def _decoded_args(call: dict[str, Any]) -> Any:
 def is_status_poll(call: dict[str, Any]) -> bool:
     """A repeated async-status check is legitimate work, not waste.
 
-    Ratified by Russel 2026-08-29. Measured across the eight Gate 1P shipping arms: of 197 exact
+    Measured across the eight Gate 1P shipping arms: of 197 exact
     repeats, 37 were `file_upload` calls with `info_type: "status"` polling a BloodHound ingest job
     to completion, and 160 were byte-identical `cypher_query` / `domain_info` re-runs against an
     unchanged graph. Only the second class is a defect. Counting polls as invalid understated the

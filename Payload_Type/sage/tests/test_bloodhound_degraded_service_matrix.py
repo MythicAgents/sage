@@ -1,7 +1,7 @@
 """What a `hello` does when BloodHound is unavailable, across every way it can be unavailable.
 
-Russel's original report was that Sage should start and work without the BloodHound MCP and should
-not refuse a `hello`. Chasing the single case he hit produced two hypotheses, both falsified, and no
+Sage should start and work without the BloodHound MCP and should not refuse a `hello`. Chasing a
+single reported case produced two hypotheses, both falsified, and no
 reproduction — which is the argument for a matrix rather than another example. Five ways BloodHound
 can be missing times three channel modes, so the answer is a property of the system instead of the
 one cell somebody happened to try.

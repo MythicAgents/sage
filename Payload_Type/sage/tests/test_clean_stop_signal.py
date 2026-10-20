@@ -41,7 +41,7 @@ def test_objective_reached_but_timeout_is_not_clean_stop():
 
 
 def test_objective_reached_but_not_recognized_is_not_clean_stop():
-    # Forge hole: a normal finish lands on Mythic's default "success"/"stopped" whether Sage RECOGNIZED the
+    # Hole: a normal finish lands on Mythic's default "success"/"stopped" whether Sage RECOGNIZED the
     # objective or just terminated (step-limit, wandered). Reached-but-not-recognized must NOT count.
     for status in ("success", "stopped", "done"):
         card = fitness.score({"status": status}, _gt(Milestone.KRBTGT_DUMPED, _child_ms(da=True, krbtgt=True)))

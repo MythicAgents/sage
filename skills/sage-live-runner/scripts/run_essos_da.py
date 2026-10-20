@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Throwaway (gitignored) — resume the autonomous solve from the live CASTELBLACK foothold toward essos DA.
+"""Resume the autonomous solve from the live CASTELBLACK foothold toward essos DA.
 
 Command-construction layer (slices 1/2/2b/2c) is loaded in the restarted Sage and validated live, so command
 construction should be reliable across the chain. Drives the documented Trust Walker. The NORTH hop escalates
@@ -16,7 +16,6 @@ import os
 import sys
 import time
 
-import os
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "Payload_Type" / "sage"))
 from evals.harness import resolve_password, login_to_mythic  # noqa: E402

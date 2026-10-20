@@ -116,9 +116,9 @@ def test_happy_path_emits_exactly_one_terminal():
 
 
 def test_self_halt_terminal_is_not_complete_and_lands_in_main_window():
-    """A self-halt must (1) record a non-`complete` request status (no operator-facing false success,
-    #50) and (2) surface the terminal in the MAIN chat window even when the last streamed block was a
-    collapsed sub-agent panel (#54 — channel 3 ended entirely inside the Mythic_Operator panel)."""
+    """A self-halt must (1) record a non-`complete` request status (no operator-facing false success)
+    and (2) surface the terminal in the MAIN chat window even when the last streamed block was a
+    collapsed sub-agent panel (a run can otherwise end entirely inside the Mythic_Operator panel)."""
 
     class _HaltModel(_FakeModel):
         def request_terminal_disposition(self):
@@ -142,11 +142,11 @@ def test_self_halt_terminal_is_not_complete_and_lands_in_main_window():
     terminals = chat.terminal_emissions
     assert len(terminals) == 1, f"expected exactly one terminal, got {chat.emissions}"
     terminal = terminals[0]
-    # #50: the request row carries the real disposition, never a false `complete`.
+    # The request row carries the real disposition, never a false `complete`.
     assert terminal["kind"] == "response"
     assert terminal["status"] == "stopped"
     assert terminal.get("complete_request") is True
-    # #54: forced onto the main-window assistant key, not the sub-agent delegation stream.
+    # Forced onto the main-window assistant key, not the sub-agent delegation stream.
     assert terminal["response_key"].startswith("assistant:")
     assert not terminal["response_key"].startswith("agent_text:")
     # The operator sees the halt explanation rather than silence or "Completed.".

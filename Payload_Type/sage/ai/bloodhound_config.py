@@ -125,7 +125,7 @@ def degraded_chat_notice(env: Optional[dict] = None) -> str:
     ordinary conversational turn that WORKED, so it has to inform without hijacking the chat: what is
     unavailable, what still works, and where to fix it, in a few lines.
 
-    Shown once per session (D5, Russel 2026-08-11): the operator saw it on the first degraded turn and
+    Shown once per session: the operator saw it on the first degraded turn and
     does not need telling again, and Mythic already renders a live BloodHound-connected chip at the
     top of the chat, so repetition would be a third copy of a fact that is already on screen.
     """
@@ -140,7 +140,7 @@ def degraded_chat_notice(env: Optional[dict] = None) -> str:
 def autonomous_unavailable_message(reason: Optional[str] = None) -> str:
     """Why an autonomous request was refused, and how to make it possible.
 
-    D6, Russel's call 2026-08-11: an autonomous channel keeps its hard refusal when BloodHound is
+    An autonomous channel keeps its hard refusal when BloodHound is
     unavailable, because a solve reasons over the attack graph and a graph-blind autonomous session
     would act without any way to choose or verify a step. What changes is that the refusal now says
     so. The previous text named an internal invariant ("exact-tool admission") and left an operator
@@ -532,9 +532,9 @@ _TRANSIENT_PROBE_MARKERS = ("timed out", "timeout", "connection reset", "tempora
 def classify_probe_failure(detail: str) -> str:
     """Turn a raw client error into a statement about which variable to fix.
 
-    Russel's requirement when he asked for this probe: the message must say which part of the
-    BloodHound configuration is wrong. "Connection closed" and "HTTPError" do not, and this ISA
-    exists because a technically-accurate error that names nothing actionable is the same as silence.
+    The message must say which part of the BloodHound configuration is wrong. "Connection closed"
+    and "HTTPError" do not, and a technically-accurate error that names nothing actionable is the
+    same as silence.
     """
     lowered = (detail or "").lower()
     for markers, explanation in _PROBE_FAILURE_CLASSES:

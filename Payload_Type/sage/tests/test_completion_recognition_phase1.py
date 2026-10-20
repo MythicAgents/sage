@@ -110,7 +110,7 @@ def test_netbios_forest_label_matches_child_fqdn():
 
 
 def test_cross_forest_same_netbios_label_does_not_complete():
-    # The cross-forest leak (Forge): a live foothold in a DIFFERENT forest that merely shares the NetBIOS
+    # The cross-forest leak: a live foothold in a DIFFERENT forest that merely shares the NetBIOS
     # label "north" must NOT witness in-domain access to north.sevenkingdoms.local. Matching is forest-only.
     state = es.EngagementState(
         objective=CHILD_DA_OBJECTIVE,
@@ -127,7 +127,7 @@ def test_cross_forest_same_netbios_label_does_not_complete():
 
 def test_completes_when_da_and_krbtgt_domain_forms_differ():
     # da: recorded FQDN, krbtgt-hash recorded NetBIOS (record-path disagreement). Domain-equivalent matching
-    # must still complete rather than silently loop forever (the relocated-bug under-reach Forge flagged).
+    # must still complete rather than silently loop forever (the relocated-bug under-reach).
     state = es.EngagementState(
         objective=CHILD_DA_OBJECTIVE,
         footholds=[_foothold(forest="north.sevenkingdoms.local", identity="NORTH\\samwell.tarly")],
@@ -168,7 +168,7 @@ def test_in_domain_da_implies_ds_replication_rights():
 def test_same_netbios_label_cross_forest_does_not_imply_replication():
     # A foothold NORTH\\evil in an UNRELATED forest (north.otherforest.local) + da:north.sevenkingdoms.local
     # must NOT grant ds-replication-rights — FQDN-only matching; the bare "north" label is not trusted (the
-    # cross-forest DCSync hazard Forge caught).
+    # cross-forest DCSync hazard).
     state = es.EngagementState(
         objective=CHILD_DA_OBJECTIVE,
         footholds=[_foothold(forest="north.otherforest.local", identity="NORTH\\evil")],

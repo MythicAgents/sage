@@ -78,7 +78,7 @@ def test_loads_only_the_exact_certify_identity_and_four_enrolled_verbs(certify, 
     renamed = _write_descriptor(tmp_path, json.loads(CERTIFY_CONTRACT.read_text(encoding="utf-8")))
     assert load_executable_contract(renamed, CERTIFY_SHA1).filename == "Certify.exe"
 
-    # Non-pinned identity (#56): the contract loads for any well-formed observed hash (a CI-rebuilt
+    # Non-pinned identity: the contract loads for any well-formed observed hash (a CI-rebuilt
     # binary), since identity is the filename and the inspected hash is advisory provenance.
     assert load_executable_contract(CERTIFY_CONTRACT, "0" * 40).filename == "Certify.exe"
     # A malformed (non-SHA-1) observed hash is still rejected on shape.
@@ -88,7 +88,7 @@ def test_loads_only_the_exact_certify_identity_and_four_enrolled_verbs(certify, 
 
 
 def test_pinned_allowlist_enforces_byte_integrity_while_non_pinned_accepts_any_build(tmp_path):
-    # #56: a contract that pins an integrity allowlist (sealed/eval) accepts only the listed builds;
+    # A contract that pins an integrity allowlist (sealed/eval) accepts only the listed builds;
     # a non-pinned contract (the default) accepts any build of the named tool.
     pinned_hash = hashlib.sha1(b"the one trusted build").hexdigest()
     other_hash = hashlib.sha1(b"a different build").hexdigest()

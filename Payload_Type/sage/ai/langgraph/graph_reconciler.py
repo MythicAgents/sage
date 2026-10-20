@@ -385,7 +385,7 @@ async def probe_path_to_objective(
     proof_envelope: dict[str, Any] | None = None,
 ) -> list[GraphFact]:
     """Ask BloodHound ONCE whether an attack path exists from any controlled principal to each named
-    objective domain (the pathfinding-first probe, cairn #58).
+    objective domain (the pathfinding-first probe).
 
     Emits ``objective-path-found:<domain>`` when a shortestPath exists, ``objective-no-path:<domain>``
     when the graph has data but no path, and emits NOTHING for a domain whose probe could not run

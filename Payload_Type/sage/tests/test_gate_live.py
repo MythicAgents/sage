@@ -70,7 +70,7 @@ def test_shipped_example_configs_load():
 
 def test_uniformly_empty_ground_truth_is_invalid(tmp_path):
     # Offline (no live Sage) every run reads an empty ledger -> zero ground-truth capability. The gate MUST
-    # fail LOUD (INVALID), never emit a confident PASS/FAIL on no data (the Forge B/C catastrophe guard).
+    # fail LOUD (INVALID), never emit a confident PASS/FAIL on no data (the no-data catastrophe guard).
     scenarios = [s for s in goad_scenarios() if s.name == "child-da"]
     configs = [LiveConfig(f"c{i}", env={}) for i in range(3)]
 

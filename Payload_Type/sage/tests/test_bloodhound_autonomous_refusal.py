@@ -1,6 +1,6 @@
 """An autonomous refusal must name BloodHound and say how to fix it.
 
-D6, Russel's call 2026-08-11: an autonomous channel KEEPS its hard refusal when BloodHound is
+An autonomous channel KEEPS its hard refusal when BloodHound is
 unavailable, because a solve reasons over the attack graph to choose and verify each step and a
 graph-blind autonomous session would act with no way to do either. The behaviour is deliberate; the
 message was not. It named an internal invariant — "exact-tool admission" — which tells an operator

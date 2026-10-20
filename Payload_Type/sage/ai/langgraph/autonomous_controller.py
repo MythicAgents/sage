@@ -556,7 +556,7 @@ class AutonomousController:
         """A route-discovery (LLM-proposed) candidate must still pass precondition checking — design §3's
         guarantee that 'a bad LLM suggestion cannot start a loop'. The deterministic frontier was empty, so the
         candidate is novel; we admit it ONLY if it carries EXPLICIT prerequisites that are ALL satisfied by
-        observed state. An empty/missing precondition list is REJECTED (Forge NEW-1): `all([])` is vacuously
+        observed state. An empty/missing precondition list is REJECTED: `all([])` is vacuously
         true, so an ad-hoc unconditional LLM action would otherwise be admitted and could start a loop — and a
         catalog action whose preconditions were truly met would already be in the (here-empty) frontier."""
         try:
@@ -596,7 +596,7 @@ class AutonomousController:
 
     async def _run(self) -> ControllerResult:
         # Per-solve reset (a Sage Model may reuse one controller across solves; never leak a prior objective's
-        # blockers/counters — the cross-solve leak Forge caught in the earlier P0 wiring).
+        # blockers/counters across solves).
         self._loop = wo.LoopBreakerState()
         self._current_cycle = 0  # span attribute only; never read by control flow
         self._collections = 0
@@ -879,7 +879,7 @@ class AutonomousController:
                 result = _parse_result(eres) if est == "ok" else {"ok": False, "reason": f"{est}: {eres}"}
 
                 # 7) verify — re-observe and diff achieved effects; PROGRESS is attributed to THIS action's expected
-                #    effect (not global drift, which unrelated effects could fake — Forge #4).
+                #    effect (not global drift, which unrelated effects could fake).
                 prev = achieved
                 ost, state = await self._seam(lambda: self._observe(), "observe")
                 if ost != "ok" or state is None:
@@ -888,8 +888,8 @@ class AutonomousController:
                 achieved = self._achieved(state)
                 new_effects = sorted(achieved - prev)
                 # PROGRESS is attributed to THIS action's own declared (canonical) effect — NOT to global drift
-                # (unrelated effects landing could otherwise fake progress, Forge #4) and NOT via a global-drift
-                # fallback for effectless actions (Forge NEW-3): an action with no declared effect cannot progress
+                # (unrelated effects landing could otherwise fake progress) and NOT via a global-drift
+                # fallback for effectless actions: an action with no declared effect cannot progress
                 # by definition, so it must register as no-progress and be caught by the loop-breaker / no-effect cap.
                 progressed = bool(expected & set(new_effects))
 
@@ -914,7 +914,7 @@ class AutonomousController:
                     )
 
                 # 8) loop-breaker (worker_outcome): the EPOCH advances on VERIFIED progress (decoupled from the
-                #    self-reported `ok`, Forge #3/NEW-4) while the OUTCOME is classified from the REAL result — so a
+                #    self-reported `ok`) while the OUTCOME is classified from the REAL result — so a
                 #    real retry after a verified state change is not over-suppressed, a self-reported success with no
                 #    verified effect cannot mask a loop, AND a slow/idempotent real success is not mislabeled a
                 #    blocker. Same blocker + same epoch -> STOP (kills the 1116 redelegation tail).

@@ -128,7 +128,7 @@ _ATTACK_PATH_PRIV_NOUNS = (
 
 def objective_seeks_attack_path(objective_text: Any) -> bool:
     """True when the objective asks to find or traverse an attack path, or to reach privilege on a
-    target (the pathfinding-first "path-shaped ask" signal, cairn #58).
+    target (the pathfinding-first "path-shaped ask" signal).
 
     Negation-aware (``do not escalate`` / ``without compromising`` do not count as a positive ask).
     Pure data classification; never raises. This only decides whether a read-only BloodHound path

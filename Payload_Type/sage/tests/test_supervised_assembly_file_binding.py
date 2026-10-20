@@ -76,7 +76,7 @@ def test_valid_enrolled_bytes_file_route_directs_to_registered_typed_route(
 
 
 def test_renamed_enrolled_bytes_reach_new_assembly_group(tmp_path, monkeypatch):
-    # Filename identity (#56): a binary whose name is not claimed by any contract is un-contracted and
+    # Filename identity: a binary whose name is not claimed by any contract is un-contracted and
     # runs open through the New Assembly group, even when its bytes match an enrolled tool. Byte-level
     # "enrolled bytes smuggled under a different name" detection is intentionally dropped -- it is
     # incompatible with CI rebuilds (which change the hash, not the name) and un-contracted tools are
@@ -109,7 +109,7 @@ def test_recognized_filename_with_unknown_bytes_fails_before_file_sink(
     by_uuid[row["agent_file_id"]] = unknown
     assert descriptor["binary"]["sha1"] != hashlib.sha1(unknown).hexdigest()
 
-    # Filename identity (#56): the name "Certify.exe" is claimed by the contract, so an inline-File
+    # Filename identity: the name "Certify.exe" is claimed by the contract, so an inline-File
     # upload of those bytes (even changed/rebuilt bytes) is refused -- an enrolled executable must go
     # through the registered selector and typed schema, regardless of its exact bytes.
     result, sink = _direct_issue(client, row, "find")

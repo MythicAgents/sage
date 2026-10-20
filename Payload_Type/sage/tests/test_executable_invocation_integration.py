@@ -577,7 +577,7 @@ def test_known_raw_legacy_malicious_and_mixed_forms_fail_before_native_issue(tmp
 
 
 def test_filename_identity_accepts_a_rebuilt_binary_and_ignores_an_unclaimed_name(tmp_path, monkeypatch):
-    # #56: contract identity is the filename, not the bytes.
+    # Contract identity is the filename, not the bytes.
     exact = b"same exact enrolled bytes"
     client, _, root, rows, _ = _fixture(
         tmp_path, monkeypatch,
@@ -592,7 +592,7 @@ def test_filename_identity_accepts_a_rebuilt_binary_and_ignores_an_unclaimed_nam
     assert binding is None
 
     # A CI-rebuilt Certify.exe (same name, DIFFERENT bytes/hash) resolves its contract and validates,
-    # instead of being hard-blocked -- the core #56 fix. The rebuild is simulated by Mythic's file
+    # instead of being hard-blocked -- the core of filename identity. The rebuild is simulated by Mythic's file
     # metadata reporting a NEW SHA-1 (the binary is never downloaded/rehashed). The binding records
     # that observed SHA-1.
     rebuilt_sha1 = hashlib.sha1(b"freshly rebuilt certify bytes with a new hash").hexdigest()
@@ -718,7 +718,7 @@ def test_parser_output_is_construction_only_for_exact_enrolled_binding(tmp_path,
             "inline_assembly", "Certify.exe   enum-cas", 7
         ))
     assert "required option" in first.lower()
-    # Filename identity (#56): the claimed "Certify.exe" is refused through the inline route and must
+    # Filename identity: the claimed "Certify.exe" is refused through the inline route and must
     # use the registered selector; it is never issued as a generic inline task.
     assert "STOP" in second and "enrolled executable" in second
     assert calls["issued"] == 1

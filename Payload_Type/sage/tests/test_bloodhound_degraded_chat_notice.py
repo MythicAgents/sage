@@ -1,9 +1,9 @@
 """The operator learns BloodHound is unavailable in the chat, once, without the turn breaking.
 
 The diagnostic this ISA raised to WARNING lands in the container log, which an operator has to go
-looking for. F4 puts it where they already are. D5 (Russel, 2026-08-11) sets the cadence at once per
-session: they saw it on the first degraded turn, and Mythic already renders a live BloodHound chip at
-the top of the chat, so repeating it per turn would be a third copy of a fact that is on screen.
+looking for. This notice puts it where they already are, once per session: they saw it on the
+first degraded turn, and Mythic already renders a live BloodHound chip at the top of the chat, so
+repeating it per turn would be a third copy of a fact that is on screen.
 
 Three properties, and the third is the one that matters most: a notice about a degraded OPTIONAL
 dependency must never be the thing that breaks a working turn. Sage went fully down on 2026-08-10
