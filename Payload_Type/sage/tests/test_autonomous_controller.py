@@ -200,7 +200,7 @@ def test_no_progress_halt_on_changing_useless_actions():
 
 
 def test_string_failure_result_is_blocker_not_silent_success():
-    """THE critical wiring landmine: the real execute_capability returns a JSON STRING. A blocked
+    """The critical wiring hazard: the real execute_capability returns a JSON STRING. A blocked
     capability returned as a string must be parsed as a FAILURE and reach STATUS_BLOCKED — never coerced to a
     silent success. (Unit fakes returning dicts hid this; this fake returns the real string shape.)"""
     import json as _json

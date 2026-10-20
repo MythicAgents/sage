@@ -179,7 +179,7 @@ class ScoreCard:
     # discriminating signal once capability saturates: reach-the-objective-and-stop (status "stopped") beats
     # reach-the-objective-and-loop-to-timeout, and stopping BEFORE the objective earns nothing (no under-reach
     # reward). The ground-truth half is Goodhart-safe (probe-derived milestone, never the agent's self-report).
-    # LIMITATION: the "clean status" half is NOT yet recognition-gated — on the harness
+    # Limitation: the "clean status" half is NOT yet recognition-gated — on the harness
     # path a normal solve ends with Mythic's default "success"/"stopped" whether Sage RECOGNIZED the objective
     # or merely terminated (step-limit, wandered-then-ended). It currently discriminates "finished before the
     # wall-clock" vs "timeout", which catches the present over-reach bug but is NOT safe to OPTIMIZE against until

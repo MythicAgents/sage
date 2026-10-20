@@ -2496,7 +2496,7 @@ class _EngagementStateMiddleware(AgentMiddleware):
 class _MessageSanitizerMiddleware(AgentMiddleware):
     """Provider-agnostic message-integrity guard on EVERY model call inside create_agent's react loop.
 
-    WHY THIS EXISTS: a native `ChatBedrock` (InvokeModel) call under the Supervisor can fail with
+    Why this exists: a native `ChatBedrock` (InvokeModel) call under the Supervisor can fail with
     `ValidationException: system: text content blocks must be non-empty`. Two other defenses do
     NOT cover that path: (1) `_sanitize_messages` only cleans the channel lists the graph passes in — it never
     sees the messages create_agent assembles internally across a multi-step react loop; (2) the
@@ -8667,7 +8667,7 @@ class Model:
         except Exception as e:
             logger.debug(f"Engagement ledger key resolution skipped during initialization: {e}")
 
-        # CRITICAL: After RPC call, check if logger still has handlers
+        # After RPC call, check if logger still has handlers
         ensure_logger_initialized()
         logger.info("✅ Mythic client logged in, starting dynamic data fetch")
         force_flush_all_handlers()
@@ -8827,7 +8827,7 @@ class Model:
         Wrap a create_agent runnable so it only sees & updates its own message list
         while keeping a global 'messages' list for tool compatibility.
 
-        CRITICAL: Worker agents (non-Supervisor) will copy their responses back to the
+        Worker agents (non-Supervisor) will copy their responses back to the
         Supervisor's channel so the Supervisor can see what work was completed.
         """
         async def _ainvoke(state: SageState | dict, config=None):
@@ -9634,7 +9634,7 @@ class Model:
                 await self._close_delegation(node_name, content=summary_text, status="finished")
                 return Command(goto=END, update=terminal_update)
 
-            # CRITICAL FIX: If this is a worker agent (not Supervisor), copy its response
+            # If this is a worker agent (not Supervisor), copy its response
             # back to the Supervisor's channel AND to the calling agent's channel (if worker-to-worker handoff)
             if node_name != "Supervisor" and state_key != "supervisor_messages":
                 if new_messages_from_agent:
@@ -13720,7 +13720,7 @@ class Model:
         if dangling_tool_calls:
             logger.warning(f"Found {len(dangling_tool_calls)} dangling tool_use blocks - injecting synthetic results")
 
-            # CRITICAL: Insert synthetic ToolMessages RIGHT AFTER their corresponding AIMessages
+            # Insert synthetic ToolMessages RIGHT AFTER their corresponding AIMessages
             # Process in REVERSE order to avoid index shifting issues
             for msg_index, tool_call_id, tool_name in reversed(dangling_tool_calls):
                 logger.info(f"Creating synthetic ToolMessage for tool_use id={tool_call_id}, name={tool_name}")
@@ -14820,7 +14820,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         except Exception:
             pass
 
-        # CRITICAL: Reset recursion flags before each invocation
+        # Reset recursion flags before each invocation
         # Without this, the graph sees stale flags from previous runs and
         # immediately returns with recursion_summary_requested=True, causing
         # the recursion summary to be shown again instead of continuing
@@ -14828,7 +14828,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             logger.debug("Resetting recursion_summary_requested flag before invocation")
             self.state["recursion_summary_requested"] = False
 
-        # CRITICAL: Clean up any dangling tool_use blocks before adding the user's message
+        # Clean up any dangling tool_use blocks before adding the user's message
         # This prevents Anthropic API errors when resuming from recursion limit
         # Note: We don't load from checkpoint here because self.state already contains
         # the full conversation history from the graph's checkpointing mechanism
@@ -15139,7 +15139,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             # Catch recursion limit error and return progress made so far
             logger.warning(f"Recursion limit hit: {e}")
 
-            # CRITICAL: When recursion limit hits, astream() only yielded events for COMPLETED nodes.
+            # When recursion limit hits, astream() only yielded events for COMPLETED nodes.
             # The current node (e.g., Mythic_Operator) was terminated mid-execution, so its messages
             # are NOT in self.state. We MUST restore from checkpoint to get partial progress.
 
@@ -15179,7 +15179,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
 
             logger.info(f"Found {checkpoint_list_count} total checkpoints for this thread")
 
-            # CRITICAL FIX: Most recent checkpoints only have 'messages', not agent-specific channels.
+            # Most recent checkpoints only have 'messages', not agent-specific channels.
             # Agent channels (mythic_operator_messages, etc.) are only in earlier checkpoints
             # from before the node started executing. We need to:
             # 1. Get global 'messages' from LATEST checkpoint (has all accumulated messages)
@@ -15229,7 +15229,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                             break
 
                     if channels_need_rebuild:
-                        # CRITICAL: Rebuild agent-specific channels from global messages
+                        # Rebuild agent-specific channels from global messages
                         # The global messages channel has ALL the work, but agent channels don't
                         # because the node hasn't returned yet. Reconstruct them from message metadata.
                         logger.info("Rebuilding agent-specific channels from global messages...")
@@ -15286,7 +15286,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                                   "generalist_messages", "mcp_manager_messages", "bloodhound_messages", "sandbox_messages"]:
                             logger.info(f"Rebuilt {ch}: {len(self.state[ch])} messages")
 
-                        # CRITICAL: Validate and fix message sequences for Bedrock compatibility
+                        # Validate and fix message sequences for Bedrock compatibility
                         # Bedrock requires that every AIMessage with tool_calls is IMMEDIATELY
                         # followed by ToolMessage(s) with matching tool_call_ids
                         # After rebuilding channels, this requirement might be violated
@@ -15343,7 +15343,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             )
 
             # Add continuation message to state
-            # CRITICAL: Add to BOTH messages AND supervisor_messages so Supervisor can see the summary
+            # Add to BOTH messages AND supervisor_messages so Supervisor can see the summary
             continuation_message_seq = self._next_seq()
             _tag_msg(continuation_message, continuation_message_seq)
             self.state["messages"].append(continuation_message)
@@ -15743,7 +15743,7 @@ def _create_summarize_handback_tool():
         # Mark that we've had a recursion handback from a specialist
         updated_state = {**runtime.state, "recursion_handback": True}
 
-        # CRITICAL FIX: Copy handback summary to supervisor_messages so Supervisor
+        # Copy handback summary to supervisor_messages so Supervisor
         # knows where the worker left off when user says "continue"
         # With operator.add reducer, only provide the NEW message to append
         updated_state["supervisor_messages"] = [tool_message]
@@ -16593,7 +16593,7 @@ def _create_handoff_tool(
         if actual_target_channel_key:
             update_state[actual_target_channel_key] = [acknowledgment, injected_human]
 
-        # CRITICAL: Track who is calling this agent so responses can be copied back
+        # Track who is calling this agent so responses can be copied back
         # Store the calling agent's name in state for response routing
         # We need to detect the current agent from the message history
         current_agent = (

@@ -139,7 +139,7 @@ def test_hop_label():
 
 
 def test_no_drift_with_mythic_tools(monkeypatch, tmp_path):
-    # CRITICAL: the agent (mythic_tools) and the command (engagement_ledger) must resolve the SAME file.
+    # The agent (mythic_tools) and the command (engagement_ledger) must resolve the SAME file.
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     import mythic_tools
     assert mythic_tools._engagement_ledger_file("goad-tw-0607") == el.ledger_path("goad-tw-0607")

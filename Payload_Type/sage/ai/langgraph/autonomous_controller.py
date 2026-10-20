@@ -157,7 +157,7 @@ def _parse_result(value: Any) -> dict:
     """Coerce a capability/collection result into a dict, FAIL-CLOSED. The real `execute_capability` returns a
     JSON *string* (`-> str`), not a dict — so a naive `isinstance(dict)` check would treat every live result
     (success AND failure) as non-dict. A malformed / None / unparseable result must become a BLOCKER, never a
-    silent success (the inverse would convert live failures into successes — the `1116`-class landmine)."""
+    silent success (the inverse would convert live failures into successes — the `1116`-class hazard)."""
     if isinstance(value, dict):
         return value
     if isinstance(value, str):

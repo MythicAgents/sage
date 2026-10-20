@@ -182,7 +182,7 @@ class LiveRunner:
         token = token or self._mint_token(config, scenario)
         env = dict(os.environ)
         env.update(getattr(config, "env", {}) or {})
-        # The token keys this run's ledger + trajectory store. CRITICAL: these env vars sit
+        # The token keys this run's ledger + trajectory store. These env vars sit
         # on the HARNESS subprocess, which is only a Mythic CLIENT — they do NOT reach the persistent Sage
         # process that actually writes the ledger (Sage freezes its own SAGE_ENGAGEMENT_ID at its startup). For
         # C1 ground truth to read THIS run's ledger, the RESET must restart Sage with SAGE_ENGAGEMENT_ID=token

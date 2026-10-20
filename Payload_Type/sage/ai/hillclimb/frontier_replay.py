@@ -10,7 +10,7 @@ already-declared precondition/effect model can carry the proven ESSOS route BEFO
 the controller loop or spend a live run. It is the cheap test of falsifier F3 ("the deterministic frontier is
 empty at a wall autonomous Sage should cross -> the capability model is under-declared").
 
-HONESTY NOTE: the persisted ledger does
+Note: the persisted ledger does
 NOT store footholds, so the runtime live-callback/live-foothold/authenticated predicates are
 absent on replay. `actions_from_state` gates most actions on a live callback, so replaying
 from the bare ledger would UNDER-produce the frontier and yield a falsely pessimistic verdict
