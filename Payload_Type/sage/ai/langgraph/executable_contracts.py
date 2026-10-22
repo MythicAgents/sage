@@ -167,7 +167,8 @@ def _split_option_token(token: str) -> tuple[str | None, str | None]:
 
     A token in none of these option shapes returns (None, None) so the caller fails closed exactly
     as before (an unexpected positional argument). This is a pure syntax split; the name still has
-    to resolve to a real enrolled option (or a declared rename) or it is rejected as unknown."""
+    to resolve to a real enrolled option (or a declared rename) or it is rejected as unknown.
+    """
     if token.startswith("--") and token != "--":
         body = token[2:]
         if "=" in body:
@@ -186,7 +187,8 @@ def _split_option_token(token: str) -> tuple[str | None, str | None]:
 def _looks_like_option_token(token: str) -> bool:
     """Whether a token begins a new option (so it terminates a preceding sequence option). Covers
     both the enrolled double-dash form and the legacy slash form; enrolled sequence VALUES never
-    start with either, so this does not truncate a legitimate value."""
+    start with either, so this does not truncate a legitimate value.
+    """
     return token.startswith("--") or (
         token.startswith("/") and len(token) > 1 and not token.startswith("//")
     )
@@ -232,7 +234,8 @@ class ExecutableContract:
     @property
     def artifact_sha1(self) -> str | None:
         """The inspected REFERENCE hash (provenance), or None. Kept for callers that need a concrete
-        hash for this contract; identity is the filename, so this is not the identity gate."""
+        hash for this contract; identity is the filename, so this is not the identity gate.
+        """
         return self.reference_sha1
 
     @property
@@ -622,7 +625,8 @@ def load_executable_contract(path: str | Path, artifact_sha1: str) -> Executable
     """Load one descriptor and assert its integrity policy against the observed artifact hash.
 
     The hash is validated for shape and, only when the contract pins an allowlist, required to be one
-    of the pinned builds. A non-pinned contract loads for any build of the named tool."""
+    of the pinned builds. A non-pinned contract loads for any build of the named tool.
+    """
     raw, descriptor_sha256 = _read_descriptor(Path(path))
     try:
         descriptor = ContractDescriptor.model_validate(raw)
@@ -642,7 +646,8 @@ def load_contract_for_filename(
     instead of being hard-blocked. Returns None when no contract claims the filename (an un-contracted
     executable, handled open by the caller). Raises ContractValidationError when more than one contract
     claims the same filename, and ExecutableIdentityError when a contract that pins an allowlist rejects
-    the observed bytes."""
+    the observed bytes.
+    """
     if type(filename) is not str or not filename.strip():
         return None
     wanted = filename.strip().casefold()
@@ -666,7 +671,8 @@ def load_contract_for_filename(
 def load_contract_for_artifact(directory: str | Path, artifact_sha1: str) -> ExecutableContract:
     """Find exactly one contract whose reference hash or pinned allowlist contains the artifact hash.
 
-    By-hash lookup retained for strict/eval callers; the runtime uses ``load_contract_for_filename``."""
+    By-hash lookup retained for strict/eval callers; the runtime uses ``load_contract_for_filename``.
+    """
     expected = _checked_sha1(artifact_sha1, label="actual artifact SHA-1")
     matches: list[ExecutableContract] = []
     for path in sorted(Path(directory).glob("*.json")):

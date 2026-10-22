@@ -2,7 +2,8 @@
 verification, and observed-state phase classification. The STRIPS planner-as-gate (the reactive
 precondition gate plus forward-planner hop enumeration) was retired in the engagement-gate retirement;
 what remains derives state and verdicts from achieved effects and live signals, never from closed-world
-precondition planning."""
+precondition planning.
+"""
 
 from dataclasses import dataclass, field
 from typing import Any
@@ -78,7 +79,8 @@ class EngagementState:
 
     def satisfied_predicates(self) -> set[str]:
         """Return predicates satisfied by achieved hops AND live footholds/graph facts, plus logical
-        implications (e.g. da/ea plus a live Kerberos context implies that domain's replication rights)."""
+        implications (e.g. da/ea plus a live Kerberos context implies that domain's replication rights).
+        """
         predicates = self.achieved_effects() | foothold_predicates(self)
         filtered = _filter_live_kerberos_context_predicates(predicates)
         return _expand_implications(filtered)
@@ -156,7 +158,8 @@ def access_context_key(state: "EngagementState", foothold: "Foothold") -> str:
 
     Same-domain Kerberos proof does not create a second epoch after DA is already recorded. This keeps the key
     aligned with the reason to collect: a new graph-visible authority, not an authentication artifact. Pure;
-    never raises."""
+    never raises.
+    """
     try:
         scope = (
             _normalize_key(getattr(foothold, "forest", ""))
@@ -180,7 +183,8 @@ def collection_target_key(
     """Return the durable collect-graph target key for one authority epoch plus one requested scope.
 
     Targeted domain collections append ``|scope:<domain>`` so the same authority epoch can legitimately collect
-    an external trusted domain without overwriting or being suppressed by the current-forest collection."""
+    an external trusted domain without overwriting or being suppressed by the current-forest collection.
+    """
     try:
         access_key = access_context_key(state, foothold)
         if not access_key:
@@ -250,7 +254,8 @@ def graph_domain_has_verified_collection(state: "EngagementState", domain: str) 
 
     This distinguishes an initial baseline collection from an optional recollection after authority changes.
     The latter is useful only when the objective still needs more graph data; it should not preempt an already
-    visible objective-scoped collection or a grounded executable capability."""
+    visible objective-scoped collection or a grounded executable capability.
+    """
     try:
         expected_domain = _normalize_key(domain)
         if not expected_domain:
@@ -288,7 +293,8 @@ def trusted_uncollected_domains(state: "EngagementState") -> list[str]:
     """Return trusted domains visible in the graph but not yet fully collected.
 
     Only trust edges whose source domain is already collected are considered. This avoids chasing stub domains
-    from incomplete graph data. Objective-target domains sort first; remaining candidates are stable-sorted."""
+    from incomplete graph data. Objective-target domains sort first; remaining candidates are stable-sorted.
+    """
     try:
         collected = {
             _normalize_key(_text(getattr(fact, "predicate", ""))[len("domain-collected:"):])
@@ -327,7 +333,8 @@ def _collection_auth_context_effects(state: "EngagementState", foothold: "Footho
     """Canonical active DA/EA authority effects that can change SharpHound graph visibility.
 
     A Kerberos context is only an activation witness for authority in another domain. It is not itself a reason
-    to recollect, and an account-context proof without modeled DA/EA authority is intentionally ignored."""
+    to recollect, and an account-context proof without modeled DA/EA authority is intentionally ignored.
+    """
     callback_id = _normalize_key(getattr(foothold, "callback_id", ""))
     foothold_domain = _normalize_key(getattr(foothold, "forest", ""))
     active_domains: set[str] = {foothold_domain} if foothold_domain else set()
@@ -354,7 +361,8 @@ def foothold_predicates(state: "EngagementState") -> set[str]:
     """Predicates derived ONLY from live footholds and graph facts — NOT from hops.
 
     This is the independent-evidence set used to corroborate a durable (loaded-from-disk) achieved hop:
-    a hop must not corroborate itself, so corroboration consults live signal only."""
+    a hop must not corroborate itself, so corroboration consults live signal only.
+    """
     predicates: set[str] = set()
     for foothold in getattr(state, "footholds", []) or []:
         if not _is_live_target_foothold(foothold):
@@ -419,7 +427,8 @@ def _expand_implications(predicates: set[str]) -> set[str]:
     3. gpo-abuse (effect system:{gpo}) on a GPO that governs a domain (gpo-domain:{gpo}:{D} graph fact)
        -> ds-replication-rights:{D}. The SharpGPOAbuse SYSTEM task grants/holds DS-Replication on the DC
        the GPO governs, so controlling the GPO chains forward to dcsync on that domain (the effect-chained
-       hop the forward planner needs to name after the first graph-derived hop)."""
+       hop the forward planner needs to name after the first graph-derived hop).
+    """
     expanded = set(predicates)
     gpo_domain: dict[str, str] = {}
     live_context_domains = _live_kerberos_context_domains(predicates)
@@ -553,7 +562,8 @@ def corroborate_effect(effect: str, state: "EngagementState") -> bool:
     """Best-effort live corroboration of a durable hop's effect: True iff an INDEPENDENT live signal
     (a foothold-derived or graph-derived predicate) supports the effect. This is the deterministic,
     no-network verifier shipped now. The per-technique read-probe path (engagement_state.verify_effect
-    fed by a live query) is the documented follow-up that plugs into the same verify-on-record seam."""
+    fed by a live query) is the documented follow-up that plugs into the same verify-on-record seam.
+    """
     return _normalize_predicate(effect) in foothold_predicates(state)
 
 
@@ -687,7 +697,8 @@ def _objective_target_domains(objective) -> set:
     """Target domain(s) the objective is about — parsed GENERICALLY from goal phrases ('Domain Admin on X',
     'administrative control of X', 'reach/target/compromise X', 'X forest'). No hardcoded names. Intermediate
     domains merely named in an attack-path description are not goal-phrase-adjacent and are excluded, so
-    reaching them is a milestone, not completion. Returns a (possibly empty) set."""
+    reaching them is a milestone, not completion. Returns a (possibly empty) set.
+    """
     o = str(objective or "").casefold()
     targets: set = set()
     for m in re.finditer(
@@ -817,7 +828,8 @@ def _objective_required_effects(objective, domain) -> set[str]:
     generically from the objective text, with no hardcoded scenario names. Today: an objective that calls for
     dumping/DCSyncing krbtgt requires `krbtgt-hash:{domain}` as an INDEPENDENT witness, so completion is not
     declared on DA alone before the krbtgt material is actually extracted (an under-reach). Returns a
-    (possibly empty) set; empty means admin control of the target domain is itself sufficient."""
+    (possibly empty) set; empty means admin control of the target domain is itself sufficient.
+    """
     o = str(objective or "").casefold()
     domain = _normalize_key(domain)
     required: set[str] = set()
@@ -833,7 +845,8 @@ def _effect_satisfied(required_effect: str, achieved: set[str]) -> bool:
     domain-form differences (NetBIOS vs FQDN) between the demand and the recorded effect — otherwise
     a consistent objective is silently never-completed when two record paths spell the same domain
     differently, an under-reach that leaves the controller looping on verification (e.g.
-    `klist`)."""
+    `klist`).
+    """
     if required_effect in achieved:
         return True
     prefix, sep, dom = required_effect.partition(":")
@@ -851,7 +864,8 @@ def _objective_is_complete(state: "EngagementState", has_next: bool) -> bool:
     admin-control domain matches the objective's parsed TARGET domain; if no target is parseable, fall back to
     'no further grounded hop advances' only for real human-readable objectives. Opaque ledger IDs are not
     objectives, so they must not turn "no modeled next hop" into mission completion. A proven INTERMEDIATE
-    domain with a further hop available is a MILESTONE, not completion — so the climb continues."""
+    domain with a further hop available is a MILESTONE, not completion — so the climb continues.
+    """
     if objective_effects_complete(state):
         return True
     candidates = objective_completion_candidates(state)
@@ -892,7 +906,8 @@ def engagement_phase(state: "EngagementState") -> str:
     """Deterministic phase of the engagement, so the operator stops asking 'should I collect more?':
     FOOTHOLD (no live access) -> COMPLETE-CANDIDATE (recorded admin/control proof) -> EXPLOITATION
     (a grounded hop is already available) -> RECON (no graph and no grounded hop yet) -> BLOCKED (graph but
-    nothing modeled is available). Pure; never raises."""
+    nothing modeled is available). Pure; never raises.
+    """
     try:
         alive = any(getattr(f, "alive", False) for f in getattr(state, "footholds", []) or [])
         if not alive:
@@ -1169,7 +1184,8 @@ def verify_effect(technique: str, target: str, probe_result: dict) -> str:
 
 def _effect_hop(state: EngagementState, effect: str) -> "Hop | None":
     """Return the achieved Hop whose satisfied_effects include `effect`, else None.
-    Like _effect_evidence but returns the hop so the caller can read provenance."""
+    Like _effect_evidence but returns the hop so the caller can read provenance.
+    """
     normalized_effect = _normalize_predicate(effect)
     for hop in state.hops:
         if not _is_admitted_achieved_hop(state, hop):
@@ -1182,7 +1198,8 @@ def _effect_hop(state: EngagementState, effect: str) -> "Hop | None":
 
 def _hop_provenance(hop: "Hop") -> str:
     """'durable' if the hop was loaded from the cross-run ledger, else 'run' (achieved this process).
-    Default 'run' when unset so pre-existing/in-run hops keep their trustworthy hard-SKIP behavior."""
+    Default 'run' when unset so pre-existing/in-run hops keep their trustworthy hard-SKIP behavior.
+    """
     evidence = getattr(hop, "evidence", {}) or {}
     if isinstance(evidence, dict) and _normalize_key(evidence.get("provenance")) == "durable":
         return "durable"
@@ -1206,7 +1223,8 @@ def _parse_iso(value: Any):
 
 def filter_hops_by_ttl(hops: Any, now: str, ttl_hours: float) -> tuple[list, int]:
     """Drop hops older than ttl_hours relative to `now`. Returns (kept_hops, dropped_count).
-    ttl_hours<=0 (or unparseable now) disables expiry — all hops kept. Never raises."""
+    ttl_hours<=0 (or unparseable now) disables expiry — all hops kept. Never raises.
+    """
     hops_list = list(hops or [])
     try:
         if not ttl_hours or float(ttl_hours) <= 0:
@@ -1256,7 +1274,8 @@ def _domains_equivalent(a: str, b: str) -> bool:
     """Whether two domain spellings denote the SAME domain: exact match (FQDN==FQDN or label==label), or a
     FQDN against its own single-label NetBIOS form (north.sevenkingdoms.local <-> north). Deliberately does
     NOT treat a child FQDN as equal to its parent (north.sevenkingdoms.local != sevenkingdoms.local): an
-    in-domain callback must prove access to THIS domain, not merely the forest root."""
+    in-domain callback must prove access to THIS domain, not merely the forest root.
+    """
     a = _normalize_key(a)
     b = _normalize_key(b)
     if not a or not b:
@@ -1281,7 +1300,8 @@ def _in_domain_live_callback(state: EngagementState, domain: str) -> str:
     north.otherforest.local) and would leak a cross-forest foothold in as a false in-domain witness. `forest`
     is already canonicalized to an FQDN via the engagement NetBIOS→FQDN map in access_reconciler when one is
     known, so exact-FQDN equality is the common path; the residual bare-label match in `_domains_equivalent`
-    only applies in a degraded environment with no FQDN mapping (and no same-label sibling forest)."""
+    only applies in a degraded environment with no FQDN mapping (and no same-label sibling forest).
+    """
     for foothold in getattr(state, "footholds", []) or []:
         if not _is_live_target_foothold(foothold):
             continue
@@ -1480,7 +1500,8 @@ def _domain_from_host(target: str) -> str:
 def _parent_domain(target: str) -> str:
     """The parent (forest-root-ward) domain of an FQDN: strip the leftmost label when there are >2 labels
     (north.sevenkingdoms.local → sevenkingdoms.local); a 2-label root returns itself. Backs the {parent}
-    template var for the SID-history child→parent escalation effect (da:{parent})."""
+    template var for the SID-history child→parent escalation effect (da:{parent}).
+    """
     parts = [part for part in _normalize_key(target).split(".") if part]
     if len(parts) > 2:
         return ".".join(parts[1:])
@@ -1743,7 +1764,8 @@ def _effect_with_task(effect: str, task_id: str) -> str:
 
 def hops_to_dicts(hops: Any) -> list[dict]:
     """Serialize a list of Hop dataclasses to plain JSON-safe dicts. Never raises — skips anything
-    that is not a dataclass-shaped Hop. Used by the durable per-engagement ledger (write-through)."""
+    that is not a dataclass-shaped Hop. Used by the durable per-engagement ledger (write-through).
+    """
     import dataclasses
     out: list[dict] = []
     for hop in _render_items(hops):
@@ -1757,7 +1779,8 @@ def hops_to_dicts(hops: Any) -> list[dict]:
 
 def hops_from_dicts(items: Any) -> list["Hop"]:
     """Deserialize plain dicts (from the durable ledger) back into Hop dataclasses. Never raises —
-    skips malformed entries. Mirrors hops_to_dicts; round-trips losslessly for well-formed hops."""
+    skips malformed entries. Mirrors hops_to_dicts; round-trips losslessly for well-formed hops.
+    """
     out: list[Hop] = []
     for d in _render_items(items):
         if not isinstance(d, dict):

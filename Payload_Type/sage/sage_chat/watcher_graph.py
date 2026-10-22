@@ -103,7 +103,6 @@ def _deterministic_summary(
 
 def build_watcher_graph(profile: ResolvedLLMProfile, *, model: Any | None = None) -> Any:
     """Build exactly one node with no tools, checkpointer, or ordinary Sage imports."""
-
     chat_model = model or init_chat_model_from_profile(profile)
 
     async def explain(state: WatcherGraphState) -> dict[str, Any]:

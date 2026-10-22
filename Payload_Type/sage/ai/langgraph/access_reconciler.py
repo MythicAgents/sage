@@ -60,7 +60,6 @@ def project_access(
     netbios_to_fqdn: dict[str, str] | None = None,
 ) -> list[Foothold]:
     """Return footholds projected from raw Mythic callbacks."""
-
     footholds: list[Foothold] = []
     safe_liveness = liveness if isinstance(liveness, dict) else {}
     for raw_callback in raw_callbacks:
@@ -86,7 +85,6 @@ def project_access(
 
 def normalize_forest(domain: str, *, netbios_to_fqdn: dict[str, str] | None = None) -> str:
     """Return a normalized forest name from a domain hint."""
-
     raw = _text(domain).strip()
     if not raw:
         return ""
@@ -103,7 +101,6 @@ def normalize_forest(domain: str, *, netbios_to_fqdn: dict[str, str] | None = No
 
 def is_stale(foothold: Foothold, now: str, ttl_seconds: int) -> bool:
     """Return whether a foothold fact is older than its TTL."""
-
     observed_at = _parse_iso_datetime(_text(getattr(foothold, "timestamp", "")))
     current = _parse_iso_datetime(now)
     if observed_at is None or current is None:
@@ -113,7 +110,6 @@ def is_stale(foothold: Foothold, now: str, ttl_seconds: int) -> bool:
 
 async def reconcile_access(mythic_tools: Any, now: str) -> list[Foothold]:
     """Fetch Mythic callbacks and return reconciled footholds."""
-
     raw_payload = await mythic_tools.get_all_active_callbacks()
     raw_callbacks = _callbacks_from_json(raw_payload)
     liveness: dict[str, bool] = {}
@@ -133,7 +129,6 @@ async def reconcile_access(mythic_tools: Any, now: str) -> list[Foothold]:
 
 def _text(value: Any) -> str:
     """Return a string value without raising."""
-
     if value is None:
         return ""
     return str(value).strip()
@@ -141,7 +136,6 @@ def _text(value: Any) -> str:
 
 def _callback_display_id(callback: dict) -> Any:
     """Return a callback display id from known Mythic shapes."""
-
     display_id = callback.get("display_id")
     if display_id is None:
         display_id = callback.get("id")
@@ -150,7 +144,6 @@ def _callback_display_id(callback: dict) -> Any:
 
 def _agent_from_callback(callback: dict) -> str:
     """Return the callback agent name from known Mythic fields."""
-
     agent = callback.get("agent")
     if agent is None:
         agent = callback.get("payloadtype")
@@ -164,7 +157,6 @@ def _agent_from_callback(callback: dict) -> str:
 
 def _domain_from_callback(callback: dict) -> str:
     """Return the best domain hint from callback domain or identity."""
-
     domain = _text(callback.get("domain"))
     if domain:
         return domain
@@ -173,7 +165,6 @@ def _domain_from_callback(callback: dict) -> str:
 
 def _domain_from_identity(identity: str) -> str:
     """Return a domain hint parsed from a user identity."""
-
     raw = _text(identity)
     if "\\" in raw:
         return raw.split("\\", 1)[0]
@@ -184,7 +175,6 @@ def _domain_from_identity(identity: str) -> str:
 
 def _normalize_integrity(callback: dict) -> str:
     """Return an engagement-state integrity value for a Mythic callback."""
-
     identity = _text(callback.get("user"))
     if _is_system_identity(identity):
         return "system"
@@ -205,14 +195,12 @@ def _normalize_integrity(callback: dict) -> str:
 
 def _is_system_identity(identity: str) -> bool:
     """Return whether an identity is the local SYSTEM user."""
-
     normalized = _text(identity).casefold()
     return normalized in ("system", "nt authority\\system")
 
 
 def _parse_int(value: Any) -> int | None:
     """Parse an integer value without raising."""
-
     if value is None:
         return None
     try:
@@ -223,7 +211,6 @@ def _parse_int(value: Any) -> int | None:
 
 def _parse_iso_datetime(value: str) -> datetime | None:
     """Parse an ISO-8601 timestamp without raising."""
-
     raw = _text(value)
     if not raw:
         return None
@@ -240,7 +227,6 @@ def _parse_iso_datetime(value: str) -> datetime | None:
 
 def _callbacks_from_json(raw_payload: Any) -> list[dict]:
     """Return callback dictionaries from a Mythic JSON payload."""
-
     try:
         payload = json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
     except (TypeError, json.JSONDecodeError):
@@ -250,7 +236,6 @@ def _callbacks_from_json(raw_payload: Any) -> list[dict]:
 
 def _callbacks_from_payload(payload: Any) -> list[dict]:
     """Return callback dictionaries from known wrapped payload shapes."""
-
     if isinstance(payload, list):
         return [item for item in payload if isinstance(item, dict)]
     if not isinstance(payload, dict):

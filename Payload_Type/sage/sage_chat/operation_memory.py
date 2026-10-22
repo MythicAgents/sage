@@ -512,7 +512,6 @@ class OperationMemoryStore:
         generation: int | None = None,
     ) -> WatcherProfileRecord:
         """Claim or advance one exact owner generation without persisting credentials."""
-
         op = _required_text(operation_id, "operation_id")
         channel_id = int(owner_channel_id)
         if channel_id <= 0:

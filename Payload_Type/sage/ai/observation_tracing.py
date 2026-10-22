@@ -96,7 +96,6 @@ class MetadataOnlyExporter(SpanExporter):
 
 def create_provider(delegate_exporter: SpanExporter, project: str = _PROJECT) -> TracerProvider:
     """Return a provider that exports only fixed metadata and numeric counts."""
-
     if project != _PROJECT:
         raise ValueError("measurement project is unsupported")
     provider = TracerProvider(resource=_RESOURCE)

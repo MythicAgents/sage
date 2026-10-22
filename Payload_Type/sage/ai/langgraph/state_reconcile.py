@@ -287,7 +287,8 @@ async def _candidate_reconcile_tasks(client, task_id: str, callback_id: str, lim
 
 async def reconcile_task_history(client, data: dict, task_id: str, callback_id: str, limit: int, now: str, apply: bool = False) -> tuple[dict, list[str]]:
     """Inspect completed Mythic task history, record any achieved modeled effects into the ledger, and
-    (dry-run by default) import discovered credential material. Returns (updated_ledger, notes)."""
+    (dry-run by default) import discovered credential material. Returns (updated_ledger, notes).
+    """
     if _task_reconciler is None or _es is None:
         return data, ["task reconciliation unavailable in this Sage build."]
     tasks = await _candidate_reconcile_tasks(client, task_id, callback_id, limit)

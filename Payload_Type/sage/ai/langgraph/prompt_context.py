@@ -1,5 +1,4 @@
-"""
-prompt_context — runtime values injected into agent prompts (Layer 1).
+"""prompt_context — runtime values injected into agent prompts (Layer 1).
 
 This is the ONE place that defines every variable a prompt file may interpolate and how it is
 computed from the live Model. Each provider takes the Model instance and returns the string that

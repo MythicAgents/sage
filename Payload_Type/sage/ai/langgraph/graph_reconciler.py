@@ -49,7 +49,6 @@ def project_graph_predicates(edge_records: list[dict], now: str, ttl_seconds: in
     Domain write edges emit ``write-dacl:domain:{fqdn}``. Direct DCSync edges
     to domains emit ``ds-replication-rights:{fqdn}``.
     """
-
     facts: list[GraphFact] = []
     safe_records = edge_records if isinstance(edge_records, list) else []
     for edge_record in safe_records:
@@ -83,7 +82,6 @@ def project_graph_predicates(edge_records: list[dict], now: str, ttl_seconds: in
 
 def project_graph_position(edge_records: list[dict], controlled_principals: list[str], now: str) -> dict:
     """Return a compact graph-position view for DECIDE prompts."""
-
     del now
     principals = _normalized_unique(controlled_principals)
     candidate_edges: list[dict] = []
@@ -103,7 +101,8 @@ def controlled_principals_from_state(state: EngagementState) -> list[str]:
     (``DOMAIN\\user`` or ``user@domain``) projected to the UPN form ``user@forest`` that BloodHound
     stores as a node ``.name``, any ``creds:user@domain`` effects already achieved (a DCSynced /
     dumped principal we can now act as), and live domain-admin authority projected to the privileged
-    group principals BloodHound stores in the graph. Pure; never raises."""
+    group principals BloodHound stores in the graph. Pure; never raises.
+    """
     principals: set[str] = set()
     try:
         for foothold in getattr(state, "footholds", []) or []:
@@ -145,7 +144,6 @@ def controlled_principals_from_state(state: EngagementState) -> list[str]:
 
 def prune_stale_graph_facts(state: EngagementState, now: str) -> EngagementState:
     """Return a new state with stale graph facts removed."""
-
     current = access_reconciler._parse_iso_datetime(now)
     pruned: list[GraphFact] = []
     for graph_fact in getattr(state, "graph_facts", []):
@@ -188,7 +186,8 @@ async def reconcile_graph_position(
     a record/edge list. So we inline the principal allowlist, run one focused single-column query per
     target kind, and read names out of ``literals``. GPO control is keyed by GPO NAME (matching
     intent_classifier's ``gpo-abuse`` target = ``--gponame``), computers by short host, domains by FQDN.
-    Read-only; never runs collection. Fail-open -> []."""
+    Read-only; never runs collection. Fail-open -> [].
+    """
     del objective
     try:
         tool = await asyncio.wait_for(mcp_manager.get_tool_by_name(_CYPHER_TOOL), timeout=_MCP_TIMEOUT_SECONDS)
@@ -391,7 +390,8 @@ async def probe_path_to_objective(
     when the graph has data but no path, and emits NOTHING for a domain whose probe could not run
     (fail-open: never assert a false "no path"). Read-only — one bounded ``shortestPath`` per domain,
     never collection, never mutation. The 15s per-query timeout bounds cost; any failure degrades to
-    the no-op behavior that exists today. Fail-open -> []."""
+    the no-op behavior that exists today. Fail-open -> [].
+    """
     try:
         tool = await asyncio.wait_for(
             mcp_manager.get_tool_by_name(_CYPHER_TOOL), timeout=_MCP_TIMEOUT_SECONDS
@@ -464,7 +464,8 @@ def credential_target_domains_from_state(state: EngagementState) -> list[str]:
 def _gpo_domain_fact(raw_name: Any, gpo_key: str) -> str:
     """The ``gpo-domain:{gpo}:{domain}`` link fact (domain parsed from the GPO name's ``@suffix``), or ''.
     Lets the planner chain gpo-abuse -> dcsync on the GPO's domain — the SharpGPOAbuse SYSTEM task grants
-    DS-Replication on the DC the GPO governs, so controlling the GPO implies eventual replication rights."""
+    DS-Replication on the DC the GPO governs, so controlling the GPO implies eventual replication rights.
+    """
     text = _text(raw_name)
     if "@" not in text:
         return ""
@@ -591,7 +592,8 @@ def _gpo_name_key(name: Any) -> str:
 
 async def _run_scalar_names(tool: Any, query: str) -> list[str]:
     """Run a single-column Cypher RETURN via the MCP cypher_query tool and read the values from the
-    BloodHound ``data.literals`` response shape. Fail-open -> []."""
+    BloodHound ``data.literals`` response shape. Fail-open -> [].
+    """
     try:
         payload = await asyncio.wait_for(
             tool.ainvoke({"info_type": "run", "query": query, "include_properties": False}),
@@ -604,7 +606,8 @@ async def _run_scalar_names(tool: Any, query: str) -> list[str]:
 
 def _names_from_payload(payload: Any) -> list[str]:
     """Extract scalar values from a BloodHound MCP cypher_query 'run' response (``data.literals``).
-    Handles MCP content-list wrapping plus a raw dict / JSON string. Never raises."""
+    Handles MCP content-list wrapping plus a raw dict / JSON string. Never raises.
+    """
     try:
         text = payload
         if isinstance(payload, list) and payload and isinstance(payload[0], dict):

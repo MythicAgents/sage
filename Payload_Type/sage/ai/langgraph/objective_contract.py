@@ -132,7 +132,8 @@ def objective_seeks_attack_path(objective_text: Any) -> bool:
 
     Negation-aware (``do not escalate`` / ``without compromising`` do not count as a positive ask).
     Pure data classification; never raises. This only decides whether a read-only BloodHound path
-    probe is relevant — it adds no prompt policy and selects no attack path itself."""
+    probe is relevant — it adds no prompt policy and selects no attack path itself.
+    """
     text = _normalize_text(objective_text)
     if not text:
         return False
@@ -226,7 +227,6 @@ def _strip_cli_quotes(value: Any) -> str:
 
 def _parse_sharphound_arguments(value: Any) -> dict[str, Any] | None:
     """Parse the admitted SharpHound flags semantically, independent of order/casing/quotes."""
-
     raw = str(value or "").strip()
     if not raw or any(marker in raw for marker in ("\r", "\n", "&&", "||", ";", "|", ">", "<")):
         return None
@@ -827,7 +827,6 @@ def compile_objective_contract(
     objective_is_open_ended: bool,
 ) -> ObjectiveContract:
     """Compile the thinnest admissible data contract for one operator objective."""
-
     text = _normalize_text(objective_text)
     lowered = text.casefold()
     callback_match = _CALLBACK_RE.search(text)

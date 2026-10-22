@@ -13,7 +13,6 @@ def classify_tool_call(command: str, params, callback_host: str | None = None) -
     whose tool args carry no host (e.g. an LSASS dump runs on *this* callback's host) fall back
     to it, so the gate doesn't false-DEFER on an empty host predicate.
     """
-
     try:
         parsed = _parse_params(params)
         command_text = _text(command)

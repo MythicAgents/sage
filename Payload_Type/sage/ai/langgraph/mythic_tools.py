@@ -430,7 +430,8 @@ def build_sharphound_arguments(
     collection omits). For a trusted domain outside the current forest, callers can pass ``domain`` to emit a
     targeted ``--Domain`` collection instead. ``domain_controller`` is optional and should be used only when a
     generic resolver has already proven a specific DC is needed; the normal targeted path lets SharpHound
-    resolve the DC itself."""
+    resolve the DC itself.
+    """
     output_directory = str(output_directory or "").strip() or SHARPHOUND_CANONICAL_OUTPUT_DIRECTORY
     zip_filename = str(zip_filename or "").strip() or SHARPHOUND_CANONICAL_ZIP_FILENAME
     domain = str(domain or "").strip()
@@ -485,7 +486,8 @@ import re as _re_mod
 
 def _engagement_ledger_mod():
     """The shared ledger module — single source of truth for the ledger path/IO, used by BOTH this agent
-    and the operator-facing `engagement` Mythic command so they never drift onto different files."""
+    and the operator-facing `engagement` Mythic command so they never drift onto different files.
+    """
     try:
         from . import engagement_ledger
     except ImportError:  # when ai/langgraph is on sys.path directly (tests, some runtimes)
@@ -629,7 +631,8 @@ def _record_output_is_failure(output: str) -> bool:
     """True when task output shows the task did NOT cleanly succeed: empty/whitespace output, or a Mythic/agent
     infrastructure error / traceback / known agent-side failure. Gates the LEGACY no-probe recording path so a
     no-artifact technique (e.g. gpo-abuse) never records `achieved` off a failed or empty task. Intentionally
-    broad: for a no-probe hop, under-recording (a retry) is far safer than a false-achieved that corrupts the solve."""
+    broad: for a no-probe hop, under-recording (a retry) is far safer than a false-achieved that corrupts the solve.
+    """
     if not output or not str(output).strip():
         return True
     low = str(output).lower()
@@ -638,7 +641,8 @@ def _record_output_is_failure(output: str) -> bool:
 
 def _gpo_abuse_guid_only_noop(output: str) -> bool:
     """SharpGPOAbuse can print only discovery lines (Domain/DC/DN/GUID) when it does not apply a change.
-    Treat that as a no-op: there is no new artifact to wait on and no effect proof to record."""
+    Treat that as a no-op: there is no new artifact to wait on and no effect proof to record.
+    """
     text = str(output or "")
     if not text.strip():
         return False
@@ -707,7 +711,6 @@ _CALLBACK_LIVENESS_QUERY = """
 
 def _parse_mythic_datetime(value: str | None) -> datetime | None:
     """Parse Mythic's UTC-ish ISO timestamps without raising."""
-
     if not value or not isinstance(value, str):
         return None
     raw = value.strip()
@@ -741,7 +744,6 @@ def _parse_mythic_datetime(value: str | None) -> datetime | None:
 
 def _parse_int(value: str | int | None) -> int | None:
     """Parse an integer-ish value without raising."""
-
     if value is None:
         return None
     try:
@@ -752,7 +754,6 @@ def _parse_int(value: str | int | None) -> int | None:
 
 def _extract_first_int(value: object) -> int | None:
     """Extract the first integer token from a value without raising."""
-
     match = re.search(r"-?\d+", str(value))
     if match is None:
         return None
@@ -764,7 +765,6 @@ def _extract_first_int(value: object) -> int | None:
 
 def _parse_sleep_interval(original_params: object) -> int | None:
     """Parse a sleep interval from Mythic sleep task params without raising."""
-
     if original_params is None:
         return None
     if isinstance(original_params, dict):
@@ -788,7 +788,6 @@ def _parse_sleep_interval(original_params: object) -> int | None:
 
 def _task_timestamp_sort_key(task_with_index: tuple[int, dict]) -> tuple[int, datetime, int]:
     """Sort newest parsed task timestamps first, using original order for ties/missing timestamps."""
-
     index, task = task_with_index
     parsed = _parse_mythic_datetime(task.get("timestamp") if isinstance(task, dict) else None)
     if parsed is None:
@@ -798,7 +797,6 @@ def _task_timestamp_sort_key(task_with_index: tuple[int, dict]) -> tuple[int, da
 
 def _format_duration(seconds: float | int | None) -> str:
     """Return a short approximate human duration for large gaps."""
-
     if seconds is None or seconds < 3600:
         return ""
     total_minutes = int(seconds // 60)
@@ -827,7 +825,6 @@ def _compute_liveness(
     now: datetime | None = None,
 ) -> dict:
     """Compute callback liveness from check-in time, effective sleep, jitter, and recent tasks."""
-
     now_utc = now or datetime.now(timezone.utc)
     if now_utc.tzinfo is None:
         now_utc = now_utc.replace(tzinfo=timezone.utc)
@@ -984,7 +981,6 @@ def _compute_liveness(
 
 async def assess_callback_liveness(client, display_id: int, *, now: datetime | None = None) -> dict:
     """Fetch callback timing data from Mythic and compute a liveness verdict."""
-
     logger.debug(f"🛠️ Calling assess_callback_liveness for callback_display_id: {display_id}")
     try:
         resp = await mythic.execute_custom_query(client, _CALLBACK_LIVENESS_QUERY, variables={"ids": [display_id]})
@@ -1196,7 +1192,8 @@ def _command_argument_candidates(values: dict, keys: tuple[str, ...]) -> list[st
 
 def _is_failed_read_output(output: str) -> bool:
     """True if task output looks like a (re-read) failure — broader than the breaker scope. Used only
-    by the get_all_task_output_by_task_id no-progress clamp."""
+    by the get_all_task_output_by_task_id no-progress clamp.
+    """
     if not output:
         return False
     low = output.lower()
@@ -2061,7 +2058,8 @@ class MythicTools:
 
     def _request_shape_counts(self) -> dict:
         """The same-request rotation-cap counts, defensively materialized: harnesses may
-        construct MythicTools without running __init__ (mirror of model.py's getattr rule)."""
+        construct MythicTools without running __init__ (mirror of model.py's getattr rule).
+        """
         counts = getattr(self, "_task_failure_shape_counts", None)
         if not isinstance(counts, dict):
             counts = self._task_failure_shape_counts = {}
@@ -2071,7 +2069,8 @@ class MythicTools:
         """Same-request loop-guard window reset. Called when a NEW request
         contract binds (and directly by request-boundary harnesses): the rotation-proof
         (command, callback) shape cap counts failures within the current request only,
-        so a fresh request — operator steering or a new objective — starts clean."""
+        so a fresh request — operator steering or a new objective — starts clean.
+        """
         self._request_shape_counts().clear()
 
     def set_request_contract(self, contract) -> None:
@@ -2482,7 +2481,6 @@ class MythicTools:
         Positive provenance, fail closed: a root that does not name the file returns False, so a
         path with no filename to bind against stays denied rather than inheriting authority.
         """
-
         name = str((actual_args or {}).get("binary_filename") or "").strip().casefold()
         if not name:
             return False
@@ -2751,7 +2749,8 @@ class MythicTools:
         """Minimal loop-breaker (denial-routing spec, staged). When an APPROVED supervised effect is
         refused at the boundary, record the reason so the resume loop returns it to the operator and
         terminalises instead of letting the model blindly re-propose the same action into the same gate.
-        Returns `blocker` unchanged; never breaks the effect path on bookkeeping."""
+        Returns `blocker` unchanged; never breaks the effect path on bookkeeping.
+        """
         try:
             if not blocker:
                 return blocker
@@ -3743,7 +3742,6 @@ class MythicTools:
 
         Do not use the LangChain @tool decorator because it will cause a conflict with 'self' argument in class methods
         """
-
         if "get_task_history_for_callback" in method_names and "list_open_artifacts" not in method_names:
             method_names = [*method_names, "list_open_artifacts"]
 
@@ -3841,7 +3839,6 @@ class MythicTools:
 
     @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def get_all_active_callbacks(self) -> str:
-
         """
         Retrieve detailed information about all active Mythic agents.
 
@@ -3878,7 +3875,8 @@ class MythicTools:
         integrity, status, secs_since_checkin}. It is ~8x smaller than get_all_active_callbacks AND folds in
         computed liveness (same logic as check_callback_alive), so for routine situational awareness it
         replaces BOTH. Use get_all_active_callbacks ONLY when you need full host detail (pid, process_name,
-        IPs, external_ip); use check_callback_alive for a deep single-callback crash assessment."""
+        IPs, external_ip); use check_callback_alive for a deep single-callback crash assessment.
+        """
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug("🛠️ Calling list_callbacks (slim)")
@@ -3947,7 +3945,7 @@ class MythicTools:
 
     @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def get_all_payload_info(self) -> str:
-        """ Get information about ALL payload types in Mythic. """
+        """Get information about ALL payload types in Mythic."""
         query = """
             query PayloadInfo {
                 payloadtype {
@@ -5513,7 +5511,8 @@ class MythicTools:
     def _failure_shape_key_from_fail_key(self, fail_key) -> tuple | None:
         """Derive the rotation-proof (command, callback) key from a (command, callback,
         params) failure key. Enrolled-executable construction keys replace the command
-        slot, so they have no command+callback shape and keep their own breaker."""
+        slot, so they have no command+callback shape and keep their own breaker.
+        """
         try:
             if isinstance(fail_key, tuple) and len(fail_key) >= 2 and fail_key[0] != "enrolled-executable":
                 return (fail_key[0], fail_key[1])
@@ -5523,7 +5522,8 @@ class MythicTools:
 
     def _task_failure_shape_key(self, command: str, callback_display_id) -> tuple:
         """Permutation-blind failure unit: the same command failing on the same callback
-        counts together even when parameters rotate (rotated credentials)."""
+        counts together even when parameters rotate (rotated credentials).
+        """
         return (str(command), callback_display_id)
 
     def _task_failure_shape_refusal(self, command: str, callback_display_id) -> str | None:
@@ -5552,7 +5552,8 @@ class MythicTools:
     def _normalize_volatile_output(self, text: str) -> str:
         """Strip volatile fields (timestamps, LUIDs/handles) and collapse whitespace so two runs of the same
         command that differ ONLY in drifting values (e.g. `klist` ticket valid/expires/renew times) hash to
-        the same string. Without this the loop-guard would never fire on klist. Never raises."""
+        the same string. Without this the loop-guard would never fire on klist. Never raises.
+        """
         try:
             s = str(text or "")
             for pat in getattr(self, "_volatile_output_patterns", []) or []:
@@ -5569,7 +5570,8 @@ class MythicTools:
 
         Only SUCCESS counts: failures are handled by the failure circuit breaker, and SUCCESS is exactly the
         case that breaker RESETS and therefore cannot catch (the `shell klist` loop). A different or non-success
-        action breaks the streak AND clears prior loop flags (it is real progress). Never raises."""
+        action breaks the streak AND clears prior loop flags (it is real progress). Never raises.
+        """
         try:
             if str(result_class) != command_builder.ResultClass.SUCCESS.value:
                 self._last_action_sig = None
@@ -7489,7 +7491,8 @@ class MythicTools:
     @staticmethod
     def _dcsync_target_domain(technique: str, target_key: str) -> str:
         """The domain a DCSync hop targets: the bare domain for `dcsync`, the realm half for
-        `dcsync-user` (`user@domain`)."""
+        `dcsync-user` (`user@domain`).
+        """
         tk = str(target_key or "")
         return tk.split("@")[-1] if technique == "dcsync-user" else tk
 
@@ -7498,7 +7501,8 @@ class MythicTools:
         """Pure: block a proposed DCSync with rights-guidance? True ONLY for a dcsync technique whose gate
         DEFER cites missing replication rights, AND only when the graph is POPULATED (so absence is real
         evidence, not ignorance), AND only until the per-domain cap. Never blocks on an empty/unknown graph
-        and never past the cap — so it cannot become a permanent deadlock."""
+        and never past the cap — so it cannot become a permanent deadlock.
+        """
         return bool(
             technique in ("dcsync", "dcsync-user")
             and graph_populated
@@ -7509,7 +7513,8 @@ class MythicTools:
     @staticmethod
     def _dcsync_rights_guidance(dom: str) -> str:
         """Constructive, unambiguous block message for a premature DCSync — frames it as a RIGHTS
-        problem (not command syntax, an easy misreading) and names the corrective path."""
+        problem (not command syntax, an easy misreading) and names the corrective path.
+        """
         return (
             f"[engagement-precheck] DCSync of {dom} not attempted: per the BloodHound graph and the "
             f"credentials you currently hold, NO principal you control has DS-Replication rights on {dom}, "
@@ -7572,7 +7577,8 @@ class MythicTools:
         (provenance-less) objective — only an absent or prior autonomous_seed objective is (re)written —
         matching state.py's own load→set-objective→save pattern. Stamps objective_source='autonomous_seed'.
         Latches on success so it runs at most once per seed; a transient I/O error leaves the latch unset so
-        the next call retries. Fail-open: never breaks the solve."""
+        the next call retries. Fail-open: never breaks the solve.
+        """
         try:
             try:
                 from . import engagement_ledger
@@ -7672,7 +7678,8 @@ class MythicTools:
     async def _fetch_credentials_cached(self, now: str) -> list:
         """Read the Mythic credential store (read-only) with a short-TTL cache, shared by read_credentials
         and the gate's corroboration probe so neither re-queries Mythic repeatedly. Returns raw cred rows.
-        Fail-open -> last cache or []."""
+        Fail-open -> last cache or [].
+        """
         try:
             try:
                 from . import engagement_state, operation_context
@@ -7716,7 +7723,8 @@ class MythicTools:
         graph ACLs into corroboration predicates so the gate SKIPs a durable hop whose result is STILL
         PRESENT instead of re-running the attack. Emits ONLY positive predicates (creds:, krbtgt-hash:,
         ds-replication-rights:, system:{gpo}) — never generic-write:/write-dacl:, so it can't newly enforce a
-        graph precondition (no DEFER regression). Fail-open -> []."""
+        graph precondition (no DEFER regression). Fail-open -> [].
+        """
         try:
             from . import engagement_state
         except ImportError:
@@ -7786,7 +7794,8 @@ class MythicTools:
         """Refresh the cached BloodHound graph facts (ACL edges → engagement predicates) that feed the
         forward planner / per-turn injection. TTL-bounded (the read-only cypher runs at most ~every 2 min
         unless forced — e.g. right after a verified ingest). SUGGESTION-ONLY: these are NOT fed into the
-        gate's enforcement state, so this can never newly DEFER a real hop. Best-effort, fail-open."""
+        gate's enforcement state, so this can never newly DEFER a real hop. Best-effort, fail-open.
+        """
         # A forced refresh follows a verified ingest (topology may have changed — e.g. a parent domain's DC
         # just became visible). Invalidate the per-domain DC + domain-SID caches so a stale pre-collection
         # result (e.g. a child DC cached for a parent domain, or a pre-rebuild SID) is never served.
@@ -7868,7 +7877,8 @@ class MythicTools:
             class _SingleToolMCP:
                 """Adapter: graph_reconciler.reconcile_graph_position expects a get_tool_by_name(name)
                 accessor; the live MCPManager exposes get_tools_by_server instead. We already resolved the
-                cypher tool, so hand it back directly."""
+                cypher tool, so hand it back directly.
+                """
 
                 def __init__(self, tool):
                     self._tool = tool
@@ -8308,7 +8318,8 @@ class MythicTools:
 
         Default ``--SearchForest`` ingests keep the legacy access-only key. Targeted ``--Domain`` ingests append
         the scope domain so the same auth context can collect a trusted external domain exactly once without
-        clobbering the current-forest collection record. Best-effort, fail-open."""
+        clobbering the current-forest collection record. Best-effort, fail-open.
+        """
         try:
             proof_envelope = (
                 dict(proof_envelope)
@@ -9289,7 +9300,8 @@ class MythicTools:
     def _ticket_effect_domain(self, technique: str, target_key: str) -> str:
         """The domain of the EFFECT a ticket technique records. For sid-history-escalation the effect is
         da:{parent}, so proof must correlate to the PARENT domain (one DNS label up), not the child target.
-        Generic (no GOAD priors): a child is assumed one label deeper than its parent, true for AD subdomains."""
+        Generic (no GOAD priors): a child is assumed one label deeper than its parent, true for AD subdomains.
+        """
         tk = str(target_key or "").strip()
         if technique == "sid-history-escalation":
             parts = tk.split(".")
@@ -9301,7 +9313,8 @@ class MythicTools:
         """True ONLY for DS_DRA_ACCESS_DENIED (a real replication-RIGHTS denial): hresult 0x2105 / 8453, or
         explicit access-denied text. NOTE: 0x20f7 / 8439 is DS_DRA_BAD_DN (a malformed DN / name-resolution
         error — fix the /user DN, e.g. qualify with the NETBIOS short name), NOT a rights denial, so it must
-        NOT downgrade a rights hop."""
+        NOT downgrade a rights hop.
+        """
         if "0x00002105" in low or "0x2105" in low or "ds_dra_access_denied" in low:
             return True
         if "replication access was denied" in low:
@@ -9323,7 +9336,8 @@ class MythicTools:
     def _is_dcsync_command(self, command, parameters) -> bool:
         """True when the issued command is a DCSync / DRSUAPI replication request — native `dcsync`, an
         `lsadump::dcsync` string, OR the mimikatz-via-execute_pe {Domain, User, DC} param shape. Gates the
-        downgrade/hint so unrelated output with a stray '8453'/domain string can't trip it."""
+        downgrade/hint so unrelated output with a stray '8453'/domain string can't trip it.
+        """
         blob = (str(command) + " " + str(parameters)).casefold()
         if "dcsync" in blob or "drsuapi" in blob or "getncchanges" in blob:
             return True
@@ -9336,7 +9350,8 @@ class MythicTools:
 
     def _refutation_domain(self, command, parameters) -> str:
         """The domain a replication-denied error is about — from the ISSUED command's `/domain:` flag or its
-        `Domain` param key (never parsed from tool OUTPUT, which can echo a different domain than was denied)."""
+        `Domain` param key (never parsed from tool OUTPUT, which can echo a different domain than was denied).
+        """
         blob = " ".join(str(x) for x in (parameters, command) if x is not None)
         m = re.search(r"/domain:([A-Za-z0-9._-]+)", blob)
         if m:
@@ -9354,7 +9369,8 @@ class MythicTools:
         Canonical case: a dcsync returning DS_DRA_ACCESS_DENIED (8439 / 0x20f7) proves the actor does NOT hold
         DS-Replication rights on that domain — refuting da:/ea:/ds-replication-rights: for it. Intentionally
         decisive: even if the actor IS a real DA whose ticket/context was wrong, REOPENING the hop (re-verify, or
-        fix the Kerberos execution context) is correct and cheap; an unbreakable retry loop is not."""
+        fix the Kerberos execution context) is correct and cheap; an unbreakable retry loop is not.
+        """
         if not self._is_dcsync_command(command, parameters):
             return  # only a dcsync/replication command's ACCESS_DENIED can refute replication rights
         low = str(results_str or "").casefold()
@@ -9413,7 +9429,8 @@ class MythicTools:
 
     def _assembly_name_from_params(self, parameters) -> str:
         """The by-name assembly reference (e.g. 'SharpGPOAbuse.exe') from execute_assembly params, or '' when
-        the upload/file group is used (a UUID/path is not a registered-assembly name)."""
+        the upload/file group is used (a UUID/path is not a registered-assembly name).
+        """
         p = parameters
         if isinstance(p, str):
             try:
@@ -9632,7 +9649,8 @@ class MythicTools:
     def _normalize_dcsync_user(self, user, domain) -> str:
         """Normalize a dcsync target user to NETBIOS\\sAMAccountName. Handles bare ('krbtgt'), FQDN
         ('dom.fqdn\\krbtgt'), DN ('CN=krbtgt,CN=Users,DC=...'), and user@domain forms. The bare/FQDN/DN forms
-        are ambiguous or invalid to the DC's CrackNames (ERROR_NOT_UNIQUE / BAD_DN 8439); NETBIOS\\sam is exact."""
+        are ambiguous or invalid to the DC's CrackNames (ERROR_NOT_UNIQUE / BAD_DN 8439); NETBIOS\\sam is exact.
+        """
         u = str(user or "").strip()
         if not u:
             return u
@@ -9917,7 +9935,8 @@ class MythicTools:
 
     def _artifact_secret(self, prefix: str, slug: str = "") -> str:
         """Per-run, non-source-visible password for a forged/exported offensive artifact (shared salt with
-        capabilities.artifact_secret so a forge step and its use step agree on the password)."""
+        capabilities.artifact_secret so a forge step and its use step agree on the password).
+        """
         try:
             from . import capabilities as _caps
         except ImportError:
@@ -17609,7 +17628,8 @@ class MythicTools:
         """The PARENT domain of a SAME-FOREST child->parent forge-golden-ticket, else "". Same-forest only: the
         parent must be a DNS suffix of the child (child.root.example.local -> root.example.local). A
         cross-FOREST target (other.example.local) has no implicit Enterprise-Admins path to the parent and must never be
-        granted replication rights — so it returns "" and the DCSync precheck still applies."""
+        granted replication rights — so it returns "" and the DCSync precheck still applies.
+        """
         if self._capability_text(getattr(action, "name", "")).casefold() != "forge-golden-ticket":
             return ""
         child = self._capability_domain(action, inputs).strip(".")
@@ -18143,7 +18163,8 @@ class MythicTools:
         """The existing hop for (technique, target_key) that is `achieved` with a REAL key in evidence
         (artifact_present True), else None. A legacy false-achieved (no such evidence) returns None so a
         verified-failed re-probe can overwrite it — the stickiness rule is 'verified-with-key beats no-key',
-        never blind last-writer-wins."""
+        never blind last-writer-wins.
+        """
         tech = str(technique).casefold()
         tgt = str(target_key).casefold()
         for h in self._engagement_hops:
@@ -18159,14 +18180,16 @@ class MythicTools:
 
     def _eng_key(self) -> str:
         """The active durable-ledger key: the operation-resolved key once known, else the explicit
-        SAGE_ENGAGEMENT_ID (env/test override or 'default')."""
+        SAGE_ENGAGEMENT_ID (env/test override or 'default').
+        """
         return self._engagement_key or SAGE_ENGAGEMENT_ID
 
     async def _ensure_engagement_key(self) -> None:
         """Resolve the durable-ledger key from the current Mythic operation the first time it's needed,
         then reload the ledger under that key. No-op if already resolved, if SAGE_ENGAGEMENT_ID is an
         explicit override (!= 'default'), or if resolution fails (keeps the 'default' key). The
-        resolve+reload is serialized under a lock so concurrent gate calls can't double-reload. Fail-open."""
+        resolve+reload is serialized under a lock so concurrent gate calls can't double-reload. Fail-open.
+        """
         if self._engagement_key is not None:
             return
         if SAGE_ENGAGEMENT_ID and SAGE_ENGAGEMENT_ID != "default":
@@ -18201,7 +18224,8 @@ class MythicTools:
     def _notice_legacy_ledgers(self) -> None:
         """One-time INFO if pre-rename `engagement_*.json` ledgers are present but unused — the clean break
         makes them invisible to `list_engagements`, so surface that they exist rather than letting it look
-        like data vanished. Best-effort; never raises."""
+        like data vanished. Best-effort; never raises.
+        """
         if MythicTools._legacy_notice_done:
             return
         try:
@@ -18223,7 +18247,8 @@ class MythicTools:
 
     def _load_engagement_ledger(self, *, replace: bool = False) -> None:
         """Load the durable hop ledger from disk into self._engagement_hops. Fail-open: any error
-        (missing file, bad JSON, unreadable) leaves the in-memory ledger untouched. NO LLM inference."""
+        (missing file, bad JSON, unreadable) leaves the in-memory ledger untouched. NO LLM inference.
+        """
         path = self._engagement_ledger_path()
         if not os.path.exists(path):
             if replace:
@@ -18686,7 +18711,8 @@ class MythicTools:
         """Resolve the most-recent COMPLETE, non-deleted file DOWNLOADED FROM the agent on the given
         callback. Returns a dict with agent_file_id / filename_utf8 / timestamp, or None if no match.
         `name_contains` is an optional case-insensitive filename substring filter ("" disables it).
-        The join (callback.display_id -> task -> filemeta) was verified against live Mythic."""
+        The join (callback.display_id -> task -> filemeta) was verified against live Mythic.
+        """
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         query = """
@@ -18740,7 +18766,8 @@ class MythicTools:
         """Upload a Mythic-stored file (by file UUID) to the agent at callback_display_id via the agent's upload-style command.
 
         Caveat: file_uuid is the Mythic *file* UUID (`agent_file_id` from create_payload), NOT the
-        payload `uuid`; the command's target parameter must be type "File", never "String"."""
+        payload `uuid`; the command's target parameter must be type "File", never "String".
+        """
         # HITL: guarded
         self._require_request_contract_effect(
             "upload_file_by_file_uuid",
@@ -18829,7 +18856,8 @@ class MythicTools:
 
     def _collection_already_ingested(self, file_content: bytes) -> tuple[str, str | None]:
         """(content_sha256, prior_job_id_or_None): idempotency key for a collection ZIP keyed by CONTENT, not
-        by callback/foothold (the old graph-built gate missed re-ingests when callback_display_id was None)."""
+        by callback/foothold (the old graph-built gate missed re-ingests when callback_display_id was None).
+        """
         import hashlib
         h = hashlib.sha256(file_content).hexdigest()
         return h, self._ingested_collection_hashes.get(h)
@@ -19937,7 +19965,8 @@ class MythicTools:
 
         Returns None when the schema cannot be fetched (no client / no payload type / no schema /
         query error) so callers FAIL OPEN. A real zero-parameter command still returns `[]`, which
-        is a different answer from None and is distinguished by at least one caller. Never raises."""
+        is a different answer from None and is distinguished by at least one caller. Never raises.
+        """
         try:
             if self.client is None:
                 return None
@@ -20044,7 +20073,8 @@ class MythicTools:
     async def _validate_command_parameters(self, command, parameters, callback_display_id):
         """Pre-flight: validate a dict of params against the command's parameter-group schema.
         Returns None when OK (or when validation cannot be performed -> FAIL OPEN), else an
-        actionable correction string the agent can act on without a wasted Mythic round-trip."""
+        actionable correction string the agent can act on without a wasted Mythic round-trip.
+        """
         try:
             if not isinstance(parameters, dict) or not parameters:
                 logger.info(f"🛡️ ARGVAL failed_open command={command} reason=not_a_dict")
@@ -20310,7 +20340,8 @@ class MythicTools:
 
     def _record_and_check_guidance_cycle(self, goal: str) -> str | None:
         """Track recent get_ttp_guidance goals; return an escalating nudge when the agent re-queries
-        near-identical guidance instead of executing. In-memory per MythicTools; never raises."""
+        near-identical guidance instead of executing. In-memory per MythicTools; never raises.
+        """
         try:
             stop = {"the", "and", "for", "with", "using", "over", "from", "into", "via", "then",
                     "that", "this", "use", "get", "run", "now", "please", "onto", "off"}
@@ -20349,7 +20380,8 @@ class MythicTools:
     def _recon_reread_guard(self, tool: str, key) -> str | None:
         """Detect redundant recon re-reads within the current task epoch (no command issued since the last
         read of this target). Returns an escalating STOP-re-reading nudge after repeated identical calls,
-        else None. The epoch resets on each issued command, so a legitimate post-action re-read is allowed."""
+        else None. The epoch resets on each issued command, so a legitimate post-action re-read is allowed.
+        """
         try:
             k = (tool, str(key), self._recon_epoch)
             n = self._recon_call_log.get(k, 0) + 1
@@ -20379,7 +20411,6 @@ class MythicTools:
         an explicit `@tool_safety` classification (`test_tool_safety_classification.py`). This is
         an internal accessor for the loop-breaker, not a tool the model may call.
         """
-
         try:
             epoch = self._recon_epoch
             return max(
@@ -20442,7 +20473,8 @@ class MythicTools:
         """Find a non-deleted, operator-uploaded (NOT download-from-agent) Mythic file whose md5 AND sha1
         matches. Content-based dedup: an unchanged binary keeps the same hash even if re-dropped under the
         SAME name, so we reuse the existing registration instead of uploading a duplicate. A recompiled
-        binary has a new hash and still uploads. Mythic tracks md5/sha1 on `filemeta`."""
+        binary has a new hash and still uploads. Mythic tracks md5/sha1 on `filemeta`.
+        """
         # Require BOTH md5 AND sha1 to match (not OR — a single-hash match widens the collision/poison
         # surface), and require the file to be COMPLETE (a partial/interrupted upload
         # carries the hash but its bytes aren't fully on the server — reusing it breaks a later execute) and

@@ -157,7 +157,8 @@ def _parse_result(value: Any) -> dict:
     """Coerce a capability/collection result into a dict, FAIL-CLOSED. The real `execute_capability` returns a
     JSON *string* (`-> str`), not a dict — so a naive `isinstance(dict)` check would treat every live result
     (success AND failure) as non-dict. A malformed / None / unparseable result must become a BLOCKER, never a
-    silent success (the inverse would convert live failures into successes — the `1116`-class hazard)."""
+    silent success (the inverse would convert live failures into successes — the `1116`-class hazard).
+    """
     if isinstance(value, dict):
         return value
     if isinstance(value, str):
@@ -177,7 +178,8 @@ def _action_effects(action: Any) -> set[str]:
 
 def _tie_cluster(frontier: list[Any]) -> list[Any]:
     """The set of top-priority actions (a genuine selection tie the LLM may rank). Same priority value as the
-    rank-0 action; the deterministic order already put them first."""
+    rank-0 action; the deterministic order already put them first.
+    """
     if not frontier:
         return []
     top = cap._capability_action_priority(frontier[0])
@@ -189,7 +191,8 @@ def _collection_request_key(value: Any) -> str:
 
     Runtime wiring returns a `_ControllerCollectionRequest`; unit fakes often return `True`. Anonymous requests
     still get a retry budget, but real requests are isolated so one failed scope cannot consume another scope's
-    allowance."""
+    allowance.
+    """
     if isinstance(value, dict):
         key = value.get("collection_key") or value.get("request_key")
         return str(key or "").strip()
@@ -436,7 +439,8 @@ class AutonomousController:
 
     def _achieved(self, state: Any) -> set[str]:
         """Canonical achieved-effect set, normalized with the SAME fn the frontier uses (cap._canonical_effect)
-        so the controller's progress diff agrees with the frontier's notion of 'already achieved'."""
+        so the controller's progress diff agrees with the frontier's notion of 'already achieved'.
+        """
         return {cap._canonical_effect(e) for e in (state.achieved_effects() or [])}
 
     async def _seam(
@@ -453,7 +457,8 @@ class AutonomousController:
         emitted from to cover observe/execute/collect/verify/policy_select. The span is emission-only: the
         (status, value) contract below is untouched, and a seam that fails still returns its diagnostic rather
         than raising. `policy_select` in particular runs the model call inside this span, which is what gives
-        the otherwise-parentless LLM span a parent."""
+        the otherwise-parentless LLM span a parent.
+        """
         status, value = "ok", None
         with _tracing.kernel_span(
             f"sage.kernel.seam.{name}",
@@ -558,7 +563,8 @@ class AutonomousController:
         candidate is novel; we admit it ONLY if it carries EXPLICIT prerequisites that are ALL satisfied by
         observed state. An empty/missing precondition list is REJECTED: `all([])` is vacuously
         true, so an ad-hoc unconditional LLM action would otherwise be admitted and could start a loop — and a
-        catalog action whose preconditions were truly met would already be in the (here-empty) frontier."""
+        catalog action whose preconditions were truly met would already be in the (here-empty) frontier.
+        """
         try:
             preconds = list(getattr(action, "preconditions", None) or [])
             if not preconds:

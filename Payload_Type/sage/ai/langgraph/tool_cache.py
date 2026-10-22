@@ -1,5 +1,4 @@
-"""
-Generic tool cache manager for storing and retrieving tool call results.
+"""Generic tool cache manager for storing and retrieving tool call results.
 
 This module provides a flexible caching system that can store results from any tool call,
 with support for TTL (time-to-live), cache invalidation, and async operations.

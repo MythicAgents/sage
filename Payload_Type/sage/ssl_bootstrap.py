@@ -39,7 +39,6 @@ def configure_sage_ssl_cert_file(
     or custom bundle exists. The absence case deliberately leaves the environment
     unchanged so HTTP clients continue with their normal system trust behavior.
     """
-
     target_environ = os.environ if environ is None else environ
     configured = str(target_environ.get("SSL_CERT_FILE") or "").strip()
     if configured:

@@ -264,7 +264,6 @@ def resolve_llm_profile(
     provider_model_secrets: bool = True,
 ) -> ResolvedLLMProfile:
     """Resolve either role through one first-non-empty algorithm and field projection."""
-
     config = ChatConfigView.from_request(request)
     secrets = ChatSecretView.from_request(request)
     environment_profile = resolve_environment_llm_profile(
@@ -304,7 +303,6 @@ def resolve_watcher_llm_profile(
 
 def init_chat_model_from_profile(profile: ResolvedLLMProfile) -> Any:
     """Construct either role's base model from the shared normalized field projection."""
-
     if not profile.model:
         raise ValueError("model is not configured")
     from langchain.chat_models import init_chat_model

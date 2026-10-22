@@ -407,8 +407,7 @@ class MCPServerManager:
             return await self._connect_server_locked(config)
 
     async def _connect_server_locked(self, config: MCPConnectionConfig) -> tuple[bool, Optional[str]]:
-        """
-        Connect to an MCP server based on the provided configuration
+        """Connect to an MCP server based on the provided configuration
 
         Args:
             config: MCPConnectionConfig object containing connection details
@@ -589,8 +588,7 @@ class MCPServerManager:
             return await self._disconnect_server_locked(server_name)
 
     async def _disconnect_server_locked(self, server_name: str) -> bool:
-        """
-        Disconnect from an MCP server
+        """Disconnect from an MCP server
 
         Args:
             server_name: Name of the server to disconnect
@@ -714,8 +712,7 @@ class MCPServerManager:
         return len(self.get_servers_with_tool(tool_name)) > 1
     
     def get_all_tools(self) -> List[BaseTool]:
-        """
-        Get all tools from all connected MCP servers
+        """Get all tools from all connected MCP servers
         
         Returns:
             List of all LangChain BaseTool instances
@@ -726,8 +723,7 @@ class MCPServerManager:
         return all_tools
     
     def get_tools_by_server(self, server_name: str) -> List[BaseTool]:
-        """
-        Get tools from a specific server
+        """Get tools from a specific server
         
         Args:
             server_name: Name of the server
@@ -738,8 +734,7 @@ class MCPServerManager:
         return self.tools.get(server_name, [])
     
     def get_connected_servers(self) -> List[str]:
-        """
-        Get list of all connected server names
+        """Get list of all connected server names
         
         Returns:
             List of connected server names
@@ -747,8 +742,7 @@ class MCPServerManager:
         return list(self.sessions.keys())
     
     def get_server_info(self, server_name: str) -> Optional[Dict[str, Any]]:
-        """
-        Get information about a specific server
+        """Get information about a specific server
         
         Args:
             server_name: Name of the server
@@ -771,8 +765,7 @@ class MCPServerManager:
         }
     
     async def refresh_tools(self, server_name: Optional[str] = None):
-        """
-        Refresh tools for a specific server or all servers
+        """Refresh tools for a specific server or all servers
         
         Args:
             server_name: Name of server to refresh, or None for all servers
@@ -792,8 +785,7 @@ class MCPServerManager:
                         await self._load_tools_for_server(name)
     
     async def get_tool_by_name(self, tool_name: str, server_name: Optional[str] = None) -> Optional[BaseTool]:
-        """
-        Get a specific tool by name, optionally from a specific server
+        """Get a specific tool by name, optionally from a specific server
 
         Args:
             tool_name: Name of the tool to find
@@ -818,8 +810,7 @@ class MCPServerManager:
             return None
     
     def get_tools_summary(self) -> Dict[str, Any]:
-        """
-        Get a summary of all tools across all servers
+        """Get a summary of all tools across all servers
         
         Returns:
             Dictionary with summary information

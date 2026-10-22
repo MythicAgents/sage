@@ -26,7 +26,8 @@ _MYTHIC_TASKING_AGENTS = ("mythic_operator", "mythic_payload")
 
 def _mythic_tool_universe() -> set[str]:
     """Distinct Mythic C2/tasking tools declared across the tasking agents' prompt frontmatter,
-    excluding control/handoff and TTP-library tools (which aren't Mythic tasking actions)."""
+    excluding control/handoff and TTP-library tools (which aren't Mythic tasking actions).
+    """
     try:
         from ai.langgraph.prompt_loader import get_prompt_tools
     except ImportError:  # pragma: no cover
@@ -47,7 +48,8 @@ def scope_usable_mythic_tools(model: Any) -> int:
     """Count of Mythic tools the CURRENT bot token can actually invoke: the declared
     Mythic tool universe minus the scope-gated (`disabled_tools`) set on the live model's client. The
     universe is static; `disabled_tools` is per-session (set by the token's scope preflight), so this
-    number reflects the operator's real reach. No client yet → the full universe (nothing gated)."""
+    number reflects the operator's real reach. No client yet → the full universe (nothing gated).
+    """
     universe = _mythic_tool_universe()
     disabled = getattr(getattr(model, "mythic_client", None), "disabled_tools", None) or set()
     try:

@@ -60,7 +60,6 @@ def persist_verified_ca_pfx_artifact(
     validates the blob, verifies any declared SHA256, writes a deterministic file,
     and returns only non-secret provenance fields for the ledger.
     """
-
     pfx_base64 = _output_field(output, "PFX_BASE64")
     artifact_id = _output_field(output, "PFX_ARTIFACT_ID") or _output_field(output, "ARTIFACT_ID")
     if not pfx_base64 or not artifact_id:
@@ -128,7 +127,6 @@ def materialize_adcs_certificate_auth(
     as a path resolver for that verified fact, not as independent proof. Sage does
     not use the CA private key to forge the target certificate itself.
     """
-
     domain = _normalize(domain)
     account = _normalize(account) or "administrator"
     ca_host = _canonical_ca_host(ca_host, domain)

@@ -655,7 +655,8 @@ def _dcsync_user_qualifier(account: str, domain: str) -> str:
     """Always qualify the mimikatz dcsync `/user` with the domain NETBIOS short name (e.g. NORTH\\krbtgt) so
     the DC's CrackNames lookup is unambiguous. The same sAMAccountName (krbtgt, administrator) exists in EVERY
     domain of a forest; an unqualified name returns `CrackNames ... ERROR_NOT_UNIQUE` (0x3) and the dcsync
-    yields no hash. An already-qualified account (DOMAIN\\user or user@domain) is left untouched."""
+    yields no hash. An already-qualified account (DOMAIN\\user or user@domain) is left untouched.
+    """
     acct = _text(account).strip()
     if not acct or "\\" in acct or "/" in acct or "@" in acct:
         return acct

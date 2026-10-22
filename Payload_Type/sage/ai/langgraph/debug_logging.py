@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-Logging diagnostic script to identify why mythic_container.logging stops working.
+"""Logging diagnostic script to identify why mythic_container.logging stops working.
 
 This script tests various logging configurations and provides workarounds.
 """

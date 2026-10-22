@@ -19,9 +19,24 @@ extend-exclude = [
 ]
 
 [lint]
-# Start narrow: pyflakes (F), a safe slice of pycodestyle (E), and import sorting (I). Expand once
-# the baseline is clean.
-select = ["E", "F", "I"]
+# Start narrow: pyflakes (F), a safe slice of pycodestyle (E), import sorting (I), and PEP 257
+# docstrings (D) in Google style. Expand once the baseline is clean.
+select = ["E", "F", "I", "D"]
 ignore = [
     "E501",  # line length is enforced by the formatter, not the linter
+    "D105",  # magic methods document themselves through the protocol they implement
+    "D107",  # __init__ parameters are documented on the class
 ]
+
+[lint.pydocstyle]
+convention = "google"
+
+# Docstrings are enforced on the shipped runtime first. Tests, development evaluation, and operator
+# scripts are exempt until the runtime baseline is clean.
+[lint.per-file-ignores]
+"**/tests/**" = ["D"]
+"**/test_*.py" = ["D"]
+"Payload_Type/sage/ai/hillclimb/**" = ["D"]
+"Payload_Type/sage/ai/trajectory/**" = ["D"]
+"Payload_Type/sage/evals/**" = ["D"]
+"skills/**" = ["D"]

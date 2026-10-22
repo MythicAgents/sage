@@ -191,7 +191,8 @@ def _nonempty_system(text: Any) -> str:
     """Return a non-blank system prompt: the given text if it carries content, else a minimal default.
 
     Only a real string counts as content — a non-str (e.g. a list of content blocks passed by mistake) would
-    otherwise str()-ify to non-empty garbage, so it falls back to the default instead."""
+    otherwise str()-ify to non-empty garbage, so it falls back to the default instead.
+    """
     t = (text if isinstance(text, str) else "").strip()
     return t if t else _DEFAULT_SYSTEM_PROMPT
 
@@ -201,7 +202,8 @@ def _coerce_prompt_text(prompt: Any) -> str:
 
     A prompt is usually a str, but LangChain content can be a list of blocks ([{'type':'text','text':...}]).
     The objective detector is a regex over text, so join the text parts and ignore non-text blocks rather
-    than str()-ing a list (which would smuggle '[{...}]' into the match)."""
+    than str()-ing a list (which would smuggle '[{...}]' into the match).
+    """
     if isinstance(prompt, str):
         return prompt
     if isinstance(prompt, list):
@@ -313,7 +315,8 @@ def _content_has_text(content: Any) -> bool:
     """True if a message's content carries at least one non-blank piece of text or a non-text block.
 
     Used to decide whether a SystemMessage is 'real' or an empty block that would trip Bedrock's
-    'text content blocks must be non-empty' validation."""
+    'text content blocks must be non-empty' validation.
+    """
     if isinstance(content, str):
         return bool(content.strip())
     if isinstance(content, list):
@@ -337,7 +340,8 @@ def _strip_blank_text_blocks(content: Any) -> Any:
     Returns the original content unchanged if it is not a list, or if stripping would remove every block
     (the caller decides what to do with a now-empty message). Mirrors _fix_payload_empty_content's list
     handling so the langchain-aws provider path — which never touches the langchain_openai patch — is also
-    protected against blank text blocks."""
+    protected against blank text blocks.
+    """
     if not isinstance(content, list):
         return content
     kept = [
@@ -353,7 +357,6 @@ def _tool_call_ids_from_ai_message(message: AIMessage) -> list[str]:
     Duplicate IDs are distinct occurrences. Provider-native copies are fallbacks,
     not additional calls, when normalized ``tool_calls`` are present.
     """
-
     normalized_calls = [
         item
         for item in (getattr(message, "tool_calls", None) or [])
@@ -408,7 +411,6 @@ def _tool_call_batch_error(tool_calls: Any) -> str:
     normalizes that identity: one malformed occurrence makes the complete batch
     ambiguous and therefore non-executable.
     """
-
     if not isinstance(tool_calls, list):
         return "tool-call batch is not a list"
     seen_ids: set[str] = set()
@@ -460,7 +462,6 @@ def _json_tree_error(value: Any, *, path: str = "$") -> str:
 
 def _strict_provider_argument_object(value: Any) -> tuple[dict[str, Any] | None, str]:
     """Decode one provider argument payload without LangChain's shape coercion."""
-
     if isinstance(value, dict):
         tree_error = _json_tree_error(value)
         return (
@@ -499,7 +500,6 @@ def _strict_provider_argument_object(value: Any) -> tuple[dict[str, Any] | None,
 
 def _type_exact_json_equal(left: Any, right: Any) -> bool:
     """Compare JSON-like values without Python's bool/int or int/float aliases."""
-
     if type(left) is not type(right):
         return False
     if isinstance(left, dict):
@@ -524,7 +524,6 @@ def _provider_call_record(
     source: str,
 ) -> tuple[dict[str, Any] | None, str]:
     """Parse one provider-native call into Sage's canonical call shape."""
-
     if not isinstance(item, dict):
         return None, f"{source} call is not a dictionary"
     if "function" in item:
@@ -612,7 +611,6 @@ def _tool_call_envelope_error(
     sanitizer permits one valid native sequence as their canonical source while
     still requiring exact agreement across every other present copy.
     """
-
     normalized = list(getattr(message, "tool_calls", None) or [])
     invalid = list(getattr(message, "invalid_tool_calls", None) or [])
     if invalid:
@@ -789,7 +787,8 @@ def _sanitize_model_messages(msgs: list) -> tuple[list, bool]:
     tool calls are stripped before they can reach strict providers, orphan tool results are dropped, empty system
     blocks are removed, and empty assistant text is backfilled. It is the provider-agnostic core shared by
     `_MessageSanitizerMiddleware`, which reaches create_agent's internal react loop where `_sanitize_messages` and
-    the langchain_openai monkeypatch cannot."""
+    the langchain_openai monkeypatch cannot.
+    """
     normalized, sequence_changed = _repair_tool_call_adjacency(list(msgs))
     out: list = []
     changed = sequence_changed
@@ -1325,7 +1324,8 @@ def _patch_model_for_bedrock(model: BaseChatModel) -> BaseChatModel:
     `init_chat_model(model_provider="bedrock")` → langchain-aws `ChatBedrock`/`ChatBedrockConverse` — this
     patch is a NO-OP (that path never imports langchain_openai). The authoritative, provider-agnostic
     empty-`system`/blank-block guard for the native path is `_sanitize_messages` plus the `_nonempty_system`
-    construction-site default; do not rely on this monkeypatch for the langchain-aws provider."""
+    construction-site default; do not rely on this monkeypatch for the langchain-aws provider.
+    """
     _apply_bedrock_patch()
     return model
 
@@ -1564,7 +1564,6 @@ class _StopCheckMiddleware(AgentMiddleware):
         records its own reason. Every other halt already had one recorded by whoever requested the
         stop; an unset reason stays neutral rather than being attributed to the operator.
         """
-
         if getattr(self._model, "_global_step_limit_hit", False):
             return _OperatorStopRequested(
                 STOP_REASON_STEP_LIMIT,
@@ -2381,7 +2380,8 @@ _BLOODHOUND_CONNECT_STEPS = (
 class _BloodHoundConnectionGuardMiddleware(AgentMiddleware):
     """BloodHound agent only: if the BloodHound MCP is NOT connected, do not silently fail. Emit a Mythic
     EventFeed WARNING with connect steps (once per run) and END the turn with a user-facing message, so the
-    Supervisor returns it to the operator — who can connect BloodHound if they wish, then re-run."""
+    Supervisor returns it to the operator — who can connect BloodHound if they wish, then re-run.
+    """
     def __init__(self, model: "Model"):
         super().__init__()
         self._model = model
@@ -2508,7 +2508,8 @@ class _MessageSanitizerMiddleware(AgentMiddleware):
     sees the final request after all other middleware (engagement-state injection, summarization). The same
     boundary now also strips malformed historical tool calls whose results are not immediately adjacent, which is
     required by Anthropic/Bedrock and harmless for valid OpenAI-style transcripts. Fail-open: a sanitizer error
-    must never abort a model call."""
+    must never abort a model call.
+    """
     def __init__(self, model: "Model"):
         super().__init__()
         self._model = model
@@ -2540,7 +2541,8 @@ class _MessageSanitizerMiddleware(AgentMiddleware):
 
 def _tool_name_from_request(request: Any) -> str:
     """Extract the tool name from a langgraph ToolCallRequest (dataclass with
-    tool_call: ToolCall TypedDict {'name': str}, tool: BaseTool | None). Never raises."""
+    tool_call: ToolCall TypedDict {'name': str}, tool: BaseTool | None). Never raises.
+    """
     try:
         tool_call = getattr(request, "tool_call", None)
         if isinstance(tool_call, dict):
@@ -3070,7 +3072,8 @@ class _ToolResultCompactionMiddleware(AgentMiddleware):
     don't flood the worker's per-call prompt. Reuses the densify/cap encoder (_transform_content).
     Skips protected control-flow tools. Passes Command / non-ToolMessage results through untouched.
     Never breaks a tool call: try/except around the COMPACTION only -> returns the original result;
-    a handler's own exception is NOT caught here and propagates normally."""
+    a handler's own exception is NOT caught here and propagates normally.
+    """
 
     def __init__(self, model: "Model"):
         super().__init__()
@@ -3120,7 +3123,8 @@ class _ToolResultCompactionMiddleware(AgentMiddleware):
 
 class _ToolSchemaSlimMiddleware(AgentMiddleware):
     """Trims duplicated Google-docstring sections from per-call tool schemas without
-    mutating source tools. Parameter details remain in each tool's JSON schema."""
+    mutating source tools. Parameter details remain in each tool's JSON schema.
+    """
 
     def __init__(self, model: "Model"):
         super().__init__()
@@ -4947,8 +4951,7 @@ class Model:
     _dynamic_data_loaded: bool
 
     def __init__(self, provider: str, model: str, system_prompt: str, config: dict, task_id: int, agent_task_id: str, mode: str = "conversation", autonomous_solve: bool = False, policy_mode: str = "", max_steps: int = 200, response_emitter: "Callable[[str], Awaitable[bool]] | None" = None, operation_id: int | None = None, channel_id: int | None = None, apitoken_id: int = 0, mythic_preauth_client: Any = None, policy_mode_resolution: str = "", policy_mode_requested: str = "", eval_force_capability_prefix_json: str | None = None, eval_arm_deadline_epoch: float | None = None):
-        """
-        Initialize the Model with provider, model, and configuration.
+        """Initialize the Model with provider, model, and configuration.
         :param provider: The model provider (e.g., 'anthropic', 'bedrock').
         :param model: The model string (e.g., 'claude-3-5-sonnet-latest').
         :param system_prompt: The system prompt to use for the model.
@@ -6441,7 +6444,6 @@ class Model:
         Returns None (allow) unless this is a supervised back-to-back repeat. A→B→A stays legal:
         hitting the same specialist twice in a request is fine, doing it consecutively is not.
         """
-
         try:
             from .request_contract import RequestLane
 
@@ -7213,7 +7215,8 @@ class Model:
         request-scoped event ledger (keyed by the logical request_id), so — unlike the former volatile
         one-shot flag — it is shared across a Supervisor↔Operator handoff and survives turn restarts within
         the request, while remaining strictly bounded (`_UNSUPPORTED_VERB_REPAIR_BUDGET`) so it can never
-        become an unbounded re-prompt loop. Fail-closed on a missing request id (no forced re-run)."""
+        become an unbounded re-prompt loop. Fail-closed on a missing request id (no forced re-run).
+        """
         rid = str(request_id or "").strip()
         if not rid:
             return False
@@ -7606,7 +7609,8 @@ class Model:
         `complete` with the bare "Completed." fallback is a FALSE SUCCESS — a routing-loop halt seen live
         that reported an objective it never reached. When a stop was requested this turn, the request did not
         complete: map the recorded reason to a non-`complete` terminal status and hand back the reason's own
-        halt notice so the fallback narrative explains the stop instead of claiming success."""
+        halt notice so the fallback narrative explains the stop instead of claiming success.
+        """
         if not getattr(self, "_stop_requested", False):
             return "complete", ""
         reason = str(getattr(self, "_stop_reason", "") or STOP_REASON_UNSPECIFIED)
@@ -7792,7 +7796,8 @@ class Model:
     def _delegation_icon(agent_name: str) -> str:
         """Sub-agent card icon. rc5 lets this be a Font-Awesome icon NAME (rendered as the glyph);
         operator-editable via the prompt frontmatter ``icon:`` (like ``color:``), with a per-agent fa
-        default, then a 2-letter code for an unknown agent."""
+        default, then a 2-letter code for an unknown agent.
+        """
         fallback = {
             "BloodHound": "dog",            # bloodhound = the dog
             "Mythic_Operator": "user-secret",
@@ -8255,8 +8260,7 @@ class Model:
                 pass
 
     async def _stream_message_to_mythic(self, formatted_message: str) -> bool:
-        """
-        Stream a formatted message chunk to the Mythic task.
+        """Stream a formatted message chunk to the Mythic task.
 
         Args:
             formatted_message: Pre-formatted message string (e.g., "🤖[Agent]> response")
@@ -8300,8 +8304,7 @@ class Model:
             return False
 
     async def _process_stream_event(self, event: dict[str, Any]) -> None:
-        """
-        Process a streaming event from graph.astream() and stream messages to Mythic.
+        """Process a streaming event from graph.astream() and stream messages to Mythic.
 
         NOTE: AIMessages and ToolMessages are now streamed immediately by MessageCaptureCallback
         during agent execution. This method only needs to stream HumanMessages (handoff messages)
@@ -8390,8 +8393,7 @@ class Model:
                         logger.debug(f"📨 [Stream] Suppressing Supervisor routing/respond_to_user message from user output")
 
     async def _extract_new_messages_from_event(self, state_update: dict) -> list[BaseMessage]:
-        """
-        Extract messages from a stream event's state update.
+        """Extract messages from a stream event's state update.
 
         LangGraph events only contain the NEW messages added by that node,
         so we can stream everything without deduplication logic.
@@ -8530,8 +8532,7 @@ class Model:
         return render_identity_report(self._identity_report_observations(values))
 
     def _format_message_for_streaming(self, message: BaseMessage, agent_name: str = None) -> str:
-        """
-        Format a single message for streaming output.
+        """Format a single message for streaming output.
 
         This is a streamlined version of _generate_mythic_output() logic that handles
         one message at a time instead of batching.
@@ -8631,7 +8632,7 @@ class Model:
             return ""
 
     async def initialize(self):
-        """ Initialize the model's graph and Mythic client."""
+        """Initialize the model's graph and Mythic client."""
         # Ensure logger has handlers before any logging calls
         ensure_logger_initialized()
         #logger.info("🚀 Starting Model initialization...")
@@ -8704,8 +8705,7 @@ class Model:
             return None
 
     def set_verbose(self, verbose: bool):
-        """
-        Set the verbosity of the model.
+        """Set the verbosity of the model.
         :param verbose: If True, the model will print all User & AI messages.
         """
         self.verbose = verbose
@@ -8823,8 +8823,7 @@ class Model:
         )
 
     def _wrap_create_agent(self, agent_runnable, state_key: str, node_name: str):
-        """
-        Wrap a create_agent runnable so it only sees & updates its own message list
+        """Wrap a create_agent runnable so it only sees & updates its own message list
         while keeping a global 'messages' list for tool compatibility.
 
         Worker agents (non-Supervisor) will copy their responses back to the
@@ -9941,7 +9940,8 @@ class Model:
         """Cheap, synchronous, in-memory render of the observed engagement state for PER-TURN injection
         by `_EngagementStateMiddleware`. Returns None — and the middleware injects nothing — when this is not
         an autonomous solve, there is no mythic_client, or there is no observed state yet. NO network: reads the
-        in-memory incremental hop ledger plus cached footholds. Never raises (caller also guards)."""
+        in-memory incremental hop ledger plus cached footholds. Never raises (caller also guards).
+        """
         try:
             if not self._autonomous_execution_enabled_for_turn():
                 return None
@@ -10117,7 +10117,8 @@ class Model:
         live to burn 461K tokens. Keyed on the worker's blocker, so it is immune to the supervisor's paraphrasing (which defeated the
         action-signature stall detector). `turn_key` dedups multiple middleware fires WITHIN one worker turn (the
         execute_capability tool-call id is fresh per re-delegation, so cross-turn repeats still count). Fail-open:
-        never raises into the agent loop."""
+        never raises into the agent loop.
+        """
         try:
             if not isinstance(payload, dict) or self._loop_breaker is None:
                 return
@@ -10144,7 +10145,8 @@ class Model:
         NO new progress for _AUTONOMOUS_STALL_LIMIT consecutive steps — the dead-loop signature. Real progress
         (count grows) OR moving to a DIFFERENT hop resets the counter, so a solve that keeps advancing — or that
         legitimately works through distinct multi-step precondition hops — never trips; only a genuinely stuck
-        re-selection of one dead hop does. Pure counter; never raises."""
+        re-selection of one dead hop does. Pure counter; never raises.
+        """
         last_progress = getattr(self, "_autonomous_stall_progress", None)
         last_sig = getattr(self, "_autonomous_stall_sig", None)
         progressed = last_progress is not None and progress > last_progress
@@ -12348,7 +12350,8 @@ class Model:
     def _controller_terminal_report(self, result) -> str:
         """Render a terminal controller result as an operator-facing report. Range-agnostic: lists status,
         reason, the precise blocker (if any), and achieved effects. Scenario 'wall' mapping is the eval layer's
-        job (ai/hillclimb/wall_checkpoints.py), not the runtime's."""
+        job (ai/hillclimb/wall_checkpoints.py), not the runtime's.
+        """
         lines = [f"Sage halted deterministic execution: **{result.status}** — {result.reason}.",
                  f"Cycles: {result.cycle_count}. Verified effects: {len(result.achieved_effects)}."]
         blocker = result.blocker or {}
@@ -12370,7 +12373,8 @@ class Model:
         re-collect an already-covered authority epoch forever while the missing one is never collected — but
         ADDITIONALLY filtered to payloads with a collector profile. Selecting an
         unsupported-agent foothold and then rejecting it would burn collection slots and starve a collectable
-        foothold. Returns a Foothold or None."""
+        foothold. Returns a Foothold or None.
+        """
         try:
             from . import engagement_state as _es
         except ImportError:
@@ -12477,7 +12481,8 @@ class Model:
         3. Only when no grounded action remains may a new modeled authority epoch recollect the current forest.
         4. Other trusted-domain expansion remains available after the objective-target and authority cases.
 
-        This prevents raw credential/ticket churn from preempting the route the graph already exposes."""
+        This prevents raw credential/ticket churn from preempting the route the graph already exposes.
+        """
         try:
             from . import engagement_state as _es
         except ImportError:
@@ -12601,7 +12606,8 @@ class Model:
         the resolved `file_uuid` (the exact artifact), with `callback_display_id` so `_record_graph_built` flips
         the collection gate. `ok` is driven by `graph_verified`: only `ingested`/`already_ingested`
         set it True; `ingest_failed`/`uploaded_pending_ingest`/`error` are NOT success, so the collection stays
-        'missing' and the controller's per-request retry budget may re-run it (self-heal by composition)."""
+        'missing' and the controller's per-request retry budget may re-run it (self-heal by composition).
+        """
         try:
             from . import mythic_tools as _mt
         except ImportError:
@@ -13144,7 +13150,8 @@ class Model:
         SummarizationMiddleware is a SAFETY NET that only fires on genuine context overflow.
         Note: the per-call floor (system prompt + tool schemas) is ~75k tokens, so the summarization
         trigger MUST sit well above it (we run bedrock-claude-4-6-sonnet via LiteLLM, ~200k context) —
-        a trigger near the floor makes summarization fire every step and thrash (~10s/call) for no gain."""
+        a trigger near the floor makes summarization fire every step and thrash (~10s/call) for no gain.
+        """
         # Protect routing/handoff tool results from clearing — they drive graph control.
         _PROTECTED_TOOLS = (
             "summarize_and_handback", "handback_to_supervisor", "request_continuation", "respond_to_user",
@@ -13365,7 +13372,8 @@ class Model:
 
     async def _notify_bloodhound_not_connected(self):
         """Emit a ONE-TIME Mythic EventFeed WARNING (idempotent per run) telling the operator that
-        BloodHound is needed but not connected, and how to connect it. Fail-soft."""
+        BloodHound is needed but not connected, and how to connect it. Fail-soft.
+        """
         if getattr(self, "_bh_notconnected_notified", False):
             return
         self._bh_notconnected_notified = True
@@ -13675,8 +13683,7 @@ class Model:
         return result
 
     def _cleanup_dangling_tool_calls(self):
-        """
-        Clean up ANY dangling tool_use blocks throughout the entire conversation state.
+        """Clean up ANY dangling tool_use blocks throughout the entire conversation state.
 
         Anthropic's API requires that every tool_use block must have a corresponding
         tool_result block. This function scans ALL messages to find tool_use blocks
@@ -13741,8 +13748,7 @@ class Model:
             logger.info("No dangling tool calls found - state is clean")
 
     def _sanitize_messages(self, msgs: list[AnyMessage]) -> list[AnyMessage]:
-            """
-            Sanitize message list for LLM invocation:
+            """Sanitize message list for LLM invocation:
             1. Repair invalid tool-call adjacency and remove orphan ToolMessages
             2. Keep only the FIRST NON-EMPTY SystemMessage; drop empty/blank ones and all later ones
                (prevents both "multiple non-consecutive system messages" AND the Bedrock
@@ -13801,8 +13807,7 @@ class Model:
             return cleaned
 
     def _fix_message_sequence_for_bedrock(self, msgs: list[AnyMessage]) -> list[AnyMessage]:
-        """
-        Validate and fix message sequences for strict LLM provider requirements.
+        """Validate and fix message sequences for strict LLM provider requirements.
 
         Some providers (like AWS Bedrock) require that every AIMessage with tool_calls
         is IMMEDIATELY followed by ToolMessage(s) with matching tool_call_ids.
@@ -13829,8 +13834,7 @@ class Model:
         return out
 
     async def _generate_per_agent_summaries(self) -> str:
-        """
-        Generate summaries from each participating agent about their own work.
+        """Generate summaries from each participating agent about their own work.
         Returns formatted string with per-agent summaries.
         """
         agent_channels = {
@@ -14296,7 +14300,8 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
 
         Fires ONLY when a denial was recorded this resume cycle, so the legitimate path — an approved action
         that SUCCEEDS and is followed by a distinct next action — records no denial and is untouched. The
-        follow-on denial-routing replaces the terminalise with recover / return-to-user by reason."""
+        follow-on denial-routing replaces the terminalise with recover / return-to-user by reason.
+        """
         denial = getattr(getattr(self, "mythic_client", None), "_last_effect_denial", None)
         if not denial:
             return False
@@ -14405,7 +14410,8 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
     def _issue_task_card_verification_text(self, args: dict[str, Any]) -> str:
         """Expected-verification line for a raw issue_task card when the command maps
         to a modeled technique (the card should state what evidence proves the
-        effect). Unknown commands render nothing — no prose is invented."""
+        effect). Unknown commands render nothing — no prose is invented.
+        """
         try:
             from . import intent_classifier
         except ImportError:
@@ -14543,7 +14549,8 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         approve/deny prompt to the operator and return True. The graph stays paused (checkpointed) so
         the operator's next message resumes it via handle_hitl_resume. Without this, supervised mode
         halts on the raw tool-call request with no prompt (an observed symptom: 'stop had
-        no text back to the user, last text showing as the tool call request')."""
+        no text back to the user, last text showing as the tool call request').
+        """
         interrupts = event.get("__interrupt__") if isinstance(event, dict) else None
         if not interrupts:
             return False
@@ -14704,7 +14711,8 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         STILL resolves opaque (blank/opaque prompt AND no operator/env objective), warn once — in that case
         completion-recognition (engagement_state._objective_is_complete) is unreachable and the solve would
         silently over-reach until the stall detector halts it. No-op unless this is a controller-owned solve with a
-        live client. Fail-open: never breaks the solve."""
+        live client. Fail-open: never breaks the solve.
+        """
         if not self._controller_owned_solve() or self.mythic_client is None:
             return
         try:
@@ -14721,8 +14729,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             pass
 
     async def invoke(self, prompt: str, is_interactive: bool = False) -> str:
-        """
-        Invoke the model with a prompt and return the response.
+        """Invoke the model with a prompt and return the response.
         :param prompt: The prompt to send to the model.
         :param is_interactive: Whether this is an interactive task (subsequent turn in conversation).
         :return: The model's response as a string.
@@ -15534,8 +15541,7 @@ The conversation history below shows all work completed before the error occurre
         return label if label in {"CONTINUE", "STOP", "REDIRECT"} else ""
 
     async def handle_continuation_response(self, response: str) -> str:
-        """
-        Handle user response to recursion limit continuation request.
+        """Handle user response to recursion limit continuation request.
         :param response: User's response ('continue', 'stop', 'redirect', or specific instruction)
         :return: The model's response after handling the continuation
         """
@@ -15708,8 +15714,7 @@ Continue now.""")
         return ""  # All output already streamed to Mythic
 
 def _create_summarize_handback_tool():
-    """
-    Create a tool that allows specialist agents to hand back control to the Supervisor
+    """Create a tool that allows specialist agents to hand back control to the Supervisor
     when approaching recursion limits, with a progress summary.
     """
     @tool("summarize_and_handback")
@@ -15720,7 +15725,6 @@ def _create_summarize_handback_tool():
         key_findings: Annotated[str, "Important findings or results discovered"] = "",
     ) -> Command:
         """Hand back control to Supervisor when approaching recursion limit with progress summary."""
-
         handback_message = f"""🔄 **Approaching Recursion Limit - Progress Handback**
 
 **Work Completed:**
@@ -15841,8 +15845,7 @@ def _deterministic_post_ingest_owner(mythic_client) -> _HandoffDirective | None:
 
 def _create_handback_to_supervisor_tool(mythic_client=None, *, autonomous: bool = False,
                                        source_model: Model | None = None):
-    """
-    Let a specialist yield control to the Supervisor WITHOUT ending the run, so the Supervisor can route
+    """Let a specialist yield control to the Supervisor WITHOUT ending the run, so the Supervisor can route
     to another agent (BloodHound for graph work, Mythic_Payload for a build) or finalize. This is the
     explicit autonomous handback path: with the keep-going continue-loop a plain turn-end does not
     reach the Supervisor, so the Operator MUST call this to hand off across agents. Distinct from
@@ -15859,7 +15862,8 @@ def _create_handback_to_supervisor_tool(mythic_client=None, *, autonomous: bool 
         """Yield control to the Supervisor WITHOUT ending the run so it can route to another agent
         (BloodHound for graph work, Mythic_Payload for builds) or finalize the objective.
         Call this the moment the NEXT step needs a capability you do not own, or the objective is reached.
-        Plain completion = keep going; summarize_and_handback = pause for the user at the recursion limit only."""
+        Plain completion = keep going; summarize_and_handback = pause for the user at the recursion limit only.
+        """
         msg = ToolMessage(
             content=f"🔄 **Handback to Supervisor** — {reason}\n\n{summary}",
             name="handback_to_supervisor",
@@ -16004,8 +16008,7 @@ def _create_handback_to_supervisor_tool(mythic_client=None, *, autonomous: bool 
 
 
 def _create_respond_to_user_tool():
-    """
-    Create a tool that allows the Supervisor to explicitly indicate it's done
+    """Create a tool that allows the Supervisor to explicitly indicate it's done
     delegating and wants to deliver a user-facing final report. It may synthesize
     findings or reuse one complete specialist answer verbatim.
     """
@@ -16104,8 +16107,7 @@ def _create_respond_to_user_tool():
     return respond_to_user
 
 def _create_recursion_summary_tool():
-    """
-    Create a tool that allows the supervisor to handle recursion limit situations
+    """Create a tool that allows the supervisor to handle recursion limit situations
     by asking the user if they want to continue.
     """
     @tool("request_continuation")
@@ -16114,7 +16116,6 @@ def _create_recursion_summary_tool():
         summary: Annotated[str, "Summary of progress made so far"],
     ) -> Command:
         """Request user input on whether to continue when approaching recursion limit."""
-
         continuation_message = f"""🔄 **Recursion Limit Approaching**
 
 **Progress Summary:**
@@ -16262,8 +16263,7 @@ def _create_handoff_tool(
     subgoal_scheduler: Callable[..., dict[str, Any]] | None = None,
     assisted_operator_lookup: Callable[[], str | None] | None = None,
 ):
-    """
-    Create a handoff tool to transfer control to another agent.
+    """Create a handoff tool to transfer control to another agent.
     https://docs.langchain.com/oss/python/langchain/multi-agent#handoffs
     https://langchain-ai.github.io/langgraph/how-tos/multi_agent/#handoffs
 
@@ -16773,7 +16773,8 @@ def _compiled_autonomous_blocked_bloodhound_instruction(
 
 def _action_signature(action) -> tuple:
     """A stable identity for a selected capability action (handles dict or object), used by the stall detector
-    to tell "re-selecting the same dead hop" from "advancing through distinct hops". Never raises."""
+    to tell "re-selecting the same dead hop" from "advancing through distinct hops". Never raises.
+    """
     try:
         if isinstance(action, dict):
             return (action.get("name"), action.get("target"), action.get("effect"))
@@ -16784,7 +16785,8 @@ def _action_signature(action) -> tuple:
 
 def _autonomous_stall_report(snapshot) -> str:
     """Terminal report when the autonomous solve stalls (no ledger progress for _AUTONOMOUS_STALL_LIMIT steps).
-    Self-contained string surfaced to the operator via the __terminal__ handback. Never raises."""
+    Self-contained string surfaced to the operator via the __terminal__ handback. Never raises.
+    """
     try:
         objective = str(getattr(snapshot, "objective", "") or "")
         achieved = sorted(snapshot.achieved_effects()) if snapshot is not None else []
@@ -16932,7 +16934,8 @@ def _find_token_zip_path(ls_output: str, token: str) -> str:
     timestamp to `--ZipFilename` (e.g. `<ts>_bloodhound_<token>.zip`), so the on-disk name is NOT predictable —
     we discover it instead. Anchored on the per-run random `token` so it cannot match any other file. Apollo
     streams one-or-more structured JSON objects; Merlin emits a tab-delimited native directory listing. Returns
-    the exact full path or ""."""
+    the exact full path or "".
+    """
     dec = json.JSONDecoder()
     s = ls_output or ""
     i, n = 0, len(s)
@@ -17271,7 +17274,8 @@ def _autonomous_capability_inputs(action: Any, engagement_snapshot: Any) -> dict
 
 def _autonomous_controlled_identity(engagement_snapshot: Any, callback_id: str = "") -> str:
     """The identity (DOMAIN\\user or user@domain) of the live foothold we control — preferring the one on the
-    action's callback, else any live foothold. Used to parameterize self-escalation capabilities."""
+    action's callback, else any live foothold. Used to parameterize self-escalation capabilities.
+    """
     footholds = list(getattr(engagement_snapshot, "footholds", []) or [])
     cb = str(callback_id or "").strip()
     if cb:

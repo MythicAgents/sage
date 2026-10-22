@@ -1647,7 +1647,6 @@ def validate_structured_artifacts(output: Any) -> dict[str, Any]:
     structured artifact, the artifact has to be syntactically valid before an
     executor treats the setup as usable progress.
     """
-
     text = _text(output)
     xml_text = _extract_first_xml_document(text)
     if not xml_text:

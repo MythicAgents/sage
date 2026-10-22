@@ -19,7 +19,8 @@ def default_engagement_id() -> str:
 
 def state_dir() -> str:
     """Directory holding the per-engagement ledgers. `SAGE_ENGAGEMENT_STATE_DIR` overrides; default is
-    `.sage_engagement` next to the Sage process cwd (same persistence guarantee as the operational db)."""
+    `.sage_engagement` next to the Sage process cwd (same persistence guarantee as the operational db).
+    """
     override = os.environ.get("SAGE_ENGAGEMENT_STATE_DIR", "").strip()
     if override:
         return override
@@ -136,7 +137,8 @@ def _hop_matches(hop: dict, selector_cf: str) -> bool:
 
 def _resolve_index(selector: str, hops: list) -> int | None:
     """If `selector` is a 1-based row number (as shown by `state show`), return its 0-based index, else None.
-    Hop labels are never bare integers, so a numeric selector unambiguously means a row."""
+    Hop labels are never bare integers, so a numeric selector unambiguously means a row.
+    """
     s = (selector or "").strip()
     if s.isdigit():
         i = int(s) - 1
@@ -147,14 +149,16 @@ def _resolve_index(selector: str, hops: list) -> int | None:
 
 def remove_hop(data: dict, selector: str) -> tuple[dict, int]:
     """Remove hops matching `selector` — a 1-based ROW NUMBER (from `state show`) OR a label/effect/technique.
-    Returns (data, removed_count). Single-selector convenience over remove_hops."""
+    Returns (data, removed_count). Single-selector convenience over remove_hops.
+    """
     return remove_hops(data, [selector])
 
 
 def remove_hops(data: dict, selectors) -> tuple[dict, int]:
     """Remove every hop matching ANY selector in `selectors` (each a 1-based ROW NUMBER OR a
     label/effect/technique). Row numbers are resolved against the ORIGINAL indexing, so a CSV like
-    `9,10,11` removes those exact rows with no index-shift surprises. Returns (data, removed_count)."""
+    `9,10,11` removes those exact rows with no index-shift surprises. Returns (data, removed_count).
+    """
     hops = list(data.get("hops") or [])
     targets: set[int] = set()
     for sel in selectors:
@@ -175,7 +179,8 @@ def remove_hops(data: dict, selectors) -> tuple[dict, int]:
 
 def set_hop_status(data: dict, selector: str, status: str) -> tuple[dict, int]:
     """Set the `status` of hops matching `selector` — a 1-based ROW NUMBER OR a label/effect/technique.
-    Returns (data, changed_count)."""
+    Returns (data, changed_count).
+    """
     hops = data.get("hops") or []
     new_status = (status or "").strip()
     if new_status.casefold() == "achieved":

@@ -47,14 +47,16 @@ def _sanitize(value: str) -> str:
 
 def operation_key(op_name: str, op_id) -> str:
     """The ledger/engagement key for an operation: `<SanitizedName>_<id>` (e.g. `Operation_Chimera_1`).
-    `engagement_ledger.ledger_path` turns this into `state_<key>.json`."""
+    `engagement_ledger.ledger_path` turns this into `state_<key>.json`.
+    """
     name = _sanitize(op_name) or "operation"
     return f"{name}_{op_id}"
 
 
 def _as_op(op_id, op_name) -> tuple[int, str] | None:
     """Coerce a raw (id, name) to (int, str), or None if the id isn't a usable int. Coercing in ONE place
-    keeps the agent path (GraphQL int) and the `state` path (taskData int/str) producing identical keys."""
+    keeps the agent path (GraphQL int) and the `state` path (taskData int/str) producing identical keys.
+    """
     if op_id is None:
         return None
     try:
@@ -149,7 +151,8 @@ async def get_or_create_engagement_uuid(client, op_id) -> str | None:
 async def resolve_operation_key(client) -> str | None:
     """The durable ledger key for the current operation: `<SanitizedName>_<id>_<uuid>`, or None if the
     operation can't be resolved. Falls back to `<SanitizedName>_<id>` (no uuid) only if the durable marker
-    can't be read/created — the operation id alone is NOT reset-safe, so that path is best-effort."""
+    can't be read/created — the operation id alone is NOT reset-safe, so that path is best-effort.
+    """
     resolved = await resolve_operation(client)
     if resolved is None:
         return None

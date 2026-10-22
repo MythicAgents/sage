@@ -24,7 +24,6 @@ def operator_error_text(exc: BaseException) -> str:
     payload is suppressed and only the exception type is named; the full detail belongs in
     the logs, not the chat channel.
     """
-
     args = getattr(exc, "args", ())
     try:
         payload_is_text = all(isinstance(arg, str) for arg in args)

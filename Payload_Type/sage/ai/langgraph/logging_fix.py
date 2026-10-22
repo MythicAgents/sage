@@ -1,5 +1,4 @@
-"""
-Logging fix for mythic_container.logging handler issues.
+"""Logging fix for mythic_container.logging handler issues.
 
 This module ensures the logger always has proper handlers and provides a fallback.
 """
@@ -15,8 +14,7 @@ def emergency_log(message: str):
 
 
 def ensure_logger_initialized():
-    """
-    Ensure mythic logger has handlers and is properly configured.
+    """Ensure mythic logger has handlers and is properly configured.
 
     This fixes the issue where mythic_container.logging stops working
     after initial logs because handlers get removed or aren't added.
@@ -53,8 +51,7 @@ def ensure_logger_initialized():
 
 
 def get_safe_logger():
-    """
-    Get a logger that is guaranteed to work.
+    """Get a logger that is guaranteed to work.
 
     Returns the mythic logger if it has handlers, otherwise returns a fallback.
     """

@@ -118,7 +118,8 @@ _DUMP_STARTED_TOKENS = (
 
 def _strip_placeholder_lines(text: str) -> str:
     """Drop lines whose only hex-looking content is an agent placeholder, so a real key elsewhere is
-    still detected but a placeholder-only output yields nothing."""
+    still detected but a placeholder-only output yields nothing.
+    """
     kept = []
     for line in text.splitlines():
         low = line.lower()
@@ -130,7 +131,8 @@ def _strip_placeholder_lines(text: str) -> str:
 
 def _has_real_key(text: str) -> bool:
     """True iff a real, label-anchored NTLM/AES/RC4 secret or a secretsdump credential line is present
-    AND its value is a usable hash (not an empty-LM / blank-NT / all-zero degenerate constant)."""
+    AND its value is a usable hash (not an empty-LM / blank-NT / all-zero degenerate constant).
+    """
     return bool(extract_credential_material(text))
 
 
@@ -298,7 +300,8 @@ def extract_grant_probe(output) -> dict:
     output shows an explicit ACE-applied success marker AND names a replication right AND carries NO
     failure signature. Checking only for a known failure signature would record a grant ``achieved``
     when it returned ``Access is denied`` (e.g. a medium-integrity principal) or produced NO output
-    (a SYSTEM task that never fired)."""
+    (a SYSTEM task that never fired).
+    """
     text = output if isinstance(output, str) else ("" if output is None else str(output))
     low = text.lower()
     denied = (not low.strip()) or any(tok in low for tok in _GRANT_FAILURE_TOKENS)
@@ -409,7 +412,8 @@ def _line_correlates_to_domain(low_line, expected_domain, expected_netbios, expe
     """True when a membership line is bound to the TARGET domain. With NO domain context supplied the gate is
     open (the deny-only / negation / entry-shape filters still apply); with context it requires a NetBIOS
     prefix, the FQDN, or the well-known RID SID under the target domain SID. This stops a child-domain group
-    line (e.g. ``NORTH\\Domain Admins``) from proving a parent-domain effect (``da:sevenkingdoms.local``)."""
+    line (e.g. ``NORTH\\Domain Admins``) from proving a parent-domain effect (``da:sevenkingdoms.local``).
+    """
     if not (expected_domain or expected_netbios or expected_domain_sid):
         return True
     netbios = _derive_netbios(expected_domain, expected_netbios)
@@ -464,7 +468,8 @@ def _qualifying_group_memberships(text, expected_domain=None, expected_netbios=N
 def _service_access_proven(text, expected_domain=None, expected_netbios=None) -> bool:
     """A genuine remote directory listing succeeded. With domain context, the listed admin share must belong
     to the TARGET domain (the host's immediate parent domain == target) — a child-host listing does not prove
-    a parent-domain effect."""
+    a parent-domain effect.
+    """
     low = str(text).casefold()
     if not any(tok in low for tok in _SERVICE_ACCESS_TOKENS):
         return False

@@ -113,7 +113,8 @@ def action_fingerprint(action: str, state_revision: str, impl_version: str = "")
 
     Two attempts are 'the same' (suppressible) ONLY when all three match. A changed `state_revision` (new creds,
     fresh graph, new callback context) or a bumped `impl_version` (a capability fix) yields a NEW fingerprint, so
-    a legitimate retry is never suppressed (the over-suppression guard)."""
+    a legitimate retry is never suppressed (the over-suppression guard).
+    """
     return f"{_norm(action)}|rev={state_revision}|impl={impl_version}"
 
 
@@ -158,7 +159,8 @@ def outcome_from_capability_result(capability: str, result: dict, state_revision
     re-delegations of the same blocked action never tripped it. `state_revision` is the caller's progress epoch,
     so a blocker only counts as 'repeated at the same state' until real progress is made (the over-suppression
     guard). A structured prerequisite field (`run_first` / `next_capability` / `prerequisite`) becomes the route
-    target; free-text reasons are NOT parsed (kept generic / range-agnostic)."""
+    target; free-text reasons are NOT parsed (kept generic / range-agnostic).
+    """
     ok = bool(result.get("ok", True)) if isinstance(result, dict) else True
     if ok:
         return WorkerOutcome(Outcome.PROGRESS, state_revision)
@@ -179,7 +181,8 @@ def outcome_from_capability_result(capability: str, result: dict, state_revision
 def decide_capability_outcome(history: list[WorkerOutcome], capability: str, result: dict,
                               progress_epoch: int) -> tuple[WorkerOutcome, Decision]:
     """Pure: build the typed outcome from a capability result + decide. The state wrapper manages the epoch and
-    appends to history; this keeps the loop-breaking decision fully unit-testable without the agent runtime."""
+    appends to history; this keeps the loop-breaking decision fully unit-testable without the agent runtime.
+    """
     outcome = outcome_from_capability_result(capability, result, str(progress_epoch))
     return outcome, supervisor_decision(history, outcome)
 
@@ -187,7 +190,8 @@ def decide_capability_outcome(history: list[WorkerOutcome], capability: str, res
 @dataclass
 class LoopBreakerState:
     """Per-solve state for the supervisor/worker loop-breaker. The Model holds one of these and RE-CREATES it
-    each solve (a Sage session reuses one Model, so a prior objective's blockers must never leak into the next)."""
+    each solve (a Sage session reuses one Model, so a prior objective's blockers must never leak into the next).
+    """
     outcomes: list = field(default_factory=list)
     progress_epoch: int = 0
     last_turn_key: str = ""
@@ -371,7 +375,8 @@ def observe_capability_outcome(state: LoopBreakerState, capability: str, result:
     self-reported `result.ok`. The OUTCOME classification (PROGRESS/BLOCKED + blocker fingerprint) is ALWAYS
     derived from the real `result`, never overwritten — so a slow/idempotent real success is not mislabeled a
     terminal blocker, and a self-reported success with no verified effect does not advance the state revision
-    that the over-suppression guard keys on."""
+    that the over-suppression guard keys on.
+    """
     if not turn_key or turn_key == state.last_turn_key:
         return False
     state.last_turn_key = turn_key

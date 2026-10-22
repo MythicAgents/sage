@@ -1,5 +1,4 @@
-"""
-prompt_loader — externalized agent system prompts.
+"""prompt_loader — externalized agent system prompts.
 
 Each Sage agent's system prompt lives in `Payload_Type/sage/prompts/<agent>.md` as a
 markdown file with a YAML frontmatter block:
