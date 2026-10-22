@@ -34,6 +34,8 @@ from mythic_container.ChatBase import (
 )
 from mythic_container.logging import logger
 
+from _version import agent_version
+
 from .config import build_bloodhound_env, build_model_kwargs
 from .findings_watcher import FindingsWatcherManager, render_watcher_status
 from .hitl import (
@@ -281,7 +283,8 @@ def _bloodhound_unavailable_message(reason: str | None = None) -> str:
 class SageChat(Chat):
     name = "sage"
     description = "Sage — AI red-team operator assistant (native Mythic v4.0.0 chat container)."
-    semver = "4.0.0"
+    # Mythic shows semver as the container's own version, so it is Sage's release version, not Mythic's.
+    semver = agent_version()
     # rc5: the chat container's service icon (light + dark). Only sage.svg exists today, so it serves both
     # until a dedicated dark variant lands. Path is resolved from this module (…/sage_chat/) up to the sage root.
     agent_icon_path = str(Path(__file__).resolve().parent.parent / "sage.svg")

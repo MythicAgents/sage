@@ -40,8 +40,8 @@ __all__ = [
 # module does not keep a second copy. That file is NOT copied into the deployed service dir and is not
 # in the Docker build context, so the running container cannot read it. Two reads cover both cases: a
 # dev checkout has the file a couple levels up (found by search), and the built image carries the value
-# in SAGE_AGENT_VERSION, baked from the same file by CI. tests/test_version.py guards the file against
-# drift from the chat container's declared semver.
+# in SAGE_AGENT_VERSION, baked from the same file by CI. The chat container registers this value with
+# Mythic as its semver; tests/test_version.py guards that.
 _CAPABILITIES_FILE = "agent_capabilities.json"
 
 # Env vars the Dockerfile bakes (ARG -> ENV). Absent/empty -> "unknown".

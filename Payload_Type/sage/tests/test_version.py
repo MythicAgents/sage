@@ -31,13 +31,14 @@ def test_baked_agent_version_env_wins():
         del os.environ["SAGE_AGENT_VERSION"]
 
 
-def test_chat_container_semver_matches_targeted_mythic_version():
-    # Drift guard: SageChat.semver advertises the Mythic framework version (minus the leading "v"),
-    # which is exactly agent_capabilities.json's mythic_version. If one is bumped without the other,
-    # this fails and names the mismatch rather than letting the logged/registered versions diverge.
+def test_chat_container_semver_is_the_sage_release_version(monkeypatch):
+    # Mythic shows a container's semver as that container's own version, so SageChat must register
+    # Sage's release version from agent_capabilities.json, never the Mythic framework version.
+    monkeypatch.delenv("SAGE_AGENT_VERSION", raising=False)
     from sage_chat.service import SageChat
 
-    assert SageChat.semver == _version.mythic_version().lstrip("v")
+    assert SageChat.semver == _version.agent_version()
+    assert SageChat.semver != _version.mythic_version().lstrip("v")
 
 
 def test_build_commit_reads_env(monkeypatch):
