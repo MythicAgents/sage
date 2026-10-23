@@ -41,7 +41,8 @@ versioned container image.
 - Approval cards carry decision context and list all three operator actions. Guard errors name their remedy, and
   the engagement ledger is surfaced at the end of each turn.
 - All Sage tables share one database, `sage.db`.
-- Dependency pins were refreshed to clear the fixable known vulnerabilities.
+- Dependency pins were refreshed to clear most of the fixable known vulnerabilities, including an updated
+  `certifi` CA bundle.
 
 ### Fixed
 
@@ -58,8 +59,10 @@ versioned container image.
 - **macOS Docker Desktop and OrbStack.** SQLite cannot lock files on the bind-mounted service directory there.
   Set `PHOENIX_WORKING_DIR` and `SAGE_DATABASE_PATH` as described in the README section "SQLite on macOS Docker
   Desktop / OrbStack". With that setting, the databases do not survive a container rebuild or reinstall.
-- **Upstream-pinned dependency vulnerabilities.** Some reported vulnerabilities remain because `mythic-container`
-  and `arize-phoenix` pin the affected packages. They clear when those projects update their pins.
+- **Dependency vulnerabilities.** Some reported vulnerabilities remain because `mythic-container` and
+  `arize-phoenix` pin the affected packages. They clear when those projects update their pins. An advisory against
+  `opentelemetry-api` 1.44.0 is fixed in 1.45.1; that update moves the whole OpenTelemetry package family and is
+  planned for a follow-up release.
 - **Root-owned runtime state.** Sage writes `.sage_engagement*` state into the installed service directory as
   root, which can block a later reinstall by a non-root user. Archive or remove that state with `sudo` before
   reinstalling.

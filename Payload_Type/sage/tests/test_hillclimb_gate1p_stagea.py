@@ -75,7 +75,7 @@ def test_validate_request_accepts_only_the_declared_arm_mapping():
         ("token_ceiling", True),
         ("source_version", ""),
         ("api_endpoint", ""),
-        ("api_endpoint", "https://user:secret@provider.invalid/v1"),
+        ("api_endpoint", "https://user:secret@provider.invalid/v1"),  # trufflehog:ignore (fake credential)
         ("api_endpoint", "https://provider.invalid/v1?token=secret"),
         ("model_context_limit", 0),
         ("model_context_limit", True),
