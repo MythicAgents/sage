@@ -17,6 +17,10 @@ between minor releases.
 
 - The startup version banner now appears in the container logs at Mythic's default log level
   (`DEBUG_LEVEL=warning`); it was logged at INFO and hidden.
+- A request's final message now records how the request ended (`completed`, `blocked`, `checkpoint`,
+  `stopped`, `cancelled`, or `error`) as `turn_outcome` in its metadata. Mythic stores only `complete`,
+  `error`, and `cancelled` as a request's status, so a request Sage stopped on its own, or one that ended
+  blocked, still shows as `complete` there; the message content and `turn_outcome` give the real ending.
 
 ## [0.2.0] - 2026-10-23
 

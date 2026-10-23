@@ -115,9 +115,25 @@ def test_happy_path_emits_exactly_one_terminal():
     assert model.invoked_with == ("do the thing", False)
 
 
+def _mythic_stored_request_status(terminal):
+    """The chat_request status Mythic stores for a terminal emission.
+
+    Mirrors normalizeChatContainerResponseStatus in Mythic's recv_chat_response.go: only streaming,
+    complete, error, and cancelled are kept; otherwise an error wins, then complete=True means complete.
+    """
+    if terminal["kind"] == "complete":
+        return "complete"
+    if terminal["kind"] == "error":
+        return "error"
+    status = str(terminal.get("status") or "").strip().lower()
+    if status in {"streaming", "complete", "error", "cancelled"}:
+        return status
+    return "complete" if terminal.get("complete") else ""
+
+
 def test_self_halt_terminal_is_not_complete_and_lands_in_main_window():
-    """A self-halt must (1) record a non-`complete` request status (no operator-facing false success)
-    and (2) surface the terminal in the MAIN chat window even when the last streamed block was a
+    """A self-halt must (1) record its real ending, not a silent `complete` (no operator-facing false
+    success), and (2) surface the terminal in the MAIN chat window even when the last streamed block was a
     collapsed sub-agent panel (a run can otherwise end entirely inside the Mythic_Operator panel)."""
 
     class _HaltModel(_FakeModel):
@@ -142,9 +158,10 @@ def test_self_halt_terminal_is_not_complete_and_lands_in_main_window():
     terminals = chat.terminal_emissions
     assert len(terminals) == 1, f"expected exactly one terminal, got {chat.emissions}"
     terminal = terminals[0]
-    # The request row carries the real disposition, never a false `complete`.
-    assert terminal["kind"] == "response"
-    assert terminal["status"] == "stopped"
+    # Mythic cannot store `stopped` (it would rewrite it to complete), so the request terminates with a
+    # status Mythic keeps and the real ending rides in the terminal metadata.
+    assert _mythic_stored_request_status(terminal) == "complete"
+    assert terminal["metadata"]["turn_outcome"] == "stopped"
     assert terminal.get("complete_request") is True
     # Forced onto the main-window assistant key, not the sub-agent delegation stream.
     assert terminal["response_key"].startswith("assistant:")
@@ -170,6 +187,50 @@ def test_genuine_completion_still_uses_send_complete_in_main_window():
     assert len(terminals) == 1
     assert terminals[0]["kind"] == "complete"
     assert terminals[0]["response_key"].startswith("assistant:")
+
+
+def test_blocked_final_answer_records_blocked_turn_outcome_on_the_terminal():
+    """A request the Supervisor ends as blocked terminates `complete` in Mythic's vocabulary, with the
+    blocked ending recorded in the terminal metadata Mythic stores."""
+
+    class _BlockedModel(_FakeModel):
+        def request_terminal_disposition(self):
+            return "complete", ""
+
+        def request_turn_outcome(self):
+            return "blocked"
+
+    chat = _DriverChat(_BlockedModel(stream=("🤖> ⛔ **Blocked** denied",), return_value="denied"))
+    _run(chat.chat(build_chat_request("do the thing", channel_id=5, request_id=9)))
+
+    terminal, = chat.terminal_emissions
+    assert _mythic_stored_request_status(terminal) == "complete"
+    assert terminal["metadata"]["turn_outcome"] == "blocked"
+
+
+@pytest.mark.parametrize("disposition", ("cancelled", "error"))
+def test_halt_statuses_mythic_stores_are_still_sent_as_the_request_status(disposition):
+    class _HaltModel(_FakeModel):
+        def request_terminal_disposition(self):
+            return disposition, "halt notice"
+
+        def request_turn_outcome(self):
+            return disposition
+
+    chat = _DriverChat(_HaltModel(stream=(), return_value=""))
+    _run(chat.chat(build_chat_request("do the thing", channel_id=5, request_id=9)))
+
+    terminal, = chat.terminal_emissions
+    assert _mythic_stored_request_status(terminal) == disposition
+    assert terminal["metadata"]["turn_outcome"] == disposition
+
+
+def test_undeclared_outcome_adds_no_turn_outcome_metadata():
+    chat = _DriverChat(_FakeModel(stream=("🤖> done",), return_value="all done"))
+    _run(chat.chat(build_chat_request("do the thing", channel_id=5, request_id=9)))
+
+    terminal, = chat.terminal_emissions
+    assert "turn_outcome" not in (terminal.get("metadata") or {})
 
 
 def test_restarted_native_channel_refuses_lost_scope_before_model_invoke():

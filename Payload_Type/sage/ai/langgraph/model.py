@@ -5053,6 +5053,9 @@ class Model:
         # *they* stopped the session. Blaming the operator for a halt they had no part in sends them
         # hunting for their own mistake.
         self._stop_reason = ""
+        # How the Supervisor's final report classified the ending (completed / blocked / checkpoint),
+        # kept for the request terminal; empty when the report declared none.
+        self._final_turn_outcome = ""
         self._running_tasks = set()
         self._max_steps = int(max_steps) if max_steps else 0  # 0 = unlimited
         self._global_step_count = 0
@@ -5653,6 +5656,7 @@ class Model:
             # proceed, a retry of the stopped one is not.
             self._stop_requested = False
             self._stop_reason = ""
+            self._final_turn_outcome = ""
             lock = getattr(self, "_subgoal_authority_lock", None)
             if lock is None:
                 lock = threading.Lock()
@@ -7617,6 +7621,10 @@ class Model:
         status = _TERMINAL_STATUS_BY_STOP_REASON.get(reason, "stopped")
         return status, stop_notice_for(reason)
 
+    def request_turn_outcome(self) -> str:
+        """The outcome this request's final report declared (completed / blocked / checkpoint), or ""."""
+        return str(getattr(self, "_final_turn_outcome", "") or "")
+
     def record_final_response_projection(
         self,
         event_id: str,
@@ -8339,6 +8347,8 @@ class Model:
                         # The banner classifies the ending: completed / blocked /
                         # checkpoint. Undeclared endings stream without a banner.
                         banner = _turn_end_banner(msg.additional_kwargs.get("_turn_outcome"))
+                        if banner:
+                            self._final_turn_outcome = msg.additional_kwargs["_turn_outcome"]
                         content = f"{banner}\n{msg.content}" if banner else msg.content
                         # The reconciled engagement ledger rides INSIDE the closing
                         # content — the terminal must stay one response (a post-final

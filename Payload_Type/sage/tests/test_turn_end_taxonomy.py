@@ -279,3 +279,41 @@ def test_terminal_worker_fallback_classifies_blocked(monkeypatch):
     ]
     assert len(finals) == 1
     assert finals[0].additional_kwargs.get("_turn_outcome") == "blocked"
+
+
+def _streamed_final_report_model(additional_kwargs):
+    model = model_mod.Model.__new__(model_mod.Model)
+    model._stop_requested = False
+    model._stop_reason = ""
+    model._final_turn_outcome = ""
+    report = AIMessage(content="report", name="Supervisor", additional_kwargs=additional_kwargs)
+
+    async def extract(_state_update):
+        return [report]
+
+    async def no_summary():
+        return ""
+
+    model._extract_new_messages_from_event = extract
+    model._engagement_state_turn_summary_text = no_summary
+    model._format_message_for_streaming = lambda message, agent_name=None: str(message.content)
+    model._stream_message_to_mythic = lambda message: asyncio.sleep(0)
+    return model
+
+
+@pytest.mark.parametrize("outcome", ("completed", "blocked", "checkpoint"))
+def test_streamed_final_report_records_its_declared_outcome_for_the_request(outcome):
+    model = _streamed_final_report_model({"_is_final_report": True, "_turn_outcome": outcome})
+    asyncio.run(model._process_stream_event({"Supervisor": {}}))
+    assert model.request_turn_outcome() == outcome
+
+
+@pytest.mark.parametrize("outcome", (None, "Completed", "unknown"))
+def test_undeclared_or_unknown_final_report_outcome_records_nothing(outcome):
+    kwargs = {"_is_final_report": True}
+    if outcome is not None:
+        kwargs["_turn_outcome"] = outcome
+    model = _streamed_final_report_model(kwargs)
+    asyncio.run(model._process_stream_event({"Supervisor": {}}))
+    assert model.request_turn_outcome() == ""
+

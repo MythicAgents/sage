@@ -68,6 +68,8 @@ from .watcher_graph import build_watcher_graph, render_watcher_explanation
 
 
 _CHANNEL_METADATA_HEARTBEAT_SECONDS = 2.0
+# The terminal request statuses Mythic stores; it rewrites any other status sent with complete=True.
+_MYTHIC_TERMINAL_REQUEST_STATUSES = frozenset({"complete", "error", "cancelled"})
 _CHANNEL_TURN_LOCKS: dict[str, asyncio.Lock] = {}
 _WATCHER_TURN_TASKS: dict[tuple[int, int], asyncio.Task[Any]] = {}
 # A new channel can receive /help or /mode before its first Model exists. This
@@ -1544,6 +1546,14 @@ class SageChat(Chat):
             disposition = getattr(model, "request_terminal_disposition", None)
             if callable(disposition):
                 terminal_status, halt_notice = disposition()
+            # How the request really ended, recorded where Mythic keeps it: a halt's own status, else
+            # the outcome the final report declared (completed / blocked / checkpoint).
+            turn_outcome = terminal_status if terminal_status != "complete" else ""
+            declared_outcome = getattr(model, "request_turn_outcome", None)
+            if not turn_outcome and callable(declared_outcome):
+                turn_outcome = declared_outcome()
+            if turn_outcome:
+                terminal_metadata["turn_outcome"] = turn_outcome
             response_content = (
                 native_response_text
                 or _last_streamed
@@ -1602,10 +1612,12 @@ class SageChat(Chat):
                     )
             elif callable(finalize_visibility):
                 await finalize_visibility()
-            # A self-halt must not mark the Mythic request row `complete` — send_complete hardcodes
-            # status="complete", which is the operator-facing false success (the control-transition
-            # ledger already recorded the honest `stopped`/`blocked`). Send the terminal with the real
-            # disposition status; a genuine completion still goes through send_complete unchanged.
+            # Mythic stores only complete, error, and cancelled as a request's terminal status and rewrites
+            # any other status sent with complete=True to `complete`. So a self-halt (`stopped`) still
+            # terminates as `complete` here; its real ending rides in the terminal's `turn_outcome`
+            # metadata and in the control-transition ledger, and its content is the halt notice.
+            if terminal_status not in _MYTHIC_TERMINAL_REQUEST_STATUSES:
+                terminal_status = "complete"
             if terminal_status == "complete":
                 await self.send_complete(
                     request,
