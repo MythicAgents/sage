@@ -5,7 +5,7 @@ read live, while the Python dependencies are baked into the image. Mythic copies
 usable git metadata, so there is no commit to read from a deployed tree, and ``git rev-parse`` inside
 the installed service directory misleadingly resolves to the *Mythic* checkout instead.
 
-This module gives an honest, dependency-free version signal that ``main.py`` logs at startup:
+This module gives an honest, dependency-free version signal that ``main.py`` prints at startup:
 
 * ``agent_version`` / ``mythic_version`` -- read from the project's existing ``agent_capabilities.json``
                            (the single source of truth Mythic already uses), not a second hardcoded copy.
@@ -24,7 +24,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
+from typing import TextIO
 
 __all__ = [
     "__version__",
@@ -34,6 +36,7 @@ __all__ = [
     "source_fingerprint",
     "version_info",
     "startup_banner",
+    "announce_startup",
 ]
 
 # The canonical version lives in the repo-root agent_capabilities.json (Mythic reads it too); this
@@ -174,3 +177,11 @@ def startup_banner() -> str:
         f"Sage build_commit={_short_commit(info['build_commit'])} source_fp={info['source_fp']} "
         f"version={info['agent_version']}"
     )
+
+
+def announce_startup(stream: TextIO | None = None) -> str:
+    # Printed rather than logged: Mythic passes its DEBUG_LEVEL (default "warning") to the container
+    # logger, which hides INFO, and the banner must appear in a default deployment's container logs.
+    banner = startup_banner()
+    print(banner, file=stream if stream is not None else sys.stdout, flush=True)
+    return banner

@@ -95,3 +95,10 @@ def test_startup_banner_leads_with_commit_and_fingerprint():
     # The discipline-free facts come first; the hand-maintained version follows.
     assert banner.index("build_commit=") < banner.index("version=")
     assert banner.index("source_fp=") < banner.index("version=")
+
+
+def test_startup_announcement_prints_the_banner_to_stdout(capsys):
+    # Mythic's default DEBUG_LEVEL ("warning") hides INFO logging, so the banner is printed instead.
+    banner = _version.announce_startup()
+    assert capsys.readouterr().out == banner + "\n"
+    assert banner.startswith("Sage build_commit=")

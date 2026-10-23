@@ -13,6 +13,11 @@ between minor releases.
   building Sage locally. Set `sage_use_build_context` to `true` in Mythic's configuration to keep building from
   source.
 
+### Fixed
+
+- The startup version banner now appears in the container logs at Mythic's default log level
+  (`DEBUG_LEVEL=warning`); it was logged at INFO and hidden.
+
 ## [0.2.0] - 2026-10-23
 
 Sage 0.2.0 makes supervised mode objective-led, makes request endings honest, and ships Sage as a published,
