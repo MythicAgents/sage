@@ -28,3 +28,9 @@ jobs:
             echo "::error::Release tag '$tag' != agent_capabilities.json agent_version '$declared'. Bump agent_version to match before tagging."
             exit 1
           fi
+          image="$(jq -r '.remote_images.sage' config.json)"
+          echo "config.json remote_images.sage: $image"
+          if [ "$image" != "ghcr.io/mythicagents/sage:$declared" ]; then
+            echo "::error::config.json remote_images.sage '$image' != ghcr.io/mythicagents/sage:$declared. Point it at the release image before tagging."
+            exit 1
+          fi

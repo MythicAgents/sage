@@ -272,6 +272,10 @@ Install Sage into a running Mythic the same way as any agent, from your Mythic d
 sudo ./mythic-cli install github https://github.com/MythicAgents/sage
 ```
 
+The installer pulls the published image named in `config.json` (`ghcr.io/mythicagents/sage:<version>`) instead
+of building one. To build from your checkout instead, run `sudo ./mythic-cli config set sage_use_build_context
+true` and then `sudo ./mythic-cli build sage`.
+
 After the container registers, create a Mythic chat channel using the `Sage` model, then configure provider,
 model, mode, policy, and credentials in the channel or user-secret views. Mythic renders Sage output as markdown
 and renders each tool execution as an updating, collapsible card. What you do next happens in the chat itself —

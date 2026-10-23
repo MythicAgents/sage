@@ -20,6 +20,14 @@ def test_reads_canonical_version_from_agent_capabilities(monkeypatch):
     assert _version.mythic_version() == str(caps["mythic_version"])
 
 
+def test_installer_remote_image_matches_agent_version():
+    # mythic-cli install pulls config.json's remote_images entry instead of building, so the pinned
+    # image must be the release that agent_version declares; a version bump must move it too.
+    config = json.loads((REPO_ROOT / "config.json").read_text(encoding="utf-8"))
+    caps = json.loads((REPO_ROOT / "agent_capabilities.json").read_text(encoding="utf-8"))
+    assert config["remote_images"] == {"sage": f"ghcr.io/mythicagents/sage:{caps['agent_version']}"}
+
+
 def test_baked_agent_version_env_wins():
     # A built image stamps SAGE_AGENT_VERSION; it must win over any file read.
     import os

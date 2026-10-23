@@ -10,8 +10,8 @@ name: Container image
 # matches agent_capabilities.json, so a release image is never built from unmerged code or mislabeled.
 # Push main before pushing the tag.
 #
-# Operator note: Mythic pulls the image named in its installer's remote_images config. Point that at
-# ghcr.io/mythicagents/sage:latest, a release version, or a specific sha- tag to use a published build.
+# mythic-cli install pulls the image named in config.json's remote_images.sage. Cutting a release
+# moves it to the new version together with agent_version; the version check enforces that.
 
 on:
   push:

@@ -7,6 +7,12 @@ between minor releases.
 
 ## [Unreleased]
 
+### Changed
+
+- `mythic-cli install github` now pulls the published release image from GitHub Container Registry instead of
+  building Sage locally. Set `sage_use_build_context` to `true` in Mythic's configuration to keep building from
+  source.
+
 ## [0.2.0] - 2026-10-23
 
 Sage 0.2.0 makes supervised mode objective-led, makes request endings honest, and ships Sage as a published,
