@@ -276,6 +276,12 @@ The installer pulls the published image named in `config.json` (`ghcr.io/mythica
 of building one. To build from your checkout instead, run `sudo ./mythic-cli config set sage_use_build_context
 true` and then `sudo ./mythic-cli build sage`.
 
+The container runs Sage as the user who owns `InstalledServices/sage`, so the databases and state Sage writes
+there belong to that user, not root. A later `mythic-cli install` by that user can replace the directory without
+`sudo`. On its first start, the container hands back to that user any root-owned files an older Sage left there.
+A reinstall replaces the whole directory, including `sage.db` and `.phoenix/`, so archive them first if you need
+the history (see [Runtime state and clean resets](#runtime-state-and-clean-resets)).
+
 After the container registers, create a Mythic chat channel using the `Sage` model, then configure provider,
 model, mode, policy, and credentials in the channel or user-secret views. Mythic renders Sage output as markdown
 and renders each tool execution as an updating, collapsible card. What you do next happens in the chat itself —

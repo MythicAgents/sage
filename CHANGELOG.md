@@ -15,6 +15,10 @@ between minor releases.
 
 ### Fixed
 
+- The container no longer runs Sage as root. It runs as the owner of the installed service directory, so the
+  databases and state Sage writes there belong to that user, and a later `mythic-cli install` no longer fails
+  on root-owned files and leaves Sage uninstalled. The first start hands back root-owned files left by earlier
+  versions. Python bytecode caches are no longer written into the service directory.
 - The startup version banner now appears in the container logs at Mythic's default log level
   (`DEBUG_LEVEL=warning`); it was logged at INFO and hidden.
 - A request's final message now records how the request ended (`completed`, `blocked`, `checkpoint`,

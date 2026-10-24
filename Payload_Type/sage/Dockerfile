@@ -24,6 +24,12 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends git && \
     rm -rf /var/lib/apt/lists/* && \
     pip install --no-cache-dir uv
+# uv's managed Python must be readable by the unprivileged user Sage runs as (see sage_entrypoint.py), so
+# keep it out of root's private home. uv's cache stays under HOME, which the entrypoint makes writable.
+# UV_NO_SYNC makes `uv run` use the environment synced below as-is: without it, every first MCP connect
+# re-synced (downloading dev dependencies) into a venv the unprivileged user cannot write.
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python \
+    UV_NO_SYNC=1
 # Clone the BloodHound MCP and pre-sync its deps so first connect needs no network.
 # Override only with another prospectively verified immutable commit:
 # --build-arg BLOODHOUND_MCP_REF=<full-commit> --build-arg BLOODHOUND_MCP_REPO=<url>
@@ -74,8 +80,19 @@ ENV SAGE_AGENT_VERSION=${SAGE_AGENT_VERSION}
 LABEL org.opencontainers.image.revision=${SAGE_GIT_COMMIT}
 LABEL org.opencontainers.image.version=${SAGE_AGENT_VERSION}
 
+# Bytecode caches go to scratch, not into the bind-mounted service directory.
+ENV PYTHONPYCACHEPREFIX=/tmp/sage-pycache
+# The documented macOS database location (README "SQLite on macOS Docker Desktop / OrbStack") must be
+# creatable by the unprivileged runtime user.
+RUN install -d -m 1777 /opt/sage_data
+
+# Start as root only long enough to run Sage as the owner of the mounted service directory.
+COPY sage_entrypoint.py /usr/local/bin/sage-entrypoint
+RUN chmod 0755 /usr/local/bin/sage-entrypoint
+
 WORKDIR /Mythic/
 
 COPY [".", "."]
 
+ENTRYPOINT ["python3", "/usr/local/bin/sage-entrypoint"]
 CMD ["python3", "main.py"]
