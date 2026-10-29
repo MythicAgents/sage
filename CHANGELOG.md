@@ -41,6 +41,9 @@ between minor releases.
   any AI channel token), the read scopes for the Mythic data it queries, and `credential.write` and
   `eventlog.write`. The unused `tag.write` is gone. Mythic does not enforce this list; it tells the operator
   what to grant, and the docs list the same set.
+- Approval cards for raw tasks now show the intended effect with its target filled in, for example
+  `graph-built:north.sevenkingdoms.local|baseline` for a SharpHound collection, instead of the template
+  `graph-built:{target}`. When the target can't be worked out yet, the card shows only the expected evidence.
 
 ## [0.2.0] - 2026-10-23
 

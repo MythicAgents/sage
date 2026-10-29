@@ -14430,10 +14430,12 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         if not command:
             return ""
         parameters = args.get("parameters")
-        classified = intent_classifier.classify_tool_call(command, parameters)
+        classified = intent_classifier.classify_tool_call(
+            command, parameters, callback_host=self._card_callback_foothold_host(args)
+        )
         if not classified:
             return ""
-        technique, _target_key = classified
+        technique, target_key = classified
         try:
             from . import engagement_state
         except ImportError:
@@ -14441,15 +14443,61 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         model = getattr(engagement_state, "TECHNIQUE_MODEL", {}).get(technique)
         if not isinstance(model, dict):
             return ""
-        effect = str(model.get("effect") or model.get("name") or technique)
+        effect = self._issue_task_card_effect(engagement_state, technique, target_key, model, args)
         verify = model.get("verify") or {}
         signals: list[str] = []
         for item in (verify.get("achieved_all") or []) + (verify.get("achieved_any") or []):
             text = str(item).strip()
             if text and text not in signals:
                 signals.append(text)
+        if not effect:
+            return f"Expected evidence: {', '.join(signals)}" if signals else ""
         detail = f" (expected evidence: {', '.join(signals)})" if signals else ""
         return f"Intended effect: {effect}{detail}"
+
+    def _issue_task_card_effect(
+        self, engagement_state: Any, technique: str, target_key: str, model: dict, args: dict[str, Any]
+    ) -> str:
+        """The technique's effect with its target filled in, or "" when the target can't be resolved.
+
+        Effects are templates such as ``graph-built:{target}``. A card never shows an unfilled
+        placeholder: an unresolvable target omits the effect rather than printing braces.
+        """
+        template = str(model.get("effect") or "")
+        if "{" not in template:
+            return template or str(model.get("name") or technique)
+        if technique == "collect-graph":
+            # The classifier leaves the collection key empty (or a --Domain scope); the gate rebinds it
+            # from the issuing callback's foothold, so the card does the same from the cached footholds.
+            target_key = self._card_collection_target_key(engagement_state, args, target_key)
+        if not str(target_key or "").strip():
+            return ""
+        effect = engagement_state._technique_effect(technique, target_key)
+        return "" if "{" in effect or "}" in effect else effect
+
+    def _card_callback_foothold(self, args: dict[str, Any]) -> Any:
+        """The gate's cached foothold for the card's callback, or None before the gate has reconciled."""
+        footholds = list(getattr(getattr(self, "mythic_client", None), "_engagement_footholds", []) or [])
+        callback_id = str(args.get("callback_display_id") or "")
+        return next((f for f in footholds if str(getattr(f, "callback_id", "")) == callback_id), None)
+
+    def _card_callback_foothold_host(self, args: dict[str, Any]) -> str | None:
+        return str(getattr(self._card_callback_foothold(args), "host", "") or "") or None
+
+    def _card_collection_target_key(self, engagement_state: Any, args: dict[str, Any], scope_domain: str) -> str:
+        mythic_client = getattr(self, "mythic_client", None)
+        foothold = self._card_callback_foothold(args)
+        if foothold is None:
+            return ""
+        footholds = list(getattr(mythic_client, "_engagement_footholds", []) or [])
+        state = engagement_state.EngagementState(
+            objective="sage-engagement",
+            footholds=footholds,
+            hops=list(getattr(mythic_client, "_engagement_hops", []) or []),
+            graph_facts=list(getattr(mythic_client, "_engagement_graph_facts", []) or []),
+            runtime_scope=True,
+        )
+        return engagement_state.collection_target_key(state, foothold, str(scope_domain or "").strip().casefold())
 
     def _issue_task_card_tool_note(self, args: dict[str, Any]) -> str:
         """Per-binary knowledge note for the binary a raw task invokes.
