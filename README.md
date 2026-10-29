@@ -393,7 +393,7 @@ guidance and hands control back without issuing another action. Objective-led co
 evidence; completing one collection does not prove the objective.
 
 Guarded tools are also **scope-preflighted**: each maps to a required Mythic bot-token scope (`task.write`,
-`payload.write`, `credential.write`, `file.write`, `file.read`, or `callback.write`), and a tool whose scope your channel token lacks is disabled
+`payload.write`, `credential.write`, `file.write`, or `file.read`), and a tool whose scope your channel token lacks is disabled
 up front rather than failing mid-run.
 
 <p align="center">
@@ -416,7 +416,7 @@ up front rather than failing mid-run.
 | `/stop` | Cooperatively stop the running agent on this channel |
 | `/bloodhound [force] [dir]` | Connect, report, or rebind the BloodHound MCP — see [BloodHound](#bloodhound) |
 | `/mcp <list\|tools\|call\|connect\|disconnect\|policy>` | Manage MCP servers — see [Connecting other MCP servers](#connecting-other-mcp-servers) |
-| `/sandbox [shell\|python] <code>` | Run an isolated local snippet (requires the `callback.write` scope) |
+| `/sandbox [shell\|python] <code>` | Run an isolated local snippet (no network or host mounts; needs no Mythic scope) |
 
 `/state` is available in conversation, supervised and auto modes. Its ledger is shared across
 chats in the same operation engagement and persists once written. A new engagement can show an

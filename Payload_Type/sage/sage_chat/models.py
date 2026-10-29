@@ -29,7 +29,6 @@ SLASH_COMMANDS = SAGE_SLASH_COMMANDS
 _CHANNEL_TOKEN_SCOPES = [
     "chat-ai.write",
     "task.write",
-    "callback.write",
     "payload.write",
     "file.write",
     "tag.write",

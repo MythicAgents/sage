@@ -807,10 +807,6 @@ async def _sandbox_tools_for_request(model: Any, request: ChatRequest):
         apitoken_id=getattr(request, "APITokenID", 0),
     )
     await tools.login()
-    try:
-        tools.apply_scope_gating(await tools.whoami_scopes())
-    except Exception as e:
-        logger.debug(f"/sandbox scope preflight skipped: {e}")
     return tools
 
 
@@ -864,8 +860,6 @@ async def _handle_sandbox(model: Any, request: ChatRequest, arg: str) -> str:
     if not code:
         return _sandbox_usage()
     tools = await _sandbox_tools_for_request(model, request)
-    if "sandbox_exec" in (getattr(tools, "disabled_tools", set()) or set()):
-        return "`/sandbox` is unavailable for this channel because the chat token lacks `callback.write` scope."
     raw = await tools.sandbox_exec(code_or_command=code, language=language)
     return _render_sandbox_result(language, raw)
 

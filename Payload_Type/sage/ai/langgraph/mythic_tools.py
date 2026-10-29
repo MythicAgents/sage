@@ -1286,7 +1286,9 @@ _CHAT_TOKEN_MINT_TIMEOUT = 15
 # rather than erroring mid-run. All scope strings verified against auth-adjustments
 # `authentication/mythicjwt/scopes.go` (incl. `credential.write`). Each entry names the scope of the
 # Mythic route the tool's required call hits: task creation is `create_task_webhook` (`task.write`),
-# not a callback route. Best-effort credential capture during tasking is not gated.
+# not a callback route. Best-effort credential capture during tasking is not gated. Guarded tools that
+# make no Mythic call (`sandbox_exec`, `download_tool`) have no entry; approval and turn authority
+# still apply to them.
 SCOPE_REQUIREMENTS: dict[str, str] = {
     "issue_task_and_waitfor_task_output": "task.write",
     "upload_file_by_file_uuid": "task.write",
@@ -1294,10 +1296,8 @@ SCOPE_REQUIREMENTS: dict[str, str] = {
     "execute_capability": "task.write",
     "collect_graph": "task.write",
     "ingest_collection": "file.read",
-    "sandbox_exec": "callback.write",
     "create_payload": "payload.write",
     "delete_payload": "payload.write",
-    "download_tool": "file.write",
     "ensure_tool_uploaded": "file.write",
     "file_upload": "file.write",
     "add_credential": "credential.write",

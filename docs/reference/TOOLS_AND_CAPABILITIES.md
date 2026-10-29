@@ -62,9 +62,9 @@ scope the channel token lacks is disabled up front.
 | `add_credential` | Add a credential to Mythic's credential store | `credential.write` |
 | `create_payload` | Create a new Mythic payload/agent | `payload.write` |
 | `delete_payload` | Soft-delete a junk payload after verifying it has no callbacks | `payload.write` |
-| `download_tool` | Download a tool binary from its pinned, sha256-verified source into the drop zone | `file.write` |
+| `download_tool` | Download a tool binary from its pinned, sha256-verified source into the drop zone | None (local only; `ensure_tool_uploaded` needs `file.write`) |
 | `ensure_tool_uploaded` | Ensure a tool binary is in Mythic's file store (uploads if missing) | `file.write` |
-| `sandbox_exec` | Run untrusted code in an isolated ephemeral sandbox container | `callback.write` |
+| `sandbox_exec` | Run untrusted code in an isolated ephemeral sandbox container | None (local only) |
 
 For a direct `issue_task_and_waitfor_task_output` proposal in native supervised chat, Sage resolves
 deterministic command aliases, parameter names, defaults, and supported context before it displays the

@@ -33,6 +33,10 @@ between minor releases.
   with `callback.write` but no `task.write` no longer fails mid-run. `ingest_collection` only reads files from
   Mythic, so it now needs `file.read`, which `file.write` also grants. Sage's declared channel scopes now
   list `task.write`.
+- `sandbox_exec`, the `/sandbox` command, and `download_tool` no longer require a Mythic scope. They run
+  locally and make no Mythic call, so a narrow channel token no longer disables them. Model-proposed use
+  still needs approval in supervised mode and is refused in conversation mode. `callback.write` is no longer
+  among Sage's declared channel scopes, since no tool uses it.
 
 ## [0.2.0] - 2026-10-23
 

@@ -4137,6 +4137,48 @@ def test_write_never_satisfied_by_read():
     assert "execute_capability" in tools_missing_scope({"task.read"})
 
 
+@pytest.mark.parametrize("tool", ("sandbox_exec", "download_tool"))
+def test_local_only_tools_are_not_scope_gated_but_stay_guarded(tool):
+    """Neither tool calls Mythic, so no Mythic scope gates it; approval and turn authority still apply."""
+    from ai.langgraph.mythic_tools import GUARDED_TOOLS, tools_missing_scope
+    assert tool not in tools_missing_scope({"chat-ai.write", "apitoken.write"})
+    assert tool in GUARDED_TOOLS
+    assert "ensure_tool_uploaded" in tools_missing_scope({"chat-ai.write", "apitoken.write"})
+
+
+def test_slash_sandbox_runs_without_a_scope_preflight(monkeypatch):
+    import ai.langgraph.mythic_tools as mythic_tools
+    from sage_chat import slash
+
+    scope_lookups = []
+
+    class _Tools:
+        disabled_tools = {"sandbox_exec"}  # what an old scope preflight would have produced
+
+        def __init__(self, **_kwargs):
+            pass
+
+        async def login(self):
+            return None
+
+        async def whoami_scopes(self):
+            scope_lookups.append(True)
+            return {"chat-ai.write", "apitoken.write"}
+
+        def apply_scope_gating(self, _scopes):
+            return None
+
+        async def sandbox_exec(self, *, code_or_command, language):
+            return json.dumps({"status": "ok", "exit_code": 0, "stdout": code_or_command, "stderr": ""})
+
+    monkeypatch.setattr(mythic_tools, "MythicTools", _Tools)
+    request = build_chat_request("/sandbox shell echo hi", channel_id=9, request_id=1)
+    text = _run(slash._handle_sandbox(None, request, "shell echo hi"))
+    assert "| Status | `ok` |" in text
+    assert "echo hi" in text
+    assert scope_lookups == []
+
+
 def test_declared_channel_scopes_cover_tasking_and_ingest():
     from ai.langgraph.mythic_tools import tools_missing_scope
     sage = next(m for m in SAGE_MODELS if m.Name == "Sage")

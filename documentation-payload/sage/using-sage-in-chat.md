@@ -27,7 +27,7 @@ actions, Sage presents them one at a time. Accept runs the action; Reject denies
 completes, the next guarded action is proposed. Read-only tools never prompt.
 
 Guarded tools are also **scope-preflighted**: each maps to a required Mythic bot-token scope (`task.write`,
-`payload.write`, `credential.write`, `file.write`, `file.read`, or `callback.write`), and a tool whose scope your channel token lacks is disabled
+`payload.write`, `credential.write`, `file.write`, or `file.read`), and a tool whose scope your channel token lacks is disabled
 up front rather than failing mid-run.
 
 ## Slash commands
@@ -48,7 +48,7 @@ up front rather than failing mid-run.
 | `/stop` | Cooperatively stop the running agent on this channel |
 | `/bloodhound [force] [dir]` | Connect, report, or rebind the [BloodHound MCP](/agents/sage/bloodhound/) |
 | `/mcp <list\|tools\|call\|connect\|disconnect\|policy>` | Manage [MCP servers](/agents/sage/connecting-mcp-servers/) |
-| `/sandbox [shell\|python] <code>` | Run an isolated local snippet (requires the `callback.write` scope) |
+| `/sandbox [shell\|python] <code>` | Run an isolated local snippet (no network or host mounts; needs no Mythic scope) |
 
 ## Background findings watcher
 

@@ -10,7 +10,7 @@ tool. For the higher-level view, see [Tools and Capabilities](/agents/sage/tools
 
 {{% notice info %}}
 Each guarded tool requires a specific Mythic bot-token scope (`task.write`, `payload.write`,
-`credential.write`, `file.write`, `file.read`, or `callback.write`). A tool whose scope your chat token lacks is disabled up front rather than
+`credential.write`, `file.write`, or `file.read`). A tool whose scope your chat token lacks is disabled up front rather than
 failing mid-run.
 {{% /notice %}}
 
@@ -61,9 +61,9 @@ failing mid-run.
 | `execute_capability` | Execute one generic capability action, verify it, and record only proven effects | `task.write` |
 | `upload_file_by_file_uuid` | Upload a Mythic-stored file to a callback | `task.write` |
 | `ingest_collection` | Ingest a downloaded SharpHound/AzureHound collection into BloodHound | `file.read` (granted by `file.write`) |
-| `sandbox_exec` | Run untrusted code in an isolated, ephemeral sandbox container | `callback.write` |
+| `sandbox_exec` | Run untrusted code in an isolated, ephemeral sandbox container | None (local only) |
 | `add_credential` | Add a credential to Mythic's credential store | `credential.write` |
 | `create_payload` | Create a new Mythic payload | `payload.write` |
 | `delete_payload` | Soft-delete a junk payload after verifying it has no callbacks | `payload.write` |
 | `ensure_tool_uploaded` | Ensure a tool binary is in Mythic's file store, uploading it from the drop zone if missing | `file.write` |
-| `download_tool` | Download a pinned, sha256-verified tool binary from its TTP source into the drop zone | `file.write` |
+| `download_tool` | Download a pinned, sha256-verified tool binary from its TTP source into the drop zone | None (local only; `ensure_tool_uploaded` needs `file.write`) |
