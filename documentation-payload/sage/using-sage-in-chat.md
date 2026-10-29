@@ -26,8 +26,8 @@ only an explicit Accept lets it through. **One action, one card** — when the m
 actions, Sage presents them one at a time. Accept runs the action; Reject denies it. After the action
 completes, the next guarded action is proposed. Read-only tools never prompt.
 
-Guarded tools are also **scope-preflighted**: each maps to a required Mythic bot-token scope (`callback.write`,
-`payload.write`, `credential.write`, `file.write`), and a tool whose scope your channel token lacks is disabled
+Guarded tools are also **scope-preflighted**: each maps to a required Mythic bot-token scope (`task.write`,
+`payload.write`, `credential.write`, `file.write`, `file.read`, or `callback.write`), and a tool whose scope your channel token lacks is disabled
 up front rather than failing mid-run.
 
 ## Slash commands

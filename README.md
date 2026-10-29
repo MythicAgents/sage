@@ -392,8 +392,8 @@ model for this guidance even when only one alternative remains. Symbolic policy 
 guidance and hands control back without issuing another action. Objective-led completion requires objective
 evidence; completing one collection does not prove the objective.
 
-Guarded tools are also **scope-preflighted**: each maps to a required Mythic bot-token scope (`callback.write`,
-`payload.write`, `credential.write`, `file.write`), and a tool whose scope your channel token lacks is disabled
+Guarded tools are also **scope-preflighted**: each maps to a required Mythic bot-token scope (`task.write`,
+`payload.write`, `credential.write`, `file.write`, `file.read`, or `callback.write`), and a tool whose scope your channel token lacks is disabled
 up front rather than failing mid-run.
 
 <p align="center">

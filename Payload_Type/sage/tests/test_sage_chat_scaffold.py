@@ -4066,8 +4066,8 @@ def test_tools_missing_scope_unknown_gates_nothing():
 
 def test_tools_missing_scope_partial_grant():
     from ai.langgraph.mythic_tools import tools_missing_scope
-    disabled = tools_missing_scope({"callback.write"})
-    assert "execute_capability" not in disabled       # callback.write granted → kept
+    disabled = tools_missing_scope({"task.write"})
+    assert "execute_capability" not in disabled       # task.write granted → kept
     assert "create_payload" in disabled                # payload.write not granted → gated
     assert "add_credential" in disabled                # credential.write not granted → gated
 
@@ -4080,7 +4080,7 @@ def test_tools_missing_scope_full_grant_gates_nothing():
 def test_get_tools_skips_scope_gated():
     from ai.langgraph.mythic_tools import MythicTools
     mt = MythicTools(channel_id=5)
-    mt.apply_scope_gating({"callback.write"})
+    mt.apply_scope_gating({"task.write"})
     names = {t.name for t in mt.get_tools(["execute_capability", "create_payload", "list_callbacks"])}
     assert "create_payload" not in names               # gated (no payload.write)
     assert {"execute_capability", "list_callbacks"} <= names
@@ -4093,9 +4093,55 @@ def test_tools_missing_scope_star_gates_nothing():
 
 def test_tools_missing_scope_resource_wildcard():
     from ai.langgraph.mythic_tools import tools_missing_scope
-    disabled = tools_missing_scope({"callback.*"})   # wildcard grants all callback.* tools
-    assert "execute_capability" not in disabled       # callback.write covered by callback.*
+    disabled = tools_missing_scope({"task.*"})       # wildcard grants all task.* tools
+    assert "execute_capability" not in disabled       # task.write covered by task.*
     assert "create_payload" in disabled                # payload.write not covered
+
+
+TASKING_TOOLS = (
+    "issue_task_and_waitfor_task_output",
+    "upload_file_by_file_uuid",
+    "materialize_capability_inputs",
+    "execute_capability",
+    "collect_graph",
+)
+
+
+def test_tasking_tools_need_task_write_not_callback_write():
+    """Mythic authorizes task creation (`create_task_webhook`) on task.write; callback.write covers callback routes."""
+    from ai.langgraph.mythic_tools import tools_missing_scope
+    assert set(TASKING_TOOLS).isdisjoint(tools_missing_scope({"task.write"}))
+    assert set(TASKING_TOOLS) <= tools_missing_scope({"callback.write"})
+    assert set(TASKING_TOOLS) <= tools_missing_scope({"task.read"})
+
+
+@pytest.mark.parametrize(
+    ("granted", "enabled"),
+    (
+        ({"file.read"}, True),
+        ({"file.write"}, True),     # write includes read, as in Mythic's scope definitions
+        ({"file.*"}, True),
+        ({"callback.write"}, False),
+        ({"task.write"}, False),
+        ({"filebrowser.write"}, False),  # near-match resource must not count
+    ),
+)
+def test_ingest_collection_needs_only_file_read(granted, enabled):
+    from ai.langgraph.mythic_tools import tools_missing_scope
+    assert ("ingest_collection" not in tools_missing_scope(granted)) is enabled
+
+
+def test_write_never_satisfied_by_read():
+    from ai.langgraph.mythic_tools import tools_missing_scope
+    assert "create_payload" in tools_missing_scope({"payload.read"})
+    assert "execute_capability" in tools_missing_scope({"task.read"})
+
+
+def test_declared_channel_scopes_cover_tasking_and_ingest():
+    from ai.langgraph.mythic_tools import tools_missing_scope
+    sage = next(m for m in SAGE_MODELS if m.Name == "Sage")
+    disabled = tools_missing_scope(set(sage.Metadata.RequiredChannelAPITokenScopes))
+    assert disabled.isdisjoint((*TASKING_TOOLS, "ingest_collection"))
 
 
 def test_whoami_scopes_offline_returns_none():

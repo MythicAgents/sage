@@ -28,6 +28,11 @@ between minor releases.
 - A channel in Conversation mode with Autonomous Solve on no longer switches itself to autonomous mode.
   Conversation stays read-only; Sage ignores the toggle there and says so once in the chat. Autonomous
   execution now comes only from Mode = Autonomous.
+- Tasking tools are now enabled by the `task.write` scope, which Mythic requires to create a task, instead of
+  `callback.write`. A channel token with `task.write` and no `callback.write` no longer loses tasking, and one
+  with `callback.write` but no `task.write` no longer fails mid-run. `ingest_collection` only reads files from
+  Mythic, so it now needs `file.read`, which `file.write` also grants. Sage's declared channel scopes now
+  list `task.write`.
 
 ## [0.2.0] - 2026-10-23
 

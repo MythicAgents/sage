@@ -9,8 +9,8 @@ or Mythic state and are approval-gated in supervised mode; read-only tools never
 tool. For the higher-level view, see [Tools and Capabilities](/agents/sage/tools-and-capabilities/).
 
 {{% notice info %}}
-Each guarded tool requires a specific Mythic bot-token scope (`callback.write`, `payload.write`,
-`credential.write`, or `file.write`). A tool whose scope your chat token lacks is disabled up front rather than
+Each guarded tool requires a specific Mythic bot-token scope (`task.write`, `payload.write`,
+`credential.write`, `file.write`, `file.read`, or `callback.write`). A tool whose scope your chat token lacks is disabled up front rather than
 failing mid-run.
 {{% /notice %}}
 
@@ -57,10 +57,10 @@ failing mid-run.
 
 | Tool | What it does | Scope |
 |---|---|---|
-| `issue_task_and_waitfor_task_output` | Issue a command on a callback and wait for output — the core tasking path | `callback.write` |
-| `execute_capability` | Execute one generic capability action, verify it, and record only proven effects | `callback.write` |
-| `upload_file_by_file_uuid` | Upload a Mythic-stored file to a callback | `callback.write` |
-| `ingest_collection` | Ingest a downloaded SharpHound/AzureHound collection into BloodHound | `callback.write` |
+| `issue_task_and_waitfor_task_output` | Issue a command on a callback and wait for output — the core tasking path | `task.write` |
+| `execute_capability` | Execute one generic capability action, verify it, and record only proven effects | `task.write` |
+| `upload_file_by_file_uuid` | Upload a Mythic-stored file to a callback | `task.write` |
+| `ingest_collection` | Ingest a downloaded SharpHound/AzureHound collection into BloodHound | `file.read` (granted by `file.write`) |
 | `sandbox_exec` | Run untrusted code in an isolated, ephemeral sandbox container | `callback.write` |
 | `add_credential` | Add a credential to Mythic's credential store | `credential.write` |
 | `create_payload` | Create a new Mythic payload | `payload.write` |

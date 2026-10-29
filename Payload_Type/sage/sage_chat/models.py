@@ -28,6 +28,7 @@ SLASH_COMMANDS = SAGE_SLASH_COMMANDS
 # requirement — it's needed to post responses.
 _CHANNEL_TOKEN_SCOPES = [
     "chat-ai.write",
+    "task.write",
     "callback.write",
     "payload.write",
     "file.write",

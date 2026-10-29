@@ -1284,14 +1284,16 @@ _CHAT_TOKEN_MINT_TIMEOUT = 15
 # Chat bot-token scope required per guarded tool. A chat channel's bot token is
 # operator-scoped at setup, so a guarded tool whose scope isn't granted is preflight-disabled (fail cheap)
 # rather than erroring mid-run. All scope strings verified against auth-adjustments
-# `authentication/mythicjwt/scopes.go` (incl. `credential.write`).
+# `authentication/mythicjwt/scopes.go` (incl. `credential.write`). Each entry names the scope of the
+# Mythic route the tool's required call hits: task creation is `create_task_webhook` (`task.write`),
+# not a callback route. Best-effort credential capture during tasking is not gated.
 SCOPE_REQUIREMENTS: dict[str, str] = {
-    "issue_task_and_waitfor_task_output": "callback.write",
-    "upload_file_by_file_uuid": "callback.write",
-    "materialize_capability_inputs": "callback.write",
-    "execute_capability": "callback.write",
-    "collect_graph": "callback.write",
-    "ingest_collection": "callback.write",
+    "issue_task_and_waitfor_task_output": "task.write",
+    "upload_file_by_file_uuid": "task.write",
+    "materialize_capability_inputs": "task.write",
+    "execute_capability": "task.write",
+    "collect_graph": "task.write",
+    "ingest_collection": "file.read",
     "sandbox_exec": "callback.write",
     "create_payload": "payload.write",
     "delete_payload": "payload.write",
@@ -1305,17 +1307,18 @@ SCOPE_REQUIREMENTS: dict[str, str] = {
 def _allows_scope(granted: "set[str]", required: str) -> bool:
     """Mirror of the server's `mythicjwt.AllowsScope` for the cases our tool requirements hit.
 
-    A required scope is granted if the token holds `*` (all), the exact scope, or a matching
-    `resource.*` wildcard. (The write→read `Includes` relationship in the server is irrelevant here:
-    every SCOPE_REQUIREMENTS value is a `.write`, and no scope *includes* a `.write`.) Passing the
+    A required scope is granted if the token holds `*` (all), the exact scope, a matching
+    `resource.*` wildcard, or — for a `.read` requirement — the same resource's `.write`, which the
+    server's scope definitions say *includes* read. No scope includes a `.write`. Passing the
     server's `effective_scopes` (already `*`/wildcard-expanded) also works — exact match then suffices.
     """
     required = required.strip().lower()
+    including = required[: -len(".read")] + ".write" if required.endswith(".read") else ""
     for scope in granted:
         scope = str(scope).strip().lower()
         if not scope:
             continue
-        if scope == "*" or scope == required:
+        if scope == "*" or scope == required or (including and scope == including):
             return True
         if scope.endswith(".*") and required.startswith(scope[:-2] + "."):
             return True

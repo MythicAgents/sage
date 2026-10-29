@@ -55,10 +55,10 @@ scope the channel token lacks is disabled up front.
 
 | Tool | What it does | Required scope |
 |---|---|---|
-| `issue_task_and_waitfor_task_output` | Issue a command on a callback and wait for output (the core tasking path) | `callback.write` |
-| `execute_capability` | Execute one generic capability action, verify it, record only proven effects | `callback.write` |
-| `upload_file_by_file_uuid` | Upload a Mythic-stored file to a callback via its upload command | `callback.write` |
-| `ingest_collection` | Ingest a downloaded SharpHound/AzureHound collection into BloodHound | `callback.write` |
+| `issue_task_and_waitfor_task_output` | Issue a command on a callback and wait for output (the core tasking path) | `task.write` |
+| `execute_capability` | Execute one generic capability action, verify it, record only proven effects | `task.write` |
+| `upload_file_by_file_uuid` | Upload a Mythic-stored file to a callback via its upload command | `task.write` |
+| `ingest_collection` | Ingest a downloaded SharpHound/AzureHound collection into BloodHound | `file.read` (granted by `file.write`) |
 | `add_credential` | Add a credential to Mythic's credential store | `credential.write` |
 | `create_payload` | Create a new Mythic payload/agent | `payload.write` |
 | `delete_payload` | Soft-delete a junk payload after verifying it has no callbacks | `payload.write` |
