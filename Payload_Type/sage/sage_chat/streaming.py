@@ -7,7 +7,9 @@ Mythic response block with its own ``response_key`` — satisfying the response_
 follow-up that adds an ``on_llm_new_token`` hook feeding ``send_delta`` on a stable key.
 
 The service finalizes the last visible assistant block with the turn's single terminal status,
-avoiding a separate empty completion row in the Mythic UI.
+avoiding a separate empty completion row in the Mythic UI — but only while that block is still the
+newest row the request created. Mythic orders a transcript by row creation, so a terminal written into
+an older block would sit above every card and panel created after it.
 """
 
 from __future__ import annotations
@@ -31,6 +33,26 @@ class ChatStreamEmitter:
         self._agent_text_block = 0
         self.last_response_key = ""
         self.last_content = ""
+        # Creation order of every row this request has created (first send to a key creates it; later
+        # sends to the same key update it in place).
+        self._created: dict[str, int] = {}
+        self._assistant_key = ""
+
+    def note_created(self, response_key: str) -> None:
+        """Record that a send created (or may have created) the row for ``response_key``."""
+        if response_key and response_key not in self._created:
+            self._created[response_key] = len(self._created) + 1
+
+    def reusable_terminal_key(self) -> str:
+        """The last main-window block's key when it is still the newest row, else "".
+
+        The terminal may finalize that block in place only then; otherwise it needs its own new row so
+        it lands after everything the request emitted.
+        """
+        key = self._assistant_key
+        if key and self._created.get(key) == len(self._created):
+            return key
+        return ""
 
     async def __call__(self, formatted_message: str) -> bool:
         # Mirror the RPC path's empty-guard: a blank block would create an empty UI part.
@@ -40,6 +62,8 @@ class ChatStreamEmitter:
         response_key = f"assistant:{self._request.RequestID}:{self._block}"
         try:
             await self._chat.send_text(self._request, response_key, content=formatted_message)
+            self.note_created(response_key)
+            self._assistant_key = response_key
             self.last_response_key = response_key
             self.last_content = formatted_message
             return True
@@ -88,6 +112,7 @@ class ChatStreamEmitter:
                     content=content,
                     metadata=metadata,
                 )
+            self.note_created(response_key)
             self.last_response_key = response_key
             self.last_content = content
             return True
@@ -161,6 +186,7 @@ class ChatStreamEmitter:
                 complete=complete,
                 metadata=metadata,
             )
+            self.note_created(response_key)
             return True
         except Exception:
             return False
@@ -190,6 +216,7 @@ class ChatStreamEmitter:
                     "delegation_name": delegation_name,
                 },
             )
+            self.note_created(response_key)
             return True
         except Exception:
             return False
@@ -255,6 +282,10 @@ class ChatStreamEmitter:
                 complete=complete,
                 metadata=metadata,
             )
+            self.note_created(response_key)
+            if complete and content:
+                # Mythic persists a closing card's content as its own sub-agent final-output row.
+                self.note_created(f"subagent_final:{response_key}")
             return True
         except Exception:
             return False

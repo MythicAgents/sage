@@ -1187,6 +1187,7 @@ class SageChat(Chat):
                             "provider_retry_event_id": event["event_id"],
                         },
                     )
+                    stream_emitter.note_created(f"provider_retry:{request.RequestID}")
                 retry_state.bind_async_event_sink(publish_retry_event, asyncio.get_running_loop())
             await self._notify_bloodhound_degraded_once(model, request)
             await self._notify_autonomous_solve_ignored_once(model, request)
@@ -1566,10 +1567,12 @@ class SageChat(Chat):
             # final (the channel-3 "nothing in the main window" defect: the whole request ended inside
             # the Mythic_Operator panel). Reuse the last streamed key only when it is a main-window
             # assistant block; otherwise force the main turn key.
+            #
+            # Reuse it only while it is still the newest row the request created. Mythic orders the
+            # transcript by row creation, so finalizing an older block put the request's checkpoint
+            # above the progress messages and sub-agent panels that came after it.
             _main_turn_key = f"assistant:{request.RequestID}:turn"
-            response_key = stream_emitter.last_response_key or turn.response_key or _main_turn_key
-            if not str(response_key).startswith("assistant:"):
-                response_key = _main_turn_key
+            response_key = stream_emitter.reusable_terminal_key() or _main_turn_key
             _last_streamed = stream_emitter.last_content
             if _last_streamed and _last_streamed.lstrip().startswith("Command("):
                 _last_streamed = ""

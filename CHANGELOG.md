@@ -26,6 +26,11 @@ between minor releases.
 
 ### Fixed
 
+- A request's final message now appears after everything the request showed. It used to finalize the
+  last main-window message in place, and Mythic orders a chat by when each message was created, so a
+  checkpoint written into an early progress message sat above the sub-agent panels and tool cards that
+  followed it. The final message reuses that message only while nothing newer exists; otherwise it is
+  its own message at the end.
 - A supervised request no longer stops at a "has not reached a terminal state" checkpoint when the task
   had already finished. The handback read the task once, and output that landed a moment later made a
   finished task look unfinished. It now re-reads for a few seconds and takes completion from the task
