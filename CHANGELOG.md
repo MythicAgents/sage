@@ -26,6 +26,13 @@ between minor releases.
 
 ### Fixed
 
+- Sage can answer questions about the engagement-state tables you see. `/state` and the end-of-turn table
+  were shown only to the operator, so a question such as "why is hop 1 pending?" had nothing to refer to.
+  The table you were last shown now reaches Sage with your next message, without the evidence previews.
+  Hops also keep permanent numbers: `/state remove` leaves a gap instead of renumbering later rows, so
+  `/state set 4 …` and "hop 4" mean the same hop in every view. The end-of-turn table now uses the same
+  columns and numbers as `/state`, and the `/state` count is labelled "Hops", since it includes pending
+  and failed rows.
 - The container no longer runs Sage as root. It runs as the owner of the installed service directory, so the
   databases and state Sage writes there belong to that user, and a later `mythic-cli install` no longer fails
   on root-owned files and leaves Sage uninstalled. The first start hands back root-owned files left by earlier

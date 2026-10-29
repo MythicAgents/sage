@@ -18369,6 +18369,20 @@ class MythicTools:
             engagement_ledger._quarantine_unproven_achievements(payload, self._eng_key())
         except Exception:
             pass
+        try:
+            # Hop dataclasses carry no display number; keep each hop's permanent number from the ledger
+            # as last written, and never reuse a number the operator or model may have referred to.
+            previous = None
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    previous = json.load(fh)
+            except (OSError, ValueError):
+                previous = None
+            engagement_ledger.assign_hop_numbers(
+                payload, previous=previous if isinstance(previous, dict) else None,
+            )
+        except Exception:
+            pass
         tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, default=str)

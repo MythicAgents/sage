@@ -4515,12 +4515,8 @@ def _capability_rejection_message(tool_name: str, args: dict[str, Any]) -> str:
     )
 
 
-def _md_cell_value(value: Any, limit: int = 0) -> str:
-    """Escape a value for a markdown table cell (pipes), with an optional length cap."""
-    text = str(value if value is not None else "").replace("|", "\\|").replace("\n", " ")
-    if limit and len(text) > limit:
-        return text[: limit - 1] + "…"
-    return text
+# The turn-end engagement-state table shows only the newest hops; `/state` shows the full ledger.
+_TURN_END_STATE_HOP_LIMIT = 8
 
 
 def _turn_outcome_from_capability_verdict(verdict: Any) -> str:
@@ -14572,6 +14568,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         if signature == getattr(self, "_last_turn_state_signature", None):
             return "📊 Engagement state unchanged since the last turn."
         self._last_turn_state_signature = signature
+        hops = [hop for hop in hops if isinstance(hop, dict)]
         lines = ["📊 **Engagement state**"]
         if objective:
             lines.append(f"Objective: {objective}")
@@ -14579,29 +14576,18 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             lines.append("_(empty — no hops recorded yet)_")
         else:
             lines.append("")
-            lines.append("| Hop | Effect | Status | Task | Evidence |")
-            lines.append("|---|---|---|---|---|")
-            shown = 0
-            for hop in reversed(hops):
-                if shown >= 8:
-                    break
-                if not isinstance(hop, dict):
-                    continue
-                evidence = hop.get("evidence") if isinstance(hop.get("evidence"), dict) else {}
-                task_id = evidence.get("mythic_task_id")
-                preview = str(evidence.get("result_preview") or evidence.get("source") or "")
-                label = str(hop.get("technique") or "")
-                target = str(hop.get("target") or "")
-                hop_label = f"{label} → {target}" if target else label
-                lines.append(
-                    f"| {_md_cell_value(hop_label, 48)} | {_md_cell_value(hop.get('effect'))} | "
-                    f"`{_md_cell_value(hop.get('status') or '-', 16)}` | "
-                    f"{task_id if task_id is not None else '-'} | {_md_cell_value(preview, 60)} |"
-                )
-                shown += 1
-            remaining = len(hops) - shown
+            lines.extend(engagement_ledger.render_hop_table(hops, limit=_TURN_END_STATE_HOP_LIMIT))
+            remaining = len(hops) - _TURN_END_STATE_HOP_LIMIT
             if remaining > 0:
                 lines.append(f"_…{remaining} earlier hop(s) not shown — `/state` for the full ledger._")
+        # The operator sees this table with the closing message; queue the same rows for the model's next
+        # request on this channel so "hop N" resolves against what the operator saw.
+        engagement_ledger.record_operator_view(
+            getattr(self, "channel_id", None),
+            engagement_ledger.operator_view_text(
+                data, "the end-of-turn engagement-state table", limit=_TURN_END_STATE_HOP_LIMIT,
+            ),
+        )
         return "\n".join(lines)
 
     async def _surface_hitl_interrupt(self, event: dict) -> bool:
@@ -14909,6 +14895,25 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         # Note: We don't load from checkpoint here because self.state already contains
         # the full conversation history from the graph's checkpointing mechanism
         #self._cleanup_dangling_tool_calls()
+
+        # A ledger view the operator was shown since the last request (`/state` or the turn-end table) enters
+        # the conversation once, just before the operator's message, so "hop N" resolves against those rows.
+        try:
+            from . import engagement_ledger as _ledger_views
+        except ImportError:
+            import engagement_ledger as _ledger_views
+        operator_view = _ledger_views.take_operator_view(getattr(self, "channel_id", None))
+        if operator_view:
+            view_msg = HumanMessage(
+                content=operator_view,
+                additional_kwargs={
+                    "_request_id": request_contract.request_id,
+                    "_synthetic_nudge": "operator_ledger_view",
+                    "_hide_from_stream": True,
+                },
+            )
+            _tag_msg(view_msg, self._next_seq())
+            self.state["supervisor_messages"].append(view_msg)
 
         user_msg = HumanMessage(
             content=prompt,

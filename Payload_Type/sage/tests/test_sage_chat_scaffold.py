@@ -5318,7 +5318,7 @@ def test_handle_state_shows_engagement_ledger(monkeypatch):
     assert "Operation_Chimera_1" in text          # the engagement, not the channel
     assert "compromise CORP" in text              # objective surfaced
     assert "da:corp.local" in text                # a hop row
-    assert "Achieved hops:** 1" in text
+    assert "**Hops:** 1" in text  # counts every hop, not only achieved ones
 
 
 def test_handle_state_remove_mutates_and_saves(monkeypatch):

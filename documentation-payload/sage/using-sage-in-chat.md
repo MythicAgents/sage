@@ -42,7 +42,7 @@ up front rather than failing mid-run.
 | `/state` | Show the [engagement ledger](/agents/sage/engagement-ledger/) — the hop table of proven effects for this channel |
 | `/state objective <text>` | Set the engagement objective |
 | `/state reconcile [task_id] [apply]` | Import verified effects and credentials from completed Mythic tasks — dry-run unless `apply` is given |
-| `/state set <row> <status>` · `/state remove <row>` · `/state wipe` | Edit or clear ledger rows (you cannot hand-promote a row to `achieved`) |
+| `/state set <#> <status>` · `/state remove <#>` · `/state wipe` | Edit or clear ledger rows by hop number (the `#` column) or hop id (you cannot hand-promote a row to `achieved`) |
 | `/mode [conversation\|supervised\|auto]` | Show or switch the channel's mode |
 | `/list` | List active Sage chat sessions |
 | `/stop` | Cooperatively stop the running agent on this channel |

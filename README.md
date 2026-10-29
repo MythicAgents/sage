@@ -170,7 +170,9 @@ context resets, restarts, and even a change of model.
 </p>
 
 - **What it is.** One JSON file per Mythic operation — a table of hops toward the objective, each with a status.
-  You read and edit it in chat with [`/state`](#slash-commands).
+  You read and edit it in chat with [`/state`](#slash-commands). Each hop keeps a permanent number (the `#`
+  column): removing a hop leaves a gap rather than renumbering the rest. When `/state` or the end-of-turn table
+  shows you the ledger, Sage also sees that table on your next message, so you can ask about "hop 4" directly.
 
 - **Why it is proof-gated.** A hop flips to *achieved* only when a verifier confirms the effect from real
   evidence. Each achieved hop carries a **proof envelope** recording the Mythic callback, task, and transaction
@@ -421,7 +423,7 @@ the token has no read scope for.
 | `/state` | Show the [engagement ledger](#the-engagement-ledger) — the durable hop table of proven effects shared by chats in the current Mythic operation engagement |
 | `/state objective <text>` | Set the engagement objective |
 | `/state reconcile [task_id] [apply]` | Import verified effects and credentials from completed Mythic tasks — **dry-run unless `apply`** is given, because task output is attacker-influenceable |
-| `/state set <row> <status>` · `/state remove <row>` · `/state wipe` | Edit or clear ledger rows (you cannot hand-promote a row to `achieved` — that needs a real proof envelope) |
+| `/state set <#> <status>` · `/state remove <#>` · `/state wipe` | Edit or clear ledger rows by hop number (the `#` column) or hop id (you cannot hand-promote a row to `achieved` — that needs a real proof envelope) |
 | `/mode [conversation\|supervised\|auto]` | Show or switch the channel's mode |
 | `/list` | List active Sage chat sessions |
 | `/tools` | List Sage's public Mythic tool functions, descriptions, and access requirements |

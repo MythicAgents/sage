@@ -251,8 +251,8 @@ async def _handle_state(model: Any, request: ChatRequest, arg: str = "") -> str:
     the autonomous solve. Re-homed from the PayloadType `state` command; `ai.langgraph.engagement_ledger`
     is the single source of truth (the running model publishes its active engagement id there).
 
-    Usage: `/state` (show) · `/state reconcile [task_id] [apply]` · `/state remove <row|id[,…]>` ·
-    `/state set <row|id> <status>` · `/state objective <text>` · `/state wipe`.
+    Usage: `/state` (show) · `/state reconcile [task_id] [apply]` · `/state remove <#|id[,…]>` ·
+    `/state set <#|id> <status>` · `/state objective <text>` · `/state wipe`.
     """
     try:
         from ai.langgraph import engagement_ledger
@@ -286,7 +286,7 @@ async def _handle_state(model: Any, request: ChatRequest, arg: str = "") -> str:
         return _render_ledger_markdown(data, engagement_id, model, request, notice="🎯 Objective updated.")
     if sub == "remove":
         if not rest:
-            return "Usage: `/state remove <row|id[,…]>` — remove hop(s) by row number (the # column) or id/effect/technique."
+            return "Usage: `/state remove <#|id[,…]>` — remove hop(s) by hop number (the # column) or id/effect/technique."
         data = engagement_ledger.load_runtime(engagement_id)
         selectors = [s.strip() for s in rest.split(",") if s.strip()]
         data, removed = engagement_ledger.remove_hops(data, selectors)
@@ -295,7 +295,7 @@ async def _handle_state(model: Any, request: ChatRequest, arg: str = "") -> str:
     if sub == "set":
         bits = rest.split(maxsplit=1)
         if len(bits) < 2:
-            return "Usage: `/state set <row|id> <status>` — change a hop's status (e.g. `/state set 9 pending`)."
+            return "Usage: `/state set <#|id> <status>` — change a hop's status (e.g. `/state set 9 pending`)."
         selector, status = bits[0].strip(), bits[1].strip()
         if status.casefold() == "achieved":
             return (
@@ -333,8 +333,8 @@ async def _handle_state(model: Any, request: ChatRequest, arg: str = "") -> str:
         return ("Unknown `/state` subcommand. Usage:\n"
                 "- `/state` — show the engagement ledger\n"
                 "- `/state reconcile [task_id] [apply]` — import verified effects/creds from task history (dry-run unless `apply`)\n"
-                "- `/state remove <row|id[,…]>`\n"
-                "- `/state set <row|id> <status>`\n"
+                "- `/state remove <#|id[,…]>`\n"
+                "- `/state set <#|id> <status>`\n"
                 "- `/state objective <text>`\n"
                 "- `/state wipe`")
 
@@ -386,33 +386,19 @@ async def _resolve_chat_engagement_id(model: Any, request: ChatRequest) -> str:
     return ""
 
 
-def _md_cell(value: Any, limit: int = 40) -> str:
-    """Sanitize a value for a SINGLE markdown table cell.
-
-    Ledger evidence is often a bytes-repr (`b'...\\r\\n...'`) or multi-line tool output. A raw CR/LF/tab
-    in a cell makes Mythic's markdown renderer split the row into phantom lines (the "[+] Domain Controll…"
-    orphan row and the ascii-art-without-a-number row). So: unwrap the bytes-repr, drop its literal escapes,
-    collapse EVERY real whitespace run to one space, escape pipes, and hard-truncate.
-    """
-    s = str(value if value is not None else "")
-    if len(s) >= 3 and s[0] == "b" and s[1] in ("'", '"') and s[-1] == s[1]:
-        s = s[2:-1]                                                      # b'...' / b"..." → inner text
-    s = s.replace("\\r", " ").replace("\\n", " ").replace("\\t", " ")    # literal escapes from the repr
-    s = " ".join(s.split())                                             # collapse real CR/LF/tab/space runs
-    s = s.replace("|", "\\|")                                            # escape the markdown column pipe
-    if len(s) > limit:
-        s = s[: limit - 1] + "…"
-    return s or "-"
-
-
 def _render_ledger_markdown(data: dict, engagement_id: str, model: Any, request: ChatRequest, notice: str = "") -> str:
-    """Render the engagement ledger as a Mythic-chat markdown view (+ a compact session footer)."""
+    """Render the engagement ledger as a Mythic-chat markdown view (+ a compact session footer).
+
+    The same view, minus evidence previews, is queued for this channel's next model request so the model
+    can resolve the operator's "hop N" against the rows shown here.
+    """
     try:
         from ai.langgraph import engagement_ledger
     except ImportError:  # pragma: no cover
         from ..ai.langgraph import engagement_ledger  # type: ignore
 
-    hops = data.get("hops") or []
+    engagement_ledger.assign_hop_numbers(data)
+    hops = [hop for hop in (data.get("hops") or []) if isinstance(hop, dict)]
     out: list[str] = []
     if notice:
         out.append(notice + "\n")
@@ -420,25 +406,18 @@ def _render_ledger_markdown(data: dict, engagement_id: str, model: Any, request:
     objective = str(data.get("objective") or "").strip()
     if objective:
         out.append(f"\n**Objective:** {objective}")
-    out.append(f"\n**Achieved hops:** {len(hops)}\n")
+    out.append(f"\n**Hops:** {len(hops)}\n")
     if not hops:
-        out.append("_(empty — no achieved hops recorded yet)_")
+        out.append("_(empty — no hops recorded yet)_")
     else:
-        out.append("| # | Hop | Effect | Status | Task | CB | Evidence |")
-        out.append("|---|---|---|---|---|---|---|")
-        for i, hop in enumerate(hops, 1):
-            ev = hop.get("evidence") if isinstance(hop.get("evidence"), dict) else {}
-            task_id = ev.get("mythic_task_id")
-            cb_id = ev.get("callback_id")
-            evidence = ev.get("result_preview") or ev.get("source") or ""
-            out.append(
-                f"| {i} | `{_md_cell(engagement_ledger.hop_label(hop), 48)}` | {_md_cell(hop.get('effect'))} | "
-                f"`{_md_cell(hop.get('status') or '-', 16)}` | {task_id if task_id is not None else '-'} | "
-                f"{cb_id if cb_id is not None else '-'} | {_md_cell(evidence, 60)} |"
-            )
+        out.extend(engagement_ledger.render_hop_table(hops))
     out.append(
-        "\n**Edit:** `/state remove <row|id[,…]>` · `/state set <row|id> <status>` · "
-        "`/state objective <text>` · `/state wipe`  _(row = the # column, or a hop id/effect/technique)_"
+        "\n**Edit:** `/state remove <#|id[,…]>` · `/state set <#|id> <status>` · "
+        "`/state objective <text>` · `/state wipe`  _(# = the permanent hop number, or a hop id/effect/technique)_"
+    )
+    engagement_ledger.record_operator_view(
+        getattr(request, "ChannelID", None),
+        engagement_ledger.operator_view_text(data, "`/state`"),
     )
     # Compact session footer so the old /state's session info isn't lost.
     if model is not None:

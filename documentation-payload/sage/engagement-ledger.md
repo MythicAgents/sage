@@ -10,7 +10,10 @@ context resets, restarts, and even a change of model. You read and edit it in ch
 
 ## What it is
 
-One JSON file per Mythic operation — a table of hops toward the objective, each with a status.
+One JSON file per Mythic operation — a table of hops toward the objective, each with a status. Each hop keeps a
+permanent number (the `#` column): removing a hop leaves a gap rather than renumbering the rest. When `/state` or
+the end-of-turn table shows you the ledger, Sage also sees that table on your next message, so you can ask about
+"hop 4" directly.
 
 ## Why it is proof-gated
 
