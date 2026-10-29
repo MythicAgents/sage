@@ -41,13 +41,14 @@ gotchas: |
   - BloodHound must already contain ingested data for path queries to return anything. The
     workflow is collect (SharpHound) -> ingest (file_upload) -> query (graph_analysis/adcs_info)
     -> act. Querying before ingest yields empty graphs.
-  - API token id/key are created in the BloodHound UI (Administration -> API Tokens) and are
-    distinct from the admin login. The token key is shown ONCE on creation — capture it then.
+  - The API token ID/key pair is separate from the admin login. For Sage, create it on a dedicated
+    BloodHound user (Manage Users -> user menu -> Generate / Revoke API Tokens -> Create Token), not under
+    an operator's My Profile. The key is shown ONCE on creation — capture it then. Tokens do not expire.
   - Repo license is unmarked at time of writing (TBD-verify before redistribution).
 related_ttps: [sharphound, bloodhound-ingest, bloodhound-cypher-reference, bloodhound-custom-queries, certify, adcs-esc4, sharpgpoabuse, laps-abuse]
 alternatives: [bloodhound-cypher-reference, manual-cypher-via-neo4j-browser, bloodhound-python]
 common_args: {}
-last_updated: 2026-05-29
+last_updated: 2026-10-29
 ---
 
 # BloodHound MCP
@@ -108,8 +109,14 @@ tar -xzf bloodhound-cli-linux-amd64.tar.gz
 - Lost it? `./bloodhound-cli resetpwd`
 
 **2. Create an API token (for the MCP):**
-- Log into the BloodHound UI → **Administration → API Tokens → Create**.
-- Copy the **Token ID** and **Token Key**. The key is shown only once — capture it now.
+- As an Administrator, create a dedicated BloodHound user for Sage with the **Power User** role, which can
+  both explore the graph and ingest files (`file_upload` is a required MCP tool).
+- Go to **Administration → Manage Users**, open that user's menu, choose **Generate / Revoke API Tokens →
+  Create Token**, name it, and save.
+- Copy the **Token ID** and **Token Key**. The key is shown only once — capture it now. Tokens do not
+  expire; revoke and recreate one if the key is lost.
+- For a quick personal lab, **My Profile → API Key Management → Create Token** works too, but the token
+  then carries your own account's role.
 
 **3. Stand up the MCP server (inside the Sage container — stdio transport):**
 ```bash
@@ -168,7 +175,7 @@ After connecting, confirm the 13 tools surface via `MCP_Manager.get_tools_summar
 | Variable | Required | Default | Meaning |
 |----------|----------|---------|---------|
 | `BLOODHOUND_URL` | yes | — | Where BloodHound is, as `scheme://host:port`. Sage expands it into the `DOMAIN`/`PORT`/`SCHEME` the MCP server reads; scheme defaults to `http`, port to the scheme default. |
-| `BLOODHOUND_TOKEN_ID` | yes | — | API token identifier (BloodHound UI → Administration → API Tokens) |
+| `BLOODHOUND_TOKEN_ID` | yes | — | API token identifier (BloodHound UI → Manage Users → user menu → Generate / Revoke API Tokens) |
 | `BLOODHOUND_TOKEN_KEY` | yes | — | API token secret (shown once at creation) |
 
 ### Transport & run
@@ -197,6 +204,8 @@ After connecting, confirm the 13 tools surface via `MCP_Manager.get_tools_summar
 
 - https://github.com/mwnickerson/bloodhound_mcp (README — tool list, env vars, run command, setup), captured 2026-05-29
 - https://bloodhound.specterops.io/get-started/quickstart/community-edition-quickstart (CE standup via BloodHound CLI), captured 2026-05-29
+- https://bloodhound.specterops.io/integrations/bloodhound-api/working-with-api (API token creation), checked 2026-10-29
+- https://bloodhound.specterops.io/manage-bloodhound/auth/users-and-roles (role permissions), checked 2026-10-29
 
 ## See also
 - `sharphound` — the collector that feeds BloodHound (step 1 of the loop)

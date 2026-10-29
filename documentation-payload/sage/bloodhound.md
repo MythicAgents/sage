@@ -18,8 +18,10 @@ finds it not connected.
 ## Prerequisites
 
 1. **BloodHound CE** running and reachable from the Sage host.
-2. **A BloodHound API token** (BloodHound CE → *Administration → API tokens → Create*). You need the **Token ID**
-   and **Token Key**.
+2. **A BloodHound API token.** Create a dedicated BloodHound user for Sage with the **Power User** role, which can
+   explore the graph and ingest files. Then go to *Administration → Manage Users*, open that user's menu, and choose
+   *Generate / Revoke API Tokens → Create Token*. You need the **Token ID** and **Token Key**; the key is shown
+   only once. *My Profile → API Key Management* also works, but the token then carries your own account's role.
 3. **A BloodHound MCP checkout** on the Sage host (run with `uv`). The container bakes one at
    `/opt/bloodhound_mcp`, so under a standard Mythic install you do not need your own.
 

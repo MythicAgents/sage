@@ -44,6 +44,10 @@ between minor releases.
 - Approval cards for raw tasks now show the intended effect with its target filled in, for example
   `graph-built:north.sevenkingdoms.local|baseline` for a SharpHound collection, instead of the template
   `graph-built:{target}`. When the target can't be worked out yet, the card shows only the expected evidence.
+- The BloodHound setup steps in the docs, the BloodHound MCP guidance, and the message Sage shows when
+  BloodHound isn't connected now give BloodHound CE's current path for creating an API token: a dedicated
+  Power User account, then *Administration → Manage Users → Generate / Revoke API Tokens*. The old
+  *Administration → API Tokens* menu no longer exists.
 
 ## [0.2.0] - 2026-10-23
 
