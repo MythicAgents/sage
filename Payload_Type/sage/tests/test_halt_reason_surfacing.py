@@ -257,3 +257,24 @@ def test_no_step_limit_no_halt():
 
     mw = _StopCheckMiddleware(_Model(max_steps=20, step_count=18))
     assert mw.before_model(state={}, runtime=None) is None
+
+
+# --------------------------------------------------------------------------------------
+# Max Steps caps each chat request, not the channel's session.
+# --------------------------------------------------------------------------------------
+
+
+def test_step_budget_resets_for_a_new_request_but_still_caps_the_request():
+    model = _Model(max_steps=3, step_count=3)
+    mw = _StopCheckMiddleware(model)
+
+    # The previous request used the whole budget; a new request starts from zero.
+    Model.reset_step_budget(model)
+    assert (model._global_step_count, model._global_step_limit_hit) == (0, False)
+    for _ in range(3):
+        mw.before_model(state={}, runtime=None)
+
+    # The fourth step of the same request still halts.
+    with pytest.raises(_OperatorStopRequested) as excinfo:
+        mw.before_model(state={}, runtime=None)
+    assert excinfo.value.stop_reason == STOP_REASON_STEP_LIMIT

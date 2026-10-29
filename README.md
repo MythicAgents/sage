@@ -573,7 +573,7 @@ Model settings resolve through the chain above. The main settings are:
 | `mode` | `conversation` (default), `supervised`, or `auto` — see [Modes](#modes) |
 | `autonomous_solve` | Enable objective-led controller execution; supervised mode still requires approval for each guarded action. Ignored in conversation mode, which stays read-only |
 | `policy_mode` | `hybrid` (default), `symbolic`, or `llm` capability selection |
-| `max_steps` | Model-step ceiling; unset defaults to `200`, `0` means unlimited |
+| `max_steps` | Model-step ceiling per chat request; unset defaults to `200`, `0` means unlimited |
 
 **Providers.** The four above are the tested set. Sage builds the model through LangChain's `init_chat_model`, so
 other providers it supports may work but are unverified. Bedrock is the only provider with dedicated AWS
@@ -595,8 +595,9 @@ This setting governs controller capability selection. Ordinary supervised chat w
 uses the agent graph: read-only requests can run immediately, and guarded requests can be proposed for approval.
 Turning Autonomous Solve off does not remove the operator's ability to request an action.
 
-**Step budget.** `max_steps` bounds the number of model steps in a run. Left unset it defaults to 200; set it to
-`0` for unlimited. A small ceiling caps cost and stops runaway loops on scoped work. For a full autonomous
+**Step budget.** `max_steps` bounds the number of model steps in each chat request; the count starts again with
+every new request, and approving a card continues the same request's budget. Left unset it defaults to 200; set it
+to `0` for unlimited. A small ceiling caps cost and stops runaway loops on scoped work. For a full autonomous
 objective, raise it or set `0` — but the autonomous controller also enforces hard stop-losses independent of step
 count: **60 cycles**, a **45-minute wall clock**, a **3M-token budget**, and a no-progress loop-breaker. Each is
 tunable through `SAGE_CONTROLLER_MAX_CYCLES`, `SAGE_CONTROLLER_WALL_S`, and `SAGE_CONTROLLER_TOKEN_BUDGET`.

@@ -1381,6 +1381,12 @@ class SageChat(Chat):
                             )
                         )
                     else:
+                        if recovery_state is None:
+                            # Max Steps caps each new request; an approval resume above keeps its request's
+                            # budget, and a recovered autonomous run continues the one it belongs to.
+                            reset_step_budget = getattr(model, "reset_step_budget", None)
+                            if callable(reset_step_budget):
+                                reset_step_budget()
                         native_response_text = _nonempty_native_response_text(
                             await (
                                 model.resume_autonomous_controller()

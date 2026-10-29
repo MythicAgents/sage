@@ -160,7 +160,7 @@ _CONFIG_OPTIONS = [
         DisplayName="Max Steps",
         DisplayAsChip=True,
         Type=OptType.Number,
-        Description="Global cap on model steps for this run; halts a runaway loop. 0 = unlimited.",
+        Description="Cap on model steps for each chat request; halts a runaway loop. 0 = unlimited.",
         Required=False,
         DefaultValue=200,
     ),

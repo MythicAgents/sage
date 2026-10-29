@@ -58,6 +58,10 @@ between minor releases.
   any AI channel token), the read scopes for the Mythic data it queries, and `credential.write` and
   `eventlog.write`. The unused `tag.write` is gone. Mythic does not enforce this list; it tells the operator
   what to grant, and the docs list the same set.
+- Max Steps now caps each chat request. The model-step count used to add up across every request in a channel
+  until the session was rebuilt, so a later request could halt after only a few steps while the notice blamed
+  "this request". It now starts again with each new request; approving a card continues the budget of the
+  request it belongs to.
 - Approval cards for raw tasks now show the intended effect with its target filled in, for example
   `graph-built:north.sevenkingdoms.local|baseline` for a SharpHound collection, instead of the template
   `graph-built:{target}`. When the target can't be worked out yet, the card shows only the expected evidence.

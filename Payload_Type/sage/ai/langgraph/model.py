@@ -14787,6 +14787,15 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         except Exception:
             pass
 
+    def reset_step_budget(self) -> None:
+        """Start a fresh model-step budget: Max Steps caps each chat request, not the channel's session.
+
+        Called when a new operator request starts. Not called by ``invoke`` itself, which also re-enters to
+        continue the same request, nor by approval resumes, which continue the request they belong to.
+        """
+        self._global_step_count = 0
+        self._global_step_limit_hit = False
+
     async def invoke(self, prompt: str, is_interactive: bool = False) -> str:
         """Invoke the model with a prompt and return the response.
         :param prompt: The prompt to send to the model.

@@ -5801,3 +5801,31 @@ def test_build_channel_metadata_degrades_safely(monkeypatch):
     assert items["mcp_servers"]["value"] == 0
     assert items["rounds"]["value"] == 0
     assert items["bloodhound"]["value"] is False
+
+
+class _StepBudgetHitlModel(_HitlModel):
+    def __init__(self):
+        super().__init__()
+        self.step_budget_resets = 0
+
+    def reset_step_budget(self):
+        self.step_budget_resets += 1
+
+
+def test_step_budget_resets_per_new_request_but_not_for_an_approval_resume():
+    model = _StepBudgetHitlModel()
+    chat = _HitlDriverChat(model)
+
+    _run(chat.chat(build_chat_request("do risky thing", channel_id=5, request_id=1)))
+    assert model.step_budget_resets == 1
+
+    # The approval continues request 1 and keeps its budget.
+    approval = build_chat_request("", channel_id=5, request_id=2)
+    approval.InputResponse = _input_response_for_context("accept", model._pending_approval_context)
+    _run(chat.chat(approval))
+    assert model.resumed_with == "approve"
+    assert model.step_budget_resets == 1
+
+    # A new operator request starts a fresh budget.
+    _run(chat.chat(build_chat_request("next thing", channel_id=5, request_id=3)))
+    assert model.step_budget_resets == 2

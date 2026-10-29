@@ -17,7 +17,7 @@ The main model settings are:
 | `mode` | `conversation` (default), `supervised`, or `auto` |
 | `autonomous_solve` | Enable objective-led solving in `supervised` mode; each guarded action still needs approval. `auto` always enables it. Ignored in `conversation`, which stays read-only; Sage says so once in the chat |
 | `policy_mode` | `hybrid` (default), `symbolic`, or `llm` capability selection |
-| `max_steps` | Model-step ceiling; unset defaults to `200`, `0` means unlimited |
+| `max_steps` | Model-step ceiling per chat request; unset defaults to `200`, `0` means unlimited |
 
 ## Providers
 
@@ -48,8 +48,9 @@ Choose `hybrid` unless you have a reason not to.
 
 ## Step budget
 
-`max_steps` bounds the number of model steps in a run. Left unset it defaults to 200; set it to `0` for
-unlimited. A small ceiling caps cost and stops runaway loops on scoped work. For a full autonomous objective,
-raise it or set `0` — but the autonomous controller also enforces hard stop-losses independent of step count
-(60 cycles, a 45-minute wall clock, a 3M-token budget, and a no-progress loop-breaker), tunable through
+`max_steps` bounds the number of model steps in each chat request; the count starts again with every new request,
+and approving a card continues the same request's budget. Left unset it defaults to 200; set it to `0` for
+unlimited. A small ceiling caps cost and stops runaway loops on scoped work. For a full autonomous objective, raise
+it or set `0` — but the autonomous controller also enforces hard stop-losses independent of step count (60 cycles, a
+45-minute wall clock, a 3M-token budget, and a no-progress loop-breaker), tunable through
 `SAGE_CONTROLLER_MAX_CYCLES`, `SAGE_CONTROLLER_WALL_S`, and `SAGE_CONTROLLER_TOKEN_BUDGET`.
