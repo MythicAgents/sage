@@ -159,3 +159,52 @@ def test_heartbeat_interval_leaves_room_inside_the_idle_budget():
     from ai.langgraph import model as model_module
 
     assert model_module.SAGE_NODE_IDLE_TIMEOUT > SAGE_TASK_HEARTBEAT_INTERVAL * 2
+
+
+# --------------------------------------------------------------------------------------
+# Sage's own deliberate waits: wait_for_seconds and the capability's Group Policy wait.
+# --------------------------------------------------------------------------------------
+
+
+def _waiting_tool_graph(wait):
+    async def waiter(state: _S) -> dict:
+        await wait()
+        return {"done": True}
+
+    return (
+        StateGraph(_S)
+        .set_node_defaults(timeout=TimeoutPolicy(idle_timeout=IDLE, refresh_on="auto"))
+        .add_node("waiter", waiter)
+        .add_edge(START, "waiter")
+        .compile()
+    )
+
+
+def test_wait_for_seconds_outlives_the_idle_budget(monkeypatch):
+    """A model-requested wait (a 300 s GPO refresh in production) must not be cancelled as a stall."""
+    from ai.langgraph import mythic_tools
+    from ai.langgraph.mythic_tools import MythicTools
+
+    monkeypatch.setattr(mythic_tools, "SAGE_TASK_HEARTBEAT_INTERVAL", BEAT)
+    tools = MythicTools(agent_task_id="test")
+
+    graph = _waiting_tool_graph(lambda: tools.wait_for_seconds(int(WAIT), reason="gpo refresh"))
+    assert asyncio.run(graph.ainvoke({})) == {"done": True}
+
+
+def test_capability_wait_with_progress_callback_outlives_the_idle_budget(monkeypatch):
+    """The progress callback reports to the operator; it is not what keeps the node alive."""
+    from ai.langgraph import mythic_tools
+    from ai.langgraph.mythic_tools import MythicTools
+
+    monkeypatch.setattr(mythic_tools, "SAGE_TASK_HEARTBEAT_INTERVAL", BEAT)
+    tools = MythicTools(agent_task_id="test")
+    progress = []
+
+    async def report(elapsed, remaining):
+        progress.append((elapsed, remaining))
+
+    graph = _waiting_tool_graph(
+        lambda: tools._bounded_wait_for_seconds(int(WAIT), reason="gpo-wait", heartbeat=report)
+    )
+    assert asyncio.run(graph.ainvoke({})) == {"done": True}

@@ -62,6 +62,10 @@ between minor releases.
   until the session was rebuilt, so a later request could halt after only a few steps while the notice blamed
   "this request". It now starts again with each new request; approving a card continues the budget of the
   request it belongs to.
+- A deliberate wait of 300 seconds or more, such as waiting for a Group Policy refresh, no longer fails with
+  `NodeTimeoutError: Node 'Mythic_Operator' exceeded its idle timeout`. `wait_for_seconds` and the GPO
+  capability's wait now keep the agent's idle timer alive for as long as they wait, as a Mythic task wait
+  already did.
 - A supervised `execute_capability` proposal whose inputs arrive as a JSON string now reaches its approval card.
   The card's plan preview read `inputs` only when it was already an object, so it planned with no inputs and
   refused with a missing field (for example `system_action` on a GPO execution) even though the capability

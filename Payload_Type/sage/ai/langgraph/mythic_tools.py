@@ -3819,20 +3819,24 @@ class MythicTools:
         except (TypeError, ValueError):
             wait_seconds = 1
         wait_seconds = max(1, min(wait_seconds, 600))
-        if heartbeat is None or wait_seconds < 2:
-            await asyncio.sleep(wait_seconds)
-        else:
-            elapsed = 0
-            remaining = wait_seconds
-            heartbeat_interval = 60
-            while remaining > heartbeat_interval:
-                await asyncio.sleep(heartbeat_interval)
-                elapsed += heartbeat_interval
-                remaining -= heartbeat_interval
-                observed = heartbeat(elapsed, remaining)
-                if inspect.isawaitable(observed):
-                    await observed
-            await asyncio.sleep(remaining)
+        # A deliberate wait must keep the graph node's idle timer alive, like a Mythic task wait does.
+        # Without it a wait at or past SAGE_NODE_IDLE_TIMEOUT (a 300 s Group Policy refresh) cancels the
+        # node with NodeTimeoutError. `heartbeat` below is only the operator-facing progress callback.
+        async with _graph_heartbeat():
+            if heartbeat is None or wait_seconds < 2:
+                await asyncio.sleep(wait_seconds)
+            else:
+                elapsed = 0
+                remaining = wait_seconds
+                heartbeat_interval = 60
+                while remaining > heartbeat_interval:
+                    await asyncio.sleep(heartbeat_interval)
+                    elapsed += heartbeat_interval
+                    remaining -= heartbeat_interval
+                    observed = heartbeat(elapsed, remaining)
+                    if inspect.isawaitable(observed):
+                        await observed
+                await asyncio.sleep(remaining)
         suffix = f" reason={reason}" if reason else ""
         return f"waited {wait_seconds} seconds{suffix}"
 
