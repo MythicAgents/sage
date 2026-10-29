@@ -41,8 +41,9 @@ def test_sharphound_card_resolves_the_collection_key_from_the_callback_foothold(
     assert "{" not in text and "}" not in text
 
 
-def test_sharphound_domain_scope_is_part_of_the_resolved_key():
-    params = '{"assembly_name": "SharpHound.exe", "assembly_arguments": "-c All --Domain essos.local"}'
+@pytest.mark.parametrize("scope", ["--Domain essos.local", "-d essos.local", "--domain=essos.local"])
+def test_sharphound_domain_scope_is_part_of_the_resolved_key(scope):
+    params = f'{{"assembly_name": "SharpHound.exe", "assembly_arguments": "-c All {scope}"}}'
     assert "graph-built:north.lab.local|baseline|scope:essos.local" in _card("execute_assembly", params, [_foothold()])
 
 

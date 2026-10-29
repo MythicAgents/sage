@@ -560,7 +560,8 @@ def test_collect_graph_inflight_marker_is_task_backed_after_issue(monkeypatch):
     assert mt._collection_in_flight[access_key]["command"] == "execute_assembly"
 
 
-def test_collect_graph_targeted_scope_uses_distinct_inflight_key(monkeypatch):
+@pytest.mark.parametrize("scope", ["--Domain essos.local", "-d essos.local", "--domain=essos.local"])
+def test_collect_graph_targeted_scope_uses_distinct_inflight_key(monkeypatch, scope):
     calls = {"issue": 0}
     foothold = _foothold(host="CASTELBLACK", forest="north.sevenkingdoms.local")
     base = engagement_state.EngagementState(objective="test", footholds=[foothold])
@@ -605,7 +606,7 @@ def test_collect_graph_targeted_scope_uses_distinct_inflight_key(monkeypatch):
                 "execute_assembly",
                 {
                     "assembly_name": "SharpHound.exe",
-                    "assembly_arguments": "-c All --Domain essos.local --OutputDirectory C:\\Users\\Public",
+                    "assembly_arguments": f"-c All {scope} --OutputDirectory C:\\Users\\Public",
                 },
                 50,
                 timeout=5,

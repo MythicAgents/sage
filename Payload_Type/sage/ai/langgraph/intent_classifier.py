@@ -78,7 +78,7 @@ def classify_tool_call(command: str, params, callback_host: str | None = None) -
         if _is_collection_execution_command(command_text) and (
             "sharphound" in combined_cf or "azurehound" in combined_cf
         ):
-            return ("collect-graph", _domain_value(parsed).casefold())
+            return ("collect-graph", _collection_scope_domain(parsed).casefold())
 
         return None
     except Exception:
@@ -204,6 +204,22 @@ def _has_flag(parsed: dict[str, Any], flag: str) -> bool:
 
 def _domain_value(parsed: dict[str, Any]) -> str:
     return _flag_value(parsed, "domain")
+
+
+def _collection_scope_domain(parsed: dict[str, Any]) -> str:
+    """SharpHound's domain scope in any form it accepts: ``--Domain x``, ``-d x``, or ``--domain=x``.
+
+    ``-d`` is read only here: in other tools it can mean something other than a domain.
+    """
+    value = _domain_value(parsed) or _flag_value(parsed, "d")
+    if value:
+        return value
+    for token in parsed.get("tokens", []):
+        token_text = _strip_quotes(_text(token))
+        for prefix in ("--domain=", "-d="):
+            if token_text.casefold().startswith(prefix):
+                return _strip_quotes(token_text[len(prefix):]).rstrip("\"]},'")
+    return ""
 
 
 def _is_collection_execution_command(command: str) -> bool:

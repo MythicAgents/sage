@@ -194,3 +194,34 @@ def test_lsass_dump_falls_back_to_callback_host_when_args_lack_host():
     assert intent_classifier.classify_tool_call(
         "dcsync", "/domain:essos.local /user:krbtgt", callback_host="CASTELBLACK"
     ) == ("dcsync", "essos.local")
+
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.parametrize("arguments,target", [
+    ("-c All --Domain essos.local", "essos.local"),
+    ("-c All -d essos.local", "essos.local"),
+    ("-c All -D ESSOS.LOCAL", "essos.local"),
+    ("-c All --domain=essos.local", "essos.local"),
+    ("-c All -d=essos.local", "essos.local"),
+    ("-c All --domain:essos.local", "essos.local"),
+    ('-c All -d "essos.local" --OutputDirectory C:\\Users\\Public', "essos.local"),
+    # No scope: the baseline collection of the callback's own forest.
+    ("-c All --OutputDirectory C:\\Users\\Public", ""),
+    ("-c All --SearchForest", ""),
+    # Near misses: --DomainController names a DC, not a scope; -dc is not -d.
+    ("-c All --DomainController dc01.essos.local", ""),
+    ("-c All -dc dc01.essos.local", ""),
+])
+def test_sharphound_collection_scope_reads_every_domain_flag_form(arguments, target):
+    params = {"Assembly": "SharpHound.exe", "Arguments": arguments}
+    assert intent_classifier.classify_tool_call("execute_assembly", params) == ("collect-graph", target)
+
+
+def test_short_d_flag_is_not_a_domain_outside_sharphound():
+    # A dcsync with no --Domain must not read an unrelated -d as its domain.
+    result = intent_classifier.classify_tool_call(
+        "execute_assembly", "--Assembly SharpKatz.exe --Command dcsync --User LAB\\krbtgt -d 5",
+    )
+    assert result is None or result[1] != "5"

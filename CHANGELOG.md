@@ -55,6 +55,10 @@ between minor releases.
 - Approval cards for raw tasks now show the intended effect with its target filled in, for example
   `graph-built:north.sevenkingdoms.local|baseline` for a SharpHound collection, instead of the template
   `graph-built:{target}`. When the target can't be worked out yet, the card shows only the expected evidence.
+- A SharpHound collection scoped to another domain with `-d <domain>` or `--domain=<domain>` is now recognised
+  as that domain's collection, as `--Domain <domain>` already was. Before, Sage treated it as a repeat of the
+  callback's own baseline collection, so the approval card named the wrong target and Sage could skip the
+  collection as already done.
 - The BloodHound setup steps in the docs, the BloodHound MCP guidance, and the message Sage shows when
   BloodHound isn't connected now give BloodHound CE's current path for creating an API token: a dedicated
   Power User account, then *Administration → Manage Users → Generate / Revoke API Tokens*. The old
