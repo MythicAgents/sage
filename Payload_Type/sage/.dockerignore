@@ -10,8 +10,12 @@ __pycache__
 # Secrets and machine-local configuration
 .env
 .env.*
-certs/bundle.pem
-certs/combined-bundle.pem
+certs/*.pem
+
+# Operator-supplied tool binaries. Sage ships none; a local build must not bake an operator's drop zone into an
+# image layer. The installed service directory is mounted over /Mythic at runtime, which is where they belong.
+tools/*
+!tools/.keep
 
 # Runtime state and retained evidence. These are archived data, never image input.
 .phoenix

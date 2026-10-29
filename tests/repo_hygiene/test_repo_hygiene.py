@@ -72,6 +72,10 @@ def test_docker_context_excludes_development_state_and_archived_databases():
         "evals",
         "tests",
         "Payload_Type",
+        # Operator-local material: TLS bundles and drop-zone binaries never enter an image layer.
+        "certs/*.pem",
+        "tools/*",
+        "!tools/.keep",
     }
     assert required <= ignored
 
