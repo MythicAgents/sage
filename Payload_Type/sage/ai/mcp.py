@@ -56,6 +56,19 @@ BLOODHOUND_CREDENTIAL_ENV_KEYS = (
     "BLOODHOUND_TOKEN_ID",
     "BLOODHOUND_TOKEN_KEY",
 )
+def bloodhound_run_args() -> list[str]:
+    """The ``uv`` arguments after ``--directory <dir>`` that launch the canonical BloodHound MCP server.
+
+    ``UV_NO_SYNC`` set on the Sage process becomes ``--no-sync``. The stdio client passes the server
+    only a fixed safe subset of the environment, so the variable itself never reaches ``uv``. The
+    container image needs it: it pre-syncs the MCP's environment as root, and Sage runs as an
+    unprivileged user who cannot write there, so a sync at connect time fails and BloodHound never
+    connects. Without the variable, as in a local checkout, ``uv run`` syncs as before.
+    """
+    no_sync = str(os.environ.get("UV_NO_SYNC") or "").strip().casefold() in {"1", "true", "yes", "on"}
+    return ["run", "--no-sync", "main.py"] if no_sync else ["run", "main.py"]
+
+
 _LEGACY_MCP_EXECUTION_CLASS_ALIASES = {
     "control_plane": MCP_EXECUTION_CLASS_NON_TARGET_CONTROL_PLANE,
 }
@@ -379,6 +392,7 @@ class MCPServerManager:
         expected_dir = os.path.realpath(configured_dir)
         expected_command = str(os.environ.get("SAGE_BLOODHOUND_MCP_COMMAND", "uv"))
         args = list(config.args or []) if config is not None else []
+        run_args = bloodhound_run_args()
         return bool(
             config is not None
             and config.name == "BloodHound"
@@ -389,11 +403,11 @@ class MCPServerManager:
             and _bloodhound_env_admissible(config.env)
             and str(config.cwd or "") == configured_dir
             and os.path.realpath(str(config.cwd or "")) == expected_dir
-            and len(args) == 4
+            and len(args) == 2 + len(run_args)
             and args[0] == "--directory"
             and str(args[1]) == configured_dir
             and os.path.realpath(str(args[1])) == expected_dir
-            and args[2:] == ["run", "main.py"]
+            and args[2:] == run_args
         )
 
     def is_bloodhound_server(self, server_name: str) -> bool:

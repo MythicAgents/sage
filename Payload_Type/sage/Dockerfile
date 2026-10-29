@@ -26,8 +26,10 @@ RUN apt-get update && \
     pip install --no-cache-dir uv
 # uv's managed Python must be readable by the unprivileged user Sage runs as (see sage_entrypoint.py), so
 # keep it out of root's private home. uv's cache stays under HOME, which the entrypoint makes writable.
-# UV_NO_SYNC makes `uv run` use the environment synced below as-is: without it, every first MCP connect
-# re-synced (downloading dev dependencies) into a venv the unprivileged user cannot write.
+# UV_NO_SYNC tells Sage to launch the MCP with `uv run --no-sync`, using the environment synced below as-is.
+# Without it, every first MCP connect re-synced (downloading dev dependencies) into a venv the unprivileged
+# user cannot write, and BloodHound never connected. The variable itself does not reach the MCP process: the
+# stdio client passes it only a fixed safe environment, so Sage turns it into the flag (ai/mcp.py).
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python \
     UV_NO_SYNC=1
 # Clone the BloodHound MCP and pre-sync its deps so first connect needs no network.

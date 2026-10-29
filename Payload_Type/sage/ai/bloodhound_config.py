@@ -20,6 +20,7 @@ from ai.mcp import (
     MCPManager,
     MCPConnectionConfig,
     MCP_EXECUTION_CLASS_BLOODHOUND_CONTROL_PLANE,
+    bloodhound_run_args,
     create_stdio_config,
 )
 
@@ -197,7 +198,7 @@ def bloodhound_mcp_config(
     return create_stdio_config(
         name=BLOODHOUND_SERVER_NAME,
         command=command,
-        args=["--directory", d, "run", "main.py"],
+        args=["--directory", d, *bloodhound_run_args()],
         env=dict(env) if env else {},
         cwd=d,
         encoding=None,

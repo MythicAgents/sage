@@ -555,3 +555,44 @@ def test_stdio_client_does_not_inherit_bloodhound_vars_by_default():
         assert "BLOODHOUND_DOMAIN" not in get_default_environment()
     finally:
         os.environ.pop("BLOODHOUND_DOMAIN", None)
+
+
+def _canonical(cfg) -> bool:
+    from ai.mcp import MCPManager
+
+    return MCPManager._is_canonical_bloodhound_config(cfg)
+
+
+def test_container_launch_skips_the_sync_the_unprivileged_user_cannot_write(monkeypatch, tmp_path):
+    # The image pre-syncs the MCP environment as root and sets UV_NO_SYNC; the stdio client drops that
+    # variable, so it has to travel as a flag or `uv run` tries to write the root-owned venv and fails.
+    monkeypatch.setenv("SAGE_BLOODHOUND_MCP_DIR", str(tmp_path))
+    monkeypatch.setenv("UV_NO_SYNC", "1")
+    cfg = bloodhound_mcp_config(str(tmp_path))
+    assert cfg.args == ["--directory", str(tmp_path), "run", "--no-sync", "main.py"]
+    assert _canonical(cfg)
+
+
+def test_local_launch_keeps_syncing_and_the_identity_check_stays_exact(monkeypatch, tmp_path):
+    monkeypatch.setenv("SAGE_BLOODHOUND_MCP_DIR", str(tmp_path))
+    monkeypatch.delenv("UV_NO_SYNC", raising=False)
+    cfg = bloodhound_mcp_config(str(tmp_path))
+    assert cfg.args == ["--directory", str(tmp_path), "run", "main.py"]
+    assert _canonical(cfg)
+
+    # Each environment admits only its own form: the flag cannot be added or dropped behind its back.
+    monkeypatch.setenv("UV_NO_SYNC", "1")
+    assert not _canonical(cfg)
+    synced = bloodhound_mcp_config(str(tmp_path))
+    monkeypatch.delenv("UV_NO_SYNC")
+    assert not _canonical(synced)
+    for extra in (["run", "--no-sync", "--with", "x", "main.py"], ["run", "main.py", "--no-sync"]):
+        cfg.args = ["--directory", str(tmp_path), *extra]
+        assert not _canonical(cfg)
+
+
+def test_uv_no_sync_false_values_keep_syncing(monkeypatch, tmp_path):
+    monkeypatch.setenv("SAGE_BLOODHOUND_MCP_DIR", str(tmp_path))
+    for value in ("", "0", "false", "no"):
+        monkeypatch.setenv("UV_NO_SYNC", value)
+        assert "--no-sync" not in bloodhound_mcp_config(str(tmp_path)).args
