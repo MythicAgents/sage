@@ -26,6 +26,11 @@ between minor releases.
 
 ### Fixed
 
+- A request that ends while a specialist's delegation is still open, for example when a capability
+  cannot be planned or an identical re-proposal is stopped, now finishes normally. The open delegation
+  failed the final consistency check, so a request whose work had finished ended as an error with its
+  sub-agent card stuck on "running". Open delegations now close as stopped, as open tool calls already
+  did, including one whose card was lost to an interrupted resume.
 - A request's final message now appears after everything the request showed. It used to finalize the
   last main-window message in place, and Mythic orders a chat by when each message was created, so a
   checkpoint written into an early progress message sat above the sub-agent panels and tool cards that

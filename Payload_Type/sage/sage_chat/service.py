@@ -1623,9 +1623,15 @@ class SageChat(Chat):
                 # terminating with a final response. A card still awaiting an operator decision
                 # releases the channel and returns before reaching this point, so nothing pending can
                 # be closed out from under the operator.
-                close_open_tools = getattr(model, "_close_open_tool_lifecycles", None)
-                if callable(close_open_tools):
-                    await close_open_tools(status="stopped")
+                #
+                # Delegations need the same close: a refusal that ends the request mid-delegation (an
+                # unplannable capability, an identical re-proposal stop) leaves the specialist's
+                # delegation open, and the reconciliation below raised on it.
+                close_open = getattr(model, "_close_all_request_lifecycles", None)
+                if not callable(close_open):
+                    close_open = getattr(model, "_close_open_tool_lifecycles", None)
+                if callable(close_open):
+                    await close_open(status="stopped")
 
                 preterminal = await finalize_visibility(require_final=False)
                 if not preterminal.get("ok", False):

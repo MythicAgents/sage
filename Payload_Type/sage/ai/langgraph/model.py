@@ -8286,10 +8286,46 @@ class Model:
                 delegation_name=metadata.get("delegation_name") or None,
             )
 
+    async def _close_open_delegation_lifecycles(self, status: str = "stopped") -> None:
+        """Terminalize and project every delegation still open in the request ledger.
+
+        Open sub-agent cards close through _close_all_delegations. A delegation whose `opened` event is
+        in the ledger but which no longer has an in-memory card (an interrupted resume, or a refusal that
+        ended the request mid-delegation) is closed from its ledger metadata instead. Left open, it made
+        the pre-terminal reconciliation fail and turned a usable request into status=error.
+        """
+        phase = status if status in {"stopped", "cancelled", "error"} else "stopped"
+        await self._close_all_delegations(status=phase)
+        ledger = getattr(self, "_request_event_ledger", None)
+        if not isinstance(ledger, RequestEventLedger):
+            return
+        for kind, event_id in tuple(ledger.open_lifecycles()):
+            if kind != "delegation":
+                continue
+            metadata = dict(ledger.actual_events(event_id=event_id, kind=kind)[0].metadata)
+            ledger.record_once(event_id=event_id, kind="delegation", phase=phase, content="", metadata=metadata)
+            emitted = await self._emit_subagent_status(
+                event_id=event_id,
+                title=str(metadata.get("title", "")),
+                delegation_id=str(metadata.get("delegation_id", "")),
+                delegation_name=str(metadata.get("delegation_name", "")),
+                status=phase,
+                icon=str(metadata.get("icon", "")),
+                icon_color=str(metadata.get("icon_color", "")),
+                complete=True,
+            )
+            if emitted and ledger.should_project(event_id, "delegation", phase):
+                ledger.record_projection(
+                    event_id=event_id,
+                    kind="delegation",
+                    phase=phase,
+                    projection_key=f"event:{event_id}",
+                )
+
     async def _close_all_request_lifecycles(self, status: str = "stopped") -> None:
         """Terminalize and project every lifecycle that remains open."""
         phase = status if status in {"stopped", "cancelled", "error"} else "stopped"
-        await self._close_all_delegations(status=phase)
+        await self._close_open_delegation_lifecycles(status=phase)
         await self._close_open_tool_lifecycles(status=phase)
 
     async def _emit_operator_stop(
