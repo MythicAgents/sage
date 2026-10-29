@@ -354,3 +354,25 @@ live `sage.db` into that same directory and `rsync --delete` would otherwise be 
 (rsync protects excluded files on the receiver, which is what makes this safe). And the installed
 directory is resolved from `MYTHIC_ENV_PATH`, never guessed by name — a guess silently deploys into
 the wrong install on a machine with two Mythic checkouts.
+
+#### Switching between tmux and the container
+
+Each deployment keeps its own runtime state, and switching carries some of it but not all:
+
+- **Databases live where that Sage runs.** Local tmux uses `Payload_Type/sage/sage.db` and
+  `Payload_Type/sage/.phoenix/phoenix.db`; the container uses the same names inside the installed service
+  directory. The reset's archive phase covers only the repo paths. Before a clean run in the container, stop
+  it and archive its database too:
+  `archive_runtime_dbs.py --sage-db <installed service dir>/sage.db`. Stale channel markers there make Sage
+  refuse the first prompt in a new channel ("Sage restarted or this channel's session was replaced") when
+  Mythic reuses channel IDs after its own reset.
+- **The sync carries git-ignored operator files.** `deploy` mirrors the working tree, so TLS bundles in
+  `certs/` and binaries in `tools/` reach the installed copy without copying by hand. It does not sync
+  `.env`: give the container its model and BloodHound settings through the chat channel's configuration or
+  the installed copy's own `.env`.
+- **What needs a restart.** Sage picks the TLS bundle once at startup, so a changed bundle needs a restart.
+  `tools/` is read on each tool call and needs neither restart nor rebuild.
+- **Which build it is.** A local `mythic-cli build sage` (with `sage_use_build_context` set) reports
+  `version=unknown` and `build_commit=unknown` in the banner. Only the published image carries them; use
+  `parity` to identify a local build.
+- **One Sage at a time.** Confirm with `sage_deployment.py check` after every switch.
