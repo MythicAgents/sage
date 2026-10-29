@@ -244,7 +244,9 @@ def execution_hint(ttp_frontmatter: dict[str, Any] | None, agent_frontmatter: di
         binary = ttp_frontmatter.get("binary_filename", "the binary")
         lines.append(
             f"`{binary}` must be in Mythic's file store first "
-            f"(ensure_tool_uploaded / get_all_uploaded_files), then pass its file UUID."
+            f"(ensure_tool_uploaded / get_all_uploaded_files), then pass its file UUID. "
+            f"list_staged_tools(\"{binary}\") shows whether it, or a renamed or per-architecture build, is "
+            f"staged or already in Mythic."
         )
     template = entry.get("parameters_template")
     if template:

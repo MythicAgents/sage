@@ -52,7 +52,10 @@ SAGE_SLASH_COMMANDS = [
     ),
     ChatSlashCommandDefinition(Name="state", Description="Show/edit Sage's engagement state (hop ledger): /state, /state reconcile|remove|set|objective|wipe."),
     ChatSlashCommandDefinition(Name="list", Description="List active Sage chat sessions."),
-    ChatSlashCommandDefinition(Name="tools", Description="List Sage's Mythic tool functions: /tools."),
+    ChatSlashCommandDefinition(
+        Name="tools",
+        Description="List Sage's Mythic tool functions (/tools) or the binaries staged in its tools/ folder (/tools staged).",
+    ),
     ChatSlashCommandDefinition(
         Name="mode",
         Description="Show or set the agent mode: /mode [conversation|supervised|auto].",
@@ -125,6 +128,78 @@ def render_tool_inventory(model: Any = None) -> str:
     rows.extend(["", "For connected MCP tools, use `/mcp tools [server]`. "
                  "For commands installed on a payload callback, ask Sage to query that payload type."])
     return "\n".join(rows)
+
+
+
+_IN_MYTHIC_LABELS = {
+    "yes": "yes",
+    "same_bytes_other_name": "yes, as {mythic_filename}",
+    "different_bytes": "other bytes under this name",
+    "no": "no",
+    "unknown": "not checked",
+}
+
+
+async def render_staged_tools(model: Any = None) -> str:
+    """Show the tools/ drop zone inventory without a model call; Mythic presence when a session can read it."""
+    try:
+        from ai.langgraph import staged_tools, ttp_library
+    except ImportError:  # pragma: no cover
+        from ..ai.langgraph import staged_tools, ttp_library  # type: ignore
+
+    inventory = await asyncio.to_thread(staged_tools.scan, ttp_library.TOOLS_DIR, ttp_library.iter_ttps())
+    client = getattr(model, "mythic_client", None) if model is not None else None
+    rows = None
+    if client is not None and hasattr(client, "_uploaded_file_rows"):
+        try:
+            rows = await client._uploaded_file_rows()
+        except Exception:
+            rows = None
+    staged_tools.annotate_mythic(inventory["files"], rows)
+    if not inventory["tools_dir_present"]:
+        return "**Staged tools**\n\nSage's `tools/` folder does not exist, so nothing is staged."
+    files = [entry for entry in inventory["files"] if "error" not in entry]
+    if not files:
+        return "**Staged tools**\n\nSage's `tools/` folder is empty. Drop tool binaries there for Sage to use."
+    lines = [
+        "**Staged tools**",
+        "",
+        "Binaries in Sage's `tools/` folder. Staging a file does not authorize running it.",
+    ]
+    if rows is None:
+        lines.append("Mythic's file store was not checked in this session.")
+    lines.extend(["", "| Family | File | Kind | Arch | Size | TTP | In Mythic |", "| --- | --- | --- | --- | --- | --- | --- |"])
+    for entry in sorted(files, key=lambda e: (e["family"], e["filename"].casefold())):
+        matches = entry.get("ttp_matches") or []
+        if matches:
+            total = entry.get("ttp_match_count", len(matches))
+            ttp = f"`{matches[0]['ttp']}`" + (f" +{total - 1}" if total > 1 else "")
+            if matches[0]["match"] != "exact":
+                ttp += f" ({matches[0]['match'].replace('_', ' ')})"
+        else:
+            ttp = "none — ask before use"
+        in_mythic = _IN_MYTHIC_LABELS.get(entry.get("in_mythic", "unknown"), "not checked").format(
+            mythic_filename=entry.get("mythic_filename") or "another name"
+        )
+        cells = [
+            entry["family"], f"`{entry['filename']}`", entry["kind"], entry["arch"] or "—",
+            _format_size(entry["size"]), ttp, in_mythic,
+        ]
+        lines.append("| " + " | ".join(str(c).replace("|", "\\|") for c in cells) + " |")
+    if inventory["truncated"]:
+        lines.append(f"\nShowing the first {staged_tools.MAX_FILES} files.")
+    errors = [entry for entry in inventory["files"] if "error" in entry]
+    if errors:
+        lines.append("\nUnreadable: " + ", ".join(f"`{entry['filename']}`" for entry in errors))
+    return "\n".join(lines)
+
+
+def _format_size(size: int) -> str:
+    for unit in ("B", "KiB", "MiB"):
+        if size < 1024 or unit == "MiB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size} B"
 
 
 def _handle_mode(model: Any, arg: str) -> str:
@@ -911,7 +986,13 @@ async def handle_slash(chat: Any, request: ChatRequest, model: Any, response_key
     elif name == "list":
         text = await _handle_list()
     elif name == "tools":
-        text = render_tool_inventory(model) if not arg.strip() else "Usage: `/tools` — list Sage Mythic tool functions."
+        sub = arg.strip().lower()
+        if not sub:
+            text = render_tool_inventory(model)
+        elif sub == "staged":
+            text = await render_staged_tools(model)
+        else:
+            text = "Usage: `/tools` — list Sage Mythic tool functions · `/tools staged` — list staged tool binaries."
     elif name == "stop":
         text = await _handle_stop(request, model)
     elif name == "mcp":

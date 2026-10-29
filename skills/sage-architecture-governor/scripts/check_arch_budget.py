@@ -168,7 +168,7 @@ def main() -> int:
     # nothing distinguishes 25 from 30. Keep this equal to the current count so a failure means
     # "this change added a tool": a gate that is always red cannot tell you whether your change
     # broke something, which is worse than no gate. Say why in the commit when raising.
-    parser.add_argument("--max-mythic-operator-tools", type=int, default=25)
+    parser.add_argument("--max-mythic-operator-tools", type=int, default=26)
     args = parser.parse_args()
     if args.self_test:
         return self_test()

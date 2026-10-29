@@ -7,6 +7,17 @@ between minor releases.
 
 ## [Unreleased]
 
+### Added
+
+- `list_staged_tools`, a read-only tool for the operator agent, and `/tools staged` in chat list the binaries in
+  Sage's `tools/` drop zone. Before, Sage found a staged binary only when a TTP named its exact filename. Each
+  file shows its sha256, its type and architecture read from the file header, the TTPs that document it, and
+  whether Mythic already holds the same bytes, so Sage can use that copy without asking to upload it again.
+  Renamed and per-architecture builds (`new_sharphound_x64.exe`, `SharpHound.o`) match their tool. A binary no
+  TTP documents carries a hint to ask the operator what it is for, and a tool that is staged nowhere returns a
+  message asking the operator to add it. `ensure_tool_uploaded` names staged variants when the exact filename
+  is missing.
+
 ### Changed
 
 - `mythic-cli install github` now pulls the published release image from GitHub Container Registry instead of

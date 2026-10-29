@@ -269,6 +269,7 @@ SHIPPING_MYTHIC_REVERSE_DISPOSITIONS: dict[str, tuple[str, tuple[str, ...]]] = {
     "get_ttp_guidance": ("DO_NOT_ADD_TREATMENT", ()),
     "get_ttp_full_reference": ("DO_NOT_ADD_TREATMENT", ()),
     "list_ttp_categories": ("DO_NOT_ADD_TREATMENT", ()),
+    "list_staged_tools": ("DO_NOT_ADD_TREATMENT", ()),
     "ensure_tool_uploaded": ("DO_NOT_ADD_TREATMENT", ()),
     "download_tool": ("DO_NOT_ADD_TREATMENT", ()),
     "ingest_collection": ("ADD_RAW", ("ingest_collection",)),

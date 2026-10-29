@@ -42,6 +42,7 @@ These never prompt for approval and cannot change target or Mythic state.
 | `get_ttp_guidance` | Match a plain-language goal to Sage's TTP library; returns args, examples, guidance |
 | `get_ttp_full_reference` | Full reference section for a TTP |
 | `list_ttp_categories` | Sage's TTP library grouped by category |
+| `list_staged_tools` | Binaries in the `tools/` drop zone, or every variant of one tool: type, architecture, matching TTPs, and Mythic presence |
 
 `get_ttp_guidance` labels library requirements, examples, and agent instructions as reference material.
 Its `reference_scope` metadata does not attest that a callback meets those requirements. A resolved payload
@@ -87,6 +88,17 @@ authorize a hidden upload.
 directory ships **empty** (only a `.keep`) — Sage bundles no binaries. An operator drops in tools such as Rubeus,
 Certify, SharpHound, SharpGPOAbuse, SharpDPAPI, or Whisker; a binary placed there is staged into Mythic on
 demand, and `download_tool` fetches a pinned, sha256-verified binary from its TTP source into the same folder.
+
+`list_staged_tools` (read-only, also `/tools staged`) inventories the top level of the folder, skipping
+dotfiles, symlinks, and subfolders. Per file it reports the sha256, the type and architecture read from the
+header (PE and CLR headers, COFF for BOFs, ELF, archive magic, script extension or shebang), the TTPs whose
+`binary_filename` matches (`exact`, `family` for renamed or per-architecture builds, `name_contains` for a
+longer name that contains a TTP's tool name), and `in_mythic` (`yes`, `same_bytes_other_name`,
+`different_bytes`, `no`, `unknown`). Mythic presence compares md5 and sha1 against Mythic's uploaded-file rows
+and needs `file.read`; without it the column is `unknown`. With a `binary_filename` argument the tool returns
+every staged and Mythic-held variant of that tool, or an operator-facing message when there is none.
+`ensure_tool_uploaded` also names staged variants when the exact filename is missing. Header parsing never runs
+the file.
 
 ## Payload adapters and command discovery
 

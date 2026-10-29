@@ -24,6 +24,7 @@ SHIPPING_MYTHIC_OPERATOR_TOOL_NAMES = (
     "get_ttp_guidance",
     "get_ttp_full_reference",
     "list_ttp_categories",
+    "list_staged_tools",
     "ensure_tool_uploaded",
     "download_tool",
     "ingest_collection",

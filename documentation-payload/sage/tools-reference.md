@@ -58,6 +58,7 @@ the token has no read scope for.
 | `get_ttp_guidance` | Match a plain-language goal to Sage's TTP library; returns args, examples, guidance |
 | `get_ttp_full_reference` | Full reference section for a TTP |
 | `list_ttp_categories` | Sage's TTP library grouped by category |
+| `list_staged_tools` | Binaries in the `tools/` drop zone, or every variant of one tool: type, architecture, matching TTPs, and Mythic presence |
 
 ## Guarded tools
 

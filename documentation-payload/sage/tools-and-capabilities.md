@@ -62,6 +62,23 @@ coercion/relay, delegation, lateral movement, privesc, evasion, and persistence.
 
 `Payload_Type/sage/tools/` is an operator drop zone for tool binaries. It ships **empty** — Sage bundles no
 offensive binaries. Drop a binary in (for example `Rubeus.exe`, `Certify.exe`, `SharpHound.exe`,
-`SharpGPOAbuse.exe`, `SharpDPAPI.exe`, or `Whisker.exe`) and Sage discovers it and stages it into Mythic on
-demand instead of making you upload it by hand. The `download_tool` capability can also fetch a pinned,
-sha256-verified binary from its TTP source straight into this folder.
+`SharpGPOAbuse.exe`, `SharpDPAPI.exe`, or `Whisker.exe`) and Sage can list it with the read-only
+`list_staged_tools` tool, then stage it into Mythic on demand instead of making you upload it by hand. The
+`download_tool` capability can also fetch a pinned, sha256-verified binary from its TTP source straight into
+this folder.
+
+For each staged file the inventory reports:
+
+- its sha256, and its type (.NET assembly, native executable, BOF, script, archive) and architecture (x86, x64,
+  AnyCPU), read from the file header rather than the name;
+- the TTPs that document it. Renamed and per-architecture builds match their tool, so `new_sharphound_x64.exe`,
+  `SharpHound_x86.exe`, and `SharpHound.o` are all listed as SharpHound variants, and Sage picks the one that
+  fits the callback;
+- whether Mythic's file store already holds the same bytes. When it does, Sage uses that file directly and does
+  not ask to upload it again.
+
+A binary that no TTP documents is listed with a hint that tells Sage to ask you what it is for before using
+it. When Sage looks for a tool that is in neither `tools/` nor Mythic, the result carries a message for Sage to
+pass on, asking you to add the tool and tell it to continue. Run
+`/tools staged` to see the inventory in chat. Only the top level of `tools/` is read; dotfiles, symlinks, and
+subfolders are skipped. Staging a file never authorizes running it: uploading and tasking stay guarded.

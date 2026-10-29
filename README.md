@@ -418,6 +418,7 @@ the token has no read scope for.
 | `/mode [conversation\|supervised\|auto]` | Show or switch the channel's mode |
 | `/list` | List active Sage chat sessions |
 | `/tools` | List Sage's public Mythic tool functions, descriptions, and access requirements |
+| `/tools staged` | List the binaries in Sage's `tools/` drop zone: type, architecture, matching TTPs, and whether Mythic already holds them |
 | `/report [identity]` | Show retained identity/membership observations shared across assisted chats in this operation engagement, unknown access prerequisites, and next checks; one identity metadata check, no model call or new task |
 | `/stop` | Cooperatively stop the running agent on this channel |
 | `/bloodhound [force] [dir]` | Connect, report, or rebind the BloodHound MCP — see [BloodHound](#bloodhound) |
@@ -478,9 +479,13 @@ agents retrieve against through `get_ttp_guidance`.
 
 **Tool drop zone.** `Payload_Type/sage/tools/` is an operator drop zone for tool binaries. It ships **empty** —
 Sage bundles no offensive binaries. Drop a binary in (for example `Rubeus.exe`, `Certify.exe`, `SharpHound.exe`,
-`SharpGPOAbuse.exe`, `SharpDPAPI.exe`, or `Whisker.exe`) and Sage discovers it and stages it into Mythic on
-demand instead of making you upload it by hand. `download_tool` can also fetch a pinned, sha256-verified binary
-from its TTP source straight into this folder.
+`SharpGPOAbuse.exe`, `SharpDPAPI.exe`, or `Whisker.exe`) and Sage can see it through the read-only
+`list_staged_tools` tool, then stage it into Mythic on demand instead of making you upload it by hand. The
+inventory reads each file's type and architecture from its header, matches renamed and per-architecture builds
+(`new_sharphound_x64.exe`, `SharpHound.o`) to their TTPs, and says whether Mythic already holds the same bytes.
+A binary no TTP documents is listed with a hint that tells Sage to ask you what it is for before using it. `/tools
+staged` shows the same inventory in chat. `download_tool` can also fetch a pinned, sha256-verified binary from
+its TTP source straight into this folder. Staging a file never authorizes running it.
 
 For operator-run static metadata and reviewed executable-help inspection in isolated
 containers, see [off-target artifact inspection](docs/development/ARTIFACT_INSPECTION.md).

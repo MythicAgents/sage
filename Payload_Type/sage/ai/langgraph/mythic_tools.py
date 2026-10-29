@@ -534,6 +534,11 @@ except ImportError:  # allow running this module directly for manual testing
     import ttp_library
 
 try:
+    from . import staged_tools
+except ImportError:  # allow running this module directly for manual testing
+    import staged_tools
+
+try:
     from . import command_builder
 except ImportError:  # allow running this module directly for manual testing
     import command_builder
@@ -20592,6 +20597,63 @@ class MythicTools:
         file_uuid = await self._register_file(filename, content)
         return file_uuid, False
 
+    async def _uploaded_file_rows(self) -> list[dict] | None:
+        """Operator-uploaded Mythic file rows with hashes, or None when Mythic can't be read (no client, scope, error)."""
+        if self.client is None:
+            return None
+        try:
+            rows: list[dict] = []
+            async with asyncio.timeout(20):
+                async for batch in mythic.get_all_uploaded_files(
+                    mythic=self.client,
+                    custom_return_attributes="id agent_file_id filename_utf8 md5 sha1 complete deleted",
+                    batch_size=100,
+                ):
+                    rows.extend(batch if isinstance(batch, list) else [batch])
+                    if len(rows) >= 5000:
+                        break
+            return rows
+        except Exception as e:
+            logger.debug(f"uploaded-file listing for list_staged_tools failed: {e}")
+            return None
+
+    @tool_safety(TOOL_SAFETY_READ_ONLY)
+    async def list_staged_tools(
+        self,
+        binary_filename: Annotated[str, "Optional. A tool to look for, e.g. 'SharpHound.exe'. Finds renamed and per-architecture variants (new_sharphound_x64.exe, SharpHound.o). Empty lists everything staged."] = "",
+    ) -> str:
+        """List the tool binaries the operator staged in Sage's tools/ drop zone, or find every variant of one tool; read-only.
+
+        Each file reports its sha256, its kind (.net-assembly, native-exe, bof, script, ...) and arch (x86, x64,
+        anycpu) read from the file header, the TTPs that document it, and in_mythic:
+        - "yes" or "same_bytes_other_name": the bytes are already in Mythic's file store. Use the returned
+          file_uuid (or the filename for by-name commands) directly; do NOT call ensure_tool_uploaded.
+        - "no" or "different_bytes": call ensure_tool_uploaded with this exact staged filename first.
+        - "unknown": Mythic could not be checked.
+        Several variants of one tool (e.g. SharpHound_x86.exe, SharpHound_x64.exe, SharpHound.o): pick the one
+        whose kind and arch fit the callback's architecture and the agent's execution command.
+        A file with no TTP match carries a hint: ask the operator what it is for before using it.
+        When a looked-up tool is staged nowhere, relay operator_message to the operator and stop that line of
+        work until they confirm. A staged file is not authority to run it.
+        """
+        logger.debug(f"🛠️ Calling list_staged_tools tool (binary={binary_filename!r})")
+        inventory = await asyncio.to_thread(staged_tools.scan, ttp_library.TOOLS_DIR, ttp_library.iter_ttps())
+        mythic_rows = await self._uploaded_file_rows()
+        staged_tools.annotate_mythic(inventory["files"], mythic_rows)
+        mythic_checked = mythic_rows is not None
+        if str(binary_filename or "").strip():
+            found = staged_tools.lookup(inventory, binary_filename, mythic_rows)
+            found["staged"] = [staged_tools.public_view(entry) for entry in found["staged"]]
+            found["mythic_checked"] = mythic_checked
+            return json.dumps(found, sort_keys=True)
+        return json.dumps({
+            "tools_dir_present": inventory["tools_dir_present"],
+            "count": len(inventory["files"]),
+            "truncated": inventory["truncated"],
+            "mythic_checked": mythic_checked,
+            "files": [staged_tools.public_view(entry) for entry in inventory["files"]],
+        }, sort_keys=True)
+
     @tool_safety(TOOL_SAFETY_GUARDED)
     async def ensure_tool_uploaded(
         self,
@@ -20652,7 +20714,7 @@ class MythicTools:
 
         # 2. Operator drop zone
         if not local_path.is_file():
-            return json.dumps({
+            missing = {
                 "status": "missing",
                 "binary_filename": binary_filename,
                 "note": f"Not in Mythic's file store and not found at tools/{binary_filename}. "
@@ -20660,7 +20722,22 @@ class MythicTools:
                         f"If this tool's TTP has a pinned binary_download block, you may call "
                         f"download_tool(binary_filename) FIRST (with operator approval) to fetch it into tools/, "
                         f"then call ensure_tool_uploaded again.",
-            }, sort_keys=True)
+            }
+            # A renamed or per-architecture build may be staged under another name.
+            try:
+                inventory = await asyncio.to_thread(staged_tools.scan, ttp_library.TOOLS_DIR, ttp_library.iter_ttps())
+                variants = staged_tools.lookup(inventory, binary_filename, None)["staged"]
+                if variants:
+                    missing["staged_variants"] = [
+                        {key: entry.get(key) for key in ("filename", "kind", "arch")} for entry in variants
+                    ]
+                    missing["note"] += (
+                        " Staged variants of this tool exist under other names: call ensure_tool_uploaded with the "
+                        "variant's exact filename that fits the callback."
+                    )
+            except Exception as e:
+                logger.debug(f"staged-variant lookup failed for {binary_filename}: {e}")
+            return json.dumps(missing, sort_keys=True)
         # 3. Content-dedup then register: reuse an existing Mythic file with the SAME md5/sha1 (refuse a
         #    duplicate upload of an unchanged binary); only a changed/recompiled binary actually uploads.
         try:

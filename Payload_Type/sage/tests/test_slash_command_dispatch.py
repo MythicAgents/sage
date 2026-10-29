@@ -127,3 +127,28 @@ def test_state_wipe_removes_only_selected_operation_ledger(
     assert not (tmp_path / "state_Operation_7_selected.json").exists()
     assert (tmp_path / "state_Operation_8_other.json").exists()
     assert engagement_ledger.load_runtime(other)["objective"] == "other"
+
+
+def test_tools_staged_renders_the_drop_zone_without_model(monkeypatch, fresh_channel, tmp_path):
+    from ai.langgraph import ttp_library
+
+    (tmp_path / "SharpHound.exe").write_bytes(b"not a pe")
+    (tmp_path / "Mystery.exe").write_bytes(b"also not a pe")
+    monkeypatch.setattr(ttp_library, "TOOLS_DIR", tmp_path)
+    monkeypatch.setattr(ttp_library, "iter_ttps", lambda: iter([
+        ("sharphound", {"name": "SharpHound", "binary_filename": "SharpHound.exe"}, ""),
+    ]))
+    chat = _NoModelChat()
+    asyncio.run(chat.chat(_request("tools", "staged")))
+
+    text = chat.terminal_emissions[0]["content"]
+    assert "| sharphound | `SharpHound.exe` | unknown | — |" in text
+    assert "`sharphound` | not checked |" in text
+    assert "| mystery | `Mystery.exe` |" in text and "none — ask before use" in text
+    assert "Mythic's file store was not checked" in text
+
+
+def test_tools_rejects_unknown_subcommand(fresh_channel):
+    chat = _NoModelChat()
+    asyncio.run(chat.chat(_request("tools", "bogus")))
+    assert "`/tools staged`" in chat.terminal_emissions[0]["content"]
