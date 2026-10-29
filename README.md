@@ -4,11 +4,12 @@
 
 # Sage
 
-**Sage is an AI operator that lives inside your C2.** It reads your live Mythic operation — its callbacks, tasks,
-credentials, and files — alongside your BloodHound graph, reasons over it the way an analyst would, and turns
-that reasoning into real Mythic tasks, so you can ask it a scoped question about the engagement and get a grounded
-answer, or hand it an objective and let it plan and drive the path itself. Sage drives Mythic and operates
-through your Mythic payloads; it never touches the target environment itself.
+**Sage is an AI operator that lives inside your C2 and works under your direction.** It reads your live Mythic
+operation — its callbacks, tasks, credentials, and files — alongside your BloodHound graph and reasons over it the
+way an analyst would. Ask it a scoped question about the engagement and get a grounded answer, or work an
+objective with it: Sage proposes each next step as a concrete Mythic task, shows you what it expects that step to
+prove, and runs it only when you approve. Sage drives Mythic and operates through your Mythic payloads; it never
+touches the target environment itself.
 
 Concretely, Sage is a chat container for [Mythic](https://github.com/its-a-feature/Mythic). It is not a
 standalone tool — it installs into a Mythic server the same way a payload type or C2 profile does, and it has no
@@ -17,14 +18,18 @@ same Mythic surfaces an operator does — callbacks, payloads, tasks, credential
 the BloodHound graph. It runs on the control plane: it is not an implant and does not create a Sage payload
 callback.
 
-Sage can answer scoped operator questions or run an explicitly configured autonomous objective. Target-facing
-activity always executes through a live Mythic payload callback. The Sage process may query Mythic and BloodHound
+Sage is built for supervised, operator-approved work in Mythic. **Conversation** mode reads and answers;
+**supervised** mode proposes one guarded action at a time and runs it only after you accept its approval card. A
+separate, experimental **auto** mode can pursue an explicitly configured objective without per-action approval;
+it is a research and evaluation capability, validated only against the GOAD lab. Target-facing activity always
+executes through a live Mythic payload callback. The Sage process may query Mythic and BloodHound
 control-plane data, but it must not connect directly to target LDAP, SMB, Kerberos, WinRM, RPC, HTTP, or similar
 services, and Sage-local attack artifacts are not admissible proof of an objective.
 
 <p align="center">
-  <img src="docs/assets/sage-ledger-solve.gif" alt="Sage autonomously solving GOAD" width="900">
-  <br><em>An autonomous GOAD solve: the engagement ledger fills in as each hop is verified, through to domain compromise.</em>
+  <img src="docs/assets/supervised-approval-hero.png" alt="Sage supervised approval card in Mythic" width="900">
+  <br><em>Supervised mode: Sage works the objective in a specialist agent and pauses each guarded action for your
+  decision — Accept, Reject, or Respond with guidance.</em>
 </p>
 
 > **⚠️ Authorized use only, and still maturing.** Use Sage only for activity you are explicitly authorized to
@@ -362,9 +367,15 @@ Set `mode` when you create the channel, or switch it live with `/mode`:
 |---|---|---|
 | `conversation` (default) | Reads Mythic and BloodHound state, queries read-only tools (callbacks, graph, credentials, tradecraft), and answers. Cannot fire a guarded/offensive action. | Asking questions, reviewing the graph, getting tradecraft advice, planning. The safe default. |
 | `supervised` | Proposes guarded actions; each one waits for your approval before it runs. | Interactive engagement work where you want Sage to act but keep a hand on every trigger. |
-| `auto` | Runs the autonomous kernel — observe → select → execute → verify — with no per-action approval. | A prepared, scoped objective with a live callback and an ingested graph. |
+| `auto` (experimental) | Runs the autonomous kernel — observe → select → execute → verify — with no per-action approval. Validated only against the GOAD lab. | Research and evaluation against a prepared lab objective with a live callback and an ingested graph. |
 
 `/mode` with no argument reports the channel's current mode.
+
+<p align="center">
+  <img src="docs/assets/sage-ledger-solve.gif" alt="Sage in experimental auto mode on the GOAD lab" width="900">
+  <br><em>Experimental auto mode in a GOAD lab: the engagement ledger fills in as each hop is verified, through to
+  domain compromise. Auto mode is a research and evaluation capability, validated only on GOAD.</em>
+</p>
 
 ### Supervised approvals
 
@@ -402,10 +413,6 @@ For every Sage tool to be available, give the channel token `chat-ai.write`, `ap
 on any AI channel token. Sage's session token inherits the channel token's scopes, and Mythic rejects a query
 the token has no read scope for.
 
-<p align="center">
-  <img src="docs/assets/supervised-approval.png" alt="Supervised approval card in Mythic" width="820">
-  <br><em>In supervised mode a guarded action pauses for approval: Accept, Reject, or Respond.</em>
-</p>
 
 ### Slash commands
 
