@@ -18461,7 +18461,34 @@ class MythicTools:
         suspect = result.get("suspect_crash_task")
         suspect_text = f" (suspect: {suspect!r})" if suspect else ""
         return f"callback {callback_display_id} status={status}{suspect_text} — {result.get('reason', '')}"
-    
+
+    async def _task_record_state(self, task_id) -> dict | None:
+        """Read one task's own record (status, completed), independent of its output rows.
+
+        Output rows can land after the task record already says it finished, so an output read alone
+        cannot tell a finished task from a running one. Read-only control-plane data; None when the
+        record cannot be read.
+        """
+        exact_task_id = self._exact_task_display_id(task_id)
+        if self.client is None or exact_task_id is None:
+            return None
+        resp = await mythic.execute_custom_query(
+            mythic=self.client,
+            query=(
+                "query sageTaskRecordState($display_id: Int!) { "
+                "task(where: {display_id: {_eq: $display_id}}, limit: 1) { display_id status completed } }"
+            ),
+            variables={"display_id": exact_task_id},
+        )
+        rows = (resp or {}).get("task") if isinstance(resp, dict) else None
+        if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+            return None
+        completed = rows[0].get("completed")
+        return {
+            "status": str(rows[0].get("status") or "").strip().casefold(),
+            "completed": completed if type(completed) is bool else None,
+        }
+
     @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def get_all_task_output_by_task_id(self, task_id: Annotated[int, "The Mythic task ID to retrieve output for"]) -> str:
         """Get all output associated with a specific Mythic task ID.

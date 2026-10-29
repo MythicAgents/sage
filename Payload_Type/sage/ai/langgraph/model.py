@@ -4612,6 +4612,24 @@ def _capability_rejection_message(tool_name: str, args: dict[str, Any]) -> str:
 # The turn-end engagement-state table shows only the newest hops; `/state` shows the full ledger.
 _TURN_END_STATE_HOP_LIMIT = 8
 
+# Re-reads of a deferred task at handback, in seconds, after the first read. Bounded well inside the node
+# heartbeat window; they cover output rows that land just after the task record says it finished.
+_DEFERRED_RECONCILE_RETRY_DELAYS = (0.5, 1.0, 2.0)
+
+# A finished task whose agent-side completion function raised: the task ran and returned output, but the
+# agent's post-processing (for example registering credentials or files in Mythic) did not complete.
+_RECONCILED_COMPLETED_WITH_AGENT_ERROR = "completed_with_agent_error"
+
+
+def _reconciled_task_outcome(status: str) -> str:
+    """Classify a finished task's Mythic status for the deferred-task handback."""
+    text = str(status or "").strip().casefold()
+    if text.startswith("error") and "completion function" in text:
+        return _RECONCILED_COMPLETED_WITH_AGENT_ERROR
+    if text in {"error", "failed", "timeout"} or text.startswith(("error:", "error ")):
+        return "failed"
+    return "completed"
+
 
 def _turn_outcome_from_capability_verdict(verdict: Any) -> str:
     """Map a typed capability verdict to a turn outcome; empty when not classifiable."""
@@ -5656,6 +5674,10 @@ class Model:
         end — or confirms the task is still in flight, in which case the caller keeps today's
         designed cap. Read-only: this never issues, re-issues, or mutates target state.
 
+        Output rows can land in the same second the handback runs, after the task record already says
+        it finished, so an unfinished or row-less observation is re-read a few times within a short
+        bounded window, and a row-less read takes completion from the task record itself.
+
         Returns {"status", "completed", "excerpt"} or None when the outcome is still unresolved.
         """
         mythic_client = getattr(self, "mythic_client", None)
@@ -5665,33 +5687,53 @@ class Model:
         reader = getattr(mythic_client, "get_all_task_output_by_task_id", None)
         if reader is None:
             return None
-        try:
-            raw = await asyncio.wait_for(
-                reader(task_id=task_id),
-                timeout=15,
-            )
-        except Exception as e:
-            logger.warning(f"Deferred-task receipt reconciliation read failed for task {task_id}: {type(e).__name__}: {e}")
-            return None
-        try:
-            rows = json.loads(raw) if isinstance(raw, str) else raw
-        except (TypeError, ValueError) as e:
-            logger.warning(f"Deferred-task receipt reconciliation read returned unparseable output for task {task_id}: {e}")
-            return None
-        if not isinstance(rows, list) or not rows:
-            return None
-        task_fields = rows[-1].get("task") if isinstance(rows[-1], dict) else None
-        status = str((task_fields or {}).get("status") or "").strip().casefold()
-        completed = (task_fields or {}).get("completed")
-        if type(completed) is not bool:
-            completed = status in {"success", "completed", "complete"}
-        excerpt_parts = [
-            str(row.get("response_text") or "").strip()
-            for row in rows
-            if isinstance(row, dict) and str(row.get("response_text") or "").strip()
-        ]
-        excerpt = "\n".join(excerpt_parts).strip()
-        return {"status": status, "completed": completed, "excerpt": excerpt}
+        record_reader = getattr(mythic_client, "_task_record_state", None)
+        observed: dict[str, Any] | None = None
+        observed_rows = False
+        for delay in (0.0, *_DEFERRED_RECONCILE_RETRY_DELAYS):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                raw = await asyncio.wait_for(
+                    reader(task_id=task_id),
+                    timeout=15,
+                )
+            except Exception as e:
+                logger.warning(f"Deferred-task receipt reconciliation read failed for task {task_id}: {type(e).__name__}: {e}")
+                return observed
+            try:
+                rows = json.loads(raw) if isinstance(raw, str) else raw
+            except (TypeError, ValueError) as e:
+                logger.warning(f"Deferred-task receipt reconciliation read returned unparseable output for task {task_id}: {e}")
+                return observed
+            if isinstance(rows, list) and rows:
+                task_fields = rows[-1].get("task") if isinstance(rows[-1], dict) else None
+                status = str((task_fields or {}).get("status") or "").strip().casefold()
+                completed = (task_fields or {}).get("completed")
+                if type(completed) is not bool:
+                    completed = status in {"success", "completed", "complete"}
+                excerpt_parts = [
+                    str(row.get("response_text") or "").strip()
+                    for row in rows
+                    if isinstance(row, dict) and str(row.get("response_text") or "").strip()
+                ]
+                observed = {"status": status, "completed": completed,
+                            "excerpt": "\n".join(excerpt_parts).strip()}
+                observed_rows = True
+            elif callable(record_reader):
+                try:
+                    record = await asyncio.wait_for(record_reader(task_id), timeout=15)
+                except Exception as e:
+                    logger.warning(f"Deferred-task record read failed for task {task_id}: {type(e).__name__}: {e}")
+                    record = None
+                if isinstance(record, dict) and record.get("completed") is not None:
+                    observed = {"status": str(record.get("status") or ""),
+                                "completed": record["completed"] is True, "excerpt": ""}
+            # Finished with its output in hand: done. A record-only completion keeps re-reading so the
+            # handback can still carry the output if its rows land within the window.
+            if observed is not None and observed["completed"] and observed_rows:
+                break
+        return observed
 
     def _install_turn_authority(self, authority: TurnAuthority) -> None:
         self._turn_authority = authority
@@ -9500,15 +9542,20 @@ class Model:
                 reconcile = await self._reconcile_deferred_task_receipt(pending_receipt)
                 if reconcile is not None and reconcile.get("completed") is True:
                     reconcile_status = str(reconcile.get("status") or "")
-                    outcome = (
-                        "failed"
-                        if reconcile_status in {"error", "failed", "timeout"}
-                        else "completed"
-                    )
+                    outcome = _reconciled_task_outcome(reconcile_status)
                 else:
                     outcome = ""
                 if outcome and reconcile is not None:
-                    status_word = "completed" if outcome == "completed" else "FAILED"
+                    if outcome == _RECONCILED_COMPLETED_WITH_AGENT_ERROR:
+                        status_word = (
+                            "completed and returned output, but the agent's completion function failed "
+                            f"(Mythic status {json.dumps(reconcile_status)}). Artifacts the agent normally "
+                            "registers from its output, such as credentials or files, may be missing from "
+                            "Mythic; judge the result from the task output below, not from the credential "
+                            "store or file browser"
+                        )
+                    else:
+                        status_word = "completed" if outcome == "completed" else "FAILED"
                     excerpt = str(reconcile.get("excerpt") or "").strip()
                     excerpt_cap = 4000
                     excerpt_note = (

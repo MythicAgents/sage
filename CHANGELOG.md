@@ -26,6 +26,13 @@ between minor releases.
 
 ### Fixed
 
+- A supervised request no longer stops at a "has not reached a terminal state" checkpoint when the task
+  had already finished. The handback read the task once, and output that landed a moment later made a
+  finished task look unfinished. It now re-reads for a few seconds and takes completion from the task
+  record. A task whose agent completion function failed (Mythic's `Error: completion function` status) is
+  reported as finished with output, with a note that the agent may not have registered credentials or
+  files from it, and other `error:` statuses on a finished task are reported as failed rather than
+  completed.
 - Answered requests no longer end in a "no progress" stop. A BloodHound answer reached the Supervisor
   without the graph queries behind it, so the Supervisor treated a finished analysis as unsupported and
   delegated it again until the stop. The queries and bounded excerpts of their results now arrive with the
