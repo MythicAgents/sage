@@ -14378,8 +14378,9 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         if client is None:
             return ""
         action = args.get("action") if isinstance(args.get("action"), (dict, str)) else None
-        inputs = args.get("inputs") if isinstance(args.get("inputs"), dict) else {}
-        input_values = client._capability_tool_inputs(inputs)
+        # Same parsing as execute_capability itself, which accepts inputs as a dict or a JSON string. Dropping a
+        # string here planned the card with no inputs and refused a capability the tool would have run.
+        input_values = client._capability_tool_inputs(args.get("inputs"))
         action_obj = client._capability_tool_action(action, input_values, capabilities_mod)
         if action_obj is None:
             return ""

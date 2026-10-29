@@ -62,6 +62,10 @@ between minor releases.
   until the session was rebuilt, so a later request could halt after only a few steps while the notice blamed
   "this request". It now starts again with each new request; approving a card continues the budget of the
   request it belongs to.
+- A supervised `execute_capability` proposal whose inputs arrive as a JSON string now reaches its approval card.
+  The card's plan preview read `inputs` only when it was already an object, so it planned with no inputs and
+  refused with a missing field (for example `system_action` on a GPO execution) even though the capability
+  itself accepts the string form.
 - Approval cards for raw tasks now show the intended effect with its target filled in, for example
   `graph-built:north.sevenkingdoms.local|baseline` for a SharpHound collection, instead of the template
   `graph-built:{target}`. When the target can't be worked out yet, the card shows only the expected evidence.
