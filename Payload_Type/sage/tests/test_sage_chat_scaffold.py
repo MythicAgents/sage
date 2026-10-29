@@ -767,7 +767,7 @@ def test_autonomous_native_chat_fails_closed_without_exact_bloodhound_tools(monk
                     "objective",
                     channel_id=801,
                     request_id=1,
-                    config={"autonomous_solve": "true"},
+                    config={"mode": "auto"},
                 )
             )
         )
@@ -4302,7 +4302,7 @@ def test_provider_and_model_are_adjacent_static_header_chips():
     (
         ({}, "conversation", False),
         ({"mode": "conversation", "autonomous_solve": "false"}, "conversation", False),
-        ({"mode": "conversation", "autonomous_solve": "true"}, "auto", True),
+        ({"mode": "conversation", "autonomous_solve": "true"}, "conversation", False),
         ({"mode": "invalid", "autonomous_solve": "false"}, "conversation", False),
         ({"mode": "supervised", "autonomous_solve": "false"}, "supervised", False),
         ({"mode": "supervised", "autonomous_solve": "true"}, "supervised", True),

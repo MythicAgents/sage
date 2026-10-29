@@ -780,9 +780,7 @@ def build_request_contract(
     normalized_mode = _required_text(str(mode), "mode").casefold()
     if not isinstance(autonomous_solve, bool):
         raise ValueError("autonomous_solve must be a boolean")
-    if normalized_mode == "auto" or (
-        normalized_mode == "conversation" and autonomous_solve
-    ):
+    if normalized_mode == "auto":
         lane = RequestLane.AUTONOMOUS_OBJECTIVE
         default_intent = RequestIntent.EXECUTE
         stop_kind = StopConditionKind.OBJECTIVE_PROVED
@@ -795,6 +793,7 @@ def build_request_contract(
             if autonomous_solve else StopConditionKind.ACTIONS_COMPLETE
         )
     elif normalized_mode == "conversation":
+        # Read-only regardless of autonomous_solve: only Mode=Autonomous grants the objective lane.
         lane = RequestLane.CONVERSATIONAL
         default_intent = RequestIntent.RESPOND
         stop_kind = StopConditionKind.RESPONSE_EMITTED

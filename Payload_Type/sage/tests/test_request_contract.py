@@ -174,7 +174,8 @@ def test_action_identity_rejects_malformed_or_nonfinite_nested_values(malformed)
         ("supervised", False, RequestLane.SUPERVISED_WORKFLOW),
         ("auto", False, RequestLane.AUTONOMOUS_OBJECTIVE),
         ("supervised", True, RequestLane.SUPERVISED_WORKFLOW),
-        ("conversation", True, RequestLane.AUTONOMOUS_OBJECTIVE),
+        ("conversation", True, RequestLane.CONVERSATIONAL),
+        ("auto", True, RequestLane.AUTONOMOUS_OBJECTIVE),
     ],
 )
 def test_lane_is_derived_only_from_typed_transport(mode, autonomous, expected_lane):

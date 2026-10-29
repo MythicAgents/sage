@@ -366,6 +366,20 @@ def build_bloodhound_env(request: ChatRequest) -> dict[str, str]:
     return resolved
 
 
+def _autonomous_solve_requested(config: Any, secrets: Any) -> bool:
+    return _resolve_bool(config, secrets, "autonomous_solve", env_key="autonomous_solve", default=False)
+
+
+def autonomous_solve_ignored(request: ChatRequest) -> bool:
+    """True when the Autonomous Solve toggle is on but Mode=Conversation keeps the channel read-only."""
+    config = ChatConfigView.from_request(request)
+    secrets = ChatSecretView.from_request(request)
+    mode = _resolve(config, secrets, "mode", env_key="mode", default="conversation").lower()
+    if mode not in ("conversation", "supervised", "auto"):
+        mode = "conversation"
+    return mode == "conversation" and _autonomous_solve_requested(config, secrets)
+
+
 def build_model_kwargs(request: ChatRequest) -> dict[str, Any]:
     """Produce the kwargs for ``Model(**kwargs)`` from a ``ChatRequest``.
 
@@ -389,12 +403,11 @@ def build_model_kwargs(request: ChatRequest) -> dict[str, Any]:
     if mode not in ("conversation", "supervised", "auto"):
         mode = "conversation"
     # Both legacy controls coexist (ChatArguments shipped `mode` AND `autonomous_solve`): Mode=Autonomous
-    # OR the explicit autonomous_solve toggle enables it. The toggle resolves through the full chain.
-    autonomous_solve = mode == "auto" or _resolve_bool(
-        config, secrets, "autonomous_solve", env_key="autonomous_solve", default=False
+    # always enables objective solving; the toggle adds it to supervised. Conversation is read-only, so
+    # the toggle never widens it — the service tells the operator once that it was ignored.
+    autonomous_solve = mode == "auto" or (
+        mode == "supervised" and _autonomous_solve_requested(config, secrets)
     )
-    if mode == "conversation" and autonomous_solve:
-        mode = "auto"
     policy_mode_requested = _resolve(
         config,
         secrets,

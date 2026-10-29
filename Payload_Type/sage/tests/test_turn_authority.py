@@ -70,7 +70,7 @@ def test_completion_preflight_uses_only_typed_stop_contract(prompt):
         ("conversation", False, False),
         ("supervised", False, False),
         ("auto", False, True),
-        ("conversation", True, True),
+        ("conversation", True, False),
     ):
         instance._request_contract = request_mod.build_request_contract(
             request_id=f"{mode}-{autonomous}",

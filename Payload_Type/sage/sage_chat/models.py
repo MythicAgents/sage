@@ -123,7 +123,8 @@ _CONFIG_OPTIONS = [
         Description=(
             "Force deterministic multi-hop solving for this session. In supervised mode, controller moves "
             "still require approval and completion requires objective evidence. Off keeps supervised "
-            "requests on the scoped graph workflow. Mode=Autonomous always enables objective solving."
+            "requests on the scoped graph workflow. Mode=Autonomous always enables objective solving. "
+            "Ignored in Conversation mode, which stays read-only."
         ),
         Required=False,
         DefaultValue=False,

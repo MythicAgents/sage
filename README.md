@@ -553,7 +553,7 @@ Model settings resolve through the chain above. The main settings are:
 | `API_ENDPOINT` | Optional endpoint override — point `openai` at any OpenAI-compatible server (see below) |
 | `API_KEY` | Provider API key when required |
 | `mode` | `conversation` (default), `supervised`, or `auto` — see [Modes](#modes) |
-| `autonomous_solve` | Enable objective-led controller execution; supervised mode still requires approval for each guarded action |
+| `autonomous_solve` | Enable objective-led controller execution; supervised mode still requires approval for each guarded action. Ignored in conversation mode, which stays read-only |
 | `policy_mode` | `hybrid` (default), `symbolic`, or `llm` capability selection |
 | `max_steps` | Model-step ceiling; unset defaults to `200`, `0` means unlimited |
 

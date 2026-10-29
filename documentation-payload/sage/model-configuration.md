@@ -15,7 +15,7 @@ The main model settings are:
 | `API_ENDPOINT` | Optional endpoint override — point `openai` at any OpenAI-compatible server (see below) |
 | `API_KEY` | Provider API key when required |
 | `mode` | `conversation` (default), `supervised`, or `auto` |
-| `autonomous_solve` | Force the autonomous execution kernel for the channel (equivalent to `mode: auto`) |
+| `autonomous_solve` | Enable objective-led solving in `supervised` mode; each guarded action still needs approval. `auto` always enables it. Ignored in `conversation`, which stays read-only; Sage says so once in the chat |
 | `policy_mode` | `hybrid` (default), `symbolic`, or `llm` capability selection |
 | `max_steps` | Model-step ceiling; unset defaults to `200`, `0` means unlimited |
 

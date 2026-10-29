@@ -12,7 +12,7 @@ Set `mode` when you create the channel, or switch it live with `/mode`:
 
 | Mode | What Sage can do | When to use |
 |---|---|---|
-| `conversation` (default) | Reads Mythic and BloodHound state, queries read-only tools (callbacks, graph, credentials, tradecraft), and answers. Cannot fire a guarded/offensive action. | Asking questions, reviewing the graph, getting tradecraft advice, planning. The safe default. |
+| `conversation` (default) | Reads Mythic and BloodHound state, queries read-only tools (callbacks, graph, credentials, tradecraft), and answers. Cannot fire a guarded/offensive action, even with Autonomous Solve on. | Asking questions, reviewing the graph, getting tradecraft advice, planning. The safe default. |
 | `supervised` | Proposes guarded actions; each one waits for your approval before it runs. | Interactive engagement work where you want Sage to act but keep a hand on every trigger. |
 | `auto` | Runs the autonomous kernel (observe, select, execute, verify) with no per-action approval. | A prepared, scoped objective with a live callback and an ingested graph. |
 

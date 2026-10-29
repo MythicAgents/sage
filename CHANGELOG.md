@@ -25,6 +25,9 @@ between minor releases.
   `stopped`, `cancelled`, or `error`) as `turn_outcome` in its metadata. Mythic stores only `complete`,
   `error`, and `cancelled` as a request's status, so a request Sage stopped on its own, or one that ended
   blocked, still shows as `complete` there; the message content and `turn_outcome` give the real ending.
+- A channel in Conversation mode with Autonomous Solve on no longer switches itself to autonomous mode.
+  Conversation stays read-only; Sage ignores the toggle there and says so once in the chat. Autonomous
+  execution now comes only from Mode = Autonomous.
 
 ## [0.2.0] - 2026-10-23
 

@@ -36,7 +36,7 @@ from mythic_container.logging import logger
 
 from _version import agent_version
 
-from .config import build_bloodhound_env, build_model_kwargs
+from .config import autonomous_solve_ignored, build_bloodhound_env, build_model_kwargs
 from .findings_watcher import FindingsWatcherManager, render_watcher_status
 from .hitl import (
     approved_action_ids_for_request,
@@ -758,6 +758,34 @@ class SageChat(Chat):
         except Exception as exc:  # pragma: no cover - never break a turn over a notice
             logger.warning(f"BloodHound degraded notice not delivered: {exc}")
 
+    async def _notify_autonomous_solve_ignored_once(self, model: Any, request: ChatRequest) -> None:
+        """Tell the operator once per session that Conversation mode ignores Autonomous Solve.
+
+        Conversation is read-only, so the toggle cannot widen it; saying so in the chat keeps the
+        operator from assuming an autonomous run is underway. Skipped once `/mode` has moved the
+        session out of conversation. Fail-soft: a notice must never break a working turn.
+        """
+        if getattr(model, "_autonomous_solve_ignored_notice_sent", False):
+            return
+        try:
+            if str(getattr(model, "mode", "")) != "conversation" or not autonomous_solve_ignored(request):
+                return
+            await self.send_response(
+                request,
+                response_key=f"autonomous_solve_ignored:{request.ChannelID}",
+                content=(
+                    "Autonomous Solve is on, but Mode is **Conversation**, which is read-only. "
+                    "Sage will answer without running tasks. To run autonomously, set Mode to "
+                    "**Autonomous**; for approved actions, set it to **Supervised**."
+                ),
+                status="complete",
+                complete=False,
+                metadata={},
+            )
+            model._autonomous_solve_ignored_notice_sent = True
+        except Exception as exc:  # pragma: no cover - never break a turn over a notice
+            logger.warning(f"Autonomous Solve notice not delivered: {exc}")
+
     async def _chat_watcher(self, request: ChatRequest) -> None:
         """Serve one stateless Watcher control/explanation turn without a Sage session."""
 
@@ -1161,6 +1189,7 @@ class SageChat(Chat):
                     )
                 retry_state.bind_async_event_sink(publish_retry_event, asyncio.get_running_loop())
             await self._notify_bloodhound_degraded_once(model, request)
+            await self._notify_autonomous_solve_ignored_once(model, request)
 
             def approval_context() -> dict[str, str]:
                 authority = getattr(model, "_turn_authority", None)
