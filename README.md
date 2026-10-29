@@ -37,9 +37,9 @@ services, and Sage-local attack artifacts are not admissible proof of an objecti
 > understood: an autonomous agent driving a C2 carries real risk of unintended impact on a live network. Weigh
 > production use very carefully, and prefer labs and authorized engagements until Sage has matured.
 
-> **Beta-qualified Mythic target: `v4.0.0rc5`.** Native chat containers do not exist before Mythic v4. The beta
-> evidence binds tag `v4.0.0rc5` at commit `a9add7f1f62f5b2098d1f0eb0306c4b15b8cd916`; newer Mythic v4 builds may
-> work, but are not part of this beta's validated support matrix.
+> **Last live-qualified Mythic target: `v4.0.0rc5`.** Native chat containers do not exist before Mythic v4. The
+> 0.1.0-beta evidence binds tag `v4.0.0rc5` at commit `a9add7f1f62f5b2098d1f0eb0306c4b15b8cd916`; newer Mythic v4
+> builds may work, but have not been through a live qualification run. See [Limitations](#limitations).
 
 ## Contents
 
@@ -231,15 +231,15 @@ strategy.
 
 ## Requirements
 
-- **Mythic `v4.0.0rc5`** at commit `a9add7f1f62f5b2098d1f0eb0306c4b15b8cd916` for the beta-qualified path.
-  Earlier Mythic versions have no native chat-container support; other Mythic v4 revisions are unvalidated for
-  this beta.
+- **Mythic v4.** `v4.0.0rc5` at commit `a9add7f1f62f5b2098d1f0eb0306c4b15b8cd916` is the last live-qualified
+  target (0.1.0-beta). Earlier Mythic versions have no native chat-container support; other Mythic v4 revisions
+  have not been live-qualified.
 - Python 3.14 and a repository virtual environment.
 - Model-provider credentials or an OpenAI-compatible endpoint.
-- For the beta-qualified graph path, BloodHound CE 9.5.1 plus [BloodHound MCP](https://github.com/mwnickerson/bloodhound_mcp)
+- For the live-qualified graph path, BloodHound CE 9.5.1 plus [BloodHound MCP](https://github.com/mwnickerson/bloodhound_mcp)
   commit `92a37dd481ce675fe552f14c9957a31dbbcd212e`.
-- For beta-qualified target activity, an Apollo `v0.1.0-rc1` callback. Other payload types may work through the
-  generic adapter but are unvalidated for this beta.
+- For live-qualified target activity, an Apollo `v0.1.0-rc1` callback. Other payload types may work through the
+  generic adapter but have not been live-qualified.
 
 Create the development environment from the repository root:
 
@@ -508,7 +508,7 @@ a payload's commands does not establish support for every automated capability o
 
 See [payload adapters and command discovery](docs/reference/TOOLS_AND_CAPABILITIES.md#payload-adapters-and-command-discovery)
 for the profile mappings and approval/alias boundary. An implemented profile is separate from live validation;
-the beta-qualified payload remains Apollo in the exact configuration described under [Limitations](#limitations).
+the live-qualified payload remains Apollo in the 0.1.0-beta configuration described under [Limitations](#limitations).
 
 The complete tool and capability reference is in
 [docs/reference/TOOLS_AND_CAPABILITIES.md](docs/reference/TOOLS_AND_CAPABILITIES.md). Because the exposed set is
@@ -1006,39 +1006,38 @@ a legacy override, an operator-configured channel ID that is never derived from 
 
 ## Limitations
 
-`v0.1.0-beta` is deliberately narrow:
+Sage 0.2 is deliberately narrow, and its live validation lags its code:
 
-- Auto mode is experimental and has been exercised against GOAD. That does not establish reliability or
+- **Live validation.** The most recent live-validated configuration is still the
+  [0.1.0-beta support matrix](docs/releases/v0.1.0-beta.md): Linux arm64 Sage Docker on Mythic `v4.0.0rc5`,
+  Apollo `v0.1.0-rc1`, BloodHound CE 9.5.1, BloodHound MCP `92a37dd`, and `sonnet-4-6` through an
+  OpenAI-compatible LiteLLM route. Releases from 0.2.0 on are validated by the offline suite, the
+  repository-boundary guards, the repo-hygiene checks, and scripted tests of the assembled chat path. The
+  clean-clone Docker qualification and live-range runs were not repeated for them. Individual fixes are
+  spot-checked live on a GOAD lab during development; those checks are not a release qualification.
+- **Supervised mode.** Objective-led supervised mode (new in 0.2.0) has not been through a live qualification
+  run. Sage proposes and you approve each guarded action, but the quality of its proposals on a given engagement
+  is not established.
+- **Auto mode** is experimental and has been exercised only against GOAD. That does not establish reliability or
   generalization on another range or a production network.
-- The assisted operation-memory acceptance case joins one completed native Apollo `download` task to its exact
-  current downloaded `.ps1` file record containing direct literal username/password assignments. One tool-free
-  model call may propose `credential-material`; deterministic admission binds the operation, task, callback, and
-  file identity before background delivery. It does not show that a consultant would have missed the finding,
-  acted on it, or received independent value.
-- The beta support target is Linux arm64 Sage Docker on Mythic `v4.0.0rc5` (`a9add7f1f62f5b2098d1f0eb0306c4b15b8cd916`),
-  Apollo `v0.1.0-rc1` (`d44676d9eda540377ce91a6e636dd8788bc86def`), BloodHound CE 9.5.1 image
-  `specterops/bloodhound@sha256:5f6ae41631b82b2516dd5ffa050105ddb2e4dbf04e3e2f6d00fbc302932cf4ed`,
-  BloodHound MCP `92a37dd481ce675fe552f14c9957a31dbbcd212e`, and `sonnet-4-6` through Sage's
-  `openai` protocol via an OpenAI-compatible LiteLLM route. The accepted release evidence records a successful
-  clean-clone Docker/backfill/restart run for exact tree `b25c00ec22c030566ff7636015ca4a39c1910e35`, which is the
-  an ancestor of the `v0.1.0-beta` tag. Since then the tree gained only optional Slack channel-ID routing,
-  `mcp` `1.28.1`, an operator deploy-script fix, and documentation bytes; the offline suite, repository-boundary
-  guards, and the seeded capability case all pass on the tagged tree, but the Docker qualification above was not
-  re-run against it. This is the beta's validated matrix, not a general production readiness claim.
-- Other operating systems and architectures; Mythic, Apollo, BloodHound CE, or BloodHound MCP revisions; model
-  providers and direct-provider routes; models other than the effective `sonnet-4-6` LiteLLM route; and payload
-  types other than Apollo are not validated for this beta. Code paths that support them are not evidence that
-  the release configuration works.
-- The frozen defect cut covered ESSOS certificate-identity proof, reject binding, approval/resolver parity,
-  worker-handoff authority, fabricated operator attribution, and prior-task provenance. The first, handoff,
-  attribution, and provenance defects were repaired and passed their frozen offline gates; reject binding and
-  approval/resolver parity did not reproduce in their assembled offline paths. No new live-range reproduction is
-  claimed.
-- Operation-memory erasure removes Sage-derived state for one operation but deliberately leaves authoritative
-  Mythic records unchanged. It does not erase separate LangGraph checkpoints, Phoenix traces, LiteLLM/provider
-  retention, native Mythic messages, or Slack workspace records; each owner must apply its own retention policy.
-- Slack findings delivery, when configured, contains only a generic change notice. It does not provide finding
-  previews or operation identifiers; review the full finding inside access-controlled Mythic Chat.
+- **Other configurations.** Other operating systems and architectures; other Mythic, Apollo, BloodHound CE, or
+  BloodHound MCP revisions; other model providers, routes, and models; and payload types other than Apollo are not
+  validated. Code paths that support them are not evidence that they work.
+- **Findings acceptance.** The assisted operation-memory acceptance case joins one completed native Apollo
+  `download` task to its exact current downloaded `.ps1` file record containing direct literal username/password
+  assignments. One tool-free model call may propose `credential-material`; deterministic admission binds the
+  operation, task, callback, and file identity before background delivery. It does not show that a consultant
+  would have missed the finding, acted on it, or received independent value.
+- **Known issues.** See the [CHANGELOG](CHANGELOG.md) for each release's known issues. As of 0.2.0 these include
+  SQLite locking on the bind-mounted service directory under macOS Docker Desktop and OrbStack (see
+  [SQLite on macOS Docker Desktop / OrbStack](#sqlite-on-macos-docker-desktop--orbstack)) and dependency
+  vulnerabilities that remain until `mythic-container` and `arize-phoenix` update their pins.
+- **Erasure.** Operation-memory erasure removes Sage-derived state for one operation but deliberately leaves
+  authoritative Mythic records unchanged. It does not erase separate LangGraph checkpoints, Phoenix traces,
+  LiteLLM/provider retention, native Mythic messages, or Slack workspace records; each owner must apply its own
+  retention policy.
+- **Slack.** Findings delivery, when configured, contains only a generic change notice. It does not provide
+  finding previews or operation identifiers; review the full finding inside access-controlled Mythic Chat.
 
 ## Development guidance
 

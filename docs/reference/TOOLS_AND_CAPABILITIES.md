@@ -117,8 +117,8 @@ The automated graph-collection controller currently selects only Apollo and Merl
 
 An adapter defines known execution semantics; the live schema supplies current argument syntax and validation.
 Adding another payload requires a suitable collection profile and verification of its assembled execution path.
-An existing profile does not imply support for every capability or live qualification. The beta's validated
-payload configuration is Apollo; see the [README limitations](../../README.md#limitations).
+An existing profile does not imply support for every capability or live qualification. The last live-validated
+payload configuration (0.1.0-beta) is Apollo; see the [README limitations](../../README.md#limitations).
 
 Mythic parameters can have a native `name` and a different `cli_name`. For example, Apollo declares
 `assembly_name`/`assembly_arguments` with CLI aliases `Assembly`/`Arguments`. Sage's resolver translates

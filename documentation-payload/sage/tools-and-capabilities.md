@@ -43,7 +43,7 @@ the shared collection defaults, including `execute_assembly`, `whoami` and `tick
 overrides these mappings with `execute-assembly` and token-based identity checks, along with its own
 transport and file-parameter conventions. Payload types without a collection profile are excluded from
 automated collection. Profiles are defined in `mythic_capability_adapter.py`; an implemented profile is
-separate from live qualification, which remains limited to the beta's documented Apollo configuration.
+separate from live qualification, which remains limited to the documented 0.1.0-beta Apollo configuration.
 
 The live schema supplies parameter syntax, including native names and CLI aliases. Apollo's
 `assembly_name`/`assembly_arguments`, for example, have CLI aliases `Assembly`/`Arguments`. Sage resolves
