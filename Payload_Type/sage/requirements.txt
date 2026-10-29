@@ -48,4 +48,4 @@ python-dotenv==1.2.2
 # spans). It arrives transitively via arize-phoenix and openinference today;
 # same defect class as the two entries above, so it is declared rather than borrowed. The module
 # degrades to a null span if the import fails, but a shipped image should not rely on that path.
-opentelemetry-api==1.44.0
+opentelemetry-api==1.45.1

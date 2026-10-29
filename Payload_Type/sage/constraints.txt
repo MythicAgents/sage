@@ -40,6 +40,12 @@
 #     pydantic-ai-slim==2.31.1                — capped by arize-phoenix==19.19.0
 # Clearing those means moving mythic-container (pre-release, matched to the Mythic v4 server) or
 # arize-phoenix (the tracing stack), which is a larger change than a dependency CVE patch.
+#
+# Updated 2026-10-29 in place from that resolution: only the OpenTelemetry family moved, to clear the
+# opentelemetry-api 1.44.0 advisory (fixed in 1.45.1). opentelemetry-api/-sdk/-proto/-exporter-otlp* went
+# 1.44.0 -> 1.45.1, -instrumentation and -semantic-conventions 0.65b0 -> 0.66b1, and 1.45 adds
+# opentelemetry-exporter-otlp-common and opentelemetry-exporter-http-transport (0.66b1). A dry-run resolve
+# confirmed no other package changes. Offline suite: 9154 passed, 0 failed.
 aio-pika==9.4.1
 aiofile==3.12.3
 aiohappyeyeballs==2.7.1
@@ -162,15 +168,17 @@ openinference-instrumentation==0.1.71
 openinference-instrumentation-langchain==0.1.70
 openinference-instrumentation-openai==0.1.65
 openinference-semantic-conventions==0.1.41
-opentelemetry-api==1.44.0
-opentelemetry-exporter-otlp==1.44.0
-opentelemetry-exporter-otlp-proto-common==1.44.0
-opentelemetry-exporter-otlp-proto-grpc==1.44.0
-opentelemetry-exporter-otlp-proto-http==1.44.0
-opentelemetry-instrumentation==0.65b0
-opentelemetry-proto==1.44.0
-opentelemetry-sdk==1.44.0
-opentelemetry-semantic-conventions==0.65b0
+opentelemetry-api==1.45.1
+opentelemetry-exporter-http-transport==0.66b1
+opentelemetry-exporter-otlp-common==0.66b1
+opentelemetry-exporter-otlp-proto-common==1.45.1
+opentelemetry-exporter-otlp-proto-grpc==1.45.1
+opentelemetry-exporter-otlp-proto-http==1.45.1
+opentelemetry-exporter-otlp==1.45.1
+opentelemetry-instrumentation==0.66b1
+opentelemetry-proto==1.45.1
+opentelemetry-sdk==1.45.1
+opentelemetry-semantic-conventions==0.66b1
 orjson==3.13.0
 ormsgpack==1.13.0
 packaging==26.3

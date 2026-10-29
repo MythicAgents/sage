@@ -36,4 +36,4 @@ pyasn1==0.6.4
 # `Payload_Type/sage/tests/test_kernel_tracing.py` build a real TracerProvider with an in-memory
 # exporter to assert spans are emitted and nested. That needs the SDK, not just the API that the
 # product imports; the SDK is a test-only dependency and belongs here rather than in requirements.txt.
-opentelemetry-sdk==1.44.0
+opentelemetry-sdk==1.45.1

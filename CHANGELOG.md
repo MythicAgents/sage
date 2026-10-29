@@ -74,6 +74,11 @@ between minor releases.
   Power User account, then *Administration → Manage Users → Generate / Revoke API Tokens*. The old
   *Administration → API Tokens* menu no longer exists.
 
+### Security
+
+- OpenTelemetry moves from 1.44.0 to 1.45.1 (instrumentation and semantic conventions to 0.66b1), clearing the
+  advisory against `opentelemetry-api` 1.44.0 listed under 0.2.0's known issues. No other dependency changed.
+
 ## [0.2.0] - 2026-10-23
 
 Sage 0.2.0 makes supervised mode objective-led, makes request endings honest, and ships Sage as a published,
