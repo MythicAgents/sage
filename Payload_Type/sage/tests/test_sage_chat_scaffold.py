@@ -4179,11 +4179,46 @@ def test_slash_sandbox_runs_without_a_scope_preflight(monkeypatch):
     assert scope_lookups == []
 
 
-def test_declared_channel_scopes_cover_tasking_and_ingest():
-    from ai.langgraph.mythic_tools import tools_missing_scope
+def _declared_sage_scopes():
     sage = next(m for m in SAGE_MODELS if m.Name == "Sage")
-    disabled = tools_missing_scope(set(sage.Metadata.RequiredChannelAPITokenScopes))
-    assert disabled.isdisjoint((*TASKING_TOOLS, "ingest_collection"))
+    return set(sage.Metadata.RequiredChannelAPITokenScopes)
+
+
+def test_declared_channel_scopes_enable_every_guarded_tool():
+    from ai.langgraph.mythic_tools import tools_missing_scope
+    assert tools_missing_scope(_declared_sage_scopes()) == set()
+
+
+@pytest.mark.parametrize(
+    "required",
+    (
+        # Mythic rejects any AI channel token without these two.
+        "apitoken.write",
+        "chat-ai.write",
+        # Mythic 4.0.8 read scopes for the tables Sage's runtime queries (callback, response,
+        # operation, operator, task, filemeta, payload, credential, operationeventlog).
+        "callback.read",
+        "response.read",
+        "operation.read",
+        "operator.read",
+        "task.read",
+        "file.read",
+        "payload.read",
+        "credential.read",
+        "eventlog.read",
+        # The engagement marker is written through create_operation_event_log.
+        "eventlog.write",
+    ),
+)
+def test_declared_channel_scopes_grant_what_sage_uses(required):
+    from ai.langgraph.mythic_tools import _allows_scope
+    assert _allows_scope(_declared_sage_scopes(), required)
+
+
+def test_declared_channel_scopes_omit_unused_scopes():
+    declared = _declared_sage_scopes()
+    assert "tag.write" not in declared
+    assert "callback.write" not in declared
 
 
 def test_whoami_scopes_offline_returns_none():

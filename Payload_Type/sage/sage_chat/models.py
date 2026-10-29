@@ -23,15 +23,23 @@ from .slash import SAGE_SLASH_COMMANDS, WATCHER_SLASH_COMMANDS
 # The Watcher role has its own explicit inventory below; this alias must never become a union.
 SLASH_COMMANDS = SAGE_SLASH_COMMANDS
 
-# Declarative: the channel bot-token scopes Sage's action tools need. The `whoami` scope
-# preflight disables guarded tools whose scope isn't granted. `chat-ai.write` is the one hard
-# requirement — it's needed to post responses.
+# Declarative: the channel bot-token scopes a fully working Sage uses. Mythic stores this list but does
+# not enforce or read it; it tells the operator what to grant. Mythic itself requires `apitoken.write`
+# and `chat-ai.write` on any AI channel token, and Sage's per-session token inherits the channel token's
+# scopes. Each `.write` also grants its `.read`. The `whoami` scope preflight disables guarded tools whose
+# scope isn't granted, so a narrower token still runs with those tools off.
 _CHANNEL_TOKEN_SCOPES = [
     "chat-ai.write",
+    "apitoken.write",
+    "callback.read",
+    "response.read",
+    "operation.read",
+    "operator.read",
     "task.write",
-    "payload.write",
     "file.write",
-    "tag.write",
+    "payload.write",
+    "credential.write",
+    "eventlog.write",
 ]
 _WATCHER_CHANNEL_TOKEN_SCOPES = ["chat-ai.write", "apitoken.write"]
 

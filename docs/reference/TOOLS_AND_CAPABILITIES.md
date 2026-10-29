@@ -53,6 +53,12 @@ target applicability from separate observations and keep unobserved prerequisite
 These are approval-gated in supervised mode and each requires a specific Mythic bot-token scope; a tool whose
 scope the channel token lacks is disabled up front.
 
+For every Sage tool to be available, give the channel token `chat-ai.write`, `apitoken.write`, `callback.read`,
+`response.read`, `operation.read`, `operator.read`, `task.write`, `file.write`, `payload.write`,
+`credential.write`, and `eventlog.write` (each `.write` also grants its `.read`). Mythic requires the first two
+on any AI channel token. Sage's session token inherits the channel token's scopes, and Mythic rejects a query
+the token has no read scope for.
+
 | Tool | What it does | Required scope |
 |---|---|---|
 | `issue_task_and_waitfor_task_output` | Issue a command on a callback and wait for output (the core tasking path) | `task.write` |

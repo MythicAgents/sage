@@ -396,6 +396,12 @@ Guarded tools are also **scope-preflighted**: each maps to a required Mythic bot
 `payload.write`, `credential.write`, `file.write`, or `file.read`), and a tool whose scope your channel token lacks is disabled
 up front rather than failing mid-run.
 
+For every Sage tool to be available, give the channel token `chat-ai.write`, `apitoken.write`, `callback.read`,
+`response.read`, `operation.read`, `operator.read`, `task.write`, `file.write`, `payload.write`,
+`credential.write`, and `eventlog.write` (each `.write` also grants its `.read`). Mythic requires the first two
+on any AI channel token. Sage's session token inherits the channel token's scopes, and Mythic rejects a query
+the token has no read scope for.
+
 <p align="center">
   <img src="docs/assets/supervised-approval.png" alt="Supervised approval card in Mythic" width="820">
   <br><em>In supervised mode a guarded action pauses for approval: Accept, Reject, or Respond.</em>

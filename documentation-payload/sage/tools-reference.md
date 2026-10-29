@@ -12,6 +12,12 @@ tool. For the higher-level view, see [Tools and Capabilities](/agents/sage/tools
 Each guarded tool requires a specific Mythic bot-token scope (`task.write`, `payload.write`,
 `credential.write`, `file.write`, or `file.read`). A tool whose scope your chat token lacks is disabled up front rather than
 failing mid-run.
+
+For every Sage tool to be available, give the channel token `chat-ai.write`, `apitoken.write`, `callback.read`,
+`response.read`, `operation.read`, `operator.read`, `task.write`, `file.write`, `payload.write`,
+`credential.write`, and `eventlog.write` (each `.write` also grants its `.read`). Mythic requires the first two
+on any AI channel token. Sage's session token inherits the channel token's scopes, and Mythic rejects a query
+the token has no read scope for.
 {{% /notice %}}
 
 ## Read-only tools

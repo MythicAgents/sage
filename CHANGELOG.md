@@ -37,6 +37,10 @@ between minor releases.
   locally and make no Mythic call, so a narrow channel token no longer disables them. Model-proposed use
   still needs approval in supervised mode and is refused in conversation mode. `callback.write` is no longer
   among Sage's declared channel scopes, since no tool uses it.
+- Sage's declared channel token scopes now list everything it uses: `apitoken.write` (which Mythic requires on
+  any AI channel token), the read scopes for the Mythic data it queries, and `credential.write` and
+  `eventlog.write`. The unused `tag.write` is gone. Mythic does not enforce this list; it tells the operator
+  what to grant, and the docs list the same set.
 
 ## [0.2.0] - 2026-10-23
 
