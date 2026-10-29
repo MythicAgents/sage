@@ -26,6 +26,15 @@ between minor releases.
 
 ### Fixed
 
+- Answered requests no longer end in a "no progress" stop. A BloodHound answer reached the Supervisor
+  without the graph queries behind it, so the Supervisor treated a finished analysis as unsupported and
+  delegated it again until the stop. The queries and bounded excerpts of their results now arrive with the
+  answer, as Mythic task output already did. A Mythic_Operator re-delegation in the same request also ended
+  before it ran, because an earlier delegation's finished capability result was taken as its own; only a
+  result from the current delegation ends it now.
+- A forged-ticket request for one domain that also named a different `source_domain` was treated as a
+  request for the source domain, so it reported "already achieved" from the source domain's existing proof.
+  The named domain is now the ticket's target and the source domain supplies the ticket.
 - Sage can answer questions about the engagement-state tables you see. `/state` and the end-of-turn table
   were shown only to the operator, so a question such as "why is hop 1 pending?" had nothing to refer to.
   The table you were last shown now reaches Sage with your next message, without the evidence previews.

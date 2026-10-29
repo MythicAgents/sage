@@ -3165,10 +3165,14 @@ def _build_forge_golden_ticket_execution_plan(
     inputs: dict[str, Any],
 ) -> CapabilityExecutionPlan:
     fields = _target_fields(action.target)
+    # The ticket's own domain is the krbtgt (source) domain. A distinct `domain` alongside `source_domain`
+    # names the requested target, which the action target carries as `target_domain`.
     domain = _normalize(
-        _input_text(inputs, "domain", "source_domain")
-        or action.intent.get("domain")
+        _input_text(inputs, "source_domain")
+        or action.intent.get("source_domain")
         or fields.get("domain")
+        or _input_text(inputs, "domain")
+        or action.intent.get("domain")
     )
     user = _input_text(inputs, "user", "account", "ticket_user") or \
         _text(action.intent.get("user") or action.intent.get("account") or "Administrator")

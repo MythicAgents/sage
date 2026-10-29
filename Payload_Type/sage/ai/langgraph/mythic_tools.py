@@ -17187,6 +17187,26 @@ class MythicTools:
             ) if commands else "",
         }
 
+    def _forge_ticket_domains(self, intent: dict, inputs: dict) -> tuple[str, str]:
+        """Return (source_domain, target_domain) for a forged ticket request.
+
+        `domain` alone names the krbtgt domain. When the caller also names a distinct `source_domain`,
+        `domain` is the domain it wants the ticket for: keying the effect to the source instead reported
+        `da:<source>` as "already achieved" for a request aimed at a different domain.
+        """
+        source_domain = self._capability_text(
+            inputs.get("source_domain") or intent.get("source_domain")
+            or inputs.get("domain") or intent.get("domain")
+        ).casefold()
+        requested = self._capability_text(inputs.get("domain") or intent.get("domain")).casefold()
+        target_domain = self._capability_text(
+            inputs.get("target_domain") or inputs.get("effect_domain")
+            or intent.get("target_domain") or intent.get("effect_domain")
+        ).casefold()
+        if not target_domain and requested and requested != source_domain:
+            target_domain = requested
+        return source_domain, (target_domain if target_domain != source_domain else "")
+
     def _default_capability_target(self, name: str, intent: dict, inputs: dict) -> str:
         capability = self._capability_text(name).casefold()
         domain = self._capability_text(
@@ -17202,10 +17222,11 @@ class MythicTools:
             if account:
                 return f"domain={domain};account={account}"
         if capability == "forge-golden-ticket" and domain:
-            target_domain = self._capability_text(
-                inputs.get("target_domain") or inputs.get("effect_domain") or intent.get("target_domain")
-            ).casefold()
-            return f"domain={domain};target_domain={target_domain}" if target_domain else f"domain={domain}"
+            source_domain, target_domain = self._forge_ticket_domains(intent, inputs)
+            return (
+                f"domain={source_domain};target_domain={target_domain}" if target_domain
+                else f"domain={source_domain}"
+            )
         if capability == "ensure-kerberos-context":
             target_domain = self._capability_text(
                 inputs.get("target_domain") or inputs.get("effect_domain") or inputs.get("domain")
@@ -17430,12 +17451,10 @@ class MythicTools:
             if account:
                 return [f"creds:{account}@{domain}"]
         if capability == "forge-golden-ticket" and domain:
-            target_domain = self._capability_text(
-                inputs.get("target_domain") or inputs.get("effect_domain") or intent.get("target_domain")
-            ).casefold()
+            source_domain, target_domain = self._forge_ticket_domains(intent, inputs)
             if not target_domain and (inputs.get("extra_sids") or inputs.get("parent_domain_sid")):
-                target_domain = self._parent_domain_for_capability(domain)
-            return [f"da:{target_domain or domain}"]
+                target_domain = self._parent_domain_for_capability(source_domain)
+            return [f"da:{target_domain or source_domain}"]
         if capability == "ensure-kerberos-context":
             target_domain = self._capability_text(
                 inputs.get("target_domain") or inputs.get("effect_domain") or inputs.get("domain")
