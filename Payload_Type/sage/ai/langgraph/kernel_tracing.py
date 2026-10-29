@@ -46,6 +46,7 @@ _SPAN_KIND_ATTRIBUTE = "openinference.span.kind"
 _SPAN_KIND = "CHAIN"
 
 _tracer_cache: Any = None
+_tracer_provider: Any = None
 
 
 def tracing_enabled() -> bool:
@@ -71,12 +72,26 @@ class _NullSpan:
         return False
 
 
+def use_tracer_provider(provider: Any) -> None:
+    """Emit kernel spans through ``provider`` instead of the process-global tracer provider.
+
+    Sage keeps its exporting provider out of the global slot, because Phoenix's own server traces its
+    requests through the global provider and a synchronous export from that thread deadlocks it.
+    """
+    global _tracer_cache, _tracer_provider
+    _tracer_provider = provider
+    _tracer_cache = None
+
+
 def _tracer() -> Any:
     global _tracer_cache
     if not tracing_enabled():
         return None
     if _tracer_cache is None:
-        _tracer_cache = _trace_api.get_tracer(_TRACER_NAME)
+        if _tracer_provider is not None:
+            _tracer_cache = _tracer_provider.get_tracer(_TRACER_NAME)
+        else:
+            _tracer_cache = _trace_api.get_tracer(_TRACER_NAME)
     return _tracer_cache
 
 

@@ -393,3 +393,20 @@ def test_seam_spans_nest_under_the_episode(spans):
         pytest.skip("this controller configuration completed without entering a seam")
     assert episode
     assert all(s.parent is not None for s in seams)
+
+
+def test_configured_provider_receives_kernel_spans_instead_of_the_global_one(spans, monkeypatch):
+    # `spans` is what the global tracer would export to; Sage's own provider is configured explicitly.
+    sage_exporter = InMemorySpanExporter()
+    sage_provider = TracerProvider()
+    sage_provider.add_span_processor(SimpleSpanProcessor(sage_exporter))
+    monkeypatch.setattr(kernel_tracing, "_tracer_provider", None)
+    kernel_tracing.use_tracer_provider(sage_provider)
+    try:
+        with kernel_tracing.kernel_span("kernel.step"):
+            pass
+    finally:
+        kernel_tracing.use_tracer_provider(None)
+
+    assert _names(sage_exporter) == ["kernel.step"]
+    assert _names(spans) == []

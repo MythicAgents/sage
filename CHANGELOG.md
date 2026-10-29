@@ -30,6 +30,12 @@ between minor releases.
   databases and state Sage writes there belong to that user, and a later `mythic-cli install` no longer fails
   on root-owned files and leaves Sage uninstalled. The first start hands back root-owned files left by earlier
   versions. Python bytecode caches are no longer written into the service directory.
+- The Phoenix UI on port 6006 no longer freezes in the container. Sage's span exporter was the process-wide
+  tracer, so Phoenix's own server exported the span for each request it handled, synchronously, to the
+  collector that the same server thread runs, and stopped answering on its first request. Sage's spans now go
+  to Sage's own exporter, with no change to what is traced. `kill -USR1` on the Sage process, or
+  `docker kill -s USR1 sage`, now writes every thread's stack to the log, and startup logs which span
+  exporter Sage uses.
 - The startup version banner now appears in the container logs at Mythic's default log level
   (`DEBUG_LEVEL=warning`); it was logged at INFO and hidden.
 - A request's final message now records how the request ended (`completed`, `blocked`, `checkpoint`,

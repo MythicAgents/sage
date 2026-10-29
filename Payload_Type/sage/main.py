@@ -24,8 +24,16 @@ if os.environ.get("SAGE_RESOURCE_BUDGET_CONFIG") or os.environ.get("SAGE_RESOURC
     _install_resource_clients()
     _install_resource_rpc()
 
+import faulthandler
+import signal
+
 import mythic_container
 from mythic_container.logging import logger
+
+# `kill -USR1 <pid>` (or `docker kill -s USR1 sage`) writes every thread's Python stack to stderr, so a
+# hung Phoenix server or a stuck request can be located from the container logs without a debugger.
+if hasattr(signal, "SIGUSR1"):
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
 
 # Print a version banner first thing so the container's logs always state exactly which Sage is running:
 # the declared version, the commit the image was built from (SAGE_GIT_COMMIT, "unknown" for a plain
@@ -56,7 +64,6 @@ if _observation_capture:
         "channel_present": bool(_effective_notification_channel),
     })
 import phoenix as px
-from phoenix.otel import register
 from openinference.instrumentation.langchain import LangChainInstrumentor
 
 # Names only — never values. Silence here means either no .env, or every setting already came from
@@ -136,11 +143,23 @@ if _observation_capture:
     )
     LangChainInstrumentor().instrument(tracer_provider=tracer_provider, config=_trace_config)
 else:
-    tracer_provider = register(
-        project_name="Sage",
-        auto_instrument=False,  # We manually instrument LangChain below
-        batch=False,
+    # Synchronous per-span export, kept out of the process-global provider so in-process Phoenix's own
+    # request spans cannot deadlock its server. See ai/phoenix_tracing.py.
+    from ai.phoenix_tracing import register_sage_tracing
+
+    tracer_provider = register_sage_tracing()
+
+# Logged at WARNING so it shows at Mythic's default log level: which span processors export Sage's spans,
+# and whether Sage's provider is the process-global one that Phoenix's own server spans also use.
+try:
+    from opentelemetry import trace as _otel_trace_api
+
+    _span_processors = getattr(getattr(tracer_provider, "_active_span_processor", None), "_span_processors", ())
+    logger.warning(
+        f"Phoenix tracing: span processors={[type(p).__name__ for p in _span_processors]}, "
+        f"global provider={_otel_trace_api.get_tracer_provider() is tracer_provider}"
     )
-    LangChainInstrumentor().instrument(tracer_provider=tracer_provider)
+except Exception as _tracing_log_exc:  # a diagnostic must never stop startup
+    logger.warning(f"Phoenix tracing configuration unavailable: {_tracing_log_exc}")
 
 mythic_container.mythic_service.start_and_run_forever()
