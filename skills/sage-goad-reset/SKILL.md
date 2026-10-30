@@ -114,12 +114,22 @@ executable path, and executable hash together before starting the task.
 An absent `sage` tmux session is an idempotent already-stopped state. A present Sage process that survives the
 bounded interrupt sequence remains a hard failure.
 
-2. Archive the active databases. The helper moves them beside their originals as
-   `sage_YYYYMMDD-HHMM.db` and `phoenix_YYYYMMDD-HHMM.db`. It never overwrites an existing archive:
+2. Preserve the run's evidence, then archive the active databases. The helper first copies the installed
+   container's `sage*.db`, `.phoenix/phoenix*.db` and `.sage_engagement/` with SQLite online backup (safe while
+   the container runs), and dumps Mythic's database with `pg_dump` inside its Postgres container, into
+   `.sage_history/runtime-db-archive/reset-YYYYMMDD-HHMM/` with a hashed `MANIFEST.json`. Only after every copy
+   verifies does it move the local databases beside their originals as `sage_YYYYMMDD-HHMM.db` and
+   `phoenix_YYYYMMDD-HHMM.db`. A failed copy stops here and nothing is moved, so the reset does not continue.
+   It never overwrites an existing archive. The installed directory comes from `MYTHIC_ENV_PATH`; without it the
+   container copy is skipped and recorded in the manifest:
 
 ```bash
-.venv/bin/python skills/sage-goad-reset/scripts/archive_runtime_dbs.py
+.venv/bin/python skills/sage-goad-reset/scripts/archive_reset_evidence.py
 ```
+
+   Step 3 wipes Mythic's database, including every task's output. Pass `--skip-mythic-dump` only when that
+   history is deliberately not needed; the manifest records the skip. `archive_runtime_dbs.py` remains the
+   local-only move for callers that do not reset Mythic.
 
 3. Reset and restart Mythic. This uses the Docker-backed Mythic CLI without `sudo`:
 
@@ -275,6 +285,7 @@ does not treat `SyncLAPSPassword` as equivalent to `ReadLAPSPassword`.
 ## Bundled Scripts
 
 - `_sage_relaunch.py`
+- `archive_reset_evidence.py` (copies container databases and dumps Mythic before the reset, then archives)
 - `archive_runtime_dbs.py`
 - `bh_reset.py`
 - `check_cross_forest_laps_bridge.py`
@@ -361,8 +372,8 @@ Each deployment keeps its own runtime state, and switching carries some of it bu
 
 - **Databases live where that Sage runs.** Local tmux uses `Payload_Type/sage/sage.db` and
   `Payload_Type/sage/.phoenix/phoenix.db`; the container uses the same names inside the installed service
-  directory. The reset's archive phase covers only the repo paths. Before a clean run in the container, stop
-  it and archive its database too:
+  directory. The reset's archive phase copies the container's databases as evidence but moves only the repo
+  paths. Before a clean run in the container, stop it and archive its database too:
   `archive_runtime_dbs.py --sage-db <installed service dir>/sage.db`. Stale channel markers there make Sage
   refuse the first prompt in a new channel ("Sage restarted or this channel's session was replaced") when
   Mythic reuses channel IDs after its own reset.

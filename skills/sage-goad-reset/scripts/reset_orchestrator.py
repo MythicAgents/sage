@@ -358,9 +358,16 @@ def _phase_commands(config: dict[str, Any]) -> dict[str, list[str]]:
             "/bin/bash",
             str(RESET_DIR / "scripts" / "sage_stop.sh"),
         ],
+        # Preserves the container's databases and Mythic's records before moving the local
+        # databases; reset-mythic would otherwise wipe the task output a run's proof rests on.
         "archive-runtime-dbs": [
             str(PYTHON),
-            str(RESET_DIR / "scripts" / "archive_runtime_dbs.py"),
+            str(RESET_DIR / "scripts" / "archive_reset_evidence.py"),
+            *(
+                ["--mythic-env-path", config["mythic_env_path"]]
+                if config["mythic_env_path"]
+                else []
+            ),
         ],
         "reset-mythic": [
             "/bin/bash",

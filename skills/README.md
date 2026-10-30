@@ -10,7 +10,7 @@ operational tooling (per `CLAUDE.md` / `AGENTS.md`); do **not** put helper scrip
 
 | Skill | Purpose | Primary entry |
 |-------|---------|---------------|
-| **sage-goad-reset** | Full GOAD lab reset + readiness: archive Sage/Phoenix runtime DBs, reset Docker-Mythic, reset/verify Ludus GOAD, wipe/check BloodHound, restart local Sage, preflight before a solve. | `scripts/sage_restart.sh`, `scripts/archive_runtime_dbs.py`, `scripts/ludus.py`, `scripts/bh_reset.py` |
+| **sage-goad-reset** | Full GOAD lab reset + readiness: preserve container DBs and Mythic's records, archive Sage/Phoenix runtime DBs, reset Docker-Mythic, reset/verify Ludus GOAD, wipe/check BloodHound, restart local Sage, preflight before a solve. | `scripts/sage_restart.sh`, `scripts/archive_reset_evidence.py`, `scripts/archive_runtime_dbs.py`, `scripts/ludus.py`, `scripts/bh_reset.py` |
 | **sage-callback-bootstrap** | Post-Mythic-reset Sage chat/foothold bootstrap: verify native chat, create Apollo or import retained footholds, run readiness, rediscover Apollo. | `scripts/bootstrap_payloads.py` |
 | **sage-foothold-launch** | Create a batch-logon Apollo foothold from a genuinely downloadable Mythic payload. Use only when the operation accepts a batch token; staged interactive snapshots use `launch-existing`. | `scripts/foothold_launch.py` |
 | **sage-mythic-payload-deploy** | Authoritative snapshot-to-bootstrap decision table plus Mythic payload deploy and pre-staged interactive `launch-existing` workflows. | `scripts/deploy_payload_via_ludus.py`, `scripts/launch_apollo_foothold.sh` |

@@ -200,6 +200,15 @@ def test_plan_has_canonical_order_and_never_deploys_payload():
     ]
 
 
+def test_archive_phase_preserves_evidence_from_the_configured_mythic_install():
+    command = reset._phase_commands(_config())["archive-runtime-dbs"]
+
+    assert command[1].endswith("archive_reset_evidence.py")
+    assert command[2:] == ["--mythic-env-path", "/opt/mythic-install/.env"]
+    unset = reset._phase_commands({**_config(), "mythic_env_path": ""})["archive-runtime-dbs"]
+    assert unset[2:] == []
+
+
 def test_unqualified_profile_can_be_planned_but_not_started(capsys):
     common = [
         "--snapshot", "snapshot-v1",
