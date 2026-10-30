@@ -487,7 +487,7 @@ def test_identity_freshness_full_native_checkpoint_without_network(decision, mon
     script = [
         module.CASE.call("transfer_to_Mythic_Operator", {
             "handoff_title": "review identity and request fresh check",
-            "handoff_instruction": module.IDENTITY_PROMPT}, 1),
+            "handoff_instruction": module.IDENTITY_PROMPT, **module.CASE.TASK_BRIEF}, 1),
         module.CASE.call("get_all_task_output_by_task_id", {"task_id": 41}, 2),
         proposal,
         resumed_answer,
@@ -539,7 +539,7 @@ def test_historical_mock_read_reaches_supervisor_as_current_request_evidence(mon
         return AIMessage(content="Task 41 is historical; fresh check reported EXAMPLE\\current-user.")
     script = [
         module.CASE.call("transfer_to_Mythic_Operator", {
-            "handoff_title": "review identity", "handoff_instruction": module.IDENTITY_PROMPT}, 1),
+            "handoff_title": "review identity", "handoff_instruction": module.IDENTITY_PROMPT, **module.CASE.TASK_BRIEF}, 1),
         module.CASE.call("get_all_task_output_by_task_id", {"task_id": 41}, 2),
         worker_after_read,
         AIMessage(content="Task 41 was historical; fresh check reported EXAMPLE\\current-user."),
@@ -573,7 +573,7 @@ def test_identity_freshness_rejects_drifted_proposal_before_effect(monkeypatch):
         AssertionError("scripted identity case attempted network")))
     script = [
         module.CASE.call("transfer_to_Mythic_Operator", {
-            "handoff_title": "identity", "handoff_instruction": module.IDENTITY_PROMPT}, 1),
+            "handoff_title": "identity", "handoff_instruction": module.IDENTITY_PROMPT, **module.CASE.TASK_BRIEF}, 1),
         module.CASE.call("get_all_task_output_by_task_id", {"task_id": 41}, 2),
         module.CASE.call(module.CASE.EXPECTED["name"], {
             **module.CASE.EXPECTED["args"], "command": "hostname"}, 3),
@@ -605,7 +605,7 @@ def test_identity_freshness_verification_read_requires_actual_effect(decision, m
         return AIMessage(content="The available evidence has been reported.")
     script = [
         module.CASE.call("transfer_to_Mythic_Operator", {
-            "handoff_title": "identity", "handoff_instruction": module.IDENTITY_PROMPT}, 1),
+            "handoff_title": "identity", "handoff_instruction": module.IDENTITY_PROMPT, **module.CASE.TASK_BRIEF}, 1),
         module.CASE.call("get_all_task_output_by_task_id", {"task_id": 41}, 2),
         module.CASE.call("get_all_task_output_by_task_id", {"task_id": 41}, 3),
         module.CASE.call(module.CASE.EXPECTED["name"], module.CASE.EXPECTED["args"], 4),
@@ -644,7 +644,7 @@ def test_identity_v2_scripted_native_decisions(decision, path, monkeypatch):
              "Task 41 recorded EXAMPLE\\previous-user; current identity remains unknown.")
     script = [
         module.CASE.call("transfer_to_Mythic_Operator", {
-            "handoff_title": "review identity", "handoff_instruction": module.IDENTITY_PROMPT}, 1),
+            "handoff_title": "review identity", "handoff_instruction": module.IDENTITY_PROMPT, **module.CASE.TASK_BRIEF}, 1),
         module.CASE.call("get_all_task_output_by_task_id", {"task_id": 41}, 2),
     ]
     if path == "text_followup":
@@ -653,7 +653,7 @@ def test_identity_v2_scripted_native_decisions(decision, path, monkeypatch):
             AIMessage(content="Task 41 is historical; a fresh whoami check needs approval."),
             module.CASE.call("transfer_to_Mythic_Operator", {
                 "handoff_title": "submit native approval",
-                "handoff_instruction": module.IDENTITY_APPROVAL_FOLLOWUP}, 4),
+                "handoff_instruction": module.IDENTITY_APPROVAL_FOLLOWUP, **module.CASE.TASK_BRIEF}, 4),
         ])
     observed_issue_outputs = []
     final_supervisor_system = []
@@ -794,7 +794,7 @@ def test_identity_v2_scripted_explicit_handback_after_native_decision(
 
     script = [
         module.CASE.call("transfer_to_Mythic_Operator", {
-            "handoff_title": "review identity", "handoff_instruction": module.IDENTITY_PROMPT}, 1),
+            "handoff_title": "review identity", "handoff_instruction": module.IDENTITY_PROMPT, **module.CASE.TASK_BRIEF}, 1),
         module.CASE.call("get_all_task_output_by_task_id", {"task_id": 41}, 2),
         module.CASE.call(module.CASE.EXPECTED["name"], module.CASE.EXPECTED["args"], 3),
         after_decision,
@@ -863,7 +863,7 @@ def test_identity_v2_does_not_follow_up_invalid_first_turn(first, monkeypatch):
         AssertionError("scripted identity case attempted network")))
     script = [
         module.CASE.call("transfer_to_Mythic_Operator", {
-            "handoff_title": "review identity", "handoff_instruction": module.IDENTITY_PROMPT}, 1),
+            "handoff_title": "review identity", "handoff_instruction": module.IDENTITY_PROMPT, **module.CASE.TASK_BRIEF}, 1),
         module.CASE.call("get_all_task_output_by_task_id", {"task_id": 41}, 2),
     ]
     if first == "empty":
@@ -966,7 +966,7 @@ def test_report_fresh_native_task_evidence_boundary(decision, handback, monkeypa
     script = [
         module.CASE.call("transfer_to_Mythic_Operator", {
             "handoff_title": "synthetic network observation",
-            "handoff_instruction": module.REPORT_FRESH_PROMPT,
+            "handoff_instruction": module.REPORT_FRESH_PROMPT, **_netstat_brief(module),
         }, 1),
         module.CASE.call(module.CASE.EXPECTED["name"], module.REPORT_NETSTAT_ARGS, 2),
         worker_after_decision, supervisor_after_decision,
@@ -1055,7 +1055,7 @@ def test_report_historical_withdrawal_recap_assembled(scenario, monkeypatch, tmp
     script = [
         module.CASE.call("transfer_to_Mythic_Operator", {
             "handoff_title": "review historical network records",
-            "handoff_instruction": module.REPORT_HISTORY_PROMPT,
+            "handoff_instruction": module.REPORT_HISTORY_PROMPT, **module.CASE.READ_BRIEF,
         }, 1),
         module.CASE.call("get_all_task_output_by_task_id", {"task_id": 61}, 2),
         module.CASE.call("get_all_task_output_by_task_id", {"task_id": 62}, 3),
@@ -1109,7 +1109,7 @@ def test_report_fresh_optional_readback_uses_netstat_not_identity(monkeypatch, t
         return AIMessage(content="Current task output is available for synthesis.")
     script = [
         module.CASE.call("transfer_to_Mythic_Operator", {
-            "handoff_title": "network check", "handoff_instruction": module.REPORT_FRESH_PROMPT,
+            "handoff_title": "network check", "handoff_instruction": module.REPORT_FRESH_PROMPT, **_netstat_brief(module),
         }, 1),
         module.CASE.call(module.CASE.EXPECTED["name"], module.REPORT_NETSTAT_ARGS, 2),
         module.CASE.call("get_all_task_output_by_task_id", {"task_id": 42}, 3),
@@ -1149,13 +1149,13 @@ def test_identity_v2_wrong_followup_card_is_rejected_without_effect(monkeypatch)
         AssertionError("scripted identity case attempted network")))
     script = [
         module.CASE.call("transfer_to_Mythic_Operator", {
-            "handoff_title": "review identity", "handoff_instruction": module.IDENTITY_PROMPT}, 1),
+            "handoff_title": "review identity", "handoff_instruction": module.IDENTITY_PROMPT, **module.CASE.TASK_BRIEF}, 1),
         module.CASE.call("get_all_task_output_by_task_id", {"task_id": 41}, 2),
         AIMessage(content="Task 41 is historical; a fresh check needs approval."),
         AIMessage(content="Task 41 is historical; a fresh check needs approval."),
         module.CASE.call("transfer_to_Mythic_Operator", {
             "handoff_title": "native approval",
-            "handoff_instruction": module.IDENTITY_APPROVAL_FOLLOWUP}, 3),
+            "handoff_instruction": module.IDENTITY_APPROVAL_FOLLOWUP, **module.CASE.TASK_BRIEF}, 3),
         module.CASE.call(module.CASE.EXPECTED["name"], {
             **module.CASE.EXPECTED["args"], "command": "hostname"}, 4),
         AIMessage(content="Current identity remains unknown."),
@@ -1175,11 +1175,17 @@ def test_identity_v2_wrong_followup_card_is_rejected_without_effect(monkeypatch)
     assert result["decision_terminal_count"] == 1
 
 
+def _netstat_brief(module):
+    """The brief for a supervised step that tasks the fixture callback with netstat."""
+    return {**module.CASE.TASK_BRIEF, "expected_result": "The callback's netstat -ano output."}
+
+
 def _recon_script(module, *, first_variant="normal", second_variant="normal",
                   observations=None, explicit_return=False, second_reply=None,
                   third_reply=None, second_response_tool_args=None):
     script = [module.CASE.call("transfer_to_Mythic_Operator", {
-        "handoff_title": "review stored inventory", "handoff_instruction": module.RECON_PROMPT}, 1)]
+        "handoff_title": "review stored inventory", "handoff_instruction": module.RECON_PROMPT,
+        **module.CASE.READ_BRIEF}, 1)]
     if first_variant != "missing_read":
         script.append(module.CASE.call("get_all_task_output_by_task_id", {"task_id": 51}, 2))
     script.append(module.CASE.call("get_all_task_output_by_task_id", {
@@ -1215,14 +1221,16 @@ def _recon_script(module, *, first_variant="normal", second_variant="normal",
         if second_variant == "read":
             script.extend([
                 module.CASE.call("transfer_to_Mythic_Operator", {
-                    "handoff_title": "retrieve more", "handoff_instruction": "read inventory"}, 5),
+                    "handoff_title": "retrieve more", "handoff_instruction": "read inventory",
+                    **module.CASE.READ_BRIEF}, 5),
                 module.CASE.call("get_all_task_output_by_task_id", {"task_id": 51}, 6),
                 AIMessage(content="Read again."),
             ])
         elif second_variant == "card":
             script.extend([
                 module.CASE.call("transfer_to_Mythic_Operator", {
-                    "handoff_title": "issue check", "handoff_instruction": "issue task"}, 5),
+                    "handoff_title": "issue check", "handoff_instruction": "issue task",
+                    **module.CASE.TASK_BRIEF}, 5),
                 module.CASE.call(module.CASE.EXPECTED["name"], module.CASE.EXPECTED["args"], 6),
             ])
         elif second_variant == "error":
@@ -1234,6 +1242,7 @@ def _recon_script(module, *, first_variant="normal", second_variant="normal",
                 module.CASE.call("transfer_to_Mythic_Operator", {
                     "handoff_title": "recap prior output",
                     "handoff_instruction": "Recap without another read.",
+                    **module.CASE.READ_BRIEF,
                 }, 5),
                 AIMessage(content="Earlier worker narration from historical records."),
                 AIMessage(content=""),

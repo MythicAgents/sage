@@ -110,7 +110,7 @@ def _stored_messages(matrix, prompt, final):
         for task_id in (701, 702, 703)])
     return [
         matrix.CASE.call("transfer_to_Mythic_Operator", {
-            "handoff_title": "review stored observations", "handoff_instruction": prompt}, 1),
+            "handoff_title": "review stored observations", "handoff_instruction": prompt, **matrix.READ_BRIEF}, 1),
         matrix.CASE.call("list_callbacks", {}, 2),
         matrix.CASE.call("get_task_history_for_callback", {"callback_display_id": 7}, 3),
         reads,
@@ -227,7 +227,7 @@ def test_task811_membership_is_distinct_from_authentication(tmp_path, monkeypatc
     result, report, tagged = _run_with_report(matrix, limits, monkeypatch, tmp_path,
         "09_direct_evidence", prompt, [
             matrix.CASE.call("transfer_to_Mythic_Operator", {
-                "handoff_title": "inspect task 811", "handoff_instruction": prompt}, 1),
+                "handoff_title": "inspect task 811", "handoff_instruction": prompt, **matrix.READ_BRIEF}, 1),
             matrix.CASE.call("get_all_task_output_by_task_id", {"task_id": 811}, 2),
             AIMessage(content="This proves target authentication and trust."),
             matrix.CASE.call("respond_to_user", {"reuse_latest_worker_answer": True}, 3),
@@ -259,7 +259,7 @@ def test_withdrawn_task_output_cannot_be_replaced_by_model_claim(tmp_path, monke
     _, report, _ = _run_with_report(matrix, limits, monkeypatch, tmp_path,
         "09_direct_evidence", prompt, [
             matrix.CASE.call("transfer_to_Mythic_Operator", {
-                "handoff_title": "inspect task", "handoff_instruction": prompt}, 1),
+                "handoff_title": "inspect task", "handoff_instruction": prompt, **matrix.READ_BRIEF}, 1),
             matrix.CASE.call("get_all_task_output_by_task_id", {"task_id": 811}, 2),
             AIMessage(content="Task 811 proves example.test membership and administrator access."),
             matrix.CASE.call("respond_to_user", {"reuse_latest_worker_answer": True}, 3),
@@ -275,7 +275,7 @@ def test_report_slash_preserves_native_task_decision(tmp_path, monkeypatch, deci
     prompt = "Run whoami on callback 7 and report the output."
     messages = [
         matrix.CASE.call("transfer_to_Mythic_Operator", {
-            "handoff_title": "identity", "handoff_instruction": prompt}, 1),
+            "handoff_title": "identity", "handoff_instruction": prompt, **matrix.TASK_BRIEF}, 1),
         matrix.CASE.call("issue_task_and_waitfor_task_output", {
             "command": "whoami", "parameters": "", "callback_display_id": 7}, 2),
         AIMessage(content="If approved, report the task's observed identity."),

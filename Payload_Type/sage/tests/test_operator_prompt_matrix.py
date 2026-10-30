@@ -70,7 +70,7 @@ def test_retained_episode_uses_registered_history_and_empty_output_without_netwo
     monkeypatch.setattr(socket.socket, "connect", lambda *_: (_ for _ in ()).throw(AssertionError("network")))
     fake = runner.CASE.ScriptedModel(messages=iter([
         runner.CASE.call("transfer_to_Mythic_Operator", {
-            "handoff_title": "state", "handoff_instruction": runner.RETAINED_PROMPT}, 1),
+            "handoff_title": "state", "handoff_instruction": runner.RETAINED_PROMPT, **runner.READ_BRIEF}, 1),
         runner.CASE.call("get_task_history_for_callback", {"callback_display_id": 2}, 2),
         runner.CASE.call("get_all_task_output_by_task_id", {"task_id": 25}, 3),
         AIMessage(content="Historical task25 is pending at file fetch; no output proves GPO changes."),
@@ -125,7 +125,7 @@ def test_retained_episode_stops_on_out_of_fixture_reads(tmp_path, monkeypatch, n
     monkeypatch.setattr(socket.socket, "connect", lambda *_: (_ for _ in ()).throw(AssertionError("network")))
     fake = runner.CASE.ScriptedModel(messages=iter([
         runner.CASE.call("transfer_to_Mythic_Operator", {
-            "handoff_title": "state", "handoff_instruction": runner.RETAINED_PROMPT}, 1),
+            "handoff_title": "state", "handoff_instruction": runner.RETAINED_PROMPT, **runner.READ_BRIEF}, 1),
         runner.CASE.call(name, args, 2),
         AIMessage(content="This must not be consumed."),
     ]))
@@ -195,7 +195,7 @@ def test_accepted_whoami_card_reaches_inert_final_sink_once(tmp_path, monkeypatc
     monkeypatch.setattr(socket.socket, "connect_ex", lambda *_: (_ for _ in ()).throw(AssertionError("network")))
     fake = runner.CASE.ScriptedModel(messages=iter([
         runner.CASE.call("transfer_to_Mythic_Operator", {
-            "handoff_title": "identity", "handoff_instruction": "Run whoami on callback 7 and report the output."}, 1),
+            "handoff_title": "identity", "handoff_instruction": "Run whoami on callback 7 and report the output.", **runner.TASK_BRIEF}, 1),
         runner.CASE.call("issue_task_and_waitfor_task_output", {
             "command": "whoami", "parameters": "", "callback_display_id": 7}, 2),
         AIMessage(content="I will report the accepted task output."),
@@ -271,7 +271,7 @@ def test_fresh_history_and_local_ttp_guidance_use_fixture_only(tmp_path, monkeyp
     goal = "enumerate host information, running processes, and local users"
     fake = runner.CASE.ScriptedModel(messages=iter([
         runner.CASE.call("transfer_to_Mythic_Operator", {
-            "handoff_title": "enumerate", "handoff_instruction": "Which commands are available on callback 7?"}, 1),
+            "handoff_title": "enumerate", "handoff_instruction": "Which commands are available on callback 7?", **runner.READ_BRIEF}, 1),
         runner.CASE.call("get_task_history_for_callback", {"callback_display_id": 7}, 2),
         runner.CASE.call("get_ttp_guidance", {"goal": goal, "callback_display_id": 7}, 3),
         runner.CASE.call("list_ttp_categories", {}, 4),
@@ -307,7 +307,7 @@ def test_accepted_task_appears_in_synthetic_history(tmp_path, monkeypatch):
     monkeypatch.setattr(socket.socket, "connect_ex", lambda *_: (_ for _ in ()).throw(AssertionError("network")))
     fake = runner.CASE.ScriptedModel(messages=iter([
         runner.CASE.call("transfer_to_Mythic_Operator", {
-            "handoff_title": "identity", "handoff_instruction": "Run whoami on callback 7 and report the output."}, 1),
+            "handoff_title": "identity", "handoff_instruction": "Run whoami on callback 7 and report the output.", **runner.TASK_BRIEF}, 1),
         runner.CASE.call("issue_task_and_waitfor_task_output", {
             "command": "whoami", "parameters": "", "callback_display_id": 7}, 2),
         runner.CASE.call("get_task_history_for_callback", {"callback_display_id": 7}, 3),
@@ -403,7 +403,7 @@ def test_direct_evidence_control_reads_seeded_output_without_effect(tmp_path, mo
     fake = runner.CASE.ScriptedModel(messages=iter([
         runner.CASE.call("transfer_to_Mythic_Operator", {
             "handoff_title": "read task 811",
-            "handoff_instruction": "Read output of task 811 and report domain membership and trusts."}, 1),
+            "handoff_instruction": "Read output of task 811 and report domain membership and trusts.", **runner.READ_BRIEF}, 1),
         runner.CASE.call("get_all_task_output_by_task_id", {"task_id": 811}, 2),
         AIMessage(content="Task 811 shows LAB-WS01 is joined to example.test; trusts were not collected."),
         supervisor_after_worker,
@@ -453,7 +453,7 @@ def test_stored_enumeration_reads_prior_tasks_then_recommends_without_effect(tmp
         return AIMessage(content="Task 701 shows LAB\\analyst; 702 shows two processes; 703 lists local accounts. Trusts are unknown.")
     fake = runner.CASE.ScriptedModel(messages=iter([
         runner.CASE.call("transfer_to_Mythic_Operator", {
-            "handoff_title": "review existing evidence", "handoff_instruction": prompt}, 1),
+            "handoff_title": "review existing evidence", "handoff_instruction": prompt, **runner.READ_BRIEF}, 1),
         runner.CASE.call("list_callbacks", {}, 2),
         runner.CASE.call("get_task_history_for_callback", {"callback_display_id": 7}, 3),
         task_reads,
@@ -461,7 +461,7 @@ def test_stored_enumeration_reads_prior_tasks_then_recommends_without_effect(tmp
         supervisor_after_worker,
         runner.CASE.call("transfer_to_Mythic_Operator", {
             "handoff_title": "check credential inventory",
-            "handoff_instruction": "Read the operation credential inventory; recommend a next step without execution."}, 5),
+            "handoff_instruction": "Read the operation credential inventory; recommend a next step without execution.", **runner.READ_BRIEF}, 5),
         runner.CASE.call("read_credentials", {"realm": "", "account": ""}, 6),
         AIMessage(content="The Mythic credential inventory is empty. Recommend an evidence-gathering step."),
         AIMessage(content="The credential store is empty. Next, verify domain context through an approved callback 7 task. I have not executed it."),
@@ -518,7 +518,8 @@ def test_explicit_scope_controls_reach_proposal_without_execution(
     fake = runner.CASE.ScriptedModel(messages=iter([
         runner.CASE.call("transfer_to_Mythic_Operator", {
             "handoff_title": "enumerate selected callback",
-            "handoff_instruction": prompt}, 1),
+            "handoff_instruction": prompt, **runner.TASK_BRIEF, "callback_display_id": callback_id,
+            "targets": [{7: "LAB-WS01", 8: "LAB-WS02"}[callback_id]]}, 1),
         runner.CASE.call("issue_task_and_waitfor_task_output", {
             "command": "whoami", "parameters": "", "callback_display_id": callback_id}, 2),
     ]))
@@ -545,7 +546,8 @@ def test_ambiguous_followup_reaches_scoped_card_without_automatic_approval(tmp_p
         AIMessage(content="Callbacks 7 and 8 are active. Which callback should I use?"),
         runner.CASE.call("transfer_to_Mythic_Operator", {
             "handoff_title": "enumerate callback 7",
-            "handoff_instruction": "Use callback 7 only to enumerate the host, processes, and users."}, 1),
+            "handoff_instruction": "Use callback 7 only to enumerate the host, processes, and users.",
+            **runner.TASK_BRIEF}, 1),
         runner.CASE.call("issue_task_and_waitfor_task_output", {
             "command": "whoami", "parameters": "", "callback_display_id": 7}, 2),
     ]))
@@ -573,7 +575,8 @@ def test_ambiguous_card_does_not_trigger_resolution_followup(tmp_path, monkeypat
     monkeypatch.setattr(socket.socket, "connect_ex", lambda *_: (_ for _ in ()).throw(AssertionError("network")))
     fake = runner.CASE.ScriptedModel(messages=iter([
         runner.CASE.call("transfer_to_Mythic_Operator", {
-            "handoff_title": "enumerate", "handoff_instruction": "Enumerate the host, processes, and users."}, 1),
+            "handoff_title": "enumerate", "handoff_instruction": "Enumerate the host, processes, and users.",
+            **runner.TASK_BRIEF}, 1),
         runner.CASE.call("issue_task_and_waitfor_task_output", {
             "command": "whoami", "parameters": "", "callback_display_id": 7}, 2),
     ]))
@@ -602,7 +605,7 @@ def test_unknown_apollo_command_schema_is_a_recoverable_tool_result(tmp_path, mo
         for command in ("getprivs", "hostname")])
     fake = runner.CASE.ScriptedModel(messages=iter([
         runner.CASE.call("transfer_to_Mythic_Operator", {
-            "handoff_title": "enumerate", "handoff_instruction": "enumerate host, processes, and users on callback 7"}, 1),
+            "handoff_title": "enumerate", "handoff_instruction": "enumerate host, processes, and users on callback 7", **runner.TASK_BRIEF}, 1),
         schema_calls,
         AIMessage(content="Those two commands are absent from the fixture catalog."),
         AIMessage(content="The queried commands were unavailable; no task ran."),

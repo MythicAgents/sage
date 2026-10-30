@@ -28,6 +28,10 @@ ACTION = {
     "name": "issue_task_and_waitfor_task_output",
     "args": {"callback_display_id": 5, "command": "whoami", "parameters": "", "timeout": 1},
 }
+# Supervised delegation briefs: the tasking step names callback 5, which the sink reports as observed, and its
+# host; the later step only reads a stored task output.
+_TASK_BRIEF = {"callback_display_id": 5, "targets": ["WORKSTATION-5"], "expected_result": "The whoami output."}
+_READ_BRIEF = {"allowed_capabilities": ["control_plane"], "expected_result": "The stored output of task 4242."}
 
 
 def test_native_issued_pending_task_yields_without_poll_loop():
@@ -48,6 +52,7 @@ def test_native_issued_pending_task_yields_without_poll_loop():
         tools._fetch_command_schema = AsyncMock(return_value=[])
         tools._callback_tasking_liveness_blocker = AsyncMock(return_value="")
         tools._issue_mythic_task = AsyncMock(return_value={"display_id": 4242})
+        tools._recon_snapshot_cache[("list_callbacks", "all")] = [{"id": 5, "host": "WORKSTATION-5"}]
         model.mythic_client = tools
         model._payload_names = []
         model.memory = InMemorySaver()
@@ -57,6 +62,7 @@ def test_native_issued_pending_task_yields_without_poll_loop():
                 _call("transfer_to_Mythic_Operator", {
                     "handoff_title": "inspect task",
                     "handoff_instruction": "Run the approved check and report its state.",
+                    **_TASK_BRIEF,
                 }, 1),
                 _call(ACTION["name"], ACTION["args"], 2),
             ),
@@ -92,6 +98,7 @@ def test_native_issued_pending_task_yields_without_poll_loop():
                 _call("transfer_to_Mythic_Operator", {
                     "handoff_title": "inspect prior task",
                     "handoff_instruction": "Read task 4242 and report its output.",
+                    **_READ_BRIEF,
                 }, 4),
                 _call("get_all_task_output_by_task_id", {"task_id": 4242}, 5),
                 AIMessage(content="Task 4242 returned a late identity result."),

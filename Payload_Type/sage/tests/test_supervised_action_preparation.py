@@ -399,9 +399,12 @@ def test_native_approval_reaches_registered_task_sink_with_prepared_args(monkeyp
             raise RuntimeError("inert task sink reached")
         monkeypatch.setattr(tools, "_issue_mythic_task", inert_sink)
     prompt = "Run the specified LAB check on callback 2."
+    # Sage holds callback 2 as it would after listing callbacks, so the supervised brief may name it.
+    tools._recon_snapshot_cache[("list_callbacks", "all")] = [{"id": 2, "host": "LAB-WS01"}]
     fake = driver.ScriptedModel(messages=iter([
         driver.call("transfer_to_Mythic_Operator", {
-            "handoff_title": "LAB check", "handoff_instruction": prompt}, 1),
+            "handoff_title": "LAB check", "handoff_instruction": prompt, "callback_display_id": 2,
+            "targets": ["LAB-WS01"], "expected_result": "The LAB check's task output."}, 1),
         driver.call(TOOL, raw, 2),
         AIMessage(content="The task result was handled."),
         AIMessage(content="The request is complete."),

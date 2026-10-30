@@ -52,7 +52,7 @@ def test_retained_task_outputs_reach_generalist_model_input_without_new_authorit
         for task_id in (701, 702, 703)])
     scripted = [
         matrix.CASE.call("transfer_to_Mythic_Operator", {
-            "handoff_title": "review existing tasks", "handoff_instruction": initial}, 1),
+            "handoff_title": "review existing tasks", "handoff_instruction": initial, **matrix.READ_BRIEF}, 1),
         task_reads,
         AIMessage(content=worker_summary),
         AIMessage(content="The worker reviewed stored task outputs."),
@@ -179,7 +179,7 @@ def test_withdrawn_native_task_output_does_not_become_generalist_evidence(
 
     scripted = [
         matrix.CASE.call("transfer_to_Mythic_Operator", {
-            "handoff_title": "review existing task", "handoff_instruction": initial}, 1),
+            "handoff_title": "review existing task", "handoff_instruction": initial, **matrix.READ_BRIEF}, 1),
         matrix.CASE.call("get_all_task_output_by_task_id", {"task_id": 701}, 2),
         AIMessage(content=worker_summary),
         AIMessage(content="Stored output is unavailable."),

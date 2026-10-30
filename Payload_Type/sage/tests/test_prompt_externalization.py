@@ -63,7 +63,7 @@ EXPECTED_META = {
     "mcp_manager": ("MCP_Manager", 1),
     "bloodhound": ("BloodHound", 4),
     "sandbox": ("Sandbox", 2),
-    "supervisor": ("Supervisor", 8),
+    "supervisor": ("Supervisor", 9),
 }
 
 # A distinctive, post-substitution substring per agent. Its presence proves the

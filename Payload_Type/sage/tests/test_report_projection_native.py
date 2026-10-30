@@ -67,7 +67,7 @@ def test_task811_positive_survives_worker_and_native_final(tmp_path, monkeypatch
         supervisor = AIMessage(content=worker)
     messages = [
         matrix.CASE.call("transfer_to_Mythic_Operator", {
-            "handoff_title": "inspect task 811", "handoff_instruction": prompt}, 1),
+            "handoff_title": "inspect task 811", "handoff_instruction": prompt, **matrix.READ_BRIEF}, 1),
         matrix.CASE.call("get_all_task_output_by_task_id", {"task_id": 811}, 2),
         AIMessage(content=worker), supervisor,
     ]
@@ -104,7 +104,7 @@ def test_stored_observations_and_conditional_followup_complete(tmp_path, monkeyp
         "if_verified": "inspect an authorized directory collection path"}]})
     messages = [
         matrix.CASE.call("transfer_to_Mythic_Operator", {
-            "handoff_title": "Known domain administrator account", "handoff_instruction": prompt}, 1),
+            "handoff_title": "Known domain administrator account", "handoff_instruction": prompt, **matrix.READ_BRIEF}, 1),
         matrix.CASE.call("list_callbacks", {}, 2),
         matrix.CASE.call("get_task_history_for_callback", {"callback_display_id": 7}, 3),
         task_reads,
@@ -145,7 +145,7 @@ def test_unsupported_old_prose_blocked_on_all_views_with_format_failure(tmp_path
            "shows no earlier elevation. Use the existing domain credentials.")
     messages = [
         matrix.CASE.call("transfer_to_Mythic_Operator", {
-            "handoff_title": "stored facts", "handoff_instruction": prompt}, 1),
+            "handoff_title": "stored facts", "handoff_instruction": prompt, **matrix.READ_BRIEF}, 1),
         matrix.CASE.call("get_all_task_output_by_task_id", {"task_id": 701}, 2),
         AIMessage(content=bad),
         AIMessage(content=bad),
@@ -172,7 +172,7 @@ def test_structural_proposal_can_carry_unsupported_presupposition(tmp_path, monk
         "if_verified": "use the existing domain administrator credentials to query the directory"}]})
     messages = [
         matrix.CASE.call("transfer_to_Mythic_Operator", {
-            "handoff_title": "review task", "handoff_instruction": prompt}, 1),
+            "handoff_title": "review task", "handoff_instruction": prompt, **matrix.READ_BRIEF}, 1),
         matrix.CASE.call("get_all_task_output_by_task_id", {"task_id": 701}, 2),
         AIMessage(content=proposal), AIMessage(content=proposal),
         AIMessage(content='{"proposals":[]}'),
@@ -194,7 +194,7 @@ def test_projection_preserves_native_approval_decision(tmp_path, monkeypatch, de
     prompt = "Run whoami on callback 7 and report the output."
     messages = [
         matrix.CASE.call("transfer_to_Mythic_Operator", {
-            "handoff_title": "identity", "handoff_instruction": prompt}, 1),
+            "handoff_title": "identity", "handoff_instruction": prompt, **matrix.TASK_BRIEF}, 1),
         matrix.CASE.call("issue_task_and_waitfor_task_output", {
             "command": "whoami", "parameters": "", "callback_display_id": 7}, 2),
         AIMessage(content='{"proposals":[]}'),

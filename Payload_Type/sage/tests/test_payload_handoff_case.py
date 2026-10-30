@@ -465,7 +465,8 @@ def test_assembled_reuse_download_and_wrong_selector(monkeypatch, tmp_path, down
         ("Mythic_Payload", None, {"content": f"Reused {case.FILENAME}; agent_file_id={case.FILE_UUID}."}),
         ("Supervisor", "transfer_to_Mythic_Operator", {
             "handoff_title": "Propose exact upload",
-            "handoff_instruction": f"Propose callback 7 upload of file {case.FILE_UUID} to {case.DESTINATION}."}),
+            "handoff_instruction": f"Propose callback 7 upload of file {case.FILE_UUID} to {case.DESTINATION}.",
+            **case.OPERATOR_BRIEF, "expected_result": "An upload approval card for the reused payload file."}),
         ("Mythic_Operator", "upload_file_by_file_uuid", {
             "command": "upload", "parameters": {"file": case.FILE_UUID,
                 "remote_path": case.DESTINATION}, "file_uuid": case.FILE_UUID,

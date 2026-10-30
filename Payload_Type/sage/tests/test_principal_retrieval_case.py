@@ -120,7 +120,8 @@ def test_native_tool_path_and_unexpected_query_stop(tmp_path, monkeypatch):
 
     fake = mod.matrix.CASE.ScriptedModel(messages=iter([
         mod.matrix.CASE.call("transfer_to_Mythic_Operator", {
-            "handoff_title": "retained callback", "handoff_instruction": "Read callback inventory"}, 1),
+            "handoff_title": "retained callback", "handoff_instruction": "Read callback inventory",
+            **mod.matrix.READ_BRIEF}, 1),
         mod.matrix.CASE.call("list_callbacks", {}, 2),
         AIMessage(content="Callback 7 is LAB-WS01 in the retained inventory."),
         mod.matrix.CASE.call("transfer_to_BloodHound", {
@@ -218,7 +219,8 @@ def test_retained_task_provenance_reaches_bloodhound_handoff(tmp_path, monkeypat
 
     fake = mod.matrix.CASE.ScriptedModel(messages=iter([
         mod.matrix.CASE.call("transfer_to_Mythic_Operator", {
-            "handoff_title": "retained identity", "handoff_instruction": "Read task 701"}, 1),
+            "handoff_title": "retained identity", "handoff_instruction": "Read task 701",
+            **mod.matrix.READ_BRIEF}, 1),
         mod.matrix.CASE.call("get_all_task_output_by_task_id", {"task_id": 701}, 2),
         AIMessage(content="The retained output names a principal SID."),
         supervisor_to_bh,

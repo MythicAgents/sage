@@ -63,7 +63,9 @@ def test_source_identity_and_refined_assignment_reach_supervisor_after_three_ret
 
     script = [
         call("transfer_to_Mythic_Operator", {"handoff_title": "Read callback identity",
-                                           "handoff_instruction": "Read the available callback metadata."}, "route-1"),
+                                           "handoff_instruction": "Read the available callback metadata.",
+                                           "allowed_capabilities": ["control_plane"],
+                                           "expected_result": "Callback identity metadata."}, "route-1"),
         call("list_callbacks", {}, "callbacks-1"),
         call("handback_to_supervisor", {"reason": "Metadata available", "summary": "Callback metadata read.",
                                          "outcome": "progress", "next_owner": ""}, "return-1"),
@@ -205,6 +207,7 @@ def test_three_specialist_returns_can_reach_pending_native_approval(monkeypatch,
         effects.append((command, callback_display_id))
         return "inert output"
 
+    sink._recon_snapshot_cache[("list_callbacks", "all")] = [{"id": 7, "host": "WORKSTATION-7"}]
     sink.get_tools = lambda names: ([issue_task_and_waitfor_task_output]
                                     if "issue_task_and_waitfor_task_output" in names else [])
     script = [
@@ -214,7 +217,9 @@ def test_three_specialist_returns_can_reach_pending_native_approval(monkeypatch,
         AIMessage(content="Scope remains uncertain."),
         call("transfer_to_BloodHound", {"handoff_title": "Check evidence", "handoff_instruction": "Check the evidence."}, "route-c"),
         AIMessage(content="Evidence is incomplete."),
-        call("transfer_to_Mythic_Operator", {"handoff_title": "Propose check", "handoff_instruction": "Propose whoami on callback 7."}, "route-d"),
+        call("transfer_to_Mythic_Operator", {"handoff_title": "Propose check", "handoff_instruction": "Propose whoami on callback 7.",
+                                             "callback_display_id": 7, "targets": ["WORKSTATION-7"],
+                                             "expected_result": "The callback's identity."}, "route-d"),
         call("issue_task_and_waitfor_task_output", {"callback_display_id": 7,
              "command": "whoami", "parameters": ""}, "proposed-action"),
     ]

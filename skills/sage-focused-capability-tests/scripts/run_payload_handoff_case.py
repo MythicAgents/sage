@@ -94,16 +94,21 @@ UPLOAD_SCHEMA = [
     {"name": "filename", "cli_name": "fileName", "type": "ChooseOne", "choices": [],
      "parameter_group_name": "ExistingFile", "required": True},
 ]
+# A supervised Mythic_Operator delegation names the callback it works on, the host behind it, and its result.
+CALLBACK_HOST = CALLBACK_C2_CONFIG["callback"]["host"]
+OPERATOR_BRIEF = {"callback_display_id": 7, "targets": [CALLBACK_HOST]}
 SEEDS = (
     ("Supervisor", "transfer_to_Mythic_Operator", {"handoff_title": "Prepare Apollo payload",
-      "handoff_instruction": PROMPT}),
+      "handoff_instruction": PROMPT, **OPERATOR_BRIEF,
+      "expected_result": "A built Apollo payload's Mythic file identity, then an upload approval card."}),
     ("Mythic_Operator", "transfer_to_Mythic_Payload", {"handoff_title": "Build Apollo payload",
       "handoff_instruction": "Build the Windows Apollo payload using callback 7 as C2 reference; report its Mythic file identity."}),
     ("Mythic_Payload", "create_payload", BUILD_ARGS),
     ("Mythic_Payload", None, {"content": f"The Apollo build succeeded: {FILENAME}; "
       f"agent_file_id={FILE_UUID}; payload_uuid={PAYLOAD_UUID}."}),
     ("Supervisor", "transfer_to_Mythic_Operator", {"handoff_title": "Propose upload",
-      "handoff_instruction": f"Resume the requested upload proposal for callback 7 at {DESTINATION}."}),
+      "handoff_instruction": f"Resume the requested upload proposal for callback 7 at {DESTINATION}.",
+      **OPERATOR_BRIEF, "expected_result": "An upload approval card for the built payload file."}),
 )
 
 
@@ -353,6 +358,8 @@ async def run_case(profile: dict, output_dir: Path, _shared_ledger=None, tls_con
     sink._authenticate_live_command = live_command
     sink._fetch_command_schema = upload_schema
     sink._find_uploaded_file_by_name = uploaded_file
+    # Sage holds callback 7 as it would after listing callbacks, so a supervised delegation brief may name it.
+    sink._recon_snapshot_cache[("list_callbacks", "all")] = [{"id": 7, "host": CALLBACK_HOST}]
     async def dispatch(name, args):
         if name == "create_payload":
             if args != BUILD_ARGS or row["accepted_local_builds"]:

@@ -45,6 +45,12 @@ REDIRECT_TEXT = (
     "callback's identity and recommend one check for later. Stop without asking "
     "for approval or taking another action."
 )
+# A supervised Mythic_Operator delegation carries a structural brief. The fixture sink knows callback 7 on
+# this host, so a step that tasks callback 7 names both; a step that only reads records declares control_plane.
+CALLBACK_HOST = "WS01"
+TASK_BRIEF = {"callback_display_id": 7, "targets": [CALLBACK_HOST],
+              "expected_result": "The callback's whoami output."}
+READ_BRIEF = {"allowed_capabilities": ["control_plane"], "expected_result": "Report what the stored records show."}
 REDIRECT_ANSWER = (
     "This offline case has not verified the callback's identity. A later, separately "
     "approved whoami task could check it."
@@ -110,7 +116,12 @@ def accepted_effective_arguments(arguments: object) -> dict | None:
 
 
 def install_inert_supervised_preparation(sink, *, commands=("whoami", "shell", "hostname"), callback_id=7):
-    """Give a fixture sink real deterministic preparation backed by known empty schemas."""
+    """Give a fixture sink real deterministic preparation backed by known empty schemas.
+
+    The sink also holds the callback in its snapshot, as Sage would after listing callbacks, so a supervised
+    delegation brief may name it.
+    """
+    sink._recon_snapshot_cache = {("list_callbacks", "all"): [{"id": callback_id, "host": CALLBACK_HOST}]}
     preparer = MythicTools(agent_task_id="offline-preparation")
     preparer.client = object()
     async def live_command(command, callback):
@@ -210,12 +221,12 @@ async def _run_case(*, decision: str, proposed_command: str) -> dict:
         if authenticated_steer_seen:
             return AIMessage(content=REDIRECT_ANSWER)
         return call("transfer_to_Mythic_Operator", {
-            "handoff_title": "retry original identity task", "handoff_instruction": PROMPT,
+            "handoff_title": "retry original identity task", "handoff_instruction": PROMPT, **TASK_BRIEF,
         }, 4)
 
     script = [
         call("transfer_to_Mythic_Operator", {"handoff_title": "run scoped command",
-             "handoff_instruction": PROMPT}, 1),
+             "handoff_instruction": PROMPT, **TASK_BRIEF}, 1),
         call(proposal["name"], proposal["args"], 2),
         AIMessage(content="The guarded task was handled."),
         (finish_redirect_only_from_current_steer if decision == "redirect"

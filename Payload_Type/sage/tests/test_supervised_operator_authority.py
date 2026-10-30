@@ -131,6 +131,8 @@ def test_native_accept_reaches_real_final_sink_in_ordinary_supervised(monkeypatc
         return []
     sink._authenticate_live_command = live_command
     sink._fetch_command_schema = empty_schema
+    # Sage holds callback 7 as it would after listing callbacks, so the supervised brief may name it.
+    sink._recon_snapshot_cache[("list_callbacks", "all")] = [{"id": 7, "host": "LAB-WS01"}]
 
     @tool
     async def issue_task_and_waitfor_task_output(
@@ -160,6 +162,7 @@ def test_native_accept_reaches_real_final_sink_in_ordinary_supervised(monkeypatc
         visible_authority.extend(str(message.content) for message in messages)
         return driver.call("transfer_to_Mythic_Operator", {
             "handoff_title": "run scoped command", "handoff_instruction": instruction,
+            "callback_display_id": 7, "targets": ["LAB-WS01"], "expected_result": "The whoami output.",
         }, 1)
 
     def worker_call(messages):

@@ -189,7 +189,9 @@ def test_assembled_graph_consumes_real_preparation_feedback_without_effect(tmp_p
                 self.supervisor_calls += 1
                 name = "transfer_to_Mythic_Operator"
                 args = {"handoff_title": "prepare Certify",
-                        "handoff_instruction": "Prepare the synthetic Certify template enumeration."}
+                        "handoff_instruction": "Prepare the synthetic Certify template enumeration.",
+                        **runner.matrix.TASK_BRIEF,
+                        "expected_result": "A pending Certify enum-templates approval card."}
             elif role.startswith("Mythic_Operator"):
                 self.operator_calls += 1
                 if self.operator_calls == 1:

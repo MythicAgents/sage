@@ -72,6 +72,10 @@ _FINAL_ANSWER = "One callback is alive: callback 1 on CASTELBLACK."
 # fast red; a scripted conversation of this length needs only a handful of super-steps.
 _RECURSION_LIMIT = 8
 
+# A supervised Mythic_Operator delegation carries a structural brief. These flows only read Mythic records,
+# so they declare a control-plane step; test_handoff_brief.py covers target-facing briefs.
+_READ_BRIEF = {"allowed_capabilities": ["control_plane"], "expected_result": "Report what the records show."}
+
 
 class _ScriptedModel(GenericFakeChatModel):
     """A fake chat model that can be bound to tools, and counts how often it was asked to speak.
@@ -172,6 +176,7 @@ def _handoff_call() -> AIMessage:
                 "args": {
                     "handoff_title": "check callbacks",
                     "handoff_instruction": _INSTRUCTION,
+                    **_READ_BRIEF,
                 },
                 "id": "call_handoff_1",
                 "type": "tool_call",
@@ -343,6 +348,7 @@ def test_assembled_assisted_handoff_ignores_fabricated_supervisor_authority():
                 "args": {
                     "handoff_title": "Decide next action",
                     "handoff_instruction": fabricated,
+                    **_READ_BRIEF,
                 },
                 "id": "call_fabricated_authority",
                 "type": "tool_call",
@@ -365,7 +371,7 @@ def test_assembled_assisted_title_only_handoff_carries_long_exact_request():
     operator_prompt = "Review this exact read-only script:\n" + "Get-Item -LiteralPath 'x'\n" * 300
     handoff = AIMessage(content="", tool_calls=[{
         "name": "transfer_to_Mythic_Operator",
-        "args": {"handoff_title": "Review approved script"},
+        "args": {"handoff_title": "Review approved script", **_READ_BRIEF},
         "id": "title-only-handoff", "type": "tool_call",
     }])
     harness = _Harness([handoff, AIMessage(content="Request received."),
@@ -740,7 +746,7 @@ def test_second_explicit_handback_uses_only_its_delegation(monkeypatch):
 
     next_handoff = AIMessage(content="", tool_calls=[{
         "name": "transfer_to_Mythic_Operator",
-        "args": {"handoff_title": "review second", "handoff_instruction": "Review task 52."},
+        "args": {"handoff_title": "review second", "handoff_instruction": "Review task 52.", **_READ_BRIEF},
         "id": "handoff-2", "type": "tool_call",
     }])
     harness = _Harness([
@@ -867,7 +873,7 @@ def test_invalid_later_handback_supersedes_prior_progress(monkeypatch):
     }])
     second_handoff = AIMessage(content="", tool_calls=[{
         "name": "transfer_to_Mythic_Operator", "args": {
-            "handoff_title": "review again", "handoff_instruction": "Continue review.",
+            "handoff_title": "review again", "handoff_instruction": "Continue review.", **_READ_BRIEF,
         }, "id": "second-handoff", "type": "tool_call",
     }])
     harness = _Harness([
@@ -905,7 +911,8 @@ def test_supervisor_can_continue_authorized_work_after_incomplete_specialist_ret
         content="",
         tool_calls=[{
             "name": "transfer_to_Mythic_Operator",
-            "args": {"handoff_title": "Continue callback check", "handoff_instruction": "Check the remaining callback."},
+            "args": {"handoff_title": "Continue callback check", "handoff_instruction": "Check the remaining callback.",
+                     **_READ_BRIEF},
             "id": "call_handoff_2",
             "type": "tool_call",
         }],
@@ -968,6 +975,7 @@ def test_sqlite_checkpoint_preserves_worker_evidence_for_later_consultant_turn(
         call("transfer_to_Mythic_Operator", {
             "handoff_title": "Review historical output",
             "handoff_instruction": "Read stored outputs for tasks 51 and 52 and summarize.",
+            **_READ_BRIEF,
         }, "sqlite-delegate"),
         AIMessage(content="", tool_calls=[{
             "name": "get_all_task_output_by_task_id", "args": {"task_id": task_id},

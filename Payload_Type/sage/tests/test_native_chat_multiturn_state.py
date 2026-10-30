@@ -238,7 +238,10 @@ def test_same_channel_worker_sees_prior_command_schema_after_second_handoff(monk
         return AIMessage(content="", tool_calls=[{
             "name": "transfer_to_Mythic_Operator",
             "args": {"handoff_title": "Inspect command metadata",
-                     "handoff_instruction": "Inspect the command schema."},
+                     "handoff_instruction": "Inspect the command schema.",
+                     # A supervised step that only reads Mythic records declares a control-plane brief.
+                     "allowed_capabilities": ["control_plane"],
+                     "expected_result": "The command's parameter schema."},
             "id": call_id, "type": "tool_call",
         }])
 

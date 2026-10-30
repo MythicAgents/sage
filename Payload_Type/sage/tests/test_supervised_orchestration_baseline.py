@@ -1,8 +1,9 @@
 """Baseline probes: what the current supervised path does with the delegation shapes channel 3 exposed.
 
-These are MEASUREMENTS, not desired behaviour. Each test asserts what the real assembled graph does today, so the
-supervised orchestration plan's later slices flip them deliberately (a brief gate, per-step bounds) instead of
-discovering the old behaviour by accident. Only the model is scripted; the graph, handoff tools, middleware and
+These are MEASUREMENTS, not desired behaviour. Each test asserts what the real assembled graph does today, so later
+changes flip them deliberately instead of discovering the old behaviour by accident. The brief probe is flipped: a
+supervised Mythic_Operator delegation now needs a structural brief (test_handoff_brief.py). The step-bound probe
+still records that nothing bounds a delegation. Only the model is scripted; the graph, handoff tools, middleware and
 state channels are real (see test_scripted_handoff.py for the harness and its stated seams).
 
 The worker's tool is a neutral, test-only counter added to Mythic_Operator's tool list, so the probes measure
@@ -83,15 +84,16 @@ def _worker_received(result: dict) -> list[str]:
     {"handoff_title": "List active callbacks"},                                            # title only
     {"handoff_title": "Take the domain", "handoff_instruction": "Objective: " + PROMPT},   # restates the objective
 ], ids=["title-only", "restates-objective"])
-def test_baseline_any_brief_shape_is_dispatched_and_the_worker_gets_the_operator_input(args, probe_calls):
-    result = _run([_handoff(args), AIMessage(content="worker done"), AIMessage(content="final")],
-                  recursion_limit=8)
+def test_baseline_unscoped_brief_shapes_are_no_longer_dispatched(args, probe_calls):
+    result = _run([_handoff(args), AIMessage(content="final")], recursion_limit=12)
 
-    assert PROMPT in _worker_received(result)  # dispatched: no brief check rejects it today
+    assert PROMPT not in _worker_received(result)  # the brief check rejects both channel 3 shapes before dispatch
 
 
 def test_baseline_a_worker_runs_every_step_it_chooses_before_control_returns(probe_calls):
-    script = [_handoff({"handoff_title": "Work the objective", "handoff_instruction": "Objective: " + PROMPT}),
+    # A control-plane brief passes the brief check without callback data; the probe tool itself is neutral.
+    script = [_handoff({"handoff_title": "Work the objective", "handoff_instruction": "Objective: " + PROMPT,
+                        "allowed_capabilities": ["control_plane"], "expected_result": "Probe steps recorded."}),
               *(_probe_step(step) for step in range(PROBE_CALLS)),
               AIMessage(content="worker done"),
               AIMessage(content="final")]

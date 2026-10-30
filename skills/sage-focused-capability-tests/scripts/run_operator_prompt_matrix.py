@@ -86,6 +86,11 @@ CALLBACKS = [
     {"id": 8, "agent": "apollo", "user": "LAB\\operator", "host": "LAB-WS02", "integrity": 2, "status": "active", "secs_since_checkin": 7},
 ]
 COMMANDS = ("whoami", "shell", "ps")
+# A supervised Mythic_Operator delegation carries a structural brief: a step that tasks a callback names the
+# callback and its host, and a step that only reads Mythic records declares control_plane.
+TASK_BRIEF = {"callback_display_id": 7, "targets": ["LAB-WS01"],
+              "expected_result": "The task output from callback 7."}
+READ_BRIEF = CASE.READ_BRIEF
 
 
 def fixture_task_schema(command, callback_id):
@@ -608,6 +613,11 @@ async def run_case(case_id, prompt, decision, profile, output_dir, limits, tls_c
         ids = (2,) if retained_fixture is not None else (7, 8)
         return "apollo" if type(callback_display_id) is int and callback_display_id in ids else None
     sink._resolve_payload_type = fixture_payload_type
+    if retained_fixture is None:
+        # Sage holds the fixture inventory as it would after listing callbacks, so a supervised delegation
+        # brief may name the callback a step tasks. The retained fixture is read-only and needs no callback.
+        sink._recon_snapshot_cache[("list_callbacks", "all")] = [
+            {"id": row["id"], "host": row["host"], "user": row["user"]} for row in CALLBACKS]
     async_client = httpx.AsyncClient(transport=transport, timeout=limits.request_seconds, trust_env=False)
     sync_transport = REAL.BoundedSyncTransport()
     sync_client = httpx.Client(transport=sync_transport, timeout=limits.request_seconds, trust_env=False)

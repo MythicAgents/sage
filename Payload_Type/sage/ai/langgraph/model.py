@@ -34,7 +34,7 @@ from mythic_container.MythicRPC import (
     MythicRPCTaskUpdateMessage,
     SendMythicRPCTaskUpdate
 )
-from typing import Annotated, Any, Awaitable, Callable, Literal
+from typing import Annotated, Any, Awaitable, Callable, Iterable, Literal
 from typing_extensions import NotRequired
 from uuid import UUID, uuid4
 from .mythic_tools import (
@@ -61,6 +61,7 @@ from .request_events import RequestEventLedger, stable_event_id
 from .decision_record import seal_request_decision_record
 from .operator_error import operator_error_text
 from . import worker_outcome as _worker_outcome
+from . import handoff_brief as _handoff_brief
 from . import prompt_context
 from ai.mcp import MCPManager, MCP_EXECUTION_CONTEXT_OFFENSIVE_RUNTIME
 from ai import observation_channel, provider_retry, resource_budget, resource_http
@@ -5649,6 +5650,55 @@ class Model:
 
     def _assisted_operator_input_for_handoff(self) -> str | None:
         return _current_assisted_operator_input(self.state)
+
+    def _check_handoff_brief(
+        self, worker: str, brief: "_handoff_brief.HandoffBrief", instruction: str,
+    ) -> tuple[tuple[str, ...], bool] | None:
+        """Structurally check a delegation's brief before dispatch; None admits it.
+
+        Reads the request lane and operator input from the Model's state, as the assisted-input lookup does: the
+        handoff tool's runtime state is the Supervisor's own channel view. Rejections are request evidence.
+        Returns the errors and whether this rejection ends the step, so the Supervisor cannot trade rejections
+        until the step budget runs out.
+        """
+        state = self.state
+        contract = getattr(self, "_request_contract", None)
+        lane = str(getattr(getattr(contract, "lane", None), "value", "") or state.get("_request_lane") or "")
+        if lane == "autonomous_objective":
+            return None
+        try:
+            operator_input = _current_assisted_operator_input(state) or ""
+        except RuntimeError:
+            operator_input = ""
+        scope = _handoff_brief.known_scope(
+            getattr(self, "mythic_client", None),
+            operator_input=operator_input,
+            bound_callback=getattr(getattr(self, "_turn_authority", None), "bounded_callback_id", ""),
+        )
+        errors = _handoff_brief.validate_brief(
+            brief, worker=worker, require_scope=lane == "supervised_workflow", scope=scope,
+        )
+        restatement = _handoff_brief.restatement(instruction, operator_input)
+        ledger = self._ensure_request_event_ledger(str(getattr(contract, "request_id", "") or ""))
+        ledger.record(
+            event_id=f"brief:{ledger.request_id}:{len(ledger.actual_events(kind='brief')) + 1}",
+            kind="brief",
+            phase="rejected" if errors else "accepted",
+            content="; ".join(errors) if errors else worker,
+            metadata={
+                "worker": worker,
+                "restatement": restatement,
+                "brief": json.dumps(brief.as_metadata(), sort_keys=True),
+            },
+        )
+        logger.info(
+            f"🧾 [brief] {worker} {'rejected' if errors else 'accepted'} | "
+            f"restatement={restatement} | errors={list(errors)}"
+        )
+        if not errors:
+            return None
+        rejections = _handoff_brief.rejection_count(ledger.actual_events(kind="brief"))
+        return errors, rejections >= _handoff_brief.REJECTIONS_BEFORE_STOP
 
     def _pending_task_receipt_for_request(self) -> dict[str, Any] | None:
         """Return a trusted unfinished-task receipt for this supervised graph request."""
@@ -13813,6 +13863,7 @@ class Model:
             "caller_request_id_lookup": lambda: str(
                 getattr(getattr(self, "_request_contract", None), "request_id", "") or ""
             ),
+            "brief_check": None if self.mode == "auto" else self._check_handoff_brief,
         }
         assign_to_generalist_agent = _create_handoff_tool(
             agent_name="Generalist",
@@ -13892,6 +13943,11 @@ class Model:
         if not self._autonomous_execution_enabled_for_turn():
             tools.insert(4, assign_to_sandbox_agent)
             tools.insert(4, assign_to_mcp_manager_agent)
+        mythic_client = getattr(self, "mythic_client", None)
+        if self.mode != "auto" and mythic_client is not None:
+            # Read-only callback listing lets the Supervisor answer callback questions and name a step's callback
+            # and targets in the delegation brief without first delegating a lookup.
+            tools.extend(mythic_client.get_tools(["list_callbacks"]))
         tools = filter_tools_by_frontmatter("supervisor", tools)
 
         llm = self._get_base_chat_model()
@@ -16592,6 +16648,7 @@ def _create_handoff_tool(
     worker_outcome_lookup: Callable[[dict[str, Any]], tuple[dict[str, Any], str] | None] | None = None,
     subgoal_scheduler: Callable[..., dict[str, Any]] | None = None,
     assisted_operator_lookup: Callable[[], str | None] | None = None,
+    brief_check: Callable[..., tuple[tuple[str, ...], bool] | None] | None = None,
 ):
     """Create a handoff tool to transfer control to another agent.
     https://docs.langchain.com/oss/python/langchain/multi-agent#handoffs
@@ -16626,6 +16683,7 @@ def _create_handoff_tool(
         *,
         input_payload: str = "",
         input_type: str = "",
+        brief: _handoff_brief.HandoffBrief | None = None,
     ) -> Command:
         # The Supervisor chooses the worker, but its generated prose is not
         # operator authority. The exact current assisted input is rebound after every redirect
@@ -16644,6 +16702,12 @@ def _create_handoff_tool(
             )
         except Exception:  # pragma: no cover
             pass
+        if brief_check is not None:
+            rejected = brief_check(
+                agent_name, brief or _handoff_brief.HandoffBrief(), str(handoff_instruction or ""),
+            )
+            if rejected is not None:
+                return _brief_rejection_command(runtime, name, agent_name, *rejected, channels=channel_map.values())
         requested = _handoff_directive(agent_name, handoff_instruction, handoff_title)
         redirect = None
         raw_subgoal = runtime.state.get("_subgoal_state")
@@ -16901,6 +16965,8 @@ def _create_handoff_tool(
         injected_human = HumanMessage(content=delegated_instruction)
         injected_human.additional_kwargs["_delegated_to"] = actual_agent_name
         injected_human.additional_kwargs["_handoff_title"] = actual_title
+        if brief is not None:
+            injected_human.additional_kwargs["_handoff_brief"] = brief.as_metadata()
         if assisted_operator_input is not None and not terminal_redirect and actual_instruction.strip():
             # Materialized as explicitly non-authoritative AI context at the worker
             # invocation, after the current request/operator binding is checked.
@@ -16971,6 +17037,26 @@ def _create_handoff_tool(
                 input_payload=input_payload,
                 input_type=input_type,
             )
+    elif brief_check is not None:
+        @tool(name, description=description)
+        def handoff_tool(
+            runtime: ToolRuntime,
+            handoff_instruction: Annotated[str, "The specific worker task, including what needs resolving after a prior result. In assisted modes this is non-authoritative task context; Sage separately supplies the exact operator input. Omit when that input already states the whole task."] = "",
+            handoff_title: Annotated[str, "A short operator-facing title for the sub-agent card, usually 3-8 words and never the full instruction. Example: 'List active callbacks'."] = "",
+            callback_display_id: Annotated[int | str | None, "The Mythic callback display id this step runs on. Required for a supervised Mythic_Operator step unless allowed_capabilities is ['control_plane']; must be a callback already observed, and the request's bound callback when it has one."] = None,
+            targets: Annotated[list[str] | None, "Hosts, domains, or principals this step acts on, each named in the operator's request or already in engagement state. Required for a supervised Mythic_Operator step unless allowed_capabilities is ['control_plane']."] = None,
+            expected_result: Annotated[str, "One line stating what this step should produce. Required for a supervised Mythic_Operator step."] = "",
+            allowed_capabilities: Annotated[list[str] | None, "Capability classes the step may use: catalog names, 'off_catalog' for work outside the catalog, or ['control_plane'] alone for a step that only reads Mythic or BloodHound records (callbacks, task output, credentials, graph) and tasks no callback."] = None,
+            inputs_by_reference: Annotated[list[str] | None, "Earlier results this step uses, as 'task:<display id>' or 'cred:<credential id>' records Sage already holds."] = None,
+        ) -> Command:
+            brief = _handoff_brief.HandoffBrief.from_args(
+                targets=targets,
+                callback_display_id=callback_display_id,
+                allowed_capabilities=allowed_capabilities,
+                inputs_by_reference=inputs_by_reference,
+                expected_result=expected_result,
+            )
+            return _build_handoff_command(runtime, handoff_instruction, handoff_title, brief=brief)
     else:
         @tool(name, description=description)
         def handoff_tool(
@@ -16981,6 +17067,52 @@ def _create_handoff_tool(
             return _build_handoff_command(runtime, handoff_instruction, handoff_title)
 
     return handoff_tool
+
+
+def _brief_rejection_command(
+    runtime: ToolRuntime,
+    tool_name: str,
+    agent_name: str,
+    errors: tuple[str, ...],
+    stop: bool,
+    *,
+    channels: Iterable[str],
+) -> Command:
+    """Refuse a delegation whose brief failed structural checks; nothing reaches the worker."""
+    detail = "\n".join(f"- {error}" for error in errors)
+    tool_message = ToolMessage(
+        content=f"Delegation to {agent_name} was not dispatched; its brief failed these checks:\n{detail}",
+        name=tool_name,
+        tool_call_id=runtime.tool_call_id,
+        status="error",
+    )
+    if not stop:
+        return Command(update={"messages": [tool_message]})
+    max_seq = max(
+        (_get_seq(message) for key in channels for message in runtime.state.get(key, [])),
+        default=0,
+    )
+    final_message = AIMessage(
+        content=(
+            f"**Blocked**\n\nI could not form an admissible delegation to {agent_name} for this request "
+            f"after {_handoff_brief.REJECTIONS_BEFORE_STOP} attempts. The last brief failed these checks:"
+            f"\n{detail}\n\nName the callback and targets for the step, or narrow the request."
+        ),
+        name="Supervisor",
+        additional_kwargs={"_is_final_report": True, "_turn_outcome": _TURN_OUTCOME_BLOCKED},
+    )
+    _tag_msg(tool_message, max_seq + 1)
+    _tag_msg(final_message, max_seq + 2)
+    return Command(
+        goto="__end__",
+        update={
+            "messages": [tool_message, final_message],
+            "supervisor_messages": [tool_message, final_message],
+            "_message_seq": max_seq + 3,
+            "recursion_handback": True,
+        },
+        graph=Command.PARENT,
+    )
 
 
 def _autonomous_capability_handoff_title(action: Any) -> str:
