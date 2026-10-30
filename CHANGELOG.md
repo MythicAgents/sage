@@ -9,6 +9,15 @@ between minor releases.
 
 ### Added
 
+- In supervised and conversation mode, a request to reach privilege on or take control of a target now consults
+  the BloodHound graph before Sage chooses a specialist. Sage reads which domains the graph has collected and,
+  for each target domain the graph covers, whether a path exists from the principals Sage controls. It then
+  hands that result to the Supervisor as context: covered, partially covered (naming the domains that were never
+  collected), no graph, or BloodHound unreachable. A target named without its suffix ("essos") resolves only
+  against domains Sage has observed. The read cannot block a request: if BloodHound is down or slow, Sage
+  proceeds and says no graph analysis was available. "Administrative control", "full control" and "DA" now count
+  as privilege goals.
+
 - `list_staged_tools`, a read-only tool for the operator agent, and `/tools staged` in chat list the binaries in
   Sage's `tools/` drop zone. Before, Sage found a staged binary only when a TTP named its exact filename. Each
   file shows its sha256, its type and architecture read from the file header, the TTPs that document it, and

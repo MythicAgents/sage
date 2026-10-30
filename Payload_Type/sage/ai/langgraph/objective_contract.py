@@ -123,6 +123,9 @@ _ATTACK_PATH_VERBS = (
 _ATTACK_PATH_PRIV_NOUNS = (
     "domain admin", "domain admins", "enterprise admin", "enterprise admins",
     "domain controller", "privilege", "privileges", "privileged",
+    "domain administrator", "domain administrators", "enterprise administrator",
+    "administrative control", "administrative access", "admin access", "admin rights",
+    "full control", "da", "ea",
 )
 
 

@@ -7796,6 +7796,73 @@ class MythicTools:
     _GRAPH_FACTS_TTL_SECONDS = 600                 # facts stay live in the engagement state for 10 min
     _GRAPH_FACTS_REFRESH_INTERVAL_SECONDS = 120    # don't re-run the read-only cypher more than ~every 2 min
 
+    async def _consult_attack_graph(self, prompt: str):
+        """Run the attack-graph knowledge source contract for an operator prompt (read-only, fail-open)."""
+        try:
+            from . import access_reconciler, engagement_state, graph_reconciler, knowledge_sources
+        except ImportError:
+            import access_reconciler
+            import engagement_state
+            import graph_reconciler
+            import knowledge_sources
+
+        cypher_tool = info_tool = None
+        try:
+            from ai.mcp import MCPManager
+            for server in MCPManager.get_connected_servers():
+                if not MCPManager.is_bloodhound_server(server):
+                    continue
+                for tool in MCPManager.get_tools_by_server(server):
+                    name = getattr(tool, "name", "")
+                    if name == "cypher_query":
+                        cypher_tool = tool
+                    elif name == "domain_info":
+                        info_tool = tool
+        except Exception:
+            cypher_tool = info_tool = None
+
+        now = datetime.now(timezone.utc).isoformat()
+
+        async def collected_domains():
+            return await _bloodhound_collected_domains(info_tool)
+
+        async def probe_paths(domains):
+            footholds = list(getattr(self, "_engagement_footholds", []) or [])
+            if not footholds:
+                footholds = list(await access_reconciler.reconcile_access(self, now) or [])
+                self._engagement_footholds = list(footholds)
+            state = engagement_state.EngagementState(
+                objective=str(prompt or ""),
+                footholds=footholds,
+                hops=list(self._engagement_hops),
+                graph_facts=list(getattr(self, "_engagement_graph_facts", []) or []),
+                engagement_id=self._eng_key(),
+                runtime_scope=True,
+            )
+            principals = graph_reconciler.controlled_principals_from_state(state)
+
+            class _SingleToolMCP:
+                async def get_tool_by_name(self, name, server_name=None):
+                    return cypher_tool
+
+            facts = await graph_reconciler.probe_path_to_objective(
+                _SingleToolMCP(), principals, domains, now, self._GRAPH_FACTS_TTL_SECONDS,
+            )
+            return [getattr(fact, "predicate", "") for fact in facts or []]
+
+        trust_domains = [
+            str(getattr(fact, "predicate", "")).split(":", 1)[1]
+            for fact in getattr(self, "_engagement_graph_facts", []) or []
+            if str(getattr(fact, "predicate", "")).startswith("trust-reachable:")
+        ]
+        return await knowledge_sources.consult_attack_graph(
+            prompt,
+            available=cypher_tool is not None and info_tool is not None,
+            collected_domains=collected_domains,
+            probe_paths=probe_paths,
+            other_known_domains=trust_domains,
+        )
+
     async def _refresh_graph_facts_if_stale(
         self,
         now: str,

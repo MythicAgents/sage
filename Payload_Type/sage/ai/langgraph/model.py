@@ -7434,6 +7434,64 @@ class Model:
             metadata={"native_request_id": str(native_request_id or "")},
         )
 
+    _ATTACK_GRAPH_CONSULT_TIMEOUT_SECONDS = 20.0
+
+    async def _attack_graph_consult_message(self, prompt, request_contract) -> HumanMessage | None:
+        """Hidden Supervisor context carrying the attack-graph consult for an objective-shaped request.
+
+        Supervisor-graph lanes only (supervised and conversation); fail-open, so an error or timeout costs
+        the turn nothing but the consult itself.
+        """
+        try:
+            from . import knowledge_sources
+            from .request_contract import RequestLane
+        except ImportError:
+            import knowledge_sources
+            from request_contract import RequestLane
+        if getattr(request_contract, "lane", None) not in (
+            RequestLane.SUPERVISED_WORKFLOW, RequestLane.CONVERSATIONAL,
+        ):
+            return None
+        if knowledge_sources.classify_turn(prompt) != knowledge_sources.TURN_OBJECTIVE:
+            return None
+        consult_fn = getattr(getattr(self, "mythic_client", None), "_consult_attack_graph", None)
+        if not callable(consult_fn):
+            return None
+        try:
+            consult = await asyncio.wait_for(
+                consult_fn(prompt), timeout=self._ATTACK_GRAPH_CONSULT_TIMEOUT_SECONDS,
+            )
+        except Exception as e:
+            logger.warning(f"Attack-graph consult failed open: {type(e).__name__}: {e}")
+            consult = knowledge_sources.AttackGraphConsult(knowledge_sources.ConsultOutcome.UNAVAILABLE)
+        text = knowledge_sources.render_consult(consult)
+        if not text:
+            return None
+        metadata = consult.as_metadata()
+        try:
+            ledger = self._ensure_request_event_ledger()
+            if ledger is not None and getattr(ledger, "request_id", ""):
+                ledger.record_once(
+                    event_id=stable_event_id(ledger.request_id, "knowledge_consult", "attack_graph"),
+                    kind="knowledge_consult",
+                    phase=metadata["outcome"],
+                    content=text,
+                    metadata=metadata,
+                )
+        except Exception:
+            pass
+        logger.info(f"🧭 [knowledge-consult] attack_graph outcome={metadata['outcome']} "
+                    f"objective={metadata['objective_domains']} missing={metadata['missing_domains']}")
+        return HumanMessage(
+            content=text,
+            additional_kwargs={
+                "_request_id": request_contract.request_id,
+                "_synthetic_nudge": "knowledge_source_consult",
+                "_knowledge_source_consult": metadata,
+                "_hide_from_stream": True,
+            },
+        )
+
     def request_event_transcript(self) -> list[dict[str, str]]:
         ledger = getattr(self, "_request_event_ledger", None)
         return ledger.reconstruct_transcript() if isinstance(ledger, RequestEventLedger) else []
@@ -15105,6 +15163,13 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             )
             _tag_msg(view_msg, self._next_seq())
             self.state["supervisor_messages"].append(view_msg)
+
+        # An objective-shaped request consults the attack graph before the Supervisor routes, so graph
+        # coverage and path existence are known facts rather than a specialist the Supervisor must remember.
+        consult_msg = await self._attack_graph_consult_message(prompt, request_contract)
+        if consult_msg is not None:
+            _tag_msg(consult_msg, self._next_seq())
+            self.state["supervisor_messages"].append(consult_msg)
 
         user_msg = HumanMessage(
             content=prompt,
