@@ -33,9 +33,10 @@ between minor releases.
 - The Supervisor can list callbacks itself in conversation and supervised mode, so "which callbacks are alive"
   is answered without a delegation and a brief can name a callback the Supervisor has seen.
 
-- Every delegation outside the capability catalog is recorded with its title, assignment, expected result and
-  brief, so later reviews can find recurring procedures worth adding to the catalog. The capability choices
-  offered to the model come from the catalog itself.
+- Every delegation outside the capability catalog, that is every step scoped by its guarded tools rather than a
+  catalog procedure, is recorded with its title, assignment, expected result and brief, so later reviews can find
+  recurring procedures worth adding to the catalog. The capability choices offered to the model come from the
+  catalog itself, and a name that is not a catalog procedure is refused.
 
 - In supervised and conversation mode, a request to reach privilege on or take control of a target now consults
   the BloodHound graph before Sage chooses a specialist. Sage reads which domains the graph has collected and,

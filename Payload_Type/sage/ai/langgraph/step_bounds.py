@@ -22,7 +22,6 @@ DENIED_PREFIX = "[DENIED by operator]"
 CONTROL_TOOLS = frozenset({"handback_to_supervisor", "summarize_and_handback", "request_continuation",
                            "respond_to_user"})
 CONTROL_PLANE = "control_plane"
-OFF_CATALOG = "off_catalog"
 
 
 class StepStatus(str, Enum):
@@ -150,7 +149,7 @@ def scope_violation(brief: Any, tool_name: str, capability_name: str = "") -> st
         if tool_name in tools:
             return ""
         return f"`{tool_name}` is not in this step's allowed_tools ({', '.join(tools)})"
-    if capabilities and OFF_CATALOG not in capabilities:
+    if capabilities:
         if tool_name != "execute_capability":
             return (f"`{tool_name}` is outside this step's capabilities ({', '.join(capabilities)}); "
                     "a catalog procedure runs through execute_capability")

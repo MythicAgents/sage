@@ -88,7 +88,7 @@ def test_bound_reached_at_each_limit_and_not_before(calls, errors, active, reach
     ({"allowed_tools": [ISSUE]}, ISSUE, "", False),
     ({"allowed_tools": [ISSUE]}, "upload_file_by_file_uuid", "", True),
     ({"allowed_capabilities": ["control_plane"]}, ISSUE, "", True),
-    ({"allowed_capabilities": ["off_catalog"]}, ISSUE, "", False),
+    ({"allowed_capabilities": ["collect-graph", "dcsync-krbtgt"]}, "execute_capability", "dcsync-krbtgt", False),
     ({"allowed_capabilities": ["collect-graph"]}, "execute_capability", "collect-graph", False),
     ({"allowed_capabilities": ["collect-graph"]}, "execute_capability", "dcsync-krbtgt", True),
     ({"allowed_capabilities": ["collect-graph"]}, ISSUE, "", True),

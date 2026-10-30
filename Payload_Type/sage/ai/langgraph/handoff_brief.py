@@ -20,7 +20,6 @@ except ImportError:  # pragma: no cover - flat import layout
     import capabilities
 
 CONTROL_PLANE = "control_plane"
-OFF_CATALOG = "off_catalog"
 TARGET_FACING_WORKERS = frozenset({"Mythic_Operator"})
 REJECTIONS_BEFORE_STOP = 2
 
@@ -52,8 +51,11 @@ def catalog_names() -> tuple[str, ...]:
 
 
 def capability_choices() -> tuple[str, ...]:
-    """Every value a brief may name in `allowed_capabilities`."""
-    return (*catalog_names(), OFF_CATALOG, CONTROL_PLANE)
+    """Every value a brief may name in `allowed_capabilities`: a catalog procedure, or control-plane reads only.
+
+    Work outside the catalog names its guarded tools in `allowed_tools` instead, so it is always scoped.
+    """
+    return (*catalog_names(), CONTROL_PLANE)
 
 
 @dataclass(frozen=True)
@@ -64,8 +66,6 @@ class HandoffBrief:
     allowed_tools: tuple[str, ...] = ()
     inputs_by_reference: tuple[str, ...] = ()
     expected_result: str = ""
-    # Names the brief gave that are not catalog classes, as given; each is recorded as off-catalog work.
-    off_catalog_names: tuple[str, ...] = ()
     # Reserved: step budgets are enforced by the step-bounds work and plan identity by the plan work.
     budget: str = ""
     step_id: str = ""
@@ -75,18 +75,13 @@ class HandoffBrief:
     def from_args(cls, *, targets: Any = None, callback_display_id: Any = None, allowed_capabilities: Any = None,
                   allowed_tools: Any = None, inputs_by_reference: Any = None,
                   expected_result: Any = None) -> "HandoffBrief":
-        catalog = set(catalog_names())
-        requested = tuple(item.casefold() for item in _items(allowed_capabilities))
-        off_catalog = tuple(item for item in requested if item not in catalog and item != CONTROL_PLANE)
-        allowed = tuple(dict.fromkeys(OFF_CATALOG if item in off_catalog else item for item in requested))
         return cls(
             targets=_items(targets),
             callback_display_id=_callback(callback_display_id),
-            allowed_capabilities=allowed,
+            allowed_capabilities=tuple(dict.fromkeys(item.casefold() for item in _items(allowed_capabilities))),
             allowed_tools=tuple(dict.fromkeys(_items(allowed_tools))),
             inputs_by_reference=tuple(item.casefold() for item in _items(inputs_by_reference)),
             expected_result=str(expected_result or "").strip(),
-            off_catalog_names=off_catalog,
         )
 
     @property
@@ -95,8 +90,8 @@ class HandoffBrief:
 
     @property
     def off_catalog(self) -> bool:
-        """Work that is not a catalog procedure: named off-catalog, or scoped by tools instead of a procedure."""
-        return OFF_CATALOG in self.allowed_capabilities or bool(self.allowed_tools)
+        """Work that is not a catalog procedure: the step names its guarded tools instead of a procedure."""
+        return bool(self.allowed_tools)
 
     def as_metadata(self) -> dict[str, Any]:
         return {
@@ -106,7 +101,6 @@ class HandoffBrief:
             "allowed_tools": list(self.allowed_tools),
             "inputs_by_reference": list(self.inputs_by_reference),
             "expected_result": self.expected_result,
-            "off_catalog_names": list(self.off_catalog_names),
         }
 
 
@@ -229,6 +223,10 @@ def validate_brief(brief: HandoffBrief, *, worker: str, require_scope: bool, sco
                    worker_tools: Iterable[str] | None = None) -> tuple[str, ...]:
     """Return one error per failing field; empty when the brief may be dispatched."""
     errors: list[str] = []
+    unknown = [name for name in brief.allowed_capabilities if name not in {*catalog_names(), CONTROL_PLANE}]
+    if unknown:
+        errors.append(f"allowed_capabilities: {', '.join(unknown)} is not a catalog procedure; name the step's "
+                      "guarded tools in allowed_tools for work outside the catalog")
     if brief.allowed_capabilities and brief.allowed_tools:
         errors.append("name either allowed_capabilities or allowed_tools for a step, not both")
     if worker_tools is not None:

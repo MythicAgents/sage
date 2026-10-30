@@ -5893,8 +5893,8 @@ class Model:
         )
         if not errors:
             if brief.off_catalog:
-                # Durable through the sealed decision record: retrospectives mine these for recurring
-                # multi-step procedures worth adding to the capability catalog.
+                # A tool-scoped step is work outside the catalog. Durable through the sealed decision record:
+                # retrospectives mine these for recurring multi-step procedures worth adding to the catalog.
                 ledger.record(
                     event_id=f"off_catalog:{ledger.request_id}:{len(ledger.actual_events(kind='off_catalog')) + 1}",
                     kind="off_catalog",
@@ -5904,7 +5904,7 @@ class Model:
                         "worker": worker,
                         "title": title,
                         "assignment": instruction[:2000],
-                        "names_given": ",".join(brief.off_catalog_names),
+                        "allowed_tools": ",".join(brief.allowed_tools),
                         "brief": json.dumps(brief.as_metadata(), sort_keys=True),
                     },
                 )
@@ -17292,7 +17292,7 @@ def _create_handoff_tool(
             callback_display_id: Annotated[int | str | None, "The Mythic callback display id this step runs on. Required for a supervised Mythic_Operator step unless allowed_capabilities is ['control_plane']; must be a callback already observed, and the request's bound callback when it has one."] = None,
             targets: Annotated[list[str] | None, "Hosts, domains, or principals this step acts on, each named in the operator's request or already in engagement state. Required for a supervised Mythic_Operator step unless allowed_capabilities is ['control_plane']."] = None,
             expected_result: Annotated[str, "One line stating what this step should produce. Required for a supervised Mythic_Operator step."] = "",
-            allowed_capabilities: Annotated[list[capability_choice] | None, "Capability classes the step may use: catalog procedures by name, 'off_catalog' for any other work (including single commands), or ['control_plane'] alone for a step that only reads Mythic or BloodHound records (callbacks, task output, credentials, graph) and tasks no callback."] = None,
+            allowed_capabilities: Annotated[list[capability_choice] | None, "Catalog procedures this step's one guarded action may run, by name, or ['control_plane'] alone for a step that only reads Mythic or BloodHound records (callbacks, task output, credentials, graph) and tasks no callback. For any other work, including a single command, name the guarded tools in allowed_tools instead."] = None,
             allowed_tools: Annotated[list[tool_choice] | None, "Instead of allowed_capabilities: the guarded tools this step's one action may use. Name either allowed_capabilities or allowed_tools, not both. Read-only tools are always available and need not be listed."] = None,
             inputs_by_reference: Annotated[list[str] | None, "Earlier results this step uses, as 'task:<display id>' or 'cred:<credential id>' records Sage already holds."] = None,
         ) -> Command:
