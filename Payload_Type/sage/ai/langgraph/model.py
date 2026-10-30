@@ -5652,7 +5652,7 @@ class Model:
         return _current_assisted_operator_input(self.state)
 
     def _check_handoff_brief(
-        self, worker: str, brief: "_handoff_brief.HandoffBrief", instruction: str,
+        self, worker: str, brief: "_handoff_brief.HandoffBrief", instruction: str, title: str = "",
     ) -> tuple[tuple[str, ...], bool] | None:
         """Structurally check a delegation's brief before dispatch; None admits it.
 
@@ -5696,6 +5696,22 @@ class Model:
             f"restatement={restatement} | errors={list(errors)}"
         )
         if not errors:
+            if brief.off_catalog:
+                # Durable through the sealed decision record: retrospectives mine these for recurring
+                # multi-step procedures worth adding to the capability catalog.
+                ledger.record(
+                    event_id=f"off_catalog:{ledger.request_id}:{len(ledger.actual_events(kind='off_catalog')) + 1}",
+                    kind="off_catalog",
+                    phase="recorded",
+                    content=brief.expected_result,
+                    metadata={
+                        "worker": worker,
+                        "title": title,
+                        "assignment": instruction[:2000],
+                        "names_given": ",".join(brief.off_catalog_names),
+                        "brief": json.dumps(brief.as_metadata(), sort_keys=True),
+                    },
+                )
             return None
         rejections = _handoff_brief.rejection_count(ledger.actual_events(kind="brief"))
         return errors, rejections >= _handoff_brief.REJECTIONS_BEFORE_STOP
@@ -16705,6 +16721,7 @@ def _create_handoff_tool(
         if brief_check is not None:
             rejected = brief_check(
                 agent_name, brief or _handoff_brief.HandoffBrief(), str(handoff_instruction or ""),
+                str(handoff_title or ""),
             )
             if rejected is not None:
                 return _brief_rejection_command(runtime, name, agent_name, *rejected, channels=channel_map.values())
@@ -17038,6 +17055,9 @@ def _create_handoff_tool(
                 input_type=input_type,
             )
     elif brief_check is not None:
+        # The allowed values come from the catalog when the graph is built, so the model sees the current list.
+        capability_choice = Literal[_handoff_brief.capability_choices()]
+
         @tool(name, description=description)
         def handoff_tool(
             runtime: ToolRuntime,
@@ -17046,7 +17066,7 @@ def _create_handoff_tool(
             callback_display_id: Annotated[int | str | None, "The Mythic callback display id this step runs on. Required for a supervised Mythic_Operator step unless allowed_capabilities is ['control_plane']; must be a callback already observed, and the request's bound callback when it has one."] = None,
             targets: Annotated[list[str] | None, "Hosts, domains, or principals this step acts on, each named in the operator's request or already in engagement state. Required for a supervised Mythic_Operator step unless allowed_capabilities is ['control_plane']."] = None,
             expected_result: Annotated[str, "One line stating what this step should produce. Required for a supervised Mythic_Operator step."] = "",
-            allowed_capabilities: Annotated[list[str] | None, "Capability classes the step may use: catalog names, 'off_catalog' for work outside the catalog, or ['control_plane'] alone for a step that only reads Mythic or BloodHound records (callbacks, task output, credentials, graph) and tasks no callback."] = None,
+            allowed_capabilities: Annotated[list[capability_choice] | None, "Capability classes the step may use: catalog procedures by name, 'off_catalog' for any other work (including single commands), or ['control_plane'] alone for a step that only reads Mythic or BloodHound records (callbacks, task output, credentials, graph) and tasks no callback."] = None,
             inputs_by_reference: Annotated[list[str] | None, "Earlier results this step uses, as 'task:<display id>' or 'cred:<credential id>' records Sage already holds."] = None,
         ) -> Command:
             brief = _handoff_brief.HandoffBrief.from_args(

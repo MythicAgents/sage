@@ -78,15 +78,30 @@ def test_control_plane_cannot_be_mixed_with_target_facing_classes():
     assert any("cannot be combined" in error for error in errors)
 
 
-@pytest.mark.parametrize("capabilities, ok", [
-    (["collect-graph"], True),
-    (["off_catalog"], True),
-    (["collect-graph", "off_catalog"], True),
-    (["collect-graphs"], False),
-    (["anything"], False),
+@pytest.mark.parametrize("capabilities, allowed, recorded", [
+    (["collect-graph"], ("collect-graph",), ()),
+    (["off_catalog"], ("off_catalog",), ("off_catalog",)),
+    (["collect-graph", "off_catalog"], ("collect-graph", "off_catalog"), ("off_catalog",)),
+    (["shell"], ("off_catalog",), ("shell",)),                      # a command name is off-catalog work
+    (["collect-graphs", "whoami"], ("off_catalog",), ("collect-graphs", "whoami")),
 ])
-def test_capability_classes_come_from_the_catalog_or_off_catalog(capabilities, ok):
-    assert (_errors(_brief(allowed_capabilities=capabilities)) == ()) is ok
+def test_names_outside_the_catalog_become_off_catalog_and_are_kept(capabilities, allowed, recorded):
+    brief = _brief(allowed_capabilities=capabilities)
+    assert brief.allowed_capabilities == allowed
+    assert brief.off_catalog_names == recorded
+    assert _errors(brief) == ()
+
+
+def test_capability_choices_follow_the_catalog(monkeypatch):
+    from ai.langgraph import capabilities
+
+    monkeypatch.setattr(capabilities, "_CAPABILITY_CATALOG", (("new-procedure", "A newly cataloged procedure."),))
+    assert hb.capability_choices() == ("new-procedure", "off_catalog", "control_plane")
+    assert _brief(allowed_capabilities=["new-procedure"]).allowed_capabilities == ("new-procedure",)
+    tool = model_module._create_handoff_tool(agent_name="Mythic_Operator", brief_check=lambda *args: None)
+    schema = tool.tool_call_schema.model_json_schema()["properties"]["allowed_capabilities"]
+    items = next(branch["items"] for branch in schema["anyOf"] if branch.get("type") == "array")
+    assert items["enum"] == ["new-procedure", "off_catalog", "control_plane"]
 
 
 @pytest.mark.parametrize("target, ok", [
@@ -392,3 +407,34 @@ def test_only_assisted_supervisors_get_the_callback_listing(monkeypatch, mode, l
 
     asyncio.run(build())
     assert ("list_callbacks" in captured["Supervisor"]) is listed
+
+
+def test_an_off_catalog_delegation_is_recorded_for_retrospectives():
+    args = {"handoff_title": "Enumerate admins", "handoff_instruction": "List local administrators.",
+            "callback_display_id": 3, "targets": ["meereen.essos.local"], "expected_result": "Admin list.",
+            "allowed_capabilities": ["off_catalog"]}
+    harness, result = _run([_handoff(args), AIMessage(content="worker done"), AIMessage(content="final")])
+
+    assert [m.content for m in _delegated(result)] == [PROMPT]
+    records = harness.model._request_event_ledger.actual_events(kind="off_catalog")
+    assert len(records) == 1 and records[0].content == "Admin list."
+    metadata = dict(records[0].metadata)
+    assert metadata["title"] == "Enumerate admins" and metadata["assignment"] == "List local administrators."
+    assert metadata["worker"] == "Mythic_Operator"
+
+
+def test_a_catalog_delegation_is_not_recorded_as_off_catalog():
+    args = {"handoff_title": "Collect graph", "callback_display_id": 3, "targets": ["meereen.essos.local"],
+            "expected_result": "Graph collected.", "allowed_capabilities": ["collect-graph"]}
+    harness, _result = _run([_handoff(args), AIMessage(content="worker done"), AIMessage(content="final")])
+    assert harness.model._request_event_ledger.actual_events(kind="off_catalog") == ()
+
+
+def test_a_name_outside_the_offered_list_is_refused_by_the_schema_with_the_choices():
+    args = {"handoff_title": "Enumerate admins", "callback_display_id": 3, "targets": ["meereen.essos.local"],
+            "expected_result": "Admin list.", "allowed_capabilities": ["shell"]}
+    harness, result = _run([_handoff(args), AIMessage(content="final")])
+
+    assert _delegated(result) == []
+    errors = [str(m.content) for m in result.get("supervisor_messages", []) if type(m).__name__ == "ToolMessage"]
+    assert any("off_catalog" in text and "collect-graph" in text for text in errors)

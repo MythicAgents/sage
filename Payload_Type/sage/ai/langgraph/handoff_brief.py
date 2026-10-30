@@ -10,7 +10,7 @@ Pure and offline: the caller passes in what Sage holds; nothing here queries Myt
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import re
 from typing import Any, Iterable, Mapping
 
@@ -46,6 +46,16 @@ def _name(value: Any) -> str:
     return str(value or "").strip().strip("'\"").rstrip(".").casefold()
 
 
+def catalog_names() -> tuple[str, ...]:
+    """Capability classes as the catalog defines them now; read at each graph build, never copied here."""
+    return tuple(item["name"] for item in capabilities.capability_catalog())
+
+
+def capability_choices() -> tuple[str, ...]:
+    """Every value a brief may name in `allowed_capabilities`."""
+    return (*catalog_names(), OFF_CATALOG, CONTROL_PLANE)
+
+
 @dataclass(frozen=True)
 class HandoffBrief:
     targets: tuple[str, ...] = ()
@@ -53,6 +63,8 @@ class HandoffBrief:
     allowed_capabilities: tuple[str, ...] = ()
     inputs_by_reference: tuple[str, ...] = ()
     expected_result: str = ""
+    # Names the brief gave that are not catalog classes, as given; each is recorded as off-catalog work.
+    off_catalog_names: tuple[str, ...] = ()
     # Reserved: step budgets are enforced by the step-bounds work and plan identity by the plan work.
     budget: str = ""
     step_id: str = ""
@@ -61,17 +73,26 @@ class HandoffBrief:
     @classmethod
     def from_args(cls, *, targets: Any = None, callback_display_id: Any = None, allowed_capabilities: Any = None,
                   inputs_by_reference: Any = None, expected_result: Any = None) -> "HandoffBrief":
+        catalog = set(catalog_names())
+        requested = tuple(item.casefold() for item in _items(allowed_capabilities))
+        off_catalog = tuple(item for item in requested if item not in catalog and item != CONTROL_PLANE)
+        allowed = tuple(dict.fromkeys(OFF_CATALOG if item in off_catalog else item for item in requested))
         return cls(
             targets=_items(targets),
             callback_display_id=_callback(callback_display_id),
-            allowed_capabilities=tuple(item.casefold() for item in _items(allowed_capabilities)),
+            allowed_capabilities=allowed,
             inputs_by_reference=tuple(item.casefold() for item in _items(inputs_by_reference)),
             expected_result=str(expected_result or "").strip(),
+            off_catalog_names=off_catalog,
         )
 
     @property
     def control_plane_only(self) -> bool:
         return self.allowed_capabilities == (CONTROL_PLANE,)
+
+    @property
+    def off_catalog(self) -> bool:
+        return OFF_CATALOG in self.allowed_capabilities
 
     def as_metadata(self) -> dict[str, Any]:
         return {
@@ -80,6 +101,7 @@ class HandoffBrief:
             "allowed_capabilities": list(self.allowed_capabilities),
             "inputs_by_reference": list(self.inputs_by_reference),
             "expected_result": self.expected_result,
+            "off_catalog_names": list(self.off_catalog_names),
         }
 
 
@@ -95,9 +117,6 @@ class KnownScope:
     principals: frozenset[str] = frozenset()
     tasks: frozenset[str] = frozenset()
     credentials: frozenset[str] = frozenset()
-    capability_classes: frozenset[str] = field(
-        default_factory=lambda: frozenset(item["name"] for item in capabilities.capability_catalog())
-    )
 
     def names_target(self, target: str) -> bool:
         name = _name(target)
@@ -204,13 +223,6 @@ def known_scope(mythic_client: Any, *, operator_input: str = "", bound_callback:
 def validate_brief(brief: HandoffBrief, *, worker: str, require_scope: bool, scope: KnownScope) -> tuple[str, ...]:
     """Return one error per failing field; empty when the brief may be dispatched."""
     errors: list[str] = []
-    unknown = [item for item in brief.allowed_capabilities
-               if item not in scope.capability_classes and item not in {CONTROL_PLANE, OFF_CATALOG}]
-    if unknown:
-        errors.append(
-            f"allowed_capabilities: unknown class(es) {', '.join(unknown)}; use catalog names, "
-            f"`{OFF_CATALOG}`, or `{CONTROL_PLANE}` alone for Mythic/BloodHound reads that task no callback"
-        )
     if CONTROL_PLANE in brief.allowed_capabilities and not brief.control_plane_only:
         errors.append(f"allowed_capabilities: `{CONTROL_PLANE}` cannot be combined with other classes")
     if require_scope and worker in TARGET_FACING_WORKERS:
