@@ -46,9 +46,11 @@ REDIRECT_TEXT = (
     "for approval or taking another action."
 )
 # A supervised Mythic_Operator delegation carries a structural brief. The fixture sink knows callback 7 on
-# this host, so a step that tasks callback 7 names both; a step that only reads records declares control_plane.
+# this host, so a step that tasks callback 7 names both and the guarded tool its one action uses; a step that only
+# reads records declares control_plane.
 CALLBACK_HOST = "WS01"
 TASK_BRIEF = {"callback_display_id": 7, "targets": [CALLBACK_HOST],
+              "allowed_tools": ["issue_task_and_waitfor_task_output"],
               "expected_result": "The callback's whoami output."}
 READ_BRIEF = {"allowed_capabilities": ["control_plane"], "expected_result": "Report what the stored records show."}
 REDIRECT_ANSWER = (

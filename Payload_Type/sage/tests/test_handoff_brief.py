@@ -27,6 +27,7 @@ from ai.langgraph import model as model_module  # noqa: E402
 from ai.langgraph.request_contract import build_request_contract  # noqa: E402
 
 PROMPT = "Enumerate local administrators on meereen.essos.local from callback 3"
+TASK_TOOL = ["issue_task_and_waitfor_task_output"]
 CALLBACKS = [{"id": 3, "host": "MEEREEN", "user": "ESSOS\\daenerys"}]
 
 
@@ -46,6 +47,8 @@ def _scope(operator_input: str = PROMPT, bound: Any = "", **extra: Any) -> hb.Kn
 
 def _brief(**fields: Any) -> hb.HandoffBrief:
     base = {"callback_display_id": 3, "targets": ["meereen.essos.local"], "expected_result": "Local admin list."}
+    if "allowed_capabilities" not in fields:
+        base["allowed_tools"] = TASK_TOOL
     base.update(fields)
     return hb.HandoffBrief.from_args(**base)
 
@@ -237,7 +240,7 @@ def _brief_events(harness) -> list[Any]:
 
 def test_complete_brief_dispatches_the_exact_operator_input_with_the_brief_attached():
     args = {"handoff_title": "Enumerate admins", "handoff_instruction": "Objective: " + PROMPT,
-            "callback_display_id": "3", "targets": ["meereen.essos.local"], "expected_result": "Admin list."}
+            "callback_display_id": "3", "targets": ["meereen.essos.local"], "expected_result": "Admin list.", "allowed_tools": TASK_TOOL}
     harness, result = _run([_handoff(args), AIMessage(content="worker done"), AIMessage(content="final")])
 
     delegated = _delegated(result)
@@ -250,11 +253,11 @@ def test_complete_brief_dispatches_the_exact_operator_input_with_the_brief_attac
 @pytest.mark.parametrize("args", [
     {"handoff_title": "Enumerate admins"},
     {"handoff_title": "Enumerate admins", "callback_display_id": 3, "targets": ["braavos.essos.local"],
-     "expected_result": "Admin list."},
+     "expected_result": "Admin list.", "allowed_tools": TASK_TOOL},
     {"handoff_title": "Enumerate admins", "callback_display_id": 4, "targets": ["meereen.essos.local"],
-     "expected_result": "Admin list."},
+     "expected_result": "Admin list.", "allowed_tools": TASK_TOOL},
     {"handoff_title": "Enumerate admins", "callback_display_id": 3, "targets": ["meereen.essos.local"],
-     "expected_result": "Admin list.", "inputs_by_reference": ["task:99"]},
+     "expected_result": "Admin list.", "allowed_tools": TASK_TOOL, "inputs_by_reference": ["task:99"]},
 ], ids=["no-scope", "unrequested-target", "unobserved-callback", "unresolved-reference"])
 def test_inadmissible_brief_reaches_no_worker_and_tells_the_supervisor_why(args):
     harness, result = _run([_handoff(args), AIMessage(content="final")])
@@ -279,7 +282,7 @@ def test_two_rejections_end_the_step_and_tell_the_operator():
 
 def test_a_corrected_brief_after_one_rejection_dispatches():
     good = {"handoff_title": "Enumerate admins", "callback_display_id": 3, "targets": ["meereen.essos.local"],
-            "expected_result": "Admin list."}
+            "expected_result": "Admin list.", "allowed_tools": TASK_TOOL}
     script = [_handoff({"handoff_title": "Enumerate admins"}, "first"), _handoff(good, "second"),
               AIMessage(content="worker done"), AIMessage(content="final")]
     harness, result = _run(script)
@@ -346,7 +349,7 @@ def test_supervisor_lists_callbacks_itself_then_briefs_from_what_it_saw(monkeypa
     reader.client = object()
     listing = AIMessage(content="", tool_calls=[{"name": "list_callbacks", "args": {}, "id": "list", "type": "tool_call"}])
     brief = {"handoff_title": "Enumerate admins", "callback_display_id": 3, "targets": ["MEEREEN"],
-             "expected_result": "Admin list."}
+             "expected_result": "Admin list.", "allowed_tools": TASK_TOOL}
     script = [listing] if lists_first else []
     script += [_handoff(brief), AIMessage(content="worker done"), AIMessage(content="final")]
     harness = _harness._Harness(script)

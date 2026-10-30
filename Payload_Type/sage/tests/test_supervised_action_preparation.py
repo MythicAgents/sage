@@ -404,7 +404,8 @@ def test_native_approval_reaches_registered_task_sink_with_prepared_args(monkeyp
     fake = driver.ScriptedModel(messages=iter([
         driver.call("transfer_to_Mythic_Operator", {
             "handoff_title": "LAB check", "handoff_instruction": prompt, "callback_display_id": 2,
-            "targets": ["LAB-WS01"], "expected_result": "The LAB check's task output."}, 1),
+            "targets": ["LAB-WS01"], "expected_result": "The LAB check's task output.",
+            "allowed_tools": [TOOL]}, 1),
         driver.call(TOOL, raw, 2),
         AIMessage(content="The task result was handled."),
         AIMessage(content="The request is complete."),

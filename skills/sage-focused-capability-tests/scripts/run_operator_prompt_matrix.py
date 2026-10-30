@@ -87,8 +87,10 @@ CALLBACKS = [
 ]
 COMMANDS = ("whoami", "shell", "ps")
 # A supervised Mythic_Operator delegation carries a structural brief: a step that tasks a callback names the
-# callback and its host, and a step that only reads Mythic records declares control_plane.
+# callback, its host and the guarded tool its one action uses, and a step that only reads Mythic records declares
+# control_plane.
 TASK_BRIEF = {"callback_display_id": 7, "targets": ["LAB-WS01"],
+              "allowed_tools": ["issue_task_and_waitfor_task_output"],
               "expected_result": "The task output from callback 7."}
 READ_BRIEF = CASE.READ_BRIEF
 

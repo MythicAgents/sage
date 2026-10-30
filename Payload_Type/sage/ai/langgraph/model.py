@@ -51,7 +51,7 @@ from ..comparison_tool_surface import (
     SHIPPING_MYTHIC_OPERATOR_TOOL_NAMES,
     SHIPPING_MYTHIC_PAYLOAD_TOOL_NAMES,
 )
-from .prompt_loader import load_prompt, load_prompt_meta, filter_tools_by_frontmatter
+from .prompt_loader import load_prompt, load_prompt_meta, filter_tools_by_frontmatter, get_prompt_tools
 from .turn_authority import (
     TurnAuthority,
     apply_supervised_semantic_intent,
@@ -62,6 +62,7 @@ from .decision_record import seal_request_decision_record
 from .operator_error import operator_error_text
 from . import worker_outcome as _worker_outcome
 from . import handoff_brief as _handoff_brief
+from . import step_bounds as _step_bounds
 from . import prompt_context
 from ai.mcp import MCPManager, MCP_EXECUTION_CONTEXT_OFFENSIVE_RUNTIME
 from ai import observation_channel, provider_retry, resource_budget, resource_http
@@ -1651,6 +1652,8 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
     def before_model(self, state, runtime):
         if self._agent_name == "Mythic_Operator" and self._model._pending_task_receipt_for_request():
             return {"jump_to": "end"}
+        if self._model._supervised_step_should_end(self._agent_name, state):
+            return {"jump_to": "end"}
         return None
 
     @hook_config(can_jump_to=["end"])
@@ -2774,6 +2777,125 @@ class _BoundedExecuteCapabilityStopMiddleware(AgentMiddleware):
                 pass
             return self._blocked_tool_message(request, reason)
         return handler(request)
+
+
+class _SupervisedStepBoundMiddleware(AgentMiddleware):
+    """Account a supervised worker step and remove a guarded call the step may not make.
+
+    Adds no graph nodes, so it does not spend the request's step budget: it works only inside the model and tool
+    calls. Model calls and read tools count as active time; guarded tool execution (which contains the Mythic task
+    wait) and the approval pause do not. A guarded call is removed from the model's response, before any after-model
+    hook or approval card, when the step already ran or was denied its one guarded action, or when the call is outside
+    the step's brief. Ending the step at a bound happens in the turn-authority `before_model`
+    (`Model._supervised_step_should_end`). Supervised lane only; other requests pass through untouched.
+    """
+
+    def __init__(self, model: "Model", agent_name: str, guarded: frozenset[str]):
+        super().__init__()
+        self._model = model
+        self._agent_name = agent_name
+        self._guarded = guarded
+        model._step_guarded_tools = {**getattr(model, "_step_guarded_tools", {}), agent_name: guarded}
+
+    def _record(self, request: Any) -> Any:
+        return self._model._supervised_step_record(
+            self._agent_name, _agent_state_messages(getattr(request, "state", None)),
+        )
+
+    def _limit_response(self, request: Any, response: Any) -> None:
+        """Remove a guarded call this step may not make from the model's response, in place."""
+        record = self._record(request)
+        result = getattr(response, "result", None)
+        if result is None:
+            result = getattr(getattr(response, "model_response", None), "result", None)
+        candidates = [response] if isinstance(response, AIMessage) else list(result or [])
+        message = next((item for item in reversed(candidates) if isinstance(item, AIMessage)), None)
+        if record is None or message is None:
+            return
+        guarded = [call for call in message.tool_calls if str(call.get("name") or "") in self._guarded]
+        if not guarded:
+            return
+        state_messages = _agent_state_messages(getattr(request, "state", None))
+        name = str(guarded[0].get("name") or "")
+        prior = _step_bounds.step_activity(_current_delegation_messages(state_messages), self._guarded).guarded
+        if prior:
+            denied = prior[-1][1]
+            status = _step_bounds.StepStatus.REJECTED if denied else _step_bounds.StepStatus.ACTION_EXECUTED
+            reason = (f"this step's one guarded action was already {'denied by the operator' if denied else 'run'}; "
+                      f"`{name}` needs a new step from the Supervisor")
+            bound = "guarded_actions"
+        else:
+            # The delegated message is the step's boundary, so it sits outside the step's own messages.
+            delegated = next((msg for msg in reversed(state_messages) if isinstance(msg, HumanMessage)
+                              and msg.additional_kwargs.get("_delegated_to") == self._agent_name), None)
+            reason = _step_bounds.scope_violation(
+                getattr(delegated, "additional_kwargs", {}).get("_handoff_brief"), name,
+                _capability_name_from_request_args(guarded[0].get("args") or {}),
+            )
+            if not reason:
+                return
+            status, bound = _step_bounds.StepStatus.REJECTED_BY_SCOPE, "scope"
+        record.end(status, bound, reason)
+        _remove_tool_calls(message, {str(call.get("id") or "") for call in guarded}, f"[step-boundary] {reason}")
+
+    def _add_time(self, request: Any, started: float, *, guarded: bool) -> None:
+        record = self._record(request)
+        if record is None:
+            return
+        elapsed = max(0.0, self._model._step_clock() - started)
+        if guarded:
+            record.action_seconds += elapsed
+        else:
+            record.active_seconds += elapsed
+
+    def wrap_model_call(self, request, handler):
+        started = self._model._step_clock()
+        try:
+            response = handler(request)
+        finally:
+            self._add_time(request, started, guarded=False)
+        self._limit_response(request, response)
+        return response
+
+    async def awrap_model_call(self, request, handler):
+        started = self._model._step_clock()
+        try:
+            response = await handler(request)
+        finally:
+            self._add_time(request, started, guarded=False)
+        self._limit_response(request, response)
+        return response
+
+    def wrap_tool_call(self, request, handler):
+        started = self._model._step_clock()
+        try:
+            return handler(request)
+        finally:
+            self._add_time(request, started, guarded=_tool_name_from_request(request) in self._guarded)
+
+    async def awrap_tool_call(self, request, handler):
+        started = self._model._step_clock()
+        try:
+            return await handler(request)
+        finally:
+            self._add_time(request, started, guarded=_tool_name_from_request(request) in self._guarded)
+
+
+def _remove_tool_calls(message: AIMessage, call_ids: set[str], note: str) -> None:
+    """Drop the named tool calls from a generation message in place and say why, as the authority filter does."""
+    message.tool_calls[:] = [call for call in message.tool_calls if str(call.get("id") or "") not in call_ids]
+    if isinstance(message.content, list):
+        message.content[:] = [
+            block for block in message.content
+            if not (isinstance(block, dict) and str(block.get("type") or "").casefold() in {"tool_use", "tool_call"}
+                    and str(block.get("id") or "") in call_ids)
+        ]
+        message.content.append({"type": "text", "text": note})
+    else:
+        message.content = f"{str(message.content or '').strip()}\n{note}".strip()
+    message.invalid_tool_calls[:] = []
+    message.additional_kwargs.pop("tool_calls", None)
+    message.additional_kwargs.pop("function_call", None)
 
 
 class _MCPManagerNoProgressStopMiddleware(AgentMiddleware):
@@ -5651,6 +5773,79 @@ class Model:
     def _assisted_operator_input_for_handoff(self) -> str | None:
         return _current_assisted_operator_input(self.state)
 
+    def _step_clock(self) -> float:
+        return time.monotonic()
+
+    def _supervised_step_bounds(self) -> "_step_bounds.StepBounds":
+        bounds = getattr(self, "_step_bounds_config", None)
+        if bounds is None:
+            bounds = self._step_bounds_config = _step_bounds.StepBounds.from_env()
+        return bounds
+
+    def _issued_task_ids(self) -> frozenset[str]:
+        issued = getattr(getattr(self, "mythic_client", None), "_task_source_request_ids", None)
+        return frozenset(str(task_id) for task_id in issued) if isinstance(issued, dict) else frozenset()
+
+    def _supervised_step_record(self, worker: str, messages: list[AnyMessage]) -> "_step_bounds.StepRecord | None":
+        """The accounting record for a worker's current supervised step, created on first use; None outside one."""
+        contract = getattr(self, "_request_contract", None)
+        if getattr(getattr(contract, "lane", None), "value", "") != "supervised_workflow" or worker == "Supervisor":
+            return None
+        request_id = str(getattr(contract, "request_id", "") or "")
+        seq = max((_get_seq(message) for message in messages if isinstance(message, HumanMessage)
+                   and message.additional_kwargs.get("_delegated_to") == worker), default=0)
+        if not request_id or seq <= 0:
+            return None
+        records = getattr(self, "_step_records", None)
+        if not isinstance(records, dict):
+            records = self._step_records = {}
+        key = (request_id, worker, seq)
+        if key not in records:
+            for stale in [item for item in records if item[0] != request_id]:
+                records.pop(stale)
+            records[key] = _step_bounds.StepRecord(
+                request_id=request_id, delegation_seq=seq, worker=worker, started=self._step_clock(),
+                tasks_before=self._issued_task_ids(),
+            )
+        return records[key]
+
+    def _supervised_step_should_end(self, worker: str, state: Any) -> bool:
+        """Whether a worker's supervised step has ended or reached a bound, checked before its next model call."""
+        messages = _agent_state_messages(state)
+        record = self._supervised_step_record(worker, messages)
+        if record is None:
+            return False
+        if record.status is None:
+            guarded = getattr(self, "_step_guarded_tools", {}).get(worker, frozenset(GUARDED_TOOLS))
+            reached = _step_bounds.bound_reached(
+                _step_bounds.step_activity(_current_delegation_messages(messages), guarded), record,
+                self._supervised_step_bounds(),
+            )
+            if reached is not None:
+                record.end(_step_bounds.StepStatus.BUDGET_EXHAUSTED, *reached)
+        if record.status is None:
+            return False
+        logger.info(f"⏹️ [{worker}] step ended: {record.status.value} {record.detail}".rstrip())
+        return True
+
+    def _supervised_step_outcome(
+        self, worker: str, messages: list[AnyMessage], status: "_step_bounds.StepStatus | None" = None,
+    ) -> dict[str, Any] | None:
+        """Close the worker's current step and return its Sage-authored outcome; None outside a supervised step."""
+        record = self._supervised_step_record(worker, messages)
+        if record is None:
+            return None
+        guarded = getattr(self, "_step_guarded_tools", {}).get(worker, frozenset(GUARDED_TOOLS))
+        outcome = _step_bounds.step_outcome(
+            record,
+            _step_bounds.step_activity(_current_delegation_messages(messages), guarded),
+            now=self._step_clock(),
+            tasks_issued=self._issued_task_ids() - record.tasks_before,
+            status=status,
+        )
+        self._step_records.pop((record.request_id, worker, record.delegation_seq), None)
+        return outcome
+
     def _check_handoff_brief(
         self, worker: str, brief: "_handoff_brief.HandoffBrief", instruction: str, title: str = "",
     ) -> tuple[tuple[str, ...], bool] | None:
@@ -5677,6 +5872,7 @@ class Model:
         )
         errors = _handoff_brief.validate_brief(
             brief, worker=worker, require_scope=lane == "supervised_workflow", scope=scope,
+            worker_tools=_worker_guarded_tool_names(worker),
         )
         restatement = _handoff_brief.restatement(instruction, operator_input)
         ledger = self._ensure_request_event_ledger(str(getattr(contract, "request_id", "") or ""))
@@ -9823,14 +10019,22 @@ class Model:
                             _tool_note = ""
                         if _tool_note:
                             summary_text = f"{summary_text}\n\n{_tool_note}"
+                    pending_kwargs: dict[str, Any] = {
+                        "_is_final_report": True,
+                        "_pending_task_handoff": True,
+                        "_turn_outcome": _TURN_OUTCOME_CHECKPOINT,
+                    }
+                    pending_outcome = self._supervised_step_outcome(
+                        node_name, updated_channel,
+                        status=(_step_bounds.StepStatus.SUBMISSION_UNKNOWN if task_id is None
+                                else _step_bounds.StepStatus.TASK_PENDING),
+                    )
+                    if pending_outcome is not None:
+                        pending_kwargs["_step_outcome"] = pending_outcome
                     final_msg = AIMessage(
                         content=summary_text,
                         name="Supervisor",
-                        additional_kwargs={
-                            "_is_final_report": True,
-                            "_pending_task_handoff": True,
-                            "_turn_outcome": _TURN_OUTCOME_CHECKPOINT,
-                        },
+                        additional_kwargs=pending_kwargs,
                     )
                     _tag_msg(final_msg, next_seq)
                     self._message_seq = next_seq + 1
@@ -10188,6 +10392,20 @@ class Model:
                     empty_notice = self._empty_delegation_return_notice(node_name)
                     _tag_msg(empty_notice, self._next_seq())
                     update["supervisor_messages"] = [empty_notice]
+
+            if node_name != "Supervisor":
+                step_outcome = self._supervised_step_outcome(node_name, updated_channel)
+                if step_outcome is not None:
+                    # Authored by Sage, not the worker, and appended last: the worker's answer stays directly
+                    # after its completion header and a typed handback stays the latest worker message.
+                    step_message = AIMessage(
+                        content=_step_bounds.render_outcome(step_outcome),
+                        name="Sage",
+                        additional_kwargs={"_step_outcome": step_outcome,
+                                           "_request_id": str(state.get("_request_id") or "")},
+                    )
+                    _tag_msg(step_message, self._next_seq())
+                    update["supervisor_messages"] = list(update.get("supervisor_messages") or []) + [step_message]
 
             # `result` is the node's return value and CAN be None — a node that halts (e.g. the
             # no-progress backstop) returns nothing, and `flag in None` raises `TypeError: argument
@@ -13555,8 +13773,9 @@ class Model:
             ))
         # HITL (supervised mode only): gate guarded tool calls behind an operator approve/deny
         # interrupt. AUTO mode appends nothing here, so its behavior is byte-identical to before.
-        if getattr(self, "mode", "auto") == "supervised":
-            hitl_tools = set(GUARDED_TOOLS)
+        mode = getattr(self, "mode", "auto")
+        hitl_tools = set(GUARDED_TOOLS)
+        if mode != "auto":
             try:
                 from ai.langgraph.mcp_tool_policy import is_mcp_tool_guarded
                 for server in MCPManager.get_connected_servers():
@@ -13566,6 +13785,7 @@ class Model:
                             hitl_tools.add(str(name))
             except Exception:
                 pass
+        if mode == "supervised":
             mw.append(HumanInTheLoopMiddleware(
                 interrupt_on={
                     t: InterruptOnConfig(allowed_decisions=["approve", "reject"])
@@ -13576,6 +13796,9 @@ class Model:
         # Listed after HITL so LangChain's reverse after_model order runs this authority filter
         # first. Its tool wrapper remains a second enforcement point immediately before execution.
         mw.append(_TurnAuthorityToolMiddleware(self, agent_name=agent_name))
+        if mode != "auto" and agent_name and agent_name != "Supervisor":
+            # Built for every assisted worker; it acts only while the request lane is supervised.
+            mw.append(_SupervisedStepBoundMiddleware(self, agent_name, frozenset(hitl_tools)))
         # Per-turn engagement-state injection (Mythic_Operator only, autonomous + gate-on, fail-open).
         # Appended LAST so it is the INNERMOST wrapper: the rendered block is added AFTER all the
         # context-editing/summarization middleware run, so it is never trimmed before reaching the model.
@@ -17055,8 +17278,11 @@ def _create_handoff_tool(
                 input_type=input_type,
             )
     elif brief_check is not None:
-        # The allowed values come from the catalog when the graph is built, so the model sees the current list.
+        # The allowed values come from the catalog and the worker's declared tools when the graph is built, so the
+        # model sees the current lists and nobody maintains a copy.
         capability_choice = Literal[_handoff_brief.capability_choices()]
+        worker_tools = _worker_guarded_tool_names(agent_name)
+        tool_choice = Literal[worker_tools] if worker_tools else str
 
         @tool(name, description=description)
         def handoff_tool(
@@ -17067,12 +17293,14 @@ def _create_handoff_tool(
             targets: Annotated[list[str] | None, "Hosts, domains, or principals this step acts on, each named in the operator's request or already in engagement state. Required for a supervised Mythic_Operator step unless allowed_capabilities is ['control_plane']."] = None,
             expected_result: Annotated[str, "One line stating what this step should produce. Required for a supervised Mythic_Operator step."] = "",
             allowed_capabilities: Annotated[list[capability_choice] | None, "Capability classes the step may use: catalog procedures by name, 'off_catalog' for any other work (including single commands), or ['control_plane'] alone for a step that only reads Mythic or BloodHound records (callbacks, task output, credentials, graph) and tasks no callback."] = None,
+            allowed_tools: Annotated[list[tool_choice] | None, "Instead of allowed_capabilities: the guarded tools this step's one action may use. Name either allowed_capabilities or allowed_tools, not both. Read-only tools are always available and need not be listed."] = None,
             inputs_by_reference: Annotated[list[str] | None, "Earlier results this step uses, as 'task:<display id>' or 'cred:<credential id>' records Sage already holds."] = None,
         ) -> Command:
             brief = _handoff_brief.HandoffBrief.from_args(
                 targets=targets,
                 callback_display_id=callback_display_id,
                 allowed_capabilities=allowed_capabilities,
+                allowed_tools=allowed_tools,
                 inputs_by_reference=inputs_by_reference,
                 expected_result=expected_result,
             )
@@ -17087,6 +17315,28 @@ def _create_handoff_tool(
             return _build_handoff_command(runtime, handoff_instruction, handoff_title)
 
     return handoff_tool
+
+
+_WORKER_PROMPTS = {
+    "Generalist": "generalist",
+    "Mythic_Operator": "mythic_operator",
+    "Mythic_Payload": "mythic_payload",
+    "BloodHound": "bloodhound",
+    "MCP_Manager": "mcp_manager",
+    "Sandbox": "sandbox",
+}
+
+
+def _worker_guarded_tool_names(agent_name: str) -> tuple[str, ...]:
+    """Guarded tools a worker declares in its prompt frontmatter, the source its tool list is filtered by."""
+    prompt = _WORKER_PROMPTS.get(agent_name)
+    if prompt is None:
+        return ()
+    try:
+        declared = get_prompt_tools(prompt)
+    except Exception:
+        return ()
+    return tuple(name for name in declared if name in GUARDED_TOOLS)
 
 
 def _brief_rejection_command(

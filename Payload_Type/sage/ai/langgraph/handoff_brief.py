@@ -61,6 +61,7 @@ class HandoffBrief:
     targets: tuple[str, ...] = ()
     callback_display_id: str = ""
     allowed_capabilities: tuple[str, ...] = ()
+    allowed_tools: tuple[str, ...] = ()
     inputs_by_reference: tuple[str, ...] = ()
     expected_result: str = ""
     # Names the brief gave that are not catalog classes, as given; each is recorded as off-catalog work.
@@ -72,7 +73,8 @@ class HandoffBrief:
 
     @classmethod
     def from_args(cls, *, targets: Any = None, callback_display_id: Any = None, allowed_capabilities: Any = None,
-                  inputs_by_reference: Any = None, expected_result: Any = None) -> "HandoffBrief":
+                  allowed_tools: Any = None, inputs_by_reference: Any = None,
+                  expected_result: Any = None) -> "HandoffBrief":
         catalog = set(catalog_names())
         requested = tuple(item.casefold() for item in _items(allowed_capabilities))
         off_catalog = tuple(item for item in requested if item not in catalog and item != CONTROL_PLANE)
@@ -81,6 +83,7 @@ class HandoffBrief:
             targets=_items(targets),
             callback_display_id=_callback(callback_display_id),
             allowed_capabilities=allowed,
+            allowed_tools=tuple(dict.fromkeys(_items(allowed_tools))),
             inputs_by_reference=tuple(item.casefold() for item in _items(inputs_by_reference)),
             expected_result=str(expected_result or "").strip(),
             off_catalog_names=off_catalog,
@@ -92,13 +95,15 @@ class HandoffBrief:
 
     @property
     def off_catalog(self) -> bool:
-        return OFF_CATALOG in self.allowed_capabilities
+        """Work that is not a catalog procedure: named off-catalog, or scoped by tools instead of a procedure."""
+        return OFF_CATALOG in self.allowed_capabilities or bool(self.allowed_tools)
 
     def as_metadata(self) -> dict[str, Any]:
         return {
             "targets": list(self.targets),
             "callback_display_id": self.callback_display_id,
             "allowed_capabilities": list(self.allowed_capabilities),
+            "allowed_tools": list(self.allowed_tools),
             "inputs_by_reference": list(self.inputs_by_reference),
             "expected_result": self.expected_result,
             "off_catalog_names": list(self.off_catalog_names),
@@ -220,21 +225,32 @@ def known_scope(mythic_client: Any, *, operator_input: str = "", bound_callback:
     )
 
 
-def validate_brief(brief: HandoffBrief, *, worker: str, require_scope: bool, scope: KnownScope) -> tuple[str, ...]:
+def validate_brief(brief: HandoffBrief, *, worker: str, require_scope: bool, scope: KnownScope,
+                   worker_tools: Iterable[str] | None = None) -> tuple[str, ...]:
     """Return one error per failing field; empty when the brief may be dispatched."""
     errors: list[str] = []
+    if brief.allowed_capabilities and brief.allowed_tools:
+        errors.append("name either allowed_capabilities or allowed_tools for a step, not both")
+    if worker_tools is not None:
+        unknown = [name for name in brief.allowed_tools if name not in set(worker_tools)]
+        if unknown:
+            errors.append(f"allowed_tools: {', '.join(unknown)} is not a guarded tool of {worker}")
     if CONTROL_PLANE in brief.allowed_capabilities and not brief.control_plane_only:
         errors.append(f"allowed_capabilities: `{CONTROL_PLANE}` cannot be combined with other classes")
     if require_scope and worker in TARGET_FACING_WORKERS:
         missing = ["expected_result"] if not brief.expected_result else []
         if not brief.control_plane_only:
-            missing = [name for name, value in (("callback_display_id", brief.callback_display_id),
-                                                ("targets", brief.targets)) if not value] + missing
+            missing = [name for name, value in (
+                ("callback_display_id", brief.callback_display_id),
+                ("targets", brief.targets),
+                ("allowed_capabilities or allowed_tools", brief.allowed_capabilities or brief.allowed_tools),
+            ) if not value] + missing
         if missing:
             errors.append(
                 f"missing required field(s): {', '.join(missing)}; a supervised {worker} step must name its "
-                f"callback, targets and expected result, or set allowed_capabilities to [`{CONTROL_PLANE}`] "
-                "for a step that only reads Mythic or BloodHound records"
+                "callback, targets, what its one guarded action may use (catalog procedures or tools) and its "
+                f"expected result, or set allowed_capabilities to [`{CONTROL_PLANE}`] for a step that only reads "
+                "Mythic or BloodHound records"
             )
     if brief.callback_display_id:
         if scope.bound_callback and brief.callback_display_id != scope.bound_callback:

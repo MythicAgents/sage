@@ -400,6 +400,14 @@ def approval_cards(emissions: list[dict]) -> list[dict]:
             e["metadata"].get("special_type") == "input_requested"]
 
 
+async def scope_removed_proposals(model) -> list[dict]:
+    """Guarded proposals Sage removed because they fell outside the step's brief; they never reach a card."""
+    snapshot = await model.graph.aget_state(model._graph_run_config(model._session_thread_id()))
+    return [outcome for message in (snapshot.values or {}).get("supervisor_messages", [])
+            for outcome in [getattr(message, "additional_kwargs", {}).get("_step_outcome")]
+            if isinstance(outcome, dict) and outcome.get("status") == "rejected_by_scope"]
+
+
 def terminal_emissions(emissions: list[dict]) -> list[dict]:
     return [e for e in emissions if e.get("complete_request")]
 
@@ -1228,7 +1236,8 @@ async def run_episode(profile: dict[str, str], *, decision: str,
                 reads_after_first = len(evidence_read_events)
                 calls_after_first = len(usage.calls)
                 requests_after_first = len(transport.requests)
-                first_ok = (not first_cards and substantive_text(initial_emissions) and
+                first_ok = (not first_cards and not await scope_removed_proposals(model) and
+                            substantive_text(initial_emissions) and
                             completed_terminal_model_answer(usage.calls[:calls_after_first]) and
                             set(recon_outputs).issubset(evidence_reads) and
                             all(task_id in recon_outputs for task_id in evidence_reads) and
@@ -1291,9 +1300,12 @@ async def run_episode(profile: dict[str, str], *, decision: str,
                                                   for row in usage.calls))
                 usage_totals = [item.get("total_tokens") for call in usage.calls
                                 for item in call.get("usage", [])]
+                removed = await scope_removed_proposals(model)
+                structural_success = structural_success and not removed
                 result.update(
+                    scope_removed_proposals=len(removed),
                     status="passed" if structural_success else
-                           "unexpected_proposal" if all_cards else
+                           "unexpected_proposal" if all_cards or removed else
                            "resource_limit" if any(row.get("reason") in (
                                "model_request_limit", "observed_token_limit", "unknown_observed_usage",
                                "episode_dollar_limit", "unknown_cost_usage", "usage_ceiling_exceeded",

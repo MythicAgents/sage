@@ -29,8 +29,9 @@ ACTION = {
     "args": {"callback_display_id": 5, "command": "whoami", "parameters": "", "timeout": 1},
 }
 # Supervised delegation briefs: the tasking step names callback 5, which the sink reports as observed, and its
-# host; the later step only reads a stored task output.
-_TASK_BRIEF = {"callback_display_id": 5, "targets": ["WORKSTATION-5"], "expected_result": "The whoami output."}
+# host and the guarded tool its one action uses; the later step only reads a stored task output.
+_TASK_BRIEF = {"callback_display_id": 5, "targets": ["WORKSTATION-5"], "expected_result": "The whoami output.",
+               "allowed_tools": ["issue_task_and_waitfor_task_output"]}
 _READ_BRIEF = {"allowed_capabilities": ["control_plane"], "expected_result": "The stored output of task 4242."}
 
 

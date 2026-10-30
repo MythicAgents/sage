@@ -163,6 +163,7 @@ def test_native_accept_reaches_real_final_sink_in_ordinary_supervised(monkeypatc
         return driver.call("transfer_to_Mythic_Operator", {
             "handoff_title": "run scoped command", "handoff_instruction": instruction,
             "callback_display_id": 7, "targets": ["LAB-WS01"], "expected_result": "The whoami output.",
+            "allowed_tools": [ACTION["name"]],
         }, 1)
 
     def worker_call(messages):

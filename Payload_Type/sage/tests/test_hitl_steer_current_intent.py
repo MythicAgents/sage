@@ -45,7 +45,8 @@ OLD_ACTION = {
     "args": {"callback_display_id": 5, "command": "getprivs", "parameters": ""},
 }
 # The supervised brief for a step on callback 5; the sink below reports that callback as observed.
-_BRIEF = {"callback_display_id": 5, "targets": ["WORKSTATION-5"], "expected_result": "The callback's privileges."}
+_BRIEF = {"callback_display_id": 5, "targets": ["WORKSTATION-5"], "expected_result": "The callback's privileges.",
+          "allowed_tools": ["issue_task_and_waitfor_task_output"]}
 NEW_ACTION = {
     "name": "issue_task_and_waitfor_task_output",
     "args": {"callback_display_id": 5, "command": "whoami", "parameters": ""},

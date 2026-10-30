@@ -2,8 +2,8 @@
 
 These are MEASUREMENTS, not desired behaviour. Each test asserts what the real assembled graph does today, so later
 changes flip them deliberately instead of discovering the old behaviour by accident. The brief probe is flipped: a
-supervised Mythic_Operator delegation now needs a structural brief (test_handoff_brief.py). The step-bound probe
-still records that nothing bounds a delegation. Only the model is scripted; the graph, handoff tools, middleware and
+supervised Mythic_Operator delegation now needs a structural brief (test_handoff_brief.py). The step-bound probe is
+flipped too: a supervised step returns to the Supervisor at its tool-call bound (test_step_bounds.py). Only the model is scripted; the graph, handoff tools, middleware and
 state channels are real (see test_scripted_handoff.py for the harness and its stated seams).
 
 The worker's tool is a neutral, test-only counter added to Mythic_Operator's tool list, so the probes measure
@@ -27,9 +27,9 @@ assert _SPEC and _SPEC.loader
 _SPEC.loader.exec_module(_harness)
 
 from ai.langgraph import model as model_module  # noqa: E402
+from ai.langgraph.step_bounds import StepBounds  # noqa: E402
 
 PROMPT = "From your current foothold, obtain administrative control of the target domain"
-PROBE_CALLS = 30
 
 
 def _probe_tool(calls: list[int]):
@@ -90,15 +90,19 @@ def test_baseline_unscoped_brief_shapes_are_no_longer_dispatched(args, probe_cal
     assert PROMPT not in _worker_received(result)  # the brief check rejects both channel 3 shapes before dispatch
 
 
-def test_baseline_a_worker_runs_every_step_it_chooses_before_control_returns(probe_calls):
-    # A control-plane brief passes the brief check without callback data; the probe tool itself is neutral.
+def test_baseline_a_worker_step_returns_control_at_its_tool_call_bound(probe_calls):
+    # A control-plane brief passes the brief check without callback data; the probe tool itself is neutral. The
+    # script holds exactly one bound's worth of worker steps and then the Supervisor's reply: without the bound the
+    # worker would consume that reply and the Supervisor would find the script empty.
+    bound = StepBounds().tool_calls
     script = [_handoff({"handoff_title": "Work the objective", "handoff_instruction": "Objective: " + PROMPT,
                         "allowed_capabilities": ["control_plane"], "expected_result": "Probe steps recorded."}),
-              *(_probe_step(step) for step in range(PROBE_CALLS)),
-              AIMessage(content="worker done"),
+              *(_probe_step(step) for step in range(bound)),
               AIMessage(content="final")]
 
-    _run(script, recursion_limit=250)
+    result = _run(script, recursion_limit=250)
 
-    # Today nothing bounds a delegation: all scripted worker steps run before the Supervisor sees control again.
-    assert probe_calls == list(range(PROBE_CALLS))
+    assert probe_calls == list(range(bound))
+    outcomes = [m.additional_kwargs["_step_outcome"] for m in result.get("supervisor_messages", [])
+                if "_step_outcome" in m.additional_kwargs]
+    assert [(o["status"], o["bound"], o["tool_calls"]) for o in outcomes] == [("budget_exhausted", "tool_calls", bound)]

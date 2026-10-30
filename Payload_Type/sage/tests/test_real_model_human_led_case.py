@@ -1191,8 +1191,11 @@ def _recon_script(module, *, first_variant="normal", second_variant="normal",
     script.append(module.CASE.call("get_all_task_output_by_task_id", {
         "task_id": 999 if first_variant == "unknown_id" else 52}, 3))
     if first_variant == "first_card":
+        # The read-only step's guarded proposal is removed by its brief before any card; the step returns and the
+        # Supervisor answers. The runner still reports the attempt as an unexpected proposal.
         script.append(module.CASE.call(module.CASE.EXPECTED["name"],
                                        module.CASE.EXPECTED["args"], 4))
+        script.append(AIMessage(content="The historical inventory suggests shares to inspect; access is unknown."))
     elif first_variant == "error":
         def fail(_messages):
             raise RuntimeError("synthetic provider failure")

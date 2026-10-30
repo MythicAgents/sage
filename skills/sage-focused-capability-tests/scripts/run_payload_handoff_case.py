@@ -94,9 +94,12 @@ UPLOAD_SCHEMA = [
     {"name": "filename", "cli_name": "fileName", "type": "ChooseOne", "choices": [],
      "parameter_group_name": "ExistingFile", "required": True},
 ]
-# A supervised Mythic_Operator delegation names the callback it works on, the host behind it, and its result.
+# A supervised Mythic_Operator delegation names the callback it works on, the host behind it, what its one guarded
+# action may use, and its result. That action is the upload, which Apollo accepts either as a file-UUID upload or as
+# an upload task (proposal_classification judges both), so the step may use either tool.
 CALLBACK_HOST = CALLBACK_C2_CONFIG["callback"]["host"]
-OPERATOR_BRIEF = {"callback_display_id": 7, "targets": [CALLBACK_HOST]}
+OPERATOR_BRIEF = {"callback_display_id": 7, "targets": [CALLBACK_HOST],
+                  "allowed_tools": ["upload_file_by_file_uuid", "issue_task_and_waitfor_task_output"]}
 SEEDS = (
     ("Supervisor", "transfer_to_Mythic_Operator", {"handoff_title": "Prepare Apollo payload",
       "handoff_instruction": PROMPT, **OPERATOR_BRIEF,
