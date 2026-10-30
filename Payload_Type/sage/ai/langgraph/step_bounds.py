@@ -15,7 +15,10 @@ from enum import Enum
 import os
 from typing import Any, Iterable, Mapping
 
-STEP_OUTCOME_VERSION = 1
+from . import step_references
+
+# 2: the outcome carries Sage-read references to the step's tasks, credentials and graph reads.
+STEP_OUTCOME_VERSION = 2
 QUEUED_PREFIX = "[Queued]"
 DENIED_PREFIX = "[DENIED by operator]"
 # Routing results that can appear in a worker's context; they are not work the step did.
@@ -75,6 +78,7 @@ class StepRecord:
     worker: str
     started: float
     tasks_before: frozenset[str] = frozenset()
+    credentials_before: frozenset[int] = frozenset()
     active_seconds: float = 0.0
     action_seconds: float = 0.0
     status: StepStatus | None = None
@@ -159,7 +163,7 @@ def scope_violation(brief: Any, tool_name: str, capability_name: str = "") -> st
 
 
 def step_outcome(record: StepRecord, activity: StepActivity, *, now: float, tasks_issued: Iterable[str] = (),
-                 status: StepStatus | None = None) -> dict[str, Any]:
+                 credentials_added: Iterable[int] = (), status: StepStatus | None = None) -> dict[str, Any]:
     final = status or record.status or StepStatus.ENDED
     wall = max(0.0, now - record.started)
     return {
@@ -172,6 +176,9 @@ def step_outcome(record: StepRecord, activity: StepActivity, *, now: float, task
         "guarded_executed": activity.executed,
         "guarded_rejected": activity.rejected,
         "tasks_issued": sorted(tasks_issued, key=lambda item: (len(item), item)),
+        "credentials_added": sorted(credentials_added),
+        # Filled from Mythic by the caller before the outcome is rendered (step_references.collect).
+        "references": step_references.empty(),
         "active_seconds": round(record.active_seconds, 1),
         "action_seconds": round(record.action_seconds, 1),
         "waiting_seconds": round(max(0.0, wall - record.active_seconds - record.action_seconds), 1),
@@ -189,6 +196,7 @@ def render_outcome(outcome: Mapping[str, Any]) -> str:
         f"Time: {outcome['active_seconds']:.0f}s active, {outcome['action_seconds']:.0f}s inside the guarded "
         f"action, {outcome['waiting_seconds']:.0f}s waiting (approval and other).",
     ]
+    lines.extend(step_references.render_lines(outcome.get("references")))
     if StepStatus(outcome["status"]) in CONTINUABLE:
         lines.append("Control is back with the Supervisor: choose the next step or answer the operator."
                      + (" Returning control did not cancel any target-side task." if outcome.get("tasks_issued")

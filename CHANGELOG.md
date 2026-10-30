@@ -21,6 +21,15 @@ between minor releases.
   with `SAGE_STEP_MAX_TOOL_CALLS`, `SAGE_STEP_MAX_ACTIVE_SECONDS` and `SAGE_STEP_MAX_CONSECUTIVE_ERRORS`.
   Autonomous mode and conversation requests are unchanged.
 
+- A supervised step's outcome now references everything the step did, read by Sage from Mythic rather than taken
+  from the specialist's summary: each task it issued with its recorded state, command, callback and output row
+  count; the credentials Mythic links to those tasks or that the step added, by account, realm and type only (never
+  the secret); and the graph reads it made. Every issued task reaches the Supervisor with an output excerpt or a
+  stated reason it has none (still pending, no output, read failed, or over the excerpt budget). Sage reads an
+  excerpt only for a task the specialist did not read itself, within 8,000 characters per step, so output that
+  lands after the specialist looked is delivered without another delegation. At most 16 tasks per step are read;
+  any beyond that are still listed.
+
 - A supervised delegation to the Mythic operator carries a brief that Sage checks before the specialist starts:
   the callback, the hosts, domains or principals the step acts on, the result it should produce, and what its one
   guarded action may use, either catalog procedures or the specialist's guarded tools. The callback must be one

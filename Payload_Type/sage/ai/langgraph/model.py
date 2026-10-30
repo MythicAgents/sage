@@ -63,6 +63,7 @@ from .operator_error import operator_error_text
 from . import worker_outcome as _worker_outcome
 from . import handoff_brief as _handoff_brief
 from . import step_bounds as _step_bounds
+from . import step_references as _step_references
 from . import prompt_context
 from ai.mcp import MCPManager, MCP_EXECUTION_CONTEXT_OFFENSIVE_RUNTIME
 from ai import observation_channel, provider_retry, resource_budget, resource_http
@@ -4271,6 +4272,49 @@ def _supervised_completed_return_context(
     return messages[:header_index] + messages[-1:] + messages[header_index:-1]
 
 
+def _step_reference_evidence(
+    references: Mapping[str, Any], rows_by_task: Mapping[int, Any], *, covered: set[int], request_id: str,
+) -> list[dict]:
+    """Observation records for a step's referenced tasks that the handback does not already carry.
+
+    A task already in the handback keeps that excerpt. Any other referenced task gets a bounded excerpt read by
+    Sage, or a record naming why it has none, so no issued task is silently absent. Marks each task reference
+    with where its excerpt is. Same scoping and envelope as the worker's own reads.
+    """
+    records: list[dict] = []
+    remaining = _step_references.SAGE_EXCERPT_CHARS
+    for reference in references.get("tasks") or []:
+        task_id = reference["task_id"]
+        if task_id in covered:
+            reference["excerpt"] = "existing"
+            continue
+        reason = {"failed": "read_failed", "not_read": "budget"}.get(reference.get("read"), "")
+        if not reason and not reference.get("output_rows"):
+            reason = "pending" if reference.get("completed") is False else "no_rows"
+        if not reason and remaining <= 0:
+            reason = "budget"
+        if not reason:
+            read = _worker_task_output_evidence(
+                [], request_id=request_id, limit=1, max_output_chars=remaining, max_total_chars=remaining,
+                supervised=True, matched_outputs=[(task_id, "current_request", rows_by_task.get(task_id))],
+            )
+            if read and read[0]["response_text_excerpts"]:
+                remaining -= sum(len(text) for text in read[0]["response_text_excerpts"])
+                records.append({**read[0], "source": "sage_reference_read",
+                                "task_completed": reference.get("completed"), "task_status": reference.get("status")})
+                reference["excerpt"] = "sage_read"
+                continue
+            reason = "scoped_content_omitted" if read and read[0]["scoped_content_omitted"] else "no_rows"
+        reference["excerpt"], reference["omitted_reason"] = "omitted", reason
+        records.append({
+            "source": "sage_reference_read", "request_id": request_id, "task_id": task_id,
+            "origin": "current_request", "task_completed": reference.get("completed"),
+            "task_status": reference.get("status"), "response_text_excerpts": [], "omitted_reason": reason,
+            "partial_snapshot": True, "truncated": False, "scoped_content_omitted": reason == "scoped_content_omitted",
+        })
+    return records
+
+
 def _handoff_task_output_evidence(
     source_model: Any, messages: list[AnyMessage], *, request_id: str,
     supervised: bool,
@@ -5786,6 +5830,10 @@ class Model:
         issued = getattr(getattr(self, "mythic_client", None), "_task_source_request_ids", None)
         return frozenset(str(task_id) for task_id in issued) if isinstance(issued, dict) else frozenset()
 
+    def _added_credential_ids(self) -> frozenset[int]:
+        added = getattr(getattr(self, "mythic_client", None), "_added_credential_ids", None)
+        return frozenset(i for i in added if type(i) is int) if isinstance(added, list) else frozenset()
+
     def _supervised_step_record(self, worker: str, messages: list[AnyMessage]) -> "_step_bounds.StepRecord | None":
         """The accounting record for a worker's current supervised step, created on first use; None outside one."""
         contract = getattr(self, "_request_contract", None)
@@ -5805,7 +5853,7 @@ class Model:
                 records.pop(stale)
             records[key] = _step_bounds.StepRecord(
                 request_id=request_id, delegation_seq=seq, worker=worker, started=self._step_clock(),
-                tasks_before=self._issued_task_ids(),
+                tasks_before=self._issued_task_ids(), credentials_before=self._added_credential_ids(),
             )
         return records[key]
 
@@ -5841,10 +5889,30 @@ class Model:
             _step_bounds.step_activity(_current_delegation_messages(messages), guarded),
             now=self._step_clock(),
             tasks_issued=self._issued_task_ids() - record.tasks_before,
+            credentials_added=self._added_credential_ids() - record.credentials_before,
             status=status,
         )
         self._step_records.pop((record.request_id, worker, record.delegation_seq), None)
         return outcome
+
+    async def _attach_step_references(
+        self, outcome: dict[str, Any] | None, messages: list[AnyMessage],
+    ) -> dict[int, Any]:
+        """Fill a step outcome's references from Mythic; returns the output rows read per task.
+
+        Sage reads these itself so the Supervisor sees every task the step issued, with its recorded state,
+        whether or not the worker read it. Read failures are recorded in the references, never raised.
+        """
+        client = getattr(self, "mythic_client", None)
+        if outcome is None or client is None:
+            return {}
+        references, rows = await _step_references.collect(
+            client, task_ids=outcome.get("tasks_issued") or (),
+            credentials_added=outcome.get("credentials_added") or (),
+            messages=_current_delegation_messages(messages), graph_tools=_BLOODHOUND_AGENT_TOOL_ALLOWLIST,
+        )
+        outcome["references"] = references
+        return rows
 
     def _check_handoff_brief(
         self, worker: str, brief: "_handoff_brief.HandoffBrief", instruction: str, title: str = "",
@@ -10030,6 +10098,7 @@ class Model:
                                 else _step_bounds.StepStatus.TASK_PENDING),
                     )
                     if pending_outcome is not None:
+                        await self._attach_step_references(pending_outcome, updated_channel)
                         pending_kwargs["_step_outcome"] = pending_outcome
                     final_msg = AIMessage(
                         content=summary_text,
@@ -10150,6 +10219,14 @@ class Model:
                 )
                 await self._close_delegation(node_name, content=summary_text, status="finished")
                 return Command(goto=END, update=terminal_update)
+
+            # A supervised step closes here; its references are read before the handback evidence is built, so
+            # every task the step issued reaches the Supervisor whether or not the worker read it.
+            step_outcome: dict[str, Any] | None = None
+            step_rows: dict[int, Any] = {}
+            if node_name != "Supervisor":
+                step_outcome = self._supervised_step_outcome(node_name, updated_channel)
+                step_rows = await self._attach_step_references(step_outcome, updated_channel)
 
             # If this is a worker agent (not Supervisor), copy its response
             # back to the Supervisor's channel AND to the calling agent's channel (if worker-to-worker handoff)
@@ -10329,6 +10406,12 @@ class Model:
                                 request_id=_completion_request_id,
                                 supervised=_supervised_lane,
                             )
+                            if step_outcome is not None:
+                                task_evidence = task_evidence + _step_reference_evidence(
+                                    step_outcome["references"], step_rows,
+                                    covered={record["task_id"] for record in task_evidence},
+                                    request_id=_completion_request_id,
+                                )
                             if task_evidence:
                                 evidence_message = _worker_task_evidence_message(
                                     task_evidence, request_id=_completion_request_id, worker=node_name,
@@ -10394,7 +10477,6 @@ class Model:
                     update["supervisor_messages"] = [empty_notice]
 
             if node_name != "Supervisor":
-                step_outcome = self._supervised_step_outcome(node_name, updated_channel)
                 if step_outcome is not None:
                     # Authored by Sage, not the worker, and appended last: the worker's answer stays directly
                     # after its completion header and a typed handback stays the latest worker message.

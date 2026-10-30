@@ -170,3 +170,30 @@ def test_cli_writes_json_and_markdown_and_opens_phoenix_read_only(tmp_path):
     assert report["requests"][0]["issued_tasks"] == 1
     assert report["requests"][0]["approval_cards"] == 0
     assert "| 1 | 1 → Mythic_Operator | go | True |" in (tmp_path / "m.md").read_text()
+
+
+def _rendered_step_outcome(referenced: list[int]) -> str:
+    """The Sage-authored step outcome exactly as the Supervisor reads it, referencing the given tasks."""
+    from ai.langgraph import step_bounds, step_references
+
+    record = step_bounds.StepRecord("r", 1, "Mythic_Operator", 0.0)
+    outcome = step_bounds.step_outcome(record, step_bounds.StepActivity(), now=1.0, tasks_issued={"1", "2"})
+    outcome["references"]["tasks"] = [
+        step_references.task_reference(task_id, {"status": "success", "completed": True}, []) for task_id in referenced]
+    return step_bounds.render_outcome(outcome)
+
+
+@pytest.mark.parametrize("referenced, visible", [
+    ([1, 2], [1, 2]),   # every issued task referenced
+    ([1], [1]),         # negative: an issued task missing from the references stays invisible
+    ([], []),           # near-match: the bare "Mythic tasks issued: 1, 2" list is not a reference
+])
+def test_handback_visibility_reads_the_step_outcomes_task_references(tmp_path, referenced, visible):
+    report = _report(tmp_path, [
+        _llm(1, "Supervisor"),
+        _tool(2, "transfer_to_Mythic_Operator", input_value="go", agent="Supervisor"),
+        _task(3, 1), _task(4, 2),
+        _llm(5, "Supervisor", prompt_text=_rendered_step_outcome(referenced)),
+    ])
+
+    assert report["delegation_detail"][0]["handback_visible_task_ids"] == visible

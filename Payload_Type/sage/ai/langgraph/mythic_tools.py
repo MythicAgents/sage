@@ -1990,6 +1990,8 @@ class MythicTools:
         # solve) and by the gate's durable-hop corroboration probe. Cache the raw rows for a short TTL so
         # neither path re-queries Mythic repeatedly.
         self._cred_cache: list | None = None
+        # Credential-store ids this process added with add_credential, in order (supervised step references).
+        self._added_credential_ids: list[int] = []
         self._cred_cache_ts: str | None = None
         self._credential_reference_bindings: dict[tuple[str, str, str, str], str] = {}
         self._credential_reference_lock = asyncio.Lock()
@@ -7687,9 +7689,10 @@ class MythicTools:
             metadata={"credential_type": str(credential.get("type") or "")},
         )
 
-    async def _fetch_credentials_cached(self, now: str) -> list:
+    async def _fetch_credentials_cached(self, now: str, force: bool = False) -> list:
         """Read the Mythic credential store (read-only) with a short-TTL cache, shared by read_credentials
         and the gate's corroboration probe so neither re-queries Mythic repeatedly. Returns raw cred rows.
+        `force` skips the cache (a step's references must see credentials its tasks just produced).
         Fail-open -> last cache or [].
         """
         try:
@@ -7698,7 +7701,7 @@ class MythicTools:
             except ImportError:
                 import engagement_state
                 import operation_context
-            if self._cred_cache is not None and self._cred_cache_ts:
+            if not force and self._cred_cache is not None and self._cred_cache_ts:
                 last = engagement_state._parse_iso(self._cred_cache_ts)
                 cur = engagement_state._parse_iso(now)
                 if last is not None and cur is not None and (cur - last).total_seconds() < self._CRED_CACHE_TTL_SECONDS:
@@ -18556,6 +18559,46 @@ class MythicTools:
             "completed": completed if type(completed) is bool else None,
         }
 
+    async def _step_task_records(self, task_ids) -> dict[int, dict[str, Any]]:
+        """Read several tasks' own records (state, command, callback) in one query, keyed by display id.
+
+        Read-only control-plane data for a supervised step's references. A display id returned twice is
+        ambiguous and left out; {} when nothing can be read.
+        """
+        exact = sorted({i for i in (self._exact_task_display_id(t) for t in task_ids) if i is not None})
+        if self.client is None or not exact:
+            return {}
+        resp = await mythic.execute_custom_query(
+            mythic=self.client,
+            query=(
+                "query sageStepTaskRecords($display_ids: [Int!]!) { "
+                "task(where: {display_id: {_in: $display_ids}}) { "
+                "display_id status completed command_name callback { display_id } } }"
+            ),
+            variables={"display_ids": exact},
+        )
+        rows = (resp or {}).get("task") if isinstance(resp, dict) else None
+        records: dict[int, dict[str, Any]] = {}
+        seen: set[int] = set()
+        for row in rows if isinstance(rows, list) else []:
+            display_id = row.get("display_id") if isinstance(row, dict) else None
+            if type(display_id) is not int or display_id not in exact:
+                continue
+            if display_id in seen:
+                records.pop(display_id, None)
+                continue
+            seen.add(display_id)
+            callback = row.get("callback")
+            callback_id = callback.get("display_id") if isinstance(callback, dict) else None
+            completed = row.get("completed")
+            records[display_id] = {
+                "status": str(row.get("status") or "").strip().casefold(),
+                "completed": completed if type(completed) is bool else None,
+                "command": str(row.get("command_name") or ""),
+                "callback_display_id": callback_id if type(callback_id) is int else None,
+            }
+        return records
+
     async def _task_output_rows(self, exact_task_id: int) -> tuple[Any, bool]:
         """Decoded output rows for one task, served from the completed-task cache when present.
 
@@ -19529,6 +19572,8 @@ class MythicTools:
         except Exception as e:
             return f"Failed to add credential: {e}"
         if (result or {}).get("status") == "success":
+            if type(result.get("id")) is int:
+                self._added_credential_ids.append(result["id"])
             return (f"Added credential to the Mythic store (id={result.get('id')}): "
                     f"account={account or '-'} realm={realm or '-'} type={credential_type or 'plaintext'}.")
         return f"add_credential did not succeed: {result}"

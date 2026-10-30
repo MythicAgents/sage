@@ -468,7 +468,9 @@ def test_native_approval_reaches_registered_task_sink_with_prepared_args(monkeyp
             second.InputResponse = driver.input_response("accept", cards[0])
             await chat.chat(second)
             if case == "inline_file":
-                task_posts = [variables for variables in posted if variables.get("command")]
+                # The step's handback references read Mythic through the same transport (some without variables).
+                task_posts = [variables for variables in posted
+                              if isinstance(variables, dict) and variables.get("command")]
                 assert len(task_posts) == 1
                 assert task_posts[0]["command"] == command
                 assert json.loads(task_posts[0]["params"]) == card_args["parameters"]
