@@ -9,6 +9,34 @@ between minor releases.
 
 ### Added
 
+- In supervised mode each specialist step is bounded. A step returns control to the Supervisor after its one
+  guarded action has run or been rejected, or earlier at 20 tool calls, 10 minutes of active time, or three
+  consecutive tool errors. Time awaiting an operator's approval and time inside the guarded action itself,
+  including the Mythic task wait, never count as active time. After its action the specialist may still read and
+  summarize the result; a further guarded proposal in the same step is removed before an approval card is shown,
+  so it needs a new step. Sage then gives the Supervisor a typed outcome for the step: the action ran, was
+  rejected, fell outside the step's scope, a limit was reached, a task is still pending, or the specialist
+  finished on its own, with the tasks issued and the time spent. Reaching a limit is not a failure; the
+  Supervisor chooses the next step, and returning control never cancels a task on the target. Set the limits
+  with `SAGE_STEP_MAX_TOOL_CALLS`, `SAGE_STEP_MAX_ACTIVE_SECONDS` and `SAGE_STEP_MAX_CONSECUTIVE_ERRORS`.
+  Autonomous mode and conversation requests are unchanged.
+
+- A supervised delegation to the Mythic operator carries a brief that Sage checks before the specialist starts:
+  the callback, the hosts, domains or principals the step acts on, the result it should produce, and what its one
+  guarded action may use, either catalog procedures or the specialist's guarded tools. The callback must be one
+  Sage has observed (and the request's bound callback when it has one), targets must be named by the operator or
+  already known, and referenced tasks and credentials must be records Sage holds. A failed check returns the
+  reasons to the Supervisor; a second consecutive failure ends the request and tells the operator why. A step
+  that only reads Mythic or BloodHound records declares itself `control_plane` and needs no callback, but may not
+  propose any guarded action. The specialist still receives the operator's exact words.
+
+- The Supervisor can list callbacks itself in conversation and supervised mode, so "which callbacks are alive"
+  is answered without a delegation and a brief can name a callback the Supervisor has seen.
+
+- Every delegation outside the capability catalog is recorded with its title, assignment, expected result and
+  brief, so later reviews can find recurring procedures worth adding to the catalog. The capability choices
+  offered to the model come from the catalog itself.
+
 - In supervised and conversation mode, a request to reach privilege on or take control of a target now consults
   the BloodHound graph before Sage chooses a specialist. Sage reads which domains the graph has collected and,
   for each target domain the graph covers, whether a path exists from the principals Sage controls. It then
