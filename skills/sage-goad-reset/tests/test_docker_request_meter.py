@@ -4,7 +4,9 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import socket
+import tempfile
 import threading
 import time
 
@@ -18,6 +20,15 @@ SPEC = importlib.util.spec_from_file_location(
 )
 meter = importlib.util.module_from_spec(SPEC); assert SPEC and SPEC.loader; SPEC.loader.exec_module(meter)
 from ai import resource_budget
+
+
+@pytest.fixture
+def tmp_path():
+    """A short temporary directory: these tests bind Unix sockets, whose paths are limited to about 107 bytes.
+    pytest's own tmp_path nests the test name (and, under xdist, the worker id) deep enough to exceed that."""
+    path = Path(tempfile.mkdtemp(prefix="sage-dm-"))
+    yield path
+    shutil.rmtree(path, ignore_errors=True)
 
 
 def _ledger(tmp_path, limit=10, cleanup=0):

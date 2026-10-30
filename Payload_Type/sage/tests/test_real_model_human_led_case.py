@@ -21,6 +21,10 @@ from langchain_core.messages import SystemMessage
 from langchain_core.messages import ToolMessage
 
 
+# Passes alone and in serial order but fails in a parallel worker after other modules have run there: shared
+# process state leaks into it that is not yet traced. Run in the offline suite's serial pass until it is.
+pytestmark = pytest.mark.serial
+
 SCRIPT = (Path(__file__).resolve().parents[3] / "skills" /
           "sage-focused-capability-tests" / "scripts" / "run_real_model_human_led_case.py")
 

@@ -166,11 +166,13 @@ def test_accept_poll_does_not_bound_an_accepted_frame_transaction(tmp_path,monke
         assert result==[True] and row["frame_bytes"]<=row["frame_limit_bytes"]
 
 
+# Explicit ids: the third case embeds generated event ids, and an id that differs per process breaks
+# parallel collection, which requires every worker to collect identical test ids.
 @pytest.mark.parametrize("content,reason", [
     (b"bad", "invalid_json"),
     (json.dumps({"schema": "wrong"}).encode(), "invalid_envelope"),
     (json.dumps({**_event(), "kind": []}).encode(), "invalid_envelope"),
-])
+], ids=["not-json", "wrong-schema", "event-with-invalid-kind"])
 def test_malformed_frames_fail_sticky_with_redacted_reason(tmp_path, content, reason):
     parent = (tmp_path / "temporary").resolve(); parent.mkdir()
     record = (tmp_path / f"{reason}.jsonl").resolve()

@@ -18,6 +18,10 @@ from ai.hillclimb.trust_walker_pilot import summarize_pair
 from ai.hillclimb import trust_walker_pilot as pilot
 
 
+# Passes alone and in serial order but fails in a parallel worker after other modules have run there: shared
+# process state leaks into it that is not yet traced. Run in the offline suite's serial pass until it is.
+pytestmark = pytest.mark.serial
+
 SCRIPT = Path(__file__).resolve().parents[3] / "skills" / "sage-eval-gauge" / "scripts" / "run_trust_walker_pilot.py"
 SPEC = importlib.util.spec_from_file_location("trust_walker_pilot_cli", SCRIPT)
 cli = importlib.util.module_from_spec(SPEC)

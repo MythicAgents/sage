@@ -16,6 +16,11 @@ SOURCE = ROOT / "skills/sage-eval-gauge/scripts/diagnostic_service_isolation.py"
 SPEC = importlib.util.spec_from_file_location("diagnostic_service_isolation", SOURCE)
 service = importlib.util.module_from_spec(SPEC); assert SPEC.loader is not None; SPEC.loader.exec_module(service)
 
+# These tests start sandboxed services against deadlines a few seconds out on the monotonic clock. Under a
+# fully loaded parallel run the setup alone can outlast the deadline, so the offline suite runs them in its
+# serial pass.
+pytestmark = pytest.mark.serial
+
 
 def _sha(path): return hashlib.sha256(path.read_bytes()).hexdigest()
 

@@ -50,6 +50,10 @@ def pytest_configure(config):
         "markers",
         f"{_PINNED_MARKER}: needs pinned live-run policy rows from gitignored .hillclimb/results/",
     )
+    config.addinivalue_line(
+        "markers",
+        "serial: timing-sensitive; the offline suite runs it after the parallel pass, with nothing else running",
+    )
 
 
 def pytest_collection_modifyitems(config, items):
@@ -70,6 +74,24 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if _PINNED_MARKER in item.keywords:
             item.add_marker(skip)
+
+
+@pytest.fixture(autouse=True)
+def _drop_log_handlers_on_closed_streams():
+    """Remove mythic-logger handlers left bound to an earlier test's closed capture stream.
+
+    `logging_fix.ensure_logger_initialized` binds a handler to whatever `sys.stdout` is the first time it
+    runs, which inside a test is pytest's per-test capture. Once that test ends the stream is closed, and
+    every later graph node's `force_flush_all_handlers()` raises "I/O operation on closed file", failing
+    tests depending only on which test happened to run first in the process. Dropping the dead handler
+    lets the logger re-initialize against the current stream.
+    """
+    from mythic_container.logging import logger as mythic_logger
+
+    for handler in list(mythic_logger.handlers):
+        if getattr(getattr(handler, "stream", None), "closed", False):
+            mythic_logger.removeHandler(handler)
+    yield
 
 
 @pytest.fixture(autouse=True)

@@ -14,6 +14,10 @@
 
 pytest==9.1.1
 
+# Lets `run_offline_suite.py --parallel` run the offline suite on every core for fast feedback. Tests must
+# collect identical ids in every worker process. The default (serial) run remains the gate.
+pytest-xdist==3.8.0
+
 # Bounded OpenAI-compatible provider transport in the operator's real-model case runner.
 httpx==0.28.1
 

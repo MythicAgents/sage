@@ -33,10 +33,33 @@ SKILLS_ROOT = REPO_ROOT / "skills"
 DEV_REQUIREMENTS = REPO_ROOT / "Payload_Type" / "sage" / "requirements-dev.txt"
 
 
-def command_for(pytest_args: list[str]) -> list[str]:
+def _chooses_workers(pytest_args: list[str]) -> bool:
+    return any(arg in ("-n", "--numprocesses") or arg.startswith(("-n", "--numprocesses=")) for arg in pytest_args)
+
+
+def command_for(pytest_args: list[str], *, parallel: bool = False) -> list[str]:
+    """The pytest command; with `parallel` it runs on every core unless the caller picks `-n`."""
+    args = list(pytest_args) or ["-q"]
     command = [sys.executable, "-m", "pytest", str(TEST_ROOT), str(HYGIENE_ROOT), str(SKILLS_ROOT)]
-    command.extend(pytest_args or ["-q"])
+    if parallel and not _chooses_workers(args):
+        command.extend(["-n", "auto"])
+    command.extend(args)
     return command
+
+
+def pass_commands(pytest_args: list[str], *, parallel: bool = False) -> list[list[str]]:
+    """The run as one or two pytest commands. The default is one serial run of everything, the proven gate.
+
+    `--parallel` (needs pytest-xdist) splits it into a parallel pass over everything not marked `serial` and a
+    serial pass over the rest. That parallel pass is reliable; the serial pass is not yet, because tests marked
+    `serial` fail after the whole tree has been collected, though they pass alone and in the default serial
+    run. Until that is traced, `--parallel` is for fast feedback during work and the default run is the gate.
+    A caller who picks `-n` or `-m` gets exactly one command with those choices."""
+    args = list(pytest_args) or ["-q"]
+    if not parallel or _chooses_workers(args) or "-m" in args:
+        return [command_for(args, parallel=parallel)]
+    return [command_for([*args, "-m", "not serial"], parallel=True),
+            command_for([*args, "-m", "serial"], parallel=False)]
 
 
 def pytest_missing_message() -> str | None:
@@ -68,20 +91,54 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("pytest_args", nargs=argparse.REMAINDER)
     parser.add_argument("--print-command", action="store_true")
+    parser.add_argument("--parallel", action="store_true",
+                        help="Fast feedback on every core (needs pytest-xdist); not yet the gate, see pass_commands.")
     return parser
 
 
+WRAPPER_OPTIONS = ("supported", "--print-command", "--parallel")
+
+
+def split_args(argv: list[str]) -> tuple[set[str], list[str]]:
+    """(wrapper options, pytest_args). Wrapper options come first; everything after them goes to pytest
+    unparsed, so pytest options such as `-q`, `-k` or `-n 0` pass through without a separator."""
+    rest = list(argv)
+    options: set[str] = set()
+    while rest and rest[0] in WRAPPER_OPTIONS:
+        options.add(rest.pop(0))
+    if rest[:1] == ["--"]:
+        rest = rest[1:]
+    return options, rest
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    command = command_for(args.pytest_args)
-    print(" ".join(command), flush=True)
-    if args.print_command:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv in (["-h"], ["--help"]):
+        build_parser().print_help()
+        return 0
+    options, pytest_args = split_args(argv)
+    parallel = "--parallel" in options
+    if parallel and importlib.util.find_spec("xdist") is None:
+        print(f"--parallel needs pytest-xdist; install the dev requirements:\n"
+              f"  {sys.executable} -m pip install -r {DEV_REQUIREMENTS}", file=sys.stderr)
+        return 1
+    commands = pass_commands(pytest_args, parallel=parallel)
+    for command in commands:
+        print(" ".join(command), flush=True)
+    if "--print-command" in options:
         return 0
     missing = pytest_missing_message()
     if missing is not None:
         print(missing, file=sys.stderr)
         return 1
-    return subprocess.run(command, cwd=REPO_ROOT, check=False).returncode
+    worst = 0
+    for index, command in enumerate(commands):
+        code = subprocess.run(command, cwd=REPO_ROOT, check=False).returncode
+        # Exit 5 means "no tests collected": expected for the serial pass when a filter selects none of them.
+        if code == 5 and index > 0:
+            code = 0
+        worst = worst or code
+    return worst
 
 
 if __name__ == "__main__":
