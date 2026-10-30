@@ -2,6 +2,7 @@ import copy
 import hashlib
 import json
 import math
+import inspect
 import ntpath
 import os
 import re
@@ -5912,6 +5913,13 @@ class Model:
             messages=_current_delegation_messages(messages), graph_tools=_BLOODHOUND_AGENT_TOOL_ALLOWLIST,
         )
         outcome["references"] = references
+        # The step's proven capability gains go to the engagement ledger (progress, not events).
+        writer = getattr(client, "_record_step_ledger", None)
+        if inspect.iscoroutinefunction(writer):
+            try:
+                outcome["ledger"] = await writer(references, [task["task_id"] for task in references["tasks"]])
+            except Exception as exc:
+                logger.warning(f"step ledger not written: {type(exc).__name__}: {exc}")
         return rows
 
     def _check_handoff_brief(

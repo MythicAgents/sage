@@ -1992,6 +1992,9 @@ class MythicTools:
         self._cred_cache: list | None = None
         # Credential-store ids this process added with add_credential, in order (supervised step references).
         self._added_credential_ids: list[int] = []
+        # Callback contexts as last seen at a supervised step boundary, by display id; None until the first
+        # observation, which is the baseline a later gain is measured against (step ledger).
+        self._callback_contexts_seen: dict | None = None
         self._cred_cache_ts: str | None = None
         self._credential_reference_bindings: dict[tuple[str, str, str, str], str] = {}
         self._credential_reference_lock = asyncio.Lock()
@@ -18573,7 +18576,7 @@ class MythicTools:
             query=(
                 "query sageStepTaskRecords($display_ids: [Int!]!) { "
                 "task(where: {display_id: {_in: $display_ids}}) { "
-                "display_id status completed command_name callback { display_id } } }"
+                "display_id status completed command_name timestamp callback { display_id } } }"
             ),
             variables={"display_ids": exact},
         )
@@ -18596,8 +18599,170 @@ class MythicTools:
                 "completed": completed if type(completed) is bool else None,
                 "command": str(row.get("command_name") or ""),
                 "callback_display_id": callback_id if type(callback_id) is int else None,
+                "timestamp": str(row.get("timestamp") or ""),
             }
         return records
+
+    async def _step_callback_rows(self) -> list[dict[str, Any]]:
+        """The operation's callbacks as Mythic records them, for a supervised step's context gains. Read-only."""
+        if self.client is None:
+            return []
+        try:
+            from . import operation_context
+        except ImportError:
+            import operation_context
+        try:
+            resolved = await operation_context.resolve_operation(self.client)
+            operation_id = resolved[0] if resolved else None
+        except Exception:
+            operation_id = None
+        if operation_id is not None:
+            query = ("query sageStepCallbacks($op: Int) { callback(where: {operation_id: {_eq: $op}}, "
+                     "order_by: {display_id: asc}, limit: 200) "
+                     "{ display_id agent_callback_id host user integrity_level init_callback } }")
+            variables = {"op": operation_id}
+        else:
+            query = ("query sageStepCallbacks { callback(order_by: {display_id: asc}, limit: 200) "
+                     "{ display_id agent_callback_id host user integrity_level init_callback } }")
+            variables = None
+        resp = await mythic.execute_custom_query(mythic=self.client, query=query, variables=variables)
+        rows = (resp or {}).get("callback") if isinstance(resp, dict) else None
+        return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+    def _runtime_callback_proof_envelope(self, gain, now: str) -> dict:
+        """Proof for a callback context gain credited to the task that caused it; {} when not admissible."""
+        if self._evaluation_authorization_proof_lineage_missing(None):
+            return {}
+        try:
+            try:
+                from . import proof_boundary, step_ledger
+            except ImportError:
+                import proof_boundary
+                import step_ledger
+            task = gain.task
+            row = gain.context.row()
+            envelope = proof_boundary.make_runtime_callback_envelope(
+                engagement_id=self._eng_key(), callback_id=gain.context.display_id, task_id=task.task_id,
+                terminal_status=task.status, command=task.command,
+                agent_callback_id=gain.context.agent_callback_id, callback_row=row,
+                verifier_id=step_ledger.VERIFIER_ID, captured_at=now,
+                transaction_id=f"callback-context:{gain.context.display_id}:{task.task_id}",
+                verifier_result={"kind": gain.kind, "effects": list(gain.effects)},
+            )
+            admission = proof_boundary.admit_runtime_envelope(
+                envelope, current_engagement_id=self._eng_key(), expected_callback_id=gain.context.display_id,
+                expected_task_id=task.task_id, expected_artifact_id=gain.context.agent_callback_id,
+            )
+            return envelope.to_dict() if admission.admitted else {}
+        except Exception:
+            return {}
+
+    async def _record_step_ledger(self, references: dict, step_task_ids) -> dict[str, Any]:
+        """Record the capability gains a supervised step proved; returns what was recorded and left unattributed.
+
+        Callback context gains are credited to tasks this process issued; credentials are recorded when their
+        source task is one of the step's tasks. Rows go through the proof boundary like every other writer, so an
+        unadmitted gain lands as `legacy_unverified`, never `achieved`. Reads are bounded and fail open.
+        """
+        try:
+            from . import engagement_state, step_ledger
+        except ImportError:
+            import engagement_state
+            import step_ledger
+        summary: dict[str, Any] = {"recorded": [], "unattributed": []}
+        lineage = sorted(i for i in getattr(self, "_task_source_request_ids", {}) if type(i) is int)
+        credentials = [c for c in (references.get("credentials") or []) if "source_task_id" in c]
+        if not lineage and not credentials:
+            return summary  # nothing this process issued can be credited with anything
+        now = datetime.now(timezone.utc).isoformat()
+        state = engagement_state.EngagementState(
+            objective=self._engagement_objective(), footholds=[], hops=list(self._engagement_hops),
+            engagement_id=self._eng_key(), runtime_scope=True,
+        )
+        hops_before = len(state.hops)
+        changed = False
+        def status_of(technique: str, target: str) -> str:
+            return next((hop.status for hop in state.hops if hop.technique == technique and hop.target == target), "")
+
+        def keeps_proof(technique: str, target: str, proof: dict) -> bool:
+            # A proven row is never downgraded by a weaker observation of the same effect.
+            return not proof and status_of(technique, target) == "achieved"
+
+        try:
+            rows = await asyncio.wait_for(self._step_callback_rows(), timeout=5.0) if lineage else []
+            records = await asyncio.wait_for(self._step_task_records(lineage[-16:]), timeout=5.0) if lineage else {}
+        except Exception as exc:
+            logger.debug(f"step ledger: callback context unreadable: {exc}")
+            lineage, rows, records = [], [], {}
+        if lineage:
+            issued = [step_ledger.IssuedTask(task_id=task_id, callback_display_id=record.get("callback_display_id"),
+                                             command=record.get("command") or "", status=record.get("status") or "",
+                                             timestamp=record.get("timestamp") or "")
+                      for task_id, record in sorted(records.items())]
+            contexts = [c for c in (step_ledger.callback_context(row) for row in rows) if c is not None]
+            first = self._callback_contexts_seen is None
+            gains = step_ledger.context_gains(contexts, self._callback_contexts_seen or {}, issued, step_task_ids,
+                                              window=step_ledger.attribution_window())
+            summary["unattributed"] = step_ledger.unattributed(gains, first_observation=first)
+            self._callback_contexts_seen = {c.display_id: c for c in contexts}
+            for gain in gains:
+                if gain.task is None:
+                    continue
+                proof = self._runtime_callback_proof_envelope(gain, now)
+                for effect in gain.effects:
+                    if keeps_proof(step_ledger.TECHNIQUE, effect, proof):
+                        continue
+                    evidence = {
+                        "source": "supervised_step", "kind": gain.kind, "mythic_task_id": gain.task.task_id,
+                        "callback_id": gain.context.display_id, "host": gain.context.host,
+                        "user": gain.context.user, "integrity": gain.context.integrity,
+                        "transaction_id": f"callback-context:{gain.context.display_id}:{gain.task.task_id}",
+                        "terminal_task_status": gain.task.status, "artifact_id": gain.context.agent_callback_id,
+                        "verifier_id": step_ledger.VERIFIER_ID,
+                    }
+                    state = engagement_state.record_effect_result(
+                        state, step_ledger.TECHNIQUE, effect, effect, "achieved", evidence, now,
+                        proof_envelope=proof, require_admissible_proof=True, engagement_id=self._eng_key(),
+                    )
+                    summary["recorded"].append({"effect": effect, "task_id": gain.task.task_id,
+                                                "status": status_of(step_ledger.TECHNIQUE, effect)})
+                    changed = True
+        if credentials:
+            wanted = {c["credential_id"] for c in credentials}
+            for row in await self._fetch_credentials_cached(now):
+                if not isinstance(row, dict) or row.get("id") not in wanted:
+                    continue
+                task = row.get("task") if isinstance(row.get("task"), dict) else {}
+                callback = task.get("callback") if isinstance(task.get("callback"), dict) else {}
+                account, realm = str(row.get("account") or ""), str(row.get("realm") or "")
+                target = f"{account}@{realm}".casefold()
+                evidence = {
+                    "source": "supervised_step", "credential_id": row["id"],
+                    "credential_type": str(row.get("type") or ""), "mythic_task_id": task.get("display_id"),
+                    "callback_id": callback.get("display_id"),
+                    "transaction_id": f"credential-observation:{task.get('display_id')}",
+                    "terminal_task_status": self._credential_task_terminal_success_status(task),
+                    "verifier_id": "mythic_credential_store:observed",
+                }
+                proof = self._credential_store_proof_envelope(row, now)
+                if keeps_proof("credential-store", target, proof):
+                    continue
+                state = engagement_state.record_effect_result(
+                    state, "credential-store", target, f"creds:{target}", "achieved", evidence, now,
+                    proof_envelope=proof,
+                    require_admissible_proof=True, engagement_id=self._eng_key(),
+                )
+                summary["recorded"].append({"effect": f"creds:{target}", "task_id": task.get("display_id"),
+                                            "status": status_of("credential-store", target)})
+                changed = True
+        if changed:
+            self._engagement_hops = state.hops
+            try:
+                self._persist_engagement_ledger()
+            except Exception:
+                pass  # fail-open: persistence must never break the handback
+            logger.info(f"📒 [step ledger] {len(state.hops) - hops_before} new rows; recorded {summary['recorded']}")
+        return summary
 
     async def _task_output_rows(self, exact_task_id: int) -> tuple[Any, bool]:
         """Decoded output rows for one task, served from the completed-task cache when present.

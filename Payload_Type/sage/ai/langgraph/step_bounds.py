@@ -197,6 +197,15 @@ def render_outcome(outcome: Mapping[str, Any]) -> str:
         f"action, {outcome['waiting_seconds']:.0f}s waiting (approval and other).",
     ]
     lines.extend(step_references.render_lines(outcome.get("references")))
+    ledger = outcome.get("ledger") if isinstance(outcome.get("ledger"), Mapping) else {}
+    if ledger.get("recorded"):
+        lines.append("Engagement ledger: " + "; ".join(
+            f"`{row['effect']}` {row.get('status') or 'recorded'} (task {row.get('task_id')})"
+            for row in ledger["recorded"]) + ".")
+    if ledger.get("unattributed"):
+        lines.append("Callback gains no Sage task can be credited with (not recorded): " + "; ".join(
+            f"callback {row['callback_display_id']} ({', '.join(row['effects'])})" for row in ledger["unattributed"])
+            + ".")
     if StepStatus(outcome["status"]) in CONTINUABLE:
         lines.append("Control is back with the Supervisor: choose the next step or answer the operator."
                      + (" Returning control did not cancel any target-side task." if outcome.get("tasks_issued")

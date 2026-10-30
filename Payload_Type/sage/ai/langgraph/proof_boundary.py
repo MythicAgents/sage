@@ -8,7 +8,7 @@ BloodHound ingest lineage.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import re
@@ -24,12 +24,15 @@ ORIGIN_MYTHIC_TASK = "mythic_task"
 ORIGIN_MYTHIC_ARTIFACT = "mythic_artifact"
 ORIGIN_MYTHIC_CREDENTIAL = "mythic_credential"
 ORIGIN_BLOODHOUND_INGEST = "bloodhound_ingest"
+# A callback context Mythic recorded (a new session, a rise in integrity), credited to the task that caused it.
+ORIGIN_MYTHIC_CALLBACK = "mythic_callback"
 
 ALLOWED_RUNTIME_ORIGINS = frozenset({
     ORIGIN_MYTHIC_TASK,
     ORIGIN_MYTHIC_ARTIFACT,
     ORIGIN_MYTHIC_CREDENTIAL,
     ORIGIN_BLOODHOUND_INGEST,
+    ORIGIN_MYTHIC_CALLBACK,
 })
 
 DISALLOWED_RUNTIME_ORIGINS = frozenset({
@@ -383,6 +386,12 @@ def admit_runtime_envelope(
             return ProofAdmission(False, envelope, "artifact proof requires artifact id and sha256", REJECTED)
         if _text(expected_artifact_id) and envelope.artifact_id != _text(expected_artifact_id):
             return ProofAdmission(False, envelope, "artifact proof does not match claimed artifact", REJECTED)
+    elif envelope.origin == ORIGIN_MYTHIC_CALLBACK:
+        # The artifact is Mythic's callback row: its agent callback id and the digest of the canonical row.
+        if not envelope.artifact_id or not _valid_sha256(envelope.artifact_sha256):
+            return ProofAdmission(False, envelope, "callback proof requires the callback row id and sha256", REJECTED)
+        if _text(expected_artifact_id) and envelope.artifact_id != _text(expected_artifact_id):
+            return ProofAdmission(False, envelope, "callback proof does not match claimed callback", REJECTED)
     elif envelope.origin == ORIGIN_MYTHIC_CREDENTIAL:
         if not envelope.credential_id:
             return ProofAdmission(False, envelope, "credential proof requires credential id", REJECTED)
@@ -637,6 +646,38 @@ def make_runtime_artifact_envelope(
         captured_at=captured_at,
         metadata=metadata or {},
     )
+
+
+def make_runtime_callback_envelope(
+    *,
+    engagement_id: str,
+    callback_id: Any,
+    task_id: Any,
+    terminal_status: str,
+    command: str,
+    agent_callback_id: str,
+    callback_row: Any,
+    verifier_id: str,
+    captured_at: str,
+    transaction_id: str = "",
+    verifier_version: str = "v1",
+    verifier_result: Any = None,
+    authorization: Mapping[str, Any] | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> ProofEnvelope:
+    """Proof that Mythic recorded a callback context, credited to the task that caused it.
+
+    The callback row is both the artifact (its digest) and the verifier input, so the claimed context cannot
+    differ from what Mythic recorded.
+    """
+    envelope = make_runtime_artifact_envelope(
+        engagement_id=engagement_id, callback_id=callback_id, task_id=task_id, terminal_status=terminal_status,
+        command=command, artifact_id=_text(agent_callback_id),
+        artifact_sha256=canonical_commitment_sha256(callback_row), verifier_id=verifier_id, captured_at=captured_at,
+        transaction_id=transaction_id, verifier_version=verifier_version, verifier_input=callback_row,
+        verifier_result=verifier_result, authorization=authorization, metadata=metadata,
+    )
+    return replace(envelope, origin=ORIGIN_MYTHIC_CALLBACK)
 
 
 def make_runtime_credential_envelope(

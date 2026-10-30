@@ -30,6 +30,17 @@ between minor releases.
   lands after the specialist looked is delivered without another delegation. At most 16 tasks per step are read;
   any beyond that are still listed.
 
+- Supervised steps now record what they proved in the engagement ledger, which tracks progress rather than every
+  task. A new callback, whether on a new host or as a new user, records a session on that host. A callback at high
+  or SYSTEM integrity, or one whose integrity rises after a step's task on it, records admin or SYSTEM on that host.
+  A credential whose source task belongs to the step is recorded by account and realm, never with its secret.
+  A callback gain is credited to the Sage task issued before the callback first checked in, within 10 minutes
+  (`SAGE_STEP_LEDGER_ATTRIBUTION_SECONDS`), so a payload that checks in after its step ended is still credited.
+  Each row is proven against Mythic's own callback record or the credential's source task; a gain credited to a
+  task that ended in error is kept unproven. A proven row is never downgraded by a weaker observation, and a
+  repeated gain updates its row. Losing a callback or changing a token records nothing, and a gain no Sage task can
+  be credited with is reported but not recorded. Autonomous mode and conversation requests are unchanged.
+
 - A supervised delegation to the Mythic operator carries a brief that Sage checks before the specialist starts:
   the callback, the hosts, domains or principals the step acts on, the result it should produce, and what its one
   guarded action may use, either catalog procedures or the specialist's guarded tools. The callback must be one

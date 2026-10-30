@@ -350,7 +350,7 @@ def test_step_task_records_read_once_and_drop_an_ambiguous_display_id(mythic, mo
         seen.append(variables)
         return {"task": [
             {"display_id": 90, "status": "Success", "completed": True, "command_name": "whoami",
-             "callback": {"display_id": 2}},
+             "timestamp": "2026-10-30T10:00:00", "callback": {"display_id": 2}},
             {"display_id": 91, "status": "submitted", "completed": False, "command_name": "ps", "callback": None},
             {"display_id": 91, "status": "success", "completed": True, "command_name": "ps", "callback": None},
             {"display_id": 99, "status": "success", "completed": True},  # not asked for
@@ -359,7 +359,8 @@ def test_step_task_records_read_once_and_drop_an_ambiguous_display_id(mythic, mo
     monkeypatch.setattr(api, "execute_custom_query", query)
     records = asyncio.run(tools._step_task_records(["91", 90, "90; drop", -1]))
     assert seen == [{"display_ids": [90, 91]}]
-    assert records == {90: {"status": "success", "completed": True, "command": "whoami", "callback_display_id": 2}}
+    assert records == {90: {"status": "success", "completed": True, "command": "whoami", "callback_display_id": 2,
+                            "timestamp": "2026-10-30T10:00:00"}}
 
 
 def test_added_credentials_are_recorded_and_a_forced_read_skips_the_cache(mythic, monkeypatch):
