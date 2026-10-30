@@ -5684,8 +5684,11 @@ class Model:
         task_id = receipt.get("task_display_id")
         if mythic_client is None or task_id is None:
             return None
+        # The internal row reader bypasses the model-facing re-read clamp, which would otherwise count
+        # these reconciliation reads against the worker's own later read of the same failed task.
+        rows_reader = getattr(mythic_client, "_task_output_rows", None)
         reader = getattr(mythic_client, "get_all_task_output_by_task_id", None)
-        if reader is None:
+        if not callable(rows_reader) and reader is None:
             return None
         record_reader = getattr(mythic_client, "_task_record_state", None)
         observed: dict[str, Any] | None = None
@@ -5694,10 +5697,10 @@ class Model:
             if delay:
                 await asyncio.sleep(delay)
             try:
-                raw = await asyncio.wait_for(
-                    reader(task_id=task_id),
-                    timeout=15,
-                )
+                if callable(rows_reader):
+                    raw, _cache_hit = await asyncio.wait_for(rows_reader(task_id), timeout=15)
+                else:
+                    raw = await asyncio.wait_for(reader(task_id=task_id), timeout=15)
             except Exception as e:
                 logger.warning(f"Deferred-task receipt reconciliation read failed for task {task_id}: {type(e).__name__}: {e}")
                 return observed
@@ -5706,6 +5709,9 @@ class Model:
             except (TypeError, ValueError) as e:
                 logger.warning(f"Deferred-task receipt reconciliation read returned unparseable output for task {task_id}: {e}")
                 return observed
+            # The output tool wraps its rows as {"provenance": ..., "task_output": [rows]}.
+            if isinstance(rows, dict):
+                rows = rows.get("task_output")
             if isinstance(rows, list) and rows:
                 task_fields = rows[-1].get("task") if isinstance(rows[-1], dict) else None
                 status = str((task_fields or {}).get("status") or "").strip().casefold()

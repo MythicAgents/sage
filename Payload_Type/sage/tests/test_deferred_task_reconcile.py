@@ -41,7 +41,13 @@ _AGENT_ERROR = "Error: completion function - click cog to check stderr"
 def _handback(request_suffix, reader, record=None):
     async def run():
         model, tools = _handback_model(f"chat:deferred-reconcile:request:{request_suffix}")
-        tools.get_all_task_output_by_task_id = reader
+        tools.get_all_task_output_by_task_id = AsyncMock(side_effect=AssertionError("model-facing read used"))
+
+        async def rows(task_id):
+            # The internal reader returns decoded rows, the shape the real helper produces.
+            return json.loads(await reader(task_id=task_id)), False
+
+        tools._task_output_rows = rows
         if record is not None:
             tools._task_record_state = record
         wrapped = _operator_wrapped(model, "Issued task 4242; output was deferred.")
@@ -164,3 +170,50 @@ def test_record_read_is_scoped_to_the_exact_task_display_id():
     assert captured["variables"] == {"display_id": 4242}
     assert "display_id: {_eq: $display_id}" in captured["query"]
     assert invalid is None
+
+
+def test_public_output_tool_envelope_is_unwrapped_when_only_it_is_available():
+    """The model-facing tool wraps rows as {"provenance", "task_output"}; the fallback reads through it."""
+    from ai.langgraph.model import Model
+
+    envelope = json.dumps({"provenance": {"task_id": 4242}, "task_output": json.loads(
+        _rows("[*] replicated account output")
+    )})
+
+    class _Client:
+        get_all_task_output_by_task_id = AsyncMock(return_value=envelope)
+
+    model = object.__new__(Model)
+    model.mythic_client = _Client()
+    observed = asyncio.run(model._reconcile_deferred_task_receipt({"task_display_id": 4242}))
+    assert observed["completed"] is True and observed["status"] == "success"
+    assert "replicated account output" in observed["excerpt"]
+
+
+def test_production_shape_through_the_real_tools_reaches_the_excerpt(monkeypatch):
+    """Drive the real MythicTools readers against a fake Mythic row source, as production does."""
+    import base64
+
+    from ai.langgraph import mythic_tools
+
+    raw_rows = [{
+        "id": 7, "response_text": base64.b64encode(b"Error: failed to parse arguments").decode(),
+        "task": {"id": 4242, "display_id": 4242, "completed": True, "status": "error",
+                 "callback": {"display_id": 5}, "command_name": "whoami"},
+    }]
+
+    async def fake_rows(**kwargs):
+        return [dict(r) for r in raw_rows]
+
+    monkeypatch.setattr(mythic_tools.mythic, "get_all_task_output_by_id", fake_rows)
+
+    async def run():
+        model, tools = _handback_model("chat:deferred-reconcile:request:real-shape")
+        observed = await model._reconcile_deferred_task_receipt({"task_display_id": 4242})
+        return observed, tools
+
+    observed, tools = asyncio.run(run())
+    assert observed["completed"] is True
+    assert "failed to parse arguments" in observed["excerpt"]
+    # Internal reads never feed the model-facing re-read clamp, so the worker still sees the output.
+    assert tools._failed_read_counts.get(4242) is None

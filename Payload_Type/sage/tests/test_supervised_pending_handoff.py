@@ -282,6 +282,16 @@ _LATE_COMPLETED_OUTPUT = json.dumps([{
 }])
 
 
+def _install_output_reader(tools: MythicTools, reader) -> None:
+    """Feed the reconciliation's internal row reader from a JSON-returning mock (decoded rows, no cache)."""
+
+    async def rows(task_id):
+        raw = await reader(task_id=task_id)
+        return (json.loads(raw) if isinstance(raw, str) else raw), False
+
+    tools._task_output_rows = rows
+
+
 def _handback_model(request_id: str) -> tuple[Model, MythicTools]:
     """A supervised Model + MythicTools holding a deferred receipt, wired for wrapper tests.
 
@@ -337,7 +347,7 @@ def test_completed_deferred_task_is_reconciled_at_handback_and_the_turn_continue
     async def run():
         model, tools = _handback_model("chat:pending-handback:request:1")
         reader = AsyncMock(return_value=_LATE_COMPLETED_OUTPUT)
-        tools.get_all_task_output_by_task_id = reader
+        _install_output_reader(tools, reader)
         wrapped = _operator_wrapped(model, "Issued task 4242; output was deferred.")
         state = dict(model.state)
         state["mythic_operator_messages"] = [
@@ -379,7 +389,7 @@ def test_failed_deferred_task_is_reconciled_at_handback_and_the_turn_continues()
                 "callback": {"display_id": 5}, "command_name": "whoami",
             },
         }]))
-        tools.get_all_task_output_by_task_id = reader
+        _install_output_reader(tools, reader)
         wrapped = _operator_wrapped(model, "Issued task 4242; output was deferred.")
         state = dict(model.state)
         state["mythic_operator_messages"] = [
@@ -407,7 +417,7 @@ def test_still_pending_deferred_task_keeps_the_forced_turn_end():
                 "callback": {"display_id": 5}, "command_name": "whoami",
             },
         }]))
-        tools.get_all_task_output_by_task_id = reader
+        _install_output_reader(tools, reader)
         wrapped = _operator_wrapped(model, "Issued task 4242; output was deferred.")
         state = dict(model.state)
         state["mythic_operator_messages"] = [
@@ -445,7 +455,7 @@ def test_unresolvable_reconciliation_read_keeps_the_forced_turn_end():
     async def run():
         model, tools = _handback_model("chat:pending-handback:request:4")
         reader = AsyncMock(side_effect=RuntimeError("transport down"))
-        tools.get_all_task_output_by_task_id = reader
+        _install_output_reader(tools, reader)
         wrapped = _operator_wrapped(model, "Issued task 4242; output was deferred.")
         state = dict(model.state)
         state["mythic_operator_messages"] = [
