@@ -484,3 +484,83 @@ def test_a_single_command_step_offers_the_command_and_its_guidance(monkeypatch):
 
     assert ISSUE in offered and "get_ttp_guidance" in offered
     assert "execute_capability" not in offered
+
+
+# --- a step whose brief fully binds one procedure ---------------------------------------------------------------
+
+@pytest.mark.parametrize("brief, call", [
+    ({"allowed_capabilities": ["collect-graph"], "callback_display_id": "3", "targets": ["North.Test"]},
+     {"action": {"capability": "collect-graph", "callback_id": "3", "domain": "north.test"}}),
+    # Anything less than a full binding leaves the choice to the worker.
+    ({"allowed_capabilities": ["collect-graph"], "callback_display_id": "3", "targets": ["ws5.north.test"]}, None),
+    ({"allowed_capabilities": ["collect-graph"], "callback_display_id": "3",
+      "targets": ["north.test", "south.test"]}, None),
+    ({"allowed_capabilities": ["collect-graph"], "targets": ["north.test"]}, None),
+    ({"allowed_capabilities": ["collect-graph", "dcsync-krbtgt"], "callback_display_id": "3",
+      "targets": ["north.test"]}, None),
+    ({"allowed_capabilities": ["dcsync-krbtgt"], "callback_display_id": "3", "targets": ["north.test"]}, None),
+    ({"allowed_tools": [ISSUE], "callback_display_id": "3", "targets": ["north.test"]}, None),
+    ({"allowed_capabilities": ["control_plane"]}, None),
+    (None, None),
+])
+def test_only_a_fully_bound_procedure_is_proposed_by_sage(brief, call):
+    assert sb.bound_procedure_call(brief, {"north.test", "south.test"}) == call
+
+
+def _bound_step(monkeypatch, brief: dict, decision: str, worker_replies: int):
+    """Run a supervised collect-graph step with a foothold in north.test; return worker model calls, cards, runs."""
+    ran: list[dict] = []
+    worker_calls: list[int] = []
+
+    @tool
+    async def execute_capability(action: dict | str, inputs: dict | str | None = None) -> str:
+        """Run one catalog capability."""
+        ran.append({"action": action, "inputs": inputs})
+        return '{"ok": true, "status": "ingested"}'
+
+    original = model_module.Model._rebuild_graph
+
+    def rebuild(self, *args, **kwargs):
+        sink = self.mythic_client
+        issue = sink.get_tools.side_effect
+        sink.get_tools.side_effect = lambda names: [*issue(names),
+                                                    *([execute_capability] if "execute_capability" in names else [])]
+        sink._engagement_footholds = [SimpleNamespace(callback_id="5", host="WORKSTATION-5", forest="north.test",
+                                                      identity="NORTH\\operator")]
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(model_module.Model, "_rebuild_graph", rebuild)
+
+    def worker(messages):
+        worker_calls.append(1)
+        return AIMessage(content="Collection result read.")
+
+    handoff = {"handoff_title": "collect graph", "handoff_instruction": ORIGINAL, **BRIEF, **brief}
+    script = [_call("transfer_to_Mythic_Operator", handoff, 1), *([worker] * worker_replies),
+              AIMessage(content="Final answer."), AIMessage(content="Final answer.")]
+    asyncio.run(_native(script, decision))
+    return worker_calls, ran
+
+
+def test_sage_proposes_a_fully_bound_collection_without_asking_the_worker_model(monkeypatch):
+    brief = {"allowed_capabilities": ["collect-graph"], "targets": ["north.test"]}
+    worker_calls, ran = _bound_step(monkeypatch, brief, "accept", worker_replies=1)
+
+    # The approved call is exactly the one the brief binds; the worker's model only read the result.
+    assert ran == [{"action": {"capability": "collect-graph", "callback_id": "5", "domain": "north.test"},
+                    "inputs": None}]
+    assert len(worker_calls) == 1
+
+
+def test_a_rejected_bound_collection_runs_nothing(monkeypatch):
+    brief = {"allowed_capabilities": ["collect-graph"], "targets": ["north.test"]}
+    worker_calls, ran = _bound_step(monkeypatch, brief, "reject", worker_replies=1)
+
+    assert ran == []
+
+
+def test_an_unbound_collection_step_is_left_to_the_worker_model(monkeypatch):
+    brief = {"allowed_capabilities": ["collect-graph"], "targets": ["unknown.test"]}
+    worker_calls, ran = _bound_step(monkeypatch, brief, "", worker_replies=1)
+
+    assert ran == [] and len(worker_calls) == 1

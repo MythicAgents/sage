@@ -84,6 +84,8 @@ class StepRecord:
     status: StepStatus | None = None
     bound: str = ""
     detail: str = ""
+    # Sage proposed the step's bound procedure itself (`bound_procedure_call`); it does so at most once per step.
+    procedure_dispatched: bool = False
 
     def end(self, status: StepStatus, bound: str = "", detail: str = "") -> None:
         if self.status is None:
@@ -243,3 +245,24 @@ def render_outcome(outcome: Mapping[str, Any]) -> str:
                      + (" Returning control did not cancel any target-side task." if outcome.get("tasks_issued")
                         else ""))
     return "\n".join(lines)
+
+
+# Catalog procedures Sage proposes itself when the brief binds every argument they take, so no worker model chooses
+# again what the Supervisor already chose. Graph collection takes a callback and a domain and nothing else.
+BRIEF_BOUND_PROCEDURES = frozenset({"collect-graph"})
+
+
+def bound_procedure_call(brief: Any, known_domains: Iterable[str]) -> dict[str, Any] | None:
+    """The `execute_capability` arguments for a step whose brief fully binds one procedure, else None.
+
+    Bound means: the brief names exactly one procedure in BRIEF_BOUND_PROCEDURES, a callback, and exactly one target
+    that is a domain Sage already holds. Anything less leaves the choice to the worker, never to a guess."""
+    capabilities, tools = _brief_scope(brief)
+    if tools or len(capabilities) != 1 or capabilities[0] not in BRIEF_BOUND_PROCEDURES:
+        return None
+    callback = str(brief.get("callback_display_id") or "").strip()
+    targets = [str(item).strip().casefold() for item in brief.get("targets") or [] if str(item).strip()]
+    domains = {str(item).strip().casefold() for item in known_domains if str(item).strip()}
+    if not callback or len(targets) != 1 or targets[0] not in domains:
+        return None
+    return {"action": {"capability": capabilities[0], "callback_id": callback, "domain": targets[0]}}

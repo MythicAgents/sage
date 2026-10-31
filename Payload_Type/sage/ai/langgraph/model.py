@@ -2819,6 +2819,44 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
         return next((msg for msg in reversed(state_messages) if isinstance(msg, HumanMessage)
                      and msg.additional_kwargs.get("_delegated_to") == self._agent_name), None)
 
+    def _bound_procedure_message(self, request: Any) -> AIMessage | None:
+        """Sage's own proposal for the step's first model call when the brief fully binds one procedure.
+
+        The Supervisor already chose the procedure and its arguments, so a worker model would only choose again.
+        The proposal is an ordinary `execute_capability` call: the step bound, turn authority and the approval card
+        all apply to it exactly as to a model's call. Later model calls in the step (reading and summarizing the
+        result) go to the worker's model."""
+        record = self._record(request)
+        if record is None or record.procedure_dispatched or record.status is not None:
+            return None
+        state_messages = _agent_state_messages(getattr(request, "state", None))
+        # The step's context also carries the Supervisor's and Sage's own messages; only the worker's acts count.
+        if any(isinstance(message, ToolMessage)
+               or (isinstance(message, AIMessage) and getattr(message, "name", None) == self._agent_name)
+               for message in _current_delegation_messages(state_messages)):
+            return None  # the worker already acted in this step
+        delegated = self._delegated_message(state_messages)
+        brief = getattr(delegated, "additional_kwargs", {}).get("_handoff_brief")
+        try:
+            domains = _handoff_brief.known_scope(getattr(self._model, "mythic_client", None)).domains
+        except Exception:
+            return None
+        call = _step_bounds.bound_procedure_call(brief, domains)
+        if call is None or "execute_capability" not in {
+                _offered_tool_name(tool) for tool in getattr(request, "tools", None) or []}:
+            return None
+        record.procedure_dispatched = True
+        try:
+            logger.info(f"🧭 [bound-procedure] {self._agent_name} step proposes {call['action']} without a model call")
+        except Exception:
+            pass
+        return AIMessage(
+            content="", name=self._agent_name,
+            tool_calls=[{"name": "execute_capability", "args": call, "type": "tool_call",
+                         "id": f"sage_bound_{record.request_id}_{record.delegation_seq}"}],
+            additional_kwargs={"_sage_bound_procedure": True},
+        )
+
     def _offer_scoped_tools(self, request: Any) -> Any:
         """Offer the step's model only the tools its brief admits, so it is never handed a choice the step bound
         would then remove. The bound in `_limit_response` stays the enforcement point."""
@@ -2899,6 +2937,10 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
     def wrap_model_call(self, request, handler):
         started = self._model._step_clock()
         request = self._offer_scoped_tools(request)
+        bound = self._bound_procedure_message(request)
+        if bound is not None:
+            self._limit_response(request, bound)
+            return bound
         try:
             response = handler(request)
         finally:
@@ -2909,6 +2951,10 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
     async def awrap_model_call(self, request, handler):
         started = self._model._step_clock()
         request = self._offer_scoped_tools(request)
+        bound = self._bound_procedure_message(request)
+        if bound is not None:
+            self._limit_response(request, bound)
+            return bound
         try:
             response = await handler(request)
         finally:

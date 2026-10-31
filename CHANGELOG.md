@@ -57,7 +57,11 @@ between minor releases.
   propose any guarded action. The specialist still receives the operator's exact words, and before it acts Sage
   tells it what its one guarded action may use, its callback and its targets. The specialist is also offered only
   the guarded tools its step admits, and a step scoped to catalog procedures is not offered technique guidance,
-  since Sage runs the procedure; the step boundary still removes any out-of-scope call. When a step scoped to a
+  since Sage runs the procedure; the step boundary still removes any out-of-scope call. When the brief binds every
+  argument of graph collection (the one procedure, its callback, and one target that is a domain Sage already
+  holds), Sage proposes that `execute_capability` call itself instead of asking the specialist's model to choose
+  again; it reaches the same approval card and step checks, and the specialist's model still reads the result.
+  Any less complete brief is left to the specialist. When a step scoped to a
   catalog procedure proposes a single command instead, the step-boundary message now names the exact fix — the
   guarded tool to put in `allowed_tools` — and if the Supervisor re-sends a scope that already failed at execution,
   the request ends with that instruction rather than looping.
