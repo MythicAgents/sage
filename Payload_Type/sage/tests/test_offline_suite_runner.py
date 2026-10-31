@@ -18,6 +18,7 @@ SPEC.loader.exec_module(runner)
     (["supported", "-q"], ({"supported"}, ["-q"])),                     # legacy tier word is accepted
     (["--parallel", "--print-command", "-n", "0"], ({"--parallel", "--print-command"}, ["-n", "0"])),
     (["--", "--print-command"], (set(), ["--print-command"])),          # after --, everything belongs to pytest
+    (["--serial", "-q"], ({"--serial"}, ["-q"])),
 ])
 def test_wrapper_options_come_first_and_the_rest_goes_to_pytest(argv, expected):
     assert runner.split_args(argv) == expected
@@ -48,3 +49,43 @@ def test_without_xdist_the_suite_runs_once_serially():
     (command,) = runner.pass_commands(["-q"], parallel=False)
     pytest_args = command[command.index("pytest") + 1:]
     assert "-n" not in pytest_args and "-m" not in pytest_args
+
+
+def _printed_commands(monkeypatch, capsys, argv, *, xdist: bool):
+    real = runner.importlib.util.find_spec
+    monkeypatch.setattr(runner.importlib.util, "find_spec",
+                        lambda name, *a: (object() if xdist else None) if name == "xdist" else real(name, *a))
+    code = runner.main(["--print-command", *argv])
+    out = capsys.readouterr()
+    return code, [line.split() for line in out.out.splitlines() if line.strip()], out.err
+
+
+def test_the_gate_is_the_parallel_run_when_xdist_is_installed(monkeypatch, capsys):
+    code, commands, _ = _printed_commands(monkeypatch, capsys, [], xdist=True)
+    assert code == 0 and len(commands) == 2
+    assert " ".join(commands[0]).endswith("-n auto -q -m not serial")
+    assert " ".join(commands[1]).endswith("-q -m serial") and "-n" not in commands[1]
+
+
+def test_serial_runs_everything_in_one_process(monkeypatch, capsys):
+    code, commands, _ = _printed_commands(monkeypatch, capsys, ["--serial"], xdist=True)
+    assert code == 0 and len(commands) == 1
+    pytest_args = commands[0][commands[0].index("pytest") + 1:]
+    assert "-n" not in pytest_args and "-m" not in pytest_args
+
+
+def test_without_xdist_the_default_falls_back_to_one_process_and_says_so(monkeypatch, capsys):
+    code, commands, err = _printed_commands(monkeypatch, capsys, [], xdist=False)
+    assert code == 0 and len(commands) == 1
+    assert "-n" not in commands[0][commands[0].index("pytest") + 1:]
+    assert "pytest-xdist is not installed" in err
+
+
+def test_requiring_parallel_without_xdist_fails_instead_of_falling_back(monkeypatch, capsys):
+    code, commands, err = _printed_commands(monkeypatch, capsys, ["--parallel"], xdist=False)
+    assert code == 1 and commands == [] and "needs pytest-xdist" in err
+
+
+def test_parallel_and_serial_together_is_refused(monkeypatch, capsys):
+    code, commands, _ = _printed_commands(monkeypatch, capsys, ["--parallel", "--serial"], xdist=True)
+    assert code == 2 and commands == []

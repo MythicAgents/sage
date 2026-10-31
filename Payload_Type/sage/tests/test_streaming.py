@@ -13,29 +13,14 @@ Run: cd Payload_Type/sage && python -m pytest tests/test_streaming.py -v
 import ast
 import asyncio
 import inspect
-import sys
 import textwrap
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-# Add the sage package to path for imports
+# These tests read Sage source text; they import no Sage module, so they patch nothing process-wide. A former
+# module-level `mythic_container` mock in `sys.modules` leaked into every later test in the same process.
 SAGE_ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(SAGE_ROOT))
-
-# We need to mock mythic_container before importing model.py since it requires
-# a running Mythic server for imports
-mythic_container_mock = MagicMock()
-mythic_container_mock.logging.logger = MagicMock()
-mythic_container_mock.MythicRPC.SendMythicRPCResponseCreate = AsyncMock()
-mythic_container_mock.MythicRPC.MythicRPCResponseCreateMessage = MagicMock()
-mythic_container_mock.MythicRPC.SendMythicRPCTaskUpdate = AsyncMock()
-mythic_container_mock.MythicRPC.MythicRPCTaskUpdateMessage = MagicMock()
-
-sys.modules["mythic_container"] = mythic_container_mock
-sys.modules["mythic_container.logging"] = mythic_container_mock.logging
-sys.modules["mythic_container.MythicRPC"] = mythic_container_mock.MythicRPC
 
 # Read model.py source for AST-based tests (avoids full import chain)
 MODEL_PY = SAGE_ROOT / "ai" / "langgraph" / "model.py"

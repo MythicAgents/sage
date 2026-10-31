@@ -150,6 +150,8 @@ def test_working_hypotheses_change_only_the_supplied_policy_payload_values():
     assert set(expected[-1]) == {"decision_id", "disposition", "capability", "target", "expected_evidence"}
 
 
+# Launches the CLI as a subprocess with a 20 s timeout: under a loaded parallel pass it can exceed that.
+@pytest.mark.serial
 def test_prepare_cli_is_unapplied_hash_bound_and_fail_closed(tmp_path):
     policy_path = ROOT / "Payload_Type/sage/ai/langgraph/policy.py"
     original_bytes = policy_path.read_bytes()

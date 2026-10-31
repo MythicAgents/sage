@@ -29,6 +29,26 @@ assert SPEC and SPEC.loader
 SPEC.loader.exec_module(cli)
 
 
+def _rejected_kernel_modules() -> list[str]:
+    return [name for name in sys.modules
+            if name == "development_row_kernel" or name.endswith(".development_row_kernel")]
+
+
+@pytest.fixture(autouse=True)
+def _process_without_rejected_kernel(monkeypatch):
+    """The pilot refuses to run while the rejected development-row kernel is loaded. Other test modules import it
+    at collection, so a shared pytest process would trip that guard here by test order alone. Hide it from this
+    test's view of `sys.modules` (restored afterwards); the guard itself stays live."""
+    for name in _rejected_kernel_modules():
+        monkeypatch.delitem(sys.modules, name)
+
+
+def test_the_pilot_refuses_to_run_while_the_rejected_kernel_is_loaded(monkeypatch):
+    monkeypatch.setitem(sys.modules, "ai.hillclimb.development_row_kernel", object())
+    with pytest.raises(pilot.PilotError, match="rejected development-row kernel is loaded"):
+        pilot.assert_rejected_kernel_absent()
+
+
 def test_matrix_cli_default_path_and_route_preflight(tmp_path, monkeypatch, capsys):
     contract_file = tmp_path / "matrix.json"
     contract_file.write_text(json.dumps({

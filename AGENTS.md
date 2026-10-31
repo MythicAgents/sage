@@ -126,6 +126,9 @@ integration boundary, rather than between every routine edit:
 .venv/bin/python skills/sage-focused-capability-tests/scripts/run_offline_suite.py
 ```
 
+It runs in parallel by default (about 2.5 minutes; `--serial` for one process). Run it once per staged group,
+not after every edit, and rerun only the affected test files after a test-only fix.
+
 - Changes to graph construction must pass `tests/test_graph_builds.py`; cover each new configuration branch.
 - Assert on built objects and actual output, not source text or generated `passes` claims.
 - Execute changed scripts through a safe local path; parsing alone does not detect runtime errors.

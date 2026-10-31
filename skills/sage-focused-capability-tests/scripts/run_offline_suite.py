@@ -48,13 +48,12 @@ def command_for(pytest_args: list[str], *, parallel: bool = False) -> list[str]:
 
 
 def pass_commands(pytest_args: list[str], *, parallel: bool = False) -> list[list[str]]:
-    """The run as one or two pytest commands. The default is one serial run of everything, the proven gate.
+    """The run as one or two pytest commands.
 
-    `--parallel` (needs pytest-xdist) splits it into a parallel pass over everything not marked `serial` and a
-    serial pass over the rest. That parallel pass is reliable; the serial pass is not yet, because tests marked
-    `serial` fail after the whole tree has been collected, though they pass alone and in the default serial
-    run. Until that is traced, `--parallel` is for fast feedback during work and the default run is the gate.
-    A caller who picks `-n` or `-m` gets exactly one command with those choices."""
+    Parallel (the default when pytest-xdist is installed) is a parallel pass over everything not marked `serial`,
+    then a serial pass over the timing-sensitive rest; both cover every test. Without `parallel` it is one
+    single-process run of everything (`--serial`, or no xdist). A caller who picks `-n` or `-m` gets exactly one
+    command with those choices."""
     args = list(pytest_args) or ["-q"]
     if not parallel or _chooses_workers(args) or "-m" in args:
         return [command_for(args, parallel=parallel)]
@@ -91,12 +90,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("pytest_args", nargs=argparse.REMAINDER)
     parser.add_argument("--print-command", action="store_true")
+    parser.add_argument("--serial", action="store_true",
+                        help="Run everything in one process instead of the default parallel pass then serial pass.")
     parser.add_argument("--parallel", action="store_true",
-                        help="Fast feedback on every core (needs pytest-xdist); not yet the gate, see pass_commands.")
+                        help="Require the parallel run (the default); fail rather than fall back without pytest-xdist.")
     return parser
 
 
-WRAPPER_OPTIONS = ("supported", "--print-command", "--parallel")
+WRAPPER_OPTIONS = ("supported", "--print-command", "--parallel", "--serial")
 
 
 def split_args(argv: list[str]) -> tuple[set[str], list[str]]:
@@ -117,11 +118,17 @@ def main(argv: list[str] | None = None) -> int:
         build_parser().print_help()
         return 0
     options, pytest_args = split_args(argv)
-    parallel = "--parallel" in options
-    if parallel and importlib.util.find_spec("xdist") is None:
+    if {"--parallel", "--serial"} <= options:
+        print("choose --parallel or --serial, not both", file=sys.stderr)
+        return 2
+    have_xdist = importlib.util.find_spec("xdist") is not None
+    if "--parallel" in options and not have_xdist:
         print(f"--parallel needs pytest-xdist; install the dev requirements:\n"
               f"  {sys.executable} -m pip install -r {DEV_REQUIREMENTS}", file=sys.stderr)
         return 1
+    parallel = "--serial" not in options and have_xdist
+    if "--serial" not in options and not have_xdist:
+        print("pytest-xdist is not installed; running every test in one process", file=sys.stderr)
     commands = pass_commands(pytest_args, parallel=parallel)
     for command in commands:
         print(" ".join(command), flush=True)

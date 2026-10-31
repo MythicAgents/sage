@@ -11,6 +11,12 @@ Run the offline suite from the repository root:
 No suite is excluded, so a green run means the tree is green. The runner still accepts a trailing `supported`
 argument and ignores it, so older invocations keep working.
 
+With `pytest-xdist` installed (it is in `requirements-dev.txt`) the run has two passes over every test: a parallel
+pass over everything not marked `serial`, then a single-process pass over the timing-sensitive `serial` tests.
+`--serial` runs everything in one process instead; without xdist the runner says so and does that. Test modules
+must not replace importable modules in `sys.modules` at import time: collection imports every module, so such a
+patch reaches every later test in the process. `tests/test_test_isolation.py` enforces this.
+
 ## Why there is one tier
 
 Rejected successor-portfolio suites freeze source hashes of an older product surface, so they can never pass
