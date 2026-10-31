@@ -8,6 +8,7 @@ ingest the transaction makes must be covered by it and nothing else. External ef
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -19,6 +20,15 @@ from sage_chat.hitl import (
     approval_proposal_digest, approval_selection_digest,
 )
 from tests.test_private_collection_transaction import collection  # noqa: F401  (fixture)
+
+# The `execute_capability` call a live supervised worker made (2026-10-31, channel 8, OpenRouter Sonnet 4.6),
+# recovered from the Phoenix trace: `action` and `inputs` as JSON strings, a string callback id, and inputs the
+# collection procedure does not use.
+LIVE_ARGS = {
+    "action": '{"capability": "collect-graph", "domain": "north.sevenkingdoms.local", "callback_id": "3"}',
+    "inputs": json.dumps({"output_directory": "C:\\Users\\Public", "zip_filename": "sysreport.zip",
+                          "collection_methods": "All"}),
+}
 
 APPROVED_STEPS = ["whoami", "ticket_cache_list", "execute_assembly", "ls", "download"]
 
@@ -206,9 +216,38 @@ def test_a_completed_collection_cannot_ingest_again_under_the_same_approval(coll
      {"callback_id": "3", "scope_domain": "north.test"}),
     ({"name": "execute_capability", "args": {"action": {"capability": "collect-graph"}}},
      {"callback_id": "", "scope_domain": ""}),
+    ({"name": "execute_capability", "args": LIVE_ARGS},
+     {"callback_id": "3", "scope_domain": "north.sevenkingdoms.local"}),
     ({"name": "execute_capability", "args": {"action": {"capability": "forge-golden-ticket"}}}, None),
     ({"name": "collect_graph", "args": {"callback_id": "7"}}, None),
     ({"name": "execute_capability", "args": "not an object"}, None),
 ])
 def test_collection_binding_reads_only_an_execute_capability_root_for_collect_graph(root, expected):
     assert mt.collection_capability_binding(root) == expected
+
+
+def _card_plan(args) -> str:
+    owner = SimpleNamespace(mythic_client=mt.MythicTools(agent_task_id="test"))
+    return model.Model._capability_card_plan_text(owner, args)
+
+
+def test_the_approval_card_plans_the_live_collection_call_instead_of_refusing_it():
+    # The HITL pre-check refuses any execute_capability card whose plan text says "could not be built". The live
+    # call was refused there, before the operator saw a card, because collection has no adapter plan.
+    text = _card_plan(LIVE_ARGS)
+
+    assert "could not be built" not in text
+    assert "callback 3" in text and "north.sevenkingdoms.local" in text
+    assert "BloodHound" in text
+
+
+def test_the_approval_card_still_refuses_a_collection_call_without_a_callback():
+    text = _card_plan({"action": '{"capability": "collect-graph", "domain": "north.sevenkingdoms.local"}'})
+
+    assert "could not be built" in text and "callback_id" in text
+
+
+def test_the_approval_card_still_refuses_a_capability_with_no_plan_that_is_not_collection():
+    text = _card_plan({"action": '{"capability": "collect-graphs", "callback_id": "3"}'})
+
+    assert "could not be built" in text

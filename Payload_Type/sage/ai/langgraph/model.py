@@ -42,6 +42,7 @@ from .mythic_tools import (
     MythicTools,
     CONTROL_PLANE_STAGING_TOOLS,
     GUARDED_TOOLS,
+    collection_capability_binding,
     SAGE_TASK_HEARTBEAT_INTERVAL,
     _env_positive_int,
 )
@@ -15002,6 +15003,19 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         client = getattr(self, "mythic_client", None)
         if client is None:
             return ""
+        # Graph collection is Sage's own procedure, not an adapter plan: execute_capability dispatches it to the
+        # collection runner on this same binding. Planning it through the adapter builder (which has none) refused
+        # the card before the operator saw it.
+        collection = collection_capability_binding({"name": "execute_capability", "args": args})
+        if collection is not None:
+            if not collection.get("callback_id"):
+                return "⚠️ Capability plan could not be built: callback_id"
+            scope = collection.get("scope_domain") or "the foothold's forest"
+            return "\n".join((
+                f"Sage graph collection on callback {collection['callback_id']}, scope {scope}:",
+                "  run the collector, locate and download its archive, ingest it into BloodHound.",
+                "Every task it issues runs under this one approval. Other inputs are not used.",
+            ))
         action = args.get("action") if isinstance(args.get("action"), (dict, str)) else None
         # Same parsing as execute_capability itself, which accepts inputs as a dict or a JSON string. Dropping a
         # string here planned the card with no inputs and refused a capability the tool would have run.
