@@ -197,18 +197,11 @@ class _CollectionProbeTaskError(RuntimeError):
 _collection_schema_binding_context: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "sage_collection_schema_binding_context", default=None,
 )
-_collection_file_preflight_context: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
-    "sage_collection_file_preflight_context",
-    default=None,
-)
 _capability_execution_context: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "sage_capability_execution_context", default=None,
 )
 _capability_command_context: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "sage_capability_command_context", default=None,
-)
-_capability_file_preflight_context: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
-    "sage_capability_file_preflight_context", default=None,
 )
 _POLICY_EVIDENCE_FIELDS = (
     "episode_id",
@@ -1212,6 +1205,10 @@ def _is_failed_read_output(output: str) -> bool:
 # GUARDED: state-changing or offensive — HITL-gated in supervised mode, denied in
 #          conversational mode. The safe default for any unclassified tool.
 # READ_ONLY: read-only control-plane query — freely available in all modes.
+# CONTROL_PLANE_STAGING: writes only Mythic's own operation-scoped store (registering a staged tool
+#          binary) and reaches no callback or target. Not HITL-gated and needs no approval claim in
+#          supervised mode; still denied in conversational and stopped requests. The target-facing tool
+#          that later consumes the file (tasking, upload to a callback) stays GUARDED.
 #
 # model.py reads the classification at enforcement time via tool_safety_of().
 # The GUARDED_TOOLS set below is derived from decorators for backwards compat
@@ -1219,16 +1216,16 @@ def _is_failed_read_output(output: str) -> bool:
 
 TOOL_SAFETY_GUARDED = "guarded"
 TOOL_SAFETY_READ_ONLY = "read_only"
-_TOOL_SAFETY_VALUES = frozenset((TOOL_SAFETY_GUARDED, TOOL_SAFETY_READ_ONLY))
+TOOL_SAFETY_STAGING = "control_plane_staging"
+_TOOL_SAFETY_VALUES = frozenset((TOOL_SAFETY_GUARDED, TOOL_SAFETY_READ_ONLY, TOOL_SAFETY_STAGING))
 _TOOL_SAFETY_ATTR = "_tool_safety"
 
 
 def tool_safety(classification: str):
-    """Declare a MythicTools method as TOOL_SAFETY_GUARDED or TOOL_SAFETY_READ_ONLY."""
+    """Declare a MythicTools method's classification (one of `_TOOL_SAFETY_VALUES`)."""
     if classification not in _TOOL_SAFETY_VALUES:
         raise ValueError(
-            f"tool_safety must be {TOOL_SAFETY_GUARDED!r} or {TOOL_SAFETY_READ_ONLY!r}, "
-            f"got {classification!r}"
+            f"tool_safety must be one of {sorted(_TOOL_SAFETY_VALUES)}, got {classification!r}"
         )
     def decorator(func):
         setattr(func, _TOOL_SAFETY_ATTR, classification)
@@ -1259,6 +1256,8 @@ def tool_safety_of(
         except ImportError:
             from mcp_tool_policy import classify_mcp_tool
         return classify_mcp_tool(mcp_server, tool_name)
+    if tool_name in CONTROL_PLANE_STAGING_TOOLS:
+        return TOOL_SAFETY_STAGING
     return TOOL_SAFETY_GUARDED if tool_name in GUARDED_TOOLS else TOOL_SAFETY_READ_ONLY
 
 
@@ -1274,20 +1273,22 @@ GUARDED_TOOLS: set[str] = {
     "create_payload",
     "delete_payload",
     "download_tool",
-    "ensure_tool_uploaded",
     "ingest_collection",
     "sandbox_exec",
     "file_upload",
     "add_credential",
 }
 
+# @tool_safety(TOOL_SAFETY_STAGING) methods, by name for the model-side lane check and the final sink.
+CONTROL_PLANE_STAGING_TOOLS: frozenset[str] = frozenset({"ensure_tool_uploaded"})
+
 # Upper bound (seconds) on the chat bot-token mint. The SDK's RabbitMQ connect retries unboundedly, so
 # without this login() would hang forever when Mythic is unreachable instead of degrading fail-closed.
 _CHAT_TOKEN_MINT_TIMEOUT = 15
 
 
-# Chat bot-token scope required per guarded tool. A chat channel's bot token is
-# operator-scoped at setup, so a guarded tool whose scope isn't granted is preflight-disabled (fail cheap)
+# Chat bot-token scope required per guarded or staging tool. A chat channel's bot token is
+# operator-scoped at setup, so a tool whose scope isn't granted is preflight-disabled (fail cheap)
 # rather than erroring mid-run. All scope strings verified against auth-adjustments
 # `authentication/mythicjwt/scopes.go` (incl. `credential.write`). Each entry names the scope of the
 # Mythic route the tool's required call hits: task creation is `create_task_webhook` (`task.write`),
@@ -1499,20 +1500,6 @@ class _PrivateCollectionTransaction:
         ):
             return str(current.get("resolved_parameters") or current.get("parameters") or "")
         return str(current.get("parameters") or "")
-
-    def matches_runner_preflight(self, command: str, parameters: Any, callback_display_id: Any) -> bool:
-        """The registered-file prerequisite belongs only to the pending reserved runner."""
-        current = self._current_step()
-        return bool(
-            self._phase == "after_probe"
-            and current is not None
-            and current.get("kind") == "runner"
-            and not current.get("task_id")
-            and current.get("callback_id") == self.callback_id
-            and self._ascii_decimal(callback_display_id) == self.callback_id
-            and str(command or "") == current.get("command")
-            and self._canonical(parameters) == current.get("parameters")
-        )
 
     def _prior_step_blocker(self) -> str:
         current = self._current_step()
@@ -2484,32 +2471,6 @@ class MythicTools:
             raise ValueError("effective action arguments are not an object")
         return canonical
 
-    @staticmethod
-    def _registered_file_named_by_root(
-        root_args: dict[str, Any] | None,
-        actual_args: dict[str, Any] | None,
-    ) -> bool:
-        """True when the approved root's parameters name this exact registered file.
-
-        Positive provenance, fail closed: a root that does not name the file returns False, so a
-        path with no filename to bind against stays denied rather than inheriting authority.
-        """
-        name = str((actual_args or {}).get("binary_filename") or "").strip().casefold()
-        if not name:
-            return False
-        params = (root_args or {}).get("parameters")
-        if isinstance(params, str):
-            try:
-                params = json.loads(params)
-            except (TypeError, ValueError):
-                return name == params.strip().casefold()
-        if not isinstance(params, dict):
-            return False
-        return any(
-            isinstance(value, str) and value.strip().casefold() == name
-            for value in params.values()
-        )
-
     def _approved_workflow_child(
         self,
         root_name: str,
@@ -2537,50 +2498,26 @@ class MythicTools:
                 )
             if tool_name == "ingest_collection":
                 return not transaction.reserve_ingest(actual_args, visibility_context)
-            if tool_name == "ensure_tool_uploaded":
-                binding = _collection_file_preflight_context.get() or {}
-                return bool(
-                    binding.get("client") is self
-                    and binding.get("transaction") is transaction
-                    and binding.get("step") is transaction._current_step()
-                    and binding.get("task") is asyncio.current_task()
-                    and str((visibility_context or {}).get("capability") or "") == "collect-graph"
-                    and actual_args.get("binary_filename") == binding.get("filename")
-                    and transaction.matches_runner_preflight(
-                        binding.get("command"), binding.get("parameters"), binding.get("callback_id"),
-                    )
-                )
             return False
-        # This map is a ONE-HOP declaration, so it must carry the transitive closure of what a
-        # root actually reaches — not just its direct callees. `ensure_tool_uploaded` is reached
-        # from `issue_task_and_waitfor_task_output`'s own registered-file preflight
-        # (`_ensure_registered_file_available`), and the two roots below reach
-        # that preflight through it. Omitting those three edges deadlocked a live request: the
-        # operator approved `issue_task_and_waitfor_task_output` for `execute_assembly`, its
-        # preflight tried to register the assembly, coverage denied `ensure_tool_uploaded` as a
-        # `name_mismatch`, and the preflight's own "do not retry until registered" blocker closed
-        # the other exit. Every entry here is bounded by audited reachability over the MythicTools
-        # call graph and by the callback binding checked below — see
-        # `tests/test_approval_child_coverage.py`, which recomputes that graph and fails if this
-        # map drifts from it in either direction.
+        # This map is a ONE-HOP declaration, so it must carry the transitive closure of the guarded
+        # tools a root actually reaches, not just its direct callees: a reachable guarded effect missing
+        # here is denied as a `name_mismatch` inside an approved root and can deadlock it. Every entry is
+        # bounded by audited reachability over the MythicTools call graph and by the callback binding
+        # checked below; `tests/test_approval_child_coverage.py` recomputes that graph and fails if this
+        # map drifts from it in either direction. Control-plane staging (`ensure_tool_uploaded`, reached
+        # from the registered-file preflight) is not guarded and never reaches this check.
         children = {
             "execute_capability": {
                 "materialize_capability_inputs",
                 "upload_file_by_file_uuid",
-                "ensure_tool_uploaded",
                 "issue_task_and_waitfor_task_output",
             },
             "materialize_capability_inputs": {
                 "upload_file_by_file_uuid",
-                "ensure_tool_uploaded",
                 "issue_task_and_waitfor_task_output",
             },
             "upload_file_by_file_uuid": {
-                "ensure_tool_uploaded",
                 "issue_task_and_waitfor_task_output",
-            },
-            "issue_task_and_waitfor_task_output": {
-                "ensure_tool_uploaded",
             },
         }
         if tool_name not in children.get(root_name, set()):
@@ -2596,46 +2533,6 @@ class MythicTools:
             return False
         root_callback = root_bindings.callback_id
         actual_callback = actual_bindings.callback_id
-        if tool_name == "ensure_tool_uploaded" and root_name == "execute_capability":
-            execution = _capability_execution_context.get() or {}
-            command = _capability_command_context.get() or {}
-            preflight = _capability_file_preflight_context.get() or {}
-            claim = getattr(self, "_active_approval_claim", None)
-            contract = getattr(self, "_request_contract", None)
-            return bool(
-                root_callback and root_bindings.capability
-                and execution.get("client") is self
-                and execution.get("task") is asyncio.current_task()
-                and execution.get("claim") is claim
-                and execution.get("contract") is contract
-                and execution.get("claim_id") == claim.get("approval_id")
-                and execution.get("request_id") == claim.get("request_id") == getattr(contract, "request_id", None)
-                and execution.get("contract_digest") == claim.get("request_contract_digest") == getattr(contract, "digest", None)
-                and execution.get("root_args") == root_args
-                and execution.get("callback_id") == root_callback
-                and execution.get("capability") == root_bindings.capability
-                and command.get("execution") is execution
-                and command.get("task") is asyncio.current_task()
-                and command.get("callback_id") == root_callback
-                and command.get("capability") == root_bindings.capability
-                and preflight.get("command") is command
-                and preflight.get("task") is asyncio.current_task()
-                and preflight.get("callback_id") == command.get("callback_id")
-                and preflight.get("filename") == actual_args.get("binary_filename")
-                and preflight.get("runner_command") == command.get("runner_command")
-                and preflight.get("runner_parameters") == command.get("runner_parameters")
-            )
-        if tool_name == "ensure_tool_uploaded" and root_name != "execute_capability":
-            # `ensure_tool_uploaded` registers a file in Mythic's operation-scoped filemeta and
-            # takes no callback argument, so the generic callback binding below can never match a
-            # task-issuing root and would deny every one of them. Bind it on what actually ties it
-            # to the approval instead: the child's binary_filename must be named verbatim in the
-            # approved root's own parameters. That is strictly TIGHTER than a callback match — it
-            # admits registering exactly the file the approved command runs, and nothing else.
-            # Capability registration has its own immediate-command binding above.
-            if not (root_callback or root_bindings.capability):
-                return False
-            return self._registered_file_named_by_root(root_args, actual_args)
         if root_callback and actual_callback != root_callback:
             return False
         if root_name == "upload_file_by_file_uuid":
@@ -2816,6 +2713,12 @@ class MythicTools:
         if contract.lane == RequestLane.CONVERSATIONAL:
             return "conversational request denies external effects"
         if contract.lane == RequestLane.SUPERVISED_WORKFLOW:
+            if tool_name in CONTROL_PLANE_STAGING_TOOLS:
+                # Staging writes Mythic's own file store, reaches no callback, and is never proposed on a
+                # card, so it carries no approval claim to cover it. Whether it runs inside an approved task's
+                # registered-file preflight or on its own, it is admitted here; the stopped and conversational
+                # denials above still apply, and the target-facing consumer of the file keeps its own approval.
+                return ""
             claim = getattr(self, "_active_approval_claim", None)
             if (
                 not isinstance(claim, dict)
@@ -9590,48 +9493,8 @@ class MythicTools:
         if self._registered_file_available_in_schema(schema, name):
             self._registered_file_checks.add(key)
             return
-        # collect_graph approves an ordered transaction, not an arbitrary tool filename.
-        # Carry this schema-selected prerequisite only across its exact runner preflight;
-        # a direct upload or another callback/step must not borrow that approval.
-        transaction = getattr(self, "_private_collection_transaction", None)
-        binding = None
-        if (
-            isinstance(transaction, _PrivateCollectionTransaction)
-            and transaction.active_for(self)
-            and transaction.matches_runner_preflight(command, parameters, callback_display_id)
-        ):
-            binding = {
-                "client": self,
-                "transaction": transaction,
-                "step": transaction._current_step(),
-                "task": asyncio.current_task(),
-                "command": command,
-                "parameters": transaction._canonical(parameters),
-                "callback_id": callback_display_id,
-                "filename": name,
-            }
-        command_binding = _capability_command_context.get() or {}
-        execution = command_binding.get("execution") or {}
-        capability_binding = None
-        if (
-            command_binding.get("task") is asyncio.current_task()
-            and execution.get("client") is self
-            and execution.get("task") is asyncio.current_task()
-            and command_binding.get("entered_issue") is True
-            and str(callback_display_id) == command_binding.get("callback_id")
-            and command == command_binding.get("runner_command")
-            and parameters == command_binding.get("runner_parameters")
-        ):
-            capability_binding = {
-                "command": command_binding,
-                "task": asyncio.current_task(),
-                "callback_id": str(callback_display_id),
-                "runner_command": command,
-                "runner_parameters": copy.deepcopy(parameters),
-                "filename": name,
-            }
-        context_token = _collection_file_preflight_context.set(binding)
-        capability_token = _capability_file_preflight_context.set(capability_binding)
+        # Registering the file is control-plane staging (`ensure_tool_uploaded`), admitted without an
+        # approval claim, so it cannot deadlock the approved task it prepares.
         try:
             raw_upload = await self.ensure_tool_uploaded(name)
             up = json.loads(raw_upload) if isinstance(raw_upload, str) else raw_upload
@@ -9643,9 +9506,6 @@ class MythicTools:
             )
             logger.warning(blocker)
             return blocker
-        finally:
-            _capability_file_preflight_context.reset(capability_token)
-            _collection_file_preflight_context.reset(context_token)
         if not isinstance(up, dict):
             blocker = (
                 f"{_REGISTERED_FILE_PREFLIGHT_PREFIX} could not register {name!r} before {command!r}: "
@@ -21004,7 +20864,7 @@ class MythicTools:
             "files": [staged_tools.public_view(entry) for entry in inventory["files"]],
         }, sort_keys=True)
 
-    @tool_safety(TOOL_SAFETY_GUARDED)
+    @tool_safety(TOOL_SAFETY_STAGING)
     async def ensure_tool_uploaded(
         self,
         binary_filename: Annotated[str, "The tool binary filename, e.g. 'SharpHound.exe' (matches a TTP's binary_filename)."],

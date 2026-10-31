@@ -461,10 +461,12 @@ Sage classifies tools as **read-only** (enumerate callbacks, payloads, tasks, fi
 retrieve tradecraft guidance; build capability plans) or **guarded/offensive** (issue a command, execute a
 capability, create a payload, add a credential, ingest a collection, run in the sandbox). The public Mythic
 tool inventory is available through `/tools`; internal helpers and callback payload commands are separate.
-Every tool carries a `@tool_safety` decorator (`TOOL_SAFETY_READ_ONLY` or
-`TOOL_SAFETY_GUARDED`) and CI enforces that no tool ships unclassified — an undecorated method defaults to
-guarded at runtime. The read-only/guarded split determines behavior across modes: guarded tools are
-approval-gated in supervised mode, denied in conversation mode, and only they can change target or Mythic state.
+Every tool carries a `@tool_safety` decorator (`TOOL_SAFETY_READ_ONLY`, `TOOL_SAFETY_GUARDED`, or
+`TOOL_SAFETY_STAGING`) and CI enforces that no tool ships unclassified — an undecorated method defaults to
+guarded at runtime. The classification determines behavior across modes: guarded tools are approval-gated in
+supervised mode, denied in conversation mode, and only they can change target state. The one staging tool,
+`ensure_tool_uploaded`, writes only Mythic's operation file store: it needs no approval in supervised mode and is
+denied in conversation mode.
 
 | Area | Example tools | |
 |---|---|---|

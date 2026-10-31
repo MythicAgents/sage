@@ -70,7 +70,6 @@ the token has no read scope for.
 | `create_payload` | Create a new Mythic payload/agent | `payload.write` |
 | `delete_payload` | Soft-delete a junk payload after verifying it has no callbacks | `payload.write` |
 | `download_tool` | Download a tool binary from its pinned, sha256-verified source into the drop zone | None (local only; `ensure_tool_uploaded` needs `file.write`) |
-| `ensure_tool_uploaded` | Ensure a tool binary is in Mythic's file store (uploads if missing) | `file.write` |
 | `sandbox_exec` | Run untrusted code in an isolated ephemeral sandbox container | None (local only) |
 
 For a direct `issue_task_and_waitfor_task_output` proposal in native supervised chat, Sage resolves
@@ -79,8 +78,16 @@ approval card. The displayed command and arguments are the action held for check
 time, Sage rechecks the command schema, declared parameter group, and any selected registered file's
 Mythic identity; a changed binding stops the task and needs a fresh proposal and approval. A selected
 `token_id` is currently refused before the card because this task transport does not forward it to
-Mythic. File registration or upload is a separate guarded action; accepting a task card does not
-authorize a hidden upload.
+Mythic. When the command selects a registered file Mythic does not yet hold, Sage stages it from the drop
+zone first (see below). Uploading a file to a callback (`upload_file_by_file_uuid`) is a separate guarded action.
+
+## Staging tool
+
+`ensure_tool_uploaded` (scope `file.write`) ensures a tool binary from the drop zone is in Mythic's operation
+file store, uploading it if missing, and returns its Mythic file UUID. It writes nothing to a callback or target,
+so it shows no approval card in supervised mode and needs no approval claim, including when a task's
+registered-file check calls it before the task is issued. It is denied in conversation mode and in a stopped
+request. The task or capability that then uses the file on a target keeps its own approval.
 
 ## Tool drop zone
 

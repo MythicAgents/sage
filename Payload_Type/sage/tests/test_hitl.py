@@ -48,7 +48,6 @@ def test_guarded_tools_are_state_changing_only():
         "execute_capability",
         "create_payload",
         "download_tool",
-        "ensure_tool_uploaded",
         "ingest_collection",
         "sandbox_exec",
         "file_upload",
@@ -57,7 +56,8 @@ def test_guarded_tools_are_state_changing_only():
     assert not any(t.startswith("get_") for t in GUARDED_TOOLS)
     assert "get_all_task_output_by_task_id" not in GUARDED_TOOLS
     assert "download_file" not in GUARDED_TOOLS
-    assert "ensure_tool_uploaded" in GUARDED_TOOLS
+    # Staging a tool into Mythic's file store reaches no callback; it is not approval-gated.
+    assert "ensure_tool_uploaded" not in GUARDED_TOOLS
 
 
 def test_auto_mode_adds_no_hitl_middleware():

@@ -494,6 +494,21 @@ def test_conversation_contract_allows_read_only_but_blocks_guarded_tools():
     assert model._request_contract_block_reason("respond_to_user") == ""
     assert "conversational" in model._request_contract_block_reason("issue_task_and_waitfor_task_output")
     assert "conversational" in model._request_contract_block_reason("execute_capability")
+    # Staging is not approval-gated, but a conversation still writes nothing to Mythic.
+    assert "conversational" in model._request_contract_block_reason("ensure_tool_uploaded")
+
+
+@pytest.mark.parametrize("mode", ["supervised", "auto"])
+def test_staging_passes_the_model_side_check_outside_conversation(mode):
+    from ai.langgraph.model import Model
+    from ai.langgraph.turn_authority import authority_from_request_contract
+
+    contract = _contract(mode)
+    model = Model.__new__(Model)
+    model._native_chat_explicit_hitl = True
+    model._request_contract = contract
+    model._turn_authority = authority_from_request_contract(contract)
+    assert model._request_contract_block_reason("ensure_tool_uploaded") == ""
 
 
 def test_supervised_guarded_action_reservation_is_exact_and_single_use():

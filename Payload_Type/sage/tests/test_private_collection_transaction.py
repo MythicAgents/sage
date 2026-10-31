@@ -566,12 +566,17 @@ def test_collection_registration_uses_adapter_and_schema_selector_alias(collecti
     assert case.tasks[2]["parameters"]["tool"] == "SharpHound.exe"
 
 
+RUNNER_BINDING_MUTATIONS = frozenset({
+    "step-parameters", "step-issued", "claim-request", "claim-digest", "closed-claim",
+})
+
+
 @pytest.mark.parametrize("mutation", [
     "filename", "filename-case", "filename-space", "filename-path", "phase", "step-callback",
     "preflight-callback", "step-parameters", "step-identity", "step-issued", "transaction", "no-transaction", "claim-id",
     "claim-request", "claim-digest", "closed-claim", "provenance", "child-task",
 ])
-def test_collection_registration_rejects_near_matches(collection, monkeypatch, mutation):
+def test_collection_staging_never_widens_its_target_facing_tasks(collection, monkeypatch, mutation):
     case = collection
     original = case.client.ensure_tool_uploaded
 
@@ -619,13 +624,26 @@ def test_collection_registration_rejects_near_matches(collection, monkeypatch, m
 
     monkeypatch.setattr(case.client, "ensure_tool_uploaded", changed)
     result = asyncio.run(_collect(case))
-    assert result["status"] == "tool_preflight_failed", result
-    assert case.events == [("task", "whoami"), ("task", "ticket_cache_list")]
-    assert case.registered == []
+    if mutation.startswith("filename"):
+        # A file nobody staged cannot be registered, and the runner never starts without it.
+        assert result["status"] == "tool_preflight_failed", result
+        assert case.events == [("task", "whoami"), ("task", "ticket_cache_list")]
+        assert case.registered == []
+        return
+    # Staging needs no approval, so a changed staging context no longer stops registration. Whatever it
+    # changes, every target-facing task is the approved transaction's own step on its callback, in order.
+    approved = ["whoami", "ticket_cache_list", "execute_assembly", "ls", "download"]
+    issued = [task["command_name"] for task in case.tasks]
+    assert issued == approved[:len(issued)], (result, case.events)
+    assert {task["callback_display_id"] for task in case.tasks} == {7}
+    assert result["status"] in {"ingested", "task_issue_failed", "tool_preflight_failed"}, result
+    if mutation in RUNNER_BINDING_MUTATIONS:
+        # These change the runner's own approval binding, which the guarded task path still enforces.
+        assert result["status"] == "task_issue_failed" and "execute_assembly" not in issued, result
 
 
 @pytest.mark.parametrize("when", ["before", "reserved", "failed-registration", "finished"])
-def test_collection_registration_cannot_escape_preflight(collection, monkeypatch, when):
+def test_collection_registration_failure_stops_the_runner_and_staging_stays_task_free(collection, monkeypatch, when):
     case = collection
     original = case.client.ensure_tool_uploaded
 
@@ -644,18 +662,18 @@ def test_collection_registration_cannot_escape_preflight(collection, monkeypatch
             monkeypatch.setattr(case.client, "_register_file_dedup", failed_effect)
             result = await _collect(case)
             assert result["status"] == "tool_preflight_failed"
-        elif when == "finished":
+            assert "execute_assembly" not in [task["command_name"] for task in case.tasks]
+            return
+        if when == "finished":
             assert (await _collect(case))["ok"] is True
-        assert mt._collection_file_preflight_context.get() is None
-        context = mt._task_visibility_context.set({"capability": "collect-graph"})
-        try:
-            with pytest.raises(PermissionError, match="does not cover this exact effect"):
-                await original("SharpHound.exe")
-        finally:
-            mt._task_visibility_context.reset(context)
+        # Outside the preflight, staging is a direct Mythic file-store write: no approval, no callback task.
+        tasks_before = len(case.tasks)
+        assert json.loads(await original("SharpHound.exe"))["file_uuid"]
+        assert len(case.tasks) == tasks_before
 
     asyncio.run(scenario())
-    assert case.registered == (["SharpHound.exe"] if when == "finished" else [])
+    # The fixture's file-store lookup always misses, so a direct stage after the collection registers again.
+    assert case.registered == {"before": ["SharpHound.exe"], "finished": ["SharpHound.exe"] * 2}.get(when, [])
 
 
 def test_completed_collection_cannot_consume_artifact_or_approval_again(collection):

@@ -40,6 +40,7 @@ from typing_extensions import NotRequired
 from uuid import UUID, uuid4
 from .mythic_tools import (
     MythicTools,
+    CONTROL_PLANE_STAGING_TOOLS,
     GUARDED_TOOLS,
     SAGE_TASK_HEARTBEAT_INTERVAL,
     _env_positive_int,
@@ -6759,6 +6760,8 @@ class Model:
             return "stopped request denies tool execution"
         if contract.lane == RequestLane.CONVERSATIONAL and tool_name in GUARDED_TOOLS:
             return "conversational request denies guarded tool execution"
+        if contract.lane == RequestLane.CONVERSATIONAL and tool_name in CONTROL_PLANE_STAGING_TOOLS:
+            return "conversational request denies Mythic file staging"
         if contract.lane == RequestLane.CONVERSATIONAL and tool_name not in GUARDED_TOOLS:
             try:
                 from ai.langgraph.mcp_tool_policy import is_mcp_tool_guarded

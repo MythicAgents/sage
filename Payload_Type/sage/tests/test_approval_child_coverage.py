@@ -2,14 +2,16 @@
 
 A live request deadlocked here. The operator approved `issue_task_and_waitfor_task_output` to run
 `execute_assembly` with `SharpHound.exe`; that tool's own registered-file preflight
-(`_ensure_registered_file_available`) calls `ensure_tool_uploaded` to register the assembly, and
+(`_ensure_registered_file_available`) called `ensure_tool_uploaded` to register the assembly, and
 `_approved_workflow_child` denied it as a `name_mismatch` because the children map never listed
 that edge. Registering was denied, retrying was forbidden until registered, and the worker spun on
 `list_callbacks` until the graph hit its recursion limit.
 
-The map is one-hop, so it has to carry the transitive closure of the call graph. These tests
-recompute that closure from source and assert the map equals it in BOTH directions — a missing
-edge deadlocks, an extra edge silently widens operator authority.
+`ensure_tool_uploaded` is now control-plane staging, not a guarded tool, so the preflight never asks
+coverage for it. The map is still one-hop, so it has to carry the transitive closure of the guarded
+call graph. These tests recompute that closure from source and assert the map equals it in BOTH
+directions — a missing edge deadlocks, an extra edge silently widens operator authority — and that
+re-guarding staging would demand its edge back.
 """
 
 import ast
@@ -18,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from ai.langgraph.mythic_tools import GUARDED_TOOLS, MythicTools
+from ai.langgraph.mythic_tools import CONTROL_PLANE_STAGING_TOOLS, GUARDED_TOOLS, MythicTools
 
 
 # --------------------------------------------------------------------------------------
@@ -43,7 +45,7 @@ def _declared_children() -> dict[str, set[str]]:
     raise AssertionError("children map not found in _approved_workflow_child")
 
 
-def _reachable_guarded() -> dict[str, set[str]]:
+def _reachable_guarded(guarded: set[str] | frozenset[str] = frozenset(GUARDED_TOOLS)) -> dict[str, set[str]]:
     """For each guarded tool, the other guarded tools reachable via self.<method> calls."""
 
     source = Path(inspect.getfile(MythicTools)).read_text()
@@ -69,11 +71,11 @@ def _reachable_guarded() -> dict[str, set[str]]:
         edges[name] = callees
 
     out = {}
-    for root in sorted(GUARDED_TOOLS & set(methods)):
+    for root in sorted(set(guarded) & set(methods)):
         seen, stack, hits = set(), [root], set()
         while stack:
             for callee in edges.get(stack.pop(), ()):
-                if callee in GUARDED_TOOLS and callee != root:
+                if callee in guarded and callee != root:
                     hits.add(callee)
                 if callee in methods and callee not in seen:
                     seen.add(callee)
@@ -88,9 +90,9 @@ def test_no_reachable_guarded_effect_is_undeclared():
     reachable = _reachable_guarded()
 
     # Floor assertion: an audit that walked an empty class would report success on nothing.
-    assert len(reachable) >= 8, f"call-graph audit only saw {len(reachable)} guarded tools"
-    assert reachable.get("issue_task_and_waitfor_task_output") == {"ensure_tool_uploaded"}, (
-        "the audit no longer sees the registered-file preflight; this test proves nothing"
+    assert len(reachable) >= 7, f"call-graph audit only saw {len(reachable)} guarded tools"
+    assert "issue_task_and_waitfor_task_output" in reachable.get("execute_capability", set()), (
+        "the audit no longer sees execute_capability tasking a callback; this test proves nothing"
     )
 
     declared = _declared_children()
@@ -119,55 +121,26 @@ def test_no_declared_child_is_unreachable():
 
 
 # --------------------------------------------------------------------------------------
-# The binding rule that admits the child.
+# Staging is outside coverage, and would need its edge back if it were guarded again.
 # --------------------------------------------------------------------------------------
 
-_ROOT = {
-    "callback_display_id": 1,
-    "command": "execute_assembly",
-    "parameters": {"assembly_name": "SharpHound.exe", "assembly_arguments": "-c All"},
-    "timeout": 300,
-}
 
-
-def test_child_admitted_when_root_names_the_exact_file():
-    assert MythicTools._registered_file_named_by_root(
-        _ROOT, {"binary_filename": "SharpHound.exe"}
+def test_the_registered_file_preflight_reaches_staging_which_is_not_guarded():
+    staging = _reachable_guarded(GUARDED_TOOLS | CONTROL_PLANE_STAGING_TOOLS)
+    assert "ensure_tool_uploaded" in staging["issue_task_and_waitfor_task_output"], (
+        "the audit no longer sees the registered-file preflight; the checks below prove nothing"
     )
+    assert not CONTROL_PLANE_STAGING_TOOLS & GUARDED_TOOLS
+    assert not any(CONTROL_PLANE_STAGING_TOOLS & kids for kids in _declared_children().values())
 
 
-def test_binding_is_case_insensitive_like_the_preflight_key():
-    assert MythicTools._registered_file_named_by_root(
-        _ROOT, {"binary_filename": "sharphound.exe"}
-    )
+def test_guarding_staging_again_would_reopen_the_deadlock_without_its_edge():
+    """The deadlock guard still fires: with staging counted as guarded, the map has a gap."""
 
-
-def test_child_denied_when_root_names_a_different_file():
-    """The authority boundary: approving SharpHound must not license uploading Rubeus."""
-
-    assert not MythicTools._registered_file_named_by_root(
-        _ROOT, {"binary_filename": "Rubeus.exe"}
-    )
-
-
-def test_child_denied_when_root_carries_no_parameters():
-    assert not MythicTools._registered_file_named_by_root(
-        {"callback_display_id": 1, "command": "shell"}, {"binary_filename": "SharpHound.exe"}
-    )
-
-
-def test_child_denied_when_filename_missing_or_blank():
-    assert not MythicTools._registered_file_named_by_root(_ROOT, {})
-    assert not MythicTools._registered_file_named_by_root(_ROOT, {"binary_filename": "   "})
-
-
-def test_json_string_parameters_are_parsed_not_substring_matched():
-    """Parameters arrive as a JSON string on some paths; a value match must still be exact."""
-
-    root = dict(_ROOT, parameters='{"assembly_name": "SharpHound.exe"}')
-    assert MythicTools._registered_file_named_by_root(root, {"binary_filename": "SharpHound.exe"})
-    # 'Hound.exe' is a substring of the JSON blob but not a parameter value.
-    assert not MythicTools._registered_file_named_by_root(root, {"binary_filename": "Hound.exe"})
+    reachable = _reachable_guarded(GUARDED_TOOLS | CONTROL_PLANE_STAGING_TOOLS)
+    declared = _declared_children()
+    gaps = {root for root, hits in reachable.items() if hits - declared.get(root, set())}
+    assert "issue_task_and_waitfor_task_output" in gaps
 
 
 @pytest.mark.parametrize("unrelated", ["add_credential", "create_payload", "delete_payload"])

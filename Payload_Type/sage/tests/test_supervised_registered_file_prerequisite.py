@@ -1,4 +1,8 @@
-"""An approved capability may register only its immediate callback command's schema-selected file."""
+"""An approved capability registers its callback command's schema-selected file before tasking.
+
+Registering is control-plane staging: it needs no approval of its own, and whatever happens to it, the only
+target-facing task is the approved command on the approved callback.
+"""
 
 import asyncio
 import json
@@ -124,8 +128,24 @@ def test_command_without_registered_file_selector_tasks_without_upload(case, mon
     assert case.events == [("task", "custom-runner", 7)]
 
 
-def test_direct_upload_does_not_borrow_capability_approval(case):
-    with pytest.raises(PermissionError, match="does not cover this exact effect"):
+def test_direct_staging_needs_no_approval_and_tasks_nothing(case):
+    case.client.clear_approval_claim()
+    result = json.loads(asyncio.run(case.client.ensure_tool_uploaded("Example.exe")))
+    assert result["status"] == "uploaded" and result["file_uuid"] == "file-uuid"
+    assert case.events == [("register", "Example.exe")]
+
+
+@pytest.mark.parametrize("mode, intent, denial", [
+    ("conversation", None, "conversational request denies external effects"),
+    ("supervised", "stop", "stopped request denies external effects"),
+])
+def test_staging_is_still_denied_where_no_effect_may_run(case, mode, intent, denial):
+    contract = build_request_contract(request_id="request-deny", channel_id="channel-file",
+                                      operation_id="operation-file", mode=mode, autonomous_solve=False,
+                                      intent=intent)
+    case.client.set_request_contract(contract)
+    case.client.set_turn_authority(authority_from_request_contract(contract))
+    with pytest.raises(PermissionError, match=denial):
         asyncio.run(case.client.ensure_tool_uploaded("Example.exe"))
     assert case.events == []
 
@@ -134,7 +154,7 @@ def test_direct_upload_does_not_borrow_capability_approval(case):
     "filename", "filename-case", "filename-path", "claim", "request", "capability",
     "callback", "command", "parameters", "child-task",
 ])
-def test_capability_registration_rejects_changed_scope(case, monkeypatch, mutation):
+def test_changed_registration_context_never_reaches_another_target_task(case, monkeypatch, mutation):
     original_upload = case.client.ensure_tool_uploaded
     original_preflight = case.client._ensure_registered_file_available
 
@@ -176,8 +196,11 @@ def test_capability_registration_rejects_changed_scope(case, monkeypatch, mutati
         monkeypatch.setattr(case.client, "ensure_tool_uploaded", altered_upload)
 
     result = json.loads(asyncio.run(case.client.execute_capability(case.action, case.inputs)))
-    assert result["ok"] is False, result
-    assert case.events == []
+    tasks = [event for event in case.events if event[0] == "task"]
+    assert tasks in ([], [("task", "custom-runner", 7)]), (result, case.events)
+    if mutation == "request":
+        # The approved task itself is bound to the request: a changed identity stops it before issue.
+        assert result["ok"] is False and tasks == []
 
 
 def test_supported_capability_plan_registers_its_real_runner_file(monkeypatch, tmp_path):

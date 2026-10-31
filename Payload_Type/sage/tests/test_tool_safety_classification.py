@@ -9,7 +9,9 @@ import inspect
 import pytest
 
 from ai.langgraph.mythic_tools import (
+    CONTROL_PLANE_STAGING_TOOLS,
     GUARDED_TOOLS,
+    TOOL_SAFETY_STAGING,
     TOOL_SAFETY_GUARDED,
     TOOL_SAFETY_READ_ONLY,
     MythicTools,
@@ -121,3 +123,13 @@ def test_read_only_methods_are_not_in_guarded_tools():
         ):
             conflicts.append(name)
     assert not conflicts, f"Methods marked READ_ONLY but in GUARDED_TOOLS: {conflicts}"
+
+
+def test_staging_tools_set_matches_decorators():
+    """The by-name staging set the lane checks read must agree with @tool_safety(STAGING)."""
+    decorated = {
+        name for name in _public_tool_methods()
+        if getattr(getattr(MythicTools, name), _TOOL_SAFETY_ATTR, None) == TOOL_SAFETY_STAGING
+    }
+    assert decorated == set(CONTROL_PLANE_STAGING_TOOLS) == {"ensure_tool_uploaded"}
+    assert not decorated & GUARDED_TOOLS
