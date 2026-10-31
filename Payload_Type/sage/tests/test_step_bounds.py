@@ -97,6 +97,26 @@ def test_scope_admits_only_what_the_brief_names(brief, tool_name, capability, vi
     assert bool(sb.scope_violation(brief, tool_name, capability)) is violates
 
 
+COLLECT = {"command": "execute_assembly", "parameters": {"assembly_name": "SharpHound.exe", "assembly_arguments": "-c All"}}
+
+
+@pytest.mark.parametrize("capabilities, tool_name, args, violates", [
+    # A procedure with no execute_capability plan runs as the one payload command that performs it.
+    (["collect-graph"], ISSUE, COLLECT, False),
+    (["collect-graph"], ISSUE, {"command": "execute_assembly", "parameters": "SharpHound.exe -c All"}, False),
+    # Near matches stay out of scope: another assembly, staging the collector, a different procedure's scope,
+    # the collector through a non-tasking guarded tool, and a command no classifier maps (on-host escalation).
+    (["collect-graph"], ISSUE, {"command": "execute_assembly", "parameters": {"assembly_name": "Rubeus.exe"}}, True),
+    (["collect-graph"], ISSUE, {"command": "register_assembly", "parameters": {"file": "SharpHound.exe"}}, True),
+    (["dcsync-krbtgt"], ISSUE, COLLECT, True),
+    (["collect-graph"], "upload_file_by_file_uuid", COLLECT, True),
+    (["execute-as-local-admin"], ISSUE, {"command": "printspoofer", "parameters": ""}, True),
+    (["control_plane"], ISSUE, COLLECT, True),
+])
+def test_a_capability_scope_admits_the_raw_command_that_performs_it(capabilities, tool_name, args, violates):
+    assert bool(sb.scope_violation({"allowed_capabilities": capabilities}, tool_name, "", args)) is violates
+
+
 def test_outcome_separates_active_action_and_waiting_time():
     record = _record(active_seconds=40.0, action_seconds=500.0)
     record.end(sb.StepStatus.ACTION_EXECUTED, "guarded_actions", "one action ran")
@@ -238,7 +258,7 @@ async def _native(script: list, decision: str, *, clock: dict | None = None):
     effects: list[str] = []
 
     @tool
-    async def issue_task_and_waitfor_task_output(command: str, parameters: str, callback_display_id: int) -> str:
+    async def issue_task_and_waitfor_task_output(command: str, parameters: str | dict, callback_display_id: int) -> str:
         """Issue one callback task and wait for its output."""
         effects.append(command)
         if clock is not None:
@@ -334,3 +354,29 @@ def test_a_guarded_call_outside_the_brief_is_removed_before_any_card():
     [outcome] = outcomes
     assert (outcome["status"], outcome["bound"]) == ("rejected_by_scope", "scope")
     assert "allowed_tools" in outcome["detail"]
+
+
+def test_a_collection_scope_reaches_a_card_for_the_collector_command_and_runs_it():
+    """The live failure: a `collect-graph` step whose worker proposes the collector was stripped before any card."""
+    handoff = {"handoff_title": "collect graph", "handoff_instruction": ORIGINAL, **BRIEF,
+               "allowed_capabilities": ["collect-graph"]}
+    script = [_call("transfer_to_Mythic_Operator", handoff, 1),
+              _call(ISSUE, {"command": "execute_assembly", "callback_display_id": 5,
+                            "parameters": '{"assembly_name": "SharpHound.exe", "assembly_arguments": "-c All"}'}, 2),
+              AIMessage(content="Final answer.")]
+    effects, cards, outcomes = asyncio.run(_native(script, "accept"))
+
+    assert cards == ["execute_assembly"] and effects == ["execute_assembly"]
+    assert all(outcome["status"] != "rejected_by_scope" for outcome in outcomes)
+
+
+def test_a_collection_scope_still_removes_an_unrelated_command_before_any_card():
+    handoff = {"handoff_title": "collect graph", "handoff_instruction": ORIGINAL, **BRIEF,
+               "allowed_capabilities": ["collect-graph"]}
+    script = [_call("transfer_to_Mythic_Operator", handoff, 1), _call(OLD_ACTION["name"], OLD_ACTION["args"], 2),
+              AIMessage(content="Final.")]
+    effects, cards, outcomes = asyncio.run(_native(script, ""))
+
+    assert effects == [] and cards == []
+    [outcome] = outcomes
+    assert (outcome["status"], outcome["bound"]) == ("rejected_by_scope", "scope")

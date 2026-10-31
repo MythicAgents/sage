@@ -87,11 +87,24 @@ between minor releases.
 
 ### Changed
 
+- Staging a tool binary into Mythic's file store (`ensure_tool_uploaded`) no longer asks for its own approval in
+  supervised mode. It writes only Mythic's operation file store from the local tool drop zone and reaches no
+  callback; the command that later runs the tool on a target still needs its approval. A task whose command
+  selects a registered file still registers that file before it is issued. Staging stays unavailable in
+  conversation mode and in a stopped request.
+
 - `mythic-cli install github` now pulls the published release image from GitHub Container Registry instead of
   building Sage locally. Set `sage_use_build_context` to `true` in Mythic's configuration to keep building from
   source.
 
 ### Fixed
+
+- A supervised step scoped to graph collection can now run the collector. Collection has no `execute_capability`
+  procedure, so the specialist proposes the collector command itself, and that proposal was removed before any
+  approval card for falling outside the step's scope; the Supervisor re-sent the same scope until the request
+  halted for making no progress. A command now fits a capability-scoped step when Sage's own command classifier
+  identifies it as that capability, as it does for a SharpHound or AzureHound launch. Any other command in such a
+  step is still removed before a card and needs a step scoped with `allowed_tools`.
 
 - A request that ends while a specialist's delegation is still open, for example when a capability
   cannot be planned or an identical re-proposal is stopped, now finishes normally. The open delegation
