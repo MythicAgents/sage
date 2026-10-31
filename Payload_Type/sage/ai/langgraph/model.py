@@ -2837,6 +2837,22 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
             if not reason:
                 return
             status, bound = _step_bounds.StepStatus.REJECTED_BY_SCOPE, "scope"
+            brief_meta = getattr(delegated, "additional_kwargs", {}).get("_handoff_brief")
+            signature = (_handoff_brief.scope_signature(
+                brief_meta.get("allowed_capabilities"), brief_meta.get("allowed_tools"),
+            ) if isinstance(brief_meta, Mapping) else "")
+            if signature:
+                # Record the scope that was rejected at execution, keyed by the delegated step, so the next
+                # brief check can see the Supervisor re-sending a scope that keeps failing (not the command).
+                try:
+                    led = self._model._ensure_request_event_ledger()
+                    led.record_once(
+                        event_id=f"scope_rejected:{led.request_id}:{_get_seq(delegated)}",
+                        kind="scope_rejected", phase="rejected", content=name,
+                        metadata={"scope_signature": signature, "tool": name},
+                    )
+                except Exception:
+                    pass
         record.end(status, bound, reason)
         _remove_tool_calls(message, {str(call.get("id") or "") for call in guarded}, f"[step-boundary] {reason}")
 
@@ -5968,6 +5984,18 @@ class Model:
             f"restatement={restatement} | errors={list(errors)}"
         )
         if not errors:
+            signature = _handoff_brief.scope_signature(brief.allowed_capabilities, brief.allowed_tools)
+            if lane == "supervised_workflow" and _handoff_brief.trailing_scope_rejections(
+                ledger.actual_events(kind="scope_rejected", phase="rejected"), signature,
+            ) >= _handoff_brief.REJECTIONS_BEFORE_STOP - 1:
+                # The Supervisor re-sent a scope that was already removed before a card because the worker's
+                # action fell outside it. Re-sending it loops; end the request with the concrete re-scope.
+                return (
+                    (f"this step's scope ({signature}) already failed at execution and was re-sent unchanged; "
+                     "for a single command name the guarded tool in allowed_tools, or a catalog procedure in "
+                     "allowed_capabilities run through execute_capability",),
+                    True,
+                )
             if brief.off_catalog:
                 # A tool-scoped step is work outside the catalog. Durable through the sealed decision record:
                 # retrospectives mine these for recurring multi-step procedures worth adding to the catalog.

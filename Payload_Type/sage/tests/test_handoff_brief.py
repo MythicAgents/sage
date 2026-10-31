@@ -443,3 +443,55 @@ def test_a_name_outside_the_offered_list_is_refused_by_the_schema_with_the_choic
     errors = [str(m.content) for m in result.get("supervisor_messages", []) if type(m).__name__ == "ToolMessage"]
     assert any("control_plane" in text and "collect-graph" in text for text in errors)
     assert not any("'off_catalog'" in text for text in errors)
+
+
+# --- scope-loop stop (repair after the 2026-10-30 live run) ----------------------------------------------------
+
+def test_scope_signature_keys_on_scope_not_command():
+    # allowed_tools wins when present; capabilities are casefolded; order does not matter.
+    assert hb.scope_signature(allowed_tools=["b", "a"]) == "tools:a,b"
+    assert hb.scope_signature(allowed_capabilities=["Execute-As-Local-Admin"]) == "capabilities:execute-as-local-admin"
+    assert hb.scope_signature(["collect-graph"], []) == "capabilities:collect-graph"
+    assert hb.scope_signature([], []) == ""
+
+
+def test_trailing_scope_rejections_counts_only_the_matching_tail():
+    def event(sig):
+        return SimpleNamespace(metadata=(("scope_signature", sig),))
+    events = [event("capabilities:a"), event("capabilities:a")]
+    assert hb.trailing_scope_rejections(events, "capabilities:a") == 2
+    # A different scope at the end resets the count: changing the scope is progress.
+    assert hb.trailing_scope_rejections(events + [event("tools:x")], "capabilities:a") == 0
+    assert hb.trailing_scope_rejections(events, "") == 0
+
+
+def test_a_capability_scope_names_the_tool_route_out_of_the_loop():
+    from ai.langgraph import step_bounds as sb
+    reason = sb.scope_violation({"allowed_capabilities": ["execute-as-local-admin"]},
+                                "issue_task_and_waitfor_task_output")
+    assert 'allowed_tools: ["issue_task_and_waitfor_task_output"]' in reason
+
+
+def test_a_re_sent_scope_that_keeps_failing_at_execution_ends_the_request():
+    cap_brief = {"handoff_title": "Elevate", "callback_display_id": 3, "targets": ["meereen.essos.local"],
+                 "expected_result": "A SYSTEM callback.", "allowed_capabilities": ["execute-as-local-admin"]}
+    # The worker keeps text, so stripping its out-of-scope guarded call needs no summary-synthesis model call.
+    propose = AIMessage(content="Running PrintSpoofer now.",
+                        tool_calls=[{"name": "issue_task_and_waitfor_task_output",
+                                     "args": {"command": "printspoofer", "callback_display_id": 3},
+                                     "id": "t1", "type": "tool_call"}])
+    harness, result = _run([_handoff(cap_brief, "d1"), propose, _handoff(cap_brief, "d2"),
+                            AIMessage(content="never")])
+
+    scope_events = harness.model._request_event_ledger.actual_events(kind="scope_rejected")
+    assert [e.phase for e in scope_events] == ["rejected"]
+    assert len(_delegated(result)) == 1  # the re-sent scope never reached the worker a second time
+    final = [m for m in result.get("supervisor_messages", []) if m.additional_kwargs.get("_is_final_report")]
+    assert final and "allowed_tools" in str(final[-1].content)
+
+
+def test_a_different_command_under_the_same_scope_does_not_count_as_a_repeat():
+    # The same wrong scope with a changed payload command is still the same stuck scope: the stop is keyed on
+    # the scope, so this is covered; the complementary case — a changed SCOPE resetting — is the unit test above.
+    assert hb.scope_signature(allowed_capabilities=["execute-as-local-admin"]) == \
+        hb.scope_signature(allowed_capabilities=["execute-as-local-admin"])

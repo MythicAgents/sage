@@ -48,7 +48,10 @@ between minor releases.
   already known, and referenced tasks and credentials must be records Sage holds. A failed check returns the
   reasons to the Supervisor; a second consecutive failure ends the request and tells the operator why. A step
   that only reads Mythic or BloodHound records declares itself `control_plane` and needs no callback, but may not
-  propose any guarded action. The specialist still receives the operator's exact words.
+  propose any guarded action. The specialist still receives the operator's exact words. When a step scoped to a
+  catalog procedure proposes a single command instead, the step-boundary message now names the exact fix — the
+  guarded tool to put in `allowed_tools` — and if the Supervisor re-sends a scope that already failed at execution,
+  the request ends with that instruction rather than looping.
 
 - The Supervisor can list callbacks itself in conversation and supervised mode, so "which callbacks are alive"
   is answered without a delegation and a brief can name a callback the Supervisor has seen.

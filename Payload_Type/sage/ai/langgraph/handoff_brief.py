@@ -285,6 +285,40 @@ def restatement(instruction: str, operator_input: str) -> float:
     return round(sum(word in source for word in words) / len(words), 3)
 
 
+def scope_signature(allowed_capabilities: Iterable[Any] = (), allowed_tools: Iterable[Any] = ()) -> str:
+    """A stable identity for a step's execution scope, so re-sending the SAME scope is detectable.
+
+    Keyed on the scope the Supervisor chose, never on the payload command: a changed command under one scope is
+    progress and resets nothing, while repeating a scope that keeps failing at execution is the stuck loop.
+    """
+    tools = sorted(str(item) for item in (allowed_tools or ()))
+    if tools:
+        return "tools:" + ",".join(tools)
+    caps = sorted(str(item).casefold() for item in (allowed_capabilities or ()))
+    if caps:
+        return "capabilities:" + ",".join(caps)
+    return ""
+
+
+def _event_scope_signature(event: Any) -> str:
+    for key, value in getattr(event, "metadata", ()) or ():
+        if key == "scope_signature":
+            return value
+    return ""
+
+
+def trailing_scope_rejections(events: Iterable[Any], signature: str) -> int:
+    """Contiguous trailing scope rejections whose scope matches `signature` (0 when it does not recur)."""
+    if not signature:
+        return 0
+    count = 0
+    for event in reversed(tuple(events)):
+        if _event_scope_signature(event) != signature:
+            break
+        count += 1
+    return count
+
+
 def rejection_count(events: Iterable[Any]) -> int:
     """Consecutive brief rejections at the end of a request's brief events."""
     count = 0

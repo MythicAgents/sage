@@ -155,8 +155,9 @@ def scope_violation(brief: Any, tool_name: str, capability_name: str = "") -> st
         return f"`{tool_name}` is not in this step's allowed_tools ({', '.join(tools)})"
     if capabilities:
         if tool_name != "execute_capability":
-            return (f"`{tool_name}` is outside this step's capabilities ({', '.join(capabilities)}); "
-                    "a catalog procedure runs through execute_capability")
+            return (f"`{tool_name}` is outside this step's capabilities ({', '.join(capabilities)}). "
+                    f"For a single command, re-scope with allowed_tools: [\"{tool_name}\"]; use "
+                    "allowed_capabilities only for a catalog procedure run through execute_capability.")
         if capability_name not in capabilities:
             return f"capability `{capability_name or 'unknown'}` is not in this step's allowed_capabilities"
     return ""
