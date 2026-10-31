@@ -2548,6 +2548,12 @@ class _MessageSanitizerMiddleware(AgentMiddleware):
         return await handler(self._sanitize(request))
 
 
+def _bound_call_id(request_id: str, delegation_seq: int) -> str:
+    """A tool-call id for a call Sage proposes itself. Providers restrict ids (Anthropic: `^[a-zA-Z0-9_-]+$`), and a
+    request id such as `chat:11:request:10` does not qualify."""
+    return re.sub(r"[^A-Za-z0-9_-]", "_", f"sage_bound_{request_id}_{delegation_seq}")
+
+
 def _offered_tool_name(tool: Any) -> str:
     """The name of a tool as a model request carries it: a tool object, or an OpenAI- or Anthropic-style dict."""
     if isinstance(tool, Mapping):
@@ -2853,7 +2859,7 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
         return AIMessage(
             content="", name=self._agent_name,
             tool_calls=[{"name": "execute_capability", "args": call, "type": "tool_call",
-                         "id": f"sage_bound_{record.request_id}_{record.delegation_seq}"}],
+                         "id": _bound_call_id(record.request_id, record.delegation_seq)}],
             additional_kwargs={"_sage_bound_procedure": True},
         )
 

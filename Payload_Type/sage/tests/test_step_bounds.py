@@ -584,3 +584,10 @@ def test_a_collection_step_with_several_targets_is_left_to_the_worker_model(monk
     worker_calls, ran = _bound_step(monkeypatch, brief, "", worker_replies=1)
 
     assert ran == [] and len(worker_calls) == 1
+
+
+def test_a_sage_proposed_call_id_is_one_every_provider_accepts():
+    """A live Bedrock call rejected the bound call's id, built from a request id containing colons."""
+    import re
+    call_id = model_module._bound_call_id("chat:11:request:10", 3)
+    assert re.fullmatch(r"[a-zA-Z0-9_-]+", call_id) and call_id != model_module._bound_call_id("chat:11:request:10", 4)
