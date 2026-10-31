@@ -2834,7 +2834,6 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
             reason = _step_bounds.scope_violation(
                 getattr(delegated, "additional_kwargs", {}).get("_handoff_brief"), name,
                 _capability_name_from_request_args(guarded[0].get("args") or {}),
-                guarded[0].get("args") or {},
             )
             if not reason:
                 return
@@ -9249,6 +9248,7 @@ class Model:
             preauth_client=self._mythic_preauth_client,
         )
         self.mythic_client.set_mechanic_repair_resolver(self._resolve_capability_mechanic)
+        self.mythic_client.set_collection_runner(self._run_collection_capability)
         self.mythic_client.set_capability_command_observer(self._emit_capability_command_card)
         self.mythic_client.set_execution_observer(self._emit_execution_event)
         self.mythic_client.set_turn_authority(self._turn_authority)
@@ -12987,6 +12987,42 @@ class Model:
             return _adapter.collection_adapter_for_payload_type(getattr(foothold, "agent", ""))
         except Exception:
             return None
+
+    async def _run_collection_capability(self, *, callback_id: str, scope_domain: str = "") -> dict:
+        """Run graph collection for an approved `execute_capability` call on the approved callback.
+
+        This is the controller's own collection procedure, so supervised and autonomous work share one
+        implementation. It never pauses for approval: the operator already approved the capability, and the
+        collection transaction binds every task it issues to that approval.
+        """
+        try:
+            from . import engagement_state as _es
+        except ImportError:
+            import engagement_state as _es
+        state = await self._build_current_engagement_state()
+        if state is None:
+            return {"ok": False, "status": "no_state", "reason": "Sage could not build the engagement state"}
+        try:
+            from datetime import datetime, timezone
+            await self.mythic_client._refresh_graph_facts_if_stale(datetime.now(timezone.utc).isoformat())
+            state.graph_facts = list(getattr(self.mythic_client, "_engagement_graph_facts", []) or [])
+        except Exception:
+            pass
+        wanted = str(callback_id or "").strip()
+        foothold = next((candidate for candidate in self._controller_ordered_supported_footholds(state)
+                         if str(getattr(candidate, "callback_id", "") or "").strip() == wanted), None)
+        if foothold is None:
+            return {"ok": False, "status": "no_target",
+                    "reason": f"callback {wanted} is not a live foothold whose agent has a collection profile"}
+        scope = str(scope_domain or "").strip().casefold()
+        request = _ControllerCollectionRequest(
+            foothold=foothold,
+            scope_domain=scope,
+            reason="operator-approved",
+            collection_key=_es.collection_target_key(state, foothold, scope),
+            support=f"operator approved collect-graph on callback {wanted}",
+        )
+        return await self._controller_collect(state, request=request)
 
     def _controller_ordered_supported_footholds(self, state) -> list[Any]:
         """Return collectable footholds with the latest proven callback lane first."""
@@ -17331,7 +17367,7 @@ def _create_handoff_tool(
             callback_display_id: Annotated[int | str | None, "The Mythic callback display id this step runs on. Required for a supervised Mythic_Operator step unless allowed_capabilities is ['control_plane']; must be a callback already observed, and the request's bound callback when it has one."] = None,
             targets: Annotated[list[str] | None, "Hosts, domains, or principals this step acts on, each named in the operator's request or already in engagement state. Required for a supervised Mythic_Operator step unless allowed_capabilities is ['control_plane']."] = None,
             expected_result: Annotated[str, "One line stating what this step should produce. Required for a supervised Mythic_Operator step."] = "",
-            allowed_capabilities: Annotated[list[capability_choice] | None, "Catalog procedures this step may run, by name (each runs as one guarded action through execute_capability, or as the single payload command that performs it, such as a graph collector), or ['control_plane'] alone for a step that only reads Mythic or BloodHound records (callbacks, task output, credentials, graph) and tasks no callback. A procedure also needs the state in its 'needs' clause; if that is not met, do the upstream procedure first. For any other work, including a single payload command, name the guarded tools in allowed_tools instead (a command is an argument to issue_task_and_waitfor_task_output, never a capability). Catalog:\n" + capability_legend] = None,
+            allowed_capabilities: Annotated[list[capability_choice] | None, "Catalog procedures (each a multi-step procedure run as one guarded action through execute_capability) this step may run, by name, or ['control_plane'] alone for a step that only reads Mythic or BloodHound records (callbacks, task output, credentials, graph) and tasks no callback. A procedure also needs the state in its 'needs' clause; if that is not met, do the upstream procedure first. For any other work, including a single payload command, name the guarded tools in allowed_tools instead (a command is an argument to issue_task_and_waitfor_task_output, never a capability). Catalog:\n" + capability_legend] = None,
             allowed_tools: Annotated[list[tool_choice] | None, "Instead of allowed_capabilities: the guarded tools this step's one action may use. Name either allowed_capabilities or allowed_tools, not both. Read-only tools are always available and need not be listed."] = None,
             inputs_by_reference: Annotated[list[str] | None, "Earlier results this step uses, as 'task:<display id>' or 'cred:<credential id>' records Sage already holds."] = None,
         ) -> Command:

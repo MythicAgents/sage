@@ -15,7 +15,7 @@ from enum import Enum
 import os
 from typing import Any, Iterable, Mapping
 
-from . import intent_classifier, step_references
+from . import step_references
 
 # 2: the outcome carries Sage-read references to the step's tasks, credentials and graph reads.
 STEP_OUTCOME_VERSION = 2
@@ -25,7 +25,6 @@ DENIED_PREFIX = "[DENIED by operator]"
 CONTROL_TOOLS = frozenset({"handback_to_supervisor", "summarize_and_handback", "request_continuation",
                            "respond_to_user"})
 CONTROL_PLANE = "control_plane"
-RAW_TASKING_TOOL = "issue_task_and_waitfor_task_output"
 
 
 class StepStatus(str, Enum):
@@ -142,27 +141,8 @@ def bound_reached(activity: StepActivity, record: StepRecord, bounds: StepBounds
     return None
 
 
-def raw_task_capability(tool_args: Any) -> str:
-    """The catalog procedure a raw tasking call performs, by Sage's command classifier; empty when none.
-
-    Some procedures (graph collection) have no execute_capability plan and run as one payload command, so a step
-    scoped to that procedure can only act through the raw tasking tool. The classifier is the same one the
-    engagement gate uses, so the mapping is not restated here.
-    """
-    if not isinstance(tool_args, Mapping):
-        return ""
-    classified = intent_classifier.classify_tool_call(str(tool_args.get("command") or ""),
-                                                      tool_args.get("parameters"))
-    return str(classified[0]).casefold() if classified else ""
-
-
-def scope_violation(brief: Any, tool_name: str, capability_name: str = "",
-                    tool_args: Mapping[str, Any] | None = None) -> str:
-    """Why a guarded call falls outside the step's brief; empty when it is in scope or the brief sets no scope.
-
-    Under a capability scope, `execute_capability` must name an allowed procedure, and the raw tasking tool is in
-    scope only when its command performs an allowed procedure (`raw_task_capability`).
-    """
+def scope_violation(brief: Any, tool_name: str, capability_name: str = "") -> str:
+    """Why a guarded call falls outside the step's brief; empty when it is in scope or the brief sets no scope."""
     if not isinstance(brief, Mapping):
         return ""
     capabilities = [str(item) for item in brief.get("allowed_capabilities") or []]
@@ -174,8 +154,6 @@ def scope_violation(brief: Any, tool_name: str, capability_name: str = "",
             return ""
         return f"`{tool_name}` is not in this step's allowed_tools ({', '.join(tools)})"
     if capabilities:
-        if tool_name == RAW_TASKING_TOOL and raw_task_capability(tool_args) in capabilities:
-            return ""
         if tool_name != "execute_capability":
             return (f"`{tool_name}` is outside this step's capabilities ({', '.join(capabilities)}). "
                     f"For a single command, re-scope with allowed_tools: [\"{tool_name}\"]; use "

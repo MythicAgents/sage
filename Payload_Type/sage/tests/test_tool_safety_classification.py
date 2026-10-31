@@ -47,6 +47,7 @@ def _public_tool_methods() -> list[str]:
         "reserve_ingest",
         "set_approval_claim",
         "set_capability_command_observer",
+        "set_collection_runner",
         "set_evaluation_authorization_context",
         "set_execution_observer",
         "set_mechanic_repair_resolver",

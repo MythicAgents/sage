@@ -1357,12 +1357,50 @@ _VOLATILE_OUTPUT_PATTERNS = [
 ]
 
 
+COLLECTION_CAPABILITY = "collect-graph"
+
+
+def collection_capability_binding(root: Any) -> dict[str, str] | None:
+    """The callback and scope an approved `execute_capability` root names when it runs graph collection.
+
+    Graph collection is a Sage-owned transaction, not an adapter plan, so an `execute_capability` call for
+    `collect-graph` is the transaction's root. Returns None for any other root or a malformed one.
+    """
+    if not isinstance(root, dict) or str(root.get("name") or "") != "execute_capability":
+        return None
+    args = root.get("args")
+    if not isinstance(args, dict):
+        return None
+    try:
+        from .request_contract import parse_capability_request
+    except ImportError:  # pragma: no cover
+        from request_contract import parse_capability_request  # type: ignore
+    try:
+        parsed = parse_capability_request(args.get("action"), args.get("inputs"))
+    except (TypeError, ValueError):
+        return None
+    if str(parsed.bindings.capability or "").casefold() != COLLECTION_CAPABILITY:
+        return None
+    scope = ""
+    for source in (parsed.input_values, parsed.intent, parsed.action_data):
+        for key in ("scope_domain", "domain"):
+            value = source.get(key) if isinstance(source, Mapping) else None
+            if isinstance(value, str) and value.strip():
+                scope = scope or value.strip().casefold()
+    return {"callback_id": str(parsed.bindings.callback_id or ""), "scope_domain": scope}
+
+
 class _PrivateCollectionTransaction:
-    """One supervised collect_graph root owns every admitted child effect."""
+    """One approved collection root (`collect_graph`, or `execute_capability` for `collect-graph`) owns every
+    admitted child effect."""
 
     _MAX_LIST_ATTEMPTS = 4
 
-    def __init__(self, *, contract, claim, root_args: dict[str, Any], request: Any, adapter: dict[str, Any]):
+    def __init__(self, *, contract, claim, root_args: dict[str, Any], request: Any, adapter: dict[str, Any],
+                 approved_name: str = "collect_graph", approved_args: dict[str, Any] | None = None):
+        # The approved action exactly as the operator accepted it; `root_args` is the collection it binds.
+        self.approved_name = str(approved_name)
+        self.approved_args = dict(root_args if approved_args is None else approved_args)
         self.request_id = str(contract.request_id)
         self.contract_digest = str(contract.digest)
         self.claim_id = str(claim.get("approval_id") or "")
@@ -1429,8 +1467,8 @@ class _PrivateCollectionTransaction:
             and str(claim.get("approval_id") or "") == self.claim_id
             and str(claim.get("request_id") or "") == self.request_id
             and str(claim.get("request_contract_digest") or "") == self.contract_digest
-            and str(approved.get("name") or "") == "collect_graph"
-            and approved.get("args") == self.root_args
+            and str(approved.get("name") or "") == self.approved_name
+            and approved.get("args") == self.approved_args
         )
 
     def _current_step(self) -> dict[str, Any] | None:
@@ -1973,6 +2011,8 @@ class MythicTools:
         # turn into an open-ended "try another command" loop.
         self._mechanic_repair_resolver = None
         self._mechanic_repair_cache: dict[tuple, dict | None] = {}
+        # Runs graph collection (a Sage-owned transaction held by the model) for execute_capability.
+        self._collection_runner = None
         # Credential-store cache: the store is read both by read_credentials (which the agent hit 24× in one
         # solve) and by the gate's durable-hop corroboration probe. Cache the raw rows for a short TTL so
         # neither path re-queries Mythic repeatedly.
@@ -2035,6 +2075,10 @@ class MythicTools:
     def set_mechanic_repair_resolver(self, resolver) -> None:
         """Install the bounded payload-mechanic resolver used by deterministic capability execution."""
         self._mechanic_repair_resolver = resolver if callable(resolver) else None
+
+    def set_collection_runner(self, runner) -> None:
+        """Install the async runner that performs `collect-graph` for execute_capability."""
+        self._collection_runner = runner if callable(runner) else None
 
     def set_capability_command_observer(self, observer) -> None:
         """Install a fail-soft presentation observer for callback tasks issued inside a capability."""
@@ -2306,9 +2350,12 @@ class MythicTools:
         if not isinstance(actions, list) or len(actions) != 1:
             return "supervised collect_graph lacks an exact active approval claim"
         approved = actions[0] if isinstance(actions[0], dict) else {}
-        if str(approved.get("name") or "") != "collect_graph" or not isinstance(approved.get("args"), dict):
+        if not isinstance(approved.get("args"), dict):
             return "supervised collect_graph lacks an exact active approval claim"
-        expected = dict(approved["args"])
+        approved_name = str(approved.get("name") or "")
+        capability_binding = collection_capability_binding(approved)
+        if approved_name != "collect_graph" and capability_binding is None:
+            return "supervised collect_graph lacks an exact active approval claim"
         authority_fields = {
             "collection_key",
             "scope_domain",
@@ -2320,13 +2367,7 @@ class MythicTools:
             "identity",
         }
         actual = {key: root_args.get(key) for key in authority_fields}
-        bound = {key: expected.get(key) for key in authority_fields}
         if not _PrivateCollectionTransaction._ascii_decimal(actual.get("callback_id")):
-            return "supervised collect_graph requires an exact ASCII callback"
-        if actual != bound:
-            return "supervised collect_graph root does not match the exact active approval"
-        callback_id = _PrivateCollectionTransaction._ascii_decimal(expected.get("callback_id"))
-        if not callback_id:
             return "supervised collect_graph requires an exact ASCII callback"
         foothold = getattr(request, "foothold", None)
         request_bound = {
@@ -2339,8 +2380,27 @@ class MythicTools:
             "agent": str(getattr(foothold, "agent", "") or ""),
             "identity": str(getattr(foothold, "identity", "") or ""),
         }
-        if request_bound != bound:
-            return "supervised collect_graph root does not match the exact active approval"
+        if capability_binding is not None:
+            # The operator approved collection on a callback (and optionally a domain). Sage derives the rest of
+            # the collection from that callback's foothold, so the derived root must name exactly the approved
+            # callback and scope; every other field is Sage's own record of that foothold.
+            if (
+                not capability_binding["callback_id"]
+                or actual != request_bound
+                or actual["callback_id"] != capability_binding["callback_id"]
+                or str(actual["scope_domain"] or "").casefold() != capability_binding["scope_domain"]
+            ):
+                return "supervised collect_graph root does not match the exact active approval"
+            expected = dict(actual)
+        else:
+            expected = dict(approved["args"])
+            bound = {key: expected.get(key) for key in authority_fields}
+            if actual != bound:
+                return "supervised collect_graph root does not match the exact active approval"
+            if not _PrivateCollectionTransaction._ascii_decimal(expected.get("callback_id")):
+                return "supervised collect_graph requires an exact ASCII callback"
+            if request_bound != bound:
+                return "supervised collect_graph root does not match the exact active approval"
         current = getattr(self, "_private_collection_transaction", None)
         if isinstance(current, _PrivateCollectionTransaction) and current.active_for(self):
             return "supervised collect_graph transaction is already active"
@@ -2350,6 +2410,8 @@ class MythicTools:
             root_args=expected,
             request=request,
             adapter=dict(adapter or {}),
+            approved_name=approved_name,
+            approved_args=dict(approved["args"]),
         )
         return ""
 
@@ -2482,7 +2544,9 @@ class MythicTools:
         recheck: bool = False,
     ) -> bool:
         """Admit only declared internal effects of the exact approved workflow root."""
-        if root_name == "collect_graph":
+        if root_name == "collect_graph" or collection_capability_binding(
+            {"name": root_name, "args": root_args},
+        ) is not None:
             transaction = getattr(self, "_private_collection_transaction", None)
             if not isinstance(transaction, _PrivateCollectionTransaction) or not transaction.active_for(self):
                 return False
@@ -11135,6 +11199,8 @@ class MythicTools:
         """
         args = {"action": action, "inputs": inputs}
         self._require_request_contract_effect("execute_capability", args)
+        if collection_capability_binding({"name": "execute_capability", "args": args}) is not None:
+            return await self._run_collection_capability(args)
         claim = getattr(self, "_active_approval_claim", None)
         contract = getattr(self, "_request_contract", None)
         execution = None
@@ -11177,6 +11243,29 @@ class MythicTools:
             return await self._execute_capability_impl(action, inputs)
         finally:
             _capability_execution_context.reset(token)
+
+    async def _run_collection_capability(self, args: dict[str, Any]) -> str:
+        """Run `collect-graph` as Sage's collection transaction: one approval covers every task it issues."""
+        binding = collection_capability_binding({"name": "execute_capability", "args": args}) or {}
+
+        def reply(result: dict[str, Any]) -> str:
+            return json.dumps({"capability": COLLECTION_CAPABILITY, **result}, default=str, sort_keys=True)
+
+        if not binding.get("callback_id"):
+            return reply({"ok": False, "status": "missing_callback",
+                          "reason": "collect-graph needs the callback_id to collect from"})
+        runner = getattr(self, "_collection_runner", None)
+        if not callable(runner):
+            return reply({"ok": False, "status": "unavailable", "reason": "no collection runner is installed"})
+        token = _task_visibility_context.set({
+            "capability": COLLECTION_CAPABILITY,
+            "purpose": "operator-approved graph collection",
+        })
+        try:
+            result = await runner(callback_id=binding["callback_id"], scope_domain=binding.get("scope_domain", ""))
+        finally:
+            _task_visibility_context.reset(token)
+        return reply(result if isinstance(result, dict) else {"ok": False, "reason": str(result)})
 
     async def _execute_capability_impl(
         self, action: dict | str, inputs: dict | str | None = None,
