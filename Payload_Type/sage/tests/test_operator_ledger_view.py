@@ -213,7 +213,6 @@ def _inventory_model(channel_id):
     m.command_name = "chat"
     m.channel_id = channel_id
     m._autonomous_solve = False
-    m._supervised_objective_active = False
     m._controller_hitl_pending = None
     m._thread_id_override = f"channel-ledger-view-{channel_id}"
     m._running_tasks = set()

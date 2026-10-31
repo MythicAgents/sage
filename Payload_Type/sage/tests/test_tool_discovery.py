@@ -134,7 +134,6 @@ def test_exact_callback_literal_invokes_existing_one_read_table_path():
     m.mode = "supervised"
     m.command_name = "chat"
     m._autonomous_solve = False
-    m._supervised_objective_active = False
     m._controller_hitl_pending = None
     m._thread_id_override = "channel-tool-discovery"
     m._running_tasks = set()

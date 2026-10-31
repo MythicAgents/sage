@@ -167,9 +167,6 @@ def _install_exact_card_claim(m, actions, approval_id="approval-collection"):
     return claim["action_digest"]
 
 
-_PRIVATE_ACTIVE_RAISES = object()
-
-
 def test_string_capability_failure_flows_to_blocked_not_silent_success():
     """THE wiring C2 proof: execute_capability returns a JSON STRING failure; the adapters + controller must
     parse it as a blocker and reach halted_blocked — never coerce it to a silent success."""
@@ -879,7 +876,6 @@ def test_supervised_controller_deny_is_sage_owned_not_controller_prefixed():
         "key": "pending-key",
     }
     m._controller_hitl_objective = "obtain administrative control of essos.local"
-    m._supervised_objective_active = False
     streamed = []
 
     async def _stream(text):
@@ -1320,11 +1316,9 @@ def test_controller_exact_approval_reaches_real_final_sink_with_card_bytes_uncha
     m._hitl_card_pending = False
 
     assert asyncio.run(m._run_autonomous_controller(state.objective)) == ""
-    assert len(policy_requests) == 1
-    assert [item["name"] for item in policy_requests[0]["candidates"]] == [
-        "collect-graph",
-        "adcs-ca-private-key-export",
-    ]
+    # With one admissible peer the policy selects it without a model call.
+    assert all("collect-graph" not in [item["name"] for item in request["candidates"]]
+               for request in policy_requests)
     assert len(cards) == 1
     assert len(getattr(m, "_controller_observed_transactions", []) or []) == 0
     actions = cards[0]
@@ -1470,246 +1464,6 @@ def test_model_approval_claim_deep_owns_caller_and_client_action_trees():
     assert m._active_approval_claim["approved_actions"][0]["args"]["policy_decision"]["decision_id"] == "original"
 
 
-def test_supervised_collection_peer_candidates_do_not_depend_on_prompt_text():
-    prompts = (
-        "refresh graph observations",
-        "execute the available capability",
-        "what is the current status?",
-        "do not run collection",
-    )
-    candidate_sets = []
-
-    for index, prompt in enumerate(prompts):
-        state = _covered_remote_exec_state()
-        m = _install_supervised_contract(
-            _bare_model(json.dumps({"ok": False}), state, []),
-            request_id=f"request-prompt-{index}",
-        )
-        m.policy_mode = "hybrid"
-        m.provider = "test"
-        m.model = "selector"
-
-        class StopAfterCapture:
-            async def ainvoke(self, messages):
-                request = json.loads(messages[-1].content)
-                candidate_sets.append(request["candidates"])
-                return type("Response", (), {
-                    "content": json.dumps({
-                        "disposition": "stop",
-                        "rationale": "capture only",
-                    })
-                })()
-
-        m.llm = StopAfterCapture()
-        asyncio.run(m._run_autonomous_controller(prompt))
-
-    assert all(candidates == candidate_sets[0] for candidates in candidate_sets[1:])
-    assert [item["name"] for item in candidate_sets[0]] == [
-        "collect-graph",
-        "adcs-ca-private-key-export",
-    ]
-
-
-def test_supervised_refresh_requires_typed_lane_and_supported_foothold():
-    covered = _covered_remote_exec_state()
-    typed = _install_supervised_contract(
-        _bare_model(json.dumps({"ok": False}), covered, []),
-        request_id="request-refresh",
-    )
-    typed.policy_mode = "hybrid"
-
-    refresh = typed._controller_collection_request(
-        covered,
-        include_trusted_scope=True,
-        include_optional_recollection=True,
-    )
-    assert refresh is not None
-    assert refresh.reason == "supervised-refresh"
-    assert refresh.foothold.callback_id == "3"
-
-    missing = _state_with_remote_exec()
-    baseline = typed._controller_collection_request(
-        missing,
-        include_trusted_scope=True,
-        include_optional_recollection=True,
-    )
-    assert baseline is not None
-    assert baseline.reason == "baseline"
-
-    untyped = _bare_model(json.dumps({"ok": False}), covered, [])
-    assert untyped._controller_collection_request(
-        covered,
-        include_trusted_scope=True,
-        include_optional_recollection=True,
-    ) is None
-
-    unsupported = es.EngagementState(
-        objective=covered.objective,
-        footholds=[_foothold("3", agent="unsupported")],
-        hops=list(covered.hops),
-        graph_facts=list(covered.graph_facts),
-    )
-    assert typed._controller_collection_request(
-        unsupported,
-        include_trusted_scope=True,
-        include_optional_recollection=True,
-    ) is None
-
-
-@pytest.mark.parametrize(
-    ("policy_mode", "enabled"),
-    (
-        ("hybrid", True),
-        ("symbolic", False),
-        ("llm", False),
-        ("", False),
-        ("invalid", False),
-    ),
-)
-def test_supervised_collection_peer_requires_explicit_hybrid_policy(policy_mode, enabled):
-    state = _covered_remote_exec_state()
-    m = _install_supervised_contract(
-        _bare_model(json.dumps({"ok": False}), state, []),
-        request_id=f"request-policy-{policy_mode or 'missing'}",
-    )
-    m.policy_mode = policy_mode
-
-    assert m._supervised_collection_proposal_enabled() is enabled
-
-
-@pytest.mark.parametrize(
-    ("policy_mode", "expected_proposals"),
-    (
-        ("hybrid", [["collect-graph", "adcs-ca-private-key-export"]]),
-        ("llm", [["adcs-ca-private-key-export"]]),
-        ("symbolic", []),
-        ("", []),
-        ("invalid", []),
-    ),
-)
-def test_supervised_collection_peer_preserves_non_hybrid_runtime_paths(
-    policy_mode,
-    expected_proposals,
-):
-    state = _covered_remote_exec_state()
-    m = _install_supervised_contract(
-        _bare_model(json.dumps({"ok": False}), state, []),
-        request_id=f"request-runtime-policy-{policy_mode or 'missing'}",
-    )
-    m.policy_mode = policy_mode
-    m.provider = "test"
-    m.model = "selector"
-    proposals = []
-    cards = []
-
-    class SelectCapability:
-        async def ainvoke(self, messages):
-            request = json.loads(messages[-1].content)
-            if request.get("selection_contract") == "hybrid-full-frontier-v2":
-                proposals.append([item["name"] for item in request["candidates"]])
-                selected = next(
-                    item for item in request["candidates"]
-                    if item["name"] == "adcs-ca-private-key-export"
-                )
-                response = {
-                    "disposition": "select",
-                    "candidate_id": selected["candidate_id"],
-                }
-            else:
-                proposals.append([
-                    item["name"]
-                    for item in request["current_admissible_actions"]
-                ])
-                response = {
-                    "disposition": "select",
-                    "capability": "adcs-ca-private-key-export",
-                }
-            return type("Response", (), {"content": json.dumps(response)})()
-
-    async def emit(action_requests):
-        cards.append(action_requests)
-
-    m.llm = SelectCapability()
-    m._hitl_card_emitter = emit
-    m._hitl_card_pending = False
-
-    assert asyncio.run(m._run_autonomous_controller("identical prompt")) == ""
-    assert proposals == expected_proposals
-    assert len(cards) == 1
-    assert cards[0][0]["name"] == "execute_capability"
-
-
-@pytest.mark.parametrize(
-    ("policy_mode", "expected_proposal_count", "expected_candidate_count"),
-    (
-        ("", 0, 1),
-        ("invalid", 0, 1),
-        ("hybrid", 2, 2),
-    ),
-)
-def test_supervised_collection_peer_policy_origin_is_stable_across_approved_resume(
-    policy_mode,
-    expected_proposal_count,
-    expected_candidate_count,
-):
-    state = _covered_remote_exec_state()
-    capability_calls = []
-    m = _install_supervised_contract(
-        _bare_model(
-            json.dumps({"ok": False, "reason": "stop after approved replay"}),
-            state,
-            capability_calls,
-        ),
-        request_id=f"request-policy-resume-{policy_mode or 'missing'}",
-    )
-    m.policy_mode = policy_mode
-    m.provider = "test"
-    m.model = "selector"
-    proposals = []
-    cards = []
-
-    class SelectThenStop:
-        async def ainvoke(self, messages):
-            request = json.loads(messages[-1].content)
-            proposals.append([item["name"] for item in request["candidates"]])
-            if len(proposals) == 1:
-                selected = next(
-                    item for item in request["candidates"]
-                    if item["name"] == "adcs-ca-private-key-export"
-                )
-                response = {
-                    "disposition": "select",
-                    "candidate_id": selected["candidate_id"],
-                }
-            else:
-                response = {"disposition": "stop", "rationale": "stop after replay"}
-            return type("Response", (), {"content": json.dumps(response)})()
-
-    async def emit(action_requests):
-        cards.append(action_requests)
-
-    m.llm = SelectThenStop()
-    m._hitl_card_emitter = emit
-    m._hitl_card_pending = False
-
-    assert asyncio.run(m._run_autonomous_controller("identical prompt")) == ""
-    assert len(cards) == 1
-    assert cards[0][0]["name"] == "execute_capability"
-
-    action_digest = _install_exact_card_claim(m, cards[0])
-    asyncio.run(m.handle_controller_hitl_resume(
-        "approve",
-        expected_action_digest=action_digest,
-    ))
-
-    assert len(proposals) == expected_proposal_count
-    assert all(items == ["collect-graph", "adcs-ca-private-key-export"] for items in proposals)
-    assert len(capability_calls) == 1
-    decisions = m.controller_runtime_telemetry()["decisions"]
-    assert decisions
-    assert all(item["candidate_count"] == expected_candidate_count for item in decisions)
-
-
 @pytest.mark.parametrize(
     ("preferred", "expected"),
     (
@@ -1844,235 +1598,6 @@ def test_supported_foothold_every_raw_tie_field_breaks_input_order(field, left, 
     assert len(orders) == 1
 
 
-def test_supervised_collection_identity_change_between_card_and_replay_fails_closed():
-    state = _covered_remote_exec_state()
-    state.footholds.append(
-        _foothold("2", host="castelblack", identity="north\\samwell.tarly")
-    )
-    m = _install_supervised_contract(
-        _bare_model(json.dumps({"ok": True}), state, []),
-        request_id="request-collection-identity-mutation",
-        callback_ids=("2", "3"),
-    )
-    m.policy_mode = "hybrid"
-    m.provider = "test"
-    m.model = "selector"
-    policy_requests = []
-    cards = []
-    collection_calls = []
-
-    class SelectCollection:
-        async def ainvoke(self, messages):
-            request = json.loads(messages[-1].content)
-            policy_requests.append(request)
-            selected = next(item for item in request["candidates"] if item["name"] == "collect-graph")
-            return type("Response", (), {"content": json.dumps({
-                "disposition": "select",
-                "candidate_id": selected["candidate_id"],
-            })})()
-
-    async def emit(action_requests):
-        cards.append(action_requests)
-
-    async def collect(_state, request=None):
-        collection_calls.append(request)
-        return {"ok": True, "status": "ingested", "graph_verified": True}
-
-    m.llm = SelectCollection()
-    m._hitl_card_emitter = emit
-    m._hitl_card_pending = False
-    m._controller_collect = collect
-    m.mythic_client._private_collection_transaction_active = lambda: False
-
-    assert asyncio.run(m._run_autonomous_controller(state.objective)) == ""
-    assert cards[0][0]["args"]["identity"] == "north\\samwell.tarly"
-    action_digest = _install_exact_card_claim(m, cards[0])
-    state.footholds[-1].identity = "north\\mallory"
-
-    asyncio.run(m.handle_controller_hitl_resume(
-        "approve",
-        expected_action_digest=action_digest,
-    ))
-
-    assert len(policy_requests) == 1
-    assert len(cards) == 2
-    assert cards[1][0]["args"]["identity"] == "north\\mallory"
-    assert collection_calls == []
-    assert getattr(m.mythic_client, "_private_collection_transaction", None) is None
-
-
-@pytest.mark.parametrize(
-    ("collection_result", "private_active", "expected_status"),
-    (
-        pytest.param({"ok": True, "status": "ingested", "graph_verified": True}, True, "complete", id="ingested"),
-        pytest.param(
-            {"ok": True, "status": "already_ingested", "graph_verified": True},
-            True,
-            "complete",
-            id="already-ingested",
-        ),
-        *(
-            pytest.param(
-                {"ok": True, "status": "ingested", "graph_verified": True},
-                value,
-                "halted_blocked",
-                id=f"private-{index}",
-            )
-            for index, value in enumerate((False, 0, 1, "true", [], {}, _PRIVATE_ACTIVE_RAISES))
-        ),
-        *(
-            pytest.param(
-                {"status": "ingested", "graph_verified": True, **({"ok": value} if include else {})},
-                True,
-                "halted_blocked",
-                id=f"ok-{index}",
-            )
-            for index, (include, value) in enumerate(
-                ((False, None), (True, False), (True, 0), (True, 1), (True, "true"), (True, []), (True, {}))
-            )
-        ),
-        *(
-            pytest.param(
-                {"ok": True, "status": "ingested", **({"graph_verified": value} if include else {})},
-                True,
-                "halted_blocked",
-                id=f"graph-{index}",
-            )
-            for index, (include, value) in enumerate(
-                ((False, None), (True, False), (True, 0), (True, 1), (True, "true"), (True, []), (True, {}))
-            )
-        ),
-        *(
-            pytest.param(
-                {"ok": True, "graph_verified": True, **({"status": value} if include else {})},
-                True,
-                "halted_blocked",
-                id=f"status-{index}",
-            )
-            for index, (include, value) in enumerate(
-                (
-                    (False, None),
-                    (True, "error"),
-                    (True, "Ingested"),
-                    (True, " ingested"),
-                    (True, 1),
-                    (True, []),
-                    (True, {}),
-                )
-            )
-        ),
-    ),
-)
-def test_supervised_collection_peer_exact_resume_has_one_terminal_without_spillover(
-    collection_result,
-    private_active,
-    expected_status,
-):
-    state = _covered_remote_exec_state()
-    state.footholds.extend((
-        _foothold("10", host="host-10"),
-        _foothold("2", host="host-2"),
-        _foothold("bad", host="host-bad"),
-    ))
-    capability_calls = []
-    m = _install_supervised_contract(
-        _bare_model(json.dumps({"ok": True}), state, capability_calls),
-        request_id=f"request-collection-{expected_status}",
-        callback_ids=("2", "3", "10", "bad"),
-    )
-    m.policy_mode = "hybrid"
-    m.provider = "test"
-    m.model = "selector"
-    policy_requests = []
-    cards = []
-    collection_calls = []
-    active = {"value": False}
-
-    class SelectCollection:
-        async def ainvoke(self, messages):
-            request = json.loads(messages[-1].content)
-            policy_requests.append(request)
-            selected = next(item for item in request["candidates"] if item["name"] == "collect-graph")
-            return type("Response", (), {
-                "content": json.dumps({
-                    "disposition": "select",
-                    "candidate_id": selected["candidate_id"],
-                    "rationale": "select the collection peer",
-                })
-            })()
-
-    async def emit(action_requests):
-        cards.append(action_requests)
-
-    async def collect(_state, request=None):
-        collection_calls.append(request)
-        active["value"] = private_active
-        return dict(collection_result) if isinstance(collection_result, dict) else collection_result
-
-    m.llm = SelectCollection()
-    m._hitl_card_emitter = emit
-    m._hitl_card_pending = False
-    m._controller_collect = collect
-    if private_active is _PRIVATE_ACTIVE_RAISES:
-        def private_checker():
-            raise RuntimeError("private transaction check failed")
-
-        m.mythic_client._private_collection_transaction_active = private_checker
-    else:
-        m.mythic_client._private_collection_transaction_active = lambda: active["value"]
-
-    assert asyncio.run(m._run_autonomous_controller(state.objective)) == ""
-    assert len(policy_requests) == 1
-    assert len(cards) == 1
-    assert cards[0][0]["name"] == "collect_graph"
-    assert cards[0][0]["args"]["callback_id"] == "2"
-    assert collection_calls == []
-    assert capability_calls == []
-    assert getattr(m, "_controller_observed_transactions", []) == []
-
-    action_digest = _install_exact_card_claim(m, cards[0])
-    state.footholds.reverse()
-    asyncio.run(m.handle_controller_hitl_resume(
-        "approve",
-        expected_action_digest=action_digest,
-    ))
-
-    telemetry = m.controller_runtime_telemetry()
-    assert telemetry["controller_status"] == expected_status
-    assert len(policy_requests) == 1
-    assert len(collection_calls) == 1
-    assert collection_calls[0].foothold.callback_id == cards[0][0]["args"]["callback_id"]
-    assert collection_calls[0].foothold.identity == cards[0][0]["args"]["identity"]
-    assert collection_calls[0].collection_key == cards[0][0]["args"]["collection_key"]
-    assert capability_calls == []
-    assert len(m._controller_observed_transactions) == 1
-    assert m._controller_observed_transactions[0]["kind"] == "collection"
-    ledger = m._request_event_ledger
-    assert len(ledger.actual_events(
-        kind="control_transition",
-        phase="request_terminal",
-    )) == 1
-    subgoal_phase = "completed" if expected_status == "complete" else "blocked"
-    assert len(ledger.actual_events(
-        kind="control_transition",
-        phase=subgoal_phase,
-    )) == 1
-
-    m._project_private_collection_terminal(
-        expected_status,
-        "duplicate projection",
-        attempted=True,
-    )
-    assert len(ledger.actual_events(
-        kind="control_transition",
-        phase="request_terminal",
-    )) == 1
-    assert len(ledger.actual_events(
-        kind="control_transition",
-        phase=subgoal_phase,
-    )) == 1
-
-
 def test_controller_duplicate_prebound_transaction_id_fails_closed():
     m = object.__new__(model.Model)
     m._controller_observed_transactions = []
@@ -2192,7 +1717,6 @@ def test_native_controller_activation_uses_typed_lane_not_prompt_shape(monkeypat
     m.command_name = "chat"
     m.mode = "auto"
     m._autonomous_solve = False
-    m._supervised_objective_active = False
     m._request_contract = build_request_contract(
         request_id="native-auto",
         channel_id="channel-1",
@@ -2269,7 +1793,6 @@ def test_supervised_prose_cannot_activate_controller_without_typed_transition(mo
     m.mode = "supervised"
     m.command_name = "chat"
     m._autonomous_solve = False
-    m._supervised_objective_active = False
     m._request_contract = build_request_contract(
         request_id="supervised-prose-inert",
         channel_id="channel",
@@ -2320,7 +1843,6 @@ def test_slash_auto_override_reused_supervised_base_routes_objective_to_controll
         existing._chat_request_config_signature = signature
         existing._chat_request_base_autonomous_solve = kwargs["autonomous_solve"]
         existing.command_name = "chat"
-        existing._supervised_objective_active = False
         assert "Mode set" in _handle_mode(existing, "auto")
 
         async def _get_existing(_request):
@@ -2456,7 +1978,6 @@ def test_demo_callback_prompt_terminates_before_supervisor_graph(monkeypatch):
     m.mode = "supervised"
     m.command_name = "chat"
     m._autonomous_solve = False
-    m._supervised_objective_active = False
     m._controller_hitl_pending = None
     m._thread_id_override = "channel-19"
     m._running_tasks = set()
@@ -2497,7 +2018,6 @@ def test_invoke_keeps_reused_supervised_prose_on_typed_supervised_graph(monkeypa
     m.mode = "supervised"
     m.command_name = "chat"
     m._autonomous_solve = False
-    m._supervised_objective_active = False
     m._controller_hitl_pending = None
     m._thread_id_override = "channel-7"
     m._running_tasks = set()
@@ -2523,7 +2043,6 @@ def test_invoke_keeps_reused_supervised_prose_on_typed_supervised_graph(monkeypa
 
     async def _run_controller(prompt):
         seen["controller_prompt"] = prompt
-        seen["active"] = m._supervised_objective_active
         return "controller"
 
     m._hitl_interrupt_pending = _no_interrupt
@@ -2541,7 +2060,6 @@ def test_invoke_keeps_reused_supervised_prose_on_typed_supervised_graph(monkeypa
         "graph": True,
     }
     assert m._request_contract.lane.value == "supervised_workflow"
-    assert m._supervised_objective_active is False
 
 
 def test_observe_attaches_graph_facts():

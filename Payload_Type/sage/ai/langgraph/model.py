@@ -5360,10 +5360,6 @@ class Model:
         self._controller_hitl_approved_key = ""
         self._controller_hitl_approved_pending = None
         self._controller_hitl_objective = ""
-        # A supervised chat turn can opt into the policy-selected execution kernel without globally enabling
-        # autonomous_solve. This flag stays true across controller-native approval pauses, then is reset
-        # before the next fresh operator turn.
-        self._supervised_objective_active = False
         # Autonomous-solve stall detector state (reset per solve in invoke() so counters never cross objectives).
         self._autonomous_stall_progress = None
         self._autonomous_stall_count = 0
@@ -7185,10 +7181,7 @@ class Model:
     def _autonomous_execution_enabled_for_turn(self) -> bool:
         authority = getattr(self, "_turn_authority", None)
         if not isinstance(authority, TurnAuthority):
-            return bool(
-                getattr(self, "_autonomous_solve", False)
-                or getattr(self, "_supervised_objective_active", False)
-            )
+            return bool(getattr(self, "_autonomous_solve", False))
         if getattr(self, "_request_contract", None) is not None:
             return bool(
                 authority.is_autonomous_objective
@@ -7197,13 +7190,7 @@ class Model:
                     and getattr(self, "_autonomous_solve", False)
                 )
             )
-        return bool(
-            authority.is_autonomous_objective
-            and (
-                getattr(self, "_autonomous_solve", False)
-                or getattr(self, "_supervised_objective_active", False)
-            )
-        )
+        return bool(authority.is_autonomous_objective and getattr(self, "_autonomous_solve", False))
 
     def _turn_authority_allows_operator_continuation(self) -> bool:
         return self._autonomous_execution_enabled_for_turn()
@@ -11205,10 +11192,7 @@ class Model:
 
     def _controller_owned_solve(self) -> bool:
         """Whether the bounded execution kernel owns the current solve."""
-        return bool(
-            self._autonomous_execution_enabled_for_turn()
-            or getattr(self, "_supervised_objective_active", False)
-        )
+        return bool(self._autonomous_execution_enabled_for_turn())
 
     def _should_use_controller(self, is_interactive: bool, prompt: Any = "") -> bool:
         """Route only from the installed typed lane; prose and reuse state are display inputs."""
@@ -11231,25 +11215,6 @@ class Model:
             and getattr(self, "mode", "auto") == "supervised"
             and getattr(self, "command_name", "") == "chat"
             and _controller_hitl_flag_enabled()
-        )
-
-    def _supervised_collection_proposal_enabled(self) -> bool:
-        """Whether the typed supervised actions-complete lane may offer a collection peer."""
-        try:
-            from . import policy as _policy
-        except ImportError:
-            import policy as _policy
-        contract = getattr(self, "_request_contract", None)
-        lane = getattr(getattr(contract, "lane", None), "value", "")
-        stop = getattr(getattr(getattr(contract, "stop_condition", None), "kind", None), "value", "")
-        policy_mode, resolution = _policy.resolve_policy_mode(getattr(self, "policy_mode", ""))
-        resolution = str(getattr(self, "_policy_mode_resolution", "") or resolution)
-        return bool(
-            self._controller_hitl_enabled()
-            and lane == "supervised_workflow"
-            and stop == "actions_complete"
-            and policy_mode == _policy.POLICY_HYBRID
-            and resolution == "explicit_valid"
         )
 
     def _controller_hitl_key(self, kind: str, args: dict[str, Any]) -> str:
@@ -11399,7 +11364,6 @@ class Model:
         if self._controller_hitl_denies(pending):
             self._controller_hitl_pending = None
             self._controller_hitl_objective = ""
-            self._supervised_objective_active = False
             self._controller_refresh_runtime_policy_telemetry(
                 status="halted_no_action",
                 reason="policy repeated an operator-denied guarded action",
@@ -11425,7 +11389,6 @@ class Model:
             self._controller_hitl_operator_steer = ""
             self._controller_hitl_pending = None
             self._controller_hitl_objective = ""
-            self._supervised_objective_active = False
             self._controller_refresh_runtime_policy_telemetry(
                 status="halted_no_action",
                 reason="operator steering was not processed by policy selection",
@@ -11482,7 +11445,6 @@ class Model:
             if steer.casefold() in {"stop", "/stop"}:
                 self.request_stop(reason=STOP_REASON_OPERATOR)
                 self._controller_hitl_objective = ""
-                self._supervised_objective_active = False
                 self._controller_refresh_runtime_policy_telemetry(
                     status="halted_aborted",
                     reason="operator stopped supervised objective at approval card",
@@ -11497,7 +11459,6 @@ class Model:
             semantic_key = self._controller_hitl_semantic_key(pending)
             if not semantic_key:
                 self._controller_hitl_objective = ""
-                self._supervised_objective_active = False
                 await self._stream_message_to_mythic(
                     "**Execution stopped**\nThe pending guarded action lacked an auditable identity. "
                     "No action was issued."
@@ -12265,10 +12226,7 @@ class Model:
         snap = {
             "state": None,
             "collection_request": None,
-            "private_collection_attempted": False,
-            "private_collection_complete": False,
         }
-        supervised_collection_lane = self._supervised_collection_proposal_enabled()
 
         async def observe():
             state = await self._build_current_engagement_state()
@@ -12456,7 +12414,7 @@ class Model:
             # _controller_collection_target — so an unsupported-agent missing foothold doesn't trigger a
             # collect()->no_target slot burn. (current_access_collection_missing counts ALL agents.)
             try:
-                if not supervised_collection_lane and policy_frontier(state):
+                if policy_frontier(state):
                     snap["collection_request"] = None
                     return False
                 request = self._controller_collection_request(
@@ -12501,7 +12459,6 @@ class Model:
                     operator_message=self._controller_collection_selection_progress(request),
                 )
             await self._require_controller_hitl_approval(pending)
-            snap["private_collection_attempted"] = supervised_collection_lane
             transaction = self._controller_record_semantic_transaction(
                 kind="collection",
                 capability="collect-graph",
@@ -12530,28 +12487,6 @@ class Model:
                     "transaction_id": transaction["transaction_id"],
                 })
                 result = await self._controller_collect(state, request=request)
-                checker = getattr(
-                    getattr(self, "mythic_client", None),
-                    "_private_collection_transaction_active",
-                    None,
-                )
-                try:
-                    private_active = callable(checker) and checker() is True
-                except Exception:
-                    private_active = False
-                valid_private_result = bool(
-                    supervised_collection_lane
-                    and isinstance(result, dict)
-                    and result.get("ok") is True
-                    and result.get("graph_verified") is True
-                    and result.get("status") in ("ingested", "already_ingested")
-                    and private_active
-                )
-                snap["private_collection_complete"] = valid_private_result
-                if supervised_collection_lane and not valid_private_result:
-                    result = dict(result) if isinstance(result, dict) else {}
-                    result["ok"] = False
-                    result.setdefault("reason", "collection result lacked exact private success proof")
                 self._controller_refresh_transaction_proof_lineage(transaction["transaction_id"])
                 return result
             except BaseException:
@@ -12571,8 +12506,6 @@ class Model:
 
         def objective_met(state):
             try:
-                if supervised_collection_lane and snap["private_collection_complete"]:
-                    return True
                 if _es.objective_effects_complete(state):
                     return True
                 if not str(_es.engagement_phase(state)).startswith("COMPLETE-CANDIDATE"):
@@ -12621,7 +12554,7 @@ class Model:
                 )
             ),
             max_cycles=None if unbounded_eval_arm else _env_positive_int("SAGE_CONTROLLER_MAX_CYCLES", 60),
-            max_collection_attempts_per_request=1 if supervised_collection_lane else 2,
+            max_collection_attempts_per_request=2,
         )
         original_controller_config = dict(vars(cfg))
         if recovery_state is not None:
@@ -12972,11 +12905,7 @@ class Model:
             report = self._objective_completion_report(require_autonomous=False)
         if not report:
             report = self._controller_terminal_report(result)
-        self._project_private_collection_terminal(
-            result.status,
-            report,
-            attempted=bool(snap["private_collection_attempted"]),
-        )
+        self._project_private_collection_terminal(result.status, report)
         # Persist the assistant turn to state so a reused Model on a later interactive turn does not see a
         # human prompt with no recorded reply (dangling-turn hazard).
         report_msg = AIMessage(content=report, name="Supervisor")
@@ -12998,7 +12927,6 @@ class Model:
             self._controller_hitl_approved_key = ""
             self._controller_hitl_approved_pending = None
             self._controller_hitl_objective = ""
-            self._supervised_objective_active = False
         if recovery_store is not None:
             recovery_store.acquire()
             try:
@@ -13242,16 +13170,6 @@ class Model:
                     )
                     if request is not None:
                         return request
-        if self._supervised_collection_proposal_enabled():
-            for candidate in supported_footholds:
-                forest = str(getattr(candidate, "forest", "") or "").strip().casefold()
-                request = request_for(
-                    candidate,
-                    reason="supervised-refresh",
-                    support=f"operator approval may refresh graph observations for {forest or 'the foothold forest'}",
-                )
-                if request is not None:
-                    return request
         return None
 
     async def _controller_collect(self, state, request=None) -> dict:
@@ -15493,10 +15411,6 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         self._refresh_graph_for_turn()
         effective_objective = _coerce_prompt_text(prompt)
 
-        # Typed transport/session state is the only controller-routing authority. The old
-        # prompt-derived supervised activation flag is intentionally never compiled.
-        self._supervised_objective_active = False
-
         # Fresh stall-detector window per solve — never carry a prior objective's counters into this one
         # (a Sage session may reuse one Model across invoke() calls).
         self._autonomous_stall_progress = None
@@ -16441,7 +16355,6 @@ Continue now.""")
             if contract is None:
                 contract = self._build_typed_session_request_contract()
             self.install_request_contract(contract.stop())
-            self._supervised_objective_active = False
             stop_message = AIMessage(content="✅ Task stopped as requested. The session remains active for new tasks.")
             self.state["messages"].append(stop_message)
 

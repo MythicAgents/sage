@@ -3701,7 +3701,6 @@ def test_reused_auto_channel_stays_autonomous_for_identical_typed_contract(monke
     model.mode = "auto"
     model.command_name = "chat"
     model._autonomous_solve = False
-    model._supervised_objective_active = False
     model._request_contract = request_mod.build_request_contract(
         request_id="reused-auto",
         channel_id="channel",
@@ -3747,7 +3746,6 @@ def test_invoke_supervised_fallback_ignores_stored_objective_and_uses_exact_prom
     model.mode = "supervised"
     model.command_name = "chat"
     model._autonomous_solve = False
-    model._supervised_objective_active = False
     model._controller_hitl_pending = None
     model._native_chat_explicit_hitl = True
     model._thread_id_override = "channel-stored-objective"
@@ -3822,7 +3820,6 @@ def test_invoke_supervised_fallback_does_not_compile_collection_scope_from_prose
     model.mode = "supervised"
     model.command_name = "chat"
     model._autonomous_solve = False
-    model._supervised_objective_active = False
     model._controller_hitl_pending = None
     model._native_chat_explicit_hitl = True
     model._thread_id_override = "channel-stored-objective-unresolved"
@@ -3885,7 +3882,6 @@ def test_invoke_auto_fallback_routes_by_typed_mode_and_ignores_stored_objective(
     model.mode = "auto"
     model.command_name = "chat"
     model._autonomous_solve = True
-    model._supervised_objective_active = False
     model._controller_hitl_pending = None
     model._thread_id_override = "channel-stored-objective-auto"
     model._running_tasks = set()
@@ -3955,7 +3951,6 @@ def test_invoke_supervised_controller_uses_typed_lane_when_autonomous_flag_is_se
     model.mode = "supervised"
     model.command_name = "chat"
     model._autonomous_solve = True
-    model._supervised_objective_active = False
     model._controller_hitl_pending = None
     model._native_chat_explicit_hitl = True
     model._thread_id_override = "channel-stored-objective-supervised-auto"
@@ -4977,7 +4972,6 @@ def test_native_invoke_uses_installed_contract_and_never_compiles_prompt_authori
     model.mode = "supervised"
     model.command_name = "chat"
     model._autonomous_solve = False
-    model._supervised_objective_active = False
     model._controller_hitl_pending = None
     model._native_chat_explicit_hitl = True
     model._thread_id_override = "typed-native-contract"
@@ -5150,7 +5144,6 @@ def test_plain_hitl_rejection_preserves_turn_and_blocks_identical_reproposal():
         ),
         "action",
     )
-    model._supervised_objective_active = True
     model._stop_requested = False
     model._graph_run_config = lambda thread_id: {
         "configurable": {"thread_id": thread_id}
@@ -5191,7 +5184,6 @@ def test_plain_hitl_rejection_preserves_turn_and_blocks_identical_reproposal():
     assert asyncio.run(model.handle_hitl_resume("deny", "thread-reject")) == ""
     assert model._turn_authority.mode == "supervised_action"
     assert model._turn_authority.denied_action_digests
-    assert model._supervised_objective_active is True
 
 
 def test_hitl_steering_retains_proposal_authority_for_a_different_action():
@@ -5216,7 +5208,6 @@ def test_hitl_steering_retains_proposal_authority_for_a_different_action():
         ),
         "action",
     )
-    model._supervised_objective_active = False
     model._stop_requested = False
     model._message_seq = 1
     model.state = {

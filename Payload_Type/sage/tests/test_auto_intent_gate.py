@@ -21,7 +21,6 @@ def _typed_model(mode: str, *, autonomous_solve: bool = False) -> Model:
     m._autonomous_solve = autonomous_solve
     m.mode = mode
     m.command_name = "chat"
-    m._supervised_objective_active = False
     m._request_contract = build_request_contract(
         request_id=f"{mode}-{autonomous_solve}",
         channel_id="channel",
