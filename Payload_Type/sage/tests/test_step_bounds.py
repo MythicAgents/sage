@@ -392,3 +392,95 @@ def test_the_worker_is_told_its_scope_before_it_acts():
     assert "only `execute_capability`, for `collect-graph`" in text and '"callback_id": "5"' in text
     # Sage's block sits immediately before the delegated operator input it scopes.
     assert seen.index(scopes[0]) == len(seen) - 2 and seen[-1].content == ORIGINAL
+
+
+# --- what a scoped step is offered ----------------------------------------------------------------------------
+
+GUIDANCE = sb.TECHNIQUE_GUIDANCE_TOOLS
+WORKER_TOOLS = model_module.get_prompt_tools("mythic_operator")
+
+
+@pytest.mark.parametrize("brief, withheld", [
+    (None, set()),
+    ({}, set()),
+    # A procedure step: only execute_capability among guarded tools, and no hand-run recipes.
+    ({"allowed_capabilities": ["collect-graph"]}, (GUARDED - {"execute_capability"}) | GUIDANCE),
+    # A control-plane step takes no guarded action; its reads, guidance included, stay.
+    ({"allowed_capabilities": ["control_plane"]}, GUARDED),
+    # A single-command step keeps the guidance that explains the command.
+    ({"allowed_tools": [ISSUE]}, GUARDED - {ISSUE}),
+])
+def test_a_step_is_offered_only_what_its_brief_admits(brief, withheld):
+    names = [*GUARDED, *GUIDANCE, "list_callbacks", "handback_to_supervisor"]
+    assert sb.withheld_tools(brief, names, GUARDED) == frozenset(withheld)
+
+
+@pytest.mark.parametrize("capability", [c for c in model_module._handoff_brief.capability_choices()
+                                        if c != sb.CONTROL_PLANE])
+def test_every_capability_step_still_offers_execute_capability_to_the_worker(capability):
+    """Every capability a brief may name resolves to execute_capability among the worker's offered tools."""
+    guarded = frozenset(model_module._worker_guarded_tool_names("Mythic_Operator"))
+    offered = set(WORKER_TOOLS) - sb.withheld_tools({"allowed_capabilities": [capability]}, WORKER_TOOLS, guarded)
+    assert "execute_capability" in offered
+    assert not (offered & (guarded - {"execute_capability"})) and not (offered & GUIDANCE)
+    # Offering never admits more than the step bound enforces.
+    assert all(not sb.scope_violation({"allowed_capabilities": [capability]}, name, capability)
+               for name in offered & guarded)
+
+
+def _offered_per_call(monkeypatch, brief: dict) -> list[set[str]]:
+    """Run one supervised step and record the tool names bound for each model call."""
+    bound: list[set[str]] = []
+
+    def record(self, tools, **kwargs):
+        bound.append({model_module._offered_tool_name(t) or getattr(t, "name", "") for t in tools})
+        return self
+
+    monkeypatch.setattr(_NativeScriptedModel, "bind_tools", record)
+
+    @tool
+    async def execute_capability(action: str, inputs: str = "") -> str:
+        """Run one catalog capability."""
+        return "not run"
+
+    @tool
+    async def get_ttp_guidance(goal: str) -> str:
+        """Technique guidance."""
+        return "a recipe"
+
+    original = model_module.Model._rebuild_graph
+
+    def rebuild(self, *args, **kwargs):
+        sink = self.mythic_client
+        issue = sink.get_tools.side_effect
+        extra = {"execute_capability": execute_capability, "get_ttp_guidance": get_ttp_guidance}
+        sink.get_tools.side_effect = lambda names: [*issue(names), *(extra[n] for n in names if n in extra)]
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(model_module.Model, "_rebuild_graph", rebuild)
+    handoff = {"handoff_title": "scoped step", "handoff_instruction": ORIGINAL, **BRIEF, **brief}
+    worker_calls: list[int] = []
+
+    def worker(messages):
+        worker_calls.append(len(bound))
+        return AIMessage(content="Nothing to run.")
+
+    script = [_call("transfer_to_Mythic_Operator", handoff, 1), worker, AIMessage(content="Final answer."),
+              AIMessage(content="Final answer.")]
+    asyncio.run(_native(script, ""))
+    assert worker_calls, "the worker never ran"
+    return [bound[index - 1] for index in worker_calls]
+
+
+def test_a_collection_step_offers_the_worker_execute_capability_and_not_the_raw_path(monkeypatch):
+    [offered] = _offered_per_call(monkeypatch, {"allowed_capabilities": ["collect-graph"]})
+
+    assert "execute_capability" in offered
+    assert ISSUE not in offered and "get_ttp_guidance" not in offered
+
+
+def test_a_single_command_step_offers_the_command_and_its_guidance(monkeypatch):
+    [offered] = _offered_per_call(monkeypatch, {"allowed_tools": [ISSUE]})
+
+    assert ISSUE in offered and "get_ttp_guidance" in offered
+    assert "execute_capability" not in offered

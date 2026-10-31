@@ -2548,6 +2548,14 @@ class _MessageSanitizerMiddleware(AgentMiddleware):
         return await handler(self._sanitize(request))
 
 
+def _offered_tool_name(tool: Any) -> str:
+    """The name of a tool as a model request carries it: a tool object, or an OpenAI- or Anthropic-style dict."""
+    if isinstance(tool, Mapping):
+        function = tool.get("function")
+        return str((function.get("name") if isinstance(function, Mapping) else None) or tool.get("name") or "")
+    return str(getattr(tool, "name", "") or "")
+
+
 def _tool_name_from_request(request: Any) -> str:
     """Extract the tool name from a langgraph ToolCallRequest (dataclass with
     tool_call: ToolCall TypedDict {'name': str}, tool: BaseTool | None). Never raises.
@@ -2806,6 +2814,28 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
             self._agent_name, _agent_state_messages(getattr(request, "state", None)),
         )
 
+    def _delegated_message(self, state_messages: list[Any]) -> Any:
+        # The delegated message is the step's boundary, so it sits outside the step's own messages.
+        return next((msg for msg in reversed(state_messages) if isinstance(msg, HumanMessage)
+                     and msg.additional_kwargs.get("_delegated_to") == self._agent_name), None)
+
+    def _offer_scoped_tools(self, request: Any) -> Any:
+        """Offer the step's model only the tools its brief admits, so it is never handed a choice the step bound
+        would then remove. The bound in `_limit_response` stays the enforcement point."""
+        tools = list(getattr(request, "tools", None) or [])
+        if not tools or self._record(request) is None:
+            return request
+        delegated = self._delegated_message(_agent_state_messages(getattr(request, "state", None)))
+        brief = getattr(delegated, "additional_kwargs", {}).get("_handoff_brief")
+        withheld = _step_bounds.withheld_tools(brief, [_offered_tool_name(tool) for tool in tools], self._guarded)
+        if not withheld:
+            return request
+        try:
+            logger.info(f"🔒 [step-scope] {self._agent_name} not offered: {', '.join(sorted(withheld))}")
+        except Exception:
+            pass
+        return request.override(tools=[tool for tool in tools if _offered_tool_name(tool) not in withheld])
+
     def _limit_response(self, request: Any, response: Any) -> None:
         """Remove a guarded call this step may not make from the model's response, in place."""
         record = self._record(request)
@@ -2829,9 +2859,7 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
                       f"`{name}` needs a new step from the Supervisor")
             bound = "guarded_actions"
         else:
-            # The delegated message is the step's boundary, so it sits outside the step's own messages.
-            delegated = next((msg for msg in reversed(state_messages) if isinstance(msg, HumanMessage)
-                              and msg.additional_kwargs.get("_delegated_to") == self._agent_name), None)
+            delegated = self._delegated_message(state_messages)
             reason = _step_bounds.scope_violation(
                 getattr(delegated, "additional_kwargs", {}).get("_handoff_brief"), name,
                 _capability_name_from_request_args(guarded[0].get("args") or {}),
@@ -2870,6 +2898,7 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
 
     def wrap_model_call(self, request, handler):
         started = self._model._step_clock()
+        request = self._offer_scoped_tools(request)
         try:
             response = handler(request)
         finally:
@@ -2879,6 +2908,7 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
 
     async def awrap_model_call(self, request, handler):
         started = self._model._step_clock()
+        request = self._offer_scoped_tools(request)
         try:
             response = await handler(request)
         finally:

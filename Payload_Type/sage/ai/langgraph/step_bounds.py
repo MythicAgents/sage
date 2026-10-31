@@ -141,26 +141,57 @@ def bound_reached(activity: StepActivity, record: StepRecord, bounds: StepBounds
     return None
 
 
-def scope_violation(brief: Any, tool_name: str, capability_name: str = "") -> str:
-    """Why a guarded call falls outside the step's brief; empty when it is in scope or the brief sets no scope."""
+def _brief_scope(brief: Any) -> tuple[list[str], list[str]]:
     if not isinstance(brief, Mapping):
-        return ""
-    capabilities = [str(item) for item in brief.get("allowed_capabilities") or []]
-    tools = [str(item) for item in brief.get("allowed_tools") or []]
+        return [], []
+    return ([str(item) for item in brief.get("allowed_capabilities") or []],
+            [str(item) for item in brief.get("allowed_tools") or []])
+
+
+def tool_scope_violation(brief: Any, tool_name: str) -> str:
+    """Why a guarded tool falls outside the step's brief, whatever its arguments; empty when the tool is in scope or
+    the brief sets no scope."""
+    capabilities, tools = _brief_scope(brief)
     if capabilities == [CONTROL_PLANE]:
         return f"`{tool_name}` is a guarded action and this step was briefed as control-plane reads only"
     if tools:
         if tool_name in tools:
             return ""
         return f"`{tool_name}` is not in this step's allowed_tools ({', '.join(tools)})"
-    if capabilities:
-        if tool_name != "execute_capability":
-            return (f"`{tool_name}` is outside this step's capabilities ({', '.join(capabilities)}). "
-                    f"For a single command, re-scope with allowed_tools: [\"{tool_name}\"]; use "
-                    "allowed_capabilities only for a catalog procedure run through execute_capability.")
-        if capability_name not in capabilities:
-            return f"capability `{capability_name or 'unknown'}` is not in this step's allowed_capabilities"
+    if capabilities and tool_name != "execute_capability":
+        return (f"`{tool_name}` is outside this step's capabilities ({', '.join(capabilities)}). "
+                f"For a single command, re-scope with allowed_tools: [\"{tool_name}\"]; use "
+                "allowed_capabilities only for a catalog procedure run through execute_capability.")
     return ""
+
+
+def scope_violation(brief: Any, tool_name: str, capability_name: str = "") -> str:
+    """Why a guarded call falls outside the step's brief; empty when it is in scope or the brief sets no scope."""
+    reason = tool_scope_violation(brief, tool_name)
+    if reason:
+        return reason
+    capabilities, tools = _brief_scope(brief)
+    if capabilities and not tools and capability_name not in capabilities:
+        return f"capability `{capability_name or 'unknown'}` is not in this step's allowed_capabilities"
+    return ""
+
+
+# Tools that teach how to run a technique by hand. A step scoped to catalog procedures has Sage run the procedure,
+# so a hand-run recipe only competes with the step's one admissible action (a live worker followed one instead).
+TECHNIQUE_GUIDANCE_TOOLS = frozenset({"get_ttp_guidance", "get_ttp_full_reference", "list_ttp_categories"})
+
+
+def withheld_tools(brief: Any, tool_names: Iterable[str], guarded: frozenset[str]) -> frozenset[str]:
+    """The tools a step's model is not offered: guarded tools its brief does not admit (the same rule the step
+    bound enforces on a call), and technique guidance in a step scoped to catalog procedures. Empty when the brief
+    sets no scope. Offering is not enforcement: the step bound still removes any out-of-scope guarded call."""
+    capabilities, tools = _brief_scope(brief)
+    if not capabilities and not tools:
+        return frozenset()
+    procedures = bool(capabilities) and capabilities != [CONTROL_PLANE] and not tools
+    return frozenset(name for name in tool_names
+                     if (name in guarded and tool_scope_violation(brief, name))
+                     or (procedures and name in TECHNIQUE_GUIDANCE_TOOLS))
 
 
 def step_outcome(record: StepRecord, activity: StepActivity, *, now: float, tasks_issued: Iterable[str] = (),
