@@ -42,6 +42,19 @@ On the first tool-using turn of a session, print exactly one line: `CANARY: AGEN
 - Do not hardcode GOAD identities or a Trust Walker path into product strategy. Overridable GOAD defaults belong
   only in operator tools intended for that range.
 
+## Capability and gate changes
+
+- Before loosening a gate that blocks an action, name the code meant to perform that action in this lane. If none
+  exists, make it exist or stop offering the action; never widen the gate to admit a substitute.
+- Every capability offered to a model must resolve to an executor reachable from that worker's tools in that lane.
+  Keep this as a test, not a convention.
+- Before ranking fix directions, search the controller and the Supervisor/worker graph for an existing
+  implementation (`rg <capability>`). Rank by correctness at the real boundary before diff size.
+- Judge a capability fix by whether its declared effect completes end to end, not by whether the symptom stops.
+- A known multi-step procedure runs as a Sage-owned transaction; the model selects the procedure, not its steps.
+- When a change touches a capability, list the lanes that reach it (conversation, supervised, supervised with
+  autonomous solve, auto) and what executes it in each.
+
 ## Local operations
 
 - Sage runs as a local process in the `sage` tmux session for this workflow. Use the reset skill's
