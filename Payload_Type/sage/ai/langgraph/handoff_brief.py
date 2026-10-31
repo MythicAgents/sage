@@ -342,23 +342,27 @@ def scope_signature(allowed_capabilities: Iterable[Any] = (), allowed_tools: Ite
     return ""
 
 
-def _event_scope_signature(event: Any) -> str:
-    for key, value in getattr(event, "metadata", ()) or ():
-        if key == "scope_signature":
-            return value
+def _event_meta(event: Any, key: str) -> str:
+    for name, value in getattr(event, "metadata", ()) or ():
+        if name == key:
+            return str(value)
     return ""
 
 
-def trailing_scope_rejections(events: Iterable[Any], signature: str) -> int:
-    """Contiguous trailing scope rejections whose scope matches `signature` (0 when it does not recur)."""
-    if not signature:
-        return 0
-    count = 0
+def scope_resend_exhausted(events: Iterable[Any], signature: str) -> bool:
+    """Whether re-sending `signature` unchanged would only fail again at execution.
+
+    A scope whose own action named an excluded capability is wrong as it stands, so one such rejection ends it. A
+    worker calling a tool its step does not offer is a deviation the same scope may retry once; a second ends it.
+    Rejections recorded without a kind count as wrong scopes."""
+    tail = []
     for event in reversed(tuple(events)):
-        if _event_scope_signature(event) != signature:
+        if not signature or _event_meta(event, "scope_signature") != signature:
             break
-        count += 1
-    return count
+        tail.append(event)
+    if not tail:
+        return False
+    return len(tail) >= REJECTIONS_BEFORE_STOP or any(_event_meta(event, "kind") != "not_offered" for event in tail)
 
 
 def rejection_count(events: Iterable[Any]) -> int:

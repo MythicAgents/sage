@@ -161,9 +161,9 @@ def tool_scope_violation(brief: Any, tool_name: str) -> str:
             return ""
         return f"`{tool_name}` is not in this step's allowed_tools ({', '.join(tools)})"
     if capabilities and tool_name != "execute_capability":
-        return (f"`{tool_name}` is outside this step's capabilities ({', '.join(capabilities)}). "
-                f"For a single command, re-scope with allowed_tools: [\"{tool_name}\"]; use "
-                "allowed_capabilities only for a catalog procedure run through execute_capability.")
+        return (f"`{tool_name}` is not offered in this step: its one guarded action is `execute_capability` for "
+                f"{', '.join(capabilities)}. Re-send this scope if that procedure is what the operator asked for; "
+                "otherwise re-scope the step to what the operator asked for.")
     return ""
 
 
@@ -174,8 +174,20 @@ def scope_violation(brief: Any, tool_name: str, capability_name: str = "") -> st
         return reason
     capabilities, tools = _brief_scope(brief)
     if capabilities and not tools and capability_name not in capabilities:
-        return f"capability `{capability_name or 'unknown'}` is not in this step's allowed_capabilities"
+        return (f"capability `{capability_name or 'unknown'}` is not in this step's allowed_capabilities "
+                f"({', '.join(capabilities)}); re-scope the step to the capability the operator asked for")
     return ""
+
+
+# A scope rejection is either the worker calling a tool its step does not offer (a deviation: the same scope may be
+# retried once) or the step's own action naming a capability its brief excludes (the scope itself is wrong).
+NOT_OFFERED = "not_offered"
+MIS_SCOPED = "mis_scoped"
+
+
+def scope_rejection_kind(brief: Any, tool_name: str) -> str:
+    """Which kind of scope rejection a guarded call is; only meaningful when `scope_violation` is non-empty."""
+    return NOT_OFFERED if tool_scope_violation(brief, tool_name) else MIS_SCOPED
 
 
 # Tools that teach how to run a technique by hand. A step scoped to catalog procedures has Sage run the procedure,

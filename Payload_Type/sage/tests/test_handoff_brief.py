@@ -481,21 +481,39 @@ def test_scope_signature_keys_on_scope_not_command():
     assert hb.scope_signature([], []) == ""
 
 
-def test_trailing_scope_rejections_counts_only_the_matching_tail():
-    def event(sig):
-        return SimpleNamespace(metadata=(("scope_signature", sig),))
-    events = [event("capabilities:a"), event("capabilities:a")]
-    assert hb.trailing_scope_rejections(events, "capabilities:a") == 2
+def _scope_event(sig, kind=None):
+    return SimpleNamespace(metadata=(("scope_signature", sig), *((("kind", kind),) if kind else ())))
+
+
+def test_a_scope_whose_own_action_was_excluded_cannot_be_re_sent():
+    assert hb.scope_resend_exhausted([_scope_event("capabilities:a", "mis_scoped")], "capabilities:a")
+    # Rejections recorded before kinds existed keep the old rule.
+    assert hb.scope_resend_exhausted([_scope_event("capabilities:a")], "capabilities:a")
+
+
+def test_a_worker_deviation_may_be_retried_once_under_the_same_scope():
+    once = [_scope_event("capabilities:a", "not_offered")]
+    assert not hb.scope_resend_exhausted(once, "capabilities:a")
+    assert hb.scope_resend_exhausted(once * 2, "capabilities:a")
+
+
+def test_only_the_matching_tail_counts_toward_a_re_send():
+    events = [_scope_event("capabilities:a", "mis_scoped")]
     # A different scope at the end resets the count: changing the scope is progress.
-    assert hb.trailing_scope_rejections(events + [event("tools:x")], "capabilities:a") == 0
-    assert hb.trailing_scope_rejections(events, "") == 0
+    assert not hb.scope_resend_exhausted(events + [_scope_event("tools:x")], "capabilities:a")
+    assert not hb.scope_resend_exhausted(events, "")
+    assert not hb.scope_resend_exhausted([], "capabilities:a")
 
 
-def test_a_capability_scope_names_the_tool_route_out_of_the_loop():
+def test_a_capability_scope_names_its_procedure_and_never_suggests_raw_tasking():
     from ai.langgraph import step_bounds as sb
-    reason = sb.scope_violation({"allowed_capabilities": ["execute-as-local-admin"]},
-                                "issue_task_and_waitfor_task_output")
-    assert 'allowed_tools: ["issue_task_and_waitfor_task_output"]' in reason
+    brief = {"allowed_capabilities": ["execute-as-local-admin"]}
+    reason = sb.scope_violation(brief, "issue_task_and_waitfor_task_output")
+    assert "`execute_capability` for execute-as-local-admin" in reason and "allowed_tools" not in reason
+    assert sb.scope_rejection_kind(brief, "issue_task_and_waitfor_task_output") == sb.NOT_OFFERED
+    excluded = sb.scope_violation(brief, "execute_capability", "dcsync-krbtgt")
+    assert "execute-as-local-admin" in excluded and "allowed_tools" not in excluded
+    assert sb.scope_rejection_kind(brief, "execute_capability") == sb.MIS_SCOPED
 
 
 def test_a_re_sent_scope_that_keeps_failing_at_execution_ends_the_request():
@@ -506,14 +524,31 @@ def test_a_re_sent_scope_that_keeps_failing_at_execution_ends_the_request():
                         tool_calls=[{"name": "issue_task_and_waitfor_task_output",
                                      "args": {"command": "printspoofer", "callback_display_id": 3},
                                      "id": "t1", "type": "tool_call"}])
+    # A call to a tool the step does not offer is a deviation: the same scope is retried once, then stopped.
+    retry = AIMessage(content=propose.content, tool_calls=[{**propose.tool_calls[0], "id": "t2"}])
+    harness, result = _run([_handoff(cap_brief, "d1"), propose, _handoff(cap_brief, "d2"), retry,
+                            _handoff(cap_brief, "d3"), AIMessage(content="never")])
+
+    scope_events = harness.model._request_event_ledger.actual_events(kind="scope_rejected")
+    assert [dict(e.metadata)["kind"] for e in scope_events] == ["not_offered", "not_offered"]
+    assert len(_delegated(result)) == 2  # the third send never reached the worker
+    final = [m for m in result.get("supervisor_messages", []) if m.additional_kwargs.get("_is_final_report")]
+    assert final and "re-scope the step to what the operator asked for" in str(final[-1].content)
+
+
+def test_a_scope_whose_action_named_an_excluded_capability_is_not_re_sent():
+    cap_brief = {"handoff_title": "Elevate", "callback_display_id": 3, "targets": ["meereen.essos.local"],
+                 "expected_result": "A SYSTEM callback.", "allowed_capabilities": ["execute-as-local-admin"]}
+    propose = AIMessage(content="Running DCSync instead.",
+                        tool_calls=[{"name": "execute_capability",
+                                     "args": {"action": {"capability": "dcsync-krbtgt", "callback_id": "3"}},
+                                     "id": "t1", "type": "tool_call"}])
     harness, result = _run([_handoff(cap_brief, "d1"), propose, _handoff(cap_brief, "d2"),
                             AIMessage(content="never")])
 
     scope_events = harness.model._request_event_ledger.actual_events(kind="scope_rejected")
-    assert [e.phase for e in scope_events] == ["rejected"]
+    assert [dict(e.metadata)["kind"] for e in scope_events] == ["mis_scoped"]
     assert len(_delegated(result)) == 1  # the re-sent scope never reached the worker a second time
-    final = [m for m in result.get("supervisor_messages", []) if m.additional_kwargs.get("_is_final_report")]
-    assert final and "allowed_tools" in str(final[-1].content)
 
 
 def test_a_different_command_under_the_same_scope_does_not_count_as_a_repeat():

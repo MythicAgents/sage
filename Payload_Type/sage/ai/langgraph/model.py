@@ -2917,7 +2917,8 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
                     led.record_once(
                         event_id=f"scope_rejected:{led.request_id}:{_get_seq(delegated)}",
                         kind="scope_rejected", phase="rejected", content=name,
-                        metadata={"scope_signature": signature, "tool": name},
+                        metadata={"scope_signature": signature, "tool": name,
+                                  "kind": _step_bounds.scope_rejection_kind(brief_meta, name)},
                     )
                 except Exception:
                     pass
@@ -6059,15 +6060,14 @@ class Model:
         )
         if not errors:
             signature = _handoff_brief.scope_signature(brief.allowed_capabilities, brief.allowed_tools)
-            if lane == "supervised_workflow" and _handoff_brief.trailing_scope_rejections(
+            if lane == "supervised_workflow" and _handoff_brief.scope_resend_exhausted(
                 ledger.actual_events(kind="scope_rejected", phase="rejected"), signature,
-            ) >= _handoff_brief.REJECTIONS_BEFORE_STOP - 1:
-                # The Supervisor re-sent a scope that was already removed before a card because the worker's
-                # action fell outside it. Re-sending it loops; end the request with the concrete re-scope.
+            ):
+                # The Supervisor re-sent a scope whose action was removed before a card: either the scope itself
+                # was wrong, or a worker already deviated from it twice. Re-sending it again loops; end the request.
                 return (
                     (f"this step's scope ({signature}) already failed at execution and was re-sent unchanged; "
-                     "for a single command name the guarded tool in allowed_tools, or a catalog procedure in "
-                     "allowed_capabilities run through execute_capability",),
+                     "re-scope the step to what the operator asked for",),
                     True,
                 )
             if brief.off_catalog:

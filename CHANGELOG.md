@@ -64,9 +64,11 @@ between minor releases.
   domain, so nothing about the network needs to be known in advance. The call reaches the same approval card and
   step checks, and the specialist's model still reads the result. A step with several targets or procedures is
   left to the specialist. When a step scoped to a
-  catalog procedure proposes a single command instead, the step-boundary message now names the exact fix — the
-  guarded tool to put in `allowed_tools` — and if the Supervisor re-sends a scope that already failed at execution,
-  the request ends with that instruction rather than looping.
+  catalog procedure calls a tool the step does not offer, the step-boundary message names the step's procedure and
+  tells the Supervisor to re-send the scope if that procedure is what the operator asked for, or else re-scope to
+  what the operator asked for; it never suggests widening a procedure step to raw tasking. Such a deviation may be
+  retried once under the same scope, and a second ends the request. A step whose `execute_capability` call names a
+  capability outside its scope has the wrong scope, and re-sending that scope unchanged ends the request at once.
 
 - The Supervisor can list callbacks itself in conversation and supervised mode, so "which callbacks are alive"
   is answered without a delegation and a brief can name a callback the Supervisor has seen.
