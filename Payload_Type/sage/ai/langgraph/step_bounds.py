@@ -248,21 +248,28 @@ def render_outcome(outcome: Mapping[str, Any]) -> str:
 
 
 # Catalog procedures Sage proposes itself when the brief binds every argument they take, so no worker model chooses
-# again what the Supervisor already chose. Graph collection takes a callback and a domain and nothing else.
+# again what the Supervisor already chose. Graph collection takes a callback and, optionally, a domain: without one
+# the collector uses the callback user's current domain, so a live callback alone binds it.
 BRIEF_BOUND_PROCEDURES = frozenset({"collect-graph"})
 
 
-def bound_procedure_call(brief: Any, known_domains: Iterable[str]) -> dict[str, Any] | None:
+def bound_procedure_call(brief: Any, known_hosts: Iterable[str]) -> dict[str, Any] | None:
     """The `execute_capability` arguments for a step whose brief fully binds one procedure, else None.
 
-    Bound means: the brief names exactly one procedure in BRIEF_BOUND_PROCEDURES, a callback, and exactly one target
-    that is a domain Sage already holds. Anything less leaves the choice to the worker, never to a guess."""
+    Bound means the brief names exactly one procedure in BRIEF_BOUND_PROCEDURES and a callback (which brief
+    validation has already matched to one Sage observed). At most one target: it becomes the domain unless it names a
+    host Sage has seen, in which case the collector's own default (the callback user's domain) applies. Several
+    targets leave the choice to the worker. Nothing about the network needs to be known beforehand."""
     capabilities, tools = _brief_scope(brief)
     if tools or len(capabilities) != 1 or capabilities[0] not in BRIEF_BOUND_PROCEDURES:
         return None
     callback = str(brief.get("callback_display_id") or "").strip()
-    targets = [str(item).strip().casefold() for item in brief.get("targets") or [] if str(item).strip()]
-    domains = {str(item).strip().casefold() for item in known_domains if str(item).strip()}
-    if not callback or len(targets) != 1 or targets[0] not in domains:
+    targets = [str(item).strip().strip("'\"").rstrip(".").casefold()
+               for item in brief.get("targets") or [] if str(item).strip()]
+    if not callback or len(targets) > 1:
         return None
-    return {"action": {"capability": capabilities[0], "callback_id": callback, "domain": targets[0]}}
+    action = {"capability": capabilities[0], "callback_id": callback}
+    hosts = {str(item).strip().casefold() for item in known_hosts if str(item).strip()}
+    if targets and targets[0] not in hosts and targets[0].split(".", 1)[0] not in hosts:
+        action["domain"] = targets[0]
+    return {"action": action}

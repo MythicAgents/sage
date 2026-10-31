@@ -2838,10 +2838,10 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
         delegated = self._delegated_message(state_messages)
         brief = getattr(delegated, "additional_kwargs", {}).get("_handoff_brief")
         try:
-            domains = _handoff_brief.known_scope(getattr(self._model, "mythic_client", None)).domains
+            hosts = _handoff_brief.known_scope(getattr(self._model, "mythic_client", None)).hosts
         except Exception:
             return None
-        call = _step_bounds.bound_procedure_call(brief, domains)
+        call = _step_bounds.bound_procedure_call(brief, hosts)
         if call is None or "execute_capability" not in {
                 _offered_tool_name(tool) for tool in getattr(request, "tools", None) or []}:
             return None
@@ -15086,7 +15086,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         if collection is not None:
             if not collection.get("callback_id"):
                 return "⚠️ Capability plan could not be built: callback_id"
-            scope = collection.get("scope_domain") or "the foothold's forest"
+            scope = collection.get("scope_domain") or "the callback user's current domain"
             return "\n".join((
                 f"Sage graph collection on callback {collection['callback_id']}, scope {scope}:",
                 "  run the collector, locate and download its archive, ingest it into BloodHound.",

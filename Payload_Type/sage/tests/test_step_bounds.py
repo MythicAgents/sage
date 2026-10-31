@@ -473,7 +473,8 @@ def _offered_per_call(monkeypatch, brief: dict) -> list[set[str]]:
 
 
 def test_a_collection_step_offers_the_worker_execute_capability_and_not_the_raw_path(monkeypatch):
-    [offered] = _offered_per_call(monkeypatch, {"allowed_capabilities": ["collect-graph"]})
+    # Two procedures, so the step is not fully bound and the worker's model chooses between them.
+    [offered] = _offered_per_call(monkeypatch, {"allowed_capabilities": ["collect-graph", "dcsync-krbtgt"]})
 
     assert "execute_capability" in offered
     assert ISSUE not in offered and "get_ttp_guidance" not in offered
@@ -488,11 +489,20 @@ def test_a_single_command_step_offers_the_command_and_its_guidance(monkeypatch):
 
 # --- a step whose brief fully binds one procedure ---------------------------------------------------------------
 
+CG = {"capability": "collect-graph", "callback_id": "3"}
+
+
 @pytest.mark.parametrize("brief, call", [
+    # A fresh range: Sage knows only the callback. The operator's domain is passed as given.
     ({"allowed_capabilities": ["collect-graph"], "callback_display_id": "3", "targets": ["North.Test"]},
-     {"action": {"capability": "collect-graph", "callback_id": "3", "domain": "north.test"}}),
-    # Anything less than a full binding leaves the choice to the worker.
-    ({"allowed_capabilities": ["collect-graph"], "callback_display_id": "3", "targets": ["ws5.north.test"]}, None),
+     {"action": {**CG, "domain": "north.test"}}),
+    # No target, or a target that names a seen host: the collector's default domain (the callback user's) applies.
+    ({"allowed_capabilities": ["collect-graph"], "callback_display_id": "3"}, {"action": CG}),
+    ({"allowed_capabilities": ["collect-graph"], "callback_display_id": "3", "targets": ["CASTELBLACK"]},
+     {"action": CG}),
+    ({"allowed_capabilities": ["collect-graph"], "callback_display_id": "3",
+      "targets": ["castelblack.north.test"]}, {"action": CG}),
+    # Anything not fully bound leaves the choice to the worker.
     ({"allowed_capabilities": ["collect-graph"], "callback_display_id": "3",
       "targets": ["north.test", "south.test"]}, None),
     ({"allowed_capabilities": ["collect-graph"], "targets": ["north.test"]}, None),
@@ -504,11 +514,11 @@ def test_a_single_command_step_offers_the_command_and_its_guidance(monkeypatch):
     (None, None),
 ])
 def test_only_a_fully_bound_procedure_is_proposed_by_sage(brief, call):
-    assert sb.bound_procedure_call(brief, {"north.test", "south.test"}) == call
+    assert sb.bound_procedure_call(brief, {"castelblack"}) == call
 
 
-def _bound_step(monkeypatch, brief: dict, decision: str, worker_replies: int):
-    """Run a supervised collect-graph step with a foothold in north.test; return worker model calls, cards, runs."""
+def _bound_step(monkeypatch, brief: dict, decision: str, worker_replies: int, *, footholds: bool = True):
+    """Run a supervised collect-graph step on callback 5; return the worker's model calls and the capability runs."""
     ran: list[dict] = []
     worker_calls: list[int] = []
 
@@ -525,8 +535,9 @@ def _bound_step(monkeypatch, brief: dict, decision: str, worker_replies: int):
         issue = sink.get_tools.side_effect
         sink.get_tools.side_effect = lambda names: [*issue(names),
                                                     *([execute_capability] if "execute_capability" in names else [])]
-        sink._engagement_footholds = [SimpleNamespace(callback_id="5", host="WORKSTATION-5", forest="north.test",
-                                                      identity="NORTH\\operator")]
+        if footholds:
+            sink._engagement_footholds = [SimpleNamespace(callback_id="5", host="WORKSTATION-5", forest="north.test",
+                                                          identity="NORTH\\operator")]
         return original(self, *args, **kwargs)
 
     monkeypatch.setattr(model_module.Model, "_rebuild_graph", rebuild)
@@ -559,8 +570,17 @@ def test_a_rejected_bound_collection_runs_nothing(monkeypatch):
     assert ran == []
 
 
-def test_an_unbound_collection_step_is_left_to_the_worker_model(monkeypatch):
-    brief = {"allowed_capabilities": ["collect-graph"], "targets": ["unknown.test"]}
+def test_a_fresh_range_binds_the_collection_on_the_callback_alone(monkeypatch):
+    """No footholds or domains loaded, only the observed callback and its host: the callback binds the procedure,
+    and the collector's own default domain applies."""
+    brief = {"allowed_capabilities": ["collect-graph"], "targets": ["WORKSTATION-5"]}
+    worker_calls, ran = _bound_step(monkeypatch, brief, "accept", worker_replies=1, footholds=False)
+
+    assert ran == [{"action": {"capability": "collect-graph", "callback_id": "5"}, "inputs": None}]
+
+
+def test_a_collection_step_with_several_targets_is_left_to_the_worker_model(monkeypatch):
+    brief = {"allowed_capabilities": ["collect-graph"], "targets": ["north.test", "WORKSTATION-5"]}
     worker_calls, ran = _bound_step(monkeypatch, brief, "", worker_replies=1)
 
     assert ran == [] and len(worker_calls) == 1
