@@ -370,3 +370,25 @@ def test_a_collection_scope_still_removes_an_unrelated_command_before_any_card()
     assert effects == [] and cards == []
     [outcome] = outcomes
     assert (outcome["status"], outcome["bound"]) == ("rejected_by_scope", "scope")
+
+
+def test_the_worker_is_told_its_scope_before_it_acts():
+    """The step bound removes out-of-scope calls; the worker must see that scope in its own input first."""
+    seen: list = []
+
+    def worker(messages):
+        seen.extend(messages)
+        return AIMessage(content="Nothing to run.")
+
+    handoff = {"handoff_title": "collect graph", "handoff_instruction": ORIGINAL, **BRIEF,
+               "allowed_capabilities": ["collect-graph"]}
+    script = [_call("transfer_to_Mythic_Operator", handoff, 1), worker, AIMessage(content="Final answer."),
+              AIMessage(content="Final answer.")]
+    asyncio.run(_native(script, ""))
+
+    scopes = [message for message in seen if "<step_scope>" in str(getattr(message, "content", ""))]
+    assert len(scopes) == 1
+    text = scopes[0].content
+    assert "only `execute_capability`, for `collect-graph`" in text and '"callback_id": "5"' in text
+    # Sage's block sits immediately before the delegated operator input it scopes.
+    assert seen.index(scopes[0]) == len(seen) - 2 and seen[-1].content == ORIGINAL

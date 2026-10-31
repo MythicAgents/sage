@@ -9567,6 +9567,15 @@ class Model:
                     )
                     sanitized_channel = (sanitized_channel[:-1] + [assignment_message]
                                          + sanitized_channel[-1:])
+                scope = (_handoff_brief.render_scope(delegated.additional_kwargs.get("_handoff_brief"))
+                         if state.get("_request_lane") == "supervised_workflow" else "")
+                if scope:
+                    # Sage-authored and enforced by the step bound: the worker learns its scope before it acts,
+                    # instead of finding out when its call is removed.
+                    sanitized_channel = sanitized_channel[:-1] + [AIMessage(
+                        content=scope, name="Sage",
+                        additional_kwargs={"_step_scope_context": True, "_request_id": state.get("_request_id")},
+                    )] + sanitized_channel[-1:]
                 reordered = _supervised_completed_return_context(
                     sanitized_channel, state, node_name,
                 )

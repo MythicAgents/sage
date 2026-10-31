@@ -11,6 +11,7 @@ Pure and offline: the caller passes in what Sage holds; nothing here queries Myt
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import re
 from typing import Any, Iterable, Mapping
 
@@ -280,6 +281,41 @@ def validate_brief(brief: HandoffBrief, *, worker: str, require_scope: bool, sco
         elif (scope.tasks if match.group(1) == "task" else scope.credentials).isdisjoint({match.group(2)}):
             errors.append(f"inputs_by_reference: `{reference}` does not resolve to a record Sage holds")
     return tuple(errors)
+
+
+def render_scope(brief: Mapping[str, Any] | None) -> str:
+    """The step's enforced scope, as Sage tells the worker before its step; empty when the brief sets none.
+
+    Only what Sage enforces is rendered: what the one guarded action may use, and the validated callback and
+    targets. The Supervisor's free-text fields stay out of this Sage-authored block.
+    """
+    if not isinstance(brief, Mapping):
+        return ""
+    capabilities = [str(item) for item in brief.get("allowed_capabilities") or [] if str(item).strip()]
+    tools = [str(item) for item in brief.get("allowed_tools") or [] if str(item).strip()]
+    callback = str(brief.get("callback_display_id") or "").strip()
+    if capabilities == [CONTROL_PLANE]:
+        rule = ("This step only reads Mythic or BloodHound records: it takes no guarded action, and any guarded "
+                "call is removed before an approval card and ends the step.")
+    elif capabilities:
+        example = json.dumps({"capability": capabilities[0], "callback_id": callback or "<callback id>"})
+        allowed = ("only `execute_capability`, for " + ", ".join(f"`{name}`" for name in capabilities)
+                   + f". Sage runs each as one procedure; name it in the call, e.g. action={example}")
+    elif tools:
+        allowed = "only " + ", ".join(f"`{name}`" for name in tools)
+    else:
+        return ""
+    if capabilities != [CONTROL_PLANE]:
+        rule = (f"Its one guarded action may use {allowed}. Any other guarded call is removed before an approval "
+                "card and ends the step.")
+    lines = ["<step_scope>", f"Sage checks this step against its brief. {rule}"]
+    if callback:
+        lines.append(f"Callback: {callback}.")
+    targets = [str(item) for item in brief.get("targets") or [] if str(item).strip()]
+    if targets:
+        lines.append("Targets: " + json.dumps(targets, ensure_ascii=False) + ".")
+    lines.append("</step_scope>")
+    return "\n".join(lines)
 
 
 def restatement(instruction: str, operator_input: str) -> float:
