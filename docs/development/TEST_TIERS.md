@@ -12,7 +12,10 @@ No suite is excluded, so a green run means the tree is green. The runner still a
 argument and ignores it, so older invocations keep working.
 
 With `pytest-xdist` installed (it is in `requirements-dev.txt`) the run has two passes over every test: a parallel
-pass over everything not marked `serial`, then a single-process pass over the timing-sensitive `serial` tests.
+pass over everything not marked `serial`, then a single-process pass over the timing-sensitive `serial` tests. The
+parallel pass uses one worker per core, capped by free memory (1.5 GiB per worker after a 2 GiB reserve), because a
+worker grows to about 1 GiB and `-n auto` beside Mythic and Sage swapped a 15 GiB host into a lockup. The runner
+prints the cap when it applies and runs in one process when fewer than two workers fit; `-n` overrides it.
 `--serial` runs everything in one process instead; without xdist the runner says so and does that. Test modules
 must not replace importable modules in `sys.modules` at import time: collection imports every module, so such a
 patch reaches every later test in the process. `tests/test_test_isolation.py` enforces this.

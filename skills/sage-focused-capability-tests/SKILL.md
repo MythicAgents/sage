@@ -21,7 +21,7 @@ callback or lab, but it sends a real message and therefore requires explicit `--
 ```
 
 One tier, no exclusions — a green run means the tree is green. It runs in parallel by default (a parallel pass,
-then the `serial`-marked tests in one process); `--serial` runs everything in one process. The four rejected successor-portfolio suites this
+then the `serial`-marked tests in one process), with workers capped by free memory so it can run beside Mythic and Sage; `--serial` runs everything in one process. The four rejected successor-portfolio suites this
 once excluded now live append-only under `.sage_history/evaluation/architecture-policy/`. A trailing `supported`
 argument is still accepted and ignored. See `docs/development/TEST_TIERS.md`.
 

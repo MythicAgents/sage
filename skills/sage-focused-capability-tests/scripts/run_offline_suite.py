@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -33,21 +34,47 @@ SKILLS_ROOT = REPO_ROOT / "skills"
 DEV_REQUIREMENTS = REPO_ROOT / "Payload_Type" / "sage" / "requirements-dev.txt"
 
 
+# Each xdist worker grows to about 1 GiB over the run. With Mythic and Sage up on a 15 GiB host, `-n auto` (one
+# worker per core) swapped the machine into a lockup, so the default is the core count capped by free memory.
+WORKER_MEMORY_BYTES = 3 * 2**29          # 1.5 GiB per worker
+RESERVED_MEMORY_BYTES = 2 * 2**30        # left for everything else running on the host
+MEMINFO = Path("/proc/meminfo")
+
+
+def available_memory_bytes(meminfo: Path = MEMINFO) -> int | None:
+    """The kernel's MemAvailable estimate, or None where it cannot be read (non-Linux hosts)."""
+    try:
+        for line in meminfo.read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def default_workers(available: int | None, cores: int | None) -> int:
+    """Parallel workers: one per core, but no more than free memory can hold after the reserve."""
+    cores = max(1, cores or 1)
+    if available is None:
+        return cores
+    return max(1, min(cores, (available - RESERVED_MEMORY_BYTES) // WORKER_MEMORY_BYTES))
+
+
 def _chooses_workers(pytest_args: list[str]) -> bool:
     return any(arg in ("-n", "--numprocesses") or arg.startswith(("-n", "--numprocesses=")) for arg in pytest_args)
 
 
-def command_for(pytest_args: list[str], *, parallel: bool = False) -> list[str]:
-    """The pytest command; with `parallel` it runs on every core unless the caller picks `-n`."""
+def command_for(pytest_args: list[str], *, parallel: bool = False, workers: int | str = "auto") -> list[str]:
+    """The pytest command; with `parallel` it runs on `workers` processes unless the caller picks `-n`."""
     args = list(pytest_args) or ["-q"]
     command = [sys.executable, "-m", "pytest", str(TEST_ROOT), str(HYGIENE_ROOT), str(SKILLS_ROOT)]
     if parallel and not _chooses_workers(args):
-        command.extend(["-n", "auto"])
+        command.extend(["-n", str(workers)])
     command.extend(args)
     return command
 
 
-def pass_commands(pytest_args: list[str], *, parallel: bool = False) -> list[list[str]]:
+def pass_commands(pytest_args: list[str], *, parallel: bool = False, workers: int | str = "auto") -> list[list[str]]:
     """The run as one or two pytest commands.
 
     Parallel (the default when pytest-xdist is installed) is a parallel pass over everything not marked `serial`,
@@ -56,8 +83,8 @@ def pass_commands(pytest_args: list[str], *, parallel: bool = False) -> list[lis
     command with those choices."""
     args = list(pytest_args) or ["-q"]
     if not parallel or _chooses_workers(args) or "-m" in args:
-        return [command_for(args, parallel=parallel)]
-    return [command_for([*args, "-m", "not serial"], parallel=True),
+        return [command_for(args, parallel=parallel, workers=workers)]
+    return [command_for([*args, "-m", "not serial"], parallel=True, workers=workers),
             command_for([*args, "-m", "serial"], parallel=False)]
 
 
@@ -129,7 +156,14 @@ def main(argv: list[str] | None = None) -> int:
     parallel = "--serial" not in options and have_xdist
     if "--serial" not in options and not have_xdist:
         print("pytest-xdist is not installed; running every test in one process", file=sys.stderr)
-    commands = pass_commands(pytest_args, parallel=parallel)
+    workers = default_workers(available_memory_bytes(), os.cpu_count())
+    if parallel and not _chooses_workers(pytest_args):
+        if workers < 2 and "--parallel" not in options:
+            parallel = False
+            print("not enough free memory for parallel workers; running every test in one process", file=sys.stderr)
+        elif workers < (os.cpu_count() or 1):
+            print(f"free memory caps the parallel pass at {workers} workers (pass -n to choose)", file=sys.stderr)
+    commands = pass_commands(pytest_args, parallel=parallel, workers=workers)
     for command in commands:
         print(" ".join(command), flush=True)
     if "--print-command" in options:
