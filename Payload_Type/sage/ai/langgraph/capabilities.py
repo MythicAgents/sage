@@ -189,31 +189,151 @@ class CapabilityTransaction:
     proof_obligations: list[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class CapabilityDoc:
+    """One capability's operator-facing description, surfaced to the Supervisor at the delegation handoff.
+
+    CONTRACT for every catalog entry (keep this formula when adding a capability):
+    - name:      the capability id (kebab-case), identical to the CapabilityAction the reconciler emits.
+    - effect:    what the engagement can do afterwards — the capability's modelled effect, in operator terms.
+    - requires:  the precondition that must already hold, in operator terms (not the raw predicate string).
+    - pick_when: the discriminator — the situation in which THIS is the right choice over its siblings.
+    All four are required and non-empty (enforced below); keep pick_when to what separates it from the nearest
+    capability. No authority/permission language (descriptions guide selection, they never grant it), no secrets,
+    and no payload command names (a single command is an argument to a guarded tool, not a capability).
+    """
+
+    name: str
+    effect: str
+    requires: str
+    pick_when: str
+
+    def __post_init__(self) -> None:
+        for field_name in ("name", "effect", "requires", "pick_when"):
+            if not str(getattr(self, field_name) or "").strip():
+                raise ValueError(f"CapabilityDoc {self.name!r}: '{field_name}' must be non-empty")
+
+    def description(self) -> str:
+        """One-line description (back-compat for consumers that want a single string, e.g. POLICY_LLM)."""
+        return (
+            f"{self.effect.rstrip('.')}. "
+            f"Requires {self.requires.rstrip('.')}. "
+            f"Use when {self.pick_when[0].lower() + self.pick_when[1:] if self.pick_when else ''}"
+        ).strip()
+
+
 _CAPABILITY_CATALOG = (
-    ("collect-graph", "Collect and ingest directory graph observations from an authorized foothold."),
-    ("gpo-controlled-system-exec", "Use a controlled GPO to obtain verified SYSTEM execution."),
-    ("grant-directory-rights", "Use verified SYSTEM execution to grant directory replication rights."),
-    ("dcsync-krbtgt", "Retrieve krbtgt credential material using verified replication authority."),
-    ("dcsync-account", "Retrieve required account credential material using verified replication authority."),
-    ("forge-golden-ticket", "Create and apply a Kerberos ticket from verified domain key material."),
-    ("ensure-kerberos-context", "Establish or refresh a callback-scoped Kerberos context for a domain."),
-    ("ensure-account-kerberos-context", "Establish a callback-scoped Kerberos context for an account."),
-    ("read-managed-local-admin-secret", "Read a graph-proven managed local administrator secret."),
-    ("use-managed-local-admin-secret", "Use a managed local administrator secret on its authorized host."),
-    ("execute-as-local-admin", "Turn verified local administrator access into a live execution context."),
-    ("endpoint-protection-adjustment", "Apply a bounded endpoint protection change required by execution."),
-    ("adcs-ca-private-key-export", "Export a CA private key from a verified administrative execution context."),
-    ("adcs-esc-certificate-enroll", "Enroll a certificate through a graph-proven ADCS escalation path."),
-    ("adcs-certificate-auth", "Authenticate with verified certificate material to obtain domain control."),
+    CapabilityDoc(
+        "collect-graph",
+        effect="BloodHound holds an attack-path graph (paths, ACLs, group/GPO membership) for the collected technology",
+        requires="a live foothold with valid credentials for the technology being collected",
+        pick_when="you need an attack-path graph for a technology (e.g. Active Directory, Azure)",
+    ),
+    CapabilityDoc(
+        "gpo-controlled-system-exec",
+        effect="SYSTEM execution on machines in a GPO's scope",
+        requires="graph-proven write over a GPO that applies to the target, and a live foothold in the domain",
+        pick_when="BloodHound shows you control of a Group Policy Object scoped to the target",
+    ),
+    CapabilityDoc(
+        "grant-directory-rights",
+        effect="Active Directory DS-Replication (DCSync) rights for a principal in the domain",
+        requires="rights to add DS-Replication-Get-Changes* (e.g. Domain or Enterprise Admins)",
+        pick_when="you need replication rights before a DCSync",
+    ),
+    CapabilityDoc(
+        "dcsync-krbtgt",
+        effect="the domain krbtgt key (krbtgt-hash:domain), the input to forge-golden-ticket and ensure-kerberos-context",
+        requires="DS-Replication rights in the domain",
+        pick_when="you hold replication rights and want the krbtgt hash to take domain-wide authority",
+    ),
+    CapabilityDoc(
+        "dcsync-account",
+        effect="one named account's credential (creds:account@domain), feeding ensure-account-kerberos-context and managed-secret reads",
+        requires="DS-Replication rights in the domain",
+        pick_when="you hold replication rights and need a specific account's key, not krbtgt",
+    ),
+    CapabilityDoc(
+        "forge-golden-ticket",
+        effect="domain-admin Kerberos authority for the domain",
+        requires="the domain krbtgt hash",
+        pick_when="you hold the krbtgt key and want to impersonate any user",
+    ),
+    CapabilityDoc(
+        "ensure-kerberos-context",
+        effect="a callback operating with DOMAIN authority (domain admin), built from krbtgt/golden-ticket material",
+        requires="the domain krbtgt hash plus proven domain authority, and a live callback",
+        pick_when="you hold the domain krbtgt key and need this callback to act with domain-wide authority",
+    ),
+    CapabilityDoc(
+        "ensure-account-kerberos-context",
+        effect="a callback operating as ONE named account, built from that account's own key (not krbtgt)",
+        requires="that account's credential (creds:account@domain) and a live callback",
+        pick_when="you hold a single account's credential and need this callback to act as that account",
+    ),
+    CapabilityDoc(
+        "read-managed-local-admin-secret",
+        effect="a host's managed/LAPS local-admin secret, read",
+        requires="the right Kerberos account context and a graph-proven read path to the secret",
+        pick_when="you need a host's managed local-admin password for access",
+    ),
+    CapabilityDoc(
+        "use-managed-local-admin-secret",
+        effect="local-admin on a host via its managed secret",
+        requires="that host's managed local-admin secret and a live callback",
+        pick_when="you hold the host's managed admin secret and want admin on it",
+    ),
+    CapabilityDoc(
+        "execute-as-local-admin",
+        effect="a live execution context on a host where you hold local-admin",
+        requires="local-admin on the host and a live callback",
+        pick_when="you ALREADY have admin on the host and want execution on it (not for gaining admin, which is upstream)",
+    ),
+    CapabilityDoc(
+        "endpoint-protection-adjustment",
+        effect="a bounded Microsoft Defender change (disable real-time protection, add a path exclusion) that unblocks execution",
+        requires="remote-exec and local-admin on the host, and a live callback",
+        pick_when="an execution step is blocked by Microsoft Defender specifically and you already have admin and exec on that host",
+    ),
+    CapabilityDoc(
+        "adcs-ca-private-key-export",
+        effect="the ADCS CA private key",
+        requires="remote-exec and local-admin on the CA host, and a live callback",
+        pick_when="you have admin execution on the ADCS CA host and want its private key to forge certificates",
+    ),
+    CapabilityDoc(
+        "adcs-esc-certificate-enroll",
+        effect="an account certificate enrolled through a vulnerable ADCS template (PFX plus private key)",
+        requires="a blocked CA private-key export on the CA host (adcs-ca-key-export-blocked), and a live callback",
+        pick_when="adcs-ca-private-key-export was tried and failed because the CA key is non-exportable; enroll through a vulnerable template instead",
+    ),
+    CapabilityDoc(
+        "adcs-certificate-auth",
+        effect="domain control by authenticating with certificate material",
+        requires="the CA key or an enrolled certificate, and a live callback",
+        pick_when="you hold a CA key or an enrolled cert and want to authenticate as a privileged principal",
+    ),
 )
 
 
 def capability_catalog() -> list[dict[str, str]]:
-    """Return the semantic capability catalog without current-state admissibility."""
-    return [
-        {"name": name, "description": description}
-        for name, description in _CAPABILITY_CATALOG
-    ]
+    """Return the semantic capability catalog (name + one-line description) without admissibility."""
+    return [{"name": doc.name, "description": doc.description()} for doc in _CAPABILITY_CATALOG]
+
+
+def capability_docs() -> tuple[CapabilityDoc, ...]:
+    """Return the typed capability catalog (name, effect, requires, pick_when)."""
+    return _CAPABILITY_CATALOG
+
+
+def capability_legend() -> str:
+    """Render the catalog as an argument legend for the delegation tool, generated from the catalog so new
+    capabilities appear automatically. One line per capability: name — effect | needs <requires> | use when <pick_when>."""
+    return "\n".join(
+        f"- {doc.name}: {doc.effect.rstrip('.')} | needs {doc.requires.rstrip('.')} | "
+        f"use when {doc.pick_when.rstrip('.')}"
+        for doc in _CAPABILITY_CATALOG
+    )
 
 
 def _current_account_context_keys(state: Any) -> set[tuple[str, str, str]]:

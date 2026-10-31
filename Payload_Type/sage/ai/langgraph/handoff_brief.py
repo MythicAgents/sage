@@ -58,6 +58,12 @@ def capability_choices() -> tuple[str, ...]:
     return (*catalog_names(), CONTROL_PLANE)
 
 
+def capability_legend() -> str:
+    """The catalog rendered as an argument legend for the delegation tool; generated from the catalog at each
+    graph build so a new capability appears automatically."""
+    return capabilities.capability_legend()
+
+
 @dataclass(frozen=True)
 class HandoffBrief:
     targets: tuple[str, ...] = ()

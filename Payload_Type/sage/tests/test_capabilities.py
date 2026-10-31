@@ -4907,3 +4907,46 @@ def test_local_admin_access_probe_accepts_native_ls_json():
     assert probe["target_resource_seen"] is True
     assert probe["admin_share_access_proven"] is True
     assert achieved.verdict == "achieved"
+
+
+# --- Capability catalog descriptions (CapabilityDoc) -----------------------------------------------
+
+import pytest  # noqa: E402
+
+
+def test_capability_docs_carry_all_four_fields_and_match_catalog():
+    docs = capabilities.capability_docs()
+    assert len(docs) == 15
+    seen = set()
+    for doc in docs:
+        for field_name in ("name", "effect", "requires", "pick_when"):
+            assert str(getattr(doc, field_name) or "").strip(), f"{doc.name}: empty {field_name}"
+        assert re.fullmatch(r"[a-z][a-z0-9-]+", doc.name), f"non-kebab name {doc.name!r}"
+        assert doc.name not in seen, f"duplicate {doc.name}"
+        seen.add(doc.name)
+    # The back-compat catalog() and the handoff enum both derive from the same docs.
+    assert {d["name"] for d in capabilities.capability_catalog()} == seen
+    legend = capabilities.capability_legend()
+    for doc in docs:
+        assert doc.name in legend, f"{doc.name} missing from generated legend"
+
+
+def test_capability_doc_rejects_an_empty_field():
+    # The guard can fail: a missing discriminator is a construction error, not a silent gap.
+    with pytest.raises(ValueError):
+        capabilities.CapabilityDoc("x", effect="e", requires="r", pick_when="")
+
+
+def test_every_catalog_name_matches_the_runtime_capability_set():
+    # Cross-check the described catalog against what the executor actually routes, so a renamed or dropped
+    # capability can't drift from its description. collect-graph is collected (BloodHound), not run through
+    # build_capability_execution_plan, so it is the one catalog entry with no execution builder.
+    names = {doc.name for doc in capabilities.capability_docs()}
+    for name in names:
+        action = capabilities.CapabilityAction(name=name, target="")
+        plan = capabilities.build_capability_execution_plan(action, {})
+        routed = plan.reason != f"no execution builder for {name}"
+        if name == "collect-graph":
+            assert not routed, "collect-graph should not route through build_capability_execution_plan"
+        else:
+            assert routed, f"catalog capability {name} has no execution builder (drift)"

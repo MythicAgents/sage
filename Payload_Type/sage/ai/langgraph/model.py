@@ -17395,12 +17395,16 @@ def _create_handoff_tool(
                 input_payload=input_payload,
                 input_type=input_type,
             )
-    elif brief_check is not None:
-        # The allowed values come from the catalog and the worker's declared tools when the graph is built, so the
-        # model sees the current lists and nobody maintains a copy.
+    elif brief_check is not None and _worker_guarded_tool_names(agent_name):
+        # The allowed values come from the catalog and the worker's declared guarded tools when the graph is
+        # built, so the model sees the current lists and nobody maintains a copy. Only workers that actually
+        # declare guarded tools get the scoped signature; a worker with none gets the plain handoff below
+        # (scope fields would force a choice between empty enums it could never act on).
         capability_choice = Literal[_handoff_brief.capability_choices()]
         worker_tools = _worker_guarded_tool_names(agent_name)
-        tool_choice = Literal[worker_tools] if worker_tools else str
+        tool_choice = Literal[worker_tools]
+        # Generated from the capability catalog so new capabilities appear here automatically.
+        capability_legend = _handoff_brief.capability_legend()
 
         @tool(name, description=description)
         def handoff_tool(
@@ -17410,7 +17414,7 @@ def _create_handoff_tool(
             callback_display_id: Annotated[int | str | None, "The Mythic callback display id this step runs on. Required for a supervised Mythic_Operator step unless allowed_capabilities is ['control_plane']; must be a callback already observed, and the request's bound callback when it has one."] = None,
             targets: Annotated[list[str] | None, "Hosts, domains, or principals this step acts on, each named in the operator's request or already in engagement state. Required for a supervised Mythic_Operator step unless allowed_capabilities is ['control_plane']."] = None,
             expected_result: Annotated[str, "One line stating what this step should produce. Required for a supervised Mythic_Operator step."] = "",
-            allowed_capabilities: Annotated[list[capability_choice] | None, "Catalog procedures this step's one guarded action may run, by name, or ['control_plane'] alone for a step that only reads Mythic or BloodHound records (callbacks, task output, credentials, graph) and tasks no callback. For any other work, including a single command, name the guarded tools in allowed_tools instead."] = None,
+            allowed_capabilities: Annotated[list[capability_choice] | None, "Catalog procedures (each a multi-step procedure run as one guarded action through execute_capability) this step may run, by name, or ['control_plane'] alone for a step that only reads Mythic or BloodHound records (callbacks, task output, credentials, graph) and tasks no callback. A procedure also needs the state in its 'needs' clause; if that is not met, do the upstream procedure first. For any other work, including a single payload command, name the guarded tools in allowed_tools instead (a command is an argument to issue_task_and_waitfor_task_output, never a capability). Catalog:\n" + capability_legend] = None,
             allowed_tools: Annotated[list[tool_choice] | None, "Instead of allowed_capabilities: the guarded tools this step's one action may use. Name either allowed_capabilities or allowed_tools, not both. Read-only tools are always available and need not be listed."] = None,
             inputs_by_reference: Annotated[list[str] | None, "Earlier results this step uses, as 'task:<display id>' or 'cred:<credential id>' records Sage already holds."] = None,
         ) -> Command:

@@ -9,6 +9,12 @@ between minor releases.
 
 ### Added
 
+- When the Supervisor scopes a supervised step to a capability, it now sees what each capability does. The
+  delegation tool lists every catalog capability with its effect, the state it already needs, and when to pick it
+  over its neighbours, generated from the capability catalog so a new capability appears automatically and nobody
+  maintains a second copy. A specialist that declares no guarded tools of its own no longer receives the
+  step-scoping fields it could never act on.
+
 - In supervised mode each specialist step is bounded. A step returns control to the Supervisor after its one
   guarded action has run or been rejected, or earlier at 20 tool calls, 10 minutes of active time, or three
   consecutive tool errors. Time awaiting an operator's approval and time inside the guarded action itself,

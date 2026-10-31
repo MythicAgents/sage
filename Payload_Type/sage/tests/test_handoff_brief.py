@@ -99,13 +99,39 @@ def test_capabilities_must_be_catalog_procedures(capabilities, rejected):
 def test_capability_choices_follow_the_catalog(monkeypatch):
     from ai.langgraph import capabilities
 
-    monkeypatch.setattr(capabilities, "_CAPABILITY_CATALOG", (("new-procedure", "A newly cataloged procedure."),))
+    monkeypatch.setattr(capabilities, "_CAPABILITY_CATALOG", (capabilities.CapabilityDoc(
+        "new-procedure",
+        effect="a newly cataloged effect",
+        requires="some upstream state",
+        pick_when="you need the new procedure",
+    ),))
     assert hb.capability_choices() == ("new-procedure", "control_plane")
     assert _brief(allowed_capabilities=["new-procedure"]).allowed_capabilities == ("new-procedure",)
     tool = model_module._create_handoff_tool(agent_name="Mythic_Operator", brief_check=lambda *args: None)
     schema = tool.tool_call_schema.model_json_schema()["properties"]["allowed_capabilities"]
     items = next(branch["items"] for branch in schema["anyOf"] if branch.get("type") == "array")
     assert items["enum"] == ["new-procedure", "control_plane"]
+
+
+def test_only_workers_with_guarded_tools_get_scope_fields():
+    # A worker that declares guarded tools gets the scoped delegation signature; one that declares none gets the
+    # plain handoff, so the model is never offered a free-text allowed_tools it could not act on.
+    scope_fields = {"allowed_capabilities", "allowed_tools", "callback_display_id", "targets"}
+
+    operator = model_module._create_handoff_tool(agent_name="Mythic_Operator", brief_check=lambda *a: None)
+    op_props = set(operator.tool_call_schema.model_json_schema()["properties"])
+    assert scope_fields <= op_props
+    # allowed_tools is a fixed enum of the worker's guarded tools, never a free-text string.
+    at = operator.tool_call_schema.model_json_schema()["properties"]["allowed_tools"]
+    at_items = next(branch["items"] for branch in at["anyOf"] if branch.get("type") == "array")
+    assert "issue_task_and_waitfor_task_output" in at_items["enum"]
+    # The capability legend is generated into the arg description from the catalog.
+    assert "Catalog:" in operator.tool_call_schema.model_json_schema()["properties"]["allowed_capabilities"]["description"]
+
+    for unguarded in ("Generalist", "BloodHound", "MCP_Manager"):
+        assert model_module._worker_guarded_tool_names(unguarded) == ()
+        tool = model_module._create_handoff_tool(agent_name=unguarded, brief_check=lambda *a: None)
+        assert scope_fields.isdisjoint(tool.tool_call_schema.model_json_schema()["properties"])
 
 
 @pytest.mark.parametrize("target, ok", [
