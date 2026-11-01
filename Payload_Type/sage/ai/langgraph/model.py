@@ -2942,6 +2942,69 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
         record.end(status, bound, reason)
         _remove_tool_calls(message, {str(call.get("id") or "") for call in guarded}, f"[step-boundary] {reason}")
 
+    async def _ground_and_limit_capability(self, request: Any, response: Any) -> None:
+        """Ground a surviving ``execute_capability`` call from engagement state, then — if its plan still cannot
+        be built — remove it with a recoverable observation instead of letting it reach the approval gate.
+
+        Two best-practice behaviours (cairn #145 grounding, #127 recoverable refusal):
+        - Grounding: the executor already fills a capability's known context (foothold identity, graph-derived
+          GPO/DC) from state. Running that same binding here, and writing it back into the call, means the
+          approval card and the executor plan from the same inputs — the model need not restate context Sage holds.
+        - Recoverable refusal: when the plan genuinely cannot be built (a required input Sage does not hold), the
+          call is dropped and a plain-words note naming the missing input replaces it, so the worker re-proposes
+          or picks another step within its bounds. Previously the unplannable call reached the HITL gate, which
+          ended the whole request with a one-word refusal. The planner never fabricates a value, so an ungroundable
+          input becomes a recoverable ask, not an invented command. Fail-open: any error leaves the call untouched.
+        """
+        try:
+            client = getattr(self._model, "mythic_client", None)
+            if client is None:
+                return
+            result = getattr(response, "result", None)
+            if result is None:
+                result = getattr(getattr(response, "model_response", None), "result", None)
+            candidates = [response] if isinstance(response, AIMessage) else list(result or [])
+            message = next((item for item in reversed(candidates) if isinstance(item, AIMessage)), None)
+            if message is None or not getattr(message, "tool_calls", None):
+                return
+            try:
+                from . import capabilities as capabilities_mod
+            except ImportError:
+                import capabilities as capabilities_mod  # type: ignore
+            for call in list(message.tool_calls):
+                if str(call.get("name") or "") != "execute_capability":
+                    continue
+                args = call.get("args") if isinstance(call.get("args"), dict) else {}
+                # Sage's own graph collection is planned by the collection runner, not the capability builder; the
+                # gate special-cases it, so leave it untouched.
+                if collection_capability_binding({"name": "execute_capability", "args": args}) is not None:
+                    continue
+                inputs = client._capability_tool_inputs(args.get("inputs"))
+                action_obj = client._capability_tool_action(args.get("action"), inputs, capabilities_mod)
+                if action_obj is None:
+                    continue
+                action_obj, _ = client._ensure_capability_transaction_context(action_obj, inputs)
+                await client._augment_capability_runtime_inputs(action_obj, inputs)
+                # Persist the grounded inputs so the approval card and the executor see the same bound values the
+                # plan was built from.
+                args["inputs"] = inputs
+                call["args"] = args
+                plan = capabilities_mod.build_capability_execution_plan(action_obj, inputs)
+                if getattr(plan, "ok", False):
+                    continue
+                capability = client._capability_text(getattr(action_obj, "name", "")) or "capability"
+                missing = ", ".join(str(item) for item in getattr(plan, "missing", []) or [])
+                reason = str(getattr(plan, "reason", "") or "").strip()
+                detail = reason or (f"missing: {missing}" if missing else "a required input is missing")
+                note = (f"`{capability}` could not be planned yet — {detail}. Supply that input, or send a "
+                        f"different step. Nothing was issued.")
+                record = self._record(request)
+                if record is not None and record.status is None:
+                    record.end(_step_bounds.StepStatus.PRECONDITION_UNSATISFIABLE, "precondition", note)
+                _remove_tool_calls(message, {str(call.get("id") or "")}, f"[step-boundary] {note}")
+        except Exception as exc:  # pragma: no cover - never break the model path on bookkeeping
+            logger.debug(f"capability grounding/plannability check skipped (fail-open): {exc}")
+
     def _add_time(self, request: Any, started: float, *, guarded: bool) -> None:
         record = self._record(request)
         if record is None:
@@ -2969,6 +3032,7 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
         bound = self._bound_procedure_message(request)
         if bound is not None:
             self._limit_response(request, bound)
+            await self._ground_and_limit_capability(request, bound)
             if bound.tool_calls:
                 await self._announce(bound)
             return bound
@@ -2977,6 +3041,7 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
         finally:
             self._add_time(request, started, guarded=False)
         self._limit_response(request, response)
+        await self._ground_and_limit_capability(request, response)
         return response
 
     def wrap_tool_call(self, request, handler):

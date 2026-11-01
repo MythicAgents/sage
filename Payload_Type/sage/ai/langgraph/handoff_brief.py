@@ -300,7 +300,10 @@ def render_scope(brief: Mapping[str, Any] | None) -> str:
     elif capabilities:
         example = json.dumps({"capability": capabilities[0], "callback_id": callback or "<callback id>"})
         allowed = ("only `execute_capability`, for " + ", ".join(f"`{name}`" for name in capabilities)
-                   + f". Sage runs each as one procedure; name it in the call, e.g. action={example}")
+                   + f". Sage runs each as one procedure; name it in the call, e.g. action={example}. "
+                   "Sage fills in the context it already holds (your foothold identity and graph-derived "
+                   "facts), so you need not restate them. If a procedure needs an input Sage does not hold, "
+                   "it tells you which one — supply it or obtain it, and do not invent a value.")
     elif tools:
         allowed = "only " + ", ".join(f"`{name}`" for name in tools)
     else:

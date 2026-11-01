@@ -604,3 +604,102 @@ def test_a_sage_proposed_call_id_is_one_every_provider_accepts():
     import re
     call_id = model_module._bound_call_id("chat:11:request:10", 3)
     assert re.fullmatch(r"[a-zA-Z0-9_-]+", call_id) and call_id != model_module._bound_call_id("chat:11:request:10", 4)
+
+
+# --- capability grounding + recoverable refusal (cairn #145 / #127) ------------------------------------------
+
+from ai.langgraph import capabilities as _caps  # noqa: E402
+
+
+class _GroundRecord:
+    """Minimal step record: captures the end() outcome the middleware assigns."""
+
+    def __init__(self):
+        self.status = None
+        self.ended = None
+
+    def end(self, status, bound, reason):
+        self.status = status
+        self.ended = (status, bound, reason)
+
+
+class _GroundClient:
+    """A capability client whose augmentation injects a fixed grounding dict, so a test controls whether the
+    plan becomes buildable. Action parsing and planning use the real capabilities module."""
+
+    def __init__(self, grounding: dict):
+        self._grounding = dict(grounding)
+
+    def _capability_text(self, value) -> str:
+        return str(value or "").strip()
+
+    def _capability_tool_inputs(self, inputs) -> dict:
+        return dict(inputs) if isinstance(inputs, dict) else {}
+
+    def _capability_tool_action(self, action, inputs, capabilities_mod):
+        name = action.get("capability") if isinstance(action, dict) else str(action)
+        return capabilities_mod.CapabilityAction(name=str(name), target="", intent={"domain": inputs.get("domain", "")})
+
+    def _ensure_capability_transaction_context(self, action, inputs):
+        return action, ""
+
+    async def _augment_capability_runtime_inputs(self, action, inputs):
+        inputs.update(self._grounding)
+
+
+def _ground_middleware(client):
+    model = SimpleNamespace(
+        mythic_client=client,
+        _supervised_step_record=lambda agent, msgs: _ground_middleware.record,
+        _step_guarded_tools={},
+        _step_clock=lambda: 0.0,
+    )
+    return model_module._SupervisedStepBoundMiddleware(model, "Mythic_Operator", frozenset({"execute_capability"}))
+
+
+def _gpo_call_message():
+    return AIMessage(content="", name="Mythic_Operator", tool_calls=[{
+        "name": "execute_capability", "id": "c1", "type": "tool_call",
+        "args": {"action": {"capability": "gpo-controlled-system-exec", "callback_id": "3"},
+                 "inputs": {"domain": "north.sevenkingdoms.local"}}}])
+
+
+def test_an_ungroundable_capability_is_returned_as_a_recoverable_step_not_a_terminal():
+    # No grounding: the GPO SYSTEM action has no command/principal/DC, so the plan cannot be built. The call is
+    # removed with a plain-words note (never a fabricated command), and the step ends as a recoverable outcome.
+    _ground_middleware.record = _GroundRecord()
+    mw = _ground_middleware(_GroundClient({}))
+    message = _gpo_call_message()
+    asyncio.run(mw._ground_and_limit_capability(SimpleNamespace(state={"messages": []}), message))
+
+    assert message.tool_calls == []  # not surfaced to the approval gate
+    assert "could not be planned yet" in str(message.content)
+    assert _ground_middleware.record.status == sb.StepStatus.PRECONDITION_UNSATISFIABLE
+
+
+def test_a_groundable_capability_survives_with_its_inputs_bound_from_state():
+    # Grounding supplies the durable effect (controlled principal + affected DC), so the plan builds and the call
+    # reaches the approval card, carrying the inputs bound from engagement state.
+    _ground_middleware.record = _GroundRecord()
+    grounding = {"gpo": "starkwallpaper", "controlled_principal": "NORTH\\samwell.tarly",
+                 "affected_dc_hosts": ["WINTERFELL.NORTH.SEVENKINGDOMS.LOCAL"]}
+    mw = _ground_middleware(_GroundClient(grounding))
+    message = _gpo_call_message()
+    asyncio.run(mw._ground_and_limit_capability(SimpleNamespace(state={"messages": []}), message))
+
+    assert len(message.tool_calls) == 1  # survives to the card
+    assert message.tool_calls[0]["args"]["inputs"]["controlled_principal"] == "NORTH\\samwell.tarly"
+    assert _ground_middleware.record.status is None
+
+
+def test_the_planner_refuses_a_gpo_system_action_without_an_effect_and_never_fabricates_one():
+    # Pure planner contract (step 4): an unspecified SYSTEM action is refused, not invented.
+    action = _caps.CapabilityAction(name="gpo-controlled-system-exec", target="",
+                                    intent={"domain": "north.sevenkingdoms.local"})
+    base = {"domain": "north.sevenkingdoms.local", "gpo": "starkwallpaper"}
+    plan = _caps.build_capability_execution_plan(action, dict(base))
+    assert plan.ok is False  # no command, principal or proof -> refused, nothing invented
+    assert plan.missing  # it names what it needs rather than fabricating an action
+    # With an explicit proof-only probe it becomes buildable — the model supplies intent, Sage does not invent it.
+    ok_plan = _caps.build_capability_execution_plan(action, {**base, "allow_proof_only": True})
+    assert ok_plan.ok is True

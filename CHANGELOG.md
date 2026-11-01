@@ -110,6 +110,14 @@ between minor releases.
 
 ### Fixed
 
+- A supervised capability step now grounds its known context from engagement state and, when it still cannot be
+  planned, returns to the worker instead of ending the request. The worker proposed a GPO SYSTEM-execution
+  capability naming only the callback and GPO; the planner needed the controlled principal and the affected
+  domain controller, which Sage already holds, and the request ended with a one-word refusal. Sage now fills
+  those from the foothold and the graph before the approval card, so the operator approves a plan that is ready
+  to run. When an input genuinely is not in state, the step is handed back with the missing input named in plain
+  words, for the worker to supply or obtain, and the planner never invents a value.
+
 - A graph collection that Sage proposes itself in a supervised step now opens its tool card. The collection ran
   end to end, but the call never passed through a model, so its card was never opened and the request ended in
   error when the card closed without having started. Sage's proposal now goes to the same capture callback a
