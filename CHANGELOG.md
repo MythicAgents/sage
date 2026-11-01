@@ -110,6 +110,11 @@ between minor releases.
 
 ### Fixed
 
+- A graph collection that Sage proposes itself in a supervised step now opens its tool card. The collection ran
+  end to end, but the call never passed through a model, so its card was never opened and the request ended in
+  error when the card closed without having started. Sage's proposal now goes to the same capture callback a
+  model's response does, after the step boundary has checked it.
+
 - A supervised step re-sent with only its expected result reworded now counts as a repeat. Live, the Supervisor
   re-sent one step six times with the same title and scope, rewording the result it expected each time, and every
   rewording ran until the request was blocked. Repeats are now compared on the worker, title, capabilities, tools,

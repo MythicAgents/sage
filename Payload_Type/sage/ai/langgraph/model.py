@@ -2863,6 +2863,17 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
             additional_kwargs={"_sage_bound_procedure": True},
         )
 
+    async def _announce(self, message: AIMessage) -> None:
+        """Give Sage's own proposal to the worker's capture callback, as a model's response would be, so its tool
+        card opens and its tool-end event pairs with it."""
+        capture = getattr(self._model, "_capture_callbacks", {}).get(self._agent_name)
+        if capture is None:
+            return
+        try:
+            await capture.on_llm_end(LLMResult(generations=[[ChatGeneration(message=message)]]), run_id=uuid4())
+        except Exception as exc:
+            logger.warning(f"bound-procedure card not opened: {type(exc).__name__}: {exc}")
+
     def _offer_scoped_tools(self, request: Any) -> Any:
         """Offer the step's model only the tools its brief admits, so it is never handed a choice the step bound
         would then remove. The bound in `_limit_response` stays the enforcement point."""
@@ -2943,11 +2954,8 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
 
     def wrap_model_call(self, request, handler):
         started = self._model._step_clock()
+        # Sage proposes a bound procedure only on the async path, where it can open the call's tool card.
         request = self._offer_scoped_tools(request)
-        bound = self._bound_procedure_message(request)
-        if bound is not None:
-            self._limit_response(request, bound)
-            return bound
         try:
             response = handler(request)
         finally:
@@ -2961,6 +2969,8 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
         bound = self._bound_procedure_message(request)
         if bound is not None:
             self._limit_response(request, bound)
+            if bound.tool_calls:
+                await self._announce(bound)
             return bound
         try:
             response = await handler(request)
@@ -9624,6 +9634,9 @@ class Model:
                 delegation_name=node_name if delegation_id is not None else None,
                 observation_request_id=str(getattr(getattr(self, "_request_contract", None), "request_id", "") or ""),
             )
+            # A call Sage proposes itself (`_SupervisedStepBoundMiddleware`) reaches no LLM callback, so the step
+            # middleware announces it through this same handler to open its tool card.
+            self._capture_callbacks = {**getattr(self, "_capture_callbacks", {}), node_name: callback_handler}
 
             # Merge callback into config - handle both list and CallbackManager types
             invoke_config = dict(config) if config else {}

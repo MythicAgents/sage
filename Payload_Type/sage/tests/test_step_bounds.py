@@ -521,6 +521,7 @@ def _bound_step(monkeypatch, brief: dict, decision: str, worker_replies: int, *,
     """Run a supervised collect-graph step on callback 5; return the worker's model calls and the capability runs."""
     ran: list[dict] = []
     worker_calls: list[int] = []
+    cards: list[str] = []
 
     @tool
     async def execute_capability(action: dict | str, inputs: dict | str | None = None) -> str:
@@ -541,6 +542,14 @@ def _bound_step(monkeypatch, brief: dict, decision: str, worker_replies: int, *,
         return original(self, *args, **kwargs)
 
     monkeypatch.setattr(model_module.Model, "_rebuild_graph", rebuild)
+    original_card = model_module.Model._emit_tool_use_card
+
+    async def card(self, *args, **kwargs):
+        if kwargs.get("tool_name") == "execute_capability":
+            cards.append(kwargs.get("status") or "completed")
+        return await original_card(self, *args, **kwargs)
+
+    monkeypatch.setattr(model_module.Model, "_emit_tool_use_card", card)
 
     def worker(messages):
         worker_calls.append(1)
@@ -550,6 +559,7 @@ def _bound_step(monkeypatch, brief: dict, decision: str, worker_replies: int, *,
     script = [_call("transfer_to_Mythic_Operator", handoff, 1), *([worker] * worker_replies),
               AIMessage(content="Final answer."), AIMessage(content="Final answer.")]
     asyncio.run(_native(script, decision))
+    _bound_step.cards = cards
     return worker_calls, ran
 
 
@@ -561,6 +571,9 @@ def test_sage_proposes_a_fully_bound_collection_without_asking_the_worker_model(
     assert ran == [{"action": {"capability": "collect-graph", "callback_id": "5", "domain": "north.test"},
                     "inputs": None}]
     assert len(worker_calls) == 1
+    # Its tool card opens once and closes once, as a model's call does; a live run failed reconciliation without it.
+    assert _bound_step.cards[0] == "started" and _bound_step.cards.count("started") == 1
+    assert len(_bound_step.cards) == 2
 
 
 def test_a_rejected_bound_collection_runs_nothing(monkeypatch):
