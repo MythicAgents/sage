@@ -2735,6 +2735,33 @@ def test_path_shaped_objective_fires_the_pathfinding_probe_once(
     assert len(calls) == 1
 
 
+def test_pathfinding_probe_runs_again_when_the_controlled_principals_change(
+    assembled_ingest_graph_path, monkeypatch,
+):
+    # A probe that could not place an identity in the graph says nothing; a new controlled principal (for
+    # example a newly recovered credential) must get its own probe instead of being shut out by the guard.
+    path = assembled_ingest_graph_path
+    graph_reconciler = importlib.import_module("ai.langgraph.graph_reconciler")
+    monkeypatch.setattr(path.tools, "_engagement_objective",
+                        lambda: "From our foothold, find an attack path to corp.local")
+    calls = []
+
+    async def _spy(mcp, principals, domains, now, ttl, proof_envelope=None):
+        calls.append(list(principals))
+        return []
+
+    monkeypatch.setattr(graph_reconciler, "probe_path_to_objective", _spy)
+    original = graph_reconciler.controlled_principals_from_state
+    asyncio.run(path.tools._refresh_graph_facts_if_stale("2026-09-17T00:01:00+00:00"))
+    asyncio.run(path.tools._refresh_graph_facts_if_stale("2026-09-17T00:02:00+00:00", force=True))
+    assert len(calls) == 1
+    monkeypatch.setattr(graph_reconciler, "controlled_principals_from_state",
+                        lambda state: [*original(state), "svc_backup@corp.local"])
+    asyncio.run(path.tools._refresh_graph_facts_if_stale("2026-09-17T00:03:00+00:00", force=True))
+    assert len(calls) == 2
+    assert "svc_backup@corp.local" in calls[1]
+
+
 def test_non_path_shaped_objective_does_not_probe(assembled_ingest_graph_path, monkeypatch):
     # The default stored objective ("Collect and ingest the current graph") is not path-shaped, so the
     # probe stays a silent no-op — demonstrating the guard can withhold.

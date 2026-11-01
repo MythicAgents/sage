@@ -1,7 +1,10 @@
 import asyncio
 import json
+import re
 import sys
 from pathlib import Path
+
+import pytest
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph"))
@@ -732,13 +735,21 @@ def test_reconcile_graph_position_returns_empty_on_mcp_errors():
 
 
 class _PathProbeTool:
-    """Fake cypher tool for probe_path_to_objective: resolves aliases to themselves and answers the
-    shortestPath existence query per `found`. `errors=True` returns an error envelope (no `data`)."""
+    """Fake cypher tool for probe_path_to_objective: resolves aliases to themselves, holds the nodes in
+    `nodes`, and answers the shortestPath existence query per `found`. `errors=True` returns an error
+    envelope (no `data`). Like BloodHound, a pattern whose endpoint is absent returns no rows."""
 
-    def __init__(self, found: bool, errors: bool = False):
+    def __init__(self, found: bool, errors: bool = False,
+                 nodes: tuple[str, ...] = ("samwell.tarly@north.sevenkingdoms.local", "essos.local")):
         self.found = found
         self.errors = errors
+        self.nodes = {n.casefold() for n in nodes}
         self.calls = []
+
+    @staticmethod
+    def _rows(*values):
+        return json.dumps({"info_type": "run", "success": True,
+                           "data": {"literals": [{"value": v, "key": "name"} for v in values]}})
 
     async def ainvoke(self, args):
         query = args.get("query", "")
@@ -747,8 +758,13 @@ class _PathProbeTool:
             return json.dumps({"data": {"literals": []}})
         if self.errors:
             return json.dumps({"errors": ["query failed"]})
-        literals = [{"value": "essos.local", "key": "name"}] if self.found else []
-        return json.dumps({"info_type": "run", "success": True, "data": {"literals": literals}})
+        named = set(re.findall(r"'([^']+)'", query))
+        present = sorted(n for n in named if n in self.nodes)
+        if "shortestPath" not in query:  # endpoint existence checks
+            return self._rows(*present)
+        if len(present) < 2:  # a missing endpoint yields no rows, exactly like "no path"
+            return self._rows()
+        return self._rows("essos.local") if self.found else self._rows()
 
 
 def test_probe_path_to_objective_emits_found_when_a_path_exists():
@@ -790,3 +806,30 @@ def test_probe_path_to_objective_requires_both_a_principal_and_a_domain():
         _FakeMCP(tool), [], ["essos.local"], NOW, TTL_SECONDS)) == []
     assert asyncio.run(graph_reconciler.probe_path_to_objective(
         _FakeMCP(tool), ["samwell.tarly@north.sevenkingdoms.local"], [], NOW, TTL_SECONDS)) == []
+
+
+@pytest.mark.parametrize("nodes", [
+    ("essos.local",),                                   # the controlled principal is not in the graph
+    ("samwell.tarly@north.sevenkingdoms.local",),       # the objective domain is not in the graph
+])
+def test_probe_path_to_objective_says_nothing_when_an_endpoint_is_missing_from_the_graph(nodes):
+    # BloodHound returns no rows both for "no path" and for a pattern whose endpoint does not exist, so a
+    # missing principal or domain must not be reported as "no path".
+    tool = _PathProbeTool(found=False, nodes=nodes)
+    facts = asyncio.run(graph_reconciler.probe_path_to_objective(
+        _FakeMCP(tool), ["samwell.tarly@north.sevenkingdoms.local"], ["essos.local"], NOW, TTL_SECONDS,
+    ))
+    assert facts == []
+
+
+def test_probe_path_to_objective_probes_only_principals_present_in_the_graph():
+    tool = _PathProbeTool(found=True)
+    facts = asyncio.run(graph_reconciler.probe_path_to_objective(
+        _FakeMCP(tool),
+        ["samwell.tarly@north.sevenkingdoms.local", "samwell.tarly@sevenkingdoms.local"],
+        ["essos.local"], NOW, TTL_SECONDS,
+    ))
+    assert [f.predicate for f in facts] == ["objective-path-found:essos.local"]
+    path_query = next(q for q in tool.calls if "shortestPath" in q)
+    assert "samwell.tarly@north.sevenkingdoms.local" in path_query
+    assert "samwell.tarly@sevenkingdoms.local" not in path_query

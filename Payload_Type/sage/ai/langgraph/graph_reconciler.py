@@ -405,6 +405,17 @@ async def probe_path_to_objective(
         principals = await _resolve_principal_aliases(tool, principals)
         if not principals:
             return []
+        # BloodHound answers a pattern with no matching endpoint exactly as it answers "no path" (no
+        # rows), so a principal or domain missing from the graph would read as a false "no path". Only
+        # principals and domains that exist as nodes are probed; with none, the probe says nothing.
+        ran, present = await _run_path_probe(
+            tool,
+            f"MATCH (s) WHERE toLower(s.name) IN {_principal_in_list(principals)} "
+            "RETURN DISTINCT toLower(s.name) AS name",
+        )
+        principals = _normalized_unique(present) if ran else []
+        if not principals:
+            return []
         inlist = _principal_in_list(principals)
         proof = dict(proof_envelope) if isinstance(proof_envelope, dict) else {}
         facts: list[GraphFact] = []
@@ -412,6 +423,11 @@ async def probe_path_to_objective(
         for domain in domains:
             safe_domain = domain.replace("\\", "").replace("'", "").strip()
             if not safe_domain:
+                continue
+            ran, target = await _run_path_probe(
+                tool, f"MATCH (t:Domain) WHERE toLower(t.name) = '{safe_domain}' RETURN t.name AS name LIMIT 1",
+            )
+            if not ran or not target:
                 continue
             # A controlled principal IS the domain's owner only via edges; shortestPath over any edge
             # to the Domain node is BloodHound's own reachability notion. Bounded hop count keeps the

@@ -8029,7 +8029,8 @@ class MythicTools:
                 if principals and objective_contract.objective_seeks_attack_path(state.objective):
                     if not covered_domains:
                         covered_domains = await _bloodhound_collected_domains()
-                    probe_key = f"{state.objective}|{','.join(sorted(covered_domains or []))}"
+                    probe_key = (f"{state.objective}|{','.join(sorted(covered_domains or []))}"
+                                 f"|{','.join(sorted(principals))}")
                     if covered_domains and probe_key != getattr(self, "_objective_path_probe_key", None):
                         probe_facts = list(await graph_reconciler.probe_path_to_objective(
                             _SingleToolMCP(cypher_tool), principals, covered_domains, now,

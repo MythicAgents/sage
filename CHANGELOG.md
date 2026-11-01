@@ -110,6 +110,12 @@ between minor releases.
 
 ### Fixed
 
+- The BloodHound attack-path probe no longer reports "no path" when it cannot place the controlled identity or the
+  objective domain in the graph. BloodHound returns the same empty answer for a missing node as for a missing path,
+  so an identity projected under the wrong domain read as "no path" to a domain it could reach. The probe now
+  checks that each principal and domain exists before asking for a path, and says nothing when one does not. The
+  once-per-objective probe also runs again when the controlled principals change.
+
 - A supervised request no longer re-sends a step that already answered until the no-progress stop. When a step
   returns without issuing a task, adding a credential or meeting a denial (an answered read, a report that the
   operator must act, or an "already achieved" capability verdict) and the Supervisor sends that same step again
