@@ -17573,11 +17573,18 @@ def _worker_guarded_tool_names(agent_name: str) -> tuple[str, ...]:
 
 
 def _answered_step_key(worker: str, title: str, brief: Any) -> str:
-    """Exact identity of a supervised step for repeat detection; empty for a delegation with no structural brief,
-    which is never compared (consecutive specialist questions without a brief differ only in prose)."""
-    if not isinstance(brief, Mapping) or not any(brief.values()):
+    """Identity of a supervised step for repeat detection; empty for a delegation with no structural brief,
+    which is never compared (consecutive specialist questions without a brief differ only in prose).
+
+    The free-text ``expected_result`` is left out: a re-sent step keeps its worker, title and scope but rewords the
+    result it expects each time, so including it let every rewording through as a new step.
+    """
+    if not isinstance(brief, Mapping):
         return ""
-    return json.dumps([worker, " ".join(title.split()).casefold(), dict(brief)], sort_keys=True, default=str)
+    scope = {key: value for key, value in brief.items() if key != "expected_result"}
+    if not any(scope.values()):
+        return ""
+    return json.dumps([worker, " ".join(title.split()).casefold(), scope], sort_keys=True, default=str)
 
 
 def _answered_step_repeat_command(

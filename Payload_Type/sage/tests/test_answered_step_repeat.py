@@ -90,8 +90,21 @@ def test_a_second_unchanged_repeat_ends_the_request_with_the_answer():
     assert _stops(messages) == []
 
 
+def test_a_repeat_that_only_rewords_its_expected_result_is_not_dispatched():
+    """Live shape: the Supervisor re-sent one step with the same title and scope, rewording only the result it
+    expected each time, and every rewording was dispatched until the request was blocked."""
+    reworded = {**READ, "expected_result": "The status and output of task 88, returned."}
+    script = [_handoff(READ, "h1"), AIMessage(content=ANSWER), _handoff(reworded, "h2"),
+              AIMessage(content="Rubeus.exe is missing; upload it to continue.")]
+    messages = _run(script)["supervisor_messages"]
+
+    assert _steps(messages) == 1
+    assert any("not dispatched" in str(m.content) for m in messages
+               if getattr(m, "name", "") == "transfer_to_Mythic_Operator")
+    assert _stops(messages) == []
+
+
 @pytest.mark.parametrize("change", [
-    {"expected_result": "Task 89 output."},
     {"handoff_title": "Fetch task 89 output"},
 ])
 def test_a_changed_step_is_dispatched(change):
@@ -142,9 +155,15 @@ def test_a_delegation_without_a_brief_is_never_compared():
     # Specialist questions with no structural brief differ only in their prose.
     assert model_module._answered_step_key("BloodHound", "Find a path", None) == ""
     assert model_module._answered_step_key("BloodHound", "Find a path", {"targets": [], "expected_result": ""}) == ""
+    assert model_module._answered_step_key("BloodHound", "Find a path", {"expected_result": "a path"}) == ""
     brief = {"allowed_capabilities": ["control_plane"], "expected_result": "x"}
     assert model_module._answered_step_key("Mythic_Operator", "Read  TASK", brief) \
-        == model_module._answered_step_key("Mythic_Operator", "read task", brief)
+        == model_module._answered_step_key("Mythic_Operator", "read task", {**brief, "expected_result": "y"})
+    # A change of scope is a different step.
+    for change in ({"targets": ["north.test"]}, {"allowed_capabilities": ["collect-graph"]},
+                   {"callback_display_id": "5"}, {"inputs_by_reference": ["task:41"]}):
+        assert model_module._answered_step_key("Mythic_Operator", "read task", {**brief, **change}) \
+            != model_module._answered_step_key("Mythic_Operator", "read task", brief)
 
 
 # --- assembled: native chat, an "already achieved" capability verdict -------------------------------------------

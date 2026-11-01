@@ -110,6 +110,11 @@ between minor releases.
 
 ### Fixed
 
+- A supervised step re-sent with only its expected result reworded now counts as a repeat. Live, the Supervisor
+  re-sent one step six times with the same title and scope, rewording the result it expected each time, and every
+  rewording ran until the request was blocked. Repeats are now compared on the worker, title, capabilities, tools,
+  callback, targets and inputs; a change to any of those is still a new step.
+
 - The BloodHound attack-path probe no longer reports "no path" when it cannot place the controlled identity or the
   objective domain in the graph. BloodHound returns the same empty answer for a missing node as for a missing path,
   so an identity projected under the wrong domain read as "no path" to a domain it could reach. The probe now
