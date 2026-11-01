@@ -3477,6 +3477,43 @@ class MythicTools:
         request["expected_zip_suffix"] = suffix
         return ""
 
+    def _collection_already_covered(self, callback_display_id: Any, scope_domain: str = "") -> bool:
+        """Whether Sage's cached engagement state already holds a verified graph for this callback's collection key.
+
+        Best effort and never raises: False when the state is not cached yet. Used to tell the operator before
+        approving; the engagement gate makes its own decision with freshly reconciled footholds."""
+        try:
+            try:
+                from . import engagement_state
+            except ImportError:  # pragma: no cover
+                import engagement_state  # type: ignore
+            footholds = list(getattr(self, "_engagement_footholds", []) or [])
+            foothold = next((f for f in footholds
+                             if str(getattr(f, "callback_id", "")) == str(callback_display_id or "").strip()), None)
+            if foothold is None:
+                return False
+            state = engagement_state.EngagementState(
+                objective=self._engagement_objective(), footholds=footholds,
+                hops=list(getattr(self, "_engagement_hops", []) or []),
+                graph_facts=list(getattr(self, "_engagement_graph_facts", []) or []),
+                engagement_id=self._eng_key(), runtime_scope=True,
+            )
+            return bool(engagement_state.graph_collection_covers_scope(
+                state, foothold, str(scope_domain or "").strip().casefold()))
+        except Exception:
+            return False
+
+    def _approved_collection_covers(self, callback_display_id: Any, scope_domain: str) -> bool:
+        """Whether the active approved `execute_capability(collect-graph)` transaction is this collection."""
+        transaction = getattr(self, "_private_collection_transaction", None)
+        return bool(
+            isinstance(transaction, _PrivateCollectionTransaction)
+            and transaction.active_for(self)
+            and transaction.approved_name == "execute_capability"
+            and transaction.callback_id == str(callback_display_id or "").strip()
+            and transaction.scope_domain == str(scope_domain or "").strip().casefold()
+        )
+
     def _operator_collection_override_available(self) -> bool:
         request = getattr(self, "_operator_collection_request", None)
         return bool(
@@ -7355,7 +7392,13 @@ class MythicTools:
             if in_flight_blocker:
                 return in_flight_blocker
             if engagement_state.graph_collection_covers_scope(cg_state, fh, scope_domain):
-                if not self._operator_collection_override_available():
+                if self._approved_collection_covers(callback_display_id, scope_domain):
+                    # The operator approved this collection: an earlier graph for the same key may predate
+                    # rights changed outside Sage, which no key can observe, so approval re-collects.
+                    logger.info(
+                        "🧭 [operator-collection] approved collection re-collects covered key=%s", collection_key,
+                    )
+                elif not self._operator_collection_override_available():
                     return (f"[engagement-gate] skipped: graph already built for this auth context/scope ({collection_key}) "
                             "— analyze the existing graph or escalate; do NOT re-collect.")
                 logger.info(

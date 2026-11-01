@@ -251,3 +251,73 @@ def test_the_approval_card_still_refuses_a_capability_with_no_plan_that_is_not_c
     text = _card_plan({"action": '{"capability": "collect-graphs", "callback_id": "3"}'})
 
     assert "could not be built" in text
+
+
+def _covered(case, monkeypatch):
+    """Turn the engagement gate on with a verified graph already covering every collection key."""
+    monkeypatch.setenv("SAGE_ENGAGEMENT_GATE", "true")
+    monkeypatch.setattr(es, "graph_collection_covers_scope", lambda *a, **k: True)
+
+    async def none(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(case.client, "_collection_in_flight_blocker", none)
+    from ai.langgraph import access_reconciler
+
+    async def footholds(*_a, **_k):
+        return list(case.state.footholds)
+
+    monkeypatch.setattr(access_reconciler, "reconcile_access", footholds)
+    gate_decisions: list = []
+    original = case.client._engagement_issue_hook
+
+    async def recorded(command, parameters, callback_display_id):
+        decision = await original(command, parameters, callback_display_id)
+        gate_decisions.append((command, decision))
+        return decision
+
+    monkeypatch.setattr(case.client, "_engagement_issue_hook", recorded)
+    return gate_decisions
+
+
+def test_an_approved_collection_re_collects_a_scope_already_collected(collection, monkeypatch):
+    """Rights changed outside Sage leave the key unchanged, so the operator's approval is what re-collects."""
+    case = collection
+    _covered(case, monkeypatch)
+    _approve(case, ACTION)
+    covered_key = es.collection_target_key(case.state, case.state.footholds[0], "corp.test")
+    result = _run(case, ACTION)
+
+    assert covered_key  # the gate could key this collection, so its covered branch was reached
+    assert result["ok"] is True and result["status"] == "ingested", (result, case.events)
+    assert "execute_assembly" in [task["command_name"] for task in case.tasks]
+
+
+def test_without_that_approval_a_covered_collection_is_still_skipped(collection, monkeypatch):
+    case = collection
+    _covered(case, monkeypatch)
+    _approve(case, ACTION)
+    case.client._private_collection_transaction = None  # no approved collection is running
+    from ai.langgraph.mythic_tools import MythicTools
+    blocked = asyncio.run(MythicTools._engagement_issue_hook(case.client, 
+        "execute_assembly", {"assembly_name": "SharpHound.exe", "assembly_arguments": "-c All"}, 7))
+
+    assert blocked and "graph already built" in blocked
+
+
+@pytest.mark.parametrize("covered", [True, False])
+def test_the_approval_card_says_when_the_collection_was_already_made(monkeypatch, covered):
+    client = mt.MythicTools(agent_task_id="test")
+    monkeypatch.setattr(client, "_collection_already_covered", lambda callback, scope: covered)
+    text = model.Model._capability_card_plan_text(SimpleNamespace(mythic_client=client), LIVE_ARGS)
+
+    assert ("already have a verified graph" in text) is covered and "could not be built" not in text
+
+
+def test_coverage_for_the_card_comes_from_the_cached_engagement_state(collection, monkeypatch):
+    case = collection
+    monkeypatch.setattr(es, "graph_collection_covers_scope", lambda *a, **k: True)
+    assert not case.client._collection_already_covered("7", "corp.test")  # nothing cached yet: no claim
+    case.client._engagement_footholds = list(case.state.footholds)
+    assert case.client._collection_already_covered("7", "corp.test")
+    assert not case.client._collection_already_covered("8", "corp.test")

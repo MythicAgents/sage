@@ -110,6 +110,12 @@ between minor releases.
 
 ### Fixed
 
+- An approved supervised graph collection now collects even when the same callback identity and scope already have
+  a verified graph. Before, collection preparation ran, then the collect-once gate skipped the collector and the
+  approved collection was reported as failed. Rights granted on directory objects outside Sage cannot be seen
+  until a new collection, so the operator's approval is the signal to collect again. The approval card says when
+  the identity and scope were already collected. Without that approval the gate still skips a covered collection.
+
 - A supervised step scoped to graph collection can now collect. Collection was offered as a capability but had no
   `execute_capability` procedure, so the specialist could only propose the collector command itself, which the
   step's scope removed before any approval card; the Supervisor re-sent the same scope until the request halted

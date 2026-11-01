@@ -15093,11 +15093,16 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             if not collection.get("callback_id"):
                 return "⚠️ Capability plan could not be built: callback_id"
             scope = collection.get("scope_domain") or "the callback user's current domain"
-            return "\n".join((
+            lines = [
                 f"Sage graph collection on callback {collection['callback_id']}, scope {scope}:",
                 "  run the collector, locate and download its archive, ingest it into BloodHound.",
                 "Every task it issues runs under this one approval. Other inputs are not used.",
-            ))
+            ]
+            covered = getattr(client, "_collection_already_covered", None)
+            if callable(covered) and covered(collection["callback_id"], collection.get("scope_domain", "")):
+                lines.append("This callback's identity and scope already have a verified graph. Approving collects "
+                             "again, which is worth it when its rights changed outside Sage.")
+            return "\n".join(lines)
         action = args.get("action") if isinstance(args.get("action"), (dict, str)) else None
         # Same parsing as execute_capability itself, which accepts inputs as a dict or a JSON string. Dropping a
         # string here planned the card with no inputs and refused a capability the tool would have run.
