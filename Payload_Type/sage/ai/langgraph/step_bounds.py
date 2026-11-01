@@ -231,6 +231,18 @@ def step_outcome(record: StepRecord, activity: StepActivity, *, now: float, task
     }
 
 
+# A step that ends in one of these with nothing changed has given its whole answer; sending the same step again
+# returns the same answer. A bounded or rejected step is excluded: continuing it, or retrying after a denial, is
+# legitimate work.
+ANSWERED = frozenset({StepStatus.ENDED, StepStatus.ACTION_EXECUTED, StepStatus.PRECONDITION_UNSATISFIABLE})
+
+
+def answered_without_effect(outcome: Mapping[str, Any]) -> bool:
+    """Whether a step returned its answer without issuing a task, adding a credential or meeting a denial."""
+    return (StepStatus(outcome["status"]) in ANSWERED and not outcome.get("tasks_issued")
+            and not outcome.get("credentials_added") and not outcome.get("guarded_rejected"))
+
+
 def render_outcome(outcome: Mapping[str, Any]) -> str:
     """The Sage-authored line the Supervisor reads when a step returns."""
     reason = outcome["status"] + (f" ({outcome['detail']})" if outcome.get("detail") else "")

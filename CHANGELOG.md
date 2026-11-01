@@ -110,6 +110,13 @@ between minor releases.
 
 ### Fixed
 
+- A supervised request no longer re-sends a step that already answered until the no-progress stop. When a step
+  returns without issuing a task, adding a credential or meeting a denial (an answered read, a report that the
+  operator must act, or an "already achieved" capability verdict) and the Supervisor sends that same step again
+  unchanged, Sage does not dispatch it: it hands the step's answer back once, and a second repeat ends the request
+  at a checkpoint with that answer. A changed step, or any step after a different one, still runs. The earlier
+  repeat guard read state the Supervisor's handoff never carried, so it never fired.
+
 - An approved supervised graph collection now collects even when the same callback identity and scope already have
   a verified graph. Before, collection preparation ran, then the collect-once gate skipped the collector and the
   approved collection was reported as failed. Rights granted on directory objects outside Sage cannot be seen

@@ -6096,6 +6096,44 @@ class Model:
         rejections = _handoff_brief.rejection_count(ledger.actual_events(kind="brief"))
         return errors, rejections >= _handoff_brief.REJECTIONS_BEFORE_STOP
 
+    def _note_answered_step(
+        self, worker: str, outcome: dict[str, Any], messages: list[AnyMessage], answer: str,
+    ) -> None:
+        """Remember the supervised step that just returned an answer without changing anything, so the Supervisor
+        sending that same step again is caught at the handoff (`_answered_step_repeat`)."""
+        self._answered_step = None
+        if not answer.strip() or not _step_bounds.answered_without_effect(outcome):
+            return
+        delegated = max((message for message in messages if isinstance(message, HumanMessage)
+                         and message.additional_kwargs.get("_delegated_to") == worker), key=_get_seq, default=None)
+        kwargs = getattr(delegated, "additional_kwargs", {}) or {}
+        key = _answered_step_key(worker, str(kwargs.get("_handoff_title") or ""), kwargs.get("_handoff_brief"))
+        request_id = str(getattr(getattr(self, "_request_contract", None), "request_id", "") or "")
+        if key and request_id:
+            self._answered_step = {"request_id": request_id, "key": key, "answer": answer, "refusals": 0}
+
+    def _answered_step_repeat(self, worker: str, title: str, brief: Any) -> tuple[str, int] | None:
+        """The prior answer and the refusal count when a delegation re-sends the step that just answered; None
+        dispatches it.
+
+        Identity is the worker, the step's structural brief and its card title, compared exactly. A step that
+        changed nothing returns the same answer when sent again, so live Supervisors re-sent an answered read, a
+        worker's report that it needed the operator, and an "already achieved" capability verdict until the
+        no-progress stop. Any other delegation clears the record, so only a back-to-back repeat is refused.
+        """
+        answered = getattr(self, "_answered_step", None)
+        request_id = str(getattr(getattr(self, "_request_contract", None), "request_id", "") or "")
+        metadata = brief.as_metadata() if isinstance(brief, _handoff_brief.HandoffBrief) else None
+        key = _answered_step_key(worker, title, metadata)
+        if (not isinstance(answered, dict) or not key or answered.get("request_id") != request_id
+                or answered.get("key") != key):
+            self._answered_step = None
+            return None
+        answered["refusals"] = int(answered.get("refusals", 0)) + 1
+        logger.info(f"🔒 [handoff] {worker} step re-sent unchanged after it answered; not dispatched "
+                    f"({answered['refusals']}/{_SUPERVISED_REPEAT_REFUSAL_CAP})")
+        return str(answered["answer"]), answered["refusals"]
+
     def _pending_task_receipt_for_request(self) -> dict[str, Any] | None:
         """Return a trusted unfinished-task receipt for this supervised graph request."""
         if getattr(self, "mode", "") != "supervised":
@@ -10343,6 +10381,7 @@ class Model:
             # every task the step issued reaches the Supervisor whether or not the worker read it.
             step_outcome: dict[str, Any] | None = None
             step_rows: dict[int, Any] = {}
+            step_answer = ""
             if node_name != "Supervisor":
                 step_outcome = self._supervised_step_outcome(node_name, updated_channel)
                 step_rows = await self._attach_step_references(step_outcome, updated_channel)
@@ -10493,6 +10532,7 @@ class Model:
                                 "sha256": hashlib.sha256(supervisor_summary_text.encode()).hexdigest(),
                             }
 
+                        step_answer = supervisor_summary_text
                         summary_ai_msg = AIMessage(
                             content=supervisor_summary_text,
                             name=node_name,
@@ -10607,6 +10647,7 @@ class Model:
                     )
                     _tag_msg(step_message, self._next_seq())
                     update["supervisor_messages"] = list(update.get("supervisor_messages") or []) + [step_message]
+                    self._note_answered_step(node_name, step_outcome, updated_channel, step_answer)
 
             # `result` is the node's return value and CAN be None — a node that halts (e.g. the
             # no-progress backstop) returns nothing, and `flag in None` raises `TypeError: argument
@@ -14271,6 +14312,7 @@ class Model:
                 getattr(getattr(self, "_request_contract", None), "request_id", "") or ""
             ),
             "brief_check": None if self.mode == "auto" else self._check_handoff_brief,
+            "repeat_check": None if self.mode == "auto" else self._answered_step_repeat,
         }
         assign_to_generalist_agent = _create_handoff_tool(
             agent_name="Generalist",
@@ -17069,6 +17111,7 @@ def _create_handoff_tool(
     subgoal_scheduler: Callable[..., dict[str, Any]] | None = None,
     assisted_operator_lookup: Callable[[], str | None] | None = None,
     brief_check: Callable[..., tuple[tuple[str, ...], bool] | None] | None = None,
+    repeat_check: Callable[[str, str, Any], tuple[str, int] | None] | None = None,
 ):
     """Create a handoff tool to transfer control to another agent.
     https://docs.langchain.com/oss/python/langchain/multi-agent#handoffs
@@ -17130,6 +17173,11 @@ def _create_handoff_tool(
             if rejected is not None:
                 return _brief_rejection_command(runtime, name, agent_name, *rejected, channels=channel_map.values())
         requested = _handoff_directive(agent_name, handoff_instruction, handoff_title)
+        if repeat_check is not None:
+            repeated = repeat_check(agent_name, requested.title, brief)
+            if repeated is not None:
+                return _answered_step_repeat_command(runtime, name, agent_name, *repeated,
+                                                     channels=channel_map.values())
         redirect = None
         raw_subgoal = runtime.state.get("_subgoal_state")
         admitted = worker_outcome_lookup(runtime.state) if worker_outcome_lookup is not None else None
@@ -17522,6 +17570,62 @@ def _worker_guarded_tool_names(agent_name: str) -> tuple[str, ...]:
     except Exception:
         return ()
     return tuple(name for name in declared if name in GUARDED_TOOLS)
+
+
+def _answered_step_key(worker: str, title: str, brief: Any) -> str:
+    """Exact identity of a supervised step for repeat detection; empty for a delegation with no structural brief,
+    which is never compared (consecutive specialist questions without a brief differ only in prose)."""
+    if not isinstance(brief, Mapping) or not any(brief.values()):
+        return ""
+    return json.dumps([worker, " ".join(title.split()).casefold(), dict(brief)], sort_keys=True, default=str)
+
+
+def _answered_step_repeat_command(
+    runtime: ToolRuntime,
+    tool_name: str,
+    agent_name: str,
+    answer: str,
+    refusals: int,
+    *,
+    channels: Iterable[str],
+) -> Command:
+    """Refuse re-sending a step that already answered: hand its answer back once, then end the request with it."""
+    if refusals < _SUPERVISED_REPEAT_REFUSAL_CAP:
+        return Command(update={"messages": [ToolMessage(
+            content=(f"Delegation to {agent_name} was not dispatched: this is the step that just returned, sent "
+                     "again unchanged, and it issued no Mythic task, so it would return the same result. Its result "
+                     "is below. Answer the operator with respond_to_user, or send a different step if something "
+                     f"remains.\n\n{answer}"),
+            name=tool_name,
+            tool_call_id=runtime.tool_call_id,
+        )]})
+    max_seq = max(
+        (_get_seq(message) for key in channels for message in runtime.state.get(key, [])),
+        default=0,
+    )
+    tool_message = ToolMessage(
+        content=f"{agent_name} was sent the step that already answered again; ending with its result.",
+        name=tool_name,
+        tool_call_id=runtime.tool_call_id,
+    )
+    # A checkpoint, not a completion: Sage ended the request, and the answer may itself be a blocker.
+    final_message = AIMessage(
+        content=answer,
+        name="Supervisor",
+        additional_kwargs={"_is_final_report": True, "_turn_outcome": _TURN_OUTCOME_CHECKPOINT},
+    )
+    _tag_msg(tool_message, max_seq + 1)
+    _tag_msg(final_message, max_seq + 2)
+    return Command(
+        goto="__end__",
+        update={
+            "messages": [tool_message, final_message],
+            "supervisor_messages": [tool_message, final_message],
+            "_message_seq": max_seq + 3,
+            "recursion_handback": True,
+        },
+        graph=Command.PARENT,
+    )
 
 
 def _brief_rejection_command(
