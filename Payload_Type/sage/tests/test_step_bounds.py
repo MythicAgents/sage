@@ -606,7 +606,7 @@ def test_a_sage_proposed_call_id_is_one_every_provider_accepts():
     assert re.fullmatch(r"[a-zA-Z0-9_-]+", call_id) and call_id != model_module._bound_call_id("chat:11:request:10", 4)
 
 
-# --- capability grounding + recoverable refusal (cairn #145 / #127) ------------------------------------------
+# --- capability grounding + recoverable refusal ------------------------------------------------------------
 
 from ai.langgraph import capabilities as _caps  # noqa: E402
 

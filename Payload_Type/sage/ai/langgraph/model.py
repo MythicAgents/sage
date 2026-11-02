@@ -2946,7 +2946,7 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
         """Ground a surviving ``execute_capability`` call from engagement state, then — if its plan still cannot
         be built — remove it with a recoverable observation instead of letting it reach the approval gate.
 
-        Two best-practice behaviours (cairn #145 grounding, #127 recoverable refusal):
+        Two best-practice behaviours (capability grounding and recoverable refusal):
         - Grounding: the executor already fills a capability's known context (foothold identity, graph-derived
           GPO/DC) from state. Running that same binding here, and writing it back into the call, means the
           approval card and the executor plan from the same inputs — the model need not restate context Sage holds.
