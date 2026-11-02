@@ -169,7 +169,7 @@ def test_cli_writes_json_and_markdown_and_opens_phoenix_read_only(tmp_path):
     report = json.loads((tmp_path / "m.json").read_text())
     assert report["requests"][0]["issued_tasks"] == 1
     assert report["requests"][0]["approval_cards"] == 0
-    assert "| 1 | 1 → Mythic_Operator | go | True |" in (tmp_path / "m.md").read_text()
+    assert "| 1 | 1 → Mythic_Operator | go | sage_run | True |" in (tmp_path / "m.md").read_text()
 
 
 def _rendered_step_outcome(referenced: list[int]) -> str:
@@ -197,3 +197,95 @@ def test_handback_visibility_reads_the_step_outcomes_task_references(tmp_path, r
     ])
 
     assert report["delegation_detail"][0]["handback_visible_task_ids"] == visible
+
+
+def _handoff(minute, *, graph, title="Step", goto=None):
+    """A transfer_to_* span whose output is the handoff Command as Phoenix records it."""
+    if goto is None:
+        goto = "Mythic_Operator" if graph == "__parent__" else []
+    return _tool(minute, "transfer_to_Mythic_Operator", agent="Supervisor",
+                 input_value=json.dumps({"handoff_title": title, "handoff_instruction": "do it"}),
+                 output_value=json.dumps({"graph": graph, "goto": goto, "update": {"messages": []}}))
+
+
+def test_a_rejected_brief_is_not_a_delegation(tmp_path):
+    report = _report(tmp_path, [
+        _llm(1, "Supervisor"),
+        _handoff(2, graph=None, title="Rejected"),          # brief failed its checks: reached no worker
+        _llm(3, "Supervisor"),
+        _handoff(4, graph="__parent__", title="Accepted"),
+        _llm(5, "Mythic_Operator"),
+        _llm(6, "Supervisor"),
+    ])
+
+    assert report["delegations"] == 1
+    assert report["rejected_briefs"] == 1
+    assert report["returns_to_supervisor"] == 1
+    assert report["delegation_targets"] == {"Mythic_Operator": 1}
+    assert [d["step_kind"] for d in report["delegation_detail"]] == ["not_dispatched", "model"]
+
+
+def test_a_second_rejection_that_ends_the_step_is_not_a_delegation(tmp_path):
+    """Near-match: this rejection returns to the parent graph, but to end the step rather than reach the worker."""
+    report = _report(tmp_path, [
+        _llm(1, "Supervisor"),
+        _handoff(2, graph=None),
+        _llm(3, "Supervisor"),
+        _handoff(4, graph="__parent__", goto="__end__"),
+    ])
+
+    assert report["delegations"] == 0
+    assert report["rejected_briefs"] == 2
+
+
+def test_a_handoff_output_without_the_graph_field_counts_as_dispatched(tmp_path):
+    """Near-match: runs from before the brief check recorded plain text, and every handoff was dispatched."""
+    report = _report(tmp_path, [
+        _tool(1, "transfer_to_Mythic_Operator", input_value="go", agent="Supervisor",
+              output_value="Delegated to Mythic_Operator with instruction: go"),
+        _llm(2, "Mythic_Operator"),
+    ])
+
+    assert report["delegations"] == 1 and report["rejected_briefs"] == 0
+
+
+def test_tasks_a_procedure_issued_are_counted_from_the_mythic_export(tmp_path):
+    export_tasks = [
+        {"display_id": 18, "timestamp": "2026-10-30T00:03:30"},   # inside the window, issued by the procedure
+        {"display_id": 1, "timestamp": "2026-10-30T00:04:00"},    # also seen in a tool output: counted once
+        {"display_id": 19, "timestamp": "2026-10-30T00:12:00"},   # after control returned
+        {"display_id": 20, "timestamp": "2026-10-29T23:59:00"},   # before the handoff
+    ]
+    db = _phoenix(tmp_path / "phoenix.db", [
+        _llm(1, "Supervisor"),
+        _handoff(2, graph="__parent__"),
+        _tool(3, "execute_capability", input_value='{"capability": "collect-graph"}', output_value="ok"),
+        _task(4, 1),
+        _llm(10, "Supervisor", prompt_text="task 18 completed"),
+    ])
+    report = metrics.request_metrics(
+        metrics.load_spans(db, REQUEST["created_at"], REQUEST["completed_at"]), REQUEST, None, export_tasks)
+
+    (delegation,) = report["delegation_detail"]
+    assert delegation["issued_task_ids"] == [1, 18]
+    assert delegation["handback_visible_task_ids"] == [18]
+    assert report["issued_tasks"] == 2
+
+
+def test_without_export_tasks_only_tool_outputs_count(tmp_path):
+    report = _report(tmp_path, [_handoff(1, graph="__parent__"), _task(2, 5), _llm(3, "Supervisor")])
+
+    assert report["delegation_detail"][0]["issued_task_ids"] == [5]
+
+
+@pytest.mark.parametrize("worker_spans, kind", [
+    ([_llm(3, "Mythic_Operator"), _task(4, 1)], "model"),
+    ([_tool(3, "execute_capability"), _tool(4, "get_task_output"), _tool(5, "get_task_output")], "sage_run"),
+    ([], "ended_before_model"),
+])
+def test_step_kind_tells_model_work_from_sage_run_procedures_and_dead_steps(tmp_path, worker_spans, kind):
+    report = _report(tmp_path, [_llm(1, "Supervisor"), _handoff(2, graph="__parent__"), *worker_spans,
+                                _llm(9, "Supervisor")])
+
+    assert report["delegation_detail"][0]["step_kind"] == kind
+    assert report["step_kinds"] == {kind: 1}

@@ -38,7 +38,14 @@ METHODS = {
     "delegation_window": "transfer_to_* tool span start -> next Supervisor model call start, else request end",
     "title_only": "handoff input carries no handoff_instruction (the worker then receives only the operator input)",
     "prompt_coverage": "share of the request prompt's distinct words present in the instruction; reported, never a gate",
-    "issued_tasks": f"task_display_id values in {TASK_TOOL} tool outputs inside the window",
+    "dispatched": "the transfer_to_* output is a Command whose goto names that worker; a rejected brief goes "
+                  "nowhere (goto []) or ends the step (goto __end__ after a second rejection). Outputs without a "
+                  "goto field (runs before the brief check) count as dispatched",
+    "issued_tasks": f"task_display_id values in {TASK_TOOL} tool outputs inside the window, plus export tasks "
+                    "whose Mythic timestamp falls inside the window (tasks a Sage-owned procedure issued)",
+    "step_kind": "dispatched steps only: 'model' when the worker made a model call; 'sage_run' when tools ran with no "
+                 "worker model call (a procedure Sage proposed itself, so its tool calls and repeats are Sage's "
+                 "polling, not model choices); 'ended_before_model' when neither ran",
     "repeat_tool_calls": "tool spans in the window whose name+input hash was already seen in the same window",
     "handback_visibility": "issued task ids named (task_display_id=N, JSON task_id, 'task N', 'Task #N') in the "
                            "Supervisor's next model input",
@@ -119,7 +126,23 @@ def _seconds(start: str, end: str) -> float:
     return round((_utc(end) - _utc(start)).total_seconds(), 1)
 
 
-def delegation_metrics(spans: list[dict[str, Any]], prompt: str, request_end: str) -> list[dict[str, Any]]:
+def dispatched(handoff: dict[str, Any]) -> bool:
+    payload = _json(handoff["output"])
+    if isinstance(payload, dict) and "goto" in payload:
+        return payload["goto"] == handoff["name"][len(HANDOFF_PREFIX):]
+    return True
+
+
+def step_kind(is_dispatched: bool, model_calls: int, tool_calls: int) -> str:
+    if not is_dispatched:
+        return "not_dispatched"
+    if model_calls:
+        return "model"
+    return "sage_run" if tool_calls else "ended_before_model"
+
+
+def delegation_metrics(spans: list[dict[str, Any]], prompt: str, request_end: str,
+                       export_tasks: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     supervisor_calls = [s for s in spans if s["kind"] == "LLM" and s["agent"] == SUPERVISOR]
     handoffs = [s for s in spans if s["kind"] == "TOOL" and s["name"].startswith(HANDOFF_PREFIX)]
     results = []
@@ -129,7 +152,9 @@ def delegation_metrics(spans: list[dict[str, Any]], prompt: str, request_end: st
         window = [s for s in spans if handoff["start"] < s["start"] < end]
         tools = [s for s in window if s["kind"] == "TOOL" and not s["name"].startswith(HANDOFF_PREFIX)]
         issued = sorted({int(m) for s in tools if s["name"] == TASK_TOOL
-                         for m in ISSUED_TASK_ID.findall(str(s["output"] or ""))})
+                         for m in ISSUED_TASK_ID.findall(str(s["output"] or ""))}
+                        | {int(t["display_id"]) for t in export_tasks or []
+                           if t.get("timestamp") and _utc(handoff["start"]) <= _utc(str(t["timestamp"])) < _utc(end)})
         seen: set[str] = set()
         repeats = 0
         for tool in tools:
@@ -141,12 +166,16 @@ def delegation_metrics(spans: list[dict[str, Any]], prompt: str, request_end: st
             text = json.dumps(returned["llm_input"], ensure_ascii=False) if returned["llm_input"] is not None else ""
             shown = {int(m) for m in CITED_TASK_ID.findall(text)}
             visible = sorted(set(issued) & shown)
+        is_dispatched = dispatched(handoff)
+        model_calls = sum(1 for s in window if s["kind"] == "LLM" and s["agent"] != SUPERVISOR)
         results.append({
             **brief_of(handoff, prompt),
             "started_at": handoff["start"],
+            "dispatched": is_dispatched,
+            "step_kind": step_kind(is_dispatched, model_calls, len(tools)),
             "returned": returned is not None,
             "wall_seconds": _seconds(handoff["start"], end),
-            "worker_model_calls": sum(1 for s in window if s["kind"] == "LLM" and s["agent"] != SUPERVISOR),
+            "worker_model_calls": model_calls,
             "tool_calls": len(tools),
             "tool_errors": sum(1 for s in tools if s["error"]),
             "repeat_tool_calls": repeats,
@@ -166,9 +195,11 @@ def card_metrics(cards: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def request_metrics(spans: list[dict[str, Any]], request: dict[str, Any],
-                    cards: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+                    cards: list[dict[str, Any]] | None = None,
+                    export_tasks: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     prompt = str(request.get("prompt") or "")
-    delegations = delegation_metrics(spans, prompt, str(request["completed_at"]))
+    handoffs = delegation_metrics(spans, prompt, str(request["completed_at"]), export_tasks)
+    delegations = [d for d in handoffs if d["dispatched"]]
     supervisor_starts = [s["start"] for s in spans if s["kind"] == "LLM" and s["agent"] == SUPERVISOR]
     gaps = [_seconds(a, b) for a, b in zip(supervisor_starts, supervisor_starts[1:])]
     issued = sum(len(d["issued_task_ids"]) for d in delegations)
@@ -180,6 +211,8 @@ def request_metrics(spans: list[dict[str, Any]], request: dict[str, Any],
         "supervisor_model_calls": len(supervisor_starts),
         "max_seconds_between_supervisor_calls": max(gaps) if gaps else None,
         "delegations": len(delegations),
+        "rejected_briefs": len(handoffs) - len(delegations),
+        "step_kinds": dict(Counter(d["step_kind"] for d in delegations)),
         "delegation_targets": dict(Counter(d["target"] for d in delegations)),
         "returns_to_supervisor": sum(d["returned"] for d in delegations),
         "issued_tasks": issued,
@@ -189,28 +222,30 @@ def request_metrics(spans: list[dict[str, Any]], request: dict[str, Any],
                                    and s["output"] not in (None, "null")),
         "prompt_tokens": sum(s["prompt_tokens"] for s in spans if s["kind"] == "LLM"),
         "completion_tokens": sum(s["completion_tokens"] for s in spans if s["kind"] == "LLM"),
-        "delegation_detail": delegations,
+        "delegation_detail": handoffs,
     }
 
 
 def render_markdown(report: dict[str, Any]) -> str:
-    lines = ["| Request | Prompt | Wall | Delegations (targets) | Returns | Max gap between Supervisor calls | "
-             "Issued tasks | Handback task visibility | Approval cards (status) | Median decision | Interrupts |",
-             "|" + "---|" * 11]
+    lines = ["| Request | Prompt | Wall | Delegations (targets) | Rejected briefs | Returns | "
+             "Max gap between Supervisor calls | Issued tasks | Handback task visibility | Approval cards (status) | "
+             "Median decision | Interrupts |",
+             "|" + "---|" * 12]
     for r in report["requests"]:
         statuses = ", ".join(f"{k} {v}" for k, v in (r.get("approval_cards_by_status") or {}).items())
         lines.append(
             f"| {r['request_id']} | {r['prompt'][:60]} | {r['wall_seconds'] / 60:.1f} min | {r['delegations']} "
-            f"({', '.join(f'{k} {v}' for k, v in r['delegation_targets'].items())}) | {r['returns_to_supervisor']} | "
+            f"({', '.join(f'{k} {v}' for k, v in r['delegation_targets'].items())}) | {r['rejected_briefs']} | "
+            f"{r['returns_to_supervisor']} | "
             f"{(r['max_seconds_between_supervisor_calls'] or 0) / 60:.1f} min | {r['issued_tasks']} | "
             f"{r['handback_task_visibility']} | {r.get('approval_cards', '—')} ({statuses}) | "
             f"{r.get('median_decision_seconds', '—')} s | {r['approval_interrupts']} |")
-    lines += ["", "| Request | Delegation | Title | Title only | Prompt coverage | Worker model calls | Tool calls | "
-              "Repeats | Errors | Wall | Issued | Visible at return |", "|" + "---|" * 12]
+    lines += ["", "| Request | Handoff | Title | Step kind | Title only | Prompt coverage | Worker model calls | "
+              "Tool calls | Repeats | Errors | Wall | Issued | Visible at return |", "|" + "---|" * 13]
     for r in report["requests"]:
         for i, d in enumerate(r["delegation_detail"], 1):
             lines.append(
-                f"| {r['request_id']} | {i} → {d['target']} | {d['title'][:40]} | {d['title_only']} | "
+                f"| {r['request_id']} | {i} → {d['target']} | {d['title'][:40]} | {d['step_kind']} | {d['title_only']} | "
                 f"{d['prompt_coverage']} | {d['worker_model_calls']} | {d['tool_calls']} | "
                 f"{d['repeat_tool_calls']} | {d['tool_errors']} | {d['wall_seconds'] / 60:.1f} min | "
                 f"{len(d['issued_task_ids'])} | "
@@ -224,7 +259,8 @@ def build_report(phoenix: Path, export: dict[str, Any], request_ids: list[int] |
     return {
         "methods": METHODS,
         "requests": [request_metrics(load_spans(phoenix, str(r["created_at"]), str(r["completed_at"])), r,
-                                     None if cards is None else [c for c in cards if c["request_id"] == r["id"]])
+                                     None if cards is None else [c for c in cards if c["request_id"] == r["id"]],
+                                     export.get("tasks"))
                      for r in requests],
     }
 
