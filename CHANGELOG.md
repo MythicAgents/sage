@@ -110,6 +110,15 @@ between minor releases.
 
 ### Fixed
 
+- A supervised step may now target a host or GPO that Sage knows from its own attack-graph facts. The scope check on
+  a step's brief admitted only targets named in the operator's request, in callback listings, footholds or ledger
+  hops, and the domains in graph facts, never the hosts and GPOs those facts name. A step aimed at the domain
+  controller on a graph-confirmed GPO path was therefore rejected, even though the capability that performs the
+  step finds that same controller from the same fact. The check now reads the GPO-to-host facts and admits the full
+  host name and the GPO name (also in its `NAME@DOMAIN` form). A bare host label passes only when exactly one known
+  host carries it, so a label seen in one domain is never admitted in another, and GPO GUIDs are still not
+  targets.
+
 - A worker step is no longer stopped before it starts by callback listings made earlier. The guard that ends a
   worker stuck re-reading the same Mythic data counted every `list_callbacks` read on the shared client,
   including the Supervisor's own reads while filling supervised briefs and reads from earlier steps. After six

@@ -579,3 +579,85 @@ def test_scope_renders_only_what_sage_enforces(brief, present, absent):
 @pytest.mark.parametrize("brief", [None, {}, {"callback_display_id": "2", "targets": ["corp.test"]}, "scope"])
 def test_no_scope_renders_nothing(brief):
     assert hb.render_scope(brief) == ""
+
+
+# --- Targets Sage knows only from its graph facts ---------------------------------------------------------------
+
+NORTH_PROMPT = "proceed"
+GPO_DC_FACT = "gpo-affects-dc:starkwallpaper:winterfell:north.sevenkingdoms.local"
+
+
+def _graph_scope(*predicates: str, operator_input: str = NORTH_PROMPT) -> hb.KnownScope:
+    facts = [SimpleNamespace(predicate=predicate) for predicate in predicates]
+    return hb.known_scope(_client(_engagement_graph_facts=facts), operator_input=operator_input)
+
+
+@pytest.mark.parametrize("target", ["WINTERFELL.NORTH.SEVENKINGDOMS.LOCAL", "winterfell", "WINTERFELL"])
+def test_a_host_named_by_a_graph_fact_is_an_observed_target(target):
+    assert _graph_scope(GPO_DC_FACT, "trust-reachable:north.sevenkingdoms.local:essos.local").names_target(target)
+
+
+@pytest.mark.parametrize("target", ["WINTERFELL.NORTH.SEVENKINGDOMS.LOCAL", "winterfell", "STARKWALLPAPER"])
+def test_without_the_fact_the_same_targets_are_rejected(target):
+    assert not _graph_scope("trust-reachable:north.sevenkingdoms.local:essos.local").names_target(target)
+
+
+def test_a_graph_host_label_is_not_admitted_in_another_known_domain():
+    scope = _graph_scope(GPO_DC_FACT, "trust-reachable:north.sevenkingdoms.local:essos.local")
+    assert "essos.local" in scope.domains
+    assert not scope.names_target("WINTERFELL.ESSOS.LOCAL")
+
+
+def test_a_bare_label_two_known_hosts_share_is_ambiguous():
+    scope = _graph_scope(GPO_DC_FACT, "gpo-affects-computer:otherpolicy:winterfell:essos.local")
+    assert scope.names_target("winterfell.essos.local")
+    assert not scope.names_target("winterfell")
+
+
+@pytest.mark.parametrize("target, ok", [
+    ("STARKWALLPAPER", True),
+    ("STARKWALLPAPER@NORTH.SEVENKINGDOMS.LOCAL", True),
+    ("STARKWALLPAPER@CONTOSO.LOCAL", False),
+    ("OTHERPOLICY", False),
+    ("4B98578C-80BF-4765-8222-99085D0C5298", False),
+    ("{3F1C08F5-D531-4D99-83B3-5CCF0A3981EF}", False),
+])
+def test_a_gpo_named_by_a_graph_fact_is_an_observed_target(target, ok):
+    scope = _graph_scope(GPO_DC_FACT, "generic-write:gpo:starkwallpaper",
+                         "gpo-guid:starkwallpaper:3f1c08f5-d531-4d99-83b3-5ccf0a3981ef")
+    assert scope.names_target(target) is ok
+
+
+@pytest.mark.parametrize("predicate", [
+    "generic-write:computer:winterfell",          # no domain: never admitted
+    "gpo-affects-dc:starkwallpaper:winterfell",   # a segment missing
+    "gpo-affects-dc:starkwallpaper:winterfell:north.sevenkingdoms.local:extra",
+    "gpo-affects-dc:starkwallpaper::north.sevenkingdoms.local",
+])
+def test_facts_of_any_other_shape_name_no_host(predicate):
+    scope = _graph_scope(predicate)
+    assert not scope.names_target("WINTERFELL.NORTH.SEVENKINGDOMS.LOCAL")
+    assert not scope.names_target("winterfell")
+
+
+def test_the_channel_18_dc_step_is_admitted_from_the_graph_facts_sage_held():
+    """The rejected live brief (targets: the DC and its domain), against the facts the live ledger held."""
+
+    scope = _graph_scope(
+        "generic-write:gpo:starkwallpaper",
+        "gpo-domain:starkwallpaper:north.sevenkingdoms.local",
+        "gpo-guid:starkwallpaper:3f1c08f5-d531-4d99-83b3-5ccf0a3981ef",
+        "gpo-affects-computer:starkwallpaper:castelblack:north.sevenkingdoms.local",
+        "gpo-affects-computer:starkwallpaper:winterfell:north.sevenkingdoms.local",
+        GPO_DC_FACT,
+        "trust-reachable:sevenkingdoms.local:north.sevenkingdoms.local",
+        operator_input="OK, execute it",
+    )
+    brief = _brief(
+        callback_display_id="3",
+        allowed_capabilities=["gpo-controlled-system-exec"],
+        targets=["WINTERFELL.NORTH.SEVENKINGDOMS.LOCAL", "NORTH.SEVENKINGDOMS.LOCAL"],
+        expected_result="SYSTEM-level code execution on the domain controller via the GPO",
+    )
+
+    assert _errors(brief, scope) == ()

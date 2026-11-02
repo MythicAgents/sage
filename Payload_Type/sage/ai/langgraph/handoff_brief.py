@@ -123,16 +123,21 @@ class KnownScope:
     principals: frozenset[str] = frozenset()
     tasks: frozenset[str] = frozenset()
     credentials: frozenset[str] = frozenset()
+    objects: frozenset[str] = frozenset()
 
     def names_target(self, target: str) -> bool:
         name = _name(target)
         if not name:
             return False
-        if name in self.hosts or name in self.domains or name in self.principals:
+        if name in self.hosts or name in self.domains or name in self.principals or name in self.objects:
             return True
         if _named_in(name, self.operator_input):
             return True
         if "." not in name and len([d for d in self.domains if d.split(".", 1)[0] == name]) == 1:
+            return True
+        # A bare label names a host only when exactly one known full host name carries it, so a label seen in one
+        # domain is never admitted in another.
+        if "." not in name and len([h for h in self.hosts if "." in h and h.split(".", 1)[0] == name]) == 1:
             return True
         label, _, rest = name.partition(".")
         if rest and label in self.hosts and rest in self.domains:
@@ -141,7 +146,8 @@ class KnownScope:
             left, found, right = name.partition(separator)
             if found:
                 user, domain = (right, left) if separator == "\\" else (left, right)
-                if user in self.principals and (domain in self.domains or self.names_target(domain)):
+                if (user in self.principals or user in self.objects) and (
+                        domain in self.domains or self.names_target(domain)):
                     return True
         return False
 
@@ -149,6 +155,27 @@ class KnownScope:
 def _named_in(name: str, text: str) -> bool:
     pattern = r"(?<![\w.\\@-])" + re.escape(name) + r"(?![\w\\@-]|\.\w)"
     return re.search(pattern, text.casefold()) is not None
+
+
+# Graph facts that name a host and the GPO applying to it, as `graph_reconciler` writes them:
+# `<kind>:{gpo}:{short_host}:{domain}`.
+_GPO_HOST_FACTS = ("gpo-affects-computer", "gpo-affects-dc")
+
+
+def _graph_fact_names(predicate: str) -> tuple[set[str], set[str]]:
+    """The full host names and directory objects (GPOs) one graph fact names; empty sets for any other shape.
+
+    Only facts whose layout is known are read. `generic-write:computer:{short_host}` is skipped: it carries no
+    domain, and a bare label would otherwise be admitted in every known domain.
+    """
+    kind, _, rest = predicate.partition(":")
+    parts = [_name(part) for part in rest.split(":")]
+    if kind in _GPO_HOST_FACTS and len(parts) == 3 and all(parts) and "." in parts[2]:
+        gpo, host, domain = parts
+        return {host if "." in host else f"{host}.{domain}"}, {gpo}
+    if kind == "generic-write" and len(parts) == 2 and parts[0] == "gpo" and parts[1]:
+        return set(), {parts[1]}
+    return set(), set()
 
 
 def known_scope(mythic_client: Any, *, operator_input: str = "", bound_callback: Any = "") -> KnownScope:
@@ -159,6 +186,7 @@ def known_scope(mythic_client: Any, *, operator_input: str = "", bound_callback:
     principals: set[str] = set()
     tasks: set[str] = set(_TASK_IN_TEXT_RE.findall(operator_input or ""))
     credentials: set[str] = set()
+    objects: set[str] = set()
 
     def principal(value: Any) -> None:
         text = _name(value)
@@ -193,9 +221,13 @@ def known_scope(mythic_client: Any, *, operator_input: str = "", bound_callback:
             tasks.update(_items(evidence.get(key) for key in ("mythic_task_id", "task_id", "display_id")
                                 if evidence.get(key) is not None))
     for fact in attr("_engagement_graph_facts", list):
-        for segment in str(getattr(fact, "predicate", "") or "").split(":")[1:]:
+        predicate = str(getattr(fact, "predicate", "") or "")
+        for segment in predicate.split(":")[1:]:
             if "." in segment:
                 domains.add(_name(segment))
+        fact_hosts, fact_objects = _graph_fact_names(predicate)
+        hosts.update(fact_hosts)
+        objects.update(fact_objects)
     for cache in ("_task_source_request_ids", "_task_output_record_cache", "_task_output_cache"):
         tasks.update(str(key) for key in attr(cache, dict))
     last_task = getattr(mythic_client, "_last_issued_task_display_id", None)
@@ -223,6 +255,7 @@ def known_scope(mythic_client: Any, *, operator_input: str = "", bound_callback:
         principals=frozenset(principals - {""}),
         tasks=frozenset(tasks - {""}),
         credentials=frozenset(credentials - {""}),
+        objects=frozenset(objects - {""}),
     )
 
 
