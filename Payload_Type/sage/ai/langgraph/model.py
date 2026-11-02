@@ -3269,9 +3269,10 @@ class _ReconRereadStopMiddleware(AgentMiddleware):
         self._model = model
         self._agent_name = agent_name or "worker"
         self._limit = max(2, int(limit))
-        self._delegation_key = ""
+        self._delegation_key: Any = ""
         self._tripped = False
         self._trip_streak = 0
+        self._trip_peak: tuple[str, str] = ("", "")
 
     def _current_delegation_key(self) -> str:
         try:
@@ -3282,13 +3283,21 @@ class _ReconRereadStopMiddleware(AgentMiddleware):
             pass
         return self._agent_name
 
+    def _current_epoch(self) -> Any:
+        client = getattr(self._model, "mythic_client", None)
+        return getattr(client, "_recon_epoch", None)
+
     def _reset_for_delegation(self) -> None:
-        current = self._current_delegation_key()
+        # A trip belongs to one delegation and one recon epoch. Keying on the epoch as well means a new
+        # worker delegation (which starts a fresh epoch) clears the trip even in headless runs, where no
+        # delegation card is opened and the delegation id never changes.
+        current = (self._current_delegation_key(), self._current_epoch())
         if current == self._delegation_key:
             return
         self._delegation_key = current
         self._tripped = False
         self._trip_streak = 0
+        self._trip_peak = ("", "")
 
     def _current_streak(self) -> int:
         client = getattr(self._model, "mythic_client", None)
@@ -3328,6 +3337,12 @@ class _ReconRereadStopMiddleware(AgentMiddleware):
         self._tripped = True
         self._trip_streak = streak
         try:
+            peak = getattr(getattr(self._model, "mythic_client", None), "_recon_reread_peak", None)
+            tool, target, _count = peak() if callable(peak) else ("", "", 0)
+            self._trip_peak = (str(tool or ""), str(target or ""))
+        except Exception:
+            self._trip_peak = ("", "")
+        try:
             logger.info(
                 "🛑 [recon-reread-boundary] ending %s after %s identical recon re-reads "
                 "with no command issued in delegation %r",
@@ -3338,11 +3353,32 @@ class _ReconRereadStopMiddleware(AgentMiddleware):
         except Exception:
             pass
 
-    def _before_model_update(self) -> dict[str, str] | None:
+    def _boundary_message(self) -> AIMessage:
+        """The typed observation the stop leaves behind, so the handback says why the step ended."""
+        tool, target = self._trip_peak
+        boundary = {
+            "capability": "recon-reread-boundary",
+            "tool": tool,
+            "target": target,
+            "count": self._trip_streak,
+            "limit": self._limit,
+        }
+        what = f"{tool or 'a recon read'}" + (f" for target {target!r}" if target else "")
+        return AIMessage(
+            content=(
+                f"[recon-reread-boundary] This step stopped: {what} was read {self._trip_streak} times "
+                f"with no task issued since (limit {self._limit}). The data is unchanged, so re-reading "
+                "is not progress. Act on the data already collected or name the blocker."
+            ),
+            name=self._agent_name,
+            additional_kwargs={"_recon_reread_boundary": boundary},
+        )
+
+    def _before_model_update(self) -> dict[str, Any] | None:
         self._reset_for_delegation()
         self._observe()
         if self._tripped:
-            return {"jump_to": "end"}
+            return {"jump_to": "end", "messages": [self._boundary_message()]}
         return None
 
     @hook_config(can_jump_to=["end"])
@@ -9618,6 +9654,36 @@ class Model:
             additional_kwargs={"_empty_delegation_return": True},
         )
 
+    def _begin_worker_recon_scope(self, node_name: str, channel: list) -> None:
+        """Start a fresh recon epoch when a worker begins a new delegated instruction.
+
+        The recon re-read counter lives on the shared Mythic client, so reads made by the Supervisor
+        (which lists callbacks itself to fill a supervised brief) or by earlier delegations would
+        otherwise count against this worker and could stop it before its first model call. A resumed
+        invocation of the same delegated instruction (an approval resume) keeps its count.
+        """
+        try:
+            delegated = next(
+                (
+                    msg
+                    for msg in reversed(channel)
+                    if isinstance(msg, HumanMessage) and msg.additional_kwargs.get("_delegated_to") == node_name
+                ),
+                None,
+            )
+            if delegated is None:
+                return
+            marker = (str(getattr(delegated, "id", "") or ""), _get_seq(delegated))
+            markers = self.__dict__.setdefault("_recon_scope_markers", {})
+            if marker != ("", 0) and markers.get(node_name) == marker:
+                return
+            markers[node_name] = marker
+            start = getattr(getattr(self, "mythic_client", None), "_start_recon_scope", None)
+            if callable(start):
+                start()
+        except Exception as e:
+            logger.debug(f"_begin_worker_recon_scope failed (non-fatal): {e}")
+
     def _wrap_create_agent(self, agent_runnable, state_key: str, node_name: str):
         """Wrap a create_agent runnable so it only sees & updates its own message list
         while keeping a global 'messages' list for tool compatibility.
@@ -9655,6 +9721,9 @@ class Model:
                 else:
                     cleaned_channel.append(msg)
             channel = cleaned_channel
+
+            if node_name != "Supervisor":
+                self._begin_worker_recon_scope(node_name, channel)
 
             try:
                 if node_name == "Supervisor":

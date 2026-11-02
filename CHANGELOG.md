@@ -110,6 +110,15 @@ between minor releases.
 
 ### Fixed
 
+- A worker step is no longer stopped before it starts by callback listings made earlier. The guard that ends a
+  worker stuck re-reading the same Mythic data counted every `list_callbacks` read on the shared client,
+  including the Supervisor's own reads while filling supervised briefs and reads from earlier steps. After six
+  such reads with no task issued, each new Mythic worker step ended before its first model call and handed back
+  nothing; the Supervisor re-sent the step until the no-progress stop ended the request. Each new delegated
+  step now starts its own count, while a worker re-reading the same data within one step is still stopped at
+  six reads. When the stop fires, the step's handback names the tool, the target, the count and the limit
+  instead of returning empty.
+
 - A supervised capability step now grounds its known context from engagement state and, when it still cannot be
   planned, returns to the worker instead of ending the request. The worker proposed a GPO SYSTEM-execution
   capability naming only the callback and GPO; the planner needed the controlled principal and the affected

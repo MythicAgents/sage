@@ -20771,6 +20771,30 @@ class MythicTools:
         except Exception:  # pragma: no cover - diagnostics must never break a tool call
             return 0
 
+    def _recon_reread_peak(self) -> tuple[str, str, int]:
+        """The (tool, target, count) of the most re-read recon target in the current epoch, or ("", "", 0).
+
+        Lets the structural stop name what was re-read instead of ending the worker's turn silently.
+        """
+        try:
+            epoch = self._recon_epoch
+            best = ("", "", 0)
+            for (tool, key, key_epoch), count in self._recon_call_log.items():
+                if key_epoch == epoch and count > best[2]:
+                    best = (str(tool), str(key), int(count))
+            return best
+        except Exception:  # pragma: no cover - diagnostics must never break a tool call
+            return ("", "", 0)
+
+    def _start_recon_scope(self) -> None:
+        """Start a fresh recon epoch for a new worker delegation.
+
+        The counter lives on this shared client, so without this the Supervisor's own brief-filling
+        `list_callbacks` reads, and earlier delegations' reads, counted against the next worker and
+        could stop it before its first model call. Reads repeated inside one delegation still count.
+        """
+        self._recon_epoch = int(getattr(self, "_recon_epoch", 0) or 0) + 1
+
     @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def get_ttp_full_reference(
         self,
