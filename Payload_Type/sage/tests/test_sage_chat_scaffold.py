@@ -3558,6 +3558,85 @@ def test_hitl_reject_resumes_deny():
     assert len(chat.terminal_emissions) == 1
 
 
+class _ResumeFinalReportModel(_HitlModel):
+    """Request shape from supervised channel 5, requests 2/4/8/10.
+
+    Before the card, the worker opens a tool card. After the operator accepts (the same Mythic request
+    resumes), the worker streams its final report, and the resume cleanup then terminalizes the
+    pre-card tool card in place.
+    """
+
+    async def invoke(self, prompt, is_interactive=False):
+        await self._response_emitter.emit_tool_use(
+            event_id="tool:pre-card", tool_call_id="c1", tool_name="issue_task_and_waitfor_task_output",
+            tool_source="mythic", status="started", content="", complete=False,
+        )
+        await super().invoke(prompt, is_interactive)
+
+    async def handle_hitl_resume(self, decision, thread_id, **kwargs):
+        self.resumed_with = decision
+        self._pending = False
+        await self._response_emitter("📊 **Final Report**\nCollection verified.")
+        await self._response_emitter.emit_tool_use(
+            event_id="tool:pre-card", tool_call_id="c1", tool_name="issue_task_and_waitfor_task_output",
+            tool_source="mythic", status="cancelled", content="", complete=True,
+        )
+        return ""
+
+
+def _accepted_resume_of_same_request(model, request_id):
+    chat = _HitlDriverChat(model)
+    _run(chat.chat(build_chat_request("collect", channel_id=5, request_id=request_id)))
+    assert chat.terminal_emissions == []
+    resume = build_chat_request("", channel_id=5, request_id=request_id)
+    resume.InputResponse = _input_response_for_context("accept", model._pending_approval_context)
+    _run(chat.chat(resume))
+    return chat
+
+
+def test_resumed_request_finalizes_its_final_report_once_after_closing_a_pre_card_tool():
+    chat = _accepted_resume_of_same_request(_ResumeFinalReportModel(), request_id=8)
+    assert len(chat.terminal_emissions) == 1
+    terminal = chat.terminal_emissions[0]
+    # The final report block is finalized in place; no second copy is created under the turn key.
+    assert terminal["response_key"] == "assistant:8:1"
+    assert terminal["content"].startswith("📊 **Final Report**")
+    assert not [e for e in chat.emissions if e["response_key"] == "assistant:8:turn"]
+
+
+def test_resumed_request_still_puts_the_terminal_after_a_row_created_after_the_final_block():
+    class _NewCardAfterFinal(_ResumeFinalReportModel):
+        async def handle_hitl_resume(self, decision, thread_id, **kwargs):
+            await super().handle_hitl_resume(decision, thread_id, **kwargs)
+            await self._response_emitter.emit_tool_use(
+                event_id="tool:post-final", tool_call_id="c2", tool_name="list_callbacks",
+                tool_source="mythic", status="finished", content="done", complete=True,
+            )
+            return ""
+
+    chat = _accepted_resume_of_same_request(_NewCardAfterFinal(), request_id=8)
+    assert chat.terminal_emissions[-1]["response_key"] == "assistant:8:turn"
+
+
+def test_stream_emitter_continues_row_order_only_for_the_same_request():
+    async def run(previous_request_id):
+        previous = ChatStreamEmitter(HeadlessSageChat(), build_chat_request("x", channel_id=5, request_id=previous_request_id))
+        await previous.emit_tool_use(event_id="tool:pre-card", tool_call_id="c1", tool_name="t",
+                                     tool_source="mythic", status="started", content="", complete=False)
+        await previous("before the card")
+        emitter = ChatStreamEmitter(HeadlessSageChat(), build_chat_request("", channel_id=5, request_id=8),
+                                    continues=previous)
+        await emitter("final report")
+        await emitter.emit_tool_use(event_id="tool:pre-card", tool_call_id="c1", tool_name="t",
+                                    tool_source="mythic", status="cancelled", content="", complete=True)
+        return emitter.reusable_terminal_key()
+
+    # Same request: the pre-card card is an existing row, and block numbering continues.
+    assert asyncio.run(run(8)) == "assistant:8:2"
+    # A different request shares nothing with the previous emitter.
+    assert asyncio.run(run(7)) == ""
+
+
 def test_multi_action_native_card_uses_batch_approval():
     """Multi-action HITL cards use send_approval_request (batch Accept/Reject), not single_choice."""
     model = _MultiHitlModel()

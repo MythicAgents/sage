@@ -1166,10 +1166,13 @@ class SageChat(Chat):
             # should gain controller-native HITL without requiring a process restart.
             model.command_name = "chat"
             # Re-bind per-turn: the stream + card emitters are scoped to THIS request; the thread key is the
-            # current collision-resistant channel generation. Never cache emitters across turns. _hitl_card_pending
-            # is reset each turn; the interrupt surface sets it True when it emits a channel-release card,
+            # current collision-resistant channel generation. Never cache emitters across turns; an
+            # approval resume of the same request only continues the previous emitter's row
+            # bookkeeping. _hitl_card_pending is reset each turn; the interrupt surface sets it True when it emits a channel-release card,
             # so we then return None and let run_chat_turn skip its own terminal completion.
-            stream_emitter = ChatStreamEmitter(self, request)
+            stream_emitter = ChatStreamEmitter(
+                self, request, continues=getattr(model, "_response_emitter", None)
+            )
             model._response_emitter = stream_emitter
             retry_state = getattr(model, "_provider_retry_state", None)
             if retry_state is not None:

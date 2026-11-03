@@ -19,6 +19,15 @@ from typing import Any
 from mythic_container.ChatBase import ChatRequest
 
 
+def _same_request(left: Any, right: Any) -> bool:
+    request_id = getattr(left, "RequestID", None)
+    return (
+        request_id is not None
+        and request_id == getattr(right, "RequestID", None)
+        and getattr(left, "ChannelID", None) == getattr(right, "ChannelID", None)
+    )
+
+
 class ChatStreamEmitter:
     """Callable matching ``Model``'s ``response_emitter: Callable[[str], Awaitable[bool]]``.
 
@@ -26,7 +35,7 @@ class ChatStreamEmitter:
     ``request`` is the live ``ChatRequest`` for this turn. One emitter is bound per turn.
     """
 
-    def __init__(self, chat: Any, request: ChatRequest):
+    def __init__(self, chat: Any, request: ChatRequest, continues: Any = None):
         self._chat = chat
         self._request = request
         self._block = 0
@@ -37,6 +46,14 @@ class ChatStreamEmitter:
         # sends to the same key update it in place).
         self._created: dict[str, int] = {}
         self._assistant_key = ""
+        if isinstance(continues, ChatStreamEmitter) and _same_request(continues._request, request):
+            # An approval resume is the same Mythic request bound to a new emitter. The rows created
+            # before the card still exist: updating one of them later creates nothing, and new blocks
+            # must not reuse their keys. The main-window block is not carried over, because the card
+            # row sits between it and anything the resume emits.
+            self._created = dict(continues._created)
+            self._block = continues._block
+            self._agent_text_block = continues._agent_text_block
 
     def note_created(self, response_key: str) -> None:
         """Record that a send created (or may have created) the row for ``response_key``."""
