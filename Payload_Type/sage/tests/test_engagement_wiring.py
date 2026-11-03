@@ -104,7 +104,8 @@ def _record_success(mt, output):
     )
 
 
-def _task_proof(task_id, callback_id="13", *, engagement_id=None, command="test-command", verifier_id="test:fixture"):
+def _task_proof(task_id, callback_id="13", *, engagement_id=None, command="test-command", verifier_id="test:fixture",
+                transaction_id=None):
     return proof_boundary.make_runtime_task_envelope(
         engagement_id=engagement_id or mythic_tools.SAGE_ENGAGEMENT_ID,
         callback_id=callback_id or "13",
@@ -113,7 +114,7 @@ def _task_proof(task_id, callback_id="13", *, engagement_id=None, command="test-
         command=command,
         verifier_id=verifier_id,
         captured_at="2026-06-12T12:00:00Z",
-        transaction_id=f"fixture:{task_id}",
+        transaction_id=transaction_id or f"fixture:{task_id}",
         verifier_input={"fixture": verifier_id, "task_id": str(task_id)},
         verifier_result={"verified": True},
     ).to_dict()
@@ -158,7 +159,8 @@ def _bloodhound_proof(task_id, callback_id="13", *, engagement_id=None):
 @contextmanager
 def _split_issue(output, calls=None, display_id=4242):
     """Patch the split issue path (issue_task + waitfor_for_task_output). issue_task increments
-    calls['issue'] (if given) and returns a task with `display_id`; the wait returns `output`.
+    calls['issue'] (if given) and returns a task with `display_id` (a callable yields one id per issue); the wait
+    returns `output`.
 
     There are two issue seams, not one. A task whose parameters resolve to a non-`Default`
     parameter group is posted through `mythic_utilities.graphql_post` so it can declare that group
@@ -180,7 +182,7 @@ def _split_issue(output, calls=None, display_id=4242):
 
     async def fake_issue_task(mythic, command_name, parameters, callback_display_id, wait_for_complete=True, timeout=None):
         _record(command_name, parameters, callback_display_id, None)
-        return {"display_id": display_id}
+        return {"display_id": display_id() if callable(display_id) else display_id}
 
     real_graphql_post = mythic_tools.mythic_utilities.graphql_post
 
@@ -202,7 +204,7 @@ def _split_issue(output, calls=None, display_id=4242):
             variables.get("callback_display_id"),
             variables.get("parameter_group_name"),
         )
-        return {"createTask": {"status": "success", "display_id": display_id}}
+        return {"createTask": {"status": "success", "display_id": display_id() if callable(display_id) else display_id}}
 
     async def fake_waitfor(mythic, task_display_id, timeout=None):
         return output() if callable(output) else output
@@ -246,8 +248,8 @@ def _seeded_reconcile(mt: MythicTools):
     return fake_reconcile
 
 
-def _proof_hop(effect, task_id, callback_id="", technique="capability:seed", target="seed"):
-    proof = _task_proof(task_id, callback_id or "13")
+def _proof_hop(effect, task_id, callback_id="", technique="capability:seed", target="seed", transaction_id=None):
+    proof = _task_proof(task_id, callback_id or "13", transaction_id=transaction_id)
     evidence, admission = proof_boundary.attach_proof(
         {"source": "test"},
         proof_boundary.ProofEnvelope.from_dict(proof),
@@ -3008,6 +3010,183 @@ def test_execute_capability_gpo_direct_valid_xml_system_author_does_not_close_ef
         if "system-exec:gpo:starkwallpaper@north.sevenkingdoms.local" in hop.satisfied_effects
     )
     assert hop.evidence["source"] == "execute_capability"
+
+
+def test_execute_capability_gpo_proof_reconciles_the_pending_setup_hop_shown_in_state(monkeypatch):
+    """Live shape of channel 5 request 9: SharpGPOAbuse (task 7) records the legacy gpo-abuse hop as pending setup,
+    then the same transaction's final `net group` (task 9) proves SYSTEM execution through that GPO. The operator's
+    `/state` table must not keep showing the setup hop as pending beside the proven capability row."""
+    monkeypatch.setenv("SAGE_TRAJECTORY_DISABLE", "1")
+    mt = _make_tools()
+    mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
+    mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
+    mt._engagement_footholds = [
+        engagement_state.Foothold(
+            callback_id="2",
+            agent="apollo",
+            host="CASTELBLACK",
+            forest="north.sevenkingdoms.local",
+            identity="NORTH\\samwell.tarly",
+            integrity="medium",
+            alive=True,
+            source="test",
+            timestamp="2026-11-03T16:25:00Z",
+        )
+    ]
+    mt._engagement_graph_facts = [
+        engagement_state.GraphFact(
+            "gpo-affects-dc:starkwallpaper:winterfell:north.sevenkingdoms.local",
+            "bloodhound:cypher",
+            "2026-11-03T16:25:00Z",
+            600,
+        ),
+    ]
+
+    async def fake_sleep(seconds, result=None):
+        return result
+
+    monkeypatch.setattr(mythic_tools.asyncio, "sleep", fake_sleep)
+    outputs = iter([
+        (
+            "[+] Domain = north.sevenkingdoms.local\r\n"
+            "[+] Domain Controller = winterfell.north.sevenkingdoms.local\r\n"
+            "[+] Distinguished Name = CN=Policies,CN=System,DC=north,DC=sevenkingdoms,DC=local\r\n"
+            "[+] GUID of \"starkwallpaper\" is: {3F1C08F5-D531-4D99-83B3-5CCF0A3981EF}\r\n"
+            "[+] Creating file \\\\north.sevenkingdoms.local\\SysVol\\north.sevenkingdoms.local\\Policies\\"
+            "{3F1C08F5-D531-4D99-83B3-5CCF0A3981EF}\\Machine\\Preferences\\ScheduledTasks\\ScheduledTasks.xml\r\n"
+            "[+] versionNumber attribute changed successfully\r\n"
+            "[+] The version number in GPT.ini was increased successfully.\r\n"
+            "[+] The GPO was modified to include a new immediate task. Wait for the GPO refresh cycle.\n"
+            "[+] Done!\r\n"
+        ),
+        (
+            "<ScheduledTasks><Task><Properties><Author>NT AUTHORITY\\SYSTEM</Author>"
+            "<Arguments>/c net group &quot;Domain Admins&quot; samwell.tarly /add /domain</Arguments>"
+            "</Properties></Task></ScheduledTasks>"
+        ),
+        (
+            "The request will be processed at a domain controller for domain north.sevenkingdoms.local.\n\n"
+            "Group name     Domain Admins\n"
+            "Comment        Designated administrators of the domain\n\n"
+            "Members\n\n"
+            "-------------------------------------------------------------------------------\n"
+            "Administrator            eddard.stark             samwell.tarly            \n"
+            "The command completed successfully.\n"
+        ),
+    ])
+    task_ids = iter([7, 8, 9])
+    calls = {}
+
+    with patch.object(access_reconciler, "reconcile_access", _seeded_reconcile(mt)), \
+        _split_issue(lambda: next(outputs), calls, display_id=lambda: next(task_ids)):
+        raw = asyncio.run(mt.execute_capability(
+            {
+                "capability": "gpo-controlled-system-exec",
+                "domain": "north.sevenkingdoms.local",
+                "gpo": "starkwallpaper",
+                "gpo_guid": "{3F1C08F5-D531-4D99-83B3-5CCF0A3981EF}",
+                "callback_id": 2,
+            },
+            {
+                "callback_id": 2,
+                "command": "net",
+                "command_arguments": r'group "Domain Admins" samwell.tarly /add /domain',
+                "wait_seconds": 1,
+                "proof_retries": 0,
+            },
+        ))
+
+    result = json.loads(raw)
+    assert result["verdict"] == "achieved"
+    assert [call["command_name"] for call in calls["issued"]] == ["execute_assembly", "shell", "shell"]
+
+    setup_hop = next(hop for hop in mt._engagement_hops if hop.technique == "gpo-abuse")
+    assert setup_hop.target == "starkwallpaper"
+    assert setup_hop.status == "achieved"
+    assert str(setup_hop.evidence.get("mythic_task_id")) == "9"
+    assert str(setup_hop.evidence.get("reconciled_setup_task_id")) == "7"
+    assert engagement_state._is_admitted_achieved_hop(
+        engagement_state.EngagementState(
+            objective="test", footholds=[], hops=list(mt._engagement_hops),
+            engagement_id=mt._eng_key(), runtime_scope=True,
+        ),
+        setup_hop,
+    )
+
+    # The operator's /state view: the same renderer, after the persist-time quarantine of unproven rows.
+    payload = {"hops": engagement_state.hops_to_dicts(mt._engagement_hops)}
+    engagement_ledger._quarantine_unproven_achievements(payload, mt._eng_key())
+    engagement_ledger.assign_hop_numbers(payload)
+    rows = [line for line in engagement_ledger.render_hop_table(payload["hops"]) if "gpo-abuse:starkwallpaper" in line]
+    assert len(rows) == 1
+    assert "`pending`" not in rows[0]
+    assert "`achieved`" in rows[0]
+
+
+def _runtime_ledger(*hops):
+    return engagement_state.EngagementState(
+        objective="test", footholds=[], hops=list(hops),
+        engagement_id=mythic_tools.SAGE_ENGAGEMENT_ID, runtime_scope=True,
+    )
+
+
+GPO_TRANSACTION = "capability-exec:gpo-starkwallpaper"
+
+
+def _record_gpo_setup_pending(state, gpo="starkwallpaper", task_id="7", transaction_id=GPO_TRANSACTION):
+    return engagement_state.record_hop_result(
+        state, "gpo-abuse", gpo, "pending",
+        {"source": "issue_task", "mythic_task_id": task_id, "verify_verdict": "partial"},
+        "2026-11-03T16:26:00Z",
+        proof_envelope=_task_proof(task_id, "2", transaction_id=transaction_id),
+    )
+
+
+def _gpo_status(state, gpo="starkwallpaper"):
+    return next(hop.status for hop in state.hops if hop.technique == "gpo-abuse" and hop.target == gpo)
+
+
+def test_gpo_setup_hop_recorded_after_its_proof_is_reconciled():
+    proof = _proof_hop("system-exec:gpo:starkwallpaper@north.sevenkingdoms.local", "9", callback_id="2",
+                       technique="capability:gpo-controlled-system-exec", target="gpo=starkwallpaper",
+                       transaction_id=GPO_TRANSACTION)
+    state = _record_gpo_setup_pending(_runtime_ledger(proof))
+    assert _gpo_status(state) == "achieved"
+
+
+def test_gpo_setup_hop_is_not_proven_by_a_same_named_gpo_in_another_transaction():
+    """A GPO name does not identify one GPO across domains: proof from another domain's transaction is not proof."""
+    elsewhere = _proof_hop("system-exec:gpo:default domain policy@essos.local", "9", callback_id="2",
+                           technique="capability:gpo-controlled-system-exec", target="gpo=default domain policy",
+                           transaction_id="capability-exec:essos")
+    state = _record_gpo_setup_pending(_runtime_ledger(elsewhere), gpo="default domain policy")
+    assert _gpo_status(state, "default domain policy") == "pending"
+
+
+def test_gpo_setup_hop_stays_pending_without_proof_for_that_gpo():
+    other = _proof_hop("system-exec:gpo:otherpolicy@north.sevenkingdoms.local", "9", callback_id="2",
+                       technique="capability:gpo-controlled-system-exec", target="gpo=otherpolicy",
+                       transaction_id=GPO_TRANSACTION)
+    downstream = _proof_hop("da:north.sevenkingdoms.local", "10", callback_id="2",
+                            technique="domain-admin-membership-check", target="north.sevenkingdoms.local",
+                            transaction_id=GPO_TRANSACTION)
+    state = _record_gpo_setup_pending(_runtime_ledger(other, downstream))
+    assert _gpo_status(state) == "pending"
+
+
+def test_gpo_setup_hop_stays_pending_beside_an_unproven_achieved_row():
+    unproven = engagement_state.Hop(
+        id="capability:gpo-controlled-system-exec:gpo=starkwallpaper",
+        technique="capability:gpo-controlled-system-exec", target="gpo=starkwallpaper",
+        effect="system-exec:gpo:starkwallpaper@north.sevenkingdoms.local", status="achieved",
+        evidence={"source": "test", "mythic_task_id": "9"}, preconditions=[],
+        satisfied_effects=["system-exec:gpo:starkwallpaper@north.sevenkingdoms.local"],
+        source="test", timestamp="2026-11-03T16:30:00Z",
+        # Same transaction, but proof bound to another engagement: not admissible here.
+        proof_envelope=_task_proof("9", "2", engagement_id="another-operation", transaction_id=GPO_TRANSACTION),
+    )
+    state = _record_gpo_setup_pending(_runtime_ledger(unproven))
+    assert _gpo_status(state) == "pending"
 
 
 def test_execute_capability_gpo_proof_only_does_not_inherit_system_author_from_xml(monkeypatch):

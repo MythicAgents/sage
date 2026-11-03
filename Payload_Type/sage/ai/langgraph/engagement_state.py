@@ -1012,6 +1012,81 @@ def _pending_hop_superseded(state: "EngagementState", hop: Hop) -> bool:
     return _gpo_domain_has_downstream_progress(state, gpo)
 
 
+def _reconcile_proven_gpo_setup_hops(state: "EngagementState", hops: list[Hop]) -> list[Hop]:
+    """Re-check a pending GPO-abuse setup hop against a later proof of SYSTEM execution through the same GPO.
+
+    SharpGPOAbuse output is setup, so its hop is recorded ``pending``. When a hop with admissible proof satisfies
+    ``system-exec:gpo:{gpo}@{domain}`` (the GPO capability's verifier, the same one the setup hop was checked with),
+    the setup hop's effect is proven: re-record it ``achieved`` on that proof, naming the setup task it replaced.
+    The proof must come from the setup task's own transaction: a GPO name alone does not identify one GPO across
+    domains. Downstream progress alone (DA, DCSync rights) is inference, not proof, and leaves the hop pending.
+    """
+
+    def transaction_of(hop: Hop) -> str:
+        proof = getattr(hop, "proof_envelope", {}) or {}
+        if not proof and isinstance(getattr(hop, "evidence", None), dict):
+            proof = hop.evidence.get("proof_envelope") or {}
+        return _text(proof.get("transaction_id")) if isinstance(proof, dict) else ""
+
+    proof_scope = EngagementState(
+        objective=state.objective,
+        footholds=[],
+        hops=list(hops),
+        engagement_id=getattr(state, "engagement_id", ""),
+        runtime_scope=bool(getattr(state, "runtime_scope", False)),
+    )
+    proofs: dict[tuple[str, str], Hop] = {}
+    for candidate in hops:
+        if not _is_admitted_achieved_hop(proof_scope, candidate):
+            continue
+        transaction = transaction_of(candidate)
+        if not transaction:
+            continue
+        for effect in getattr(candidate, "satisfied_effects", []) or []:
+            normalized = _normalize_predicate(effect)
+            if normalized.startswith("system-exec:gpo:"):
+                gpo = normalized[len("system-exec:gpo:"):].partition("@")[0].strip()
+                if gpo:
+                    proofs[(gpo, transaction)] = candidate
+    if not proofs:
+        return hops
+    reconciled: list[Hop] = []
+    for existing in hops:
+        status = _normalize_key(getattr(existing, "status", ""))
+        if status != "pending" or _normalize_key(getattr(existing, "technique", "")) != "gpo-abuse":
+            reconciled.append(existing)
+            continue
+        effect = _normalize_key(getattr(existing, "effect", ""))
+        gpo = effect[len("system:"):].strip() if effect.startswith("system:") else _normalize_key(existing.target)
+        proof = proofs.get((gpo, transaction_of(existing)))
+        if proof is None:
+            reconciled.append(existing)
+            continue
+        setup_evidence = existing.evidence if isinstance(existing.evidence, dict) else {}
+        evidence = dict(proof.evidence) if isinstance(proof.evidence, dict) else {}
+        evidence.update({
+            "verify_verdict": "achieved",
+            "verify_reason": f"SYSTEM execution through GPO {gpo} proven by hop {proof.id}",
+            "reconciled_from_hop": proof.id,
+            "reconciled_setup_task_id": setup_evidence.get("mythic_task_id"),
+            "reconciled_setup_preview": setup_evidence.get("result_preview"),
+        })
+        reconciled.append(Hop(
+            id=existing.id,
+            technique=existing.technique,
+            target=existing.target,
+            effect=existing.effect,
+            status="achieved",
+            evidence=evidence,
+            preconditions=list(existing.preconditions),
+            satisfied_effects=list(existing.satisfied_effects),
+            source=existing.source,
+            timestamp=proof.timestamp,
+            proof_envelope=dict(getattr(proof, "proof_envelope", {}) or {}),
+        ))
+    return reconciled
+
+
 def record_hop_result(
     state: EngagementState,
     technique: str,
@@ -1142,6 +1217,7 @@ def record_effect_result(
             hops.append(existing)
     if not updated:
         hops.append(hop)
+    hops = _reconcile_proven_gpo_setup_hops(state, hops)
     return EngagementState(
         objective=state.objective,
         footholds=list(state.footholds),
