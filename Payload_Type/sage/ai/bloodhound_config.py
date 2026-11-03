@@ -11,8 +11,11 @@ Used by:
   - the BloodHound agent's not-connected EventFeed notice (the steps text)
 """
 import hashlib
+import json
 import os
+import re
 from collections import Counter
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from ai.mcp import (
@@ -598,6 +601,345 @@ async def probe_bloodhound_reachable(
     if ok:
         return True, detail
     return False, f"{detail}\n\n{classify_probe_failure(detail)}"
+
+
+# --- Ingest contract ------------------------------------------------------------------------------------------
+#
+# Sage verifies a collection only through BloodHound's own ingest-job status: `file_upload(info_type="upload_bytes")`
+# returns a job id, and `file_upload(info_type="status", job_id=...)` reports that exact job. Being connected, or
+# exposing a tool named `file_upload`, does not prove the server implements the status half. The pinned upstream
+# MCP does not; the Sage image adds it with `patches/bloodhound-mcp-ingest-status.patch`. These helpers decode that
+# contract and check the connected server actually serves it, so the runtime never mistakes an unsupported
+# operation for a pending ingest.
+
+INGEST_TOOL_NAME = "file_upload"
+#: Parameters the ingest path passes. Names alone are not readiness; the status read below is.
+INGEST_TOOL_PARAMETERS = frozenset({"info_type", "job_id", "file_name", "file_bytes_base64"})
+#: Bound on the readiness read and on each status read.
+INGEST_CALL_TIMEOUT_SECONDS = 10.0
+INGEST_STATUS_POLL_LIMIT = 20
+INGEST_STATUS_POLL_INTERVAL_SECONDS = 6.0
+INGEST_STATUS_DEADLINE_SECONDS = 120.0
+
+#: BloodHound CE job-status enum (openapi `enum.job-status.yaml`), as the patched MCP reports it: the numeric
+#: status plus its documented label. CE's own free-text message travels separately as `detail`.
+BLOODHOUND_JOB_STATUS_LABELS = {
+    -1: "Invalid",
+    0: "Ready",
+    1: "Running",
+    2: "Complete",
+    3: "Canceled",
+    4: "Timed Out",
+    5: "Failed",
+    6: "Ingesting",
+    7: "Analyzing",
+    8: "Partially Complete",
+}
+INGEST_JOB_COMPLETE = 2
+INGEST_JOB_PENDING = frozenset({0, 1, 6, 7})
+#: Partial ingestion is a failure here: a verified collection means BloodHound ingested all of it.
+INGEST_JOB_TERMINAL_FAILURE = frozenset({-1, 3, 4, 5, 8})
+#: The typed answer for a job id BloodHound does not (yet) list; retried for visibility lag.
+INGEST_JOB_NOT_FOUND = "not_found"
+
+#: Diagnostic kinds. Only `transient` is worth another read inside the existing poll allowance.
+INGEST_ERROR_UNSUPPORTED = "unsupported_operation"
+INGEST_ERROR_AUTH = "authentication"
+INGEST_ERROR_TRANSIENT = "transient"
+INGEST_ERROR_TOOL = "tool_error"
+INGEST_ERROR_MALFORMED = "malformed_response"
+INGEST_ERROR_MISMATCH = "job_mismatch"
+INGEST_ERROR_PROTOCOL = "protocol_error"
+INGEST_ERROR_UNAVAILABLE = "unavailable"
+
+INGEST_CONTRACT_REMEDY = (
+    "The connected BloodHound MCP cannot report ingest-job status, so Sage cannot verify a graph collection. "
+    "The Sage image ships the pinned MCP plus Sage's status patch; rebuild the image to get it (syncing Sage "
+    "source does not change /opt/bloodhound_mcp). For a custom SAGE_BLOODHOUND_MCP_DIR, apply "
+    "patches/bloodhound-mcp-ingest-status.patch to a clean checkout of the pinned base, sync its dependencies, "
+    "then run `/bloodhound force`."
+)
+
+_INGEST_DIAGNOSTIC_LIMIT = 300
+_LONG_OPAQUE_RUN = re.compile(r"[A-Za-z0-9+/=_-]{40,}")
+_TRANSIENT_INGEST_MARKERS = (
+    "connection error", "timed out", "timeout", "temporarily", "connection reset",
+    "http 429", "http 500", "http 502", "http 503", "http 504", "rate limit",
+)
+_AUTH_INGEST_MARKERS = ("http 401", "http 403", "unauthorized", "forbidden", "invalid signature")
+
+
+class IngestContractError(ValueError):
+    """A file_upload response Sage must not read as pending or complete. `kind` is one of the INGEST_ERROR_*."""
+
+    def __init__(self, kind: str, detail: str):
+        self.kind = kind
+        self.detail = sanitize_ingest_diagnostic(detail)
+        super().__init__(f"{kind}: {self.detail}")
+
+
+def sanitize_ingest_diagnostic(text: Any) -> str:
+    """Bound one diagnostic for logs and cards; long opaque runs (encoded bytes, tokens) are redacted."""
+    value = " ".join(str(text if text is not None else "").split())
+    value = _LONG_OPAQUE_RUN.sub("[redacted]", value)
+    if len(value) > _INGEST_DIAGNOSTIC_LIMIT:
+        value = value[: _INGEST_DIAGNOSTIC_LIMIT - 1] + "…"
+    return value
+
+
+def classify_ingest_failure_text(text: Any) -> str:
+    """Name the kind of a failure reported as text or raised by the MCP adapter."""
+    lowered = str(text or "").casefold()
+    if "unknown info_type" in lowered:
+        return INGEST_ERROR_UNSUPPORTED
+    if any(marker in lowered for marker in _AUTH_INGEST_MARKERS):
+        return INGEST_ERROR_AUTH
+    if any(marker in lowered for marker in _TRANSIENT_INGEST_MARKERS):
+        return INGEST_ERROR_TRANSIENT
+    return INGEST_ERROR_TOOL
+
+
+def _is_nonempty_error(value: Any) -> bool:
+    if value is None or value is False:
+        return False
+    if isinstance(value, (str, bytes, list, tuple, dict, set)):
+        return bool(value)
+    return True
+
+
+def _explicit_failure(payload: dict) -> Optional[str]:
+    for key in ("error", "errors"):
+        if _is_nonempty_error(payload.get(key)):
+            return str(payload.get(key))
+    for key in ("isError", "is_error"):
+        if payload.get(key) is True:
+            return f"{key}=true"
+    for key in ("success", "ok"):
+        if payload.get(key) is False:
+            return f"{key}=false"
+    return None
+
+
+def _strict_int(value: Any) -> Optional[int]:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def decode_ingest_response(
+    response: Any,
+    *,
+    info_type: str,
+    expected_job_id: Optional[int] = None,
+) -> dict[str, Any]:
+    """Return the `data` object of one `file_upload` response, or raise `IngestContractError`.
+
+    Accepts the representations the MCP adapter produces: a decoded object, JSON text, or exactly one MCP text
+    content block holding that JSON. A top-level `error`/`errors`, `isError=true`, or an explicit failure flag
+    is rejected BEFORE `data` is read, so an error can never hide behind completion-shaped data, and its text is
+    kept even when no `data` exists. The envelope must name the requested `info_type`. With `expected_job_id`,
+    `data.job_id` must be exactly that integer.
+    """
+    payload: Any = response
+    if isinstance(payload, list):
+        if len(payload) != 1:
+            raise IngestContractError(
+                INGEST_ERROR_MALFORMED, f"expected one MCP content block, received {len(payload)}"
+            )
+        block = payload[0]
+        if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
+            payload = block["text"]
+        elif isinstance(block, str):
+            payload = block
+        else:
+            raise IngestContractError(INGEST_ERROR_MALFORMED, "MCP content block is not text")
+    if isinstance(payload, (bytes, bytearray)):
+        payload = bytes(payload).decode("utf-8", errors="replace")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            raise IngestContractError(INGEST_ERROR_MALFORMED, "response is not JSON") from None
+    if not isinstance(payload, dict):
+        raise IngestContractError(INGEST_ERROR_MALFORMED, "response is not a JSON object")
+    failure = _explicit_failure(payload)
+    if failure is not None:
+        raise IngestContractError(classify_ingest_failure_text(failure), failure)
+    if payload.get("info_type") != info_type:
+        raise IngestContractError(
+            INGEST_ERROR_MALFORMED, f"response envelope does not name info_type {info_type!r}"
+        )
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise IngestContractError(INGEST_ERROR_MALFORMED, "response has no data object")
+    failure = _explicit_failure(data)
+    if failure is not None:
+        raise IngestContractError(classify_ingest_failure_text(failure), failure)
+    if expected_job_id is not None and _strict_int(data.get("job_id")) != expected_job_id:
+        raise IngestContractError(INGEST_ERROR_MISMATCH, f"response is not for job {expected_job_id}")
+    return data
+
+
+def upload_job_id(data: dict[str, Any]) -> int:
+    """The positive job id from a decoded `upload_bytes` receipt, or `IngestContractError`."""
+    job_id = _strict_int(data.get("job_id"))
+    if job_id is None or job_id <= 0:
+        raise IngestContractError(INGEST_ERROR_MALFORMED, "upload receipt has no positive job id")
+    return job_id
+
+
+def classify_ingest_status(data: dict[str, Any]) -> str:
+    """Return `complete`, `pending`, or `terminal_failure` for one decoded status read.
+
+    A typed `not_found` is pending (BloodHound may not list a just-ended job yet). Otherwise the numeric status
+    and its label must be one documented pair; anything else is a protocol error, never success.
+    """
+    status = data.get("status")
+    message = data.get("status_message")
+    if message == INGEST_JOB_NOT_FOUND and "status" not in data:
+        return "pending"
+    number = _strict_int(status)
+    if number is None or BLOODHOUND_JOB_STATUS_LABELS.get(number) != message:
+        raise IngestContractError(
+            INGEST_ERROR_PROTOCOL, f"unrecognized job status pair {status!r}/{message!r}"
+        )
+    if number == INGEST_JOB_COMPLETE:
+        return "complete"
+    if number in INGEST_JOB_TERMINAL_FAILURE:
+        return "terminal_failure"
+    return "pending"
+
+
+def _tool_parameters(tool: Any) -> set[str]:
+    schema = getattr(tool, "args_schema", None)
+    try:
+        if isinstance(schema, dict):
+            properties = schema.get("properties")
+            return set(properties) if isinstance(properties, dict) else set()
+        if schema is not None and hasattr(schema, "model_json_schema"):
+            properties = schema.model_json_schema().get("properties")
+            return set(properties) if isinstance(properties, dict) else set()
+    except Exception:
+        return set()
+    return set()
+
+
+@dataclass(frozen=True)
+class IngestContract:
+    """One observation of the connected server's ingest contract. Not cached: callers probe where they act."""
+
+    ready: bool
+    kind: str
+    reason: str
+    server: Optional[str] = None
+    tool: Any = None
+    #: Corrective action for an incompatible server; empty for transient or configuration failures.
+    remedy: str = ""
+
+    def operator_text(self) -> str:
+        return f"{self.reason} {self.remedy}".strip()
+
+
+def _contract_unavailable(kind: str, reason: str, server: Optional[str] = None) -> IngestContract:
+    return IngestContract(
+        ready=False,
+        kind=kind,
+        reason=sanitize_ingest_diagnostic(reason),
+        server=server,
+        remedy=INGEST_CONTRACT_REMEDY if kind == INGEST_ERROR_UNSUPPORTED else "",
+    )
+
+
+async def probe_ingest_contract(timeout: Optional[float] = None) -> IngestContract:
+    """Read `file_upload(info_type="status", job_id=0)` once on the one connected BloodHound server.
+
+    Job 0 is never assigned, so only the structured `not_found` answer for job 0 establishes readiness. A generic
+    error, an unknown-operation error, a malformed answer, a timeout, or a purported job 0 does not. This is one
+    control-plane read under a ten-second deadline: no upload, no job start/end, no model tool call.
+    """
+    import asyncio
+
+    budget = INGEST_CALL_TIMEOUT_SECONDS if timeout is None else timeout
+    try:
+        servers = [
+            server
+            for server in MCPManager.get_connected_servers()
+            if MCPManager.is_bloodhound_server(server)
+        ]
+    except Exception as exc:
+        return _contract_unavailable(INGEST_ERROR_UNAVAILABLE, f"BloodHound MCP inspection failed: {exc}")
+    if not servers:
+        return _contract_unavailable(INGEST_ERROR_UNAVAILABLE, "BloodHound MCP is not connected.")
+    if len(servers) != 1:
+        return _contract_unavailable(
+            INGEST_ERROR_UNAVAILABLE, "BloodHound ingest requires exactly one connected BloodHound server."
+        )
+    server = servers[0]
+    server_name = _safe_server_identity(server)
+    try:
+        matches = [
+            tool for tool in MCPManager.get_tools_by_server(server)
+            if getattr(tool, "name", None) == INGEST_TOOL_NAME
+        ]
+    except Exception as exc:
+        return _contract_unavailable(INGEST_ERROR_UNAVAILABLE, f"BloodHound tool inspection failed: {exc}", server_name)
+    if len(matches) != 1:
+        return _contract_unavailable(
+            INGEST_ERROR_UNAVAILABLE,
+            f"BloodHound exposes {len(matches)} `{INGEST_TOOL_NAME}` tools; ingest needs exactly one.",
+            server_name,
+        )
+    tool = matches[0]
+    missing = sorted(INGEST_TOOL_PARAMETERS - _tool_parameters(tool))
+    if missing:
+        return _contract_unavailable(
+            INGEST_ERROR_UNSUPPORTED,
+            f"`{INGEST_TOOL_NAME}` does not accept: {', '.join(missing)}.",
+            server_name,
+        )
+    try:
+        response = await asyncio.wait_for(tool.ainvoke({"info_type": "status", "job_id": 0}), timeout=budget)
+    except (asyncio.TimeoutError, TimeoutError):
+        return _contract_unavailable(INGEST_ERROR_TRANSIENT, "The ingest status read timed out.", server_name)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - an adapter failure is a failed probe, classified below
+        kind = classify_ingest_failure_text(exc)
+        detail = sanitize_ingest_diagnostic(f"{type(exc).__name__}: {exc}")
+        return _contract_unavailable(kind, f"The ingest status read failed: {detail}", server_name)
+    try:
+        data = decode_ingest_response(response, info_type="status", expected_job_id=0)
+    except IngestContractError as exc:
+        return _contract_unavailable(exc.kind, f"The ingest status read failed: {exc.detail}", server_name)
+    if data.get("status_message") != INGEST_JOB_NOT_FOUND or "status" in data:
+        return _contract_unavailable(
+            INGEST_ERROR_PROTOCOL,
+            "The ingest status read reported a job 0, which BloodHound never assigns.",
+            server_name,
+        )
+    return IngestContract(
+        ready=True,
+        kind="ready",
+        reason="The connected BloodHound MCP answered an exact-job ingest status read.",
+        server=server_name,
+        tool=tool,
+    )
+
+
+def autonomous_ingest_unavailable_message(contract: IngestContract) -> str:
+    """Why an autonomous request was refused when BloodHound is connected but cannot verify ingest."""
+    return (
+        "Autonomous execution is unavailable because the connected BloodHound cannot report ingest status, "
+        "so Sage could not verify any graph collection it made. Ordinary chat is unaffected.\n\n"
+        f"{contract.operator_text()}"
+    )
+
+
+def ingest_degraded_chat_notice(contract: IngestContract) -> str:
+    """The chat-surface notice for a connected BloodHound whose ingest contract is unusable."""
+    return (
+        "⚠️ **BloodHound is connected, but graph ingest is unavailable.** Graph reads work normally; Sage will "
+        "refuse to collect or ingest new graph data, because it could not verify the result.\n\n"
+        f"{contract.operator_text()}"
+    )
 
 
 def reset_bloodhound_connect_cache() -> None:

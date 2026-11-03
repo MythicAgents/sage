@@ -810,17 +810,28 @@ async def _handle_bloodhound(request: ChatRequest, arg: str) -> str:
     is the exact failure an operator reaches for it to fix.
     """
     try:
-        from ai.bloodhound_config import ensure_bloodhound_connected
+        from ai.bloodhound_config import ensure_bloodhound_connected, probe_ingest_contract
     except ImportError:  # pragma: no cover
-        from ..ai.bloodhound_config import ensure_bloodhound_connected  # type: ignore
+        from ..ai.bloodhound_config import ensure_bloodhound_connected, probe_ingest_contract  # type: ignore
     try:
         from .config import build_bloodhound_env
     except ImportError:  # pragma: no cover
         from config import build_bloodhound_env  # type: ignore
     force, directory = _parse_bloodhound_arg(arg)
     env = build_bloodhound_env(request) if request is not None else {}
-    _connected, msg = await ensure_bloodhound_connected(directory, env=env or None, force=force)
-    return msg
+    connected, msg = await ensure_bloodhound_connected(directory, env=env or None, force=force)
+    # Connection and ingest readiness are separate facts. An already-connected server is probed too: being
+    # connected says nothing about whether it can report ingest status, which is what verifies a collection.
+    if not connected:
+        ingest = "Unavailable until BloodHound is connected."
+    else:
+        contract = await probe_ingest_contract()
+        ingest = (
+            f"Ready. {contract.reason}"
+            if contract.ready
+            else f"NOT ready — Sage will refuse graph collection and ingest. {contract.operator_text()}"
+        )
+    return f"**Connection:** {msg}\n\n**Ingest:** {ingest}"
 
 
 def _sandbox_usage() -> str:

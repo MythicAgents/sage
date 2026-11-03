@@ -13629,6 +13629,28 @@ class Model:
                     "controller collection target differs from the objective-bound callback",
                 )
 
+        # A collection Sage cannot verify must not task the target. Check the connected server serves the whole
+        # ingest contract (upload AND exact-job status) before the first collection task; ingest_collection checks
+        # again before it uploads.
+        from ai import bloodhound_config as _bh
+
+        ingest_contract = await _bh.probe_ingest_contract()
+        if not ingest_contract.ready:
+            reason = f"BloodHound ingest is unavailable: {ingest_contract.operator_text()}"
+            fire(
+                f"ingest contract not ready ({ingest_contract.kind}); issuing no collection tasks",
+                operator_message=(
+                    "**Collection failed**\n"
+                    "Sage did not start graph collection because the connected BloodHound cannot report "
+                    "ingest status, so the result could not be verified. No tasks were issued.\n"
+                    f"Result: {ingest_contract.operator_text()}"
+                ),
+            )
+            result = outcome(False, "error", reason)
+            result["graph_verified"] = False
+            result["ingest_error"] = {"kind": ingest_contract.kind, "detail": ingest_contract.reason}
+            return result
+
         host = str(getattr(foothold, "host", "") or "").strip()
         forest = str(getattr(foothold, "forest", "") or "").strip()
         try:
@@ -13832,16 +13854,40 @@ class Model:
         graph_verified = parsed.get("graph_verified") if isinstance(parsed, dict) else None
         status = parsed.get("status") if isinstance(parsed, dict) and isinstance(parsed.get("status"), str) else ""
         ok = graph_verified is True and status in ("ingested", "already_ingested")
+        ingest_reason = ""
+        if not ok and isinstance(parsed, dict):
+            ingest_error = parsed.get("ingest_error") if isinstance(parsed.get("ingest_error"), dict) else {}
+            job_status = parsed.get("job_status")
+            if ingest_error:
+                ingest_reason = f"{ingest_error.get('kind') or 'error'}: {ingest_error.get('detail') or ''}".strip()
+            elif parsed.get("error"):
+                ingest_reason = str(parsed.get("error"))
+            elif job_status:
+                ingest_reason = f"BloodHound job {parsed.get('bloodhound_job_id')} reported `{job_status}`"
+                if parsed.get("job_status_detail"):
+                    ingest_reason += f" ({parsed.get('job_status_detail')})"
+            ingest_reason = ingest_reason[:600]
+        if ok:
+            heading = "**Collection verified**"
+        elif status == "uploaded_pending_ingest":
+            heading = "**Collection pending**"
+        else:
+            heading = "**Collection failed**"
         fire(
-            f"ingest status={status} graph_verified={graph_verified}",
+            f"ingest status={status} graph_verified={graph_verified}"
+            + (f" reason={ingest_reason}" if ingest_reason else ""),
             operator_message=(
-                "**Collection verified**\n"
+                f"{heading}\n"
                 f"Sage finished graph ingest with status `{status or 'unknown'}` and "
                 f"`graph_verified={str(graph_verified).lower()}`."
+                + (f"\nResult: {ingest_reason}" if ingest_reason else "")
             ),
         )
-        result = outcome(ok, status or "unknown")
+        result = outcome(ok, status or "unknown", ingest_reason)
         result["graph_verified"] = graph_verified
+        for key in ("bloodhound_job_id", "job_status", "ingest_error", "file_uuid"):
+            if isinstance(parsed, dict) and parsed.get(key) not in (None, "", {}):
+                result[key] = parsed.get(key)
         return result
 
     async def _autonomous_executor_node(self, state: SageState | dict, config=None):

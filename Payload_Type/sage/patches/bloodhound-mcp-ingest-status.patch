@@ -1,0 +1,111 @@
+diff --git a/lib/bloodhound_api.py b/lib/bloodhound_api.py
+index 90ca435..9f67235 100644
+--- a/lib/bloodhound_api.py
++++ b/lib/bloodhound_api.py
+@@ -393,6 +393,83 @@ class FileUploadClient:
+         """Finalize an upload job and trigger ingest processing."""
+         self.base_client.raw_request("POST", f"/api/v2/file-upload/{job_id}/end")
+ 
++    # BloodHound CE job-status enum (openapi enum.job-status.yaml). CE's own
++    # status_message is free text (empty while running or ingesting), so the
++    # documented label is derived from the numeric status and CE's text is
++    # returned separately as detail.
++    JOB_STATUS_LABELS = {
++        -1: "Invalid",
++        0: "Ready",
++        1: "Running",
++        2: "Complete",
++        3: "Canceled",
++        4: "Timed Out",
++        5: "Failed",
++        6: "Ingesting",
++        7: "Analyzing",
++        8: "Partially Complete",
++    }
++    STATUS_TIMEOUT_SECONDS = 10.0
++    STATUS_DETAIL_LIMIT = 300
++
++    def get_job_status(self, job_id: int) -> Dict[str, Any]:
++        """Return one upload job's ingest status, looked up by exact job ID.
++
++        Uses the documented list endpoint with an exact id filter, so a job is
++        found however many newer jobs exist. Job 0 is never assigned, which
++        makes it a read-only check that this operation is supported.
++
++        Returns:
++            {"job_id", "status_message": "not_found"} when no job has this ID,
++            otherwise job_id, numeric status, status_message, detail, and the
++            start/end/file-count fields CE reports.
++        """
++        if job_id is None:
++            raise ValueError("job_id is required")
++        if isinstance(job_id, bool) or not isinstance(job_id, int) or job_id < 0:
++            raise ValueError("job_id must be a nonnegative integer")
++        response = self.base_client.request(
++            "GET",
++            "/api/v2/file-upload",
++            params={"id": f"eq:{job_id}", "skip": 0, "limit": 2},
++            timeout=self.STATUS_TIMEOUT_SECONDS,
++        )
++        rows = response.get("data") if isinstance(response, dict) else None
++        if not isinstance(rows, list):
++            raise ValueError("file-upload job list response has no data list")
++        if not rows:
++            return {"job_id": job_id, "status_message": "not_found"}
++        if len(rows) != 1:
++            raise ValueError(
++                f"file-upload job list returned {len(rows)} rows for job {job_id}"
++            )
++        row = rows[0]
++        row_id = row.get("id") if isinstance(row, dict) else None
++        if isinstance(row_id, bool) or not isinstance(row_id, int) or row_id != job_id:
++            raise ValueError(
++                f"file-upload job list returned a row that is not job {job_id}"
++            )
++        status = row.get("status")
++        if (
++            isinstance(status, bool)
++            or not isinstance(status, int)
++            or status not in self.JOB_STATUS_LABELS
++        ):
++            raise ValueError(f"job {job_id} has an unrecognized status")
++        detail = row.get("status_message")
++        result = {
++            "job_id": job_id,
++            "status": status,
++            "status_message": self.JOB_STATUS_LABELS[status],
++            "detail": (
++                detail[: self.STATUS_DETAIL_LIMIT] if isinstance(detail, str) else ""
++            ),
++        }
++        for key in ("start_time", "end_time", "total_files", "failed_files"):
++            if key in row:
++                result[key] = row[key]
++        return result
++
+     def upload_collection_file(self, file_path: str) -> Dict[str, Any]:
+         """
+         Full upload workflow for a single collection file: start -> upload -> end.
+diff --git a/main.py b/main.py
+index 4c5a6c6..d29074d 100644
+--- a/main.py
++++ b/main.py
+@@ -1338,6 +1338,10 @@ def file_upload(
+         upload_bytes_to_job - upload base64 file bytes to an existing job
+                               (requires: job_id, file_name, file_bytes_base64)
+         end_job       - finalize an upload job and trigger ingest (requires: job_id)
++        status        - read one upload job's ingest status by exact ID (requires: job_id).
++                        Returns status (numeric) and status_message ("Complete" only once the
++                        asynchronous ingest has finished), or status_message "not_found".
++                        job_id 0 is never assigned, so it is a read-only support check.
+ 
+     Args:
+         info_type: operation to perform (default: upload)
+@@ -1366,6 +1370,7 @@ def file_upload(
+             bloodhound_api.file_upload.end_upload(job_id)
+             or {"status": "ingest_started", "job_id": job_id}
+         ),
++        "status": lambda: bloodhound_api.file_upload.get_job_status(job_id),
+     }
+     return _handle_tool_call(info_type, handlers)
+ 

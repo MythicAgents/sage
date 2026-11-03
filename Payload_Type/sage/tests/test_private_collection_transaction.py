@@ -26,6 +26,7 @@ from sage_chat.hitl import (
     approval_action_digest, approval_action_fingerprint,
     approval_proposal_digest, approval_selection_digest,
 )
+from tests.test_bloodhound_ingest_contract import FakeIngestTool
 
 
 @pytest.fixture
@@ -144,9 +145,17 @@ def collection(monkeypatch, tmp_path):
     with zipfile.ZipFile(archive, "w") as stream:
         stream.writestr("domains.json", json.dumps({"data": [], "meta": {"type": "domains", "count": 0, "version": 5}}))
 
+    # The image's BloodHound MCP (pinned base plus Sage's status patch), as the MCP adapter presents it. The
+    # readiness read (status of job 0) is recorded apart from the uploaded job's status reads.
+    ingest_tool = FakeIngestTool()
+    serve_ingest = ingest_tool.ainvoke
+
     async def bloodhound(args):
-        events.append(("ingest", args["info_type"]))
-        return {"data": {"job_id": 41} if args["info_type"] == "upload_bytes" else {"status_message": "Complete"}}
+        is_readiness = args["info_type"] == "status" and args.get("job_id") == 0
+        events.append(("ingest-ready" if is_readiness else "ingest", args["info_type"]))
+        return await serve_ingest(args)
+
+    ingest_tool.ainvoke = bloodhound
 
     monkeypatch.setattr(mt.ttp_library, "TOOLS_DIR", tmp_path)
     (tmp_path / "SharpHound.exe").write_bytes(b"inert registered-file fixture")
@@ -165,7 +174,7 @@ def collection(monkeypatch, tmp_path):
     monkeypatch.setattr(mt.mythic, "download_file", AsyncMock(return_value=archive.getvalue()))
     monkeypatch.setattr(MCPManager, "get_connected_servers", lambda: ["offline-bloodhound"])
     monkeypatch.setattr(MCPManager, "is_bloodhound_server", lambda _server: True)
-    monkeypatch.setattr(MCPManager, "get_tools_by_server", lambda _server: [SimpleNamespace(name="file_upload", ainvoke=bloodhound)])
+    monkeypatch.setattr(MCPManager, "get_tools_by_server", lambda _server: [ingest_tool])
     monkeypatch.setattr(mt, "_bloodhound_collected_domains", AsyncMock(return_value=["corp.test"]))
     monkeypatch.setattr(client, "_refresh_graph_facts_if_stale", AsyncMock())
     monkeypatch.setattr(client, "_record_graph_built", AsyncMock())
@@ -178,7 +187,7 @@ def collection(monkeypatch, tmp_path):
     return SimpleNamespace(
         client=client, owner=owner, request=request, state=state, root=root, contract=contract,
         claim=claim, adapter=adapter, events=events, registered=registered, tasks=tasks,
-        selector_overrides=selector_overrides,
+        selector_overrides=selector_overrides, ingest_tool=ingest_tool,
     )
 
 
@@ -196,9 +205,10 @@ def test_approved_collection_registers_reserved_runner_and_ingests_once(collecti
     assert result["ok"] is True, (result, case.events)
     assert result["status"] == "ingested"
     assert case.events == [
+        ("ingest-ready", "status"),
         ("task", "whoami"), ("task", "ticket_cache_list"), ("register", "SharpHound.exe"),
         ("task", "execute_assembly"), ("task", "ls"), ("task", "download"),
-        ("ingest", "upload_bytes"), ("ingest", "status"),
+        ("ingest-ready", "status"), ("ingest", "upload_bytes"), ("ingest", "status"),
     ]
     tx = case.client._private_collection_transaction
     assert [step["kind"] for step in tx._steps] == ["identity", "ticket", "runner", "ls", "download"]
@@ -627,7 +637,7 @@ def test_collection_staging_never_widens_its_target_facing_tasks(collection, mon
     if mutation.startswith("filename"):
         # A file nobody staged cannot be registered, and the runner never starts without it.
         assert result["status"] == "tool_preflight_failed", result
-        assert case.events == [("task", "whoami"), ("task", "ticket_cache_list")]
+        assert case.events == [("ingest-ready", "status"), ("task", "whoami"), ("task", "ticket_cache_list")]
         assert case.registered == []
         return
     # Staging needs no approval, so a changed staging context no longer stops registration. Whatever it

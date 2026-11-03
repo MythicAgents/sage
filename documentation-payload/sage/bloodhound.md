@@ -23,7 +23,9 @@ finds it not connected.
    *Generate / Revoke API Tokens → Create Token*. You need the **Token ID** and **Token Key**; the key is shown
    only once. *My Profile → API Key Management* also works, but the token then carries your own account's role.
 3. **A BloodHound MCP checkout** on the Sage host (run with `uv`). The container bakes one at
-   `/opt/bloodhound_mcp`, so under a standard Mythic install you do not need your own.
+   `/opt/bloodhound_mcp`, so under a standard Mythic install you do not need your own. The baked checkout is the
+   pinned MCP commit plus Sage's ingest-status patch, applied when the image is built; only a rebuild changes it.
+   Your own checkout needs the same patch (see [Ingest readiness](#ingest-readiness)).
 
 ## Point Sage at the MCP checkout
 
@@ -98,8 +100,9 @@ fixed.
 A new chat auto-connects BloodHound before it builds the graph. You can also connect or check it on demand from
 chat:
 
-- `/bloodhound` — connect, or report the existing connection. It is idempotent, so it is a safe way to ask
-  whether BloodHound is connected.
+- `/bloodhound` — connect, or report the existing connection, then report **Connection** and **Ingest**
+  readiness separately. It is idempotent, so it is a safe way to ask whether BloodHound is connected and able to
+  ingest.
 - `/bloodhound force` — rebind an already-connected container to different credentials or a different BloodHound,
   using the current chat's resolved credentials (`reconnect` and `--force` also work). `/bloodhound force <dir>`
   also changes the MCP directory.
@@ -120,10 +123,29 @@ BloodHound connection rather than the old one. Plain `/bloodhound` will reconnec
 configuration.
 {{% /notice %}}
 
+## Ingest readiness
+
+Connected is not the same as able to ingest. Sage verifies a graph collection only when BloodHound reports that
+exact upload job `Complete`, through the MCP's `file_upload(info_type="status")` operation. The pinned upstream
+MCP has no such operation; the Sage image adds it with `patches/bloodhound-mcp-ingest-status.patch`. Sage checks
+the **connected** server with one read-only status read, not a checkout on disk:
+
+- Against an MCP without it, `/bloodhound` reports **Ingest: NOT ready** with the fix, conversation and supervised
+  chats show a one-time *graph ingest is unavailable* notice (graph reads keep working), and graph collection stops
+  with **Collection failed** before it tasks the target or uploads anything.
+- An ingest still running when Sage's two-minute wait ends reports **Collection pending**; a failed, partially
+  complete, canceled, or timed-out job reports **Collection failed**. Neither counts as a verified collection.
+
+To fix it under Mythic, rebuild the Sage image: syncing Sage source into `/Mythic` cannot change
+`/opt/bloodhound_mcp`. For your own checkout, check out the pinned commit
+`92a37dd481ce675fe552f14c9957a31dbbcd212e`, run `git apply --check` and then `git apply` with the patch from
+`Payload_Type/sage/patches/`, run `uv sync --no-dev`, and reconnect with `/bloodhound force`. Sage never patches a
+checkout itself.
+
 ## Autonomous sessions
 
 Autonomous (`auto`) sessions **fail closed** if BloodHound cannot connect with the graph tools the execution
-kernel requires. Ordinary supervised chat stays available in a degraded, fail-soft state so you can diagnose or
-configure the integration.
+kernel requires, or if the connected MCP cannot report ingest status. Ordinary supervised chat stays available in
+a degraded, fail-soft state so you can diagnose or configure the integration.
 
 To connect any *other* MCP server (not BloodHound), see [Connecting MCP Servers](/agents/sage/connecting-mcp-servers/).

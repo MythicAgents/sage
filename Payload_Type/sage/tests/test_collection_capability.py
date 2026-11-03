@@ -363,3 +363,252 @@ def test_the_executor_summary_omits_task_and_effect_lines_a_payload_does_not_rep
         {"capability": "gpo-controlled-system-exec", "verdict": "achieved", "issued": [], "recorded_effects": []}
     )
     assert "Task IDs: none issued" in explicit and "Recorded effects: none" in explicit, explicit
+
+
+# --- BloodHound ingest contract, through the real collection path -------------------------------------------
+#
+# Live evidence (2026-11-03, job 683): the image's MCP rejected every `status` read, the poller treated the
+# rejection as pending for twenty reads, no graph-built hop was recorded, the card said "Collection verified",
+# and the same collection was proposed again. These regressions run the approved collection through the real
+# runner, ingest, proof creation, `_record_graph_built`, persisted ledger, and unchanged scope gate; only the
+# external Mythic API and the BloodHound MCP (`FakeIngestTool`, the shipped envelope) are replaced.
+
+LEDGER_KEY = "ingest-contract-regression"
+
+
+def _real_recorder(case, monkeypatch, tmp_path):
+    from ai.langgraph import access_reconciler
+
+    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path / "ledger"))
+    monkeypatch.setattr(mt, "SAGE_ENGAGEMENT_ID", LEDGER_KEY)
+    monkeypatch.setattr(case.client, "_record_graph_built", mt.MythicTools._record_graph_built.__get__(case.client))
+
+    async def live_footholds(_client, _now):  # Mythic's live callbacks, as the access reconciler reports them
+        return list(case.state.footholds)
+
+    monkeypatch.setattr(access_reconciler, "reconcile_access", live_footholds)
+
+
+def _streamed(case):
+    messages = []
+    case.owner._queue_controller_verbose_event = (
+        lambda _text, *, operator_message=None: messages.append(operator_message or "")
+    )
+    return messages
+
+
+def _graph_hops(client):
+    return [hop for hop in client._engagement_hops if hop.technique == "collect-graph"]
+
+
+def _reloaded(case):
+    """A fresh client that knows only the persisted ledger, plus the same live footholds."""
+    fresh = mt.MythicTools()
+    fresh.client = object()
+    fresh._load_engagement_ledger(replace=True)
+    fresh._engagement_footholds = list(case.state.footholds)
+    state = es.EngagementState(
+        objective=case.state.objective, footholds=list(case.state.footholds),
+        hops=list(fresh._engagement_hops), engagement_id=LEDGER_KEY, runtime_scope=True,
+    )
+    return fresh, state
+
+
+def test_a_completed_ingest_persists_one_verified_hop_and_the_unchanged_gate_suppresses_the_same_collection(
+    collection, monkeypatch, tmp_path,
+):
+    case = collection
+    _real_recorder(case, monkeypatch, tmp_path)
+    streamed = _streamed(case)
+    case.ingest_tool.statuses = [(6, "Ingesting"), (2, "Complete")]
+    _approve(case, ACTION)
+
+    result = _run(case, ACTION)
+
+    assert result["ok"] is True and result["status"] == "ingested", (result, case.events)
+    assert result["graph_verified"] is True and result["bloodhound_job_id"] == 41
+    assert case.ingest_tool.uploads == 1
+    # Controller readiness read, ingest readiness read, then the uploaded job until it completed.
+    assert case.ingest_tool.status_reads == [0, 0, 41, 41]
+    assert streamed[-1].startswith("**Collection verified**")
+    hops = _graph_hops(case.client)
+    assert len(hops) == 1 and hops[0].status == "achieved"
+    assert hops[0].evidence["graph_verified"] is True
+    assert hops[0].evidence["covered_domains"] == ["corp.test"]
+    assert "graph-built:" in result["recorded_effects"][0]
+    proof = hops[0].proof_envelope
+    assert (proof["verifier_id"], proof["ingest_job_id"], proof["ingest_status"]) == (
+        "bloodhound_ingest:completed", "41", "complete",
+    )
+    assert (proof["callback_id"], proof["source_artifact_id"], proof["task_id"]) == ("7", "collection-file-test", "5")
+    assert proof["persistence_state"] == "admitted"
+
+    # Persisted and reloaded: the unchanged gate now covers this callback's authority epoch and scope.
+    fresh, state = _reloaded(case)
+    foothold = case.state.footholds[0]
+    assert len(_graph_hops(fresh)) == 1
+    assert es.graph_collection_covers_scope(state, foothold, "corp.test") is True
+    # The same collection is not selected again by the controller: no target task, no upload.
+    owner = object.__new__(model.Model)
+    owner.mythic_client = fresh
+    owner._turn_authority = None
+    owner._controller_collection_adapter = case.owner._controller_collection_adapter
+    owner._controller_hitl_enabled = lambda: False
+    assert owner._controller_collection_request(state) is None
+    uploads_before, tasks_before = case.ingest_tool.uploads, len(case.tasks)
+    repeat = asyncio.run(owner._controller_collect(state))
+    assert repeat["ok"] is False and repeat["status"] == "no_target"
+    assert (case.ingest_tool.uploads, len(case.tasks)) == (uploads_before, tasks_before)
+    # The card for an identical proposal says so, and an unapproved collector run is skipped by the gate.
+    assert fresh._collection_already_covered("7", "corp.test") is True
+    monkeypatch.setenv("SAGE_ENGAGEMENT_GATE", "true")
+    same_scope = mt.build_sharphound_arguments(zip_filename="bloodhound_repeat.zip", domain="corp.test")
+    blocked = asyncio.run(mt.MythicTools._engagement_issue_hook(
+        fresh, "execute_assembly", {"assembly_name": "SharpHound.exe", "assembly_arguments": same_scope}, 7,
+    ))
+    assert blocked and "graph already built" in blocked, blocked
+    # Valid recollection stays possible: another scope, or a changed authority epoch, is not covered.
+    assert es.graph_collection_covers_scope(state, foothold, "other.test") is False
+    domain_admin = es.Hop(
+        id="hop-da", technique="dcsync", target="corp.test", effect="da:corp.test", status="achieved",
+        evidence={}, preconditions=[], satisfied_effects=["da:corp.test"], source="test", timestamp="",
+    )
+    new_epoch = es.EngagementState(
+        objective=state.objective, footholds=state.footholds, hops=[*state.hops, domain_admin], runtime_scope=False,
+    )
+    assert es.collection_target_key(new_epoch, foothold, "corp.test") != es.collection_target_key(
+        state, foothold, "corp.test",
+    )
+    assert es.graph_collection_covers_scope(new_epoch, foothold, "corp.test") is False
+
+
+def test_the_pinned_base_mcp_stops_collection_before_any_target_task_or_upload(collection, monkeypatch, tmp_path):
+    case = collection
+    _real_recorder(case, monkeypatch, tmp_path)
+    streamed = _streamed(case)
+    case.ingest_tool.patched = False
+    # A compatible host checkout is not the serving MCP: the runtime reads only the connected server.
+    checkout = tmp_path / "host-checkout"
+    checkout.mkdir()
+    (checkout / "main.py").write_text('"status": lambda: get_job_status(job_id),\n')
+    monkeypatch.setenv("SAGE_BLOODHOUND_MCP_DIR", str(checkout))
+    _approve(case, ACTION)
+
+    result = _run(case, ACTION)
+
+    assert result["ok"] is False and result["status"] == "error", result
+    assert result["graph_verified"] is False
+    assert result["ingest_error"]["kind"] == "unsupported_operation"
+    assert "Unknown info_type 'status'" in result["reason"] and "rebuild the image" in result["reason"]
+    assert case.tasks == [] and case.registered == [], "no collection target task may run"
+    assert case.ingest_tool.uploads == 0 and case.ingest_tool.status_reads == [0]
+    assert streamed and streamed[-1].startswith("**Collection failed**")
+    assert not any("Collection verified" in message for message in streamed)
+    assert _graph_hops(case.client) == []
+
+
+def test_upload_acceptance_and_a_populated_graph_are_not_completion(collection, monkeypatch, tmp_path):
+    case = collection
+    _real_recorder(case, monkeypatch, tmp_path)
+    streamed = _streamed(case)
+    case.ingest_tool.statuses = [(6, "Ingesting")]
+    # BloodHound already lists the domain as collected, and the cached graph says so too.
+    case.client._engagement_graph_facts = [es.GraphFact(
+        predicate="domain-collected:corp.test", source="bloodhound:domain_info", timestamp="", ttl_seconds=3600,
+    )]
+    _approve(case, ACTION)
+
+    result = _run(case, ACTION)
+
+    assert result["ok"] is False and result["status"] == "uploaded_pending_ingest", result
+    assert result["graph_verified"] is False and result["job_status"] == "Ingesting"
+    assert case.ingest_tool.uploads == 1 and case.ingest_tool.status_reads.count(41) == 20
+    assert streamed[-1].startswith("**Collection pending**")
+    assert _graph_hops(case.client) == []
+    content = case.client._collection_already_ingested(b"")  # nothing verified was cached
+    assert content[1] is None
+    state = es.EngagementState(
+        objective=case.state.objective, footholds=list(case.state.footholds), hops=list(case.client._engagement_hops),
+        graph_facts=list(case.client._engagement_graph_facts), engagement_id=LEDGER_KEY, runtime_scope=True,
+    )
+    assert es.graph_collection_covers_scope(state, case.state.footholds[0], "corp.test") is False
+
+
+@pytest.mark.parametrize("pair", [(3, "Canceled"), (4, "Timed Out"), (5, "Failed"),
+                                  (8, "Partially Complete"), (-1, "Invalid")])
+def test_a_terminal_ingest_failure_stops_at_once_records_nothing_and_a_fresh_collection_can_still_succeed(
+    collection, monkeypatch, tmp_path, pair,
+):
+    case = collection
+    _real_recorder(case, monkeypatch, tmp_path)
+    streamed = _streamed(case)
+    case.ingest_tool.statuses = [pair]
+    _approve(case, ACTION)
+
+    failed = _run(case, ACTION)
+
+    assert failed["ok"] is False and failed["status"] == "ingest_failed", failed
+    assert failed["graph_verified"] is False and failed["job_status"] == pair[1]
+    assert case.ingest_tool.status_reads == [0, 0, 41], "a terminal status is read once"
+    assert streamed[-1].startswith("**Collection failed**") and pair[1] in streamed[-1]
+    assert _graph_hops(case.client) == []
+    assert case.client._collection_in_flight == {}
+
+    # No permanent denial: the scope is still uncovered and nothing verified was cached, so a fresh approved
+    # collection runs end to end. (The fake Mythic file registry is reset so it lists the collector once.)
+    state = es.EngagementState(
+        objective=case.state.objective, footholds=list(case.state.footholds),
+        hops=list(case.client._engagement_hops), engagement_id=LEDGER_KEY, runtime_scope=True,
+    )
+    assert es.graph_collection_covers_scope(state, case.state.footholds[0], "corp.test") is False
+    case.registered.clear()
+    case.ingest_tool.statuses = [(2, "Complete")]
+    _approve(case, ACTION)
+    succeeded = _run(case, ACTION)
+    assert succeeded["ok"] is True and succeeded["status"] == "ingested", succeeded
+    assert len(_graph_hops(case.client)) == 1
+
+
+@pytest.mark.parametrize("response", [
+    # Another job's completion.
+    [{"type": "text", "text": json.dumps({"info_type": "status", "data": {
+        "job_id": 40, "status": 2, "status_message": "Complete"}})}],
+    # A contradictory numeric/text pair.
+    [{"type": "text", "text": json.dumps({"info_type": "status", "data": {
+        "job_id": 41, "status": 5, "status_message": "Complete"}})}],
+    # A top-level error beside completion-shaped data.
+    [{"type": "text", "text": json.dumps({"error": "API error: (HTTP 500) boom", "info_type": "status", "data": {
+        "job_id": 41, "status": 2, "status_message": "Complete"}})}],
+    # Malformed JSON, and more than one content block.
+    [{"type": "text", "text": "{\"info_type\": \"status\", "}],
+    [{"type": "text", "text": json.dumps({"info_type": "status", "data": {
+        "job_id": 41, "status": 2, "status_message": "Complete"}})}] * 2,
+])
+def test_completion_lookalikes_never_verify_the_collection(collection, monkeypatch, tmp_path, response):
+    case = collection
+    _real_recorder(case, monkeypatch, tmp_path)
+    streamed = _streamed(case)
+    case.ingest_tool.statuses = [response]
+    _approve(case, ACTION)
+
+    result = _run(case, ACTION)
+
+    assert result["ok"] is False and result["graph_verified"] is False, result
+    assert result["status"] in {"error", "uploaded_pending_ingest"}
+    assert _graph_hops(case.client) == []
+    assert not streamed[-1].startswith("**Collection verified**")
+
+
+def test_refused_collections_never_read_or_upload_to_bloodhound(collection):
+    case = collection
+    _approve(case, {"capability": "collect-graph", "callback_id": "9"})
+    assert _run(case, {"capability": "collect-graph", "callback_id": "9"})["status"] == "no_target"
+    _approve(case, ACTION)
+    case.client.set_collection_runner(None)
+    assert _run(case, ACTION)["status"] == "unavailable"
+    with pytest.raises(ValueError):
+        _approve(case, ACTION, mode="conversation")
+    case.client.clear_approval_claim()
+    with pytest.raises(PermissionError):
+        _run(case, ACTION)
+    assert case.tasks == [] and case.ingest_tool.calls == []

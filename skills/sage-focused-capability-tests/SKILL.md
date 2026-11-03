@@ -28,6 +28,12 @@ argument is still accepted and ignored. See `docs/development/TEST_TIERS.md`.
 ## Bundled Scripts
 
 - `build_capability_smoke.py`
+- `check_bloodhound_ingest_contract.py --image <id> [--json out.json]` — checks a **built** Sage image's baked
+  BloodHound MCP serves the ingest contract (byte upload plus exact-job `status`). It runs one throwaway container
+  with `--network none`, the entrypoint bypassed, and only the checker mounted read-only; a loopback fake BloodHound
+  API answers Sage's own MCP launcher, readiness probe, and decoder. Records the image ID, MCP base commit, and
+  status-patch SHA-256. Exit 0 passed, 1 failed, 2 blocked (no Docker or no image — never a pass). It has no
+  live-target mode and does not prove real BloodHound ingestion.
 - `probe_slack_findings_webhook.py` — sends the exact fixed-content production notice through an explicitly
   configured webhook. It never accepts finding content and never prints the webhook URL. Modern Slack app
   webhooks are bound to their installed channel; select a different channel-bound URL with `--webhook-env NAME`.

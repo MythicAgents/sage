@@ -36,18 +36,25 @@ ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python \
 # Override only with another prospectively verified immutable commit:
 # --build-arg BLOODHOUND_MCP_REF=<full-commit> --build-arg BLOODHOUND_MCP_REPO=<url>
 #
-# Sage requires the byte-upload path: mythic_tools.py calls `file_upload` with
-# `info_type="upload_bytes"`, and bloodhound_config.py lists `file_upload` in
-# REQUIRED_BLOODHOUND_TOOLS. The exact commit below carries that path. Pinning the commit prevents
-# a future branch update from silently dropping `upload_bytes` while leaving the image build green.
+# Sage's ingest contract has two halves. Upload: mythic_tools.py calls `file_upload` with
+# `info_type="upload_bytes"`, which the exact commit below carries. Status: Sage then reads
+# `file_upload(info_type="status", job_id=...)` to learn when BloodHound finished ingesting. No upstream
+# commit has that operation, so Sage ships it as patches/bloodhound-mcp-ingest-status.patch and applies it
+# here. The effective MCP is therefore this base commit PLUS that patch; the patch stays at
+# /opt/sage-patches so its SHA-256 can be recorded beside the base commit. A patch that does not apply fails
+# the build: an override ref needs a new patch decision, never a skipped one. Syncing /Mythic source cannot
+# change /opt/bloodhound_mcp; changing either half needs an image rebuild.
 ARG BLOODHOUND_MCP_REPO=https://github.com/mwnickerson/bloodhound_mcp.git
 ARG BLOODHOUND_MCP_REF=92a37dd481ce675fe552f14c9957a31dbbcd212e
+COPY patches/bloodhound-mcp-ingest-status.patch /opt/sage-patches/bloodhound-mcp-ingest-status.patch
 RUN git init /opt/bloodhound_mcp && \
     cd /opt/bloodhound_mcp && \
     git remote add origin ${BLOODHOUND_MCP_REPO} && \
     git fetch --depth 1 origin ${BLOODHOUND_MCP_REF} && \
     git checkout --detach FETCH_HEAD && \
     test "$(git rev-parse HEAD)" = "${BLOODHOUND_MCP_REF}" && \
+    git apply --check --whitespace=error /opt/sage-patches/bloodhound-mcp-ingest-status.patch && \
+    git apply --whitespace=error /opt/sage-patches/bloodhound-mcp-ingest-status.patch && \
     uv sync --no-dev
 # Tell Sage where the baked-in BloodHound MCP lives. Native chat connects it in the serving event loop before
 # model initialization; autonomous sessions additionally require exact tool admission. Local development can

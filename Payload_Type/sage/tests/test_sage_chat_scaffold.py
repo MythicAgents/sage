@@ -855,6 +855,10 @@ def test_autonomous_native_chat_initializes_after_exact_bloodhound_admission(mon
             return None
 
     monkeypatch.setattr("ai.langgraph.model.Model", _Model)
+    from tests.test_bloodhound_ingest_contract import FakeIngestTool, install_bloodhound
+
+    ingest = FakeIngestTool()
+    install_bloodhound(monkeypatch, ingest)
     chat = SageChat()
 
     _run(
@@ -869,6 +873,122 @@ def test_autonomous_native_chat_initializes_after_exact_bloodhound_admission(mon
     )
 
     assert events == ["connect", "initialize"]
+    assert ingest.calls == [{"info_type": "status", "job_id": 0}], "auto admission reads the ingest contract"
+
+
+def test_autonomous_native_chat_fails_closed_when_the_connected_mcp_cannot_report_ingest_status(monkeypatch):
+    from ai import bloodhound_config
+    from sage_chat.service import SageChat
+    from tests.test_bloodhound_ingest_contract import FakeIngestTool, install_bloodhound
+
+    events = []
+
+    async def _ensure(**_kwargs):
+        events.append("connect")
+        return True, "BloodHound MCP already connected."
+
+    monkeypatch.setattr(bloodhound_config, "ensure_bloodhound_connected", _ensure)
+    monkeypatch.setattr(
+        bloodhound_config,
+        "bloodhound_tool_admission",
+        lambda: {"ready": True, "server": "BloodHound", "reason": "exact tools"},
+    )
+    monkeypatch.setattr(SageChat, "_bloodhound_connection_locally_pinned", staticmethod(lambda _server: True))
+    install_bloodhound(monkeypatch, FakeIngestTool(patched=False))
+
+    class _Model:
+        def __init__(self, **_kwargs):
+            self.provider = "openai"
+            self.model = "test-model"
+
+        async def initialize(self):
+            events.append("initialize")
+
+        def set_verbose(self, _value):
+            return None
+
+    monkeypatch.setattr("ai.langgraph.model.Model", _Model)
+    chat = SageChat()
+    with pytest.raises(RuntimeError) as raised:
+        _run(chat._get_or_create_model(
+            build_chat_request("objective", channel_id=806, request_id=1, config={"mode": "auto"})
+        ))
+
+    message = str(raised.value)
+    assert events == ["connect"], "the solve must not initialize without a verifiable ingest contract"
+    assert "cannot report ingest status" in message and "Unknown info_type 'status'" in message
+    assert "rebuild the image" in message
+    assert "is not connected" not in message
+
+
+def test_supervised_native_chat_stays_fail_soft_when_ingest_is_unavailable(monkeypatch):
+    from ai import bloodhound_config
+    from sage_chat.service import SageChat
+    from tests.test_bloodhound_ingest_contract import FakeIngestTool, install_bloodhound
+
+    async def _ensure(**_kwargs):
+        return True, "BloodHound MCP already connected."
+
+    monkeypatch.setattr(bloodhound_config, "ensure_bloodhound_connected", _ensure)
+    monkeypatch.setattr(
+        bloodhound_config,
+        "bloodhound_tool_admission",
+        lambda: {"ready": True, "server": "BloodHound", "reason": "exact tools"},
+    )
+    monkeypatch.setattr(SageChat, "_bloodhound_connection_locally_pinned", staticmethod(lambda _server: True))
+    install_bloodhound(monkeypatch, FakeIngestTool(patched=False))
+
+    admitted = _run(SageChat.__new__(SageChat)._ensure_bloodhound_connected(autonomous_required=False))
+
+    assert admitted is True, "graph reads stay available; only ingest is degraded (and announced per turn)"
+
+
+@pytest.mark.parametrize("patched", [True, False])
+@pytest.mark.parametrize("already_connected", [True, False])
+def test_bloodhound_command_reports_connection_and_ingest_readiness_separately(
+    monkeypatch, patched, already_connected,
+):
+    from ai import bloodhound_config
+    from sage_chat import slash
+    from tests.test_bloodhound_ingest_contract import FakeIngestTool, install_bloodhound
+
+    message = "BloodHound MCP already connected." if already_connected else "Connected to BloodHound MCP (13 tools)."
+
+    async def _ensure(directory=None, env=None, force=False):
+        return True, message
+
+    monkeypatch.setattr(bloodhound_config, "ensure_bloodhound_connected", _ensure)
+    tool = FakeIngestTool(patched=patched)
+    install_bloodhound(monkeypatch, tool)
+
+    reply = _run(slash._handle_bloodhound(None, ""))
+
+    assert reply.startswith(f"**Connection:** {message}")
+    assert tool.calls == [{"info_type": "status", "job_id": 0}], "an already-connected server is still probed"
+    if patched:
+        assert "**Ingest:** Ready." in reply
+    else:
+        assert "**Ingest:** NOT ready" in reply and "Unknown info_type 'status'" in reply
+        assert "rebuild the image" in reply
+
+
+def test_bloodhound_command_does_not_probe_ingest_without_a_connection(monkeypatch):
+    from ai import bloodhound_config
+    from sage_chat import slash
+    from tests.test_bloodhound_ingest_contract import FakeIngestTool, install_bloodhound
+
+    async def _ensure(directory=None, env=None, force=False):
+        return False, "Failed to connect to BloodHound MCP: Connection closed"
+
+    monkeypatch.setattr(bloodhound_config, "ensure_bloodhound_connected", _ensure)
+    tool = FakeIngestTool()
+    install_bloodhound(monkeypatch, tool)
+
+    reply = _run(slash._handle_bloodhound(None, ""))
+
+    assert "**Connection:** Failed to connect" in reply
+    assert "**Ingest:** Unavailable until BloodHound is connected." in reply
+    assert tool.calls == []
 
 
 def test_bloodhound_tool_admission_requires_exact_names(monkeypatch):

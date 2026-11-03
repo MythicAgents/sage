@@ -532,7 +532,6 @@ class SageChat(Chat):
                         )
                     )
                 )
-            return admitted
         except Exception as exc:
             if autonomous_required:
                 raise RuntimeError(_bloodhound_unavailable_message(str(exc))) from exc
@@ -543,6 +542,22 @@ class SageChat(Chat):
                 f"{credential_diagnostic(bloodhound_env)}"
             )
             return False
+        if autonomous_required:
+            # Exact tool names do not prove the server can report ingest status, and an autonomous solve
+            # that cannot verify its graph collection must not start. One live status read decides it.
+            # Conversation and supervised stay fail-soft: their degraded-ingest notice is sent per turn.
+            try:
+                from ai.bloodhound_config import autonomous_ingest_unavailable_message, probe_ingest_contract
+            except ImportError:  # pragma: no cover
+                from ..ai.bloodhound_config import (  # type: ignore
+                    autonomous_ingest_unavailable_message,
+                    probe_ingest_contract,
+                )
+            contract = await probe_ingest_contract()
+            if not contract.ready:
+                logger.warning(f"BloodHound ingest contract not ready ({contract.kind}): {contract.reason}")
+                raise RuntimeError(autonomous_ingest_unavailable_message(contract))
+        return admitted
 
     async def _refresh_auth_context(self, model: Any, request: ChatRequest) -> None:
         """Assert that a reused model still belongs to the same Mythic auth identity.
@@ -734,13 +749,36 @@ class SageChat(Chat):
             return
         try:
             try:
-                from ai.bloodhound_config import bloodhound_tool_admission, degraded_chat_notice
+                from ai.bloodhound_config import (
+                    bloodhound_tool_admission,
+                    degraded_chat_notice,
+                    ingest_degraded_chat_notice,
+                    probe_ingest_contract,
+                )
             except ImportError:  # pragma: no cover
                 from ..ai.bloodhound_config import (  # type: ignore
                     bloodhound_tool_admission,
                     degraded_chat_notice,
+                    ingest_degraded_chat_notice,
+                    probe_ingest_contract,
                 )
             if bloodhound_tool_admission().get("ready"):
+                # Connected with the exact tools is not the same as able to ingest. One status read per turn
+                # until the operator has been told; a healthy server is re-read, never remembered as healthy.
+                if getattr(model, "_bloodhound_ingest_notice_sent", False):
+                    return
+                contract = await probe_ingest_contract()
+                if contract.ready:
+                    return
+                await self.send_response(
+                    request,
+                    response_key=f"bloodhound_ingest_degraded:{request.ChannelID}",
+                    content=ingest_degraded_chat_notice(contract),
+                    status="complete",
+                    complete=False,
+                    metadata={},
+                )
+                model._bloodhound_ingest_notice_sent = True
                 return
             try:
                 from .config import build_bloodhound_env

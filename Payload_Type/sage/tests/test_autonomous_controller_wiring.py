@@ -31,6 +31,16 @@ from ai.langgraph import autonomous_controller as controller  # noqa: E402
 from ai.langgraph import capabilities  # noqa: E402
 from ai.langgraph import engagement_state as es  # noqa: E402
 from ai.langgraph import mythic_tools as mt  # noqa: E402
+from tests.test_bloodhound_ingest_contract import FakeIngestTool, install_bloodhound  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _connected_ingest_ready_bloodhound(monkeypatch):
+    """Controller collection now reads the connected MCP's ingest contract before its first task. These tests
+    fake the Mythic client, so serve them the image's MCP (status patch present) unless a test installs its own."""
+    tool = FakeIngestTool()
+    install_bloodhound(monkeypatch, tool)
+    return tool
 
 
 def _state_with_remote_exec():

@@ -20,6 +20,8 @@ from typing_extensions import NotRequired, TypedDict
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from tests.test_bloodhound_ingest_contract import FakeIngestTool  # noqa: E402
+
 
 def _load_turn_authority():
     return importlib.import_module("ai.langgraph.turn_authority")
@@ -2488,15 +2490,12 @@ def test_contract_ingest_uses_one_authoritative_filename_in_every_downstream_sin
     async def _sleep(_seconds):
         return None
 
-    class _UploadTool:
-        name = "file_upload"
-
+    class _UploadTool(FakeIngestTool):
         async def ainvoke(self, args):
             payload = dict(args)
             if payload.get("info_type") == "upload_bytes":
                 calls["upload"].append(payload)
-                return {"data": {"job_id": "job-new"}}
-            return {"data": {"status_message": "Complete"}}
+            return await super().ainvoke(args)
 
     upload_tool = _UploadTool()
 
@@ -2552,11 +2551,17 @@ def test_contract_ingest_uses_one_authoritative_filename_in_every_downstream_sin
     assert calls["proof"][0]["metadata"]["filename"] == filename
     if idempotent:
         assert calls["upload"] == []
+        assert upload_tool.calls == [], "a verified duplicate neither reads nor uploads to BloodHound"
     else:
         assert calls["upload"][0]["file_name"] == filename
     assert len(calls["metadata"]) == 1
     assert len(calls["graph"]) == 1
 
+
+_CE_STATUS = {
+    label: number
+    for number, label in importlib.import_module("ai.bloodhound_config").BLOODHOUND_JOB_STATUS_LABELS.items()
+}
 
 @pytest.fixture
 def assembled_ingest_graph_path(monkeypatch):
@@ -2596,13 +2601,13 @@ def assembled_ingest_graph_path(monkeypatch):
     async def sleep(seconds):
         state.sleeps.append(seconds)
 
-    class Upload:
-        name = "file_upload"
+    class Upload(FakeIngestTool):
+        """The image's MCP; the uploaded job reports `state.status` (a documented CE status label)."""
 
         async def ainvoke(self, args):
             state.uploads.append(dict(args))
-            return {"data": {"job_id": "job-new"} if args["info_type"] == "upload_bytes"
-                    else {"status_message": state.status}}
+            self.statuses = [(_CE_STATUS[state.status], state.status)]
+            return await super().ainvoke(args)
 
     class Domains:
         name = "domain_info"
@@ -2667,13 +2672,16 @@ def test_completed_ingest_reuses_positive_domain_snapshot_and_preserves_retry(
     assert {fact.predicate for fact in facts} == expected
     assert all(fact.proof_envelope == proof for fact in facts)
     assert len(path.queries) == 8
-    assert [call["info_type"] for call in path.uploads] == ["upload_bytes", "status"]
-    assert path.sleeps == [6]
+    # One readiness read (job 0), one upload, one read of the uploaded job — which completes at once.
+    assert [(call["info_type"], call.get("job_id")) for call in path.uploads] == [
+        ("status", 0), ("upload_bytes", None), ("status", 41),
+    ]
+    assert path.sleeps == []
     # Fail on the reference implementation: successful ingestion reads the same metadata twice.
     assert len(path.domains) == (1 if first_read == "collected" else 2)
 
 
-@pytest.mark.parametrize("status,polls", (("Processing", 20), ("Failed", 1)))
+@pytest.mark.parametrize("status,polls", (("Running", 20), ("Failed", 1)))
 def test_unverified_ingest_still_refreshes_without_claiming_completed_coverage(
     assembled_ingest_graph_path, status, polls,
 ):
@@ -2686,8 +2694,8 @@ def test_unverified_ingest_still_refreshes_without_claiming_completed_coverage(
     assert not path.tools._engagement_hops
     assert len(path.domains) == 1
     assert len(path.queries) == 8
-    assert len(path.uploads) == polls + 1
-    assert path.sleeps == [6] * polls
+    assert len(path.uploads) == polls + 2  # readiness read + upload + job reads
+    assert path.sleeps == [6] * (polls - 1)  # the first job read is immediate
     assert not any(fact.proof_envelope for fact in path.tools._engagement_graph_facts)
 
 

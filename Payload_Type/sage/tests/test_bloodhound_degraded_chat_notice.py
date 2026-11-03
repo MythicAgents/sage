@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import ai.bloodhound_config as bloodhound_config  # noqa: E402
 from sage_chat.service import SageChat  # noqa: E402
+from tests.test_bloodhound_ingest_contract import FakeIngestTool, install_bloodhound  # noqa: E402
 
 
 class _Session:
@@ -55,7 +56,20 @@ def unavailable(monkeypatch):
 
 @pytest.fixture
 def available(monkeypatch):
+    """Connected with the exact tools, and serving the image's MCP (status patch present)."""
     monkeypatch.setattr(bloodhound_config, "bloodhound_tool_admission", lambda: {"ready": True})
+    tool = FakeIngestTool()
+    install_bloodhound(monkeypatch, tool)
+    return tool
+
+
+@pytest.fixture
+def connected_without_status(monkeypatch):
+    """Connected with the exact tools, but serving the pinned six-handler base MCP."""
+    monkeypatch.setattr(bloodhound_config, "bloodhound_tool_admission", lambda: {"ready": True})
+    tool = FakeIngestTool(patched=False)
+    install_bloodhound(monkeypatch, tool)
+    return tool
 
 
 def _request():
@@ -97,6 +111,31 @@ def test_a_working_bloodhound_says_nothing(service, available):
     _notify(service, _Session())
 
     assert service._sent == [], "a connected BloodHound must not announce itself every session"
+    assert available.calls == [{"info_type": "status", "job_id": 0}], "working means the status read answered"
+
+
+def test_a_connected_bloodhound_that_cannot_report_ingest_status_says_so_once(service, connected_without_status):
+    session = _Session()
+    for _ in range(3):
+        _notify(service, session)
+
+    assert len(service._sent) == 1, service._sent
+    message = service._sent[0]["content"]
+    assert service._sent[0]["response_key"] == "bloodhound_ingest_degraded:7"
+    assert "connected, but graph ingest is unavailable" in message
+    assert "Graph reads work normally" in message
+    assert "Unknown info_type 'status'" in message and "rebuild the image" in message
+    assert "not connected" not in message, "a connected server must not be described as disconnected"
+
+
+def test_a_healthy_server_is_re_read_each_turn_and_a_later_breakage_is_reported(service, available, monkeypatch):
+    session = _Session()
+    _notify(service, session)
+    _notify(service, session)
+    assert service._sent == [] and len(available.calls) == 2, "healthy is observed, never remembered"
+    install_bloodhound(monkeypatch, FakeIngestTool(patched=False))
+    _notify(service, session)
+    assert len(service._sent) == 1 and "graph ingest is unavailable" in service._sent[0]["content"]
 
 
 def test_the_notice_never_breaks_the_turn(service, unavailable, monkeypatch):

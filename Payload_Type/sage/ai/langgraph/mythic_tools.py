@@ -301,6 +301,73 @@ def _mcp_response_data(response):
         return None
 
 
+async def _poll_bloodhound_ingest_job(tool, job_id: int, *, sleep=None, clock=None) -> dict:
+    """Read one BloodHound ingest job's status until it is decided or the existing wait is spent.
+
+    The first read is immediate (a deterministic failure is caught without waiting); then at most
+    INGEST_STATUS_POLL_LIMIT reads in all, INGEST_STATUS_POLL_INTERVAL_SECONDS apart, inside one monotonic
+    INGEST_STATUS_DEADLINE_SECONDS deadline; each read is bounded by the smaller of the per-call timeout and the
+    time left, so a timed-out read buys no new budget. Outcomes: `complete` (this job's Complete), `terminal_failure`
+    (stop at once), `error` (a deterministic failure on its first occurrence, or status still unreadable when the
+    wait ends), and `pending` (status validly pending when the wait ends). Cancellation propagates.
+    """
+    import time as _time
+    from ai import bloodhound_config as _bh
+
+    sleep = sleep or asyncio.sleep
+    clock = clock or _time.monotonic
+    deadline = clock() + _bh.INGEST_STATUS_DEADLINE_SECONDS
+    polls = 0
+    last_known = None
+    last_error = None
+
+    def failed(kind: str, detail: str) -> dict:
+        return {"outcome": "error", "error_kind": kind, "error_detail": detail,
+                "polls": polls, "last_known": last_known}
+
+    while polls < _bh.INGEST_STATUS_POLL_LIMIT:
+        if polls:
+            remaining = deadline - clock()
+            if remaining <= 0:
+                break
+            await sleep(min(_bh.INGEST_STATUS_POLL_INTERVAL_SECONDS, remaining))
+        remaining = deadline - clock()
+        if remaining <= 0:
+            break
+        polls += 1
+        try:
+            raw = await asyncio.wait_for(
+                tool.ainvoke({"info_type": "status", "job_id": job_id}),
+                timeout=min(_bh.INGEST_CALL_TIMEOUT_SECONDS, remaining),
+            )
+            data = _bh.decode_ingest_response(raw, info_type="status", expected_job_id=job_id)
+            state = _bh.classify_ingest_status(data)
+        except (asyncio.TimeoutError, TimeoutError):
+            last_error = (_bh.INGEST_ERROR_TRANSIENT, "the status read timed out")
+            continue
+        except _bh.IngestContractError as exc:
+            if exc.kind == _bh.INGEST_ERROR_TRANSIENT:
+                last_error = (exc.kind, exc.detail)
+                continue
+            return failed(exc.kind, exc.detail)
+        except Exception as exc:  # noqa: BLE001 - adapter failures are classified, not swallowed as pending
+            kind = _bh.classify_ingest_failure_text(exc)
+            detail = _bh.sanitize_ingest_diagnostic(f"{type(exc).__name__}: {exc}")
+            if kind == _bh.INGEST_ERROR_TRANSIENT:
+                last_error = (kind, detail)
+                continue
+            return failed(kind, detail)
+        last_known = data
+        last_error = None
+        if state != "pending":
+            return {"outcome": state, "polls": polls, "last_known": data}
+    if last_error is not None:
+        return failed(last_error[0], f"job status was still unreadable when the wait ended: {last_error[1]}")
+    if last_known is None:
+        return failed(_bh.INGEST_ERROR_UNAVAILABLE, "no job status read completed before the wait ended")
+    return {"outcome": "pending", "polls": polls, "last_known": last_known}
+
+
 async def _bloodhound_collected_domains(info_tool=None) -> list[str]:
     """Return domains BloodHound marks fully collected, never trust mere stub-domain presence."""
     try:
@@ -19567,59 +19634,80 @@ class MythicTools:
                     "This exact collection was already ingested and verified. Do not re-upload or re-collect."
                 ),
             }, sort_keys=True)
-        # 3. Resolve the BloodHound MCP's file_upload + domain_info tools (generic; no Mythic knowledge).
-        upload_tool = None
+        # 3. The connected server must serve the WHOLE ingest contract — upload and an exact-job status read —
+        #    before anything is uploaded. Checked here, at the execution boundary, even when a caller already
+        #    checked: a direct call must not bypass it, and readiness is never inherited from another connection.
+        #    The one tool the probe selected carries the upload and every status read.
+        from ai import bloodhound_config as _bh
+
+        async def clear_unverified() -> None:
+            # Clears the collection in-flight marker through the existing recorder; an unverified call records no hop.
+            try:
+                await self._record_graph_built(
+                    callback_display_id, False, collection_scope_domain=collection_scope_domain,
+                )
+            except Exception:
+                pass
+
+        contract = await _bh.probe_ingest_contract()
+        if not contract.ready:
+            await clear_unverified()
+            return json.dumps({
+                "status": "error", "file_uuid": file_uuid, "filename": safe_name,
+                "source_callback_display_id": callback_display_id, "graph_verified": False,
+                "ingest_error": {"kind": contract.kind, "detail": contract.reason},
+                "error": f"BloodHound ingest is unavailable, so nothing was uploaded. {contract.operator_text()}",
+            }, sort_keys=True)
+        upload_tool = contract.tool
         info_tool = None
         try:
             from ai.mcp import MCPManager
-            for server in MCPManager.get_connected_servers():
-                if not MCPManager.is_bloodhound_server(server):
-                    continue
-                for tool in MCPManager.get_tools_by_server(server):
-                    n = getattr(tool, "name", "")
-                    if n == "file_upload":
-                        upload_tool = tool
-                    elif n == "domain_info":
-                        info_tool = tool
-        except Exception as e:
-            return json.dumps({"status": "error", "error": f"Could not access the BloodHound MCP: {e}"}, sort_keys=True)
-        if upload_tool is None:
-            return json.dumps({"status": "error", "file_uuid": file_uuid,
-                               "error": "BloodHound MCP not connected (or its file_upload tool is unavailable). Connect it with `bloodhound-connect` first."}, sort_keys=True)
-        # 4. Upload the bytes DIRECTLY to BloodHound, programmatically (bytes never enter the LLM context).
+            info_tool = next(
+                (tool for tool in MCPManager.get_tools_by_server(contract.server)
+                 if getattr(tool, "name", "") == "domain_info"),
+                None,
+            )
+        except Exception:
+            info_tool = None
+        # 4. Upload the bytes DIRECTLY to BloodHound, once (bytes never enter the LLM context or Sage disk).
+        #    `upload_bytes` starts, uploads, and ends the job itself, so nothing here ends it again.
         import base64 as _b64
         b64 = _b64.b64encode(file_content).decode("ascii")
         logger.info(f"🩸 ingest_collection: in-memory upload of {safe_name} ({len(file_content)} bytes) to BloodHound (file_uuid={file_uuid}, {resolved_by})")
         try:
             result = await upload_tool.ainvoke({"info_type": "upload_bytes", "file_name": safe_name, "file_bytes_base64": b64})
-        except Exception as e:
+            receipt = _bh.decode_ingest_response(result, info_type="upload_bytes")
+            job_id_bh = _bh.upload_job_id(receipt)
+        except _bh.IngestContractError as e:
+            await clear_unverified()
             return json.dumps({"status": "error", "file_uuid": file_uuid, "filename": safe_name,
-                               "error": f"BloodHound upload_bytes failed: {e}"}, sort_keys=True)
-        # 5. VERIFY via the AUTHORITATIVE ingest-job status (BloodHound ingest is ASYNCHRONOUS — observed
-        #    ~46s for a full collection — so a single immediate check yields a FALSE "empty graph"). Poll
-        #    file_upload(info_type="status", job_id=...) until status_message == "Complete" (or a failure /
-        #    timeout). This is definitive: it distinguishes Complete vs still-ingesting vs Failed, regardless
-        #    of whether the domain count changed (handles re-ingest of an already-populated collection).
-        up = _mcp_response_data(result)
-        job_id_bh = up.get("job_id") if isinstance(up, dict) else None
-        status_msg = None
-        if job_id_bh is not None:
-            for _ in range(20):  # up to ~120s of async-ingest wait
-                await asyncio.sleep(6)
-                try:
-                    st = _mcp_response_data(
-                        await upload_tool.ainvoke({"info_type": "status", "job_id": job_id_bh})
-                    )
-                except Exception:
-                    st = None
-                status_msg = st.get("status_message") if isinstance(st, dict) else None
-                if status_msg == "Complete":
-                    break
-                if status_msg in ("Failed", "Canceled", "Partially Complete"):
-                    break
-        verified = (status_msg == "Complete")
-        failed = status_msg in ("Failed", "Canceled")
-        status_out = "ingested" if verified else ("ingest_failed" if failed else "uploaded_pending_ingest")
+                               "source_callback_display_id": callback_display_id, "graph_verified": False,
+                               "ingest_error": {"kind": e.kind, "detail": e.detail},
+                               "error": f"BloodHound did not accept the upload: {e.detail}"}, sort_keys=True)
+        except Exception as e:
+            detail = _bh.sanitize_ingest_diagnostic(f"{type(e).__name__}: {e}")
+            await clear_unverified()
+            return json.dumps({"status": "error", "file_uuid": file_uuid, "filename": safe_name,
+                               "source_callback_display_id": callback_display_id, "graph_verified": False,
+                               "ingest_error": {"kind": _bh.classify_ingest_failure_text(e), "detail": detail},
+                               "error": f"BloodHound upload_bytes failed: {detail}"}, sort_keys=True)
+        # 5. VERIFY via the AUTHORITATIVE status of THIS job (ingest is asynchronous — observed ~46s for a full
+        #    collection — so the graph's contents prove nothing). Only this job's Complete verifies; a terminal
+        #    failure stops at once; a deterministic error is not polled as if it were pending work.
+        poll = await _poll_bloodhound_ingest_job(upload_tool, job_id_bh)
+        outcome = poll["outcome"]
+        last_status = poll.get("last_known") if isinstance(poll.get("last_known"), dict) else {}
+        status_msg = last_status.get("status_message")
+        status_detail = _bh.sanitize_ingest_diagnostic(last_status.get("detail") or "")
+        verified = outcome == "complete"
+        failed = outcome == "terminal_failure"
+        errored = outcome == "error"
+        status_out = (
+            "ingested" if verified
+            else "ingest_failed" if failed
+            else "error" if errored
+            else "uploaded_pending_ingest"
+        )
         covered_domains = (
             await _bloodhound_collected_domains(info_tool)
             if verified
@@ -19655,9 +19743,8 @@ class MythicTools:
             self._last_bloodhound_ingest_proof_envelope = dict(collection_proof)
         # Loop-breaker: once the graph is populated the forward planner can name the next hop. Refresh the
         # cached graph facts so the per-turn injection surfaces NEXT GROUNDED ACTIONS (graph ACL edges →
-        # available hops) and the operator advances instead of re-collecting. Fire on EVERY ingest (not
-        # just verified): ingest is async, so a collection that reads "pending" here is often Complete
-        # seconds later — the refresh is non-clobbering (keeps prior facts if this cypher returns empty).
+        # available hops). Fires for every accepted upload; the refresh is non-clobbering, and graph facts alone
+        # never stand in for the verified collection hop below.
         try:
             await self._refresh_graph_facts_if_stale(
                 datetime.now(timezone.utc).isoformat(),
@@ -19683,23 +19770,29 @@ class MythicTools:
             self._record_collection_ingested(content_hash, job_id_bh)  # idempotency: don't re-ingest this artifact
             self._mark_contract_outcome("graph_ingested")
             self._complete_operator_collection_request()
-        return json.dumps({"status": status_out, "file_uuid": file_uuid, "filename": safe_name,
-                           "bytes": len(file_content), "resolved_by": resolved_by,
-                           "source_callback_display_id": callback_display_id,
-                           "bloodhound_job_id": job_id_bh, "job_status": status_msg,
-                           "graph_verified": verified,
-                           "covered_domains": covered_domains,
-                           "bloodhound_response": str(result)[:300],
-                           "next_action": (
-                               self._contract_next_action(
-                                   f"BloodHound ingest job {job_id_bh} is COMPLETE and the graph is populated."
-                               ) if verified else
-                               self._contract_next_action(
-                                   f"BloodHound ingest job {job_id_bh} ended '{status_msg}'. Report the blocker."
-                               ) if failed else
-                               self._contract_next_action(
-                                   f"BloodHound ingest job {job_id_bh} remains '{status_msg}'. Report the pending status."
-                               ))}, sort_keys=True)
+        if verified:
+            next_action = f"BloodHound ingest job {job_id_bh} is COMPLETE and the graph is populated."
+        elif failed:
+            next_action = f"BloodHound ingest job {job_id_bh} ended '{status_msg}'. Report the blocker."
+        elif errored:
+            next_action = (
+                f"BloodHound ingest job {job_id_bh} status could not be verified ({poll.get('error_kind')}). "
+                "Report the blocker; the graph collection is not verified."
+            )
+        else:
+            next_action = f"BloodHound ingest job {job_id_bh} remains '{status_msg}'. Report the pending status."
+        payload = {"status": status_out, "file_uuid": file_uuid, "filename": safe_name,
+                   "bytes": len(file_content), "resolved_by": resolved_by,
+                   "source_callback_display_id": callback_display_id,
+                   "bloodhound_job_id": job_id_bh, "job_status": status_msg,
+                   "job_status_detail": status_detail,
+                   "status_polls": poll.get("polls", 0),
+                   "graph_verified": verified,
+                   "covered_domains": covered_domains,
+                   "next_action": self._contract_next_action(next_action)}
+        if errored:
+            payload["ingest_error"] = {"kind": poll.get("error_kind"), "detail": poll.get("error_detail")}
+        return json.dumps(payload, sort_keys=True)
 
     @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def get_operations(self) -> str:

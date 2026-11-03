@@ -243,7 +243,9 @@ strategy.
 - Python 3.14 and a repository virtual environment.
 - Model-provider credentials or an OpenAI-compatible endpoint.
 - For the live-qualified graph path, BloodHound CE 9.5.1 plus [BloodHound MCP](https://github.com/mwnickerson/bloodhound_mcp)
-  commit `92a37dd481ce675fe552f14c9957a31dbbcd212e`.
+  commit `92a37dd481ce675fe552f14c9957a31dbbcd212e`. Sage also needs that MCP's ingest-status operation, which no
+  upstream commit has, so Sage ships it as `Payload_Type/sage/patches/bloodhound-mcp-ingest-status.patch` (see
+  [Ingest readiness](#ingest-readiness)).
 - For live-qualified target activity, an Apollo `v0.1.0-rc1` callback. Other payload types may work through the
   generic adapter but have not been live-qualified.
 
@@ -661,6 +663,47 @@ next rebuild and cannot be edited from the UI. Prefer either option above.
 Sage forwards whatever it resolves into the MCP subprocess. Anything you leave unset is simply not
 forwarded, so the server falls back to its own `.env` — which is what keeps the file-based workflow
 (documented in [docs/configuration/BLOODHOUND.md](docs/configuration/BLOODHOUND.md)) working unchanged.
+
+### Ingest readiness
+
+Connected is not the same as able to ingest. Sage verifies a graph collection only through BloodHound's own
+ingest-job status: it uploads the collection with `file_upload(info_type="upload_bytes")`, then reads that exact job
+with `file_upload(info_type="status")` until BloodHound reports it `Complete`. Only that verified result records the
+collection, which is what stops Sage collecting the same graph again.
+
+The pinned MCP commit has no `status` operation, so the Sage image contains that immutable base **plus** Sage's
+checked-in `patches/bloodhound-mcp-ingest-status.patch`, applied at build time; the build fails if it does not
+apply. Changing either half needs an image rebuild (`./mythic-cli build sage`). Syncing Sage source into `/Mythic`
+cannot repair `/opt/bloodhound_mcp`, and a restart alone does not pick up a new image.
+
+Sage checks the **connected** server, not a checkout on disk, with one read-only status read for job 0, which
+BloodHound never assigns:
+
+- `/bloodhound` reports **Connection** and **Ingest** separately, and probes an already-connected server too.
+- Conversation and supervised chats keep working with a connected but ingest-incompatible MCP; graph reads work,
+  and the chat shows a one-time *graph ingest is unavailable* notice naming the fix.
+- Graph collection checks again before its first target task, and ingest checks again before it uploads. Against
+  an incompatible server neither tasks the target nor uploads; the result is **Collection failed** with the
+  dependency diagnostic.
+- Autonomous solves fail closed until the connected MCP answers the status read.
+
+A collection whose job is still ingesting when Sage's two-minute wait ends reports **Collection pending**, and a
+job BloodHound ends as failed, partially complete, canceled, or timed out reports **Collection failed**. Neither
+counts as a verified collection. A host checkout's `mcp_check.py` result does not establish what the serving image
+can do; use the serving chat's `/bloodhound` answer when validating a deployment.
+
+For a custom local MCP checkout (`SAGE_BLOODHOUND_MCP_DIR` pointing at your own clone), apply the same patch to a
+clean checkout of the pinned base, then sync and reconnect:
+
+```bash
+git -C /path/to/bloodhound_mcp checkout --detach 92a37dd481ce675fe552f14c9957a31dbbcd212e
+git -C /path/to/bloodhound_mcp apply --check /path/to/sage/Payload_Type/sage/patches/bloodhound-mcp-ingest-status.patch
+git -C /path/to/bloodhound_mcp apply /path/to/sage/Payload_Type/sage/patches/bloodhound-mcp-ingest-status.patch
+uv --directory /path/to/bloodhound_mcp sync --no-dev
+```
+
+then `/bloodhound force`. Sage never patches a checkout itself; a checkout with other local changes needs your own
+judgment. An MCP that implements the same `status` contract natively needs no patch.
 
 ## When BloodHound is not connected
 
