@@ -4848,6 +4848,62 @@ def test_close_delegation_suppresses_explicit_content_matching_full_streamed_tra
     )
 
 
+_PROPOSAL = (
+    "`getsystem` takes no parameters.\n\n**Proposed action:** `getsystem` on callback 2.\n\n"
+    "Awaiting your approval."
+)
+
+
+def _close_after_streaming(streamed, close_content):
+    """Real Model close path through the real ChatStreamEmitter (supervised channel 5, requests 3/4)."""
+    chat = HeadlessSageChat()
+    emitter = ChatStreamEmitter(chat, build_chat_request("x", channel_id=5, request_id=3))
+    m = _bare_model_with(emitter, {
+        "Mythic_Operator": {"id": "mythic_operator:3:6", "name": "Mythic_Operator", "title": "t",
+                            "tool_count": 2, "icon": "MO", "icon_color": "#3B82F6",
+                            "final_summary": "", "last_text": "", "streamed_text_chunks": []},
+    })
+    for text in streamed:
+        _run(m._emit_agent_text(content=text, delegation_id="mythic_operator:3:6",
+                                delegation_name="Mythic_Operator"))
+    _run(m._close_delegation("Mythic_Operator", content=close_content))
+    close = [e for e in chat.emissions if (e.get("metadata") or {}).get("special_type") == "subagent"]
+    assert len(close) == 1 and close[0]["complete"] is True
+    return chat, close[0]
+
+
+def test_close_delegation_renders_worker_text_once_when_a_refusal_line_is_appended():
+    refusals = (
+        "[step-boundary] capability `getsystem` is not in this step's allowed_capabilities",
+        "[task preparation] Approval was not requested: invalid ChooseOne param 'Assembly'",
+    )
+    for refusal in refusals:
+        chat, close = _close_after_streaming(
+            # Streamed worker text arrives with a trailing line break, as in the evidence rows.
+            ["Checking the schema.\n", f"{_PROPOSAL}\n"], f"{_PROPOSAL}\n{refusal}",
+        )
+        # The closing card carries only what was not already streamed; Mythic persists that content
+        # as both the card's message and the sub-agent final-output row.
+        assert close["content"] == refusal
+        assert close["metadata"]["subagent"]["summary"] == f"{_PROPOSAL}\n{refusal}"
+        rows_with_proposal = [e for e in chat.emissions if _PROPOSAL in (e.get("content") or "")]
+        assert [e["response_key"] for e in rows_with_proposal] == ["agent_text:mythic_operator:3:6:2"]
+
+
+def test_close_delegation_keeps_close_content_that_only_shares_a_beginning_with_streamed_text():
+    # Not a repeat: the streamed text is not followed by a line break in the close content.
+    _, close = _close_after_streaming(
+        ["Found two active callbacks"], "Found two active callbacks, and one is dead.",
+    )
+    assert close["content"] == "Found two active callbacks, and one is dead."
+    # Unrelated close content is kept whole.
+    _, close = _close_after_streaming(["Checking the schema."], "Collection verified.")
+    assert close["content"] == "Collection verified."
+    # An exact repeat is still suppressed.
+    _, close = _close_after_streaming([_PROPOSAL], _PROPOSAL)
+    assert close["content"] == ""
+
+
 def test_agent_text_sequence_survives_per_request_emitter_replacement():
     chat = HeadlessSageChat()
     m = _bare_model_with(ChatStreamEmitter(chat, build_chat_request("x", request_id=1)), {

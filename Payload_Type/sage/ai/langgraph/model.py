@@ -8853,6 +8853,13 @@ class Model:
                     streamed_text_candidates.add("\n\n".join(cleaned_chunks))
             if content and content in streamed_text_candidates:
                 content = ""
+            elif content:
+                # Close content is often the streamed text with a line appended (a step-boundary or
+                # task-preparation refusal). Keep only the appended part; the rest is already shown.
+                for candidate in sorted(streamed_text_candidates, key=len, reverse=True):
+                    if content.startswith(candidate) and content[len(candidate):][:1] == "\n":
+                        content = content[len(candidate):].strip()
+                        break
             ledger = self._ensure_request_event_ledger()
             event_id = str(delegation.get("event_id") or "") or stable_event_id(
                 ledger.request_id,
