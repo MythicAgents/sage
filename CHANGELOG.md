@@ -103,6 +103,14 @@ specialist's summary, and records proven progress in the engagement ledger.
 
 ### Changed
 
+- A push to `main` now publishes the version image, for example `ghcr.io/mythicagents/sage:0.3.0`, alongside
+  `latest` and the `sha-` reference, so the exact release image exists before the release tag. A `v*` tag no
+  longer builds anything. It checks that the tag matches `agent_version`, that the tagged commit is on `main`, and
+  that the annotated tag's `Image-Digest: sha256:<digest>` line is exactly what the version reference resolves to,
+  with both architectures and revision and version labels that match the tag. Only then does a final release
+  point its minor reference, for example `:0.3`, at that same manifest. Once a version is tagged, later `main`
+  builds leave its reference alone until `agent_version` changes.
+
 - Staging a tool binary into Mythic's file store (`ensure_tool_uploaded`) no longer asks for its own approval in
   supervised mode. It writes only Mythic's operation file store from the local tool drop zone and reaches no
   callback; the command that later runs the tool on a target still needs its approval. A task whose command

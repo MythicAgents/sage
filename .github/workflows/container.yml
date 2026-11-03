@@ -4,11 +4,19 @@ name: Container image
 #
 # Follows the MythicAgents convention (see Ne0nd0g/merlin-mythic docker.yml): publish to GHCR with
 # the built-in GITHUB_TOKEN — no external registry secret to leak — and build-only (no push) on
-# pull requests so a PR still validates the Dockerfile. A push to main publishes :latest and a sha-
-# tag. A v* release tag publishes its version (v0.2.0 -> :0.2.0 and :0.2; a pre-release such as
-# v0.2.0-rc.1 gets only :0.2.0-rc.1), but only when the tagged commit is already on main and the tag
-# matches agent_capabilities.json, so a release image is never built from unmerged code or mislabeled.
-# Push main before pushing the tag.
+# pull requests so a PR still validates the Dockerfile.
+#
+# A push to main builds once and publishes :latest, a sha- tag, and the version declared in
+# agent_capabilities.json (for example :0.3.0), so the exact release image exists, and can be
+# qualified, before the release tag. Once v<version> is tagged, later main pushes leave that version
+# reference on its released image until agent_version is bumped.
+#
+# A v* release tag never rebuilds or overwrites anything. It verifies the already-published image:
+# the tag matches agent_version, the tagged commit is on main, and the annotated tag message carries
+# `Image-Digest: sha256:<qualified manifest digest>`, which must be exactly what :<version> resolves
+# to, with both architectures and OCI revision/version labels matching the tag. Only then does a
+# final release (not a pre-release) point its minor alias (:0.3) at that same manifest.
+# The decisions live in .github/scripts/release_image.py and are tested offline.
 #
 # mythic-cli install pulls the image named in config.json's remote_images.sage. Cutting a release
 # moves it to the new version together with agent_version; the version check enforces that.
@@ -28,7 +36,8 @@ permissions:
 
 jobs:
   image:
-    name: Build and publish (GHCR, main and release tags)
+    name: Build and publish (GHCR, main only)
+    if: github.ref_type != 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -37,33 +46,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # Full history so a release tag can be checked against main below.
+          # Full history and tags, so main can see whether its declared version is already released.
           fetch-depth: 0
 
-      # Publish on a push to main, or on a release tag whose commit is on main and whose version
-      # matches agent_capabilities.json. Everything else (dev, PRs, dispatch) builds without pushing.
+      # Publish on a push to main only. Everything else (dev, PRs, dispatch) builds without pushing.
       - name: Decide whether to publish
         id: gate
         run: |
           declared="$(jq -r '.agent_version' agent_capabilities.json)"
           echo "agent_version=$declared" >> "$GITHUB_OUTPUT"
-          publish=false
-          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
-            case "$GITHUB_REF" in
-              refs/heads/main) publish=true ;;
-              refs/tags/v*)
-                if [ "${GITHUB_REF_NAME#v}" != "$declared" ]; then
-                  echo "::error::Release tag '$GITHUB_REF_NAME' != agent_capabilities.json agent_version '$declared'."
-                  exit 1
-                fi
-                if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-                  echo "::error::Release tag '$GITHUB_REF_NAME' is not on main. Merge to main and push it before tagging."
-                  exit 1
-                fi
-                publish=true ;;
-            esac
-          fi
-          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          python3 .github/scripts/release_image.py select --event "$GITHUB_EVENT_NAME" --ref "$GITHUB_REF" \
+            --sha "$GITHUB_SHA" --declared "$declared" --image "$REGISTRY/${GITHUB_REPOSITORY,,}"
 
       # Credentials are only needed when we actually push. Other builds validate only.
       - name: Log in to GHCR
@@ -81,24 +74,23 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Image metadata
+      - name: Image labels
         id: meta
         uses: docker/metadata-action@v5
         with:
           # github.repository is lowercased by the action -> ghcr.io/mythicagents/sage
           images: ${{ env.REGISTRY }}/${{ github.repository }}
           flavor: latest=false
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha,format=short
+          # References come from the gate above; this step supplies the OCI labels. The version label is
+          # the declared release version, which the release tag later checks.
+          tags: type=sha,format=short
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.description=${{ github.repository }} container for use with Mythic
             org.opencontainers.image.licenses=GPL-3.0-or-later
+            org.opencontainers.image.version=${{ steps.gate.outputs.agent_version }}
 
-      - name: Build and (main or release tag only) push the Sage image
+      - name: Build and (main only) push the Sage image
         uses: docker/build-push-action@v6
         with:
           context: Payload_Type/sage
@@ -113,7 +105,57 @@ jobs:
           # keeps repeat builds reasonable.
           platforms: linux/amd64,linux/arm64
           push: ${{ steps.gate.outputs.publish == 'true' }}
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ${{ steps.gate.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  verify-release:
+    name: Verify the published release image (no rebuild)
+    # Only the tag push itself; a manual run on a tag ref verifies nothing and moves no reference.
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write   # only for pointing the minor alias at the verified manifest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Make sure the annotated tag object, and so its Image-Digest line, is present locally.
+      - name: Fetch the annotated release tag
+        run: git fetch --force origin "+refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Verify the version image against the tag
+        id: verify
+        run: |
+          declared="$(jq -r '.agent_version' agent_capabilities.json)"
+          python3 .github/scripts/release_image.py verify --tag "$GITHUB_REF_NAME" --declared "$declared" \
+            --image "$REGISTRY/${GITHUB_REPOSITORY,,}"
+
+      # Copies the verified manifest under the minor alias; nothing is rebuilt. Fails unless the alias
+      # then resolves to exactly the qualified digest.
+      - name: Point the minor alias at the verified manifest
+        if: steps.verify.outputs.minor_alias != ''
+        env:
+          ALIAS: ${{ steps.verify.outputs.minor_alias }}
+          DIGEST: ${{ steps.verify.outputs.digest }}
+        run: |
+          docker buildx imagetools create --tag "$ALIAS" "${ALIAS%:*}@$DIGEST"
+          resolved="$(python3 .github/scripts/release_image.py inspect "$ALIAS" | jq -r '.digest')"
+          if [ "$resolved" != "$DIGEST" ]; then
+            echo "::error::$ALIAS resolves to $resolved, not $DIGEST."
+            exit 1
+          fi

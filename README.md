@@ -281,7 +281,9 @@ sudo ./mythic-cli install github https://github.com/MythicAgents/sage
 
 The installer pulls the published image named in `config.json` (`ghcr.io/mythicagents/sage:<version>`) instead
 of building one. To build from your checkout instead, run `sudo ./mythic-cli config set sage_use_build_context
-true` and then `sudo ./mythic-cli build sage`.
+true` and then `sudo ./mythic-cli build sage`. Each version image is published from `main` before its release tag,
+and the annotated `v<version>` tag records that image's manifest digest, which the tag's CI checks without
+rebuilding.
 
 The container runs Sage as the user who owns `InstalledServices/sage`, so the databases and state Sage writes
 there belong to that user, not root. A later `mythic-cli install` by that user can replace the directory without
@@ -1011,7 +1013,7 @@ a legacy override, an operator-configured channel ID that is never derived from 
 
 ## Limitations
 
-Sage 0.2 is deliberately narrow, and its live validation lags its code:
+Sage 0.3 is deliberately narrow, and its live validation lags its code:
 
 - **Live validation.** The most recent live-validated configuration is still the
   [0.1.0-beta support matrix](docs/releases/v0.1.0-beta.md): Linux arm64 Sage Docker on Mythic `v4.0.0rc5`,
