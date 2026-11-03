@@ -312,6 +312,31 @@ specialist's summary, and records proven progress in the engagement ledger.
 - OpenTelemetry moves from 1.44.0 to 1.45.1 (instrumentation and semantic conventions to 0.66b1), clearing the
   advisory against `opentelemetry-api` 1.44.0 listed under 0.2.0's known issues. No other dependency changed.
 
+### Known issues
+
+- **macOS Docker Desktop and OrbStack.** Unchanged from 0.2.0: SQLite cannot lock files on the bind-mounted
+  service directory there. Set `PHOENIX_WORKING_DIR` and `SAGE_DATABASE_PATH` as described in the README section
+  "SQLite on macOS Docker Desktop / OrbStack"; with that setting the databases do not survive a container rebuild
+  or reinstall.
+- **Dependency vulnerabilities.** Some reported vulnerabilities remain because `mythic-container` and
+  `arize-phoenix` pin the affected packages. They clear when those projects update their pins.
+- **An approved action can be issued twice after a crash.** If Sage stops after issuing an approved supervised
+  action but before it records the result, the resumed request can issue that action again. Check the task list
+  in Mythic before approving the same action after a restart.
+- **A step scoped to the wrong procedure still ends the request.** The recovery under Fixed applies only when the
+  specialist names something that is not a catalog procedure. When the Supervisor scopes a step to a real catalog
+  procedure that does not serve the request, and the specialist proposes a different action that would, the
+  request ends instead of re-scoping.
+
+### Validation
+
+The maintained offline suite, the repository-boundary guards and the repo-hygiene checks pass on this release, and
+the supervised changes are covered by scripted tests of the assembled chat path. The release qualification runs one
+GOAD objective on a locally built image against Mythic `v4.0.8`; the GitHub release notes for 0.3.0 report the
+image, model route and result. That result covers that configuration and objective only. Auto mode remains
+experimental and exercised only against GOAD. See [README Limitations](README.md#limitations) and
+[Security and Data Handling](docs/SECURITY_AND_DATA_HANDLING.md) for the complete boundaries.
+
 ## [0.2.0] - 2026-10-23
 
 Sage 0.2.0 makes supervised mode objective-led, makes request endings honest, and ships Sage as a published,

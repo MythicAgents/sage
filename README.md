@@ -37,9 +37,10 @@ services, and Sage-local attack artifacts are not admissible proof of an objecti
 > understood: an autonomous agent driving a C2 carries real risk of unintended impact on a live network. Weigh
 > production use very carefully, and prefer labs and authorized engagements until Sage has matured.
 
-> **Last live-qualified Mythic target: `v4.0.0rc5`.** Native chat containers do not exist before Mythic v4. The
-> 0.1.0-beta evidence binds tag `v4.0.0rc5` at commit `a9add7f1f62f5b2098d1f0eb0306c4b15b8cd916`; newer Mythic v4
-> builds may work, but have not been through a live qualification run. See [Limitations](#limitations).
+> **Mythic target.** Native chat containers do not exist before Mythic v4. The 0.3.0 release qualification runs on
+> Mythic `v4.0.8`, and its GitHub release notes report the result. The last live qualification recorded in this
+> repository is 0.1.0-beta's, on tag `v4.0.0rc5` at commit `a9add7f1f62f5b2098d1f0eb0306c4b15b8cd916`. Other
+> Mythic v4 builds may work but have not been qualified. See [Limitations](#limitations).
 
 ## Contents
 
@@ -173,6 +174,8 @@ context resets, restarts, and even a change of model.
   You read and edit it in chat with [`/state`](#slash-commands). Each hop keeps a permanent number (the `#`
   column): removing a hop leaves a gap rather than renumbering the rest. When `/state` or the end-of-turn table
   shows you the ledger, Sage also sees that table on your next message, so you can ask about "hop 4" directly.
+  The ledger records capability-verified effects, not every task: a task whose effect Sage cannot verify leaves
+  no achieved hop, even when the task itself succeeded.
 
 - **Why it is proof-gated.** A hop flips to *achieved* only when a verifier confirms the effect from real
   evidence. Each achieved hop carries a **proof envelope** recording the Mythic callback, task, and transaction
@@ -233,9 +236,10 @@ strategy.
 
 ## Requirements
 
-- **Mythic v4.** `v4.0.0rc5` at commit `a9add7f1f62f5b2098d1f0eb0306c4b15b8cd916` is the last live-qualified
-  target (0.1.0-beta). Earlier Mythic versions have no native chat-container support; other Mythic v4 revisions
-  have not been live-qualified.
+- **Mythic v4.** The 0.3.0 release qualification runs on `v4.0.8`; its GitHub release notes report the result.
+  `v4.0.0rc5` at commit `a9add7f1f62f5b2098d1f0eb0306c4b15b8cd916` is the last live-qualified target recorded in
+  this repository (0.1.0-beta). Earlier Mythic versions have no native chat-container support; other Mythic v4
+  revisions have not been live-qualified.
 - Python 3.14 and a repository virtual environment.
 - Model-provider credentials or an OpenAI-compatible endpoint.
 - For the live-qualified graph path, BloodHound CE 9.5.1 plus [BloodHound MCP](https://github.com/mwnickerson/bloodhound_mcp)
@@ -1015,16 +1019,20 @@ a legacy override, an operator-configured channel ID that is never derived from 
 
 Sage 0.3 is deliberately narrow, and its live validation lags its code:
 
-- **Live validation.** The most recent live-validated configuration is still the
+- **Live validation.** The most recent live-validated configuration recorded in this repository is the
   [0.1.0-beta support matrix](docs/releases/v0.1.0-beta.md): Linux arm64 Sage Docker on Mythic `v4.0.0rc5`,
   Apollo `v0.1.0-rc1`, BloodHound CE 9.5.1, BloodHound MCP `92a37dd`, and `sonnet-4-6` through an
   OpenAI-compatible LiteLLM route. Releases from 0.2.0 on are validated by the offline suite, the
-  repository-boundary guards, the repo-hygiene checks, and scripted tests of the assembled chat path. The
-  clean-clone Docker qualification and live-range runs were not repeated for them. Individual fixes are
-  spot-checked live on a GOAD lab during development; those checks are not a release qualification.
-- **Supervised mode.** Objective-led supervised mode (new in 0.2.0) has not been through a live qualification
-  run. Sage proposes and you approve each guarded action, but the quality of its proposals on a given engagement
-  is not established.
+  repository-boundary guards, the repo-hygiene checks, and scripted tests of the assembled chat path; 0.2.0 had
+  no live-range run. The 0.3.0 release qualification runs one GOAD objective on a locally built image, and its
+  GitHub release notes report the image, Mythic version, model route and result. That result covers that one
+  configuration and objective. Individual fixes are spot-checked live on a GOAD lab during development; those
+  checks are not a release qualification.
+- **Supervised mode.** Live evidence for objective-led supervised mode comes only from GOAD with an Apollo
+  foothold and one model route. Sage proposes and you approve each guarded action, but the quality of its
+  proposals on another engagement is not established. When the Supervisor scopes a step to the wrong catalog
+  procedure, the request still ends rather than re-scoping; 0.3.0 recovers only when the specialist names
+  something that is not a catalog procedure.
 - **Auto mode** is experimental and has been exercised only against GOAD. That does not establish reliability or
   generalization on another range or a production network.
 - **Other configurations.** Other operating systems and architectures; other Mythic, Apollo, BloodHound CE, or
@@ -1035,10 +1043,11 @@ Sage 0.3 is deliberately narrow, and its live validation lags its code:
   assignments. One tool-free model call may propose `credential-material`; deterministic admission binds the
   operation, task, callback, and file identity before background delivery. It does not show that a consultant
   would have missed the finding, acted on it, or received independent value.
-- **Known issues.** See the [CHANGELOG](CHANGELOG.md) for each release's known issues. As of 0.2.0 these include
+- **Known issues.** See the [CHANGELOG](CHANGELOG.md) for each release's known issues. As of 0.3.0 these include
   SQLite locking on the bind-mounted service directory under macOS Docker Desktop and OrbStack (see
-  [SQLite on macOS Docker Desktop / OrbStack](#sqlite-on-macos-docker-desktop--orbstack)) and dependency
-  vulnerabilities that remain until `mythic-container` and `arize-phoenix` update their pins.
+  [SQLite on macOS Docker Desktop / OrbStack](#sqlite-on-macos-docker-desktop--orbstack)), dependency
+  vulnerabilities that remain until `mythic-container` and `arize-phoenix` update their pins, and an approved
+  supervised action that can be issued twice if Sage stops before it records the action's result.
 - **Erasure.** Operation-memory erasure removes Sage-derived state for one operation but deliberately leaves
   authoritative Mythic records unchanged. It does not erase separate LangGraph checkpoints, Phoenix traces,
   LiteLLM/provider retention, native Mythic messages, or Slack workspace records; each owner must apply its own
