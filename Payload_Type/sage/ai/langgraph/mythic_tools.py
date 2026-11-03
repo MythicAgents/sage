@@ -4232,6 +4232,50 @@ class MythicTools:
         except Exception as e:
             return f"Error downloading payload {payload_uuid}: {e}"
 
+    async def _registered_selector_uuid_as_name(self, command: str, schema: list[dict], parameters: Any) -> Any:
+        """Replace a Mythic file UUID on the registered-file selector with that file's registered name.
+
+        `ensure_tool_uploaded` returns a file UUID, while Apollo's registered `Assembly` group selects the file by
+        name. Runs before the executable contract and schema checks, so a proposal by UUID is then prepared exactly
+        as the same proposal by name. The name is used only when the UUID names a complete, live, operator-uploaded
+        file whose exact name is a selector choice and which is the file that name resolves to in Mythic (the file
+        the card binds). Anything else returns the parameters unchanged, and the usual refusal follows.
+        """
+        if not isinstance(parameters, dict) or not parameters or not schema:
+            return parameters
+        resolved = command_builder.resolve_params(schema, parameters, command=command)
+        if resolved.ok:
+            return parameters
+        found = command_builder.registered_selector_file_uuid(schema, resolved.params)
+        if found is None:
+            return parameters
+        cli_name, file_uuid, choices = found
+        try:
+            meta = await self._get_file_metadata(file_uuid)
+            if (
+                not isinstance(meta, dict)
+                or str(meta.get("agent_file_id") or "") != file_uuid
+                or meta.get("complete") is not True
+                or meta.get("deleted") is not False
+                or meta.get("is_payload") is not False
+                or meta.get("is_download_from_agent") is not False
+            ):
+                return parameters
+            filename = str(meta.get("filename_utf8") or "")
+            if filename not in choices:
+                return parameters
+            by_name = await self._find_uploaded_file_by_name(filename)
+        except Exception:
+            return parameters
+        if not isinstance(by_name, dict) or str(by_name.get("agent_file_id") or "") != file_uuid:
+            return parameters
+        # Substitute only the UUID value, so every later check sees the proposal's own keys exactly as by name.
+        translated = {key: (filename if value == file_uuid else value) for key, value in parameters.items()}
+        if not command_builder.resolve_params(schema, translated, command=command).ok:
+            return parameters
+        logger.info(f"[task preparation] resolved file UUID {file_uuid} on '{cli_name}' to {filename!r}")
+        return translated
+
     async def _prepare_supervised_issue_action(self, args: dict[str, Any]) -> dict[str, Any]:
         """Resolve a direct task proposal before its native approval card is built.
 
@@ -4282,6 +4326,11 @@ class MythicTools:
             and selected_executable.get("callback_display_id") == callback_id
         ):
             selected_executable = None
+        by_name = await self._registered_selector_uuid_as_name(command, schema, parameters)
+        if by_name is not parameters:
+            # Normalizations keyed on the registered name (SharpHound's argument spelling) ran before the name
+            # was known; run them on the name so the card shows what the issue path sends.
+            parameters = self._normalize_sharphound_assembly_params(command, by_name)
         parameters, executable_binding = await self._validated_executable_parameters(
             command,
             parameters,
@@ -4293,14 +4342,15 @@ class MythicTools:
         if isinstance(parameters, dict) and parameters and schema:
             resolved = command_builder.resolve_params(schema, parameters, command=command)
             if not resolved.ok:
-                raise ValueError(resolved.repair or "task parameters do not match the live schema")
+                raise command_builder.TaskPreparationSchemaError(
+                    resolved.repair or "task parameters do not match the live schema")
             resolved_group = resolved.group
             parameters = await self._bind_mythic_credential_parameters(
                 command, resolved.params, callback_id, param_schema=schema)
         if isinstance(parameters, dict) and parameters:
             error = await self._validate_command_parameters(command, parameters, callback_id)
             if error:
-                raise ValueError(error)
+                raise command_builder.TaskPreparationSchemaError(error)
         parameters = self._bind_kerberos_ticket_artifact(command, parameters)
         name = self._registered_file_name_from_schema(command, parameters, schema)
         file_identity = await self._validated_inline_assembly_file_identity(

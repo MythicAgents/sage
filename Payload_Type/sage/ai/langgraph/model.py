@@ -46,6 +46,7 @@ from .mythic_tools import (
     SAGE_TASK_HEARTBEAT_INTERVAL,
     _env_positive_int,
 )
+from .command_builder import TaskPreparationSchemaError
 from .executable_contracts import UnsupportedExecutableVerbError
 from .tool_cache import ToolCache
 from runtime_db import database_path, assert_legacy_migrated
@@ -2076,7 +2077,12 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
                     except (TypeError, ValueError) as exc:
                         prepared_message = last_ai
                         preparation_failed = True
-                        recoverable_verb_error = isinstance(exc, UnsupportedExecutableVerbError)
+                        # Both an unenrolled verb and a schema mismatch (missing parameter, invalid choice,
+                        # wrong group) are correctable by the proposer from the refusal text, so both go back
+                        # to it under the same repair budget and loop-breaker instead of ending its turn.
+                        recoverable_verb_error = isinstance(
+                            exc, (UnsupportedExecutableVerbError, TaskPreparationSchemaError)
+                        )
                         note = f"[task preparation] Approval was not requested: {exc}"
                         last_ai.content = f"{_message_content_as_text(last_ai.content)}\n{note}".strip()
                         if recoverable_verb_error:

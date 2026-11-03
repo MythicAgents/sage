@@ -456,14 +456,7 @@ def _reroute_registered_file_refs(
         file_params = [p for p in schema if p.get("type") == "File"]
         if not file_params:
             return
-        selector = next(
-            (
-                p for p in schema
-                if p.get("type") == "ChooseOne"
-                and any(tok in (_lower(p["cli_name"]) + " " + _lower(p["name"])) for tok in ("file", "assembly"))
-            ),
-            None,
-        )
+        selector = _registered_file_selector(schema)
         if not selector:
             return
         sel_cli = selector["cli_name"]
@@ -488,6 +481,50 @@ def _reroute_registered_file_refs(
                 notes.append(f"rerouted '{fcli}' (upload arg) -> '{sel_cli}' (registered selector)")
     except Exception:
         return
+
+
+def _registered_file_selector(schema: list[dict]) -> dict | None:
+    """The ChooseOne parameter that selects an already-registered file by name (Apollo `Assembly`), if any."""
+    return next(
+        (
+            p for p in schema
+            if p.get("type") == "ChooseOne"
+            and any(tok in (_lower(p["cli_name"]) + " " + _lower(p["name"])) for tok in ("file", "assembly"))
+        ),
+        None,
+    )
+
+
+_MYTHIC_FILE_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
+
+
+class TaskPreparationSchemaError(ValueError):
+    """A proposed task's parameters do not fit the live command schema (missing, invalid choice, wrong group).
+
+    The proposer can correct this from the refusal text alone, so it is returned to the proposing agent rather than
+    ending its turn.
+    """
+
+
+def registered_selector_file_uuid(command_parameters: list[dict], params: dict) -> tuple[str, str, list[str]] | None:
+    """A Mythic file UUID sitting on the registered-file selector in place of a registered name.
+
+    Returns (selector cli name, the UUID, the selector's choices) when the resolved params put a UUID-shaped value
+    that is not itself a choice on that selector, else None. Resolving the UUID to a name needs Mythic's file
+    metadata, which the caller owns.
+    """
+    try:
+        selector = _registered_file_selector(_clean_schema(command_parameters))
+        if not selector or not isinstance(params, dict):
+            return None
+        cli_name = selector["cli_name"]
+        value = _text(params.get(cli_name)).strip()
+        choices = [choice for choice in selector.get("choices", []) if choice != ""]
+        if not value or not _MYTHIC_FILE_UUID_RE.fullmatch(value) or _match_choice(value, choices) is not None:
+            return None
+        return cli_name, value, choices
+    except Exception:
+        return None
 
 
 def _is_file_transport_command(command: str) -> bool:
