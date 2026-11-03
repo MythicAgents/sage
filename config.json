@@ -6,6 +6,6 @@
 	"exclude_documentation_c2": true,
 	"exclude_agent_icons": false,
 	"remote_images": {
-		"sage": "ghcr.io/mythicagents/sage:0.2.0"
+		"sage": "ghcr.io/mythicagents/sage:0.3.0"
 	}
 }

@@ -7,6 +7,11 @@ between minor releases.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-03
+
+Sage 0.3.0 bounds and scopes each supervised step, reads every step's results from Mythic rather than from the
+specialist's summary, and records proven progress in the engagement ledger.
+
 ### Added
 
 - When the Supervisor scopes a supervised step to a capability, it now sees what each capability does. The
@@ -109,6 +114,29 @@ between minor releases.
   source.
 
 ### Fixed
+
+- After you approve a card, the request's final report appears once. The resumed request used to leave the report
+  as an unfinished block and post an identical copy below it whenever it closed a tool card opened before the
+  approval.
+
+- A specialist's proposal is shown once when its step ends with a refusal. When a step-boundary or
+  task-preparation refusal was appended to text the specialist had already streamed, the closing card repeated
+  the whole proposal, so it appeared three times. The card now adds only the refusal line; its summary keeps the
+  full text.
+
+- A task whose parameters do not fit the live command schema is repaired within the specialist's turn instead of
+  ending it. A Mythic file UUID placed on a selector that chooses files by name, such as the one returned by
+  staging a tool and passed to Apollo's assembly selector, now resolves to that file's registered name when it is
+  a complete, live, operator-uploaded file the selector offers. Other schema refusals (a missing parameter, an
+  invalid choice, the wrong parameter group) go back to the specialist under the existing per-request repair
+  budget, and you see the refusal only once that budget is spent.
+
+- The graph-collection summary names the tasks the collection issued and the graph effect it recorded. It used to
+  say "none issued" and "no effects" after a collection that had run and been ingested.
+
+- The engagement ledger marks a GPO-abuse setup hop achieved once the same GPO transaction proves SYSTEM execution
+  through that GPO. Previously `/state` kept the setup hop pending beside the proven execution and Domain Admin
+  hops.
 
 - A supervised step may now target a host or GPO that Sage knows from its own attack-graph facts. The scope check on
   a step's brief admitted only targets named in the operator's request, in callback listings, footholds or ledger
@@ -342,6 +370,7 @@ First beta: a bounded assisted-mode capability with a background findings watche
 profile. See the [0.1.0-beta release notes](docs/releases/v0.1.0-beta.md) for the validated support matrix and
 limits.
 
-[Unreleased]: https://github.com/MythicAgents/sage/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/MythicAgents/sage/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/MythicAgents/sage/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/MythicAgents/sage/compare/v0.1.0-beta...v0.2.0
 [0.1.0-beta]: https://github.com/MythicAgents/sage/releases/tag/v0.1.0-beta
