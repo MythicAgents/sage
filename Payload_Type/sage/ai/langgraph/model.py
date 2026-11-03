@@ -4865,11 +4865,15 @@ def _terminal_execute_capability_report(
     ]
     if reason:
         lines.append(f"Reason: {reason}")
-    lines.append("Task IDs: " + (", ".join(task_parts) if task_parts else "none issued"))
-    lines.append(
-        "Recorded effects: "
-        + (", ".join(f"`{effect}`" for effect in recorded) if recorded else "none")
-    )
+    # "none" is a claim about what happened, so make it only when the payload reports an empty list. A payload
+    # that does not report tasks or effects gets no line rather than a false "none issued".
+    if isinstance(payload.get("issued"), list):
+        lines.append("Task IDs: " + (", ".join(task_parts) if task_parts else "none issued"))
+    if isinstance(payload.get("recorded_effects"), list):
+        lines.append(
+            "Recorded effects: "
+            + (", ".join(f"`{effect}`" for effect in recorded) if recorded else "none")
+        )
     if proof_chain:
         lines.append("Proof chain:")
         for item in proof_chain[:8]:

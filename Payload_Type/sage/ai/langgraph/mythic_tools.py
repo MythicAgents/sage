@@ -160,6 +160,12 @@ _task_issuance_receipt_context: contextvars.ContextVar[dict | None] = contextvar
     "sage_mythic_task_issuance_receipt_context",
     default=None,
 )
+# Every Mythic task created while a Sage-owned procedure runs, in creation order, so the procedure's executor
+# report can name the tasks it issued. Set only around such a procedure; None everywhere else.
+_procedure_issued_tasks_context: contextvars.ContextVar[list | None] = contextvars.ContextVar(
+    "sage_mythic_procedure_issued_tasks_context",
+    default=None,
+)
 
 
 def _mythic_task_terminal_success(task_completed: Any, task_status: Any) -> bool:
@@ -6971,6 +6977,11 @@ class MythicTools:
                     # Task creation is the lineage boundary. Record before waiting so a timeout,
                     # subscription failure, or failed command cannot make an accepted Mythic task look manual.
                     self._record_current_request_task(tdid)
+                    procedure_tasks = _procedure_issued_tasks_context.get()
+                    if isinstance(procedure_tasks, list):
+                        procedure_tasks.append(
+                            {"task_id": tdid, "command": command, "callback_id": callback_display_id}
+                        )
                     self._commit_task_backed_transition(command, parameters, callback_display_id, tdid)
                     event_id = f"mythic-task:{callback_display_id}:{tdid}"
                     context = (
@@ -11301,15 +11312,40 @@ class MythicTools:
         runner = getattr(self, "_collection_runner", None)
         if not callable(runner):
             return reply({"ok": False, "status": "unavailable", "reason": "no collection runner is installed"})
+        def graph_hops() -> dict[str, tuple[str, str]]:
+            return {
+                str(getattr(hop, "id", "")): (str(getattr(hop, "status", "")), str(getattr(hop, "timestamp", "")))
+                for hop in (getattr(self, "_engagement_hops", []) or [])
+                if str(getattr(hop, "technique", "")).casefold() == COLLECTION_CAPABILITY
+            }
+
+        hops_before = graph_hops()
+        issued_tasks: list[dict[str, Any]] = []
         token = _task_visibility_context.set({
             "capability": COLLECTION_CAPABILITY,
             "purpose": "operator-approved graph collection",
         })
+        issued_token = _procedure_issued_tasks_context.set(issued_tasks)
         try:
             result = await runner(callback_id=binding["callback_id"], scope_domain=binding.get("scope_domain", ""))
         finally:
+            _procedure_issued_tasks_context.reset(issued_token)
             _task_visibility_context.reset(token)
-        return reply(result if isinstance(result, dict) else {"ok": False, "reason": str(result)})
+        result = dict(result) if isinstance(result, dict) else {"ok": False, "reason": str(result)}
+        # The executor report reads `issued` and `recorded_effects`; report what this collection actually did.
+        result.setdefault("issued", issued_tasks)
+        if "recorded_effects" not in result:
+            result["recorded_effects"] = [
+                str(getattr(hop, "effect", ""))
+                for hop in (getattr(self, "_engagement_hops", []) or [])
+                if str(getattr(hop, "technique", "")).casefold() == COLLECTION_CAPABILITY
+                and str(getattr(hop, "status", "")).casefold() == "achieved"
+                and getattr(hop, "effect", "")
+                and hops_before.get(str(getattr(hop, "id", ""))) != (
+                    str(getattr(hop, "status", "")), str(getattr(hop, "timestamp", ""))
+                )
+            ]
+        return reply(result)
 
     async def _execute_capability_impl(
         self, action: dict | str, inputs: dict | str | None = None,

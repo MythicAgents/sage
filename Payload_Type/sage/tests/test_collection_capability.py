@@ -321,3 +321,45 @@ def test_coverage_for_the_card_comes_from_the_cached_engagement_state(collection
     case.client._engagement_footholds = list(case.state.footholds)
     assert case.client._collection_already_covered("7", "corp.test")
     assert not case.client._collection_already_covered("8", "corp.test")
+
+
+def test_the_executor_summary_names_the_collection_tasks_and_the_recorded_graph_effect(collection, monkeypatch):
+    """The operator-facing executor summary of an approved collection lists the tasks the transaction issued and the
+    graph effect it recorded; it never claims "none issued" for a collection that ran (live shape: msg 926)."""
+    from langchain_core.messages import ToolMessage
+
+    case = collection
+    monkeypatch.setattr(case.client, "_record_graph_built", mt.MythicTools._record_graph_built.__get__(case.client))
+    from ai.langgraph import access_reconciler
+
+    async def live_footholds(_client, _now):  # what the access reconciler returns from Mythic live
+        return list(case.state.footholds)
+
+    monkeypatch.setattr(access_reconciler, "reconcile_access", live_footholds)
+    _approve(case, ACTION)
+    raw = asyncio.run(case.client.execute_capability(ACTION, None))
+    assert json.loads(raw)["ok"] is True, raw
+
+    payload = model._terminal_execute_capability_payload(
+        [ToolMessage(content=raw, name="execute_capability", tool_call_id="call-collect")]
+    )
+    summary = model._terminal_execute_capability_report(payload)
+
+    assert "none issued" not in summary, summary
+    assert "Recorded effects: none" not in summary, summary
+    task_line = next(line for line in summary.splitlines() if line.startswith("Task IDs: "))
+    for number, command in enumerate(APPROVED_STEPS, start=1):
+        assert f"{number} `{command}`" in task_line, summary
+    effects_line = next(line for line in summary.splitlines() if line.startswith("Recorded effects: "))
+    assert "`graph-built:" in effects_line, summary
+
+
+def test_the_executor_summary_omits_task_and_effect_lines_a_payload_does_not_report():
+    summary = model._terminal_execute_capability_report(
+        {"capability": "collect-graph", "verdict": "achieved", "ok": True, "status": "ingested"}
+    )
+    assert "Task IDs" not in summary and "Recorded effects" not in summary, summary
+    explicit = model._terminal_execute_capability_report(
+        {"capability": "gpo-controlled-system-exec", "verdict": "achieved", "issued": [], "recorded_effects": []}
+    )
+    assert "Task IDs: none issued" in explicit and "Recorded effects: none" in explicit, explicit
