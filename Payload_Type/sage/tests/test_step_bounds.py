@@ -243,7 +243,8 @@ def test_allowed_tools_offer_the_workers_declared_guarded_tools(monkeypatch):
 BRIEF = {"callback_display_id": 5, "targets": ["WORKSTATION-5"], "expected_result": "The callback's privileges."}
 
 
-async def _native(script: list, decision: str, *, clock: dict | None = None):
+async def _native(script: list, decision: str, *, clock: dict | None = None, mode: str = "supervised",
+                  autonomous_solve: bool = False):
     effects: list[str] = []
 
     @tool
@@ -257,7 +258,8 @@ async def _native(script: list, decision: str, *, clock: dict | None = None):
     model = model_module.Model(
         provider="openai", model="gpt-4o-mini", system_prompt="offline step bounds",
         config={"configurable": {"api_key": "offline-only", "API_ENDPOINT": "http://127.0.0.1:9/v1"}},
-        task_id=0, agent_task_id="step-bounds", mode="supervised", operation_id=1, channel_id=1, apitoken_id=0,
+        task_id=0, agent_task_id="step-bounds", mode=mode, autonomous_solve=autonomous_solve, operation_id=1,
+        channel_id=1, apitoken_id=0,
     )
     sink = MagicMock()
     preparer = MythicTools(agent_task_id="offline-step-bounds")
@@ -287,17 +289,19 @@ async def _native(script: list, decision: str, *, clock: dict | None = None):
     chat = _NativeDriverChat(model)
     try:
         first = build_chat_request(ORIGINAL, channel_id=1, operation_id=1, request_id=1,
-                                   config={"mode": "supervised"})
+                                   config={"mode": mode})
         bind_channel_thread_id(first, model)
         await chat.chat(first)
         cards = _cards(chat)
         if decision and cards:
             if clock is not None:
                 clock["now"] += 3600.0  # the operator takes an hour to decide
-            second = build_chat_request("", channel_id=1, operation_id=1, request_id=2, config={"mode": "supervised"})
+            second = build_chat_request("", channel_id=1, operation_id=1, request_id=2, config={"mode": mode})
             second.InputResponse = _input_response(decision, cards[0])
             await chat.chat(second)
         snapshot = await model.graph.aget_state(model._graph_run_config(model._session_thread_id()))
+        # What the recovery probes inspect beyond the return value: the real cards, request events and state.
+        _native.last = SimpleNamespace(model=model, cards=_cards(chat), values=snapshot.values)
         # Accepting a card re-emits that same card with its resolution; count distinct proposals.
         proposed = list(dict.fromkeys(str(card.get("data", {}).get("arguments", {}).get("command"))
                                       for card in _cards(chat)))
@@ -604,6 +608,175 @@ def test_a_sage_proposed_call_id_is_one_every_provider_accepts():
     import re
     call_id = model_module._bound_call_id("chat:11:request:10", 3)
     assert re.fullmatch(r"[a-zA-Z0-9_-]+", call_id) and call_id != model_module._bound_call_id("chat:11:request:10", 4)
+
+
+# --- a malformed capability proposal gets the existing single same-scope retry ------------------------------------
+
+CATALOG = model_module._handoff_brief.catalog_names()
+COLLECT_SCOPE = {"allowed_capabilities": ["collect-graph"]}
+
+
+@pytest.mark.parametrize("brief, tool_name, capability, kind", [
+    # A command name, a misspelling or a missing name is not a catalog procedure: a malformed proposal.
+    (COLLECT_SCOPE, "execute_capability", "whoami", sb.NOT_OFFERED),
+    (COLLECT_SCOPE, "execute_capability", "collect_graph", sb.NOT_OFFERED),
+    (COLLECT_SCOPE, "execute_capability", "requested", sb.NOT_OFFERED),
+    (COLLECT_SCOPE, "execute_capability", "", sb.NOT_OFFERED),
+    # A real catalog procedure the brief excludes keeps the strict rule, whatever its letter case.
+    (COLLECT_SCOPE, "execute_capability", "dcsync-krbtgt", sb.MIS_SCOPED),
+    (COLLECT_SCOPE, "execute_capability", " DCSync-Krbtgt ", sb.MIS_SCOPED),
+    # Tool-level mismatches are unchanged: control-plane and tool-scoped steps offer no execute_capability.
+    ({"allowed_capabilities": ["control_plane"]}, "execute_capability", "collect-graph", sb.NOT_OFFERED),
+    ({"allowed_tools": [ISSUE]}, "execute_capability", "whoami", sb.NOT_OFFERED),
+    (COLLECT_SCOPE, ISSUE, "", sb.NOT_OFFERED),
+])
+def test_a_rejected_capability_is_classified_against_the_catalog(brief, tool_name, capability, kind):
+    assert sb.scope_violation(brief, tool_name, capability, CATALOG)  # every case is still removed
+    assert sb.scope_rejection_kind(brief, tool_name, capability, CATALOG) == kind
+
+
+def test_without_the_catalog_every_capability_mismatch_stays_mis_scoped():
+    # Fail closed: a classification that cannot see the catalog never grants the retry.
+    assert sb.scope_rejection_kind(COLLECT_SCOPE, "execute_capability", "whoami") == sb.MIS_SCOPED
+    assert sb.scope_rejection_kind(COLLECT_SCOPE, "execute_capability", "whoami", ()) == sb.MIS_SCOPED
+
+
+def test_classification_never_admits_an_action_the_brief_excludes():
+    for name in ("collect-graph", "dcsync-krbtgt", "whoami", ""):
+        admitted = not sb.scope_violation(COLLECT_SCOPE, "execute_capability", name, CATALOG)
+        assert admitted is (name == "collect-graph")
+    assert not sb.scope_violation({"allowed_tools": [ISSUE]}, ISSUE, "", CATALOG)
+    assert sb.scope_violation({"allowed_capabilities": ["control_plane"]}, ISSUE, "", CATALOG)
+
+
+def test_a_malformed_proposal_is_named_with_the_allowed_procedures():
+    reason = sb.scope_violation(COLLECT_SCOPE, "execute_capability", "whoami", CATALOG)
+    assert "`whoami`" in reason and "collect-graph" in reason and "not a catalog procedure" in reason
+    excluded = sb.scope_violation(COLLECT_SCOPE, "execute_capability", "dcsync-krbtgt", CATALOG)
+    assert "re-scope the step" in excluded and "not a catalog procedure" not in excluded
+
+
+WHOAMI = {"action": {"capability": "whoami", "callback_id": "5"}}
+NET_USER = {"action": {"capability": "net user", "callback_id": "5"}}
+DCSYNC = {"action": {"capability": "dcsync-krbtgt", "callback_id": "5"}}
+COLLECT = {"action": {"capability": "collect-graph", "callback_id": "5", "domain": "north.test"}}
+# Two targets: Sage does not bind the collection itself, so the worker's model proposes the step's action.
+UNBOUND_COLLECT = {"allowed_capabilities": ["collect-graph"], "targets": ["north.test", "WORKSTATION-5"]}
+
+
+def _proposal(args: dict, index: int) -> AIMessage:
+    # The worker keeps text, so removing its call needs no summary-synthesis model call.
+    return AIMessage(content="Proposing the step's action.", tool_calls=[{
+        "name": "execute_capability", "args": args, "id": f"cap-{index}", "type": "tool_call"}])
+
+
+def _recovery(monkeypatch, proposals: list[dict], decision: str = "", *, mode: str = "supervised",
+              autonomous_solve: bool = False, resend_after: bool = True):
+    """The Supervisor sends one unbound collect-graph scope before each worker proposal (and once more after the
+    last unless `resend_after` is False); returns the capability runs and the native run's cards, events and state."""
+    ran: list[dict] = []
+
+    @tool
+    async def execute_capability(action: dict | str, inputs: dict | str | None = None) -> str:
+        """Run one catalog capability."""
+        ran.append({"action": action, "inputs": inputs})
+        return '{"ok": true, "status": "ingested"}'
+
+    original = model_module.Model._rebuild_graph
+
+    def rebuild(self, *args, **kwargs):
+        sink = self.mythic_client
+        issue = sink.get_tools.side_effect
+        sink.get_tools.side_effect = lambda names: [*issue(names),
+                                                    *([execute_capability] if "execute_capability" in names else [])]
+        sink._engagement_footholds = [SimpleNamespace(callback_id="5", host="WORKSTATION-5", forest="north.test",
+                                                      identity="NORTH\\operator")]
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(model_module.Model, "_rebuild_graph", rebuild)
+    handoff = {"handoff_title": "collect graph", "handoff_instruction": ORIGINAL, **BRIEF, **UNBOUND_COLLECT}
+    script: list = []
+    for index, args in enumerate(proposals, start=1):
+        script += [_call("transfer_to_Mythic_Operator", handoff, 10 + index), _proposal(args, index)]
+    if resend_after:
+        script.append(_call("transfer_to_Mythic_Operator", handoff, 99))
+    script += [AIMessage(content="Collection result read.")] + [AIMessage(content="Final answer.")] * 4
+    asyncio.run(_native(script, decision, mode=mode, autonomous_solve=autonomous_solve))
+    last = _native.last
+    values = last.values
+    return SimpleNamespace(
+        ran=ran,
+        cards=last.cards,
+        kinds=[dict(e.metadata)["kind"] for e in last.model._request_event_ledger.actual_events(kind="scope_rejected")],
+        delegations=[m for m in values.get("mythic_operator_messages", [])
+                     if m.additional_kwargs.get("_delegated_to") == "Mythic_Operator"],
+        outcomes=[(o["status"], o["guarded_executed"], o["guarded_rejected"])
+                  for o in _outcomes(values.get("supervisor_messages", []))],
+        final=" ".join(str(m.content) for m in values.get("supervisor_messages", [])
+                       if m.additional_kwargs.get("_is_final_report")),
+    )
+
+
+def test_a_malformed_proposal_recovers_through_one_re_send_and_an_ordinary_card(monkeypatch):
+    run = _recovery(monkeypatch, [WHOAMI, COLLECT], "accept", resend_after=False)
+
+    assert run.kinds == ["not_offered"]
+    assert len(run.delegations) == 2
+    # The malformed proposal reached no card; the worker's own corrected proposal reached exactly one, and only
+    # after acceptance did the existing executor run it, unchanged.
+    assert len({card.get("id") or str(card.get("data")) for card in run.cards}) == 1
+    assert run.ran == [{"action": COLLECT["action"], "inputs": None}]
+    assert run.outcomes == [("rejected_by_scope", 0, 0), ("ended", 1, 0)]
+
+
+@pytest.mark.parametrize("second", [WHOAMI, NET_USER], ids=["same-name", "changed-name"])
+def test_a_second_malformed_proposal_under_the_same_scope_exhausts_the_retry(monkeypatch, second):
+    run = _recovery(monkeypatch, [WHOAMI, second])
+
+    assert run.kinds == ["not_offered", "not_offered"]
+    assert len(run.delegations) == 2       # the third send never reached the worker
+    assert run.cards == [] and run.ran == []
+    assert "re-scope the step to what the operator asked for" in run.final
+
+
+def test_a_real_excluded_procedure_still_ends_the_scope_at_once(monkeypatch):
+    run = _recovery(monkeypatch, [DCSYNC])
+
+    assert run.kinds == ["mis_scoped"]
+    assert len(run.delegations) == 1       # its same-scope re-send was blocked
+    assert run.cards == [] and run.ran == []
+    assert "re-scope the step to what the operator asked for" in run.final
+
+
+def test_a_rejected_recovery_card_runs_nothing(monkeypatch):
+    run = _recovery(monkeypatch, [WHOAMI, COLLECT], "reject", resend_after=False)
+
+    assert run.ran == []
+    assert run.kinds == ["not_offered"]    # the operator's denial is not a scope rejection to retry
+    assert run.outcomes == [("rejected_by_scope", 0, 0), ("ended", 0, 1)]
+
+
+def test_supervised_autonomous_solve_keeps_its_controller_lane(monkeypatch):
+    """Supervised chat with autonomous solve is owned by the deterministic controller and its own approval seams; the
+    Supervisor/worker scope classification is never on its path."""
+    controller: list[str] = []
+    original = model_module.Model._run_autonomous_controller
+
+    async def run_controller(self, objective):
+        controller.append(objective)
+        return await original(self, objective)
+
+    monkeypatch.setattr(model_module.Model, "_run_autonomous_controller", run_controller)
+    run = _recovery(monkeypatch, [WHOAMI, COLLECT], "accept", autonomous_solve=True, resend_after=False)
+
+    assert controller == [ORIGINAL]
+    assert run.delegations == [] and run.kinds == [] and run.ran == [] and run.cards == []
+
+
+def test_a_conversation_request_gets_no_guarded_execution_or_recovery(monkeypatch):
+    run = _recovery(monkeypatch, [WHOAMI, COLLECT], "accept", mode="conversation", resend_after=False)
+
+    assert run.ran == [] and run.cards == [] and run.kinds == [] and run.outcomes == []
 
 
 # --- capability grounding + recoverable refusal ------------------------------------------------------------

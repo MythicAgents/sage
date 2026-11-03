@@ -2921,14 +2921,16 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
             bound = "guarded_actions"
         else:
             delegated = self._delegated_message(state_messages)
-            reason = _step_bounds.scope_violation(
-                getattr(delegated, "additional_kwargs", {}).get("_handoff_brief"), name,
-                _capability_name_from_request_args(guarded[0].get("args") or {}),
-            )
+            brief_meta = getattr(delegated, "additional_kwargs", {}).get("_handoff_brief")
+            capability = _capability_name_from_request_args(guarded[0].get("args") or {})
+            try:
+                catalog = _handoff_brief.catalog_names()
+            except Exception:
+                catalog = ()  # unreadable catalog: every capability mismatch keeps the strict rule
+            reason = _step_bounds.scope_violation(brief_meta, name, capability, catalog)
             if not reason:
                 return
             status, bound = _step_bounds.StepStatus.REJECTED_BY_SCOPE, "scope"
-            brief_meta = getattr(delegated, "additional_kwargs", {}).get("_handoff_brief")
             signature = (_handoff_brief.scope_signature(
                 brief_meta.get("allowed_capabilities"), brief_meta.get("allowed_tools"),
             ) if isinstance(brief_meta, Mapping) else "")
@@ -2941,7 +2943,7 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
                         event_id=f"scope_rejected:{led.request_id}:{_get_seq(delegated)}",
                         kind="scope_rejected", phase="rejected", content=name,
                         metadata={"scope_signature": signature, "tool": name,
-                                  "kind": _step_bounds.scope_rejection_kind(brief_meta, name)},
+                                  "kind": _step_bounds.scope_rejection_kind(brief_meta, name, capability, catalog)},
                     )
                 except Exception:
                     pass

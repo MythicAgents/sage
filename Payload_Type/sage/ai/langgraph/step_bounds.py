@@ -167,27 +167,43 @@ def tool_scope_violation(brief: Any, tool_name: str) -> str:
     return ""
 
 
-def scope_violation(brief: Any, tool_name: str, capability_name: str = "") -> str:
+def _malformed_capability(capability_name: str, catalog: Iterable[str]) -> bool:
+    """Whether a proposed capability names no catalog procedure (a command name, a typo, or nothing). Letter case is
+    ignored, so a real procedure written differently is never mistaken for a malformed proposal. Without the
+    catalog nothing is malformed."""
+    names = {str(item).strip().casefold() for item in catalog}
+    return bool(names) and str(capability_name or "").strip().casefold() not in names
+
+
+def scope_violation(brief: Any, tool_name: str, capability_name: str = "", catalog: Iterable[str] = ()) -> str:
     """Why a guarded call falls outside the step's brief; empty when it is in scope or the brief sets no scope."""
     reason = tool_scope_violation(brief, tool_name)
     if reason:
         return reason
     capabilities, tools = _brief_scope(brief)
     if capabilities and not tools and capability_name not in capabilities:
+        if _malformed_capability(capability_name, catalog):
+            return (f"`{capability_name or 'unknown'}` is not a catalog procedure, so the worker's proposal was "
+                    f"malformed: this step's one guarded action is `execute_capability` for "
+                    f"{', '.join(capabilities)}. Re-send this scope once if that procedure is what the operator "
+                    "asked for; otherwise re-scope the step to what the operator asked for.")
         return (f"capability `{capability_name or 'unknown'}` is not in this step's allowed_capabilities "
                 f"({', '.join(capabilities)}); re-scope the step to the capability the operator asked for")
     return ""
 
 
-# A scope rejection is either the worker calling a tool its step does not offer (a deviation: the same scope may be
-# retried once) or the step's own action naming a capability its brief excludes (the scope itself is wrong).
+# A scope rejection is either a worker deviation — calling a tool its step does not offer, or proposing a capability
+# that is no catalog procedure — which the same scope may retry once, or the step's own action naming a real catalog
+# procedure its brief excludes (the scope itself is wrong).
 NOT_OFFERED = "not_offered"
 MIS_SCOPED = "mis_scoped"
 
 
-def scope_rejection_kind(brief: Any, tool_name: str) -> str:
+def scope_rejection_kind(brief: Any, tool_name: str, capability_name: str = "", catalog: Iterable[str] = ()) -> str:
     """Which kind of scope rejection a guarded call is; only meaningful when `scope_violation` is non-empty."""
-    return NOT_OFFERED if tool_scope_violation(brief, tool_name) else MIS_SCOPED
+    if tool_scope_violation(brief, tool_name) or _malformed_capability(capability_name, catalog):
+        return NOT_OFFERED
+    return MIS_SCOPED
 
 
 # Tools that teach how to run a technique by hand. A step scoped to catalog procedures has Sage run the procedure,

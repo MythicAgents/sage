@@ -115,6 +115,15 @@ specialist's summary, and records proven progress in the engagement ledger.
 
 ### Fixed
 
+- A supervised step whose specialist proposes, as its capability, something that is not a catalog procedure (a
+  command name such as `whoami`, a misspelling, or nothing) is now treated as the specialist's mistake rather than
+  a wrong scope. The proposal is still removed before any approval card. The Supervisor may re-send the same step
+  once, as it already could after the specialist called a tool the step does not offer, and a second malformed
+  proposal under that scope ends the request. A real catalog procedure that the step's scope excludes still ends
+  that scope at once. Sage does not rewrite the proposal: the specialist must propose the step's procedure itself,
+  and it reaches an ordinary approval card. Live, a step scoped to graph collection ended the whole request when
+  its specialist proposed `whoami` as the capability.
+
 - After you approve a card, the request's final report appears once. The resumed request used to leave the report
   as an unfinished block and post an identical copy below it whenever it closed a tool card opened before the
   approval.

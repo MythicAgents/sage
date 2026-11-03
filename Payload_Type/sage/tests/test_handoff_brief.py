@@ -551,6 +551,27 @@ def test_a_scope_whose_action_named_an_excluded_capability_is_not_re_sent():
     assert len(_delegated(result)) == 1  # the re-sent scope never reached the worker a second time
 
 
+def test_a_capability_that_is_no_catalog_procedure_is_a_deviation_retried_once():
+    """A command name proposed as the step's capability is a malformed worker proposal, not a wrong scope: the same
+    scope may be re-sent once, and a second malformed proposal under it ends the request."""
+    cap_brief = {"handoff_title": "Elevate", "callback_display_id": 3, "targets": ["meereen.essos.local"],
+                 "expected_result": "A SYSTEM callback.", "allowed_capabilities": ["execute-as-local-admin"]}
+
+    def propose(call_id: str, capability: str) -> AIMessage:
+        return AIMessage(content="Checking the token first.", tool_calls=[{
+            "name": "execute_capability", "args": {"action": {"capability": capability, "callback_id": "3"}},
+            "id": call_id, "type": "tool_call"}])
+
+    harness, result = _run([_handoff(cap_brief, "d1"), propose("t1", "whoami"), _handoff(cap_brief, "d2"),
+                            propose("t2", "getprivs"), _handoff(cap_brief, "d3"), AIMessage(content="never")])
+
+    scope_events = harness.model._request_event_ledger.actual_events(kind="scope_rejected")
+    assert [dict(e.metadata)["kind"] for e in scope_events] == ["not_offered", "not_offered"]
+    assert len(_delegated(result)) == 2  # one retry, then the third send never reached the worker
+    final = [m for m in result.get("supervisor_messages", []) if m.additional_kwargs.get("_is_final_report")]
+    assert final and "re-scope the step to what the operator asked for" in str(final[-1].content)
+
+
 def test_a_different_command_under_the_same_scope_does_not_count_as_a_repeat():
     # The same wrong scope with a changed payload command is still the same stuck scope: the stop is keyed on
     # the scope, so this is covered; the complementary case — a changed SCOPE resetting — is the unit test above.
