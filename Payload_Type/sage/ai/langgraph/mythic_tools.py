@@ -11693,7 +11693,10 @@ class MythicTools:
                     "ok": False,
                     "verdict": "failed",
                     "capability": self._capability_text(getattr(action_obj, "name", "")),
-                    "reason": build_payload.get("reason") or "capability command build failed",
+                    "reason": (
+                        self._krbtgt_missing_proof_reason(action_obj, input_values, build_payload.get("missing"))
+                        or build_payload.get("reason") or "capability command build failed"
+                    ),
                     "missing": build_payload.get("missing", []),
                     "action": asdict(action_obj) if is_dataclass(action_obj) else {},
                     "materialized": self._capability_executor_materialized_summary(materialized_payload),
@@ -16918,6 +16921,30 @@ class MythicTools:
         inputs["credential_id"] = credential.get("id")
         inputs["credential_source"] = credential.get("source") or "mythic_credential_store"
         inputs["credential_proof_task_id"] = credential.get("proof_task_id")
+
+    _KRBTGT_FORGE_CAPABILITIES = frozenset({"forge-golden-ticket", "ensure-kerberos-context"})
+
+    def _krbtgt_missing_proof_reason(self, action, inputs: dict, missing) -> str:
+        """State a krbtgt forge's missing key as the proof it lacks; empty when that is not why it cannot run.
+
+        The worker is told what proof is missing and that nothing ran. It is not invited to supply a key, because
+        a key the request carries is never bound (see `_bind_proved_krbtgt_key`).
+        """
+        capability = self._capability_text(getattr(action, "name", "")).casefold()
+        missing_items = [str(item) for item in (missing or [])]
+        if capability not in self._KRBTGT_FORGE_CAPABILITIES or "key" not in missing_items:
+            return ""
+        domain = self._capability_text(
+            inputs.get("source_domain") or self._capability_domain(action, inputs)
+        ).casefold() or "unknown-domain"
+        others = [item for item in missing_items if item != "key"]
+        also = f" It also lacks: {', '.join(others)}." if others else ""
+        return (
+            f"`{capability}` has no proved `krbtgt-hash:{domain}`. Sage forges only from a krbtgt key a Mythic task "
+            "produced: a verified dcsync, or a credential an agent reported from a completed task. A key typed into "
+            "the request or the credential store, or read from another task's output, is not proof."
+            f"{also} Nothing was issued."
+        )
 
     def _drop_card_secret_inputs(self, inputs: dict, *mappings: Any) -> None:
         """Remove ticket-key values from what an approval card carries once Sage bound a proved key by reference.

@@ -3022,8 +3022,10 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
                 missing = ", ".join(str(item) for item in getattr(plan, "missing", []) or [])
                 reason = str(getattr(plan, "reason", "") or "").strip()
                 detail = reason or (f"missing: {missing}" if missing else "a required input is missing")
-                note = (f"`{capability}` could not be planned yet — {detail}. Supply that input, or send a "
-                        f"different step. Nothing was issued.")
+                missing_proof = getattr(client, "_krbtgt_missing_proof_reason", None)
+                note = (missing_proof(action_obj, inputs, getattr(plan, "missing", [])) if callable(missing_proof)
+                        else "") or (f"`{capability}` could not be planned yet — {detail}. Supply that input, or "
+                                     f"send a different step. Nothing was issued.")
                 record = self._record(request)
                 if record is not None and record.status is None:
                     record.end(_step_bounds.StepStatus.PRECONDITION_UNSATISFIABLE, "precondition", note)

@@ -566,9 +566,14 @@ def test_recovering_a_proved_krbtgt_key_writes_nothing_before_approval(monkeypat
 def _assert_no_forge(mt, inputs: dict, action: dict | None = None):
     message = _ground_forge(mt, inputs, action)
     assert message.tool_calls == [], message.tool_calls
+    # The worker is told the missing proof and that nothing ran, not invited to supply a key that is not proof.
+    note = str(message.content)
+    assert "proved `krbtgt-hash:lab.local`" in note and "nothing was issued" in note.casefold(), note
+    assert "supply that input" not in note.casefold(), note
     result, calls = _forge_from(mt, inputs, action)
     assert _rubeus_issues(calls) == [], result
     assert result["verdict"] != "achieved"
+    assert "proved `krbtgt-hash:lab.local`" in result["reason"], result["reason"]
 
 
 TYPED_KEY = "e" * 64
