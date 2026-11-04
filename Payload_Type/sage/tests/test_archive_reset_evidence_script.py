@@ -185,3 +185,92 @@ def test_installed_target_refuses_without_an_install(tmp_path):
             "--repo-root", str(tmp_path), "--evidence-root", str(tmp_path / "evidence"),
             "--mythic-env-path", "", "--skip-mythic-dump", "--target", "installed",
         ])
+
+
+def _preserve(tmp_path: Path, installed: Path, stamp: str, monkeypatch=None, backed_up: list | None = None):
+    if backed_up is not None and monkeypatch is not None:
+        real = evidence.backup_sqlite
+        monkeypatch.setattr(evidence, "backup_sqlite", lambda s, d: backed_up.append(s.name) or real(s, d))
+    return evidence.preserve_evidence(tmp_path / "evidence" / f"reset-{stamp}", installed=installed,
+                                      postgres_container=None)
+
+
+def test_data_an_earlier_reset_already_holds_is_not_copied_again(tmp_path, monkeypatch):
+    """Each container reset used to re-copy every stamped archive into its new evidence folder (26 GB by
+    2026-11-04). Data already preserved is referenced, not duplicated; new data is still copied."""
+    env, installed, conns = _install(tmp_path)
+    for conn in conns:
+        conn.close()
+    first = _preserve(tmp_path, installed, "20261104-1000")
+
+    live = sqlite3.connect(installed / "sage.db")
+    live.execute("INSERT INTO t VALUES (99)")
+    live.commit()
+    live.close()
+    second = _preserve(tmp_path, installed, "20261104-1100")
+
+    by_path = {item["path"]: item for item in second["items"]}
+    archive = by_path["installed/sage_20261029-1902.db"]
+    assert archive["already_preserved"] == "reset-20261104-1000/installed/sage_20261029-1902.db"
+    assert not (tmp_path / "evidence" / "reset-20261104-1100" / "installed" / "sage_20261029-1902.db").exists()
+    assert archive["sha256"] == {i["path"]: i for i in first["items"]}["installed/sage_20261029-1902.db"]["sha256"]
+    assert "already_preserved" not in by_path["installed/sage.db"], "changed data is new evidence"
+    assert _rows(tmp_path / "evidence" / "reset-20261104-1100" / "installed" / "sage.db") == 6
+
+
+def test_unchanged_files_are_recognized_without_another_backup(tmp_path, monkeypatch):
+    env, installed, conns = _install(tmp_path)
+    for conn in conns:
+        conn.close()
+    _preserve(tmp_path, installed, "20261104-1000")
+    _preserve(tmp_path, installed, "20261104-1100")
+    backed_up: list[str] = []
+    third = _preserve(tmp_path, installed, "20261104-1200", monkeypatch, backed_up)
+
+    assert backed_up == [], "files whose size and timestamps match a recorded copy need no new backup"
+    assert all(item.get("already_preserved", "").startswith("reset-20261104-1000/")
+               for item in third["items"] if item["kind"] == "sqlite-backup")
+
+
+def test_an_earlier_copy_that_changed_size_is_not_trusted(tmp_path):
+    """The fresh backup is deleted on the earlier manifest's word, so that copy must still look intact."""
+    env, installed, conns = _install(tmp_path)
+    for conn in conns:
+        conn.close()
+    _preserve(tmp_path, installed, "20261104-1000")
+    earlier = tmp_path / "evidence" / "reset-20261104-1000" / "installed" / "sage_20261029-1902.db"
+    earlier.write_bytes(earlier.read_bytes()[:4096])
+    second = _preserve(tmp_path, installed, "20261104-1100")
+
+    archive = {i["path"]: i for i in second["items"]}["installed/sage_20261029-1902.db"]
+    assert "already_preserved" not in archive
+
+
+def test_a_source_that_changes_during_its_backup_records_no_reusable_identity(tmp_path, monkeypatch):
+    env, installed, conns = _install(tmp_path)
+    for conn in conns:
+        conn.close()
+    real = evidence.backup_sqlite
+
+    def backup_then_write(source, target):
+        info = real(source, target)
+        if source.name == "sage.db":
+            source.with_name("sage.db-wal").write_bytes(b"x" * 10)  # a write after the snapshot
+        return info
+
+    monkeypatch.setattr(evidence, "backup_sqlite", backup_then_write)
+    first = _preserve(tmp_path, installed, "20261104-1000")
+    assert "source" not in {i["path"]: i for i in first["items"]}["installed/sage.db"]
+
+
+def test_a_missing_earlier_copy_is_not_trusted(tmp_path):
+    env, installed, conns = _install(tmp_path)
+    for conn in conns:
+        conn.close()
+    _preserve(tmp_path, installed, "20261104-1000")
+    (tmp_path / "evidence" / "reset-20261104-1000" / "installed" / "sage_20261029-1902.db").unlink()
+    second = _preserve(tmp_path, installed, "20261104-1100")
+
+    archive = {i["path"]: i for i in second["items"]}["installed/sage_20261029-1902.db"]
+    assert "already_preserved" not in archive
+    assert _rows(tmp_path / "evidence" / "reset-20261104-1100" / "installed" / "sage_20261029-1902.db") == 2

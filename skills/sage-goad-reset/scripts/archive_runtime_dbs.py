@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Archive active Sage runtime and Phoenix SQLite databases without deleting history."""
+"""Archive active Sage runtime and Phoenix SQLite databases, and the local engagement ledger, without deleting history."""
 
 from __future__ import annotations
 
@@ -37,6 +37,7 @@ def archive_runtime_dbs(
     *,
     timestamp: str | None = None,
     sage_database_path: Path | None = None,
+    include_ledger: bool = False,
 ) -> list[tuple[Path, Path]]:
     stamp = timestamp or datetime.now().astimezone().strftime("%Y%m%d-%H%M")
     if not STAMP_RE.fullmatch(stamp):
@@ -50,7 +51,21 @@ def archive_runtime_dbs(
             raise ValueError("application database path must be absolute")
         if source.exists():
             moves.append((source, source.with_name(f"{prefix}_{stamp}.db")))
-    return _move_databases(moves)
+    # The tmux Sage's engagement ledger, beside its cwd (engagement_ledger.py's default; a run that sets
+    # SAGE_ENGAGEMENT_STATE_DIR keeps its own elsewhere). The repo-root `.sage_engagement` holds reset
+    # checkpoints and is a different directory. Opt-in: the eval gauge calls this script between arms
+    # without flags, and moving the ledger there would change those runs' protocol.
+    ledger = repo_root / "Payload_Type" / "sage" / ".sage_engagement"
+    if not include_ledger:
+        return _move_databases(moves)
+    ledger_target = ledger.with_name(f".sage_engagement_{stamp}")
+    if ledger.is_dir() and ledger_target.exists():
+        raise FileExistsError(f"archive destination already exists: {ledger_target}")
+    moved = _move_databases(moves)
+    if ledger.is_dir():
+        ledger.replace(ledger_target)
+        moved.append((ledger, ledger_target))
+    return moved
 
 
 def archive_installed_runtime_state(installed: Path, *, timestamp: str | None = None) -> list[tuple[Path, Path]]:
@@ -130,11 +145,14 @@ def main() -> None:
         help="Override the local timestamp for testing; format YYYYMMDD-HHMM.",
     )
     parser.add_argument("--sage-db", type=Path, help="Explicit absolute application database path.")
+    parser.add_argument("--include-ledger", action="store_true",
+                        help="also move Payload_Type/sage/.sage_engagement aside (the reset does this)")
     args = parser.parse_args()
 
     root = args.repo_root.resolve()
     moves = archive_runtime_dbs(root, timestamp=args.timestamp,
-                               sage_database_path=args.sage_db or configured_database_path(root))
+                               sage_database_path=args.sage_db or configured_database_path(root),
+                               include_ledger=args.include_ledger)
     if not moves:
         print("No active Sage or Phoenix runtime databases found.")
         return

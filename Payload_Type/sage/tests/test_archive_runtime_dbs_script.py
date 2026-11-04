@@ -134,3 +134,46 @@ def test_database_config_matches_runtime_precedence(tmp_path, monkeypatch):
     monkeypatch.setenv("SAGE_DATABASE_PATH", "relative.db")
     with pytest.raises(ValueError, match="absolute"):
         archive_runtime_dbs.configured_database_path(tmp_path)
+
+
+def test_local_archive_moves_the_local_engagement_ledger_too(tmp_path):
+    """The tmux Sage writes its ledger to `.sage_engagement` beside its cwd (Payload_Type/sage). Left in
+    place, a new run on a reset Mythic can inherit an old run's facts; the repo-root `.sage_engagement`
+    (reset checkpoints) is a different directory and stays."""
+    make_runtime_dbs(tmp_path)
+    ledger = tmp_path / "Payload_Type" / "sage" / ".sage_engagement"
+    (ledger / "decision_records").mkdir(parents=True)
+    (ledger / "decision_records" / "chat_1_request_1.seal.json").write_text("{}")
+    checkpoints = tmp_path / ".sage_engagement" / "reset_runs"
+    checkpoints.mkdir(parents=True)
+
+    moves = archive_runtime_dbs.archive_runtime_dbs(tmp_path, timestamp="20261104-1300", include_ledger=True)
+
+    archived = tmp_path / "Payload_Type" / "sage" / ".sage_engagement_20261104-1300"
+    assert (archived / "decision_records" / "chat_1_request_1.seal.json").exists()
+    assert not ledger.exists()
+    assert (ledger, archived) in moves
+    assert checkpoints.is_dir()
+
+
+def test_the_ledger_stays_unless_asked_so_eval_teardowns_keep_their_protocol(tmp_path):
+    """The eval gauge runs this script between arms with no flags; moving the ledger there would change
+    those runs' protocol. The reset asks for it explicitly."""
+    make_runtime_dbs(tmp_path)
+    ledger = tmp_path / "Payload_Type" / "sage" / ".sage_engagement"
+    ledger.mkdir(parents=True)
+    archive_runtime_dbs.archive_runtime_dbs(tmp_path, timestamp="20261104-1300")
+    assert ledger.is_dir()
+
+
+def test_archived_ledgers_are_ignored_by_git_and_docker():
+    repo = Path(__file__).resolve().parents[3]
+    if not (repo / ".git").exists():
+        pytest.skip("needs a git checkout (not a checkout-index extraction)")
+    dockerignore = (repo / "Payload_Type" / "sage" / ".dockerignore").read_text(encoding="utf-8").splitlines()
+    assert ".sage_engagement_*" in dockerignore, "a local image build would bake archived ledgers into a layer"
+    result = subprocess.run(
+        ["git", "check-ignore", "-q", "--no-index", "Payload_Type/sage/.sage_engagement_20261104-1300/x.json"],
+        cwd=repo, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, "an archived ledger must never show up as untracked"

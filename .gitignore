@@ -79,6 +79,8 @@ Payload_Type/sage/evals/results/
 
 # Sage durable engagement-state ledger and local analysis artifacts (runtime state — never commit)
 .sage_engagement/
+# Ledgers the reset moved aside (`.sage_engagement_<YYYYMMDD-HHMM>`), beside the tmux or container Sage.
+.sage_engagement_*/
 .hillclimb/
 **/.trajectory/
 # Residual guard. Nothing in the current code writes this file, but a Sage process still running an

@@ -132,7 +132,13 @@ exits non-zero if either is still up. An absent `sage` tmux session is an alread
 .venv/bin/python skills/sage-goad-reset/scripts/archive_reset_evidence.py --target installed  # container, published
 ```
 
-   `--target installed` moves the container's own state instead: `sage.db`, `.phoenix/phoenix.db` and
+   Data an earlier reset already preserved is referenced in the manifest instead of copied again (matched by
+   size and timestamps, else by the copy's SHA-256, and only while that earlier copy still exists). The local
+   target also moves the tmux Sage's ledger, `Payload_Type/sage/.sage_engagement`, aside as
+   `.sage_engagement_<stamp>` (standalone `archive_runtime_dbs.py` does so only with `--include-ledger`, so the
+   eval gauge's between-arm teardowns are unchanged). **Do not delete an evidence folder that later folders
+   reference**: a later manifest item with `already_preserved: reset-<stamp>/...` holds no copy of its own, so
+   removing `reset-<stamp>` loses that data. Search the later manifests for the folder name first. `--target installed` moves the container's own state instead: `sage.db`, `.phoenix/phoenix.db` and
    `.sage_engagement/` inside the installed service directory, leaving the repo's databases (the local Sage's)
    alone. Mythic reuses channel and operation ids after its reset, so state left there makes the next run
    refuse its first prompt or start from an old run's facts.

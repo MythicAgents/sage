@@ -20,6 +20,7 @@ tools/*
 # Runtime state and retained evidence. These are archived data, never image input.
 .phoenix
 .sage_engagement
+.sage_engagement_*
 .trajectory
 .hillclimb
 sage*.db*
