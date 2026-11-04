@@ -13,10 +13,11 @@ readiness check that does not look for a second instance still reports `ready: t
 Mode comes from `--mode`, else `SAGE_DEPLOYMENT_MODE`, else `local` — the mode this repo's
 workflow uses (see `AGENTS.md`: Sage runs locally in the `sage` tmux session).
 
-  check    report status; exit 0 when exactly the intended Sage is up
-  enforce  stop the unintended side, then re-check
-  parity   report whether the container is running the working tree (container mode only)
-  deploy   sync the working tree into Mythic, restart the container, then prove parity
+  check     report status; exit 0 when exactly the intended Sage is up
+  enforce   stop the unintended side, then re-check (needs an explicit mode)
+  stop-all  stop every Sage, local and container (the reset's first phase)
+  parity    report whether the container is running the working tree (container mode only)
+  deploy    sync the working tree into Mythic, start the container from it, then prove parity
 
 ## Why `deploy` and `parity` exist
 
@@ -297,16 +298,121 @@ def _seed_missing_env_files(source: Path, destination: Path) -> list:
     return seeded
 
 
-def _restart_container() -> dict:
+#: Mythic settings each container mode needs. `container` builds the image from the installed copy
+#: of the working tree and bind-mounts that copy over /Mythic/, so the code that runs is the synced code.
+_MYTHIC_SETTINGS = {
+    "container": (("sage_use_build_context", "true"), ("sage_use_volume", "false")),
+}
+
+#: Sage's own .env carries Docker hostnames valid only inside the container; they poison host-side
+#: mythic-cli and docker compose (the same reason mythic_reset.sh strips them).
+_HOST_SIDE_STRIP = ("RABBITMQ_HOST", "MYTHIC_SERVER_HOST", "NGINX_HOST", "COMPOSE_FILE", "COMPOSE_PROJECT_NAME")
+
+
+def _host_side_env() -> dict:
+    return {k: v for k, v in os.environ.items() if k not in _HOST_SIDE_STRIP}
+
+
+def _mythic_dir() -> Path:
+    """The Mythic install both variables name. AGENTS.md: MYTHIC_ENV_PATH and MYTHIC_CLI must identify
+    the same install; otherwise deploy syncs into one install's copy and starts the other's container."""
+    cli_dir = _mythic_cli().resolve().parent
+    value = os.environ.get("MYTHIC_ENV_PATH", "").strip()
+    if not value:
+        raise SystemExit("ERR: MYTHIC_ENV_PATH is not set. Point it at your Mythic .env (see .env.example).")
+    env_dir = Path(value).expanduser().resolve().parent
+    if cli_dir != env_dir:
+        raise SystemExit(
+            f"ERR: MYTHIC_CLI ({cli_dir}) and MYTHIC_ENV_PATH ({env_dir}) name different Mythic installs; "
+            "point both at the same one."
+        )
+    return cli_dir
+
+
+def _run_host_side(command: list[str], action: str, timeout: int = 900) -> dict:
     result = subprocess.run(
-        ["docker", "restart", readiness_contract.SAGE_CONTAINER_NAME],
-        capture_output=True, text=True, timeout=300, check=False,
+        command, cwd=str(_mythic_dir()), env=_host_side_env(),
+        capture_output=True, text=True, timeout=timeout, check=False,
     )
     return {
-        "action": "restart-sage-container",
+        "action": action,
         "returncode": result.returncode,
+        "stdout_tail": result.stdout.strip()[-400:],
         "stderr_tail": result.stderr.strip()[-400:],
     }
+
+
+def _mythic_env_values() -> dict:
+    from dotenv import dotenv_values
+
+    value = os.environ.get("MYTHIC_ENV_PATH", "").strip()
+    if not value:
+        raise SystemExit("ERR: MYTHIC_ENV_PATH is not set. Point it at your Mythic .env (see .env.example).")
+    return {str(k).casefold(): str(v or "") for k, v in dotenv_values(Path(value).expanduser()).items()}
+
+
+def _ensure_mythic_settings(mode: str) -> dict:
+    """Make Mythic's generated compose entry for Sage match the mode, and say what changed.
+
+    `mythic-cli add sage` regenerates the compose entry from Mythic's .env; it is how a settings
+    change takes effect without a `mythic-cli start`, which would rebuild the image.
+    """
+    def mismatched() -> list[tuple[str, str]]:
+        current = _mythic_env_values()
+        return [(key, value) for key, value in _MYTHIC_SETTINGS[mode]
+                if current.get(key, "").strip().strip("'\"").casefold() != value]
+
+    changed = mismatched()
+    actions = []
+    for key, value in changed:
+        actions.append(_run_host_side([str(_mythic_cli()), "config", "set", key, value], f"set-{key}", 120))
+        if actions[-1]["returncode"] != 0:
+            return {"action": "ensure-mythic-settings", "returncode": 1, "changed": changed, "steps": actions}
+    # `config set` exits 0 even when it finds no matching key, so read the file back.
+    still_wrong = mismatched()
+    if still_wrong:
+        return {
+            "action": "ensure-mythic-settings", "returncode": 1, "changed": [key for key, _ in changed],
+            "not_applied": [f"{key}={value}" for key, value in still_wrong], "steps": actions,
+        }
+    # Always regenerate: Mythic's .env is not the compose file, and an entry left behind by an earlier
+    # mode can name another image while parity (which hashes code only) still passes.
+    actions.append(_run_host_side([str(_mythic_cli()), "add", readiness_contract.SAGE_CONTAINER_NAME],
+                                  "regenerate-compose-entry", 120))
+    return {
+        "action": "ensure-mythic-settings",
+        "returncode": max([0, *(step["returncode"] for step in actions)]),
+        "changed": [key for key, _ in changed],
+        "steps": actions,
+    }
+
+
+def _image_present(image: str) -> bool:
+    result = subprocess.run(["docker", "image", "inspect", image], capture_output=True, text=True,
+                            timeout=60, check=False)
+    return result.returncode == 0
+
+
+def _start_container(*, rebuild: bool = False) -> dict:
+    """Start Sage's container from the image already built, recreating the container.
+
+    Not `docker restart`: `mythic-cli stop sage` removes the container, so there is often nothing to
+    restart (2026-10-30). Not `mythic-cli start`: with Mythic's REBUILD_ON_START it runs
+    `docker compose up --build`, which rebuilt the image and silently replaced the one under test
+    (2026-11-03). The image is built only when it is missing or a rebuild is asked for, which is
+    what a change to requirements, constraints or the Dockerfile needs.
+    """
+    name = readiness_contract.SAGE_CONTAINER_NAME
+    steps = []
+    if rebuild or not _image_present(name):
+        steps.append(_run_host_side([str(_mythic_cli()), "build", name], "build-sage-image", 3600))
+        if steps[-1]["returncode"] != 0:
+            return {"action": "start-sage-container", "returncode": steps[-1]["returncode"], "steps": steps}
+    steps.append(_run_host_side(
+        ["docker", "compose", "up", "-d", "--no-build", "--pull", "never", "--force-recreate", name],
+        "compose-up-sage", 600,
+    ))
+    return {"action": "start-sage-container", "returncode": steps[-1]["returncode"], "steps": steps}
 
 
 def _stop_local() -> dict:
@@ -322,11 +428,32 @@ def _stop_local() -> dict:
     }
 
 
+def _stop_all() -> int:
+    """Stop every Sage, whichever kind is running. Mode-independent: the reset archives databases next,
+    and no Sage of either kind may still be writing them."""
+    actions = []
+    if readiness_contract.probe_sage_container_running():
+        actions.append(_stop_container())
+    if readiness_contract.probe_local_sage_running(REPO_ROOT):
+        actions.append(_stop_local())
+    container_running = readiness_contract.probe_sage_container_running()
+    local_running = readiness_contract.probe_local_sage_running(REPO_ROOT)
+    blockers = []
+    if container_running is None:
+        blockers.append("could not determine whether the Sage container is running; docker did not answer")
+    elif container_running:
+        blockers.append("the Sage container is still running")
+    if local_running:
+        blockers.append("a local Sage process is still running")
+    print(json.dumps({"ready": not blockers, "blockers": blockers, "actions": actions}, indent=2, sort_keys=True))
+    return 0 if not blockers else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("command", choices=("check", "enforce", "parity", "deploy"))
+    parser.add_argument("command", choices=("check", "enforce", "stop-all", "parity", "deploy"))
     parser.add_argument(
         "--mode",
         choices=readiness_contract.SAGE_DEPLOYMENT_MODES,
@@ -341,7 +468,15 @@ def main(argv: list[str] | None = None) -> int:
             "This is the mid-reset state: Mythic restarts long before Sage does."
         ),
     )
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="deploy: rebuild the image first (needed when requirements, constraints or the Dockerfile change)",
+    )
     args = parser.parse_args(argv)
+
+    if args.command == "stop-all":
+        return _stop_all()
 
     mode = readiness_contract.resolve_sage_deployment_mode(args.mode)
 
@@ -360,7 +495,12 @@ def main(argv: list[str] | None = None) -> int:
                 f"{mode!r}. Pass --mode container (or set SAGE_DEPLOYMENT_MODE=container) to say "
                 "so explicitly; local development uses sage_restart.sh instead."
             )
+        _mythic_dir()  # refuse a split install before writing anything into either one
         actions = [_sync_into_mythic()]
+        if actions[-1]["returncode"] != 0:
+            print(json.dumps({"ready": False, "actions": actions}, indent=2, sort_keys=True))
+            return 1
+        actions.append(_ensure_mythic_settings(mode))
         if actions[-1]["returncode"] != 0:
             print(json.dumps({"ready": False, "actions": actions}, indent=2, sort_keys=True))
             return 1
@@ -375,7 +515,7 @@ def main(argv: list[str] | None = None) -> int:
         if deployment["local_process_running"]:
             actions.append(_stop_local())
 
-        actions.append(_restart_container())
+        actions.append(_start_container(rebuild=args.rebuild))
         if actions[-1]["returncode"] != 0:
             print(json.dumps({"ready": False, "actions": actions}, indent=2, sort_keys=True))
             return 1
@@ -414,6 +554,16 @@ def main(argv: list[str] | None = None) -> int:
 
     status = _status()
     actions: list[dict] = []
+
+    if args.command == "enforce" and not status["ready"] and not readiness_contract.deployment_mode_is_explicit(args.mode):
+        # A defaulted `local` once stopped the container the operator meant to run, because container
+        # mode had been exported in another shell. Report instead of guessing which Sage to stop.
+        print(json.dumps({
+            **status, "actions": [],
+            "refused": "set SAGE_DEPLOYMENT_MODE (local or container) or pass --mode; "
+                       "enforce stops a Sage only when told which one is intended",
+        }, indent=2, sort_keys=True))
+        return 1
 
     if args.command == "enforce" and not status["ready"]:
         # Only ever stop the side that is not wanted. A missing intended Sage is reported, never

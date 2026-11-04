@@ -353,21 +353,23 @@ def runtime_db_status(
     *,
     runtime_dbs_archived: bool = False,
     operator_db_cleanup_confirmed: bool | None = None,
+    database_dir: Path | None = None,
 ) -> dict[str, Any]:
+    """Whether the serving Sage's databases were archived. ``database_dir`` is where that Sage keeps
+    them: the repo's `Payload_Type/sage` for local tmux (the default, reported relative to the repo),
+    or Mythic's installed service directory for a container (reported as absolute paths)."""
     if operator_db_cleanup_confirmed is not None:
         runtime_dbs_archived = operator_db_cleanup_confirmed
-    required = [
-        repo_root / "Payload_Type" / "sage" / "sage.db",
-        repo_root / "Payload_Type" / "sage" / ".phoenix" / "phoenix.db",
-    ]
-    sage_archives = sorted((repo_root / "Payload_Type" / "sage").glob("sage_*.db"))
-    phoenix_archives = sorted((repo_root / "Payload_Type" / "sage" / ".phoenix").glob("phoenix_*.db"))
-    existing_required = [str(path.relative_to(repo_root)) for path in required if path.exists()]
-    existing_archives = [
-        str(path.relative_to(repo_root))
-        for path in (*sage_archives, *phoenix_archives)
-        if path.exists()
-    ]
+    directory = Path(database_dir) if database_dir is not None else repo_root / "Payload_Type" / "sage"
+
+    def shown(path: Path) -> str:
+        return str(path) if database_dir is not None else str(path.relative_to(repo_root))
+
+    required = [directory / "sage.db", directory / ".phoenix" / "phoenix.db"]
+    sage_archives = sorted(directory.glob("sage_*.db"))
+    phoenix_archives = sorted((directory / ".phoenix").glob("phoenix_*.db"))
+    existing_required = [shown(path) for path in required if path.exists()]
+    existing_archives = [shown(path) for path in (*sage_archives, *phoenix_archives) if path.exists()]
     blocks = bool(existing_required and not runtime_dbs_archived)
     return {
         "ready": not blocks,
@@ -465,6 +467,78 @@ def startup_identity_from_env(
         "recorded_at": recorded.get("recorded_at"),
         "blockers": blockers,
     }
+
+
+def _container_parity() -> dict[str, Any]:
+    """`sage_deployment.py parity`, loaded lazily: that module imports this one at load time."""
+    module = sys.modules.get("sage_deployment")
+    if module is None:
+        spec = importlib.util.spec_from_file_location(
+            "sage_deployment", Path(__file__).resolve().parent / "sage_deployment.py"
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError("cannot load sage_deployment.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["sage_deployment"] = module
+        spec.loader.exec_module(module)
+    return module._parity()
+
+
+def runtime_identity_status(
+    *,
+    mode: Any = None,
+    identity_path: Path = DEFAULT_STARTUP_IDENTITY_PATH,
+    parity_probe: Callable[[], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Proof that the serving Sage runs the intended code, from the source that matches the mode.
+
+    Local tmux: the startup identity the launcher records. Container: parity — the container's files
+    match the working tree and its process started after the newest of them. The startup file is
+    written only by the tmux launcher, so reading it for a container reported a correct deployment
+    as `ready: false` (2026-11-03, 2026-11-04).
+    """
+    resolved = resolve_sage_deployment_mode(mode)
+    if resolved != "container":
+        return {**startup_identity_from_env(identity_path=identity_path), "source": "local-startup-identity"}
+    try:
+        parity = dict((parity_probe or _container_parity)() or {})
+    except Exception as exc:  # docker unavailable, container absent, ...
+        parity = {"ready": False, "blockers": [f"container parity could not be read: {exc}"]}
+    blockers = [str(item) for item in parity.get("blockers") or []]
+    if not parity.get("ready") and not blockers:
+        blockers = ["container parity is not ready"]
+    return {
+        "ready": bool(parity.get("ready")) and not blockers,
+        "source": "container-parity",
+        "repo_digest": parity.get("repo_digest"),
+        "container_digest": parity.get("container_digest"),
+        "container_started_at": parity.get("container_started_at"),
+        "blockers": blockers,
+    }
+
+
+def runtime_databases_status(
+    repo_root: Path = REPO_ROOT, *, runtime_dbs_archived: bool = False, mode: Any = None,
+) -> dict[str, Any]:
+    """`runtime_db_status` for the databases of the Sage the mode says is serving."""
+    if resolve_sage_deployment_mode(mode) != "container":
+        return runtime_db_status(repo_root, runtime_dbs_archived=runtime_dbs_archived)
+    installed = installed_service_dir()
+    if installed is None:
+        return {
+            "ready": False,
+            "runtime_dbs_archived": runtime_dbs_archived,
+            "blockers": ["MYTHIC_ENV_PATH is not set, so the container's databases cannot be located"],
+        }
+    return runtime_db_status(repo_root, runtime_dbs_archived=runtime_dbs_archived, database_dir=installed)
+
+
+def installed_service_dir() -> Path | None:
+    """Mythic's installed Sage directory, from MYTHIC_ENV_PATH only (never a guessed checkout)."""
+    value = os.environ.get("MYTHIC_ENV_PATH", "").strip()
+    if not value:
+        return None
+    return Path(value).expanduser().resolve().parent / "InstalledServices" / SAGE_CONTAINER_NAME
 
 
 def _probe_process(pid: int) -> dict[str, Any]:
@@ -812,6 +886,15 @@ DEFAULT_SAGE_DEPLOYMENT_MODE = "local"
 SAGE_CONTAINER_NAME = "sage"
 
 
+def deployment_mode_is_explicit(value: Any = None) -> bool:
+    """True when the mode was chosen (flag or SAGE_DEPLOYMENT_MODE), not defaulted.
+
+    Only an explicit mode may stop a Sage: a defaulted `local` once stopped the container the
+    operator meant to run, because container mode had been set in a different shell.
+    """
+    return bool(str(value or os.environ.get("SAGE_DEPLOYMENT_MODE") or "").strip())
+
+
 def resolve_sage_deployment_mode(value: Any = None) -> str:
     """Which Sage is meant to serve Mythic: the tmux process or the Docker container."""
     return str(
@@ -1148,8 +1231,8 @@ async def collect_operator_readiness(
             if sage_deployment_observation is not None
             else sage_deployment_status(repo_root=repo_root)
         ),
-        runtime_identity=startup_identity_from_env(),
-        runtime_databases=runtime_db_status(repo_root, runtime_dbs_archived=runtime_dbs_archived),
+        runtime_identity=runtime_identity_status(),
+        runtime_databases=runtime_databases_status(repo_root, runtime_dbs_archived=runtime_dbs_archived),
         ludus=ludus_section,
         clock=clock_section,
         authentication=authentication_status(clock_section, selected_profile),

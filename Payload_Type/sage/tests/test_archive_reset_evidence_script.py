@@ -148,3 +148,40 @@ def test_missing_install_and_explicit_skip_are_recorded_not_silent(tmp_path):
     assert docker.calls == []
     assert len(manifest["skipped"]) == 2
     assert manifest["items"] == []
+
+
+
+def test_installed_target_moves_the_containers_state_and_leaves_the_repo_alone(tmp_path, capsys):
+    """2026-10-29 and 2026-11-03: `archive_runtime_dbs.py --sage-db <installed>/sage.db` still moved the
+    local phoenix.db and left the container's phoenix.db and engagement ledger in place, where
+    Mythic's reused channel and operation ids made the next run start from stale state."""
+    env_path, installed, conns = _install(tmp_path)
+    for conn in conns:
+        conn.close()
+    repo = tmp_path / "repo"
+    local_db = repo / "Payload_Type" / "sage" / ".phoenix" / "phoenix.db"
+    local_db.parent.mkdir(parents=True)
+    local_db.write_text("local tmux trace")
+
+    assert evidence.main([
+        "--repo-root", str(repo), "--evidence-root", str(tmp_path / "evidence"),
+        "--timestamp", "20261104-1200", "--mythic-env-path", str(env_path),
+        "--skip-mythic-dump", "--target", "installed",
+    ]) == 0
+
+    assert not (installed / "sage.db").exists() and (installed / "sage_20261104-1200.db").exists()
+    assert not (installed / ".phoenix" / "phoenix.db").exists()
+    assert (installed / ".phoenix" / "phoenix_20261104-1200.db").exists()
+    assert not (installed / ".sage_engagement").exists()
+    assert (installed / ".sage_engagement_20261104-1200" / "decision_records" / "chat_3_request_1.seal.json").exists()
+    assert local_db.read_text() == "local tmux trace", "the local tmux databases belong to a different Sage"
+    report = json.loads(capsys.readouterr().out)
+    assert report["target"] == "installed"
+
+
+def test_installed_target_refuses_without_an_install(tmp_path):
+    with pytest.raises(SystemExit, match="MYTHIC_ENV_PATH"):
+        evidence.main([
+            "--repo-root", str(tmp_path), "--evidence-root", str(tmp_path / "evidence"),
+            "--mythic-env-path", "", "--skip-mythic-dump", "--target", "installed",
+        ])

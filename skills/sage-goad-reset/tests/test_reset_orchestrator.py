@@ -75,6 +75,7 @@ def _config() -> dict:
         "mythic_server": "127.0.0.1",
         "mythic_user": "mythic_admin",
         "mythic_env_path": "/opt/mythic-install/.env",
+        "deployment_mode": "local",
     }
 
 
@@ -230,6 +231,70 @@ def test_checkpoint_from_an_earlier_reset_tool_is_refused_with_a_reason(tmp_path
     assert "start a new reset" in message
 
 
+def test_every_mode_stops_every_sage_before_archiving():
+    """Archiving moves databases, so no Sage of either kind may still be writing them."""
+    for mode in ("local", "container"):
+        command = reset._phase_commands({**_config(), "deployment_mode": mode})["stop-sage"]
+        assert command[1].endswith("sage_deployment.py") and command[2:] == ["stop-all"]
+
+
+def test_container_mode_restarts_the_container_not_a_tmux_sage():
+    """2026-11-03: the reset always ran sage_restart.sh, so agents skipped the orchestrator and ran the
+    container steps by hand, losing its checkpoint and zero-task baseline."""
+    commands = reset._phase_commands({**_config(), "deployment_mode": "container"})
+
+    assert commands["restart-sage"][1].endswith("sage_deployment.py")
+    assert commands["restart-sage"][2:] == ["deploy", "--mode", "container"]
+    assert "sage_restart.sh" not in json.dumps(commands)
+    assert commands["archive-runtime-dbs"][-2:] == ["--target", "installed"]
+
+
+def test_local_mode_keeps_the_tmux_restart_and_local_archive():
+    commands = reset._phase_commands(_config())
+
+    assert commands["restart-sage"][1].endswith("sage_restart.sh")
+    assert "--target" not in commands["archive-runtime-dbs"]
+
+
+def test_start_requires_an_explicit_deployment_mode(monkeypatch):
+    monkeypatch.delenv("SAGE_DEPLOYMENT_MODE", raising=False)
+    start = reset.build_parser().parse_args(
+        ["start", "--snapshot", "exact-clean-snapshot", "--callback-host", "http://100.64.0.1", "--yes"]
+    )
+    with pytest.raises(reset.ResetError, match="SAGE_DEPLOYMENT_MODE"):
+        reset._config_from_args(start)
+
+    monkeypatch.setenv("SAGE_DEPLOYMENT_MODE", "container")
+    assert reset._config_from_args(start)["deployment_mode"] == "container"
+    flagged = reset.build_parser().parse_args(
+        ["start", "--snapshot", "exact-clean-snapshot", "--callback-host", "http://100.64.0.1", "--yes",
+         "--deployment-mode", "local"]
+    )
+    assert reset._config_from_args(flagged)["deployment_mode"] == "local", "the flag wins over the env"
+
+
+def test_phase_children_receive_the_checkpointed_mode(monkeypatch):
+    seen = {}
+
+    def fake_run(command, **kwargs):
+        seen.update(kwargs["env"])
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(reset.subprocess, "run", fake_run)
+    monkeypatch.setenv("SAGE_DEPLOYMENT_MODE", "local")
+    monkeypatch.setenv("MYTHIC_ENV_PATH", "/opt/other-install/.env")
+    reset.run_phase_command("stop-sage", ["true"], {**_config(), "deployment_mode": "container"})
+    assert seen["SAGE_DEPLOYMENT_MODE"] == "container"
+    # deploy and readiness locate the installed Sage through MYTHIC_ENV_PATH; they must use the install
+    # this reset archived, not whichever the resuming shell exports.
+    assert seen["MYTHIC_ENV_PATH"] == "/opt/mythic-install/.env"
+
+
+def test_an_unknown_checkpointed_mode_is_invalid(tmp_path):
+    with pytest.raises(reset.ResetError, match="deployment_mode"):
+        reset._validate_inputs({**_config(), "deployment_mode": "published-later"}, tmp_path / "c.json")
+
+
 def test_archive_phase_preserves_evidence_from_the_configured_mythic_install():
     command = reset._phase_commands(_config())["archive-runtime-dbs"]
 
@@ -252,7 +317,8 @@ def test_unqualified_profile_can_be_planned_but_not_started(capsys):
     assert planned["inputs"]["range_profile_id"] == "sage-structural-b"
     assert planned["live_activity_performed"] is False
 
-    assert reset.main(["start", *common, "--yes"]) == 2
+    # A start must name its deployment mode; the profile is what still blocks this one.
+    assert reset.main(["start", *common, "--yes", "--deployment-mode", "local"]) == 2
     blocked = json.loads(capsys.readouterr().out)
     assert "not live-qualified" in blocked["error"]
 

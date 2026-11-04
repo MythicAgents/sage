@@ -36,7 +36,8 @@ enforce_deployment_on_exit() {
     && ( "$SAGE_DEPLOYMENT_MODE" == "local" || "$result" == "0" ) ]]; then
     if [[ "${SAGE_RESET_SKIP_DEPLOYMENT_ENFORCE:-0}" == "1" ]]; then
       echo "▶ deployment enforcement SKIPPED (SAGE_RESET_SKIP_DEPLOYMENT_ENFORCE=1) — tests only" >&2
-    elif ! "$REPO_ROOT/.venv/bin/python" "$HERE/sage_deployment.py" enforce --conflict-only; then
+    elif ! "$REPO_ROOT/.venv/bin/python" "$HERE/sage_deployment.py" enforce --conflict-only \
+        --mode "$SAGE_DEPLOYMENT_MODE"; then
       echo "ERR: Sage deployment conflict could not be resolved" >&2
       result=1
     fi
@@ -104,9 +105,13 @@ inspect_started_services() {
   ((${#FAILED_SERVICES[@]} == 0))
 }
 
+# The Mythic reset never starts Sage, in any deployment mode. With Mythic's REBUILD_ON_START a full
+# `mythic-cli start` runs `docker compose up --build`, which rebuilt the Sage image and silently
+# replaced the candidate under test (2026-11-03). The reset's restart phase brings up the intended
+# Sage: sage_restart.sh for local, `sage_deployment.py deploy` for a container.
 add_required_service() {
   local service="$1"
-  [[ "$SAGE_DEPLOYMENT_MODE" == "local" && "$service" == "sage" ]] && return 0
+  [[ "$service" == "sage" ]] && return 0
   REQUIRED_SERVICES+=("$service")
 }
 
@@ -164,7 +169,7 @@ except Exception:
       echo "ERR: ambiguous Mythic compose service image" >&2
       exit 1
     }
-    if [[ "$SAGE_DEPLOYMENT_MODE" == "local" && "$service" == "sage" ]]; then
+    if [[ "$service" == "sage" ]]; then
       continue
     fi
     image_id="$(mythic_docker image inspect --format '{{.Id}}' "$image")" || {
@@ -223,11 +228,7 @@ else
   else
     mythic_cli database reset -f
   fi
-  if [[ "$SAGE_DEPLOYMENT_MODE" == "local" ]]; then
-    mythic_cli start "${REQUIRED_SERVICES[@]}"
-  else
-    mythic_cli start
-  fi
+  mythic_cli start "${REQUIRED_SERVICES[@]}"
 fi
 if inspect_started_services; then
   :

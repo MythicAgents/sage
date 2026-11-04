@@ -809,3 +809,66 @@ def test_collected_readiness_resolves_through_the_probes_and_not_when_observatio
 
     asyncio.run(MODULE.collect_operator_readiness(**common))
     assert asked == ["4"] and all(range_id == "GOADf255df" for _probe, range_id in scoped)
+
+
+
+# --- Runtime identity and databases follow the deployment mode -----------------------------------------
+
+def test_container_identity_comes_from_parity_not_the_tmux_startup_file(tmp_path):
+    """2026-11-03/04: readiness read /tmp/sage_startup_identity.json, which only the tmux launcher
+    writes, so a correctly deployed container reported `ready: false`."""
+    stale = tmp_path / "startup.json"
+    stale.write_text('{"pid": 999999999, "provider": "openai", "model": "old"}', encoding="utf-8")
+
+    ready = MODULE.runtime_identity_status(
+        mode="container", identity_path=stale,
+        parity_probe=lambda: {"ready": True, "blockers": [], "repo_digest": "abc", "container_digest": "abc"},
+    )
+    stale_code = MODULE.runtime_identity_status(
+        mode="container", identity_path=stale,
+        parity_probe=lambda: {"ready": False, "blockers": ["the container's code differs"], "repo_digest": "a"},
+    )
+
+    assert ready["ready"] is True and ready["source"] == "container-parity"
+    assert stale_code["ready"] is False
+    assert any("differs" in b for b in stale_code["blockers"])
+
+
+def test_local_identity_still_reads_the_startup_file(tmp_path):
+    def must_not_run():
+        raise AssertionError("parity is not the local identity source")
+
+    status = MODULE.runtime_identity_status(
+        mode="local", identity_path=tmp_path / "absent.json", parity_probe=must_not_run,
+    )
+    assert status["source"] == "local-startup-identity"
+
+
+def test_container_runtime_databases_are_the_installed_copy(tmp_path):
+    installed = tmp_path / "mythic" / "InstalledServices" / "sage"
+    (installed / ".phoenix").mkdir(parents=True)
+    (installed / "sage.db").write_text("")
+    repo = tmp_path / "repo"
+    (repo / "Payload_Type" / "sage").mkdir(parents=True)
+
+    status = MODULE.runtime_db_status(repo, database_dir=installed)
+
+    assert status["ready"] is False, "an unarchived installed database must block"
+    assert status["existing_required"] == [str(installed / "sage.db")]
+
+
+
+def test_container_identity_runs_the_real_parity_and_reports_its_failure(tmp_path, monkeypatch):
+    """No injected probe: readiness loads sage_deployment itself and asks the container."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    docker = bin_dir / "docker"
+    docker.write_text("#!/usr/bin/env bash\necho 'Error response from daemon: No such container: sage' >&2\nexit 1\n")
+    docker.chmod(0o755)
+    import os
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+
+    status = MODULE.runtime_identity_status(mode="container")
+
+    assert status["ready"] is False and status["source"] == "container-parity"
+    assert any("No such container" in b for b in status["blockers"]), status

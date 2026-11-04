@@ -21,6 +21,15 @@ DB_SPECS = (
     ("Payload_Type/sage/.phoenix/phoenix.db", "phoenix"),
 )
 STAMP_RE = re.compile(r"^\d{8}-\d{4}$")
+#: The same databases inside Mythic's installed service directory, which the container bind-mounts.
+INSTALLED_DB_SPECS = (
+    ("sage.db", "sage"),
+    ("sage_operation_memory.db", "sage_operation_memory"),
+    (".phoenix/phoenix.db", "phoenix"),
+)
+#: Engagement state the container writes beside its databases. Mythic reuses channel and operation ids
+#: after its own reset, so a ledger left in place can pre-seed a new run with an old run's facts.
+INSTALLED_TREES = (".sage_engagement",)
 
 
 def archive_runtime_dbs(
@@ -41,7 +50,37 @@ def archive_runtime_dbs(
             raise ValueError("application database path must be absolute")
         if source.exists():
             moves.append((source, source.with_name(f"{prefix}_{stamp}.db")))
+    return _move_databases(moves)
 
+
+def archive_installed_runtime_state(installed: Path, *, timestamp: str | None = None) -> list[tuple[Path, Path]]:
+    """Move a container Sage's databases and engagement ledger aside, inside its installed directory.
+
+    The container must be stopped. Only that directory is touched: the repo's databases belong to the
+    local tmux Sage, a different deployment (`--sage-db` once moved the local phoenix.db instead).
+    """
+    stamp = timestamp or datetime.now().astimezone().strftime("%Y%m%d-%H%M")
+    if not STAMP_RE.fullmatch(stamp):
+        raise ValueError("timestamp must use YYYYMMDD-HHMM")
+    root = Path(installed)
+    if not root.is_absolute() or not root.is_dir():
+        raise ValueError(f"installed service directory must be an existing absolute path: {root}")
+    trees = [(root / name, root / f"{name}_{stamp}") for name in INSTALLED_TREES if (root / name).is_dir()]
+    clashing = [str(target) for _, target in trees if target.exists()]
+    if clashing:
+        raise FileExistsError(f"archive destination already exists: {', '.join(clashing)}")
+    moves = [
+        (root / relative, (root / relative).with_name(f"{prefix}_{stamp}.db"))
+        for relative, prefix in INSTALLED_DB_SPECS
+        if (root / relative).exists()
+    ]
+    moved = _move_databases(moves)
+    for source, target in trees:
+        source.replace(target)
+    return [*moved, *trees]
+
+
+def _move_databases(moves: list[tuple[Path, Path]]) -> list[tuple[Path, Path]]:
     collisions: list[Path] = []
     for source, destination in moves:
         for suffix in ("", "-wal", "-shm"):

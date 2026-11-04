@@ -378,10 +378,13 @@ def test_local_reset_stops_unexpected_sage_container_after_start_failure(tmp_pat
     assert not (tmp_path / "sage-running").exists()
 
 
-def test_container_mode_retains_sage_in_full_start(tmp_path):
+def test_container_mode_leaves_sage_to_the_restart_phase(tmp_path):
+    """2026-11-03: with Mythic's REBUILD_ON_START, a full `mythic-cli start` rebuilt the Sage image and
+    silently replaced the candidate under test. The Mythic reset now never starts Sage in any mode;
+    the reset's restart phase brings up the intended one."""
     env, log = _mythic_reset_env(
         tmp_path,
-        initial_rows="mythic_postgres|true|healthy\napollo|true|none\nhttp|true|none\nsage|true|none",
+        initial_rows="mythic_postgres|true|healthy\napollo|true|none\nhttp|true|none",
     )
     env["SAGE_DEPLOYMENT_MODE"] = "container"
 
@@ -391,7 +394,8 @@ def test_container_mode_retains_sage_in_full_start(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert any(line.startswith("cli|start|") for line in log.read_text().splitlines())
+    starts = [line for line in log.read_text().splitlines() if line.startswith("cli|start")]
+    assert starts and all(line.startswith("cli|start mythic_postgres apollo http|") for line in starts), starts
 
 
 def test_local_reset_rejects_sage_only_compose_before_mutation(tmp_path):
@@ -607,8 +611,8 @@ def test_metered_reset_stops_before_wipe_when_postgres_removal_fails(tmp_path):
     assert not any("docker|run " in call or "compose up" in call for call in calls)
 
 
-def test_metered_container_mode_keeps_sage_service(tmp_path):
-    rows = "mythic_postgres|true|healthy\napollo|true|none\nhttp|true|none\nsage|true|none"
+def test_metered_container_mode_leaves_sage_to_the_restart_phase(tmp_path):
+    rows = "mythic_postgres|true|healthy\napollo|true|none\nhttp|true|none"
     env, log, proxy = _metered_reset_env(tmp_path, initial_rows=rows)
     env["SAGE_DEPLOYMENT_MODE"] = "container"
     try:
@@ -619,8 +623,8 @@ def test_metered_container_mode_keeps_sage_service(tmp_path):
 
     assert result.returncode == 0, result.stderr
     calls = log.read_text().splitlines()
-    assert sum("image inspect" in value for value in calls) == 5
-    assert any("compose up -d --no-build --pull never mythic_postgres apollo http sage" in value
+    assert sum("image inspect" in value for value in calls) == 4
+    assert any(value.split("|")[1] == "compose up -d --no-build --pull never mythic_postgres apollo http"
                for value in calls)
 
 

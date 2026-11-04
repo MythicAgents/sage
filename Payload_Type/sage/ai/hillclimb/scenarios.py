@@ -59,7 +59,7 @@ class StructuralScenarioManifest:
     required_route_coverage: str
     oracle_dependencies: tuple[str, ...]
     snapshot_id: str = UNALLOCATED_SNAPSHOT
-    reset_checkpoint_schema: str = "sage-goad-reset-orchestration-v3"
+    reset_checkpoint_schema: str = "sage-goad-reset-orchestration-v4"
 
     def as_mapping(self) -> dict[str, Any]:
         return {

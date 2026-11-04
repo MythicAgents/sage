@@ -13,6 +13,7 @@ mock of `docker exec` would assert only that the mock was called.
 
 from __future__ import annotations
 
+import json
 import shutil
 import sys
 from pathlib import Path
@@ -123,9 +124,11 @@ def _stub_deploy(monkeypatch, *, local_running: bool) -> list[str]:
             return result
         return _fn
 
+    monkeypatch.setattr(sage_deployment, "_mythic_dir", lambda: Path("/opt/mythic"))
     monkeypatch.setattr(sage_deployment, "_sync_into_mythic", record("sync", {"returncode": 0}))
+    monkeypatch.setattr(sage_deployment, "_ensure_mythic_settings", record("settings", {"returncode": 0}))
     monkeypatch.setattr(sage_deployment, "_stop_local", record("stop_local", {"returncode": 0}))
-    monkeypatch.setattr(sage_deployment, "_restart_container", record("restart", {"returncode": 0}))
+    monkeypatch.setattr(sage_deployment, "_start_container", record("restart", {"returncode": 0}))
     monkeypatch.setattr(
         sage_deployment, "_parity",
         record("parity", {"ready": True, "blockers": [], "repo_digest": "x"}),
@@ -156,7 +159,7 @@ def test_deploy_leaves_a_stopped_local_sage_alone(monkeypatch, capsys):
     """The control. If stop fired unconditionally the test above would pass while proving nothing."""
     calls = _stub_deploy(monkeypatch, local_running=False)
     assert "stop_local" not in calls, f"deploy stopped a local Sage that was not running: {calls}"
-    assert calls == ["sync", "restart", "parity"], calls
+    assert calls == ["sync", "settings", "restart", "parity"], calls
 
 
 def test_sync_excludes_cover_every_database_spelling():
@@ -175,3 +178,186 @@ def _matches(name: str, pattern: str) -> bool:
     from fnmatch import fnmatch
 
     return fnmatch(name, pattern)
+
+
+
+# --- Starting the container without a surprise rebuild (fake docker / mythic-cli on PATH) -------------
+
+def _fake_mythic(tmp_path: Path, monkeypatch, *, image_present: bool, env_lines: str) -> Path:
+    """A Mythic install whose `docker` and `mythic-cli` only record what they were asked to do."""
+    mythic = tmp_path / "mythic"
+    (mythic / "InstalledServices" / "sage").mkdir(parents=True)
+    (mythic / ".env").write_text(env_lines, encoding="utf-8")
+    log = tmp_path / "calls.log"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "docker").write_text(
+        "#!/usr/bin/env bash\n"
+        'printf "docker|%s|%s|%s\\n" "$*" "$PWD" "${RABBITMQ_HOST-unset}" >> "$CALL_LOG"\n'
+        f'if [[ "$1 $2" == "image inspect" ]]; then {"exit 0" if image_present else "exit 1"}; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    cli = mythic / "mythic-cli"
+    # Like the real one, `config set` rewrites Mythic's .env (uppercased key) and exits 0 even when it
+    # changes nothing; FAKE_CLI_IGNORE_SET simulates a set that silently did not apply.
+    cli.write_text(
+        "#!/usr/bin/env bash\n"
+        'printf "cli|%s|%s|%s\\n" "$*" "$PWD" "${RABBITMQ_HOST-unset}" >> "$CALL_LOG"\n'
+        'if [[ "$1 $2" == "config set" && "${FAKE_CLI_IGNORE_SET-0}" != 1 ]]; then\n'
+        '  key="$(printf %s "$3" | tr a-z A-Z)"; env_file="$(dirname "$0")/.env"\n'
+        '  grep -v "^$key=" "$env_file" > "$env_file.new" || true\n'
+        '  printf \'%s="%s"\\n\' "$key" "$4" >> "$env_file.new"; mv "$env_file.new" "$env_file"\n'
+        "fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    for tool in (bin_dir / "docker", cli):
+        tool.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{__import__('os').environ['PATH']}")
+    monkeypatch.setenv("CALL_LOG", str(log))
+    monkeypatch.setenv("MYTHIC_CLI", str(cli))
+    monkeypatch.setenv("MYTHIC_ENV_PATH", str(mythic / ".env"))
+    # Sage's .env carries Docker hostnames that poison host-side mythic-cli; they must be stripped.
+    monkeypatch.setenv("RABBITMQ_HOST", "mythic_rabbitmq")
+    return log
+
+
+def _calls(log: Path) -> list[list[str]]:
+    return [line.split("|") for line in log.read_text().splitlines()] if log.exists() else []
+
+
+def test_start_recreates_the_container_from_the_existing_image_without_building(tmp_path, monkeypatch):
+    """2026-10-30 and 2026-11-03: `mythic-cli stop sage` removes the container, so `docker restart`
+    failed; and `mythic-cli start` rebuilt the image under REBUILD_ON_START. Compose recreates the
+    container from the image that is already there."""
+    log = _fake_mythic(tmp_path, monkeypatch, image_present=True, env_lines="")
+    result = sage_deployment._start_container()
+
+    assert result["returncode"] == 0, result
+    calls = _calls(log)
+    commands = [call[1] for call in calls]
+    assert "compose up -d --no-build --pull never --force-recreate sage" in commands
+    assert not any(c.startswith("restart") for c in commands)
+    assert not any(call[0] == "cli" and call[1].startswith("build") for call in calls)
+    up = next(call for call in calls if call[1].startswith("compose up"))
+    assert up[2] == str(tmp_path / "mythic") and up[3] == "unset"
+
+
+@pytest.mark.parametrize("image_present, rebuild", [(False, False), (True, True)])
+def test_start_builds_only_when_the_image_is_missing_or_a_rebuild_is_asked(tmp_path, monkeypatch, image_present, rebuild):
+    log = _fake_mythic(tmp_path, monkeypatch, image_present=image_present, env_lines="")
+    result = sage_deployment._start_container(rebuild=rebuild)
+
+    assert result["returncode"] == 0, result
+    calls = _calls(log)
+    build = [i for i, call in enumerate(calls) if call[0] == "cli" and call[1] == "build sage"]
+    up = [i for i, call in enumerate(calls) if call[1].startswith("compose up")]
+    assert build and up and build[0] < up[0], calls
+    assert calls[build[0]][3] == "unset", "mythic-cli must not inherit Sage's container hostnames"
+
+
+def test_container_mode_switches_mythic_back_to_the_local_build_and_bind_mount(tmp_path, monkeypatch):
+    log = _fake_mythic(
+        tmp_path, monkeypatch, image_present=True,
+        env_lines='SAGE_USE_BUILD_CONTEXT="false"\nSAGE_USE_VOLUME="true"\n',
+    )
+    result = sage_deployment._ensure_mythic_settings("container")
+
+    assert result["returncode"] == 0, result
+    assert [call[1] for call in _calls(log) if call[0] == "cli"] == [
+        "config set sage_use_build_context true",
+        "config set sage_use_volume false",
+        "add sage",
+    ]
+
+
+def test_matching_settings_are_not_rewritten_but_the_compose_entry_is_regenerated(tmp_path, monkeypatch):
+    """Mythic's .env is not the compose file: a setting changed without a regenerate leaves the entry
+    naming another image, and parity (which hashes code only) would not notice."""
+    log = _fake_mythic(
+        tmp_path, monkeypatch, image_present=True,
+        env_lines='SAGE_USE_BUILD_CONTEXT="true"\nSAGE_USE_VOLUME="false"\n',
+    )
+    result = sage_deployment._ensure_mythic_settings("container")
+
+    assert result["returncode"] == 0 and result.get("changed") == []
+    assert [call[1] for call in _calls(log)] == ["add sage"]
+
+
+def test_a_mythic_setting_that_did_not_apply_fails_the_deploy(tmp_path, monkeypatch):
+    """`mythic-cli config set` exits 0 even when it reports it found no matching key."""
+    log = _fake_mythic(tmp_path, monkeypatch, image_present=True, env_lines='SAGE_USE_BUILD_CONTEXT="false"\n')
+    monkeypatch.setenv("FAKE_CLI_IGNORE_SET", "1")
+    result = sage_deployment._ensure_mythic_settings("container")
+
+    assert result["returncode"] != 0
+    assert "sage_use_build_context" in json.dumps(result)
+    assert not any(call[1] == "add sage" for call in _calls(log))
+
+
+def test_mythic_cli_and_env_path_must_name_the_same_install(tmp_path, monkeypatch):
+    """Otherwise deploy syncs into one install's InstalledServices and starts the other's container."""
+    _fake_mythic(tmp_path, monkeypatch, image_present=True, env_lines="")
+    other = tmp_path / "other-mythic"
+    other.mkdir()
+    (other / ".env").write_text("", encoding="utf-8")
+    monkeypatch.setenv("MYTHIC_ENV_PATH", str(other / ".env"))
+
+    with pytest.raises(SystemExit) as caught:
+        sage_deployment._start_container()
+    assert "MYTHIC_CLI" in str(caught.value) and "MYTHIC_ENV_PATH" in str(caught.value)
+
+
+# --- Stopping requires knowing which Sage is intended --------------------------------------------------
+
+def test_enforce_without_an_explicit_mode_stops_nothing(monkeypatch, capsys):
+    """2026-11-04: container mode lived only in one shell, so a later `enforce` defaulted to local and
+    stopped the container the operator meant to run."""
+    stopped: list[str] = []
+    monkeypatch.delenv("SAGE_DEPLOYMENT_MODE", raising=False)
+    monkeypatch.setattr(sage_deployment, "_stop_container", lambda: stopped.append("container") or {})
+    monkeypatch.setattr(sage_deployment, "_stop_local", lambda: stopped.append("local") or {})
+    monkeypatch.setattr(
+        sage_deployment.readiness_contract, "sage_deployment_status",
+        lambda **kw: {"ready": False, "mode": "local", "container_running": True,
+                      "local_process_running": True, "blockers": ["two Sages"]},
+    )
+    assert sage_deployment.main(["enforce"]) == 1
+    assert stopped == []
+    assert "SAGE_DEPLOYMENT_MODE" in capsys.readouterr().out
+
+
+def _running_world(monkeypatch, running: dict) -> list[str]:
+    stopped: list[str] = []
+
+    def stopper(kind):
+        def _stop():
+            stopped.append(kind)
+            running[kind] = False
+            return {"returncode": 0}
+        return _stop
+
+    monkeypatch.setattr(sage_deployment, "_stop_container", stopper("container"))
+    monkeypatch.setattr(sage_deployment, "_stop_local", stopper("local"))
+    monkeypatch.setattr(sage_deployment.readiness_contract, "probe_sage_container_running",
+                        lambda *a, **k: running["container"])
+    monkeypatch.setattr(sage_deployment.readiness_contract, "probe_local_sage_running",
+                        lambda *a, **k: running["local"])
+    return stopped
+
+
+def test_stop_all_stops_whichever_sages_are_running(monkeypatch, capsys):
+    running = {"container": True, "local": True}
+    stopped = _running_world(monkeypatch, running)
+
+    assert sage_deployment.main(["stop-all"]) == 0
+    assert sorted(stopped) == ["container", "local"]
+    assert running == {"container": False, "local": False}
+
+
+def test_stop_all_with_nothing_running_stops_nothing(monkeypatch, capsys):
+    stopped = _running_world(monkeypatch, {"container": False, "local": False})
+
+    assert sage_deployment.main(["stop-all"]) == 0
+    assert stopped == []

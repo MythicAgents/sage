@@ -12,9 +12,14 @@ safe while the Sage container and Mythic are still running:
   credentials, so no secret is passed on a command line or leaves the container. Mythic's reset wipes this
   database, and it holds the task output that runtime proof depends on.
 
-``MANIFEST.json`` records every item with its size and SHA-256. The local tmux databases are then archived exactly
-as ``archive_runtime_dbs.py`` does. The installed service directory is found from ``MYTHIC_ENV_PATH``; when that is
-unset the container copy is skipped and the manifest says so.
+``MANIFEST.json`` records every item with its size and SHA-256. Then the serving Sage's own state is moved aside:
+
+* ``--target local`` (default): the local tmux databases, exactly as ``archive_runtime_dbs.py`` does.
+* ``--target installed``: the container's databases and ``.sage_engagement`` inside the installed service
+  directory. The repo's databases are left alone; they belong to the local Sage.
+
+The installed service directory is found from ``MYTHIC_ENV_PATH``; when that is unset the container copy is skipped
+and the manifest says so, and ``--target installed`` refuses.
 """
 
 from __future__ import annotations
@@ -175,7 +180,14 @@ def main(argv: list[str] | None = None, *, run: Runner = subprocess.run) -> int:
     parser.add_argument("--postgres-container", default=DEFAULT_POSTGRES_CONTAINER)
     parser.add_argument("--skip-mythic-dump", action="store_true",
                         help="Do not dump Mythic's database. Its task records are then lost on reset.")
+    parser.add_argument("--target", choices=("local", "installed"), default="local",
+                        help="whose state to move aside after the evidence copy: the local tmux Sage's "
+                             "(default) or the container's, in Mythic's installed service directory")
     args = parser.parse_args(argv)
+    installed = installed_service_dir(args.mythic_env_path)
+    if args.target == "installed" and installed is None:
+        raise SystemExit("ERR: --target installed needs MYTHIC_ENV_PATH (or --mythic-env-path) to name a Mythic "
+                         "install with Sage in InstalledServices/sage")
 
     local = _load_local_archiver()
     stamp = args.timestamp or datetime.now().astimezone().strftime("%Y%m%d-%H%M")
@@ -188,7 +200,7 @@ def main(argv: list[str] | None = None, *, run: Runner = subprocess.run) -> int:
     try:
         manifest = preserve_evidence(
             destination,
-            installed=installed_service_dir(args.mythic_env_path),
+            installed=installed,
             postgres_container=None if args.skip_mythic_dump else args.postgres_container,
             run=run,
         )
@@ -196,10 +208,14 @@ def main(argv: list[str] | None = None, *, run: Runner = subprocess.run) -> int:
         raise SystemExit(f"ERR: evidence was not preserved, so nothing was archived or reset: {exc}. "
                          f"Partial copy left at {destination} for inspection.") from exc
 
-    root = args.repo_root.resolve()
-    moves = local.archive_runtime_dbs(root, timestamp=stamp,
-                                      sage_database_path=args.sage_db or local.configured_database_path(root))
+    if args.target == "installed":
+        moves = local.archive_installed_runtime_state(installed, timestamp=stamp)
+    else:
+        root = args.repo_root.resolve()
+        moves = local.archive_runtime_dbs(root, timestamp=stamp,
+                                          sage_database_path=args.sage_db or local.configured_database_path(root))
     print(json.dumps({
+        "target": args.target,
         "evidence_dir": str(destination),
         "evidence_items": len(manifest["items"]),
         "evidence_skipped": manifest["skipped"],

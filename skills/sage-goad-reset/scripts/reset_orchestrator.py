@@ -32,7 +32,7 @@ BOOTSTRAP = (
 READINESS_CONTRACT = RESET_DIR / "scripts" / "readiness_contract.py"
 RANGE_PROFILE = RESET_DIR / "scripts" / "range_profile.py"
 DEFAULT_CHECKPOINT_DIR = REPO_ROOT / ".sage_engagement" / "reset_runs"
-SCHEMA = "sage-goad-reset-orchestration-v3"
+SCHEMA = "sage-goad-reset-orchestration-v4"
 RANGE_FIXTURE_QUALIFICATION_SCHEMA = "sage-range-fixture-qualification-v1"
 TASK_COUNT_QUERY = """
 query SageResetTaskCount($operationId: Int!) {
@@ -147,7 +147,11 @@ INPUT_KEYS = {
     "mythic_server",
     "mythic_user",
     "mythic_env_path",
+    "deployment_mode",
 }
+#: Which Sage the reset brings back: the tmux process on the working tree, or the Mythic container
+#: built from it. Persisted so a resume restarts the same one.
+DEPLOYMENT_MODES = ("local", "container")
 SECRET_KEY = re.compile(
     r"(?:password|secret|token|api[_-]?key|credential)",
     flags=re.IGNORECASE,
@@ -267,6 +271,21 @@ def _config_from_args(args: argparse.Namespace) -> dict[str, Any]:
             "APOLLO_CALLBACK_HOST"
         )
     restart_env = _parse_restart_env(args.restart_env)
+    deployment_mode = str(
+        getattr(args, "deployment_mode", None) or os.environ.get("SAGE_DEPLOYMENT_MODE") or ""
+    ).strip().casefold()
+    if not deployment_mode:
+        if getattr(args, "command", None) == "start":
+            raise ResetError(
+                "starting a reset needs the deployment mode: pass --deployment-mode or set "
+                "SAGE_DEPLOYMENT_MODE to local (tmux) or container. A guessed mode stops or restarts "
+                "the wrong Sage."
+            )
+        deployment_mode = "local"
+    if deployment_mode not in DEPLOYMENT_MODES:
+        raise ResetError(
+            f"unknown deployment mode {deployment_mode!r}; expected one of {', '.join(DEPLOYMENT_MODES)}"
+        )
     profile_module = _load_module("sage_reset_range_profile_config", RANGE_PROFILE)
     try:
         profile = profile_module.get_profile(args.range_profile)
@@ -295,6 +314,7 @@ def _config_from_args(args: argparse.Namespace) -> dict[str, Any]:
             if str(args.mythic_env_path or "").strip()
             else ""
         ),
+        "deployment_mode": deployment_mode,
     }
     contract = _load_module(
         "sage_reset_readiness_contract_config", READINESS_CONTRACT
@@ -341,14 +361,21 @@ def _phase_commands(config: dict[str, Any]) -> dict[str, list[str]]:
         if config["download_dir"]:
             bootstrap.extend(["--download-dir", config["download_dir"]])
 
-    restart = [
-        "/bin/bash",
-        str(RESET_DIR / "scripts" / "sage_restart.sh"),
-        *[
-            f"{key}={value}"
-            for key, value in sorted(config["restart_env"].items())
-        ],
-    ]
+    deployment = [str(PYTHON), str(RESET_DIR / "scripts" / "sage_deployment.py")]
+    if config["deployment_mode"] == "container":
+        # Sync the working tree into Mythic's installed copy and start the container from the image
+        # already built; `restart_env` does not apply (the container reads the installed .env and the
+        # chat channel's configuration).
+        restart = [*deployment, "deploy", "--mode", "container"]
+    else:
+        restart = [
+            "/bin/bash",
+            str(RESET_DIR / "scripts" / "sage_restart.sh"),
+            *[
+                f"{key}={value}"
+                for key, value in sorted(config["restart_env"].items())
+            ],
+        ]
     readiness = [
         str(PYTHON),
         str(BOOTSTRAP),
@@ -367,10 +394,9 @@ def _phase_commands(config: dict[str, Any]) -> dict[str, list[str]]:
         ),
     ]
     return {
-        "stop-sage": [
-            "/bin/bash",
-            str(RESET_DIR / "scripts" / "sage_stop.sh"),
-        ],
+        # Every Sage, whichever mode: the next phase moves databases, and Mythic's reset would otherwise
+        # race a container that is still writing them.
+        "stop-sage": [*deployment, "stop-all"],
         # Preserves the container's databases and Mythic's records before moving the local
         # databases; reset-mythic would otherwise wipe the task output a run's proof rests on.
         "archive-runtime-dbs": [
@@ -381,6 +407,7 @@ def _phase_commands(config: dict[str, Any]) -> dict[str, list[str]]:
                 if config["mythic_env_path"]
                 else []
             ),
+            *(["--target", "installed"] if config["deployment_mode"] == "container" else []),
         ],
         "reset-mythic": [
             "/bin/bash",
@@ -663,6 +690,8 @@ def _validate_inputs(
         "retained-callback",
     }:
         _raise_invalid(path, "inputs.bootstrap_mode is unsupported")
+    if inputs.get("deployment_mode") not in DEPLOYMENT_MODES:
+        _raise_invalid(path, "inputs.deployment_mode is unsupported")
     if (
         inputs["bootstrap_mode"] == "fresh-apollo"
         and not inputs["callback_host"].strip()
@@ -1827,6 +1856,14 @@ def run_phase_command(
         return _wait_for_range(config)
     env = dict(os.environ)
     env["SAGE_RANGE_PROFILE_ID"] = config["range_profile_id"]
+    # Every child (Mythic reset, deployment enforcement, readiness) judges against the checkpointed
+    # mode, not whatever the operator's shell happens to export at resume time.
+    env["SAGE_DEPLOYMENT_MODE"] = config["deployment_mode"]
+    # The same for the Mythic install: archive already receives it as a flag, but deploy and readiness
+    # find the installed Sage through MYTHIC_ENV_PATH, so a shell exporting another install would have
+    # the reset archive one install and deploy and check the other.
+    if config["mythic_env_path"]:
+        env["MYTHIC_ENV_PATH"] = config["mythic_env_path"]
     if config["ludus_range_id"]:
         env["SAGE_LUDUS_RANGE_ID"] = config["ludus_range_id"]
     if config["ludus_mcp_server"]:
@@ -2162,6 +2199,12 @@ def _add_start_args(parser: argparse.ArgumentParser) -> None:
         # SAGE_BLOODHOUND_MCP_DIR is deliberately absent: sage_restart.sh resolves it the way Sage
         # does. A default here was a sibling-checkout guess that overrode the operator's own setting.
         default=["SAGE_ENGAGEMENT_GATE=1"],
+    )
+    parser.add_argument(
+        "--deployment-mode",
+        choices=DEPLOYMENT_MODES,
+        default=None,
+        help="which Sage the reset brings back (default: $SAGE_DEPLOYMENT_MODE; required for start)",
     )
     parser.add_argument("--range-ready-timeout", type=int, default=600)
     parser.add_argument("--range-poll-interval", type=float, default=10.0)
