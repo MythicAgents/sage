@@ -2786,7 +2786,11 @@ class MythicTools:
                 (claim or {}).get("approval_id"),
                 getattr(contract, "digest", None),
                 (claim or {}).get("request_contract_digest"),
-                json.dumps(trace, default=str, sort_keys=True)[:4000],
+                # Effective arguments can carry artifact passwords (a refused capability follow-on carries the
+                # materialized CA and forged PFX passwords); log their shape, never their values.
+                json.dumps(
+                    self._capability_executor_safe_parameters(trace), default=str, sort_keys=True,
+                )[:4000],
             )
         except Exception:  # pragma: no cover - diagnostics must never break the effect path
             pass
@@ -11629,6 +11633,9 @@ class MythicTools:
                 }, action_obj, input_values, callback_id, issued=all_issued)
 
             if self._capability_needs_runtime_materialization(action_obj, input_values):
+                if self._adcs_certificate_auth_verified_ca_effect(action_obj, input_values):
+                    # The forge reads the verified artifact staged below, never a path the proposal carried.
+                    self._drop_adcs_ca_path_inputs(input_values, getattr(action_obj, "intent", None))
                 # `materialize_capability_inputs` declares `action: dict | str`, and its
                 # request-contract guard canonicalizes whatever it is handed
                 # (`request_contract.canonical_action_arguments`), which refuses any non-JSON
@@ -12043,18 +12050,11 @@ class MythicTools:
                             retry_inputs["adcs_ca_export_use_current_context"] = False
                             retry_inputs["adcs_dpapi_retry_attempted"] = True
                             retry_inputs["native_export_blocker"] = verification.reason
-                            retry_raw = await self.execute_capability(action_obj, retry_inputs)
-                            try:
-                                retry_payload = json.loads(retry_raw)
-                            except Exception:
-                                retry_payload = {
-                                    "ok": False,
-                                    "verdict": "failed",
-                                    "capability": self._capability_text(getattr(action_obj, "name", "")),
-                                    "reason": self._capability_text(retry_raw),
-                                    "issued": [],
-                                    "recorded_effects": [],
-                                }
+                            retry_payload, retry_denied = await self._capability_executor_reinvoke(
+                                action_obj, retry_inputs,
+                            )
+                            if retry_denied:
+                                self._capability_note_fallback_denied(transaction, "sharpdpapi", retry_denied)
                             if isinstance(retry_payload, dict):
                                 retry_issued = retry_payload.get("issued") if isinstance(retry_payload.get("issued"), list) else []
                                 retry_payload["issued"] = self._capability_executor_public_issued(all_issued) + retry_issued
@@ -12190,13 +12190,52 @@ class MythicTools:
                 sort_keys=True,
             )
         except Exception as exc:
+            # Tasks this transaction already issued ran on the callback; an exception after them must not
+            # report that nothing ran.
+            issued_so_far = list(locals().get("all_issued") or [])
             return self._capability_executor_failure_json({
                 "ok": False,
                 "verdict": "failed",
                 "missing": ["executor"],
                 "reason": str(exc),
+                "issued": self._capability_executor_public_issued(issued_so_far),
+            }, {}, {}, None, reason=str(exc), issued=issued_so_far)
+
+    async def _capability_executor_reinvoke(self, action, inputs: dict) -> tuple[dict | None, str]:
+        """Run a follow-on transaction of the same capability (a repair or fallback route).
+
+        Returns the follow-on's payload, or None and the refusal when the request contract refused it before it
+        issued anything. The operator's approved root already ran by then, so that refusal is not a denial of the
+        approved action: the root's denial receipt is restored and the caller reports its own primary outcome.
+        The action crosses the tool boundary in its JSON form, as `materialize_capability_inputs` does.
+        """
+        prior_denial = getattr(self, "_last_effect_denial", None)
+        try:
+            raw = await self.execute_capability(asdict(action) if is_dataclass(action) else action, inputs)
+        except PermissionError as exc:
+            self._last_effect_denial = prior_denial
+            return None, str(exc)
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            payload = {
+                "ok": False,
+                "verdict": "failed",
+                "capability": self._capability_text(getattr(action, "name", "")),
+                "reason": self._capability_text(raw),
                 "issued": [],
-            }, {}, {}, None, reason=str(exc), issued=[])
+                "recorded_effects": [],
+            }
+        return (payload if isinstance(payload, dict) else None), ""
+
+    @staticmethod
+    def _capability_note_fallback_denied(transaction: Any, fallback: str, reason: str) -> None:
+        if isinstance(transaction, dict):
+            transaction["fallback_denied"] = {
+                "fallback": fallback,
+                "reason": reason[:600],
+                "issued": [],
+            }
 
     def _capability_executor_injected_blocker(
         self,
@@ -12428,6 +12467,20 @@ class MythicTools:
                     "ok": False,
                     "missing": materialized.missing,
                     "reason": materialized.reason,
+                    "action": asdict(action_obj) if is_dataclass(action_obj) else {},
+                }, sort_keys=True)
+            requested_artifact = self._capability_text(
+                input_values.get("ca_pfx_artifact_id") or input_values.get("pfx_artifact_id")
+            ).strip()
+            verified_artifact = self._capability_text(materialized.evidence.get("ca_artifact_id")).strip()
+            if requested_artifact and requested_artifact != verified_artifact:
+                return json.dumps({
+                    "ok": False,
+                    "missing": ["ca_pfx_artifact_id"],
+                    "reason": (
+                        f"requested CA artifact {requested_artifact} is not the verified export artifact for "
+                        f"{ca_host}@{domain}; nothing was staged"
+                    ),
                     "action": asdict(action_obj) if is_dataclass(action_obj) else {},
                 }, sort_keys=True)
 
@@ -13027,6 +13080,9 @@ class MythicTools:
         intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
         if any(bool(intent.get(key)) for key in ("certificate_already_forged", "skip_certificate_forge", "pre_forged_certificate")):
             return False
+        # A proved CA export is the input; a caller-supplied path never replaces it.
+        if self._adcs_certificate_auth_verified_ca_effect(action, inputs):
+            return True
         if self._capability_text(
             inputs.get("ca_pfx_path")
             or inputs.get("ca_cert_path")
@@ -13034,6 +13090,70 @@ class MythicTools:
             ):
                 return False
         return True
+
+    _ADCS_CA_PATH_INPUTS = ("ca_pfx_path", "ca_cert_path", "ca_certificate_path")
+
+    @classmethod
+    def _drop_adcs_ca_path_inputs(cls, *mappings: Any) -> None:
+        """Remove every caller CA-path key, matched the way the plan builder reads keys (case and spacing ignored),
+        from each mapping and its `intent`, so no spelling of a supplied path can reach the forge."""
+        wanted = {" ".join(key.casefold().split()) for key in cls._ADCS_CA_PATH_INPUTS}
+        for mapping in mappings:
+            for target in (mapping, mapping.get("intent") if isinstance(mapping, dict) else None):
+                if not isinstance(target, dict):
+                    continue
+                for key in [k for k in target if " ".join(str(k).casefold().split()) in wanted]:
+                    target.pop(key, None)
+
+    def _adcs_certificate_auth_verified_ca_effect(
+        self, action, inputs: dict, achieved_effects: set[str] | None = None,
+    ) -> str:
+        """The achieved `adcs-ca-private-key:<ca>@<domain>` effect this certificate-auth action forges from, or "".
+
+        The artifact precondition, the materialization decision and the materializer all resolve the CA from this
+        one effect, so a caller-supplied `ca_pfx_path` can neither stand in for it nor override it. Empty when the
+        action carries an already-forged certificate, when an enrolled certificate for the account is proved (that
+        route needs no CA key), or when no matching CA export is proved: a caller path is then an explicit input.
+        A uniquely proved CA in the domain binds `ca_host` when the action names none.
+        """
+        if self._capability_text(getattr(action, "name", "")).casefold() != "adcs-certificate-auth":
+            return ""
+        intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
+        if any(
+            self._capability_input_bool(source, key)
+            for source in (inputs, intent)
+            for key in ("certificate_already_forged", "skip_certificate_forge", "pre_forged_certificate")
+        ):
+            return ""
+        domain = (
+            self._capability_target_domain(action, inputs)
+            or self._capability_domain(action, inputs)
+            or self._capability_account_domain(action, inputs)
+        )
+        if not domain:
+            return ""
+        achieved = {
+            self._canonical_capability_effect(item)
+            for item in (self._capability_achieved_effects() if achieved_effects is None else achieved_effects)
+        }
+        account = self._capability_account(action, inputs) or "administrator"
+        if f"adcs-enrolled-certificate:{account}@{domain}" in achieved:
+            return ""
+        raw_ca_host = self._capability_text(
+            inputs.get("ca_host")
+            or intent.get("ca_host")
+            or self._capability_target_host_from_context({"target": getattr(action, "target", "")})
+        ).casefold()
+        ca_host = self._canonical_adcs_host(raw_ca_host, domain)
+        if not ca_host and not raw_ca_host:
+            hosts = sorted(self._capability_verified_ca_key_hosts(domain, achieved))
+            if len(hosts) == 1:
+                ca_host = hosts[0]
+        effect = f"adcs-ca-private-key:{ca_host}@{domain}" if ca_host else ""
+        if not effect or effect not in achieved:
+            return ""
+        inputs.setdefault("ca_host", ca_host)
+        return effect
 
     async def _execute_capability_account_context_prerequisite(
         self,
@@ -14837,18 +14957,10 @@ class MythicTools:
         fallback_inputs["primary_failure_observed"] = True
         fallback_inputs["failure_reason"] = blocker
         fallback_inputs["gpo_artifact_blocker"] = blocker
-        retry_raw = await self.execute_capability(action, fallback_inputs)
-        try:
-            retry_payload = json.loads(retry_raw)
-        except Exception:
-            retry_payload = {
-                "ok": False,
-                "verdict": "failed",
-                "capability": self._capability_text(getattr(action, "name", "")),
-                "reason": self._capability_text(retry_raw),
-                "issued": [],
-                "recorded_effects": [],
-            }
+        retry_payload, retry_denied = await self._capability_executor_reinvoke(action, fallback_inputs)
+        if retry_denied:
+            self._capability_note_fallback_denied(prior_transaction, "gpp-immediate-task-fallback", retry_denied)
+            return None
         if isinstance(retry_payload, dict):
             retry_issued = retry_payload.get("issued") if isinstance(retry_payload.get("issued"), list) else []
             retry_payload["issued"] = self._capability_executor_public_issued(all_issued) + retry_issued
@@ -14904,18 +15016,10 @@ class MythicTools:
         fallback_inputs["preflight_existing_context"] = False
         fallback_inputs["certificate_already_forged"] = True
         fallback_inputs["skip_certificate_forge"] = True
-        retry_raw = await self.execute_capability(action, fallback_inputs)
-        try:
-            retry_payload = json.loads(retry_raw)
-        except Exception:
-            retry_payload = {
-                "ok": False,
-                "verdict": "failed",
-                "capability": capability,
-                "reason": self._capability_text(retry_raw),
-                "issued": [],
-                "recorded_effects": [],
-            }
+        retry_payload, retry_denied = await self._capability_executor_reinvoke(action, fallback_inputs)
+        if retry_denied:
+            self._capability_note_fallback_denied(prior_transaction, "pkinit-kerberos", retry_denied)
+            return None
         if not isinstance(retry_payload, dict):
             return None
         retry_issued = retry_payload.get("issued") if isinstance(retry_payload.get("issued"), list) else []
@@ -15783,14 +15887,8 @@ class MythicTools:
         ):
             return {}
 
-        if self._capability_text(
-            inputs.get("ca_pfx_path")
-            or inputs.get("ca_cert_path")
-            or inputs.get("ca_certificate_path")
-            or getattr(action, "intent", {}).get("ca_pfx_path")
-            or getattr(action, "intent", {}).get("ca_cert_path")
-            or getattr(action, "intent", {}).get("ca_certificate_path")
-        ):
+        # The proved CA export satisfies this precondition; the materializer then forges from that exact artifact.
+        if self._adcs_certificate_auth_verified_ca_effect(action, inputs, achieved_effects):
             return {}
 
         domain = (
@@ -15811,6 +15909,17 @@ class MythicTools:
         enrolled_effect = f"adcs-enrolled-certificate:{account}@{domain}" if account and domain else ""
         if enrolled_effect and enrolled_effect in achieved:
             inputs.setdefault("certificate_already_forged", True)
+            return {}
+
+        # No proved artifact: a caller path is an explicit input, never a proved export.
+        if self._capability_text(
+            inputs.get("ca_pfx_path")
+            or inputs.get("ca_cert_path")
+            or inputs.get("ca_certificate_path")
+            or getattr(action, "intent", {}).get("ca_pfx_path")
+            or getattr(action, "intent", {}).get("ca_cert_path")
+            or getattr(action, "intent", {}).get("ca_certificate_path")
+        ):
             return {}
 
         if not ca_host and domain and not explicit_ca_host:

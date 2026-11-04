@@ -2993,11 +2993,21 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
                     continue
                 action_obj, _ = client._ensure_capability_transaction_context(action_obj, inputs)
                 await client._augment_capability_runtime_inputs(action_obj, inputs)
+                plan_inputs = inputs
+                verified_input = getattr(client, "_adcs_certificate_auth_verified_ca_effect", None)
+                if callable(verified_input) and verified_input(action_obj, inputs):
+                    # A proved CA export is this action's input: the executor stages that exact artifact before the
+                    # forge. The card does not carry a path the proposal supplied, and the plan is checked against
+                    # the staged input the executor will provide rather than asking the worker to invent one.
+                    client._drop_adcs_ca_path_inputs(
+                        inputs, args.get("action") if isinstance(args.get("action"), dict) else None,
+                    )
+                    plan_inputs = {**inputs, "ca_pfx_path": "{{verified_ca_pfx_staged_path}}"}
                 # Persist the grounded inputs so the approval card and the executor see the same bound values the
                 # plan was built from.
                 args["inputs"] = inputs
                 call["args"] = args
-                plan = capabilities_mod.build_capability_execution_plan(action_obj, inputs)
+                plan = capabilities_mod.build_capability_execution_plan(action_obj, plan_inputs)
                 if getattr(plan, "ok", False):
                     continue
                 capability = client._capability_text(getattr(action_obj, "name", "")) or "capability"

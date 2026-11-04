@@ -7541,7 +7541,8 @@ def test_adcs_certificate_auth_explicit_schannel_needs_declared_pkinit_fallback(
 
     async def fake_execute(retry_action, retry_inputs):
         calls["count"] += 1
-        assert retry_action is action
+        # The follow-on crosses the tool boundary in its JSON form; the dataclass is refused there.
+        assert retry_action == asdict(action)
         assert retry_inputs["certificate_auth_method"] == "pkinit-kerberos"
         return json.dumps({"ok": True, "verdict": "achieved", "issued": [], "recorded_effects": []})
 

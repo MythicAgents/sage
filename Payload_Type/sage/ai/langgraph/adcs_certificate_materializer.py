@@ -195,10 +195,17 @@ def materialize_adcs_certificate_auth(
                     "adapter requires a usable PFX artifact"
                 ),
             )
+        failed_check = _verified_ca_pfx_failed_check(
+            ledger, artifact_root, ca_host, domain,
+            ca_pfx_password=ca_pfx_passwords, subject_hint=subject_hint, engagement_key=engagement_key,
+        )
         return CertificateAuthMaterialization(
             False,
             missing=["adcs_ca_private_key_artifact"],
-            reason=f"no verified usable CA private-key PFX artifact for {ca_host}@{domain}",
+            reason=(
+                f"no verified usable CA private-key PFX artifact for {ca_host}@{domain}"
+                + (f": {failed_check}" if failed_check else "")
+            ),
         )
 
     try:
@@ -245,6 +252,7 @@ def materialize_adcs_certificate_auth(
         "remote_forged_pfx_path": remote_forged_pfx_path,
         "verified_effect": _ca_effect(ca_host, domain),
         "verified_hop_id": str(ca_hop.get("id") or ""),
+        "ca_artifact_id": _evidence_artifact_id(ca_hop),
     }
     return CertificateAuthMaterialization(
         True,
@@ -416,13 +424,27 @@ def _candidate_paths(evidence: dict[str, Any]) -> list[Path]:
 
 
 def _admitted_ca_artifact_proof(hop: dict[str, Any], engagement_key: str):
+    return _ca_artifact_proof_check(hop, engagement_key)[0]
+
+
+def _evidence_artifact_id(hop: dict[str, Any]) -> str:
+    evidence = hop.get("evidence") if isinstance(hop.get("evidence"), dict) else {}
+    for source in _evidence_sources(evidence):
+        artifact_id = str(source.get("pfx_artifact_id") or "").strip()
+        if artifact_id:
+            return artifact_id
+    return ""
+
+
+def _ca_artifact_proof_check(hop: dict[str, Any], engagement_key: str):
+    """The hop's admitted proof envelope and "", or None and the check that refused it."""
     try:
         try:
             from . import proof_boundary
         except ImportError:
             import proof_boundary
     except Exception:
-        return None
+        return None, "proof boundary unavailable"
     evidence = hop.get("evidence") if isinstance(hop.get("evidence"), dict) else {}
     proof = hop.get("proof_envelope") if isinstance(hop.get("proof_envelope"), dict) else evidence.get("proof_envelope")
     admission = proof_boundary.admit_runtime_envelope(
@@ -430,19 +452,57 @@ def _admitted_ca_artifact_proof(hop: dict[str, Any], engagement_key: str):
         current_engagement_id=engagement_key,
     )
     if not admission.admitted or admission.envelope is None:
-        return None
+        return None, "proof envelope is not admitted for this engagement"
     if admission.envelope.origin != proof_boundary.ORIGIN_MYTHIC_ARTIFACT:
-        return None
-    evidence_artifact_id = ""
+        return None, "proof envelope is not a Mythic artifact"
+    evidence_artifact_id = _evidence_artifact_id(hop)
     evidence_sha256 = ""
     for source in _evidence_sources(evidence):
-        evidence_artifact_id = evidence_artifact_id or str(source.get("pfx_artifact_id") or "").strip()
         evidence_sha256 = evidence_sha256 or str(source.get("pfx_artifact_sha256") or source.get("pfx_sha256") or "").strip().casefold()
     if evidence_artifact_id != admission.envelope.artifact_id:
-        return None
+        return None, "recorded artifact id does not match the proof envelope"
     if evidence_sha256 and evidence_sha256 != admission.envelope.artifact_sha256:
-        return None
-    return admission.envelope
+        return None, "recorded SHA-256 does not match the proof envelope"
+    return admission.envelope, ""
+
+
+def _verified_ca_pfx_failed_check(
+    ledger: dict[str, Any],
+    artifact_dir: Path,
+    ca_host: str,
+    domain: str,
+    ca_pfx_password: str | list[str] | tuple[str, ...] | set[str] = "",
+    subject_hint: str = "",
+    engagement_key: str = "",
+) -> str:
+    """Name the check that refused the newest achieved CA export, walking it as the resolver does."""
+    effect = _ca_effect(_canonical_ca_host(ca_host, domain), _normalize(domain))
+    for hop in reversed(list(ledger.get("hops") or [])):
+        if not isinstance(hop, dict) or str(hop.get("status") or "").casefold() != "achieved":
+            continue
+        effects = {str(hop.get("effect") or "").casefold()}
+        effects.update(str(item or "").casefold() for item in hop.get("satisfied_effects") or [])
+        if effect not in effects:
+            continue
+        proof, refused = _ca_artifact_proof_check(hop, engagement_key)
+        if proof is None:
+            return refused
+        evidence = hop.get("evidence") if isinstance(hop.get("evidence"), dict) else {}
+        paths = _dedupe_paths(_verified_artifact_candidates(evidence, artifact_dir))
+        if not paths:
+            return "the export recorded no artifact path"
+        checks: list[str] = []
+        for path in paths:
+            if not _safe_artifact_path(path, artifact_dir):
+                checks.append("artifact is not a private file inside the engagement artifact store")
+            elif path.suffix.casefold() != ".pfx":
+                checks.append("artifact is not a .pfx file")
+            elif _file_sha256(path) != proof.artifact_sha256:
+                checks.append("artifact bytes do not match the proved SHA-256")
+            elif not _usable_ca_pfx_password(path, ca_pfx_password, subject_hint)[0]:
+                checks.append("artifact PFX could not be opened with a recorded password")
+        return "; ".join(dict.fromkeys(checks))
+    return f"no achieved {effect} is recorded in this engagement's ledger"
 
 
 def _safe_artifact_path(path: Path, artifact_dir: Path) -> bool:
