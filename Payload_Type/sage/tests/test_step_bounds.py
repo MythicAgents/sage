@@ -8,6 +8,8 @@ rejection and scope cases through real approval cards, with the guarded tool rep
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
@@ -932,3 +934,171 @@ def test_the_planner_refuses_a_gpo_system_action_without_an_effect_and_never_fab
     # With an explicit proof-only probe it becomes buildable — the model supplies intent, Sage does not invent it.
     ok_plan = _caps.build_capability_execution_plan(action, {**base, "allow_proof_only": True})
     assert ok_plan.ok is True
+
+
+# --- assembled: a read-only step hands a proved input to a re-scoped capability card ----------------------------
+#
+# Channel 3 request 6: a control-plane step reached the forge it could not issue and stopped. With a krbtgt key
+# proved through the production dcsync executor (task 21), the same request must re-scope to
+# `forge-golden-ticket`, offer one fresh card that names the proved credential (never the raw key), and run the
+# approved forge once. The read-only step issues nothing. Only the Mythic API seam is inert.
+
+KRBTGT_KEY = "c" * 64
+FORGE_ACTION = {"capability": "forge-golden-ticket", "domain": "lab.local", "callback_id": "13"}
+FORGE_PROMPT = "Use the proved krbtgt key to forge a golden ticket for lab.local on callback 13 and verify it."
+DCSYNC_OK = (
+    "[DC] 'lab.local' will be the domain\n** SAM ACCOUNT **\nSAM Username         : krbtgt\nCredentials:\n"
+    f"  Hash NTLM: {'d' * 32}\n* Primary:Kerberos-Newer-Keys *\n  aes256_hmac       (4096) : {KRBTGT_KEY}\n"
+)
+
+
+def _proved_krbtgt_client(monkeypatch, tmp_path):
+    from tests.test_engagement_wiring import _split_issue
+
+    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path / "engagement"))
+    mt = MythicTools(agent_task_id="offline-rescope")
+    mt.client = object()
+    rows: list[dict] = []
+
+    async def fetch(now, force=False):
+        return list(rows)
+
+    async def create(client, credential, account, realm, comment, credential_type):
+        rows.append({"id": 500 + len(rows), "account": account, "realm": realm, "type": credential_type,
+                     "credential_text": credential, "comment": comment})
+        return {"status": "success", "id": rows[-1]["id"]}
+
+    mt._fetch_credentials_cached = fetch
+    from ai.langgraph import mythic_tools as package_mythic_tools
+    monkeypatch.setattr(package_mythic_tools.mythic, "create_credential", create)
+
+    async def task_output(mythic, task_display_id, custom_return_attributes=None):
+        # Mythic's record of task 21, the dcsync this fixture ran; no other task has output.
+        if int(task_display_id) != 21:
+            return []
+        return [{"response_text": base64.b64encode(DCSYNC_OK.encode()).decode()}]
+
+    monkeypatch.setattr(package_mythic_tools.mythic, "get_all_task_output_by_id", task_output)
+    mt._fetch_command_schema = lambda command, callback_display_id, **kw: asyncio.sleep(0, result=[])
+    mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
+    mt._authenticate_live_command = lambda command, callback: asyncio.sleep(
+        0, result={"status": "available", "command": command})
+    mt._resolve_payload_type = lambda callback_id: asyncio.sleep(0, result="apollo")
+    mt._resolve_domain_controller_host = lambda domain: asyncio.sleep(0, result="dc01.lab.local")
+    mt._resolve_domain_sid = lambda domain: asyncio.sleep(0, result="S-1-5-21-1-2-3")
+    mt._recon_snapshot_cache = {("list_callbacks", "all"): [{"id": 13, "display_id": 13, "host": "DC01"}]}
+    # Mythic's task-status read is the inert seam here: every stubbed task reports completed.
+    mt._supervised_task_state = lambda *args, **kwargs: asyncio.sleep(
+        0, result={"task_completed": True, "task_status": "completed"})
+    with _split_issue(lambda: DCSYNC_OK, display_id=21):
+        proved = json.loads(asyncio.run(mt.execute_capability(
+            {"capability": "dcsync-krbtgt", "domain": "lab.local", "account": "krbtgt", "callback_id": "13"},
+            {"timeout": 5})))
+    assert "krbtgt-hash:lab.local" in proved["recorded_effects"], proved
+    return mt, _split_issue
+
+
+async def _rescope_run(mt, split_issue, script: list, *, mode: str = "supervised",
+                       autonomous_solve: bool = False) -> SimpleNamespace:
+    model = model_module.Model(
+        provider="openai", model="gpt-4o-mini", system_prompt="offline re-scope",
+        config={"configurable": {"api_key": "offline-only", "API_ENDPOINT": "http://127.0.0.1:9/v1"}},
+        task_id=0, agent_task_id="rescope", mode=mode, autonomous_solve=autonomous_solve, operation_id=1,
+        channel_id=1, apitoken_id=0,
+    )
+    model.mythic_client = mt
+    model._payload_names = []
+    model.memory = InMemorySaver()
+    fake = _NativeScriptedModel(messages=iter(script))
+    model._get_base_chat_model = lambda *a, **k: fake
+    model._native_chat_explicit_hitl = True
+    model.command_name = "chat"
+    model._rebuild_graph()
+    chat = _NativeDriverChat(model)
+    calls: dict = {}
+    try:
+        with split_issue(lambda: "ok", calls, display_id=lambda: 30 + len(calls.get("issued", []))):
+            first = build_chat_request(FORGE_PROMPT, channel_id=1, operation_id=1, request_id=1,
+                                       config={"mode": mode})
+            bind_channel_thread_id(first, model)
+            await chat.chat(first)
+            cards = _cards(chat)
+            if cards:
+                second = build_chat_request("", channel_id=1, operation_id=1, request_id=2,
+                                            config={"mode": mode})
+                second.InputResponse = _input_response("accept", cards[0])
+                await chat.chat(second)
+        snapshot = await model.graph.aget_state(model._graph_run_config(model._session_thread_id()))
+        return SimpleNamespace(cards=_cards(chat), emissions=chat.emissions, issued=calls.get("issued", []),
+                               outcomes=_outcomes(snapshot.values.get("supervisor_messages", [])))
+    finally:
+        await drop_channel_session(build_chat_request("", channel_id=1, operation_id=1))
+
+
+def test_a_read_only_step_hands_a_proved_krbtgt_to_one_fresh_rescoped_forge_card(monkeypatch, tmp_path):
+    mt, split_issue = _proved_krbtgt_client(monkeypatch, tmp_path)
+    read_brief = {"handoff_title": "check the proved krbtgt", "handoff_instruction": FORGE_PROMPT,
+                  "allowed_capabilities": ["control_plane"], "expected_result": "Whether krbtgt is proved."}
+    forge_brief = {"handoff_title": "forge the golden ticket", "handoff_instruction": FORGE_PROMPT,
+                   "allowed_capabilities": ["forge-golden-ticket"], "callback_display_id": 13,
+                   "targets": ["lab.local"], "expected_result": "A verified golden ticket for lab.local."}
+    forge = {"action": dict(FORGE_ACTION), "inputs": {}}
+    script = [
+        _call("transfer_to_Mythic_Operator", read_brief, 1),
+        _call("execute_capability", forge, 2),            # removed: a control-plane step issues nothing
+        _call("transfer_to_Mythic_Operator", forge_brief, 3),
+        _call("execute_capability", forge, 4),            # grounded, carded, approved, executed once
+        AIMessage(content="The forge ran."),
+        AIMessage(content="Final answer."),
+    ]
+
+    run = asyncio.run(_rescope_run(mt, split_issue, script))
+
+    # The read-only step issued nothing; the re-scoped step offered exactly one fresh card for the forge.
+    assert [o["status"] for o in run.outcomes][:1] == ["rejected_by_scope"], run.outcomes
+    assert run.outcomes[0]["tasks_issued"] == []
+    proposed = [card for card in run.cards if card.get("status") not in {"accepted"}]
+    [card] = proposed
+    arguments = card["data"]["arguments"]
+    assert arguments["action"]["capability"] == "forge-golden-ticket"
+    assert str(arguments["action"]["callback_id"]) == "13" and arguments["action"]["domain"] == "lab.local"
+    # The approved forge ran once, from the proved key.
+    rubeus = [json.dumps(issue["parameters"]) for issue in run.issued if issue["command_name"] == "execute_assembly"]
+    assert len(rubeus) == 1 and f"/aes256:{KRBTGT_KEY}" in rubeus[0], [i["command_name"] for i in run.issued]
+    # The card names the proved credential by reference; no card, stream or report holds the raw key.
+    assert str(arguments["inputs"].get("credential_proof_task_id")) == "21", sorted(arguments["inputs"])
+    assert KRBTGT_KEY not in json.dumps(run.emissions, default=str)
+
+
+def _rescope_script() -> list:
+    read_brief = {"handoff_title": "check the proved krbtgt", "handoff_instruction": FORGE_PROMPT,
+                  "allowed_capabilities": ["control_plane"], "expected_result": "Whether krbtgt is proved."}
+    forge_brief = {"handoff_title": "forge the golden ticket", "handoff_instruction": FORGE_PROMPT,
+                   "allowed_capabilities": ["forge-golden-ticket"], "callback_display_id": 13,
+                   "targets": ["lab.local"], "expected_result": "A verified golden ticket for lab.local."}
+    forge = {"action": dict(FORGE_ACTION), "inputs": {}}
+    return [_call("transfer_to_Mythic_Operator", read_brief, 1), _call("execute_capability", forge, 2),
+            _call("transfer_to_Mythic_Operator", forge_brief, 3), _call("execute_capability", forge, 4),
+            AIMessage(content="The forge ran."), AIMessage(content="Final answer."),
+            AIMessage(content="Final answer."), AIMessage(content="Final answer.")]
+
+
+def test_conversation_never_cards_or_issues_the_proved_forge(monkeypatch, tmp_path):
+    mt, split_issue = _proved_krbtgt_client(monkeypatch, tmp_path)
+
+    run = asyncio.run(_rescope_run(mt, split_issue, _rescope_script(), mode="conversation"))
+
+    assert run.cards == [] and run.issued == []
+    assert KRBTGT_KEY not in json.dumps(run.emissions, default=str)
+
+
+def test_supervised_autonomous_solve_still_needs_the_forge_card(monkeypatch, tmp_path):
+    mt, split_issue = _proved_krbtgt_client(monkeypatch, tmp_path)
+
+    run = asyncio.run(_rescope_run(mt, split_issue, _rescope_script(), autonomous_solve=True))
+
+    # The lane asks for approval (a card is offered) and issues nothing the operator has not approved.
+    assert run.cards, "supervised with autonomous solve must still offer an approval card"
+    issued_before_card = run.issued if not run.cards else []
+    assert issued_before_card == [], [i["command_name"] for i in run.issued]
+    assert KRBTGT_KEY not in json.dumps(run.emissions, default=str)

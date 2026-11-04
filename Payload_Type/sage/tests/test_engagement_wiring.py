@@ -248,6 +248,12 @@ def _seeded_reconcile(mt: MythicTools):
     return fake_reconcile
 
 
+# A credential-store row is proof only with a completed source task (an agent reported it). Rows typed into
+# Mythic carry no task and are never a forge's key.
+_AGENT_REPORTED_TASK = {"display_id": 77, "status": "completed", "completed": True, "command_name": "dcsync",
+                        "callback": {"display_id": 2}}
+
+
 def _proof_hop(effect, task_id, callback_id="", technique="capability:seed", target="seed", transaction_id=None):
     proof = _task_proof(task_id, callback_id or "13", transaction_id=transaction_id)
     evidence, admission = proof_boundary.attach_proof(
@@ -5624,14 +5630,14 @@ def test_build_capability_commands_forge_selects_krbtgt_key_and_parent_ea_sid():
         return [
             {
                 "id": 11,
-                "account": "krbtgt",
+                "account": "krbtgt", "task": _AGENT_REPORTED_TASK,
                 "realm": "north.sevenkingdoms.local",
                 "type": "hash",
                 "credential_text": "b" * 32,
             },
             {
                 "id": 12,
-                "account": "krbtgt",
+                "account": "krbtgt", "task": _AGENT_REPORTED_TASK,
                 "realm": "north.sevenkingdoms.local",
                 "type": "key",
                 "credential_text": "a" * 64,
@@ -5747,14 +5753,8 @@ def test_build_capability_commands_recovers_krbtgt_key_from_recorded_dcsync_task
     assert plan["ok"] is True, plan
     forge_args = plan["commands"][2]["parameters"]["assembly_arguments"]
     assert f"/aes256:{'a' * 64}" in forge_args
-    assert created
-    assert {
-        "account": "krbtgt",
-        "realm": domain,
-        "credential_type": "key",
-        "credential": "a" * 64,
-    }.items() <= created[0].items()
-    assert "task 86" in created[0]["comment"]
+    # Recovery re-reads the proved task; it never writes to Mythic, because planning runs before approval.
+    assert created == []
 
 
 def test_build_capability_commands_can_opt_into_explicit_asktgs_fallback():
@@ -5763,7 +5763,7 @@ def test_build_capability_commands_can_opt_into_explicit_asktgs_fallback():
     async def fake_fetch_credentials(now):
         return [{
             "id": 12,
-            "account": "krbtgt",
+            "account": "krbtgt", "task": _AGENT_REPORTED_TASK,
             "realm": "child.root.local",
             "type": "key",
             "credential_text": "a" * 64,
@@ -5806,7 +5806,7 @@ def test_build_capability_commands_resolves_source_and_parent_domain_sids():
         return [
             {
                 "id": 12,
-                "account": "krbtgt",
+                "account": "krbtgt", "task": _AGENT_REPORTED_TASK,
                 "realm": "north.sevenkingdoms.local",
                 "type": "key",
                 "credential_text": "a" * 64,
@@ -5867,7 +5867,7 @@ def test_cross_domain_forge_executor_skips_only_leading_preflight_not_current_tg
     mt = _make_tools()
 
     async def fake_fetch_credentials(now):
-        return [{"id": 12, "account": "krbtgt", "realm": "north.sevenkingdoms.local", "type": "key", "credential_text": "a" * 64}]
+        return [{"id": 12, "account": "krbtgt", "task": _AGENT_REPORTED_TASK, "realm": "north.sevenkingdoms.local", "type": "key", "credential_text": "a" * 64}]
 
     async def fake_resolve_domain_sid(domain):
         return {"north.sevenkingdoms.local": "S-1-5-21-111-222-333", "sevenkingdoms.local": "S-1-5-21-444-555-666"}.get(domain, "")
@@ -5911,7 +5911,7 @@ def test_cross_domain_forge_issue_boundary_matches_current_cache_oracle():
     async def fake_fetch_credentials(now):
         return [{
             "id": 12,
-            "account": "krbtgt",
+            "account": "krbtgt", "task": _AGENT_REPORTED_TASK,
             "realm": "child.root.local",
             "type": "key",
             "credential_text": "a" * 64,
@@ -6200,7 +6200,7 @@ def test_build_capability_commands_ensures_callback_scoped_kerberos_context():
         return [
             {
                 "id": 12,
-                "account": "krbtgt",
+                "account": "krbtgt", "task": _AGENT_REPORTED_TASK,
                 "realm": "north.sevenkingdoms.local",
                 "type": "key",
                 "credential_text": "a" * 64,
@@ -6482,7 +6482,7 @@ def test_build_capability_commands_bare_domain_proof_resource_resolves_to_dc_sha
         return [
             {
                 "id": 12,
-                "account": "krbtgt",
+                "account": "krbtgt", "task": _AGENT_REPORTED_TASK,
                 "realm": "essos.local",
                 "type": "key",
                 "credential_text": "a" * 64,
@@ -6571,7 +6571,7 @@ def test_build_capability_commands_overrides_untrusted_parent_sid_with_bloodhoun
         return [
             {
                 "id": 12,
-                "account": "krbtgt",
+                "account": "krbtgt", "task": _AGENT_REPORTED_TASK,
                 "realm": "north.sevenkingdoms.local",
                 "type": "key",
                 "credential_text": "a" * 64,

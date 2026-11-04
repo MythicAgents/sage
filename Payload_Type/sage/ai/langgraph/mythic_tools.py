@@ -6493,6 +6493,10 @@ class MythicTools:
         Windows token; timeout is in seconds.
         """
         _collection_schema_binding_context.set(None)
+        # A call that returns before Mythic creates a task must not leave the previous task's identity behind
+        # for callers that read the issued-task slot.
+        self._last_issued_task_display_id = None
+        self._last_issued_task_terminal_status = ""
         authority_blocker = self._turn_authority_issue_blocker(
             command,
             callback_display_id,
@@ -11747,6 +11751,23 @@ class MythicTools:
                     capability_name=self._capability_text(getattr(action_obj, "name", "")),
                 )
                 all_issued.append(issued_item)
+                if issued_item.get("task_issued") is False:
+                    # Sage refused this step before Mythic created a task. Its text is not task output, so it is
+                    # never verified as the capability's evidence and never borrows an earlier task's identity.
+                    refusal = (self._capability_text(issued_item.get("failure_reason"))
+                               or self._capability_text(issued_item.get("output_preview")))
+                    return self._capability_executor_failure_json({
+                        "ok": False,
+                        "verdict": "failed",
+                        "capability": self._capability_text(getattr(action_obj, "name", "")),
+                        "reason": (f"no Mythic task was issued for `{issued_item.get('command')}`: "
+                                   f"{refusal[:400]}").rstrip(": "),
+                        "action": asdict(action_obj) if is_dataclass(action_obj) else {},
+                        "materialized": self._capability_executor_materialized_summary(materialized_payload),
+                        "issued": self._capability_executor_public_issued(all_issued),
+                        "recorded_effects": sorted(self._capability_achieved_effects() - before_effects),
+                        "stopped_after": "not_issued",
+                    }, action_obj, input_values, callback_id, issued=all_issued, build_payload=build_payload)
                 if (
                     forge_cross_domain_parent
                     and "kerberos_ticket_imported" in (command_obj.get("produces") or [])
@@ -13415,8 +13436,15 @@ class MythicTools:
         callback_id: int,
         timeout: int | None,
         capability_name: str = "",
+        issued: dict | None = None,
     ) -> tuple[str, object, str, dict[str, str]]:
-        """Issue one real callback task and report its presentation lifecycle without owning policy."""
+        """Issue one real callback task and report its presentation lifecycle without owning policy.
+
+        The task id returned, and the command written into `issued`, belong to a task Mythic created during this
+        call: the issue path clears its issued-task slot before any refusal, so a step refused before Mythic
+        created a task reports no task rather than the id of whichever task ran last.
+        """
+        issuance = issued if isinstance(issued, dict) else {}
         authorization_outcome = self._evaluation_authorize_callback_mutation(
             command_obj=command_obj,
             command_name=command_name,
@@ -13486,7 +13514,10 @@ class MythicTools:
                 result_preview=self._capability_executor_output_preview(str(exc)),
             )
             raise
-        return output, getattr(self, "_last_issued_task_display_id", None), trace_id, authorization
+        task_id = getattr(self, "_last_issued_task_display_id", None)
+        if task_id is not None:
+            issuance.update({"task_id": task_id, "command": getattr(self, "_last_issued_command", "") or command_name})
+        return output, task_id, trace_id, authorization
 
     async def _complete_capability_command_trace(
         self,
@@ -13550,6 +13581,7 @@ class MythicTools:
             self._deterministic_capability_command_contexts[
                 _capability_command_key(command_name, parameters)
             ] = dict(original_context)
+        issuance: dict = {}
         if command_name == "wait_for_seconds":
             authorization = {}
             seconds = 0
@@ -13611,15 +13643,21 @@ class MythicTools:
                 callback_id,
                 timeout,
                 capability_name,
+                issued=issuance,
             )
         item = self._capability_executor_command_item(
             command_obj,
-            command_name,
+            # Label the item with the command Mythic actually issued (the issue path may canonicalize or rewrite
+            # it); repair and retry below keep the plan's command, as before.
+            self._capability_text(issuance.get("command")) or command_name,
             parameters,
             callback_id,
             task_id,
             output,
         )
+        if command_name != "wait_for_seconds" and task_id is None:
+            # Refused before Mythic created a task: the output is Sage's own refusal, not task output.
+            item["task_issued"] = False
         if authorization:
             item["_authorization"] = authorization
         if binding.get("provider_resolved"):
@@ -13654,6 +13692,7 @@ class MythicTools:
         if repair is None:
             return item
         repaired_parameters, repair_kind = repair
+        retry_issuance: dict = {}
         retry_output, retry_task_id, retry_trace_id, retry_authorization = await self._issue_capability_callback_command(
             command_obj,
             command_name,
@@ -13661,15 +13700,18 @@ class MythicTools:
             callback_id,
             timeout,
             capability_name,
+            issued=retry_issuance,
         )
         retry_item = self._capability_executor_command_item(
             command_obj,
-            command_name,
+            self._capability_text(retry_issuance.get("command")) or command_name,
             repaired_parameters,
             callback_id,
             retry_task_id,
             retry_output,
         )
+        if retry_task_id is None:
+            retry_item["task_issued"] = False
         if retry_authorization:
             retry_item["_authorization"] = retry_authorization
         retry_item["repair_attempt"] = 1
@@ -16727,13 +16769,7 @@ class MythicTools:
                 inputs["child_dc"] = child_dc
                 inputs["child_dc_source"] = f"BloodHound Domain Controllers membership for {domain}"
 
-        if not self._capability_has_ticket_key(inputs):
-            credential = await self._select_krbtgt_credential(domain)
-            if credential:
-                inputs["key"] = credential["credential"]
-                inputs["key_type"] = credential["key_type"]
-                inputs["credential_id"] = credential.get("id")
-                inputs["credential_source"] = "mythic_credential_store"
+        await self._bind_proved_krbtgt_key(inputs, domain, action)
 
         self._normalize_capability_service_proof_target(action, inputs, default_share="C$")
         if capability == "ensure-kerberos-context":
@@ -16840,18 +16876,106 @@ class MythicTools:
             if normalized_extra_sids:
                 inputs["extra_sids"] = normalized_extra_sids
 
+    # Every field the forge builder reads a ticket key from (capabilities._ticket_key reads the action intent, then
+    # the inputs). A value the call carries in any of them is never the forge's key: Sage binds it from
+    # Mythic-origin proof (see `_bind_proved_krbtgt_key`).
+    _TICKET_KEY_FIELDS = ("aes256", "krbtgt_aes256", "aes128", "krbtgt_aes128", "rc4", "ntlm", "nthash",
+                          "krbtgt_hash", "key", "krbtgt_key", "credential", "credential_text", "secret")
+    _PROVED_KRBTGT_KEY_PLACEHOLDER = "{{proved_krbtgt_key}}"
+
+    async def _bind_proved_krbtgt_key(self, inputs: dict, domain: str, action=None) -> None:
+        """Bind the krbtgt key this forge uses to Mythic-origin proof, by reference.
+
+        A key the request carries, typed by an operator or copied from a task-output read, is dropped: it is not
+        an admitted `krbtgt-hash`. The bound credential carries its proof task, and an approved card's reference
+        (`credential_proof_task_id`, `credential_id`) must resolve to the same proved credential at execution or
+        no key is bound. Without a bound key the plan reports the key missing and nothing is issued.
+        """
+        intent = getattr(action, "intent", None)
+        intent = intent if isinstance(intent, dict) else {}
+        carried = any(self._capability_text(source.get(field)).strip()
+                      for source in (inputs, intent) for field in self._TICKET_KEY_FIELDS)
+        pinned_task = self._capability_text(inputs.get("credential_proof_task_id"))
+        pinned_id = self._capability_text(inputs.get("credential_id"))
+        for field in (*self._TICKET_KEY_FIELDS, "key_type", "etype", "credential_id", "credential_source",
+                      "credential_proof_task_id"):
+            inputs.pop(field, None)
+        for field in (*self._TICKET_KEY_FIELDS, "key_type", "etype"):
+            intent.pop(field, None)
+        credential = await self._select_krbtgt_credential(domain)
+        if credential and (
+            (pinned_task and pinned_task != self._capability_text(credential.get("proof_task_id")))
+            or (pinned_id and pinned_id != self._capability_text(credential.get("id")))
+        ):
+            logger.info("krbtgt forge input: the approved credential reference no longer resolves; no key bound")
+            credential = {}
+        if not credential:
+            if carried:
+                logger.info("krbtgt forge input: a key carried by the request is not a proved krbtgt-hash; dropped")
+            return
+        inputs["key"] = credential["credential"]
+        inputs["key_type"] = credential["key_type"]
+        inputs["credential_id"] = credential.get("id")
+        inputs["credential_source"] = credential.get("source") or "mythic_credential_store"
+        inputs["credential_proof_task_id"] = credential.get("proof_task_id")
+
+    def _drop_card_secret_inputs(self, inputs: dict, *mappings: Any) -> None:
+        """Remove ticket-key values from what an approval card carries once Sage bound a proved key by reference.
+
+        `mappings` are the card's other argument dicts (its action and that action's intent): a key written there
+        is neither shown nor used, since the executor binds the proved credential again after approval.
+        """
+        if not self._capability_text(inputs.get("credential_proof_task_id")):
+            return
+        targets = [inputs]
+        for mapping in mappings:
+            if isinstance(mapping, dict):
+                targets.append(mapping)
+                if isinstance(mapping.get("intent"), dict):
+                    targets.append(mapping["intent"])
+        for target in targets:
+            for field in self._TICKET_KEY_FIELDS:
+                target.pop(field, None)
+
+    def _capability_card_plan_inputs(self, action, inputs: dict) -> dict:
+        """Inputs to plan a card from: a proved input the executor supplies after approval is a placeholder."""
+        plan_inputs = dict(inputs)
+        if self._adcs_certificate_auth_verified_ca_effect(action, plan_inputs):
+            self._drop_adcs_ca_path_inputs(plan_inputs)
+            plan_inputs["ca_pfx_path"] = "{{verified_ca_pfx_staged_path}}"
+        if (self._capability_text(plan_inputs.get("credential_proof_task_id"))
+                and not self._capability_has_ticket_key(plan_inputs)):
+            plan_inputs["key"] = self._PROVED_KRBTGT_KEY_PLACEHOLDER
+        return plan_inputs
+
     async def _select_krbtgt_credential(self, domain: str) -> dict:
+        """The krbtgt key for `domain` with its Mythic-origin proof task, or {}.
+
+        Proof is a credential-store row whose source task lineage is complete (an agent reported it from a task),
+        or the admitted proof task of an achieved `krbtgt-hash:{domain}` hop, re-read without writing. A store row
+        with no source task (typed into Mythic) is not proof; it only names the credential a proved hop matches.
+        """
         domain_cf = self._capability_text(domain).casefold()
         if not domain_cf:
             return {}
-        creds = await self._fetch_credentials_cached(datetime.now(timezone.utc).isoformat())
-        candidate = self._best_kerberos_key_credential(creds, "krbtgt", domain_cf)
+        now = datetime.now(timezone.utc).isoformat()
+        creds = [row for row in (await self._fetch_credentials_cached(now) or []) if isinstance(row, dict)]
+        proved_rows = [row for row in creds if self._credential_store_proof_envelope(row, now)]
+        candidate = self._best_kerberos_key_credential(proved_rows, "krbtgt", domain_cf)
         if candidate:
-            return candidate
+            row = next((item for item in proved_rows if item.get("id") == candidate.get("id")), {})
+            task = row.get("task") if isinstance(row.get("task"), dict) else {}
+            return {**candidate, "proof_task_id": task.get("display_id") or task.get("id"),
+                    "source": "mythic_credential_store"}
         recovered = await self._recover_krbtgt_credential_from_recorded_task(domain_cf)
-        if recovered:
-            return recovered
-        return {}
+        if not recovered:
+            return {}
+        named = next((row for row in creds
+                      if self._canonical_credential_account(row.get("account")) == "krbtgt"
+                      and self._capability_text(row.get("realm")).casefold() == domain_cf
+                      and self._capability_text(row.get("credential_text") or row.get("credential")).strip()
+                      == recovered["credential"]), {})
+        return {**recovered, "id": named.get("id")}
 
     def _best_kerberos_key_credential(self, creds: list | tuple, account: str, realm: str) -> dict:
         account_cf = self._canonical_credential_account(account)
@@ -16890,21 +17014,23 @@ class MythicTools:
             effects.extend(self._capability_text(item) for item in (getattr(hop, "satisfied_effects", []) or []))
             if f"krbtgt-hash:{domain_cf}" not in {item.casefold() for item in effects if item}:
                 continue
+            proof = getattr(hop, "proof_envelope", {}) if isinstance(getattr(hop, "proof_envelope", {}), dict) else {}
             evidence = getattr(hop, "evidence", {}) if isinstance(getattr(hop, "evidence", {}), dict) else {}
-            task_id = evidence.get("mythic_task_id") or evidence.get("task_id") or evidence.get("source_task_id")
+            task_id = (proof.get("task_id") or evidence.get("mythic_task_id") or evidence.get("task_id")
+                       or evidence.get("source_task_id"))
             try:
                 task_ids.append(int(task_id))
             except Exception:
                 continue
         for task_id in task_ids:
+            # Read-only: grounding runs before approval, so recovery never writes to Mythic.
             output = await self._fetch_plain_task_output(task_id)
             material = self._extract_credential_material(output, account="krbtgt", realm=domain_cf)
             if not material:
                 continue
-            await self._import_credential_material(material, source_task_id=task_id)
             candidate = self._best_credential_material_candidate(material)
             if candidate:
-                return candidate
+                return {**candidate, "proof_task_id": task_id, "source": "engagement_proof_task"}
         return {}
 
     async def _fetch_plain_task_output(self, task_id: int) -> str:

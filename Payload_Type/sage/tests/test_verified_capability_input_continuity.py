@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import mythic_tools  # noqa: E402
 import request_contract  # noqa: E402
 from test_engagement_wiring import (  # noqa: E402
     _make_tools, _proof_hop, _split_issue, _write_test_ca_pfx,
@@ -373,6 +374,19 @@ def test_a_proved_ca_export_lets_certificate_auth_reach_its_card_without_a_path(
     assert call["args"]["inputs"]["ca_host"] == "ca01"
 
 
+def test_the_card_preview_plans_a_proved_ca_export_instead_of_blocking_the_card(monkeypatch, tmp_path):
+    from test_step_bounds import model_module
+
+    mt = _tools(monkeypatch, tmp_path)
+    _export_ca(mt, monkeypatch, tmp_path)
+    message, _ = _ground(mt, {"proof_host": "dc01.lab.local"})
+    [call] = message.tool_calls
+
+    preview = model_module.Model._capability_card_plan_text(SimpleNamespace(mythic_client=mt), call["args"])
+
+    assert "could not be built" not in preview and "Planned inner tasks" in preview, preview
+
+
 def test_without_a_proved_export_certificate_auth_still_needs_an_explicit_input(monkeypatch, tmp_path):
     mt = _tools(monkeypatch, tmp_path)
     mt._engagement_hops = []
@@ -381,3 +395,265 @@ def test_without_a_proved_export_certificate_auth_still_needs_an_explicit_input(
 
     assert message.tool_calls == [] and "could not be planned yet" in str(message.content)
     assert record.status is not None
+
+
+# --- issued identity: a step's task and command come from Mythic's issuance record ------------------------
+#
+# Channel 3 requests 3-4: `dcsync-krbtgt` failed twice, a Rubeus `execute_assembly` ran as task 17, and the next
+# `dcsync-krbtgt` was refused by Sage's own repeat-failure circuit breaker before any Mythic task existed. The
+# executor reported that refusal as `dcsync` task 17 with a `partial` "DCSync ran" verdict read from Sage's STOP
+# text. The fixtures run the production executor and issue path; only the Mythic API seam is inert.
+
+DCSYNC = {"capability": "dcsync-krbtgt", "domain": "lab.local", "account": "krbtgt", "callback_id": "13"}
+BAD_DN = "ERROR kuhl_m_lsadump_dcsync ; kull_m_rpc_drsr_CrackName: 0x00000002 (ERROR_DS_NAME_ERROR_NOT_FOUND) bad DN"
+
+
+def _dcsync_tools(monkeypatch, tmp_path):
+    mt = _tools(monkeypatch, tmp_path)
+    mt._resolve_payload_type = lambda callback_id: asyncio.sleep(0, result="apollo")
+    mt._resolve_domain_controller_host = lambda domain: asyncio.sleep(0, result="dc01.lab.local")
+    return mt
+
+
+def _run_dcsync(mt, output, task_ids) -> tuple[dict, dict]:
+    calls: dict = {}
+    with _split_issue(lambda: output, calls, display_id=lambda: next(task_ids)):
+        result = json.loads(asyncio.run(mt.execute_capability(dict(DCSYNC), {"timeout": 5})))
+    return result, calls
+
+
+def test_a_step_refused_before_issue_reports_no_task_and_never_borrows_the_last_ones(monkeypatch, tmp_path):
+    mt = _dcsync_tools(monkeypatch, tmp_path)
+    task_ids = iter([14, 15, 16])
+    for expected in (14, 15):
+        failed, calls = _run_dcsync(mt, BAD_DN, task_ids)
+        assert [(item["command"], item["task_id"]) for item in failed["issued"]] == [("dcsync", expected)]
+        assert [issue["command_name"] for issue in calls["issued"]] == ["dcsync"]
+
+    calls = {}
+    with _split_issue(lambda: "[*] Action: Ask TGT\n[+] TGT request successful!", calls, display_id=17):
+        asyncio.run(mt.issue_task_and_waitfor_task_output(
+            "execute_assembly", {"assembly_name": "Rubeus.exe", "assembly_arguments": "asktgt /user:svc"}, 13,
+        ))
+    assert [issue["command_name"] for issue in calls["issued"]] == ["execute_assembly"]
+
+    refused, calls = _run_dcsync(mt, BAD_DN, task_ids)
+
+    assert calls.get("issued", []) == []  # the circuit breaker refused it: no Mythic task exists
+    assert [(item["command"], item["task_id"]) for item in refused["issued"]] == [("dcsync", None)]
+    assert refused["issued"][0]["task_issued"] is False
+    assert refused["verdict"] == "failed" and refused.get("stopped_after") == "not_issued"
+    assert "no mythic task was issued" in refused["reason"].casefold()
+    assert "krbtgt-hash:lab.local" not in refused["recorded_effects"]
+
+
+# --- krbtgt -> forge-golden-ticket: the card binds the proved credential by reference --------------------
+#
+# A `dcsync-krbtgt` proved through the production executor and verifier (task 21) records `krbtgt-hash:lab.local`
+# and writes the key to Mythic's credential store. The next `forge-golden-ticket` card must name that credential
+# and its proof task, never carry the raw key, and the executor must forge from that exact credential. Grounding
+# happens before approval, so it may not write to Mythic. A key that only an operator or a task-output read
+# supplies is not an admitted `krbtgt-hash` and must not reach a forge.
+
+KRBTGT_KEY = "c" * 64
+FORGE = {"capability": "forge-golden-ticket", "domain": "lab.local", "callback_id": "13"}
+DCSYNC_OK = (
+    "[DC] 'lab.local' will be the domain\n** SAM ACCOUNT **\nSAM Username         : krbtgt\nCredentials:\n"
+    f"  Hash NTLM: {'d' * 32}\n* Primary:Kerberos-Newer-Keys *\n  aes256_hmac       (4096) : {KRBTGT_KEY}\n"
+)
+
+
+def _credential_store(mt, monkeypatch) -> dict:
+    """An inert Mythic credential store: rows the client reads back, and every write Sage makes."""
+    store: dict = {"rows": [], "writes": []}
+
+    async def fetch(now):
+        return list(store["rows"])
+
+    async def create(client, credential, account, realm, comment, credential_type):
+        row = {"id": 500 + len(store["rows"]), "account": account, "realm": realm, "type": credential_type,
+               "credential_text": credential, "comment": comment}
+        store["rows"].append(row)
+        store["writes"].append(row)
+        return {"status": "success", "id": row["id"]}
+
+    mt._fetch_credentials_cached = fetch
+    monkeypatch.setattr(mythic_tools.mythic, "create_credential", create)
+    return store
+
+
+def _krbtgt_tools(monkeypatch, tmp_path):
+    mt = _dcsync_tools(monkeypatch, tmp_path)
+    mt._resolve_domain_sid = lambda domain: asyncio.sleep(0, result="S-1-5-21-1-2-3")
+    store = _credential_store(mt, monkeypatch)
+    store["task_outputs"] = {}
+
+    async def task_output(mythic, task_display_id, custom_return_attributes=None):
+        # Mythic's record of a task's output: only tasks this fixture actually ran have one.
+        text = store["task_outputs"].get(int(task_display_id), "")
+        return [{"response_text": base64.b64encode(text.encode()).decode()}] if text else []
+
+    monkeypatch.setattr(mythic_tools.mythic, "get_all_task_output_by_id", task_output)
+    return mt, store
+
+
+def _prove_krbtgt(mt, store, task_id=21):
+    store["task_outputs"][task_id] = DCSYNC_OK
+    result, _ = _run_dcsync(mt, DCSYNC_OK, iter([task_id]))
+    assert result["verdict"] == "achieved" and "krbtgt-hash:lab.local" in result["recorded_effects"], result
+
+
+def _ground_forge(mt, inputs: dict | None = None, action: dict | None = None):
+    from langchain_core.messages import AIMessage
+    from test_step_bounds import _GroundRecord, _ground_middleware
+
+    _ground_middleware.record = _GroundRecord()
+    message = AIMessage(content="", name="Mythic_Operator", tool_calls=[{
+        "name": "execute_capability", "id": "g1", "type": "tool_call",
+        "args": {"action": dict(action or FORGE), "inputs": dict(inputs or {})}}])
+    asyncio.run(_ground_middleware(mt)._ground_and_limit_capability(SimpleNamespace(state={"messages": []}), message))
+    return message
+
+
+def _forge_from(mt, inputs: dict, action: dict | None = None) -> tuple[dict, dict]:
+    calls: dict = {}
+    with _split_issue(lambda: "ok", calls, display_id=lambda: 30 + len(calls.get("issued", []))):
+        result = json.loads(asyncio.run(mt.execute_capability(dict(action or FORGE), {**inputs, "timeout": 5})))
+    return result, calls
+
+
+def _rubeus_issues(calls: dict) -> list[str]:
+    return [json.dumps(issue["parameters"]) for issue in calls.get("issued", [])
+            if issue["command_name"] == "execute_assembly"]
+
+
+def test_a_proved_krbtgt_reaches_the_forge_card_by_reference_and_the_forge_uses_it(monkeypatch, tmp_path):
+    mt, store = _krbtgt_tools(monkeypatch, tmp_path)
+    _prove_krbtgt(mt, store)
+    [row] = [row for row in store["rows"] if row["type"] == "key"]
+    writes_before = len(store["writes"])
+
+    message = _ground_forge(mt)
+
+    [call] = message.tool_calls
+    inputs = call["args"]["inputs"]
+    assert KRBTGT_KEY not in json.dumps(call)  # the card, stream and checkpoint never hold the raw key
+    assert inputs["credential_id"] == row["id"] and str(inputs["credential_proof_task_id"]) == "21"
+    assert inputs["key_type"] == "aes256"
+    assert len(store["writes"]) == writes_before
+
+    result, calls = _forge_from(mt, inputs)
+
+    [forge] = _rubeus_issues(calls)
+    assert f"/aes256:{KRBTGT_KEY}" in forge
+    assert KRBTGT_KEY not in json.dumps(result)
+
+
+def test_recovering_a_proved_krbtgt_key_writes_nothing_before_approval(monkeypatch, tmp_path):
+    mt, store = _krbtgt_tools(monkeypatch, tmp_path)
+    _prove_krbtgt(mt, store)
+    store["rows"].clear()  # the store row is gone; the proved hop and its Mythic task remain
+    writes_before = len(store["writes"])
+
+    message = _ground_forge(mt)
+
+    [call] = message.tool_calls
+    assert len(store["writes"]) == writes_before  # no Mythic credential write before the operator approves
+    assert KRBTGT_KEY not in json.dumps(call)
+    assert str(call["args"]["inputs"]["credential_proof_task_id"]) == "21"
+
+
+def _assert_no_forge(mt, inputs: dict, action: dict | None = None):
+    message = _ground_forge(mt, inputs, action)
+    assert message.tool_calls == [], message.tool_calls
+    result, calls = _forge_from(mt, inputs, action)
+    assert _rubeus_issues(calls) == [], result
+    assert result["verdict"] != "achieved"
+
+
+TYPED_KEY = "e" * 64
+# Every place the forge builder reads a ticket key from: the action intent first, then the inputs.
+TYPED_KEY_FORMS = [
+    ({"key": TYPED_KEY, "key_type": "aes256"}, None),
+    ({"krbtgt_aes256": TYPED_KEY}, None),
+    ({"secret": TYPED_KEY}, None),
+    ({"credential_text": TYPED_KEY}, None),
+    ({"credential": TYPED_KEY}, None),
+    ({}, {**FORGE, "intent": {"aes256": TYPED_KEY}}),
+]
+TYPED_KEY_IDS = ["key", "krbtgt_aes256", "secret", "credential_text", "credential", "intent-aes256"]
+
+
+@pytest.mark.parametrize("inputs, action", TYPED_KEY_FORMS, ids=TYPED_KEY_IDS)
+def test_an_operator_asserted_krbtgt_key_never_reaches_a_forge(monkeypatch, tmp_path, inputs, action):
+    mt, _ = _krbtgt_tools(monkeypatch, tmp_path)
+    mt._engagement_hops = []
+
+    _assert_no_forge(mt, inputs, action)
+
+
+@pytest.mark.parametrize("inputs, action", TYPED_KEY_FORMS, ids=TYPED_KEY_IDS)
+def test_a_typed_key_beside_a_proved_one_is_neither_shown_nor_used(monkeypatch, tmp_path, inputs, action):
+    mt, store = _krbtgt_tools(monkeypatch, tmp_path)
+    _prove_krbtgt(mt, store)
+
+    [call] = _ground_forge(mt, inputs, action).tool_calls
+    card = json.dumps(call)
+    assert TYPED_KEY not in card and KRBTGT_KEY not in card
+    assert str(call["args"]["inputs"]["credential_proof_task_id"]) == "21"
+    _, calls = _forge_from(mt, call["args"]["inputs"], call["args"]["action"])
+    [forge] = _rubeus_issues(calls)
+    assert f"/aes256:{KRBTGT_KEY}" in forge and TYPED_KEY not in forge
+
+
+def test_a_historical_task_read_is_not_an_admitted_krbtgt(monkeypatch, tmp_path):
+    mt, store = _krbtgt_tools(monkeypatch, tmp_path)
+    mt._engagement_hops = []
+
+    store["task_outputs"][24] = DCSYNC_OK  # a task this request never issued, holding real-looking material
+    read = asyncio.run(mt.get_all_task_output_by_task_id(24))
+    assert "historical_or_external" in json.dumps(read, default=str)
+
+    assert store["writes"] == [] and mt._engagement_hops == []
+    _assert_no_forge(mt, {})
+
+
+def test_a_krbtgt_row_typed_into_the_credential_store_is_not_proof(monkeypatch, tmp_path):
+    mt, store = _krbtgt_tools(monkeypatch, tmp_path)
+    mt._engagement_hops = []
+    store["rows"].append({"id": 700, "account": "krbtgt", "realm": "lab.local", "type": "key",
+                          "credential_text": "f" * 64, "comment": "entered by hand", "task": None})
+
+    _assert_no_forge(mt, {})
+
+
+def test_a_krbtgt_row_an_agent_reported_from_a_completed_task_is_proof(monkeypatch, tmp_path):
+    mt, store = _krbtgt_tools(monkeypatch, tmp_path)
+    mt._engagement_hops = []
+    store["rows"].append({"id": 701, "account": "krbtgt", "realm": "lab.local", "type": "key",
+                          "credential_text": KRBTGT_KEY, "comment": "reported by the agent",
+                          "task": {"display_id": 24, "status": "completed", "completed": True,
+                                   "command_name": "dcsync", "callback": {"display_id": 13}}})
+
+    [call] = _ground_forge(mt).tool_calls
+    inputs = call["args"]["inputs"]
+    assert KRBTGT_KEY not in json.dumps(call)
+    assert inputs["credential_id"] == 701 and str(inputs["credential_proof_task_id"]) == "24"
+    _, calls = _forge_from(mt, inputs)
+    [forge] = _rubeus_issues(calls)
+    assert f"/aes256:{KRBTGT_KEY}" in forge
+
+
+@pytest.mark.parametrize("predecessor", ["wrong-domain", "failed", "no-parsed-secret"])
+def test_an_unadmitted_predecessor_never_reaches_a_forge(monkeypatch, tmp_path, predecessor):
+    mt, store = _krbtgt_tools(monkeypatch, tmp_path)
+    mt._engagement_hops = []
+    if predecessor == "wrong-domain":
+        mt._engagement_hops = [_proof_hop("krbtgt-hash:other.local", 22, callback_id="13")]
+    else:
+        output = BAD_DN if predecessor == "failed" else "[DC] 'lab.local' will be the domain\n[DC] ms-DRSR connected"
+        result, _ = _run_dcsync(mt, output, iter([22]))
+        assert "krbtgt-hash:lab.local" not in result["recorded_effects"]
+
+    assert [row for row in store["rows"] if row["realm"] == "lab.local"] == []
+    _assert_no_forge(mt, {})

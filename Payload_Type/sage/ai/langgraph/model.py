@@ -3003,6 +3003,14 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
                         inputs, args.get("action") if isinstance(args.get("action"), dict) else None,
                     )
                     plan_inputs = {**inputs, "ca_pfx_path": "{{verified_ca_pfx_staged_path}}"}
+                if client._capability_text(inputs.get("credential_proof_task_id")):
+                    # A proved krbtgt key is bound by reference: the plan is checked with it here, but the card,
+                    # stream and checkpoint carry only the reference the executor resolves after approval.
+                    plan_inputs = {**plan_inputs, **{field: inputs[field] for field in client._TICKET_KEY_FIELDS
+                                                     if field in inputs}}
+                    client._drop_card_secret_inputs(
+                        inputs, args.get("action") if isinstance(args.get("action"), dict) else None,
+                    )
                 # Persist the grounded inputs so the approval card and the executor see the same bound values the
                 # plan was built from.
                 args["inputs"] = inputs
@@ -10053,11 +10061,14 @@ class Model:
                 getattr(self, "mythic_client", None), "_last_issued_task_is_repeat_failure",
                 False,
             ))
+            # An empty marker means the last issue call created no task (Sage refused it): not progress.
             _effect_crossed = (
-                _task_marker != str(getattr(self, "_last_progress_task_marker", "") or "")
+                bool(_task_marker)
+                and _task_marker != str(getattr(self, "_last_progress_task_marker", "") or "")
                 and not _repeat_failure
             )
-            self._last_progress_task_marker = _task_marker
+            if _task_marker:
+                self._last_progress_task_marker = _task_marker
 
             # Progress is the effect boundary and NOTHING ELSE.
             #
@@ -15374,6 +15385,11 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         action_obj = client._capability_tool_action(action, input_values, capabilities_mod)
         if action_obj is None:
             return ""
+        card_plan_inputs = getattr(client, "_capability_card_plan_inputs", None)
+        if callable(card_plan_inputs):
+            # A proved input the executor supplies after approval (a staged CA PFX, a krbtgt key bound by
+            # reference) is not on the card; plan the preview the way grounding checked it.
+            input_values = card_plan_inputs(action_obj, input_values)
         plan = capabilities_mod.build_capability_execution_plan(action_obj, input_values)
         cost = getattr(action_obj, "operational_cost", None) or {}
         lines: list[str] = []
@@ -15622,8 +15638,28 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             def _action_key(a: dict) -> str:
                 args = a.get("args") if isinstance(a, dict) else None
                 args = args if isinstance(args, dict) else {}
+                name = str(a.get("name") or "") if isinstance(a, dict) else ""
+                if name == "execute_capability" and "action" in args:
+                    # A capability's target is in its action, not in command/callback_display_id: key on the
+                    # procedure, callback and domain, so different capabilities are never one repeated action.
+                    try:
+                        from .request_contract import parse_capability_request
+                    except ImportError:  # pragma: no cover
+                        from request_contract import parse_capability_request  # type: ignore
+                    try:
+                        parsed = parse_capability_request(args.get("action"), args.get("inputs"))
+                        action_data = dict(parsed.action_data)
+                        return "::".join((
+                            name,
+                            str(parsed.bindings.capability or ""),
+                            str(parsed.bindings.callback_id or ""),
+                            str(action_data.get("domain") or action_data.get("target_domain")
+                                or dict(parsed.input_values).get("domain") or "").casefold(),
+                        ))
+                    except (TypeError, ValueError):
+                        pass
                 return "::".join((
-                    str(a.get("name") or "") if isinstance(a, dict) else "",
+                    name,
                     str(args.get("command") or ""),
                     str(args.get("callback_display_id") or ""),
                 ))
@@ -15632,6 +15668,10 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                 fingerprint = "|".join(sorted(_action_key(a) for a in action_requests))
                 if fingerprint.strip("|:") == "":
                     fingerprint = ""
+                else:
+                    # A new request starts its own count: a card from an earlier request is not a re-proposal.
+                    request_id = str((getattr(self, "state", None) or {}).get("_request_id") or "")
+                    fingerprint = f"{request_id}#{fingerprint}"
             except Exception:  # pragma: no cover - never break the approval path on bookkeeping
                 fingerprint = ""            # A real Mythic task id moving is the progress signal — it means the effect boundary was
             # actually crossed. Without it, an operator legitimately running the same command three
@@ -15639,8 +15679,10 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             task_marker = str(
                 getattr(getattr(self, "mythic_client", None), "_last_issued_task_display_id", "") or ""
             )
-            progressed = task_marker != str(getattr(self, "_last_card_task_marker", "") or "")
-            self._last_card_task_marker = task_marker
+            # An empty marker means the last issue call created no task (Sage refused it): not progress.
+            progressed = bool(task_marker) and task_marker != str(getattr(self, "_last_card_task_marker", "") or "")
+            if task_marker:
+                self._last_card_task_marker = task_marker
             if (
                 fingerprint
                 and not progressed

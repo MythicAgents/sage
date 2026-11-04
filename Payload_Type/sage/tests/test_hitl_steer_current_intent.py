@@ -613,3 +613,102 @@ def test_native_chat_production_graph_different_action_gets_a_new_card():
     assert next_action["arguments"]["visibility_context"]["_sage_prepared_action"] is True
     assert snapshot.next
     assert _current_assisted_operator_input(model.state) == DIFFERENT_STEER
+
+
+# --- the repeat-card guard tells capability proposals apart ----------------------------------------------
+#
+# Channel 3 requests 3-7 offered different capabilities in a row. `execute_capability` carries its target in
+# `action`, not in `command`/`callback_display_id`, so the guard keyed every capability card as one action and
+# would stop a legitimate re-scope as "the same action was proposed 3 times". Identical proposals still trip it,
+# and a new request starts its own count.
+
+def _capability_card(capability: str, callback: str = "13", domain: str = "lab.local") -> dict:
+    return {"name": "execute_capability", "id": f"cap-{capability}-{callback}-{domain}", "type": "tool_call",
+            "args": {"action": {"capability": capability, "domain": domain, "callback_id": callback}, "inputs": {}}}
+
+
+def _surface_cards(model, actions: list[dict], *, request_id: str = REQUEST_ID) -> list[str]:
+    streamed: list[str] = []
+
+    async def stream(text, *args, **kwargs):
+        streamed.append(str(text))
+        return True
+
+    model._stream_message_to_mythic = stream
+    model.bind_supervised_request_proposal = lambda requests: None
+
+    async def run():
+        for action in actions:
+            model.state["_request_id"] = request_id
+            await model._surface_hitl_interrupt({"__interrupt__": [SimpleNamespace(value={"action_requests": [action]})]})
+
+    asyncio.run(run())
+    return streamed
+
+
+def test_different_capability_cards_are_not_one_repeated_action():
+    model, observed = _assembled_model()
+    cards = [_capability_card("dcsync-krbtgt"), _capability_card("forge-golden-ticket"),
+             _capability_card("prove-domain-admin-control")]
+
+    streamed = _surface_cards(model, cards)
+
+    assert not any("same action was proposed" in text for text in streamed), streamed
+    assert observed["cards"] == [[card] for card in cards]
+
+
+def test_the_same_capability_on_another_callback_or_domain_is_a_different_action():
+    model, observed = _assembled_model()
+    cards = [_capability_card("forge-golden-ticket"), _capability_card("forge-golden-ticket", callback="14"),
+             _capability_card("forge-golden-ticket", domain="other.local")]
+
+    streamed = _surface_cards(model, cards)
+
+    assert not any("same action was proposed" in text for text in streamed), streamed
+    assert len(observed["cards"]) == 3
+
+
+def test_an_identical_capability_card_still_trips_the_repeat_guard():
+    model, observed = _assembled_model()
+    card = _capability_card("forge-golden-ticket")
+
+    streamed = _surface_cards(model, [card, dict(card), dict(card)])
+
+    assert any("same action was proposed 3 times" in text for text in streamed), streamed
+    assert len(observed["cards"]) == 2
+
+
+def test_a_new_request_starts_its_own_repeat_count():
+    model, observed = _assembled_model()
+    card = _capability_card("forge-golden-ticket")
+    _surface_cards(model, [card, dict(card)], request_id="chat:steer:request:1")
+
+    streamed = _surface_cards(model, [dict(card)], request_id="chat:steer:request:2")
+
+    assert not any("same action was proposed" in text for text in streamed), streamed
+    assert len(observed["cards"]) == 3
+
+
+def test_a_refused_issue_after_a_real_task_is_not_progress_for_the_repeat_guard():
+    model, observed = _assembled_model()
+    card = _capability_card("forge-golden-ticket")
+    client = SimpleNamespace(_last_issued_task_display_id=17)
+    model.mythic_client = client
+    streamed: list[str] = []
+
+    async def stream(text, *args, **kwargs):
+        streamed.append(str(text))
+        return True
+
+    model._stream_message_to_mythic = stream
+    model.bind_supervised_request_proposal = lambda requests: None
+
+    async def run():
+        for marker in (17, None, None):  # one real task, then two calls Sage refused before Mythic created a task
+            client._last_issued_task_display_id = marker
+            await model._surface_hitl_interrupt({"__interrupt__": [SimpleNamespace(value={"action_requests": [dict(card)]})]})
+
+    asyncio.run(run())
+
+    assert any("same action was proposed 3 times" in text for text in streamed), streamed
+    assert len(observed["cards"]) == 2
