@@ -10067,8 +10067,10 @@ class Model:
                 and _task_marker != str(getattr(self, "_last_progress_task_marker", "") or "")
                 and not _repeat_failure
             )
-            if _task_marker:
-                self._last_progress_task_marker = _task_marker
+            # Keep the last real task marker; still initialize it when this Model never ran __init__.
+            self._last_progress_task_marker = (
+                _task_marker or str(getattr(self, "_last_progress_task_marker", "") or "")
+            )
 
             # Progress is the effect boundary and NOTHING ELSE.
             #
@@ -15681,8 +15683,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             )
             # An empty marker means the last issue call created no task (Sage refused it): not progress.
             progressed = bool(task_marker) and task_marker != str(getattr(self, "_last_card_task_marker", "") or "")
-            if task_marker:
-                self._last_card_task_marker = task_marker
+            self._last_card_task_marker = task_marker or str(getattr(self, "_last_card_task_marker", "") or "")
             if (
                 fingerprint
                 and not progressed
