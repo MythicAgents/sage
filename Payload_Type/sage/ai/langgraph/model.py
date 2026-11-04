@@ -2993,6 +2993,10 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
                     continue
                 action_obj, _ = client._ensure_capability_transaction_context(action_obj, inputs)
                 await client._augment_capability_runtime_inputs(action_obj, inputs)
+                # A krbtgt credential reference that no longer resolves never reaches a card: without its key,
+                # the plan the card would show is not the one the executor could run.
+                unresolved_reference = getattr(client, "_unresolved_krbtgt_reference", None)
+                stale_reference = bool(callable(unresolved_reference) and unresolved_reference(action_obj, inputs))
                 plan_inputs = inputs
                 verified_input = getattr(client, "_adcs_certificate_auth_verified_ca_effect", None)
                 if callable(verified_input) and verified_input(action_obj, inputs):
@@ -3016,14 +3020,17 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
                 args["inputs"] = inputs
                 call["args"] = args
                 plan = capabilities_mod.build_capability_execution_plan(action_obj, plan_inputs)
-                if getattr(plan, "ok", False):
+                if getattr(plan, "ok", False) and not stale_reference:
                     continue
+                plan_missing = [str(item) for item in getattr(plan, "missing", []) or []]
+                if stale_reference and "key" not in plan_missing:
+                    plan_missing.insert(0, "key")
                 capability = client._capability_text(getattr(action_obj, "name", "")) or "capability"
-                missing = ", ".join(str(item) for item in getattr(plan, "missing", []) or [])
+                missing = ", ".join(plan_missing)
                 reason = str(getattr(plan, "reason", "") or "").strip()
                 detail = reason or (f"missing: {missing}" if missing else "a required input is missing")
                 missing_proof = getattr(client, "_krbtgt_missing_proof_reason", None)
-                note = (missing_proof(action_obj, inputs, getattr(plan, "missing", [])) if callable(missing_proof)
+                note = (missing_proof(action_obj, inputs, plan_missing) if callable(missing_proof)
                         else "") or (f"`{capability}` could not be planned yet — {detail}. Supply that input, or "
                                      f"send a different step. Nothing was issued.")
                 record = self._record(request)

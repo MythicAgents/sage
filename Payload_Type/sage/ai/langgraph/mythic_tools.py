@@ -11536,6 +11536,19 @@ class MythicTools:
                     "issued": [],
                 }, action_obj, input_values, None)
 
+            if self._unresolved_krbtgt_reference(action_obj, input_values):
+                # Stop before the context checks below issue anything: the referenced key is gone.
+                return self._capability_executor_failure_json({
+                    "ok": False,
+                    "verdict": "failed",
+                    "capability": self._capability_text(getattr(action_obj, "name", "")),
+                    "reason": self._krbtgt_missing_proof_reason(action_obj, input_values, ["key"]),
+                    "missing": ["key"],
+                    "action": asdict(action_obj) if is_dataclass(action_obj) else {},
+                    "issued": [],
+                    "recorded_effects": [],
+                }, action_obj, input_values, callback_id)
+
             host_scope_failure = self._capability_host_scoped_precondition_failure(
                 action_obj,
                 input_values,
@@ -16704,6 +16717,14 @@ class MythicTools:
                 inputs["source_domain"] = domain
             if target_domain:
                 inputs["target_domain"] = target_domain
+        elif capability == "forge-golden-ticket":
+            # The key, domain SID and child DC below belong to the domain the forge plan issues the ticket in.
+            try:
+                from . import capabilities
+            except ImportError:
+                import capabilities
+            domain = capabilities.forge_ticket_domain(action, inputs)
+            target_domain = self._capability_target_domain(action, inputs)
         else:
             domain = self._capability_domain(action, inputs)
             target_domain = self._capability_target_domain(action, inputs)
@@ -16893,6 +16914,10 @@ class MythicTools:
         an admitted `krbtgt-hash`. The bound credential carries its proof task, and an approved card's reference
         (`credential_proof_task_id`, `credential_id`) must resolve to the same proved credential at execution or
         no key is bound. Without a bound key the plan reports the key missing and nothing is issued.
+
+        The executor binds the same inputs more than once (its own pass, then the command build's), so a reference
+        that does not resolve stays in the inputs: every later pass refuses it too, instead of finding no
+        reference and binding whatever key is current.
         """
         intent = getattr(action, "intent", None)
         intent = intent if isinstance(intent, dict) else {}
@@ -16915,6 +16940,10 @@ class MythicTools:
         if not credential:
             if carried:
                 logger.info("krbtgt forge input: a key carried by the request is not a proved krbtgt-hash; dropped")
+            if pinned_task:
+                inputs["credential_proof_task_id"] = pinned_task
+            if pinned_id:
+                inputs["credential_id"] = pinned_id
             return
         inputs["key"] = credential["credential"]
         inputs["key_type"] = credential["key_type"]
@@ -16934,17 +16963,50 @@ class MythicTools:
         missing_items = [str(item) for item in (missing or [])]
         if capability not in self._KRBTGT_FORGE_CAPABILITIES or "key" not in missing_items:
             return ""
-        domain = self._capability_text(
-            inputs.get("source_domain") or self._capability_domain(action, inputs)
-        ).casefold() or "unknown-domain"
+        if capability == "forge-golden-ticket":
+            try:
+                from . import capabilities
+            except ImportError:
+                import capabilities
+            domain = capabilities.forge_ticket_domain(action, inputs)
+        else:
+            domain = self._capability_text(inputs.get("source_domain") or self._capability_domain(action, inputs))
+        domain = domain.casefold() or "unknown-domain"
         others = [item for item in missing_items if item != "key"]
         also = f" It also lacks: {', '.join(others)}." if others else ""
+        pinned = [f"{label} {value}" for label, value in (
+            ("proof task", self._capability_text(inputs.get("credential_proof_task_id"))),
+            ("credential", self._capability_text(inputs.get("credential_id"))),
+        ) if value]
+        # "No forge was issued": checks that ran before the build may have issued their own tasks, which the
+        # result's `issued` list reports.
+        if pinned:
+            # A reference left unbound is one the executor could not resolve (see `_bind_proved_krbtgt_key`).
+            return (
+                f"`{capability}`: the krbtgt credential reference it names ({', '.join(pinned)}) no longer resolves "
+                f"to a proved `krbtgt-hash:{domain}` key. Sage forges only from the referenced credential. To use the "
+                "current proved key, propose the step again without that reference; in supervised mode that needs a "
+                f"new approval.{also} No forge was issued."
+            )
         return (
             f"`{capability}` has no proved `krbtgt-hash:{domain}`. Sage forges only from a krbtgt key a Mythic task "
             "produced: a verified dcsync, or a credential an agent reported from a completed task. A key typed into "
             "the request or the credential store, or read from another task's output, is not proof."
-            f"{also} Nothing was issued."
+            f"{also} No forge was issued."
         )
+
+    def _unresolved_krbtgt_reference(self, action, inputs: dict) -> bool:
+        """True when a krbtgt forge names a credential reference that `_bind_proved_krbtgt_key` could not resolve.
+
+        Such a call stops before any task is issued. Without its key, `ensure-kerberos-context` would run its
+        refresh plan instead of the forge its card showed, and a forge has no referenced key to forge from.
+        """
+        capability = self._capability_text(getattr(action, "name", "")).casefold()
+        if capability not in self._KRBTGT_FORGE_CAPABILITIES:
+            return False
+        pinned = (self._capability_text(inputs.get("credential_proof_task_id"))
+                  or self._capability_text(inputs.get("credential_id")))
+        return bool(pinned) and not self._capability_has_ticket_key(inputs)
 
     def _drop_card_secret_inputs(self, inputs: dict, *mappings: Any) -> None:
         """Remove ticket-key values from what an approval card carries once Sage bound a proved key by reference.

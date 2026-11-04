@@ -568,12 +568,14 @@ def _assert_no_forge(mt, inputs: dict, action: dict | None = None):
     assert message.tool_calls == [], message.tool_calls
     # The worker is told the missing proof and that nothing ran, not invited to supply a key that is not proof.
     note = str(message.content)
-    assert "proved `krbtgt-hash:lab.local`" in note and "nothing was issued" in note.casefold(), note
+    assert "proved `krbtgt-hash:lab.local`" in note and "no forge was issued" in note.casefold(), note
     assert "supply that input" not in note.casefold(), note
     result, calls = _forge_from(mt, inputs, action)
     assert _rubeus_issues(calls) == [], result
     assert result["verdict"] != "achieved"
     assert "proved `krbtgt-hash:lab.local`" in result["reason"], result["reason"]
+    assert "no forge was issued" in result["reason"].casefold(), result["reason"]
+    assert "nothing was issued" not in result["reason"].casefold(), result["reason"]
 
 
 TYPED_KEY = "e" * 64
@@ -662,3 +664,179 @@ def test_an_unadmitted_predecessor_never_reaches_a_forge(monkeypatch, tmp_path, 
 
     assert [row for row in store["rows"] if row["realm"] == "lab.local"] == []
     _assert_no_forge(mt, {})
+
+
+# --- an approval binds one credential; a forge binds the key for the domain it forges ---------------------------
+#
+# An approved card names a credential and its proof task. The executor resolves that key again after approval and
+# runs more than one binding pass over the same inputs, so every pass must refuse a reference that no longer
+# resolves; a later pass may not substitute whatever key is current. The forge plan issues the ticket in its source
+# (krbtgt) domain; the key and domain SID bound for it must be that domain's, even when the request also names the
+# domain it wants the ticket for.
+
+def _add_reported_krbtgt(store, *, row_id, realm, key, task_id):
+    store["rows"].append({"id": row_id, "account": "krbtgt", "realm": realm, "type": "key",
+                          "credential_text": key, "comment": "reported by the agent",
+                          "task": {"display_id": task_id, "status": "completed", "completed": True,
+                                   "command_name": "dcsync", "callback": {"display_id": 13}}})
+
+
+def _assert_stale_reference_refused(result, calls, stale_key=None):
+    assert calls.get("issued", []) == [] and result["issued"] == [], result  # it stops before any task
+    assert result["verdict"] != "achieved"
+    reason = result["reason"]
+    assert "krbtgt credential reference" in reason and "no longer resolves" in reason, reason
+    assert "new approval" in reason and "no forge was issued" in reason.casefold(), reason
+    assert "has no proved" not in reason, reason  # a proved key exists; it is not the referenced one
+    assert KRBTGT_KEY not in json.dumps(result)
+    if stale_key:
+        assert stale_key not in json.dumps(result)
+
+
+@pytest.mark.parametrize("pin", [
+    {"credential_proof_task_id": "99"},
+    {"credential_id": 9999},
+    {"credential_proof_task_id": "99", "credential_id": 9999},
+], ids=["proof-task", "credential-id", "both"])
+def test_an_approved_reference_that_no_longer_resolves_forges_nothing(monkeypatch, tmp_path, pin):
+    mt, store = _krbtgt_tools(monkeypatch, tmp_path)
+    _prove_krbtgt(mt, store)  # task 21 proves a key: the current one, but not the one approved
+
+    result, calls = _forge_from(mt, dict(pin))
+
+    _assert_stale_reference_refused(result, calls)
+
+
+def test_a_key_proved_after_approval_is_not_the_approved_key(monkeypatch, tmp_path):
+    mt, store = _krbtgt_tools(monkeypatch, tmp_path)
+    _prove_krbtgt(mt, store)
+    [call] = _ground_forge(mt).tool_calls
+    approved = call["args"]["inputs"]
+    assert str(approved["credential_proof_task_id"]) == "21"
+    rotated = "b" * 64
+    store["rows"][:] = [row for row in store["rows"] if row["type"] != "key"]
+    _add_reported_krbtgt(store, row_id=702, realm="lab.local", key=rotated, task_id=30)
+
+    result, calls = _forge_from(mt, approved, call["args"]["action"])
+
+    _assert_stale_reference_refused(result, calls, stale_key=rotated)
+
+
+@pytest.mark.parametrize("pin", [{"credential_proof_task_id": "99"}, {"credential_proof_task_id": "21"}, {}],
+                         ids=["stale", "matching", "unpinned"])
+def test_binding_the_same_inputs_again_binds_the_same_key(monkeypatch, tmp_path, pin):
+    import capabilities
+
+    mt, store = _krbtgt_tools(monkeypatch, tmp_path)
+    _prove_krbtgt(mt, store)
+    inputs = dict(pin)
+    action = mt._capability_tool_action(dict(FORGE), inputs, capabilities)
+
+    bound = []
+    for _ in range(3):  # the card, the executor, and its command build each bind the same inputs
+        asyncio.run(mt._augment_capability_runtime_inputs(action, inputs))
+        bound.append((inputs.get("key"), str(inputs.get("credential_proof_task_id") or "")))
+
+    expected_key = None if pin.get("credential_proof_task_id") == "99" else KRBTGT_KEY
+    expected_task = pin.get("credential_proof_task_id") or "21"
+    assert bound == [(expected_key, expected_task)] * 3
+
+
+PARENT_KEY = "a" * 64
+LAB_SID, PARENT_SID = "S-1-5-21-1-2-3", "S-1-5-21-9-9-9"
+
+
+def _two_domain_tools(monkeypatch, tmp_path):
+    mt, store = _krbtgt_tools(monkeypatch, tmp_path)
+    sids = {"lab.local": LAB_SID, "parent.local": PARENT_SID}
+    mt._resolve_domain_sid = lambda domain: asyncio.sleep(0, result=sids.get(str(domain).casefold(), ""))
+    return mt, store
+
+
+def test_a_forge_for_its_source_domain_binds_that_domains_key_and_sid(monkeypatch, tmp_path):
+    mt, store = _two_domain_tools(monkeypatch, tmp_path)
+    _prove_krbtgt(mt, store)  # lab.local key, task 21
+    _add_reported_krbtgt(store, row_id=701, realm="parent.local", key=PARENT_KEY, task_id=24)
+    request = {"domain": "parent.local", "source_domain": "lab.local", "extra_sids": [f"{PARENT_SID}-519"]}
+
+    [call] = _ground_forge(mt, request).tool_calls
+
+    inputs = call["args"]["inputs"]
+    assert str(inputs["credential_proof_task_id"]) == "21" and inputs["credential_id"] != 701
+    assert inputs["domain_sid"] == LAB_SID
+    assert PARENT_KEY not in json.dumps(call) and KRBTGT_KEY not in json.dumps(call)
+
+    _, calls = _forge_from(mt, inputs, call["args"]["action"])
+
+    [forge] = _rubeus_issues(calls)
+    assert "/domain:lab.local" in forge and f"/sid:{LAB_SID} " in forge, forge
+    assert f"/aes256:{KRBTGT_KEY}" in forge and PARENT_KEY not in forge, forge
+    assert f"/sids:{PARENT_SID}-519" in forge, forge
+
+
+@pytest.mark.parametrize("inputs, action", [
+    ({"domain": "parent.local", "source_domain": "lab.local", "extra_sids": [f"{PARENT_SID}-519"]}, None),
+    ({"domain": "parent.local"}, {"capability": "forge-golden-ticket", "target": "domain=lab.local", "callback_id": "13"}),
+], ids=["source-domain-input", "action-target-domain"])
+def test_another_domains_key_never_forges_the_source_domain(monkeypatch, tmp_path, inputs, action):
+    mt, store = _two_domain_tools(monkeypatch, tmp_path)
+    mt._engagement_hops = []
+    _add_reported_krbtgt(store, row_id=701, realm="parent.local", key=PARENT_KEY, task_id=24)
+
+    _assert_no_forge(mt, inputs, action)
+
+
+def test_an_approved_reference_that_no_longer_resolves_issues_nothing_under_the_approval(monkeypatch, tmp_path):
+    mt, store = _krbtgt_tools(monkeypatch, tmp_path)
+    _prove_krbtgt(mt, store)
+    [call] = _ground_forge(mt).tool_calls
+    action, approved = dict(call["args"]["action"]), {**call["args"]["inputs"], "timeout": 5}
+    store["rows"][:] = [row for row in store["rows"] if row["type"] != "key"]
+    _add_reported_krbtgt(store, row_id=702, realm="lab.local", key="b" * 64, task_id=30)
+    _install_supervised_claim(mt, action, approved)
+
+    calls: dict = {}
+    with _split_issue(lambda: "ok", calls, display_id=lambda: 30 + len(calls.get("issued", []))):
+        result = json.loads(asyncio.run(mt.execute_capability(action, approved)))
+
+    _assert_stale_reference_refused(result, calls, stale_key="b" * 64)
+
+
+EKC = {"capability": "ensure-kerberos-context", "domain": "lab.local", "callback_id": "13"}
+
+
+def test_a_kerberos_context_card_never_carries_a_reference_that_no_longer_resolves(monkeypatch, tmp_path):
+    mt, store = _krbtgt_tools(monkeypatch, tmp_path)
+    _prove_krbtgt(mt, store)
+
+    message = _ground_forge(mt, {"credential_proof_task_id": "99"}, dict(EKC))
+
+    assert message.tool_calls == [], message.tool_calls  # its card would show a forge the executor cannot run
+    note = str(message.content)
+    assert "no longer resolves" in note and "no forge was issued" in note.casefold(), note
+
+
+def test_a_kerberos_context_whose_approved_key_is_gone_runs_no_other_plan(monkeypatch, tmp_path):
+    mt, store = _krbtgt_tools(monkeypatch, tmp_path)
+    _prove_krbtgt(mt, store)
+    [call] = _ground_forge(mt, None, dict(EKC)).tool_calls
+    approved = call["args"]["inputs"]
+    assert str(approved["credential_proof_task_id"]) == "21"
+    store["rows"][:] = [row for row in store["rows"] if row["type"] != "key"]
+    _add_reported_krbtgt(store, row_id=702, realm="lab.local", key="b" * 64, task_id=30)
+
+    result, calls = _forge_from(mt, approved, call["args"]["action"])
+
+    _assert_stale_reference_refused(result, calls, stale_key="b" * 64)  # no refresh plan, no ticket purge
+
+
+def test_a_refused_forge_never_says_its_earlier_checks_did_not_run(monkeypatch, tmp_path):
+    mt, _ = _krbtgt_tools(monkeypatch, tmp_path)
+    mt._engagement_hops = []
+
+    result, calls = _forge_from(mt, {})
+
+    assert _rubeus_issues(calls) == []
+    assert result["issued"], result  # the context checks ahead of the build issued their own tasks
+    assert "nothing was issued" not in result["reason"].casefold(), result["reason"]
+    assert "no forge was issued" in result["reason"].casefold(), result["reason"]

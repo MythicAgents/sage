@@ -3280,20 +3280,29 @@ def _build_dcsync_krbtgt_execution_plan(
     )
 
 
-def _build_forge_golden_ticket_execution_plan(
-    action: CapabilityAction,
-    inputs: dict[str, Any],
-) -> CapabilityExecutionPlan:
+def forge_ticket_domain(action: CapabilityAction, inputs: dict[str, Any]) -> str:
+    """The domain a forged ticket is issued in: its krbtgt (source) domain.
+
+    A distinct `domain` alongside `source_domain` names the requested target, which the action target carries as
+    `target_domain`. The forge plan and the krbtgt key and domain SID bound for it all resolve the domain here, so
+    the key is never chosen for one domain while the ticket is forged in another.
+    """
     fields = _target_fields(action.target)
-    # The ticket's own domain is the krbtgt (source) domain. A distinct `domain` alongside `source_domain`
-    # names the requested target, which the action target carries as `target_domain`.
-    domain = _normalize(
+    return _normalize(
         _input_text(inputs, "source_domain")
         or action.intent.get("source_domain")
         or fields.get("domain")
         or _input_text(inputs, "domain")
         or action.intent.get("domain")
     )
+
+
+def _build_forge_golden_ticket_execution_plan(
+    action: CapabilityAction,
+    inputs: dict[str, Any],
+) -> CapabilityExecutionPlan:
+    fields = _target_fields(action.target)
+    domain = forge_ticket_domain(action, inputs)
     user = _input_text(inputs, "user", "account", "ticket_user") or \
         _text(action.intent.get("user") or action.intent.get("account") or "Administrator")
     domain_sid = _input_text(inputs, "domain_sid", "sid")
