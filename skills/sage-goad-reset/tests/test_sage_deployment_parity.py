@@ -361,3 +361,214 @@ def test_stop_all_with_nothing_running_stops_nothing(monkeypatch, capsys):
 
     assert sage_deployment.main(["stop-all"]) == 0
     assert stopped == []
+
+
+# --- Published mode: the GHCR image named in config.json, running the image's own code -----------------
+
+def test_published_image_is_the_tag_config_json_names():
+    image = sage_deployment._published_image()
+    config = json.loads((sage_deployment.REPO_ROOT / "config.json").read_text(encoding="utf-8"))
+    assert image == config["remote_images"]["sage"]
+    assert image.startswith("ghcr.io/")
+
+
+def test_published_mode_points_mythic_at_the_remote_image_and_keeps_the_bind_mount(tmp_path, monkeypatch):
+    """D1: the bind mount stays (databases on the host, never in a volume `mythic-cli start` deletes)."""
+    log = _fake_mythic(
+        tmp_path, monkeypatch, image_present=True,
+        env_lines='SAGE_USE_BUILD_CONTEXT="true"\nSAGE_USE_VOLUME="false"\nSAGE_REMOTE_IMAGE="ghcr.io/mythicagents/sage:0.2.0"\n',
+    )
+    result = sage_deployment._ensure_mythic_settings("published")
+
+    assert result["returncode"] == 0, result
+    image = sage_deployment._published_image()
+    assert [call[1] for call in _calls(log) if call[0] == "cli"] == [
+        "config set sage_use_build_context false",
+        f"config set sage_remote_image {image}",
+        "add sage",
+    ]
+
+
+def test_published_code_replaces_the_installed_code_but_keeps_operator_and_runtime_files(tmp_path, monkeypatch):
+    """The image's /Mythic must become what runs, while the installed copy keeps what the operator and the
+    runtime own there: .env, databases, the engagement ledger, the TLS bundle and the tool binaries."""
+    installed = tmp_path / "mythic" / "InstalledServices" / "sage"
+    (installed / "ai").mkdir(parents=True)
+    (installed / "ai" / "model.py").write_text("working tree version\n")
+    (installed / "ai" / "only_in_working_tree.py").write_text("x\n")
+    (installed / ".env").write_text("BLOODHOUND_TOKEN_ID=keep\n")
+    (installed / "sage.db").write_text("live db")
+    (installed / ".sage_engagement").mkdir()
+    (installed / ".sage_engagement" / "state.json").write_text("{}")
+    (installed / "certs").mkdir()
+    (installed / "certs" / "bundle.pem").write_text("operator CA")
+    extracted = tmp_path / "extracted"
+    (extracted / "ai").mkdir(parents=True)
+    (extracted / "ai" / "model.py").write_text("published version\n")
+    (extracted / "certs").mkdir()
+    (extracted / "tools").mkdir()
+    (extracted / "tools" / ".keep").write_text("")
+    working_tools = tmp_path / "worktree-sage" / "tools"
+    working_tools.mkdir(parents=True)
+    (working_tools / "Rubeus.exe").write_bytes(b"MZ")
+    monkeypatch.setattr(sage_deployment, "_installed_service_dir", lambda: installed)
+    monkeypatch.setattr(sage_deployment, "_payload_source_dir", lambda: working_tools.parent)
+
+    result = sage_deployment._sync_published_code(extracted)
+
+    assert result["returncode"] == 0, result
+    assert (installed / "ai" / "model.py").read_text() == "published version\n"
+    assert not (installed / "ai" / "only_in_working_tree.py").exists()
+    assert (installed / ".env").read_text() == "BLOODHOUND_TOKEN_ID=keep\n"
+    assert (installed / "sage.db").read_text() == "live db"
+    assert (installed / ".sage_engagement" / "state.json").exists()
+    assert (installed / "certs" / "bundle.pem").read_text() == "operator CA"
+    assert (installed / "tools" / "Rubeus.exe").read_bytes() == b"MZ"
+
+
+def _published_docker(tmp_path: Path, monkeypatch, *, running_image: str, image_id: str,
+                      container_digest: str, image_digest: str, started: str = "2099-01-01T00:00:00Z") -> Path:
+    log = tmp_path / "docker.log"
+    bin_dir = tmp_path / "pbin"
+    bin_dir.mkdir()
+    (bin_dir / "docker").write_text(
+        "#!/usr/bin/env bash\n"
+        'printf "%s\\n" "$*" >> "$PUB_LOG"\n'
+        'case "$1" in\n'
+        f'  image) echo "{image_id}" ;;\n'
+        '  inspect) if [[ "$*" == *StartedAt* ]]; then echo "$PUB_STARTED"; else echo "$PUB_RUNNING_IMAGE"; fi ;;\n'
+        f'  exec) echo "{container_digest} 3 1.0" ;;\n'
+        f'  run) echo "{image_digest} 3 1.0" ;;\n'
+        "esac\n",
+        encoding="utf-8",
+    )
+    (bin_dir / "docker").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{__import__('os').environ['PATH']}")
+    monkeypatch.setenv("PUB_LOG", str(log))
+    monkeypatch.setenv("PUB_RUNNING_IMAGE", running_image)
+    monkeypatch.setenv("PUB_STARTED", started)
+    return log
+
+
+def test_published_identity_holds_when_the_running_image_and_code_are_the_tags(tmp_path, monkeypatch):
+    log = _published_docker(tmp_path, monkeypatch, running_image="sha256:pub", image_id="sha256:pub",
+                            container_digest="d1", image_digest="d1")
+    result = sage_deployment._published_parity("ghcr.io/mythicagents/sage:0.3.0")
+
+    assert result["ready"] is True, result
+    # The image's own code is read from a throwaway container with no network and no bind mount.
+    run = next(line for line in log.read_text().splitlines() if line.startswith("run "))
+    assert "--network none" in run and "--rm" in run and "-v" not in run.split()
+
+
+@pytest.mark.parametrize("running_image, container_digest, needle", [
+    ("sha256:local-build", "d1", "not the published image"),
+    ("sha256:pub", "d-working-tree", "differs from the published image's code"),
+])
+def test_published_identity_fails_on_another_image_or_shadowing_code(tmp_path, monkeypatch, running_image,
+                                                                      container_digest, needle):
+    """A local build still tagged in compose, or the working tree left in the bind mount, would otherwise
+    pass as "published" — the exact confusion the 2026-11-03 investigation found."""
+    _published_docker(tmp_path, monkeypatch, running_image=running_image, image_id="sha256:pub",
+                      container_digest=container_digest, image_digest="d1")
+    result = sage_deployment._published_parity("ghcr.io/mythicagents/sage:0.3.0")
+
+    assert result["ready"] is False
+    assert any(needle in blocker for blocker in result["blockers"]), result
+
+
+def test_published_deploy_pulls_and_extracts_before_changing_anything(monkeypatch, capsys):
+    calls: list[str] = []
+
+    def record(name, result):
+        def _fn(*a, **k):
+            calls.append(name)
+            return result
+        return _fn
+
+    monkeypatch.setattr(sage_deployment, "_mythic_dir", lambda: Path("/opt/mythic"))
+    monkeypatch.setattr(sage_deployment, "_pull_image", record("pull", {"returncode": 0}))
+    monkeypatch.setattr(sage_deployment, "_extract_image_code", record("extract", {"returncode": 0}))
+    monkeypatch.setattr(sage_deployment, "_ensure_mythic_settings", record("settings", {"returncode": 0}))
+    monkeypatch.setattr(sage_deployment, "_sync_published_code", record("sync", {"returncode": 0}))
+    monkeypatch.setattr(sage_deployment, "_sync_into_mythic", record("working-tree-sync", {"returncode": 0}))
+    monkeypatch.setattr(sage_deployment, "_stop_local", record("stop_local", {"returncode": 0}))
+    monkeypatch.setattr(sage_deployment, "_start_container", record("start", {"returncode": 0}))
+    monkeypatch.setattr(sage_deployment, "_published_parity", record("identity", {"ready": True, "blockers": []}))
+    monkeypatch.setattr(sage_deployment.readiness_contract, "sage_deployment_status",
+                        lambda **kw: {"local_process_running": True, "blockers": [], "ready": True})
+
+    assert sage_deployment.main(["deploy", "--mode", "published"]) == 0
+    assert calls == ["pull", "extract", "settings", "sync", "stop_local", "start", "identity"], calls
+
+
+def test_enforce_published_stops_a_running_local_sage(monkeypatch, capsys):
+    running = {"container": True, "local": True}
+    stopped = _running_world(monkeypatch, running)
+
+    assert sage_deployment.main(["enforce", "--mode", "published"]) == 0
+    assert stopped == ["local"]
+
+
+def test_published_identity_blocks_when_the_start_time_is_unreadable(tmp_path, monkeypatch):
+    _published_docker(tmp_path, monkeypatch, running_image="sha256:pub", image_id="sha256:pub",
+                      container_digest="d1", image_digest="d1", started="not-a-time")
+    result = sage_deployment._published_parity("ghcr.io/mythicagents/sage:0.3.0")
+
+    assert result["ready"] is False
+    assert any("start time" in blocker for blocker in result["blockers"]), result
+
+
+def test_extract_copies_from_a_created_container_and_always_removes_it(tmp_path, monkeypatch):
+    log = tmp_path / "docker.log"
+    bin_dir = tmp_path / "xbin"
+    bin_dir.mkdir()
+    (bin_dir / "docker").write_text(
+        "#!/usr/bin/env bash\n"
+        'printf "%s\\n" "$*" >> "$X_LOG"\n'
+        '[[ "$1" == "cp" && "${X_CP_FAIL-0}" == 1 ]] && exit 1\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    (bin_dir / "docker").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{__import__('os').environ['PATH']}")
+    monkeypatch.setenv("X_LOG", str(log))
+
+    ok = sage_deployment._extract_image_code("ghcr.io/x/sage:1", tmp_path / "out")
+    monkeypatch.setenv("X_CP_FAIL", "1")
+    failed = sage_deployment._extract_image_code("ghcr.io/x/sage:1", tmp_path / "out")
+
+    calls = log.read_text().splitlines()
+    assert ok["returncode"] == 0 and failed["returncode"] != 0
+    assert calls[0].startswith("create --name sage-published-extract-") and calls[0].endswith(" ghcr.io/x/sage:1")
+    assert calls[1].endswith(f":/Mythic/. {tmp_path / 'out'}")
+    assert sum(line.startswith("rm -f sage-published-extract-") for line in calls) == 2, calls
+    assert not any(line.startswith(("start", "run")) for line in calls)
+
+
+def test_a_failed_pull_changes_nothing(monkeypatch, capsys):
+    calls: list[str] = []
+    monkeypatch.setattr(sage_deployment, "_mythic_dir", lambda: Path("/opt/mythic"))
+    monkeypatch.setattr(sage_deployment, "_pull_image", lambda image: calls.append("pull") or {"returncode": 1})
+    for name in ("_extract_image_code", "_ensure_mythic_settings", "_sync_published_code", "_stop_local",
+                 "_start_container"):
+        monkeypatch.setattr(sage_deployment, name, lambda *a, _n=name, **k: calls.append(_n) or {"returncode": 0})
+
+    assert sage_deployment.main(["deploy", "--mode", "published"]) == 1
+    assert calls == ["pull"]
+
+
+def test_published_sync_keeps_the_installed_directory_permissions(tmp_path, monkeypatch):
+    """The scratch directory is created 0700; rsync -a would copy that mode onto the installed copy."""
+    installed = tmp_path / "installed"
+    installed.mkdir()
+    installed.chmod(0o775)
+    extracted = tmp_path / "extracted"
+    extracted.mkdir()
+    extracted.chmod(0o700)
+    (extracted / "main.py").write_text("run()\n")
+    monkeypatch.setattr(sage_deployment, "_installed_service_dir", lambda: installed)
+    monkeypatch.setattr(sage_deployment, "_payload_source_dir", lambda: tmp_path / "no-worktree")
+
+    assert sage_deployment._sync_published_code(extracted)["returncode"] == 0
+    assert (installed.stat().st_mode & 0o777) == 0o775

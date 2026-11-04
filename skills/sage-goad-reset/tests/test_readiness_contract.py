@@ -872,3 +872,37 @@ def test_container_identity_runs_the_real_parity_and_reports_its_failure(tmp_pat
 
     assert status["ready"] is False and status["source"] == "container-parity"
     assert any("No such container" in b for b in status["blockers"]), status
+
+
+
+def test_published_identity_comes_from_the_image_check(tmp_path):
+    status = MODULE.runtime_identity_status(
+        mode="published", identity_path=tmp_path / "absent.json",
+        published_probe=lambda: {"ready": False, "blockers": ["the running container is not the published image"]},
+    )
+    assert status["source"] == "published-image" and status["ready"] is False
+    assert MODULE.sage_deployment_status(mode="published", container_running=True, local_running=False)["ready"]
+
+
+def test_published_runtime_databases_are_the_installed_copy(tmp_path, monkeypatch):
+    mythic = tmp_path / "mythic"
+    installed = mythic / "InstalledServices" / "sage"
+    installed.mkdir(parents=True)
+    (installed / "sage.db").write_text("")
+    monkeypatch.setenv("MYTHIC_ENV_PATH", str(mythic / ".env"))
+
+    status = MODULE.runtime_databases_status(tmp_path, mode="published")
+    assert status["existing_required"] == [str(installed / "sage.db")]
+
+
+
+def test_published_identity_keeps_the_image_evidence(tmp_path):
+    status = MODULE.runtime_identity_status(
+        mode="published", identity_path=tmp_path / "absent.json",
+        published_probe=lambda: {"ready": True, "blockers": [], "image": "ghcr.io/x/sage:1",
+                                 "image_id": "sha256:a", "running_image_id": "sha256:a",
+                                 "image_digest": "d", "container_digest": "d"},
+    )
+    assert status["ready"] is True
+    assert (status["image"], status["image_id"], status["running_image_id"], status["image_digest"]) == (
+        "ghcr.io/x/sage:1", "sha256:a", "sha256:a", "d")

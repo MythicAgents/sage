@@ -151,7 +151,7 @@ INPUT_KEYS = {
 }
 #: Which Sage the reset brings back: the tmux process on the working tree, or the Mythic container
 #: built from it. Persisted so a resume restarts the same one.
-DEPLOYMENT_MODES = ("local", "container")
+DEPLOYMENT_MODES = ("local", "container", "published")
 SECRET_KEY = re.compile(
     r"(?:password|secret|token|api[_-]?key|credential)",
     flags=re.IGNORECASE,
@@ -278,7 +278,7 @@ def _config_from_args(args: argparse.Namespace) -> dict[str, Any]:
         if getattr(args, "command", None) == "start":
             raise ResetError(
                 "starting a reset needs the deployment mode: pass --deployment-mode or set "
-                "SAGE_DEPLOYMENT_MODE to local (tmux) or container. A guessed mode stops or restarts "
+                "SAGE_DEPLOYMENT_MODE to local (tmux), container or published. A guessed mode stops or restarts "
                 "the wrong Sage."
             )
         deployment_mode = "local"
@@ -362,11 +362,11 @@ def _phase_commands(config: dict[str, Any]) -> dict[str, list[str]]:
             bootstrap.extend(["--download-dir", config["download_dir"]])
 
     deployment = [str(PYTHON), str(RESET_DIR / "scripts" / "sage_deployment.py")]
-    if config["deployment_mode"] == "container":
-        # Sync the working tree into Mythic's installed copy and start the container from the image
-        # already built; `restart_env` does not apply (the container reads the installed .env and the
-        # chat channel's configuration).
-        restart = [*deployment, "deploy", "--mode", "container"]
+    if config["deployment_mode"] in ("container", "published"):
+        # container: sync the working tree into Mythic's installed copy and start from the image already
+        # built. published: pull config.json's image and run its own code. `restart_env` does not apply
+        # to either (the container reads the installed .env and the chat channel's configuration).
+        restart = [*deployment, "deploy", "--mode", config["deployment_mode"]]
     else:
         restart = [
             "/bin/bash",
@@ -407,7 +407,7 @@ def _phase_commands(config: dict[str, Any]) -> dict[str, list[str]]:
                 if config["mythic_env_path"]
                 else []
             ),
-            *(["--target", "installed"] if config["deployment_mode"] == "container" else []),
+            *(["--target", "installed"] if config["deployment_mode"] != "local" else []),
         ],
         "reset-mythic": [
             "/bin/bash",

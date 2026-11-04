@@ -16,8 +16,10 @@ workflow uses (see `AGENTS.md`: Sage runs locally in the `sage` tmux session).
   check     report status; exit 0 when exactly the intended Sage is up
   enforce   stop the unintended side, then re-check (needs an explicit mode)
   stop-all  stop every Sage, local and container (the reset's first phase)
-  parity    report whether the container is running the working tree (container mode only)
-  deploy    sync the working tree into Mythic, start the container from it, then prove parity
+  parity    container: is it running the working tree? published: is it the config.json image running
+            that image's own code?
+  deploy    container: sync the working tree, start the container from it, prove parity.
+            published: pull config.json's image, install its own code, start it, prove its identity
 
 ## Why `deploy` and `parity` exist
 
@@ -50,6 +52,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -298,11 +301,28 @@ def _seed_missing_env_files(source: Path, destination: Path) -> list:
     return seeded
 
 
-#: Mythic settings each container mode needs. `container` builds the image from the installed copy
-#: of the working tree and bind-mounts that copy over /Mythic/, so the code that runs is the synced code.
-_MYTHIC_SETTINGS = {
-    "container": (("sage_use_build_context", "true"), ("sage_use_volume", "false")),
-}
+def _published_image() -> str:
+    """The image `mythic-cli install` would pull for this version: config.json's remote_images entry."""
+    config = json.loads((REPO_ROOT / "config.json").read_text(encoding="utf-8"))
+    image = str((config.get("remote_images") or {}).get(readiness_contract.SAGE_CONTAINER_NAME) or "").strip()
+    if not image:
+        raise SystemExit("ERR: config.json has no remote_images.sage entry")
+    return image
+
+
+def _mythic_settings(mode: str) -> tuple[tuple[str, str], ...]:
+    """Mythic settings each container mode needs.
+
+    Both keep `sage_use_volume=false`, so Mythic bind-mounts the installed directory over /Mythic/ and
+    the databases stay on the host. (A volume would hold them instead, and `mythic-cli start` without
+    --keep-volume deletes it under REBUILD_ON_START.) `container` builds the image from the installed
+    copy of the working tree; `published` uses config.json's image, and `deploy` copies that image's own
+    code into the installed directory so the bind mount does not shadow it with the working tree.
+    """
+    if mode == "published":
+        return (("sage_use_build_context", "false"), ("sage_remote_image", _published_image()),
+                ("sage_use_volume", "false"))
+    return (("sage_use_build_context", "true"), ("sage_use_volume", "false"))
 
 #: Sage's own .env carries Docker hostnames valid only inside the container; they poison host-side
 #: mythic-cli and docker compose (the same reason mythic_reset.sh strips them).
@@ -359,8 +379,8 @@ def _ensure_mythic_settings(mode: str) -> dict:
     """
     def mismatched() -> list[tuple[str, str]]:
         current = _mythic_env_values()
-        return [(key, value) for key, value in _MYTHIC_SETTINGS[mode]
-                if current.get(key, "").strip().strip("'\"").casefold() != value]
+        return [(key, value) for key, value in _mythic_settings(mode)
+                if current.get(key, "").strip().strip("'\"").casefold() != value.casefold()]
 
     changed = mismatched()
     actions = []
@@ -393,7 +413,125 @@ def _image_present(image: str) -> bool:
     return result.returncode == 0
 
 
-def _start_container(*, rebuild: bool = False) -> dict:
+def _pull_image(image: str) -> dict:
+    result = subprocess.run(["docker", "pull", image], env=_host_side_env(), capture_output=True,
+                            text=True, timeout=1800, check=False)
+    return {"action": "pull-published-image", "image": image, "returncode": result.returncode,
+            "stderr_tail": result.stderr.strip()[-400:]}
+
+
+def _extract_image_code(image: str, destination: Path) -> dict:
+    """Copy the image's own /Mythic/ out of a created (never started) container with no mounts."""
+    name = f"sage-published-extract-{os.getpid()}"
+    created = subprocess.run(["docker", "create", "--name", name, image], capture_output=True, text=True,
+                             timeout=300, check=False)
+    if created.returncode != 0:
+        return {"action": "extract-published-code", "returncode": created.returncode,
+                "stderr_tail": created.stderr.strip()[-400:]}
+    try:
+        copied = subprocess.run(["docker", "cp", f"{name}:/Mythic/.", str(destination)], capture_output=True,
+                                text=True, timeout=900, check=False)
+    finally:
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True, timeout=120, check=False)
+    return {"action": "extract-published-code", "returncode": copied.returncode,
+            "stderr_tail": copied.stderr.strip()[-400:]}
+
+
+#: Operator-owned directories in the installed copy. The image ships them empty (.dockerignore), so
+#: mirroring the image's /Mythic/ with --delete would remove the operator's TLS bundle and tools.
+_OPERATOR_DIRS = ("certs", "tools")
+
+
+def _sync_published_code(extracted: Path) -> dict:
+    """Make the installed copy run the image's code while keeping what the operator and runtime own.
+
+    Same excludes as the working-tree sync (databases, .env, engagement evidence), plus the operator
+    directories, which are then refreshed from the working tree exactly as a container deploy would.
+    """
+    destination = _installed_service_dir()
+    # rsync -a copies the source directory's own mode onto the destination; the scratch directory is
+    # 0700, which would lock group and other users out of the installed service directory.
+    Path(extracted).chmod(destination.stat().st_mode & 0o7777)
+    command = ["rsync", "-a", "--delete"]
+    for pattern in (*_SYNC_EXCLUDES, *(f"{name}/" for name in _OPERATOR_DIRS)):
+        command += ["--exclude", pattern]
+    result = subprocess.run([*command, f"{Path(extracted)}/", f"{destination}/"], capture_output=True,
+                            text=True, timeout=1800, check=False)
+    steps = [{"action": "sync-published-code", "returncode": result.returncode,
+              "stderr_tail": result.stderr.strip()[-400:]}]
+    for name in _OPERATOR_DIRS:
+        source = _payload_source_dir() / name
+        if result.returncode == 0 and source.is_dir():
+            copied = subprocess.run(["rsync", "-a", f"{source}/", f"{destination / name}/"], capture_output=True,
+                                    text=True, timeout=600, check=False)
+            steps.append({"action": f"copy-operator-{name}", "returncode": copied.returncode,
+                          "stderr_tail": copied.stderr.strip()[-400:]})
+    seeded = _seed_missing_env_files(_payload_source_dir(), destination) if result.returncode == 0 else []
+    return {"action": "sync-published-code", "returncode": max(step["returncode"] for step in steps),
+            "seeded_env_files": seeded, "steps": steps}
+
+
+def _published_parity(image: str) -> dict:
+    """Is the serving container the published image, running that image's own code?
+
+    Three ways to answer no: the container runs a different image (a local build still named in the
+    compose entry); the bind-mounted code differs from the code baked into the image (a working tree
+    left in the installed copy); or the files are newer than the process that imported them.
+    """
+    name = readiness_contract.SAGE_CONTAINER_NAME
+    blockers: list[str] = []
+    image_id = subprocess.run(["docker", "image", "inspect", "--format", "{{.Id}}", image],
+                              capture_output=True, text=True, timeout=60, check=False)
+    running = subprocess.run(["docker", "inspect", "-f", "{{.Image}}", name],
+                             capture_output=True, text=True, timeout=60, check=False)
+    if image_id.returncode != 0:
+        blockers.append(f"the published image {image} is not present locally; pull it")
+    if running.returncode != 0:
+        blockers.append("the Sage container is not running")
+    elif image_id.returncode == 0 and running.stdout.strip() != image_id.stdout.strip():
+        blockers.append(f"the running container is not the published image {image}")
+
+    image_digest = container_digest = None
+    if image_id.returncode == 0:
+        baked = subprocess.run(
+            ["docker", "run", "--rm", "--network", "none", "--entrypoint", "python3", image,
+             "-c", _DIGEST_PROGRAM, "/Mythic", *_RUNTIME_PATHS],
+            capture_output=True, text=True, timeout=300, check=False,
+        )
+        if baked.returncode == 0 and baked.stdout.split():
+            image_digest = baked.stdout.split()[0]
+        else:
+            blockers.append(f"could not read the published image's code: {baked.stderr.strip()[-300:]}")
+    container_newest = 0.0
+    if running.returncode == 0:
+        try:
+            container_digest, _, container_newest = _digest_container()
+        except subprocess.CalledProcessError as exc:
+            blockers.append(f"could not read code from the container: {exc.stderr.strip()[-300:]}")
+    if image_digest and container_digest and image_digest != container_digest:
+        blockers.append(
+            f"the container's code differs from the published image's code (container {container_digest[:12]}, "
+            f"image {image_digest[:12]}); run `deploy --mode published`"
+        )
+    started = _container_started_at() if running.returncode == 0 else 0.0
+    if container_digest and not started:
+        blockers.append("could not read the container's start time, so staleness cannot be ruled out")
+    elif container_digest and container_newest > started:
+        blockers.append("the container's code is newer than the running process; restart it")
+    return {
+        "schema": "sage-published-identity-v1",
+        "ready": not blockers,
+        "blockers": blockers,
+        "image": image,
+        "image_id": image_id.stdout.strip() or None,
+        "running_image_id": running.stdout.strip() or None,
+        "image_digest": image_digest,
+        "container_digest": container_digest,
+        "container_started_at": started,
+    }
+
+
+def _start_container(*, rebuild: bool = False, image: str | None = None) -> dict:
     """Start Sage's container from the image already built, recreating the container.
 
     Not `docker restart`: `mythic-cli stop sage` removes the container, so there is often nothing to
@@ -404,7 +542,12 @@ def _start_container(*, rebuild: bool = False) -> dict:
     """
     name = readiness_contract.SAGE_CONTAINER_NAME
     steps = []
-    if rebuild or not _image_present(name):
+    if image is not None:
+        # Published: never build. The image comes from the registry, pulled before anything changed.
+        if not _image_present(image):
+            return {"action": "start-sage-container", "returncode": 1,
+                    "error": f"image {image} is not present locally", "steps": steps}
+    elif rebuild or not _image_present(name):
         steps.append(_run_host_side([str(_mythic_cli()), "build", name], "build-sage-image", 3600))
         if steps[-1]["returncode"] != 0:
             return {"action": "start-sage-container", "returncode": steps[-1]["returncode"], "steps": steps}
@@ -426,6 +569,52 @@ def _stop_local() -> dict:
         "stdout_tail": result.stdout.strip()[-400:],
         "stderr_tail": result.stderr.strip()[-400:],
     }
+
+
+#: A published deploy that stops after changing Mythic's settings can leave Mythic pointing at the
+#: image while the installed copy still holds other code; the identity check reports that state.
+_RERUN_HINT = ("re-run `deploy --mode published` once the failure is fixed, or `deploy --mode container` to go "
+               "back; check the actions above for what changed")
+
+
+def _deploy_published() -> int:
+    """Run config.json's GHCR image with its own code. Pull and extract first: nothing changes until the
+    image is here and readable."""
+    _mythic_dir()  # refuse a split install before writing anything into either one
+    image = _published_image()
+    actions = [_pull_image(image)]
+    with tempfile.TemporaryDirectory(prefix="sage-published-") as scratch:
+        if actions[-1]["returncode"] == 0:
+            actions.append(_extract_image_code(image, Path(scratch)))
+        if actions[-1]["returncode"] == 0:
+            actions.append(_ensure_mythic_settings("published"))
+        if actions[-1]["returncode"] == 0:
+            actions.append(_sync_published_code(Path(scratch)))
+    if actions[-1]["returncode"] != 0:
+        print(json.dumps({"ready": False, "actions": actions, "next": _RERUN_HINT}, indent=2, sort_keys=True))
+        return 1
+    deployment = readiness_contract.sage_deployment_status(
+        mode="published", repo_root=REPO_ROOT, require_intended_running=False,
+    )
+    if deployment["local_process_running"]:
+        actions.append(_stop_local())
+    actions.append(_start_container(image=image))
+    if actions[-1]["returncode"] != 0:
+        print(json.dumps({"ready": False, "actions": actions, "next": _RERUN_HINT}, indent=2, sort_keys=True))
+        return 1
+    deadline = time.monotonic() + 90
+    result = _published_parity(image)
+    while not result["ready"] and time.monotonic() < deadline:
+        time.sleep(3)
+        result = _published_parity(image)
+    final_deployment = readiness_contract.sage_deployment_status(
+        mode="published", repo_root=REPO_ROOT, require_intended_running=True,
+    )
+    blockers = list(result["blockers"]) + [f"deployment: {b}" for b in final_deployment["blockers"]]
+    payload = {**result, "ready": not blockers, "blockers": blockers,
+               "sage_deployment": final_deployment, "actions": actions}
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0 if payload["ready"] else 1
 
 
 def _stop_all() -> int:
@@ -481,7 +670,7 @@ def main(argv: list[str] | None = None) -> int:
     mode = readiness_contract.resolve_sage_deployment_mode(args.mode)
 
     if args.command == "parity":
-        result = _parity()
+        result = _published_parity(_published_image()) if mode == "published" else _parity()
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0 if result["ready"] else 1
 
@@ -489,12 +678,14 @@ def main(argv: list[str] | None = None) -> int:
         # Deliberately explicit. Container mode is the exception, not the default, and a deploy
         # that ran because SAGE_DEPLOYMENT_MODE happened to be unset would replace the installed
         # tree while the operator believed they were working in tmux.
-        if mode != "container":
+        if mode not in readiness_contract.CONTAINER_DEPLOYMENT_MODES:
             raise SystemExit(
                 "ERR: deploy targets the container, but the resolved mode is "
-                f"{mode!r}. Pass --mode container (or set SAGE_DEPLOYMENT_MODE=container) to say "
-                "so explicitly; local development uses sage_restart.sh instead."
+                f"{mode!r}. Pass --mode container or --mode published (or set SAGE_DEPLOYMENT_MODE) to "
+                "say so explicitly; local development uses sage_restart.sh instead."
             )
+        if mode == "published":
+            return _deploy_published()
         _mythic_dir()  # refuse a split install before writing anything into either one
         actions = [_sync_into_mythic()]
         if actions[-1]["returncode"] != 0:
@@ -560,7 +751,7 @@ def main(argv: list[str] | None = None) -> int:
         # mode had been exported in another shell. Report instead of guessing which Sage to stop.
         print(json.dumps({
             **status, "actions": [],
-            "refused": "set SAGE_DEPLOYMENT_MODE (local or container) or pass --mode; "
+            "refused": "set SAGE_DEPLOYMENT_MODE (local, container or published) or pass --mode; "
                        "enforce stops a Sage only when told which one is intended",
         }, indent=2, sort_keys=True))
         return 1
@@ -570,7 +761,7 @@ def main(argv: list[str] | None = None) -> int:
         # started here: starting one belongs to sage_restart.sh or mythic-cli, which own its env.
         if mode == "local" and status["container_running"]:
             actions.append(_stop_container())
-        elif mode == "container" and status["local_process_running"]:
+        elif mode in readiness_contract.CONTAINER_DEPLOYMENT_MODES and status["local_process_running"]:
             actions.append(_stop_local())
         status = _status()
 

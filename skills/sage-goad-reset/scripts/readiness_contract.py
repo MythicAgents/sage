@@ -469,8 +469,8 @@ def startup_identity_from_env(
     }
 
 
-def _container_parity() -> dict[str, Any]:
-    """`sage_deployment.py parity`, loaded lazily: that module imports this one at load time."""
+def _sage_deployment_module():
+    """`sage_deployment.py`, loaded lazily: that module imports this one at load time."""
     module = sys.modules.get("sage_deployment")
     if module is None:
         spec = importlib.util.spec_from_file_location(
@@ -481,7 +481,16 @@ def _container_parity() -> dict[str, Any]:
         module = importlib.util.module_from_spec(spec)
         sys.modules["sage_deployment"] = module
         spec.loader.exec_module(module)
-    return module._parity()
+    return module
+
+
+def _container_parity() -> dict[str, Any]:
+    return _sage_deployment_module()._parity()
+
+
+def _published_identity() -> dict[str, Any]:
+    module = _sage_deployment_module()
+    return module._published_parity(module._published_image())
 
 
 def runtime_identity_status(
@@ -489,6 +498,7 @@ def runtime_identity_status(
     mode: Any = None,
     identity_path: Path = DEFAULT_STARTUP_IDENTITY_PATH,
     parity_probe: Callable[[], dict[str, Any]] | None = None,
+    published_probe: Callable[[], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Proof that the serving Sage runs the intended code, from the source that matches the mode.
 
@@ -498,21 +508,29 @@ def runtime_identity_status(
     as `ready: false` (2026-11-03, 2026-11-04).
     """
     resolved = resolve_sage_deployment_mode(mode)
-    if resolved != "container":
+    if resolved not in CONTAINER_DEPLOYMENT_MODES:
         return {**startup_identity_from_env(identity_path=identity_path), "source": "local-startup-identity"}
+    # Published: the running container is the config.json image, and the code it executes (the bind
+    # mount) is that image's own code, not a working tree left in the installed copy.
+    probe, source = (
+        (published_probe or _published_identity, "published-image") if resolved == "published"
+        else (parity_probe or _container_parity, "container-parity")
+    )
     try:
-        parity = dict((parity_probe or _container_parity)() or {})
+        parity = dict(probe() or {})
     except Exception as exc:  # docker unavailable, container absent, ...
-        parity = {"ready": False, "blockers": [f"container parity could not be read: {exc}"]}
+        parity = {"ready": False, "blockers": [f"{source} identity could not be read: {exc}"]}
     blockers = [str(item) for item in parity.get("blockers") or []]
     if not parity.get("ready") and not blockers:
         blockers = ["container parity is not ready"]
     return {
         "ready": bool(parity.get("ready")) and not blockers,
-        "source": "container-parity",
+        "source": source,
         "repo_digest": parity.get("repo_digest"),
         "container_digest": parity.get("container_digest"),
         "container_started_at": parity.get("container_started_at"),
+        **({key: parity.get(key) for key in ("image", "image_id", "running_image_id", "image_digest")}
+           if source == "published-image" else {}),
         "blockers": blockers,
     }
 
@@ -521,7 +539,7 @@ def runtime_databases_status(
     repo_root: Path = REPO_ROOT, *, runtime_dbs_archived: bool = False, mode: Any = None,
 ) -> dict[str, Any]:
     """`runtime_db_status` for the databases of the Sage the mode says is serving."""
-    if resolve_sage_deployment_mode(mode) != "container":
+    if resolve_sage_deployment_mode(mode) not in CONTAINER_DEPLOYMENT_MODES:
         return runtime_db_status(repo_root, runtime_dbs_archived=runtime_dbs_archived)
     installed = installed_service_dir()
     if installed is None:
@@ -881,7 +899,8 @@ def channel_status(
 # Collapsing them is how a fail-closed branch becomes unreachable.
 _UNSET: Any = object()
 
-SAGE_DEPLOYMENT_MODES = ("local", "container")
+SAGE_DEPLOYMENT_MODES = ("local", "container", "published")
+CONTAINER_DEPLOYMENT_MODES = ("container", "published")
 DEFAULT_SAGE_DEPLOYMENT_MODE = "local"
 SAGE_CONTAINER_NAME = "sage"
 
@@ -990,10 +1009,10 @@ def sage_deployment_status(
             blockers.append("no local Sage process is running in local mode")
     else:
         if require_intended_running and not container_running:
-            blockers.append("Sage docker container is not running in container mode")
+            blockers.append(f"Sage docker container is not running in {resolved} mode")
         if local_running:
             blockers.append(
-                "a local Sage process is running in container mode; stop it "
+                f"a local Sage process is running in {resolved} mode; stop it "
                 "(`sage_stop.sh`) or set SAGE_DEPLOYMENT_MODE=local"
             )
     return {

@@ -398,6 +398,18 @@ def test_container_mode_leaves_sage_to_the_restart_phase(tmp_path):
     assert starts and all(line.startswith("cli|start mythic_postgres apollo http|") for line in starts), starts
 
 
+def test_published_mode_is_accepted_and_also_leaves_sage_to_the_restart_phase(tmp_path):
+    env, log = _mythic_reset_env(tmp_path, initial_rows="mythic_postgres|true|healthy\napollo|true|none\nhttp|true|none")
+    env["SAGE_DEPLOYMENT_MODE"] = "published"
+
+    result = subprocess.run(["/bin/bash", str(MYTHIC_RESET), "--yes"], cwd=ROOT, env=env,
+                            text=True, capture_output=True, timeout=10)
+
+    assert result.returncode == 0, result.stderr
+    starts = [line for line in log.read_text().splitlines() if line.startswith("cli|start")]
+    assert starts and all(line.startswith("cli|start mythic_postgres apollo http|") for line in starts), starts
+
+
 def test_local_reset_rejects_sage_only_compose_before_mutation(tmp_path):
     env, log = _mythic_reset_env(tmp_path, initial_rows="sage|true|none", services="sage")
 

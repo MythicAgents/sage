@@ -6,7 +6,8 @@ description: Repo-local Sage GOAD/Trust Walker full lab reset and readiness work
 # Sage GOAD Reset
 
 Use from the repository root. The reset brings back the Sage named by `SAGE_DEPLOYMENT_MODE`: `local` (the working
-tree in the `sage` tmux session) or `container` (Mythic's Sage container built from the working tree). See
+tree in the `sage` tmux session), `container` (Mythic's Sage container built from the working tree) or
+`published` (the GHCR image `config.json` names, running that image's own code). See
 [Deployment modes](#deployment-modes). Mythic remains Docker-backed and is managed through `mythic-cli`. Do not
 delete runtime databases or retained archives.
 
@@ -25,13 +26,13 @@ must be requested explicitly as a range-only or GOAD-only reset.
 For repeatable operator execution, use the resumable orchestrator. Previewing the plan is read-only:
 
 ```bash
-.venv/bin/python skills/sage-goad-reset/scripts/reset_orchestrator.py plan --snapshot <exact-snapshot> --callback-host <mythic-callback-url> --deployment-mode <local|container>
+.venv/bin/python skills/sage-goad-reset/scripts/reset_orchestrator.py plan --snapshot <exact-snapshot> --callback-host <mythic-callback-url> --deployment-mode <local|container|published>
 ```
 
 Start the live reset only with explicit authorization:
 
 ```bash
-.venv/bin/python skills/sage-goad-reset/scripts/reset_orchestrator.py start --snapshot <exact-snapshot> --callback-host <mythic-callback-url> --deployment-mode <local|container> --yes
+.venv/bin/python skills/sage-goad-reset/scripts/reset_orchestrator.py start --snapshot <exact-snapshot> --callback-host <mythic-callback-url> --deployment-mode <local|container|published> --yes
 ```
 
 `start` refuses without a deployment mode (the flag, else `SAGE_DEPLOYMENT_MODE`); the mode is saved in the
@@ -128,7 +129,7 @@ exits non-zero if either is still up. An absent `sage` tmux session is an alread
 
 ```bash
 .venv/bin/python skills/sage-goad-reset/scripts/archive_reset_evidence.py                     # local
-.venv/bin/python skills/sage-goad-reset/scripts/archive_reset_evidence.py --target installed  # container
+.venv/bin/python skills/sage-goad-reset/scripts/archive_reset_evidence.py --target installed  # container, published
 ```
 
    `--target installed` moves the container's own state instead: `sage.db`, `.phoenix/phoenix.db` and
@@ -164,10 +165,12 @@ exits non-zero if either is still up. An absent `sage` tmux session is an alread
 /bin/bash skills/sage-goad-reset/scripts/sage_restart.sh SAGE_ENGAGEMENT_GATE=1
 ```
 
-   Container (sync the working tree, start from the existing image, prove parity):
+   Container (sync the working tree, start from the existing image, prove parity), or published (pull
+   `config.json`'s image, run its own code, prove it):
 
 ```bash
 .venv/bin/python skills/sage-goad-reset/scripts/sage_deployment.py deploy --mode container
+.venv/bin/python skills/sage-goad-reset/scripts/sage_deployment.py deploy --mode published
 ```
 
    The rest of this step describes the tmux launcher.
@@ -345,15 +348,21 @@ same directory, and the MCP loads its BloodHound URL and token from its own `.en
 
 ## Deployment modes
 
-| | `local` | `container` |
-|---|---|---|
-| What serves Mythic | `python main.py` from the working tree, in tmux session `sage` | Mythic's `sage` container; Mythic bind-mounts its installed copy of the working tree over `/Mythic/` |
-| Mythic settings | Sage container stopped | `sage_use_build_context=true`, `sage_use_volume=false` (`deploy` sets them) |
-| Databases and ledger | `Payload_Type/sage/` | `<Mythic>/InstalledServices/sage/` |
-| Reset archive | `archive_reset_evidence.py` | `archive_reset_evidence.py --target installed` |
-| Bring it back | `sage_restart.sh` | `sage_deployment.py deploy --mode container [--rebuild]` |
-| Readiness identity | startup identity the launcher records | parity: container files match the working tree, process newer than the files |
-| Phoenix database | `Payload_Type/sage/.phoenix/phoenix.db` | `<Mythic>/InstalledServices/sage/.phoenix/phoenix.db` |
+| | `local` | `container` | `published` |
+|---|---|---|---|
+| What serves Mythic | `python main.py` from the working tree, in tmux session `sage` | Mythic's `sage` container built from its installed copy of the working tree | Mythic's `sage` container on `config.json`'s `remote_images.sage` (e.g. `ghcr.io/mythicagents/sage:0.3.0`) |
+| Code it runs | working tree | installed copy of the working tree (bind mount over `/Mythic/`) | the image's own `/Mythic/`, copied into the installed copy (bind mount) |
+| Mythic settings | Sage container stopped | `sage_use_build_context=true`, `sage_use_volume=false` | `sage_use_build_context=false`, `sage_remote_image=<config.json tag>`, `sage_use_volume=false` |
+| Databases and ledger | `Payload_Type/sage/` | `<Mythic>/InstalledServices/sage/` | `<Mythic>/InstalledServices/sage/` |
+| Reset archive | `archive_reset_evidence.py` | `--target installed` | `--target installed` |
+| Bring it back | `sage_restart.sh` | `deploy --mode container [--rebuild]` | `deploy --mode published` |
+| Readiness identity | startup identity the launcher records | parity: files match the working tree, process newer than the files | running image is the tag's image, code matches the image's code, process newer than the files |
+| Phoenix database | `Payload_Type/sage/.phoenix/phoenix.db` | `<Mythic>/InstalledServices/sage/.phoenix/phoenix.db` | same as container |
+
+`deploy` sets the Mythic settings for its mode and stops a running local Sage, so switching between the two
+container modes, or from local to a container, is one command. Going back to local outside a reset takes two:
+`sage_deployment.py stop-all` (or `enforce --mode local`), then `sage_restart.sh`, which never stops a container.
+If a published deploy fails partway, its output lists what changed; re-run it, or `deploy --mode container`.
 
 `MYTHIC_CLI` and `MYTHIC_ENV_PATH` must name the same Mythic install; `deploy` refuses otherwise. The reset passes
 its own saved `--mythic-env-path` to every phase as `MYTHIC_ENV_PATH`.
@@ -367,7 +376,7 @@ logs `Another instance of this service, sage, is running` on a loop, while reque
 
 ```bash
 .venv/bin/python skills/sage-goad-reset/scripts/sage_deployment.py check
-.venv/bin/python skills/sage-goad-reset/scripts/sage_deployment.py enforce --mode <local|container>
+.venv/bin/python skills/sage-goad-reset/scripts/sage_deployment.py enforce --mode <local|container|published>
 .venv/bin/python skills/sage-goad-reset/scripts/sage_deployment.py parity
 ```
 
@@ -378,7 +387,7 @@ the same rule as its `sage_deployment` section, so a solve cannot start into a s
 
 ### Container deploys
 
-`deploy --mode container` refuses unless the resolved mode is `container`. It mirrors the working tree into Mythic's
+`deploy` refuses unless the resolved mode is `container` or `published`. `deploy --mode container` mirrors the working tree into Mythic's
 installed copy, sets Mythic's Sage settings for this mode when they differ (`mythic-cli config set`, read back
 because it exits 0 even when nothing matched), regenerates the compose entry (`mythic-cli add sage`), **stops a
 running local Sage**, then starts the container
@@ -386,6 +395,16 @@ with `docker compose up -d --no-build --pull never --force-recreate sage` from t
 image (`mythic-cli build sage`) only when the image is missing or `--rebuild` is passed. It does not use
 `docker restart` (`mythic-cli stop sage` removes the container) or `mythic-cli start` (which rebuilds under
 `REBUILD_ON_START`). It then proves parity and reports the deployment contract; it is `ready` only when both hold.
+
+`deploy --mode published` pulls `config.json`'s image and copies the image's own `/Mythic/` out of a created,
+never-started container, before changing anything. It then sets Mythic's settings for the image, mirrors that code
+into the installed copy (keeping `.env`, databases, `.sage_engagement*`, and the operator's `certs/` and `tools/`,
+which it refreshes from the working tree), stops a running local Sage, and starts the container from the pulled
+image without building. Identity requires the running container to be that image and its bind-mounted code to equal
+the image's code, read from a throwaway `docker run --rm --network none` with no mount. That catches the case the
+bind mount otherwise hides: a "published" container quietly executing a working tree left in the installed copy.
+The volume stays off on purpose: with `sage_use_volume=true` the databases would live in `sage_volume`, which
+`mythic-cli start` deletes under `REBUILD_ON_START`. Switch back with `deploy --mode container`.
 
 **The thing worth understanding: the Docker image does not hold the code that runs.** Mythic's
 generated compose file bind-mounts the installed service directory over `/Mythic/`, shadowing what
@@ -427,5 +446,5 @@ Each deployment keeps its own runtime state, and switching carries some of it bu
   `tools/` is read on each tool call and needs neither restart nor rebuild.
 - **Which build it is.** A local `mythic-cli build sage` (with `sage_use_build_context` set) reports
   `version=unknown` and `build_commit=unknown` in the banner. Only the published image carries them; use
-  `parity` to identify a local build.
+  `parity` (mode-aware: published mode checks the image identity) to identify what is running.
 - **One Sage at a time.** Confirm with `sage_deployment.py check` after every switch.

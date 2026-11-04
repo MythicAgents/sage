@@ -249,6 +249,14 @@ def test_container_mode_restarts_the_container_not_a_tmux_sage():
     assert commands["archive-runtime-dbs"][-2:] == ["--target", "installed"]
 
 
+def test_published_mode_deploys_the_published_image_and_archives_the_installed_copy():
+    commands = reset._phase_commands({**_config(), "deployment_mode": "published"})
+
+    assert commands["restart-sage"][2:] == ["deploy", "--mode", "published"]
+    assert commands["archive-runtime-dbs"][-2:] == ["--target", "installed"]
+    assert commands["stop-sage"][2:] == ["stop-all"]
+
+
 def test_local_mode_keeps_the_tmux_restart_and_local_archive():
     commands = reset._phase_commands(_config())
 
@@ -292,7 +300,7 @@ def test_phase_children_receive_the_checkpointed_mode(monkeypatch):
 
 def test_an_unknown_checkpointed_mode_is_invalid(tmp_path):
     with pytest.raises(reset.ResetError, match="deployment_mode"):
-        reset._validate_inputs({**_config(), "deployment_mode": "published-later"}, tmp_path / "c.json")
+        reset._validate_inputs({**_config(), "deployment_mode": "ghcr"}, tmp_path / "c.json")
 
 
 def test_archive_phase_preserves_evidence_from_the_configured_mythic_install():

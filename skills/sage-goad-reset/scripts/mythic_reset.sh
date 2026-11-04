@@ -22,7 +22,7 @@ cd "$MYTHIC_DIR"
 
 SAGE_DEPLOYMENT_MODE="${SAGE_DEPLOYMENT_MODE:-local}"
 case "$SAGE_DEPLOYMENT_MODE" in
-  local|container) ;;
+  local|container|published) ;;
   *) echo "ERR: unknown SAGE_DEPLOYMENT_MODE: $SAGE_DEPLOYMENT_MODE" >&2; exit 1 ;;
 esac
 
