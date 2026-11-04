@@ -16,7 +16,7 @@ This wrapper reuses `skills/sage-live-runner/scripts/native_chat.py`'s own Mythi
 (channel creation, `CreateSageMessage`, request snapshot, latest-request query) — it adds no new
 mutation logic. Auto mode is deliberately not offered here; use `native_chat.py run --autonomous`.
 
-Prerequisite: a running `sage` chat container and a live foothold, i.e. the same readiness the reset
+Prerequisite: a running Sage serving Mythic (tmux or container) and a live foothold, i.e. the same readiness the reset
 skills establish. Credentials resolve exactly as `native_chat.py` does (`MYTHIC_ADMIN_PASSWORD`,
 then `MYTHIC_ENV_PATH`).
 
@@ -30,6 +30,16 @@ Create a channel (conversation or supervised):
 .venv/bin/python skills/sage-chat-sessions/scripts/chat_sessions.py create \
   --mode conversation --name "Recon Q and A"
 ```
+
+**BloodHound settings follow the deployment mode** (`SAGE_DEPLOYMENT_MODE`, see `sage-goad-reset`). A local
+tmux Sage's BloodHound MCP loads its own `.env`, so the channel gets none. A `container` or `published` Sage runs
+the MCP baked into the image, with no credentials, so `create` writes `BLOODHOUND_URL`, `BLOODHOUND_TOKEN_ID` and
+`BLOODHOUND_TOKEN_KEY` from `<SAGE_BLOODHOUND_MCP_DIR>/.env` (resolved like Sage: process env, then
+`Payload_Type/sage/.env.local`, then `Payload_Type/sage/.env`; `BLOODHOUND_URL` may also be built from the MCP's
+`BLOODHOUND_SCHEME`/`DOMAIN`/`PORT`). A `localhost` URL works because Mythic runs the container with host
+networking. `--bloodhound-env FILE` names another file (for an operator with no host checkout of the MCP);
+`--no-bloodhound` writes none. The output names the keys written, never their values, and `create` fails if the
+server did not store them. Verify the connection with `send --prompt '/bloodhound'` before the first real prompt.
 
 `create` reads the server-stored `ai_metadata.config.mode` back after creation and fails if it does
 not match the requested mode, so a reported channel is one the kernel will actually run in that lane.

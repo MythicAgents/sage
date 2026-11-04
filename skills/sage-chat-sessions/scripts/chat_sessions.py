@@ -24,6 +24,7 @@ import argparse
 import asyncio
 import importlib.util
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -42,6 +43,67 @@ _spec = importlib.util.spec_from_file_location("sage_native_chat_for_sessions", 
 nc = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = nc
 _spec.loader.exec_module(nc)  # type: ignore[union-attr]
+
+# --- BloodHound settings for a container Sage's channel ----------------------------------------------
+# A local tmux Sage's BloodHound MCP loads its own .env at startup. A container Sage runs the MCP baked
+# into the image (SAGE_BLOODHOUND_MCP_DIR=/opt/bloodhound_mcp) with no credentials, so the channel
+# configuration must carry them. They come from the MCP checkout's own .env, located through Sage's
+# runtime lookup (process env, Payload_Type/sage/.env.local, then .env), or from --bloodhound-env.
+_RUNTIME_ENV_SCRIPT = Path(__file__).resolve().parents[2] / "sage-goad-reset" / "scripts" / "sage_runtime_env.py"
+_BLOODHOUND_KEYS = ("BLOODHOUND_URL", "BLOODHOUND_TOKEN_ID", "BLOODHOUND_TOKEN_KEY")
+
+
+def _runtime_env():
+    cached = sys.modules.get("sage_runtime_env")
+    if cached is not None:
+        return cached
+    spec = importlib.util.spec_from_file_location("sage_runtime_env", _RUNTIME_ENV_SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["sage_runtime_env"] = module
+    spec.loader.exec_module(module)  # type: ignore[union-attr]
+    return module
+
+
+def bloodhound_channel_config(
+    *, deployment_mode: str | None = None, env_file: str | None = None, disabled: bool = False,
+) -> tuple[dict[str, str], dict[str, Any]]:
+    """The BLOODHOUND_* channel settings to write, and a report that names keys but never values."""
+    mode = str(deployment_mode or os.environ.get("SAGE_DEPLOYMENT_MODE") or "local").strip().casefold()
+    if mode not in ("local", "container", "published"):
+        raise SystemExit(f"ERR: unknown SAGE_DEPLOYMENT_MODE {mode!r}; expected local, container or published")
+    if disabled:
+        return {}, {"bloodhound": "not set (--no-bloodhound)"}
+    if env_file is None:
+        if mode not in ("container", "published"):
+            return {}, {"bloodhound": "not set: a local Sage's BloodHound MCP loads its own .env"}
+        runtime = _runtime_env()
+        directory = runtime.resolve("SAGE_BLOODHOUND_MCP_DIR")
+        if not directory:
+            raise SystemExit(f"ERR: {runtime.unresolved_message('SAGE_BLOODHOUND_MCP_DIR')} A {mode} Sage's "
+                             "channel needs BloodHound settings: set it, or pass --bloodhound-env FILE or "
+                             "--no-bloodhound.")
+        env_file = str(Path(directory).expanduser() / ".env")
+    from dotenv import dotenv_values
+
+    path = Path(env_file).expanduser()
+    if not path.is_file():
+        raise SystemExit(f"ERR: BloodHound settings file not found: {path}")
+    values = {key: str(value or "").strip() for key, value in dotenv_values(path).items()}
+    url = values.get("BLOODHOUND_URL", "")
+    if not url and values.get("BLOODHOUND_DOMAIN"):
+        # The MCP's own defaults (bloodhound_mcp lib/bloodhound_api.py): https, port 443, each independently.
+        scheme = (values.get("BLOODHOUND_SCHEME") or "https").casefold()
+        port = values.get("BLOODHOUND_PORT") or "443"
+        url = f"{scheme}://{values['BLOODHOUND_DOMAIN']}:{port}"
+    config = {"BLOODHOUND_URL": url, "BLOODHOUND_TOKEN_ID": values.get("BLOODHOUND_TOKEN_ID", ""),
+              "BLOODHOUND_TOKEN_KEY": values.get("BLOODHOUND_TOKEN_KEY", "")}
+    missing = [key for key in _BLOODHOUND_KEYS if not config[key]]
+    if missing:
+        hint = " (or BLOODHOUND_DOMAIN with SCHEME and PORT)" if "BLOODHOUND_URL" in missing else ""
+        raise SystemExit(f"ERR: {path} does not set {', '.join(missing)}{hint}")
+    # Mythic runs the Sage container with host networking, so a localhost URL reaches the host's BloodHound.
+    return config, {"bloodhound": {"source": str(path), "keys": sorted(config)}}
+
 
 # Request statuses that mean "this request is finished and the channel is free for the next turn".
 # Anything else (streaming, submitted, an unknown value) is treated as still-processing so `send`
@@ -106,9 +168,11 @@ def _mode_of(ai_metadata: Any) -> str:
     return str(config.get("mode")) if isinstance(config, dict) else "?"
 
 
-def _build_metadata(mode: str, max_steps: int, policy_mode: str | None) -> dict[str, Any]:
+def _build_metadata(
+    mode: str, max_steps: int, policy_mode: str | None, extra_config: dict[str, str] | None = None,
+) -> dict[str, Any]:
     extra: dict[str, Any] = {}
-    config_extra: dict[str, Any] = {}
+    config_extra: dict[str, Any] = dict(extra_config or {})
     if mode == "supervised" and policy_mode:
         config_extra["policy_mode"] = policy_mode
     if config_extra:
@@ -123,7 +187,10 @@ async def _cmd_create(client: Any, args: argparse.Namespace) -> dict[str, Any]:
     mode = args.mode
     max_steps = args.max_steps if args.max_steps is not None else (200 if mode == "supervised" else 50)
     policy_mode = args.policy_mode if mode == "supervised" else None
-    metadata = _build_metadata(mode, max_steps, policy_mode)
+    bloodhound, bloodhound_report = bloodhound_channel_config(
+        env_file=args.bloodhound_env, disabled=args.no_bloodhound,
+    )
+    metadata = _build_metadata(mode, max_steps, policy_mode, extra_config=bloodhound)
     created = await nc.create_locked_channel(
         client,
         name=args.name,
@@ -142,11 +209,16 @@ async def _cmd_create(client: Any, args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError(
             f"channel {created['chat_channel_id']} stored mode={stored_mode!r}, expected {mode!r}"
         )
+    stored_config = (stored or {}).get("config") if isinstance(stored, dict) else None
+    absent = [key for key in bloodhound if not (stored_config or {}).get(key)]
+    if absent:
+        raise RuntimeError(f"channel {created['chat_channel_id']} did not store {', '.join(absent)}")
     return {
         "action": "create",
         "mode": stored_mode,
         "max_steps": max_steps,
         "policy_mode": policy_mode,
+        **bloodhound_report,
         **created,
     }
 
@@ -259,6 +331,11 @@ def _parser() -> argparse.ArgumentParser:
     c.add_argument("--max-steps", type=int, default=None,
                    help="supervised step cap (default 200); conversation default 50")
     c.add_argument("--policy-mode", default="hybrid", help="supervised policy mode (default hybrid)")
+    c.add_argument("--bloodhound-env", default=None,
+                   help="file holding BLOODHOUND_URL (or DOMAIN/SCHEME/PORT) and the token pair; default in "
+                        "container/published mode: <SAGE_BLOODHOUND_MCP_DIR>/.env")
+    c.add_argument("--no-bloodhound", action="store_true",
+                   help="write no BloodHound settings into the channel")
 
     s = sub.add_parser("send", help="post a prompt into an existing channel")
     s.add_argument("--channel-id", type=int, required=True)
