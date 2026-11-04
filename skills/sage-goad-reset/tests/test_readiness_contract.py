@@ -486,6 +486,45 @@ def test_bloodhound_mcp_status_requires_exact_tool_names(tmp_path):
     assert ready["ready"] is True
 
 
+def _point_runtime_env_at(monkeypatch, directory: Path) -> None:
+    """Redirect only WHERE the shared resolver looks; its precedence logic runs for real."""
+    monkeypatch.delenv("SAGE_BLOODHOUND_MCP_DIR", raising=False)
+    monkeypatch.setattr(MODULE._runtime_env(), "RUNTIME_DIR", directory)
+
+
+def test_unresolved_bloodhound_mcp_dir_is_a_named_blocker_not_a_sibling_guess(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    (workspace / "bloodhound_mcp").mkdir(parents=True)
+    runtime = workspace / "sage" / "Payload_Type" / "sage"
+    runtime.mkdir(parents=True)
+    (runtime / ".env").write_text("#SAGE_BLOODHOUND_MCP_DIR=\n", encoding="utf-8")
+    _point_runtime_env_at(monkeypatch, runtime)
+
+    status = MODULE.bloodhound_mcp_status(None, ["file_upload", "domain_info", "cypher_query"])
+    probed = asyncio.run(MODULE.probe_bloodhound_mcp_tools())
+
+    for section in (status, probed):
+        assert section["ready"] is False
+        assert section["directory"] is None
+        assert any("SAGE_BLOODHOUND_MCP_DIR is not set" in b for b in section["blockers"])
+
+
+def test_bloodhound_mcp_dir_follows_env_local_before_env(tmp_path, monkeypatch):
+    local_dir, tracked_dir = tmp_path / "from-local", tmp_path / "from-env"
+    local_dir.mkdir()
+    tracked_dir.mkdir()
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    (runtime / ".env.local").write_text(f"SAGE_BLOODHOUND_MCP_DIR={local_dir}\n", encoding="utf-8")
+    (runtime / ".env").write_text(f"SAGE_BLOODHOUND_MCP_DIR={tracked_dir}\n", encoding="utf-8")
+    _point_runtime_env_at(monkeypatch, runtime)
+
+    status = MODULE.bloodhound_mcp_status(None, ["file_upload", "domain_info", "cypher_query"])
+
+    assert status["ready"] is True
+    assert status["directory"] == str(local_dir)
+
+
 def test_write_startup_identity_records_only_safe_route_and_required_env(tmp_path):
     path = tmp_path / "startup.json"
     written = MODULE.write_startup_identity(

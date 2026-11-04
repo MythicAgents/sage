@@ -8,7 +8,7 @@ set -euo pipefail
 SESSION="sage"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../../.." && pwd)"
-SNAP="/tmp/sage_env.snapshot"
+SNAP="${SAGE_ENV_SNAPSHOT:-/tmp/sage_env.snapshot}"
 VENV_PY="${SAGE_VENV_PY:-$REPO_ROOT/.venv/bin/python}"
 DEFAULT_CWD="${SAGE_CWD:-$REPO_ROOT/Payload_Type/sage}"
 # No checkout-name default: set MYTHIC_ENV_PATH to your install (see .env.example).
@@ -16,6 +16,28 @@ MYTHIC_ENV_PATH="${MYTHIC_ENV_PATH:-}"
 SAGE_RUNTIME_ENV_PATH="${SAGE_RUNTIME_ENV_PATH:-$REPO_ROOT/Payload_Type/sage/.env}"
 STARTUP_DISCOVERY_SECONDS="${SAGE_STARTUP_DISCOVERY_SECONDS:-10}"
 STARTUP_STABILITY_SECONDS="${SAGE_STARTUP_STABILITY_SECONDS:-3}"
+
+# A setting as the relaunched Sage will resolve it, used only to decide whether a launcher default
+# applies: the process environment, then `.env.local`, then `.env`, empty values ignored. Reads
+# plain `KEY=value` lines (optionally `export`ed or quoted), as require_bloodhound_dir does; no
+# interpreter is involved, so a faked relaunch interpreter cannot stall it. Prints nothing when unset.
+# Every pipeline carries `|| true` for the same `set -euo pipefail` reason given in that function.
+runtime_setting() {
+  local key="$1" env_file value
+  if [[ -n "${!key:-}" ]]; then
+    printf '%s\n' "${!key}"
+    return 0
+  fi
+  for env_file in "${SAGE_RUNTIME_ENV_PATH%/*}/.env.local" "$SAGE_RUNTIME_ENV_PATH"; do
+    [[ -f "$env_file" ]] || continue
+    value="$(grep -E "^(export[[:space:]]+)?${key}=" "$env_file" | tail -1 | cut -d= -f2- | tr -d "\"'" || true)"
+    if [[ -n "$value" ]]; then
+      printf '%s\n' "$value"
+      return 0
+    fi
+  done
+  return 0
+}
 
 snapshot_last_value() {
   local key="$1"
@@ -55,10 +77,11 @@ require_bloodhound_dir() {
   # ($SAGE_RUNTIME_ENV_PATH, i.e. Payload_Type/sage/.env), mirroring the container's own
   # `ENV SAGE_BLOODHOUND_MCP_DIR=/opt/bloodhound_mcp`.
   #
-  # A fresh start already picks it up: that branch sources the runtime env with `set -a`. This
-  # covers restarting an ALREADY-RUNNING Sage, where the snapshot comes from /proc/<pid>/environ and
-  # the env file is never read — so a Sage first started without the variable would otherwise keep
-  # inheriting its absence forever.
+  # Neither start path exports the runtime env files (Sage loads them itself), so this guard reads
+  # them for the one value the launcher must check. On a restart of an ALREADY-RUNNING Sage the
+  # snapshot comes from /proc/<pid>/environ, so a Sage first started without the variable would
+  # otherwise keep inheriting its absence forever. It runs after the KEY=VAL overrides: an explicit
+  # `SAGE_BLOODHOUND_MCP_DIR=<dir>` satisfies it, and an empty one falls back to the files.
   #
   # No sibling-checkout guess. readiness_contract.py lists this in REQUIRED_STARTUP_ENV, so a wrong
   # silent default yields a Sage that starts, passes readiness, and is bound to a BloodHound
@@ -129,17 +152,17 @@ else
     source "$MYTHIC_ENV_PATH"
     set +a
   fi
-  if [[ -f "$SAGE_RUNTIME_ENV_PATH" ]]; then
-    set -a
-    # shellcheck disable=SC1090
-    source "$SAGE_RUNTIME_ENV_PATH"
-    set +a
-  fi
-  export DEBUG_LEVEL="${DEBUG_LEVEL:-debug}"
-  export MYTHIC_SERVER_HOST="${MYTHIC_SERVER_HOST:-127.0.0.1}"
-  export RABBITMQ_HOST="${RABBITMQ_HOST:-127.0.0.1}"
-  [[ -n "${RABBITMQ_PASSWORD:-}" ]] || {
-    echo "ERR: RABBITMQ_PASSWORD not set and not found in $MYTHIC_ENV_PATH" >&2
+  # Sage's runtime env files are NOT exported here. main.py loads them itself at startup
+  # (dotenv_bootstrap: `.env.local` before `.env`, existing wins, empty sets nothing). Exporting them
+  # would freeze their values into the process environment, where they outrank the files on every
+  # later restart of the running Sage, so an edit to `.env.local` would silently stop applying; and
+  # the old `source "$SAGE_RUNTIME_ENV_PATH"` also let the tracked `.env` beat `.env.local` and the
+  # caller. The launcher defaults below apply only when no source configures the setting.
+  [[ -n "$(runtime_setting DEBUG_LEVEL)" ]] || export DEBUG_LEVEL=debug
+  [[ -n "$(runtime_setting MYTHIC_SERVER_HOST)" ]] || export MYTHIC_SERVER_HOST=127.0.0.1
+  [[ -n "$(runtime_setting RABBITMQ_HOST)" ]] || export RABBITMQ_HOST=127.0.0.1
+  [[ -n "${RABBITMQ_PASSWORD:-}" || -n "$(runtime_setting RABBITMQ_PASSWORD)" ]] || {
+    echo "ERR: RABBITMQ_PASSWORD not set and not found in $MYTHIC_ENV_PATH or Sage's runtime env files" >&2
     exit 1
   }
   env -0 > "$SNAP"; chmod 600 "$SNAP"
@@ -147,18 +170,25 @@ else
 fi
 
 normalize_local_mythic_hosts
-require_bloodhound_dir
 
 # Optional env overrides: pass KEY=VAL args (e.g. `sage_restart.sh SAGE_ENGAGEMENT_GATE=1`).
 # Appended after the snapshot so they WIN (dict-merge in _sage_relaunch.py = last value wins).
+# `KEY=` deliberately clears KEY for the relaunched Sage (the eval gauge's service probe relies on
+# it to switch off the Slack hook and drop a stale episode id). A required setting cannot be cleared
+# this way: require_bloodhound_dir runs next and falls back to the env files.
 for kv in "$@"; do
   case "$kv" in
     *=*)
       printf '%s\0' "$kv" >> "$SNAP"
-      echo "▶ env override: ${kv%%=*}=<set>" >&2
+      if [[ -n "${kv#*=}" ]]; then
+        echo "▶ env override: ${kv%%=*}=<set>" >&2
+      else
+        echo "▶ env override: ${kv%%=*}=<empty>" >&2
+      fi
       ;;
   esac
 done
+require_bloodhound_dir
 echo "▶ snapshot: pid=$PID cwd=$CWD venv_py=$VENV_PY env=$(tr '\0' '\n' < "$SNAP" | grep -c =) vars" >&2
 
 # 3. Stop: Ctrl-C the pane, wait for exit.

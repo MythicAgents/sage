@@ -34,7 +34,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--bloodhound-mcp-dir",
         default=None,
-        help="Optional BloodHound MCP checkout path. Defaults to SAGE_BLOODHOUND_MCP_DIR or the workspace checkout.",
+        help=(
+            "Optional BloodHound MCP checkout path. Defaults to SAGE_BLOODHOUND_MCP_DIR from the process "
+            "environment, then Payload_Type/sage/.env.local, then Payload_Type/sage/.env."
+        ),
     )
     return parser
 

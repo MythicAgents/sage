@@ -1,5 +1,4 @@
 import importlib.util
-import os
 from pathlib import Path
 
 
@@ -10,12 +9,21 @@ assert SPEC and SPEC.loader
 SPEC.loader.exec_module(bh_reset)
 
 
-def test_default_bloodhound_dir_derives_from_workspace_root():
-    expected = Path(
-        os.environ.get("SAGE_BLOODHOUND_MCP_DIR")
-        or (bh_reset.WORKSPACE_ROOT / "bloodhound_mcp")
-    )
-    assert bh_reset.DEFAULT_BLOODHOUND_MCP_DIR == expected
+def test_bloodhound_dir_uses_the_runtime_lookup_and_never_a_sibling(tmp_path, monkeypatch):
+    """Process env, then Payload_Type/sage/.env.local, then .env; unresolved is a named refusal."""
+    import pytest
+
+    (tmp_path / "bloodhound_mcp").mkdir()
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    monkeypatch.delenv("SAGE_BLOODHOUND_MCP_DIR", raising=False)
+    monkeypatch.setattr(bh_reset.sage_runtime_env, "RUNTIME_DIR", runtime)
+    with pytest.raises(SystemExit) as excinfo:
+        bh_reset.bloodhound_mcp_dir()
+    assert "SAGE_BLOODHOUND_MCP_DIR" in str(excinfo.value)
+
+    (runtime / ".env.local").write_text(f"SAGE_BLOODHOUND_MCP_DIR={tmp_path / 'mcp'}\n", encoding="utf-8")
+    assert bh_reset.bloodhound_mcp_dir() == tmp_path / "mcp"
 
 
 def test_wait_for_empty_delays_first_poll_and_retries(monkeypatch):

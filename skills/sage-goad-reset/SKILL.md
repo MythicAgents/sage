@@ -140,22 +140,23 @@ bounded interrupt sequence remains a hard failure.
 4. Reset/verify GOAD, then wipe BloodHound and require zero domains before continuing:
 
 ```bash
-uv --directory "$SAGE_BLOODHOUND_MCP_DIR" run python "$PWD/skills/sage-goad-reset/scripts/bh_reset.py" wipe --yes
+.venv/bin/python skills/sage-goad-reset/scripts/sage_runtime_env.py mcp-run skills/sage-goad-reset/scripts/bh_reset.py wipe --yes
 ```
 
    The wipe command includes its own delayed verification and must finish with `available-domains: count=0`.
-   A nonzero exit or any remaining domain blocks the reset.
+   A nonzero exit or any remaining domain blocks the reset. `mcp-run` runs the script inside the BloodHound
+   MCP checkout's environment; see [Where the BloodHound MCP checkout comes from](#where-the-bloodhound-mcp-checkout-comes-from).
 5. Restart local Sage in tmux:
 
 ```bash
-/bin/bash skills/sage-goad-reset/scripts/sage_restart.sh SAGE_ENGAGEMENT_GATE=1 SAGE_BLOODHOUND_MCP_DIR="$SAGE_BLOODHOUND_MCP_DIR"
+/bin/bash skills/sage-goad-reset/scripts/sage_restart.sh SAGE_ENGAGEMENT_GATE=1
 ```
 
-Any extra `KEY=VAL` positional args are applied as env overrides to the relaunched Sage, winning over the snapshotted env (last value wins). The eval-gauge Gate Experiment uses this to pin `SAGE_ENGAGEMENT_ID=<run token>` (and per-config settings) so Sage writes its ledger under the token the gauge reads — see `skills/sage-eval-gauge/SKILL.md`.
-The launcher is canonical for local Sage restarts: it always uses the repo virtualenv, reads
-`SAGE_BLOODHOUND_MCP_DIR` from the Sage runtime env (`Payload_Type/sage/.env`) and **fails closed** if it is
-still unset, creates the maintained `sage` tmux session when it is
-absent, and records a redacted startup identity under
+Any extra `KEY=VAL` positional args are applied as env overrides to the relaunched Sage, winning over the snapshotted env (last value wins). An empty `KEY=` clears that variable for the relaunched Sage, except `SAGE_BLOODHOUND_MCP_DIR`: the BloodHound check runs after the overrides and falls back to the env files, so `KEY="$KEY"` with an unexported variable cannot erase the configured directory. The eval-gauge Gate Experiment uses this to pin `SAGE_ENGAGEMENT_ID=<run token>` (and per-config settings) so Sage writes its ledger under the token the gauge reads — see `skills/sage-eval-gauge/SKILL.md`.
+The launcher is canonical for local Sage restarts: it always uses the repo virtualenv, leaves Sage's runtime env
+files to Sage's own loader (`Payload_Type/sage/.env.local` before `.env`; exporting them would freeze their values
+into later restarts), applies its own defaults only when no source sets them, **fails closed** if
+`SAGE_BLOODHOUND_MCP_DIR` is still unset, creates the maintained `sage` tmux session when it is absent, and records a redacted startup identity under
 `/tmp/sage_startup_identity.json` for later readiness/manifest inspection.
 
 6. For a fresh clean baseline, run:
@@ -266,8 +267,8 @@ Mythic, Apollo, or a PFX.
 ## BloodHound
 
 ```bash
-uv --directory "$SAGE_BLOODHOUND_MCP_DIR" run python "$PWD/skills/sage-goad-reset/scripts/bh_reset.py" wipe --yes
-uv --directory "$SAGE_BLOODHOUND_MCP_DIR" run python "$PWD/skills/sage-goad-reset/scripts/bh_reset.py" status
+.venv/bin/python skills/sage-goad-reset/scripts/sage_runtime_env.py mcp-run skills/sage-goad-reset/scripts/bh_reset.py wipe --yes
+.venv/bin/python skills/sage-goad-reset/scripts/sage_runtime_env.py mcp-run skills/sage-goad-reset/scripts/bh_reset.py status
 ```
 
 The wipe is mandatory for every full reset. It waits 10 seconds before its first verification poll, then polls
@@ -277,7 +278,7 @@ After a target-scope collection on a GOAD-style cross-forest range, use the read
 blaming Sage for an empty frontier:
 
 ```bash
-uv --directory "$SAGE_BLOODHOUND_MCP_DIR" run python \
+.venv/bin/python skills/sage-goad-reset/scripts/sage_runtime_env.py mcp-run \
   skills/sage-goad-reset/scripts/check_cross_forest_laps_bridge.py \
   --source-domain <controlled-root-domain> \
   --target-domain <trusted-target-domain>
@@ -287,9 +288,26 @@ The probe mirrors Sage's reconciler shape: `User -> MemberOf* -> principal -> Re
 It fails closed when the current BloodHound graph has no cross-forest managed-secret bridge and intentionally
 does not treat `SyncLAPSPassword` as equivalent to `ReadLAPSPassword`.
 
+### Where the BloodHound MCP checkout comes from
+
+Every tool here finds `SAGE_BLOODHOUND_MCP_DIR` the way the running Sage does: the process environment, then
+`Payload_Type/sage/.env.local` (gitignored, per developer), then `Payload_Type/sage/.env` (tracked, ships commented
+out for operators to fill in). An empty value sets nothing. Nothing guesses a sibling `bloodhound_mcp` checkout; an
+unset variable is a refusal that names it and the files searched. To see what a tool will use:
+
+```bash
+.venv/bin/python skills/sage-goad-reset/scripts/sage_runtime_env.py get SAGE_BLOODHOUND_MCP_DIR
+```
+
+`sage_runtime_env.py mcp-run <script> [args]` runs a script inside that checkout's own environment
+(`uv --directory <dir> run python <script>`), which is what `bh_reset.py`, `check_cross_forest_laps_bridge.py`,
+and the eval gauge's `bh_cypher.py` need for the MCP's signed client and its `.env`. A local tmux Sage uses the
+same directory, and the MCP loads its BloodHound URL and token from its own `.env` at startup.
+
 ## Bundled Scripts
 
 - `_sage_relaunch.py`
+- `sage_runtime_env.py` (resolves a Sage runtime setting in Sage's own order; `mcp-run` for BloodHound MCP scripts)
 - `archive_reset_evidence.py` (copies container databases and dumps Mythic before the reset, then archives)
 - `archive_runtime_dbs.py`
 - `bh_reset.py`

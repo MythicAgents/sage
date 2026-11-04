@@ -25,10 +25,6 @@ from uuid import uuid4
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_BLOODHOUND_MCP_DIR = Path(
-    os.environ.get("SAGE_BLOODHOUND_MCP_DIR")
-    or (REPO_ROOT.parent / "bloodhound_mcp")
-)
 DEFAULT_STARTUP_IDENTITY_PATH = Path(
     os.environ.get("SAGE_STARTUP_IDENTITY_PATH", "/tmp/sage_startup_identity.json")
 )
@@ -680,22 +676,50 @@ def bloodhound_api_status(status_code: int | None, domains: Any) -> dict[str, An
     }
 
 
+def _runtime_env():
+    """The shared resolver (`sage_runtime_env.py`), loaded once under its own module name."""
+    cached = sys.modules.get("sage_runtime_env")
+    if cached is not None:
+        return cached
+    spec = importlib.util.spec_from_file_location(
+        "sage_runtime_env", Path(__file__).resolve().parent / "sage_runtime_env.py"
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load sage_runtime_env.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    sys.modules["sage_runtime_env"] = module
+    return module
+
+
+def resolve_bloodhound_mcp_dir() -> Path | None:
+    """The BloodHound MCP checkout Sage would use, in Sage's own lookup order; None if unset.
+
+    No sibling-checkout fallback: a guessed directory passes readiness while binding BloodHound to
+    a checkout the operator never chose.
+    """
+    value = _runtime_env().resolve("SAGE_BLOODHOUND_MCP_DIR")
+    return Path(value).expanduser() if value else None
+
+
 def bloodhound_mcp_status(
     directory: str | Path | None,
     tool_names: Iterable[str] | None,
 ) -> dict[str, Any]:
-    path = Path(directory or DEFAULT_BLOODHOUND_MCP_DIR).expanduser()
+    path = Path(directory).expanduser() if directory else resolve_bloodhound_mcp_dir()
     names = sorted({str(name).strip() for name in (tool_names or []) if str(name).strip()})
     missing = sorted(REQUIRED_BLOODHOUND_TOOLS.difference(names))
     blockers = []
-    if not path.is_dir():
+    if path is None:
+        blockers.append(_runtime_env().unresolved_message("SAGE_BLOODHOUND_MCP_DIR"))
+    elif not path.is_dir():
         blockers.append(f"BloodHound MCP checkout missing: {path}")
     if missing:
         blockers.append(f"BloodHound MCP missing exact tools: {', '.join(missing)}")
     return {
         "ready": not blockers,
-        "directory": str(path),
-        "checkout_exists": path.is_dir(),
+        "directory": str(path) if path is not None else None,
+        "checkout_exists": bool(path is not None and path.is_dir()),
         "required_tools": sorted(REQUIRED_BLOODHOUND_TOOLS),
         "tool_names": names,
         "missing_tools": missing,
@@ -945,8 +969,8 @@ def build_readiness_report(
 
 
 async def probe_bloodhound_mcp_tools(directory: str | Path | None = None) -> dict[str, Any]:
-    path = Path(directory or os.environ.get("SAGE_BLOODHOUND_MCP_DIR") or DEFAULT_BLOODHOUND_MCP_DIR)
-    if not path.is_dir():
+    path = Path(directory).expanduser() if directory else resolve_bloodhound_mcp_dir()
+    if path is None or not path.is_dir():
         return bloodhound_mcp_status(path, [])
     try:
         from langchain_mcp_adapters.client import MultiServerMCPClient

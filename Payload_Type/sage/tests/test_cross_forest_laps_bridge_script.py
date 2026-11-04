@@ -1,5 +1,4 @@
 import importlib.util
-import os
 from pathlib import Path
 
 import pytest
@@ -33,15 +32,19 @@ def test_build_bridge_query_matches_reconciler_shape_without_sync_laps():
     assert "SyncLAPSPassword" not in query
 
 
-def test_default_bloodhound_dir_derives_from_workspace_root():
-    expected = Path(
-        os.environ.get("SAGE_BLOODHOUND_MCP_DIR")
-        or (check_cross_forest_laps_bridge.WORKSPACE_ROOT / "bloodhound_mcp")
-    )
-    assert (
-        check_cross_forest_laps_bridge.DEFAULT_BLOODHOUND_MCP_DIR
-        == expected
-    )
+def test_bloodhound_dir_uses_the_runtime_lookup_and_never_a_sibling(tmp_path, monkeypatch):
+    module = check_cross_forest_laps_bridge
+    (tmp_path / "bloodhound_mcp").mkdir()
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    monkeypatch.delenv("SAGE_BLOODHOUND_MCP_DIR", raising=False)
+    monkeypatch.setattr(module.sage_runtime_env, "RUNTIME_DIR", runtime)
+    with pytest.raises(SystemExit) as excinfo:
+        module.bloodhound_mcp_dir()
+    assert "SAGE_BLOODHOUND_MCP_DIR" in str(excinfo.value)
+
+    (runtime / ".env").write_text(f"SAGE_BLOODHOUND_MCP_DIR={tmp_path / 'mcp'}\n", encoding="utf-8")
+    assert module.bloodhound_mcp_dir() == tmp_path / "mcp"
 
 
 def test_check_bridge_reports_cross_forest_managed_secret_path():

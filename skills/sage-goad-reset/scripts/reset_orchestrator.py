@@ -32,7 +32,7 @@ BOOTSTRAP = (
 READINESS_CONTRACT = RESET_DIR / "scripts" / "readiness_contract.py"
 RANGE_PROFILE = RESET_DIR / "scripts" / "range_profile.py"
 DEFAULT_CHECKPOINT_DIR = REPO_ROOT / ".sage_engagement" / "reset_runs"
-SCHEMA = "sage-goad-reset-orchestration-v2"
+SCHEMA = "sage-goad-reset-orchestration-v3"
 RANGE_FIXTURE_QUALIFICATION_SCHEMA = "sage-range-fixture-qualification-v1"
 TASK_COUNT_QUERY = """
 query SageResetTaskCount($operationId: Int!) {
@@ -407,12 +407,12 @@ def _phase_commands(config: dict[str, Any]) -> dict[str, list[str]]:
             "sync",
             "--yes",
         ],
+        # The MCP checkout is resolved when the phase runs, in Sage's own lookup order (process env,
+        # Payload_Type/sage/.env.local, then .env), never guessed from a sibling directory.
         "wipe-bloodhound": [
-            "uv",
-            "--directory",
-            str(REPO_ROOT.parent / "bloodhound_mcp"),
-            "run",
-            "python",
+            str(PYTHON),
+            str(RESET_DIR / "scripts" / "sage_runtime_env.py"),
+            "mcp-run",
             str(RESET_DIR / "scripts" / "bh_reset.py"),
             "wipe",
             "--yes",
@@ -767,6 +767,13 @@ def _validate_checkpoint(
     checkpoint: Any, path: Path, *, require_live_qualified: bool = True
 ) -> dict[str, Any]:
     if not isinstance(checkpoint, dict) or checkpoint.get("schema") != SCHEMA:
+        found = checkpoint.get("schema") if isinstance(checkpoint, dict) else None
+        if isinstance(found, str) and found.startswith("sage-goad-reset-orchestration-v"):
+            raise ResetError(
+                f"reset checkpoint at {path} was written by a different reset tool version ({found}; "
+                f"this tool writes {SCHEMA}), so its phase commands do not match. Finish it with the "
+                "version that started it, or start a new reset."
+            )
         raise ResetError(f"unsupported reset checkpoint at {path}")
     if "scenario_manifest_binding" in checkpoint:
         try:
@@ -2152,10 +2159,9 @@ def _add_start_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--restart-env",
         action="append",
-        default=[
-            "SAGE_ENGAGEMENT_GATE=1",
-            f"SAGE_BLOODHOUND_MCP_DIR={REPO_ROOT.parent / 'bloodhound_mcp'}",
-        ],
+        # SAGE_BLOODHOUND_MCP_DIR is deliberately absent: sage_restart.sh resolves it the way Sage
+        # does. A default here was a sibling-checkout guess that overrode the operator's own setting.
+        default=["SAGE_ENGAGEMENT_GATE=1"],
     )
     parser.add_argument("--range-ready-timeout", type=int, default=600)
     parser.add_argument("--range-poll-interval", type=float, default=10.0)

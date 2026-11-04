@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Read-only BloodHound Cypher query via the MCP's own signed base client.
 
-Run through the MCP env (so it targets the exact instance the MCP/Sage reach):
-  uv --directory "$SAGE_BLOODHOUND_MCP_DIR" run python \
+Run through the MCP env (so it targets the exact instance the MCP/Sage reach). `mcp-run` resolves
+SAGE_BLOODHOUND_MCP_DIR the way Sage does (process env, Payload_Type/sage/.env.local, then .env):
+  .venv/bin/python skills/sage-goad-reset/scripts/sage_runtime_env.py mcp-run \
       skills/sage-eval-gauge/scripts/bh_cypher.py '<cypher query>'
 
 Prints one JSON line: {"status": <code|null>, "node_count": N}. READ-ONLY; never writes.
@@ -10,11 +11,11 @@ Grounded in bh_reset.py's client + CypherClient.run_query (POST /api/v2/graphs/c
 import json
 import sys
 
-# BloodHound MCP location: env var, else the sibling checkout beside this repo.
-import os
+# BloodHound MCP location: Sage's own lookup, never a guessed sibling checkout.
 from pathlib import Path
-sys.path.insert(0, os.environ.get("SAGE_BLOODHOUND_MCP_DIR")
-                or str(Path(__file__).resolve().parents[4] / "bloodhound_mcp"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "sage-goad-reset" / "scripts"))
+import sage_runtime_env  # noqa: E402
+sys.path.insert(0, sage_runtime_env.require("SAGE_BLOODHOUND_MCP_DIR"))
 from lib.bloodhound_api import BloodhoundBaseClient  # noqa: E402
 
 query = sys.argv[1] if len(sys.argv) > 1 else "MATCH (d:Domain) RETURN d"

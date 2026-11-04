@@ -359,7 +359,7 @@ def test_qualification_observation_allows_only_private_allocation_from_unallocat
         "required_route_coverage": profile.required_route_coverage(replication),
         "oracle_dependencies": ["mythic-task-output-or-artifact"],
         "snapshot_id": "wrong-concrete-snapshot",
-        "reset_checkpoint_schema": "sage-goad-reset-orchestration-v2",
+        "reset_checkpoint_schema": "sage-goad-reset-orchestration-v3",
     }
     assert bound_snapshot != concrete_manifest["snapshot_id"]
     assert "snapshot_binding_mismatch" in profile.validate_scenario_manifest(
@@ -384,7 +384,7 @@ def test_qualified_profile_manifest_cannot_prove_live_readiness_without_reset_ev
         "snapshot_id": profile.require_scenario(
             selected, "replication-purpose-range-visible-cost"
         )["snapshot"],
-        "reset_checkpoint_schema": "sage-goad-reset-orchestration-v2",
+        "reset_checkpoint_schema": "sage-goad-reset-orchestration-v3",
     }
 
     report = profile.validate_scenario_manifest(manifest)

@@ -2,22 +2,27 @@
 """BloodHound reset — wipe collected graph data so each eval starts on a FRESH DB.
 
 Uses the BloodHound MCP's own signed base client (reads the MCP's .env), so it targets the exact
-instance the MCP/Sage reach — no raw host:port guessing. Run via the MCP's env:
-  uv --directory <workspace>/bloodhound_mcp run python <repo>/skills/sage-goad-reset/scripts/bh_reset.py [status|wipe --yes]
+instance the MCP/Sage reach — no raw host:port guessing. Run inside the MCP's environment, which
+`sage_runtime_env.py mcp-run` resolves the way Sage does (process env, Payload_Type/sage/.env.local,
+then .env):
+  .venv/bin/python skills/sage-goad-reset/scripts/sage_runtime_env.py mcp-run \
+      skills/sage-goad-reset/scripts/bh_reset.py [status|wipe --yes]
 """
 import json
-import os
 from pathlib import Path
 import sys
 import time
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-WORKSPACE_ROOT = REPO_ROOT.parent
-DEFAULT_BLOODHOUND_MCP_DIR = Path(
-    os.environ.get("SAGE_BLOODHOUND_MCP_DIR")
-    or (WORKSPACE_ROOT / "bloodhound_mcp")
-)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import sage_runtime_env  # noqa: E402
+
 _client = None
+
+
+def bloodhound_mcp_dir() -> Path:
+    """The MCP checkout whose client and .env this script uses; refuses naming the variable."""
+    return Path(sage_runtime_env.require("SAGE_BLOODHOUND_MCP_DIR")).expanduser()
 
 def _install_control_meter():
     sage_root = REPO_ROOT / "Payload_Type" / "sage"
@@ -32,7 +37,7 @@ def _get_client():
     global _client
     if _client is None:
         _install_control_meter()
-        sys.path.insert(0, str(DEFAULT_BLOODHOUND_MCP_DIR))
+        sys.path.insert(0, str(bloodhound_mcp_dir()))
         from lib.bloodhound_api import BloodhoundBaseClient
         _client = BloodhoundBaseClient()
     return _client

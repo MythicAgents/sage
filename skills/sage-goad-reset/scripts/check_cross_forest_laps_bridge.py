@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
 import re
 import sys
@@ -25,11 +24,14 @@ from typing import Any, Callable
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-WORKSPACE_ROOT = REPO_ROOT.parent
-DEFAULT_BLOODHOUND_MCP_DIR = Path(
-    os.environ.get("SAGE_BLOODHOUND_MCP_DIR")
-    or (WORKSPACE_ROOT / "bloodhound_mcp")
-)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import sage_runtime_env  # noqa: E402
+
+
+def bloodhound_mcp_dir() -> Path:
+    """Sage's own lookup (process env, Payload_Type/sage/.env.local, then .env); refuses when unset."""
+    return Path(sage_runtime_env.require("SAGE_BLOODHOUND_MCP_DIR")).expanduser()
+
 _DOMAIN_RE = re.compile(r"^[a-z0-9.-]+$", re.IGNORECASE)
 _MANAGED_SECRET_EDGE_TYPES = ("ReadLAPSPassword", "ReadLAPS", "ReadMSLAPSPassword")
 
@@ -60,8 +62,8 @@ def build_bridge_query(target_domain: str, source_domain: str = "") -> str:
     )
 
 
-def _get_bloodhound_api(mcp_dir: Path = DEFAULT_BLOODHOUND_MCP_DIR) -> Any:
-    sys.path.insert(0, str(mcp_dir))
+def _get_bloodhound_api(mcp_dir: Path | None = None) -> Any:
+    sys.path.insert(0, str(mcp_dir or bloodhound_mcp_dir()))
     from lib.bloodhound_api import BloodhoundAPI
 
     return BloodhoundAPI()
@@ -100,7 +102,7 @@ def check_bridge(
     *,
     source_domain: str = "",
     query_runner: Callable[[str], dict[str, Any]] | None = None,
-    mcp_dir: Path = DEFAULT_BLOODHOUND_MCP_DIR,
+    mcp_dir: Path | None = None,
 ) -> dict[str, Any]:
     target = normalize_domain(target_domain)
     source = normalize_domain(source_domain) if source_domain else ""
@@ -133,7 +135,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--target-domain", required=True)
     parser.add_argument("--source-domain", default="")
-    parser.add_argument("--bloodhound-mcp-dir", default=str(DEFAULT_BLOODHOUND_MCP_DIR))
+    parser.add_argument(
+        "--bloodhound-mcp-dir",
+        default=None,
+        help="default: SAGE_BLOODHOUND_MCP_DIR from the process env, Payload_Type/sage/.env.local, then .env",
+    )
     return parser.parse_args()
 
 
@@ -142,7 +148,7 @@ def main() -> int:
     result = check_bridge(
         args.target_domain,
         source_domain=args.source_domain,
-        mcp_dir=Path(args.bloodhound_mcp_dir),
+        mcp_dir=Path(args.bloodhound_mcp_dir) if args.bloodhound_mcp_dir else None,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if result["ready"] else 1

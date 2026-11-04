@@ -200,6 +200,36 @@ def test_plan_has_canonical_order_and_never_deploys_payload():
     ]
 
 
+def test_bloodhound_wipe_resolves_the_mcp_checkout_at_run_time_not_from_a_sibling():
+    command = reset._phase_commands(_config())["wipe-bloodhound"]
+
+    assert command[0] == str(reset.PYTHON)
+    assert command[1].endswith("sage_runtime_env.py")
+    assert command[2] == "mcp-run"
+    assert command[3].endswith("bh_reset.py")
+    assert command[4:] == ["wipe", "--yes"]
+    assert str(reset.REPO_ROOT.parent / "bloodhound_mcp") not in json.dumps(reset._phase_commands(_config()))
+
+
+def test_default_restart_env_leaves_the_bloodhound_dir_to_the_runtime_lookup():
+    config = reset._config_from_args(
+        reset.build_parser().parse_args(
+            ["plan", "--snapshot", "exact-clean-snapshot", "--callback-host", "http://100.64.0.1"]
+        )
+    )
+    assert "SAGE_BLOODHOUND_MCP_DIR" not in config["restart_env"]
+    assert config["restart_env"]["SAGE_ENGAGEMENT_GATE"] == "1"
+
+
+def test_checkpoint_from_an_earlier_reset_tool_is_refused_with_a_reason(tmp_path):
+    path = tmp_path / "reset-old.json"
+    with pytest.raises(reset.ResetError) as excinfo:
+        reset._validate_checkpoint({"schema": "sage-goad-reset-orchestration-v2"}, path)
+    message = str(excinfo.value)
+    assert "sage-goad-reset-orchestration-v2" in message
+    assert "start a new reset" in message
+
+
 def test_archive_phase_preserves_evidence_from_the_configured_mythic_install():
     command = reset._phase_commands(_config())["archive-runtime-dbs"]
 
