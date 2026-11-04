@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 from pathlib import Path
+import socket
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -22,6 +24,9 @@ _harness = importlib.util.module_from_spec(_SPEC)
 assert _SPEC and _SPEC.loader
 _SPEC.loader.exec_module(_harness)
 
+from ai.langgraph import capabilities as caps  # noqa: E402
+from ai.langgraph import engagement_state as es  # noqa: E402
+from ai.langgraph import graph_reconciler as gr  # noqa: E402
 from ai.langgraph import handoff_brief as hb  # noqa: E402
 from ai.langgraph import model as model_module  # noqa: E402
 from ai.langgraph.request_contract import build_request_contract  # noqa: E402
@@ -225,7 +230,9 @@ def _handoff(args: dict, call_id: str = "call_handoff_1", worker: str = "Mythic_
         "name": f"transfer_to_{worker}", "args": args, "id": call_id, "type": "tool_call"}])
 
 
-def _run(script: list[AIMessage], *, prompt: str = PROMPT, mode: str = "supervised", recursion_limit: int = 12):
+def _run(script: list[AIMessage], *, prompt: str = PROMPT, mode: str = "supervised", recursion_limit: int = 12,
+         hops: Any = (), facts: Any = (), autonomous_solve: bool = False):
+    """Run the real graph; `hops` and `facts` seed the engagement records Sage's producers wrote."""
     harness = _harness._Harness(script)
     original_build = harness._build
 
@@ -233,16 +240,19 @@ def _run(script: list[AIMessage], *, prompt: str = PROMPT, mode: str = "supervis
         model = original_build(script)
         model.mythic_client._recon_snapshot_cache = {("list_callbacks", "all"): CALLBACKS}
         model.mythic_client._engagement_footholds = _footholds()
+        model.mythic_client._engagement_hops = list(hops)
+        model.mythic_client._engagement_graph_facts = list(facts)
         return model
 
     harness._build = build
     original_run = harness.run
 
     async def run(prompt_text: str, *, assisted: bool = False, stream: bool = False):
-        if mode == "supervised":
+        if mode == "supervised" and not autonomous_solve:
             return await original_run(prompt_text, assisted=True)
         real_build = _harness.build_request_contract
-        _harness.build_request_contract = lambda **kw: real_build(**{**kw, "mode": mode})
+        _harness.build_request_contract = lambda **kw: real_build(
+            **{**kw, "mode": mode, "autonomous_solve": autonomous_solve})
         try:
             return await original_run(prompt_text, assisted=True)
         finally:
@@ -682,3 +692,365 @@ def test_the_channel_18_dc_step_is_admitted_from_the_graph_facts_sage_held():
     )
 
     assert _errors(brief, scope) == ()
+
+
+# --- Host identities recorded by capability rows and the managed-secret graph fact --------------------------------
+
+CHILD = "child.example.test"
+OTHER = "other.example.test"
+WS01 = f"ws01.{CHILD}"
+RECORDED_AT = "2026-11-03T00:00:00+00:00"
+FOLLOW_UP = "proceed"
+
+# The capability factories that record a host-domain pair, each with probe fields its verifier accepts.
+_HOST_CAPABILITIES = {
+    "read-managed-local-admin-secret": (
+        lambda host, domain, callback: caps._read_managed_local_admin_secret_action(domain, "ops", domain, host,
+                                                                                    callback),
+        {"managed_local_admin_secret_present": True}),
+    "use-managed-local-admin-secret": (
+        lambda host, domain, callback: caps._use_managed_local_admin_secret_action(domain, host, callback),
+        {"local_admin_access_proven": True}),
+    "execute-as-local-admin": (
+        lambda host, domain, callback: caps._execute_as_local_admin_action(domain, host, callback),
+        {"remote_execution_proven": True}),
+}
+
+
+def _recorded(capability: str = "execute-as-local-admin", *, host: str = "WS01", domain: str = CHILD,
+              callback: str = "3", verifier_input: dict | None = None, state: Any = None) -> list[Any]:
+    """Hops exactly as the real factory and recorder write them, from a synthetic verifier input."""
+    factory, proven = _HOST_CAPABILITIES[capability]
+    probe = verifier_input if verifier_input is not None else {
+        **proven, "callback_id": callback, "target_host": host.casefold(), "target_domain": domain}
+    updated, _verification = caps.record_capability_result(
+        state or es.EngagementState(objective="synthetic"), factory(host, domain, callback), probe, RECORDED_AT)
+    return list(updated.hops)
+
+
+def _laps_facts(computer: str = "WS01.CHILD.EXAMPLE.TEST", principal: str = "OPS@CHILD.EXAMPLE.TEST") -> list[Any]:
+    """The managed-secret graph fact exactly as the reconciler projects it from a ReadLAPSPassword edge."""
+    return gr.project_graph_predicates([{"principal": principal, "type": "ReadLAPSPassword",
+                                         "target_kind": "computer", "computer": computer}], RECORDED_AT, 3600)
+
+
+def _row(target: str, technique: str = "capability:execute-as-local-admin", status: str = "achieved",
+         **evidence: Any) -> SimpleNamespace:
+    """A hand-written ledger row, for inputs no producer writes."""
+    return SimpleNamespace(technique=technique, target=target, status=status, evidence=evidence)
+
+
+def _fact(predicate: str) -> SimpleNamespace:
+    return SimpleNamespace(predicate=predicate)
+
+
+def _added_hosts(scope: hb.KnownScope) -> frozenset[str]:
+    """Hosts beyond the callback and foothold baseline every scope here starts from."""
+    return scope.hosts - _scope(FOLLOW_UP).hosts
+
+
+def _assert_no_encoded_names(scope: hb.KnownScope) -> None:
+    assert not [name for name in scope.hosts | scope.domains if "=" in name or ";" in name]
+
+
+@pytest.mark.parametrize("capability", list(_HOST_CAPABILITIES))
+def test_an_achieved_capability_row_names_its_full_host_and_unique_alias(capability):
+    hops = _recorded(capability)
+    assert [(hop.technique, hop.status) for hop in hops] == [(f"capability:{capability}", "achieved")]
+
+    scope = _scope(FOLLOW_UP, _engagement_hops=hops)
+
+    assert _added_hosts(scope) == {WS01} and CHILD in scope.domains
+    _assert_no_encoded_names(scope)
+    for target in ("WS01.CHILD.EXAMPLE.TEST", "ws01", "WS01"):
+        assert _errors(_brief(targets=[target]), scope) == ()
+
+
+@pytest.mark.parametrize("capability", list(_HOST_CAPABILITIES))
+@pytest.mark.parametrize("probe, runtime_scoped, status", [
+    ({"callback_id": "3", "target_host": "ws01", "target_domain": CHILD}, False, "failed"),
+    ({"access_denied": True, "callback_id": "3", "target_host": "ws01", "target_domain": CHILD}, False, "blocked"),
+    ("proven-without-domain", False, "failed"),          # a partial verdict, recorded as failed
+    ("proven", True, "legacy_unverified"),               # runtime scope without admissible proof
+], ids=["failed", "blocked", "partial", "unadmitted"])
+def test_a_row_that_did_not_achieve_its_effect_names_no_host(capability, probe, runtime_scoped, status):
+    proven = _HOST_CAPABILITIES[capability][1]
+    if probe == "proven":
+        probe = {**proven, "callback_id": "3", "target_host": "ws01", "target_domain": CHILD}
+    elif probe == "proven-without-domain":
+        probe = {**proven, "callback_id": "3", "target_host": "ws01"}
+    state = es.EngagementState(objective="synthetic", engagement_id="eng-1", runtime_scope=True) \
+        if runtime_scoped else None
+    hops = _recorded(capability, verifier_input=probe, state=state)
+    assert [hop.status for hop in hops] == [status]
+
+    scope = _scope(FOLLOW_UP, _engagement_hops=hops)
+
+    assert _added_hosts(scope) == frozenset()
+    _assert_no_encoded_names(scope)
+    assert _errors(_brief(targets=[WS01]), scope) and _errors(_brief(targets=["ws01"]), scope)
+
+
+def test_a_managed_secret_graph_fact_names_its_host_before_any_capability_row():
+    facts = _laps_facts()
+    assert [fact.predicate for fact in facts] == [
+        f"can-read-managed-local-admin-secret:account=ops;account_domain={CHILD};target=ws01;target_domain={CHILD}"]
+
+    scope = _scope(FOLLOW_UP, _engagement_graph_facts=facts)
+
+    # Only the target computer: neither the account nor a domain controller of the target domain becomes a host.
+    assert _added_hosts(scope) == {WS01} and CHILD in scope.domains
+    _assert_no_encoded_names(scope)
+    for target in ("WS01.CHILD.EXAMPLE.TEST", "ws01", "WS01"):
+        assert _errors(_brief(targets=[target]), scope) == ()
+
+
+def test_an_account_in_another_domain_does_not_move_the_target_host():
+    scope = _scope(FOLLOW_UP, _engagement_graph_facts=_laps_facts(principal="OPS@OTHER.EXAMPLE.TEST"))
+
+    assert _added_hosts(scope) == {WS01}
+    assert not scope.names_target(f"ws01.{OTHER}") and not scope.names_target("ops")
+
+
+def _seeded(source: str, **record: Any) -> dict[str, Any]:
+    if source == "capability-row":
+        return {"_engagement_hops": _recorded(**record)}
+    computer = f"{record.get('host', 'WS01')}.{record.get('domain', CHILD)}"
+    return {"_engagement_graph_facts": _laps_facts(computer=computer)}
+
+
+@pytest.mark.parametrize("source", ["capability-row", "graph-fact"])
+@pytest.mark.parametrize("target", [
+    f"ws02.{CHILD}", "ws02",                      # a different host
+    f"ws01.{OTHER}",                              # the same label in another known domain
+    "ws01.child.example.tes", "ws01.child.example.testx", "xws01.child.example.test",
+])
+def test_a_recorded_host_admits_no_near_match(source, target):
+    seeded = _seeded(source)
+    trust = _fact(f"trust-reachable:{CHILD}:{OTHER}")
+    seeded["_engagement_graph_facts"] = [*seeded.get("_engagement_graph_facts", []), trust]
+    scope = _scope(FOLLOW_UP, **seeded)
+
+    assert OTHER in scope.domains and scope.names_target(WS01)
+    assert _errors(_brief(targets=[target]), scope)
+
+
+@pytest.mark.parametrize("source", ["capability-row", "graph-fact"])
+def test_one_short_host_recorded_in_two_domains_has_no_bare_alias(source):
+    first, second = _seeded(source, domain=CHILD), _seeded(source, domain=OTHER)
+    key = next(iter(first))
+    scope = _scope(FOLLOW_UP, **{key: [*first[key], *second[key]]})
+
+    assert _added_hosts(scope) == {WS01, f"ws01.{OTHER}"}
+    assert scope.names_target(WS01) and scope.names_target(f"ws01.{OTHER}")
+    assert not scope.names_target("ws01")
+
+
+def test_domain_only_evidence_names_no_host():
+    scope = _scope(FOLLOW_UP, _engagement_graph_facts=[_fact(f"domain-collected:{CHILD}")],
+                   _engagement_hops=[_row(CHILD, technique="capability:collect-graph")])
+
+    assert CHILD in scope.domains and _added_hosts(scope) == frozenset()
+    assert not scope.names_target(WS01) and not scope.names_target("ws01")
+
+
+def test_a_short_name_in_the_operator_text_is_not_qualified_under_a_known_domain():
+    scope = _scope("Read the password for WS01", _engagement_graph_facts=[_fact(f"domain-collected:{CHILD}")])
+
+    assert scope.names_target("WS01")         # the operator's exact token keeps its existing standing
+    assert not scope.names_target(WS01)       # but establishes no host-domain relationship
+
+
+def test_a_bare_effect_without_a_structured_pair_names_no_host():
+    row = _row("", status="achieved")
+    row.satisfied_effects = ["host-exec:ws01", "admin:ws01", f"remote-exec:ws01@{CHILD}"]
+    row.effect = "host-exec:ws01"
+    scope = _scope(FOLLOW_UP, _engagement_hops=[row], _engagement_graph_facts=[_fact(f"domain-collected:{CHILD}")])
+
+    assert _added_hosts(scope) == frozenset()
+    assert not scope.names_target(WS01) and not scope.names_target("ws01")
+
+
+_EXEC = "capability:execute-as-local-admin"
+
+
+@pytest.mark.parametrize("technique, target", [
+    (_EXEC, "target=ws01;callback=3"),                                           # missing field
+    (_EXEC, f"target=ws01;target_domain={CHILD}"),
+    (_EXEC, f"target=;target_domain={CHILD};callback=3"),                        # empty value
+    (_EXEC, "target=ws01;target_domain=;callback=3"),
+    (_EXEC, f"target=ws01;target_domain={CHILD};callback="),
+    (_EXEC, f"target=ws01;target=ws02;target_domain={CHILD};callback=3"),        # duplicate key
+    (_EXEC, f"TARGET=ws01;target=ws01;target_domain={CHILD};callback=3"),
+    (_EXEC, f"target=ws01;target_domain={CHILD};callback=3;extra=1"),            # unknown key
+    (_EXEC, f"target=ws01;target_domain={CHILD};callback=3;"),                   # non-assignment segments
+    (_EXEC, f"target=ws01;target_domain={CHILD};callback=3;stray"),
+    (_EXEC, f"target=ws01=ws02;target_domain={CHILD};callback=3"),               # a second delimiter in a value
+    (_EXEC, f"target=ws01;target_domain={CHILD};callback=3=4"),
+    (_EXEC, "target=ws01;target_domain=child;callback=3"),                       # domain not dotted
+    (_EXEC, "target=ws01;target_domain=child..example.test;callback=3"),         # empty labels
+    (_EXEC, "target=ws01;target_domain=.child.example.test;callback=3"),
+    (_EXEC, f"target=ws 01;target_domain={CHILD};callback=3"),                   # whitespace
+    (_EXEC, f"target=ws01;target_domain=child.example .test;callback=3"),
+    (_EXEC, f"target=ws01@x;target_domain={CHILD};callback=3"),                  # principal/path/predicate delimiters
+    (_EXEC, f"target=ws01\\x;target_domain={CHILD};callback=3"),
+    (_EXEC, f"target=ws01/x;target_domain={CHILD};callback=3"),
+    (_EXEC, f"target=ws01:x;target_domain={CHILD};callback=3"),
+    (_EXEC, "target=ws01;target_domain=child.example.test@x;callback=3"),
+    (_EXEC, f"target=ws01.{OTHER};target_domain={CHILD};callback=3"),            # a conflicting qualified target
+    (_EXEC, f"target=ws01.example.test;target_domain={CHILD};callback=3"),
+    ("capability:read-managed-local-admin-secret", f"target=ws01;target_domain={CHILD};callback=3"),
+    ("capability:use-managed-local-admin-secret",
+     f"account=ops;account_domain={CHILD};target=ws01;target_domain={CHILD};callback=3"),
+    ("capability:ensure-account-kerberos-context", f"target=ws01;target_domain={CHILD};callback=3"),
+    ("capability:execute-as-local-admin-v2", f"target=ws01;target_domain={CHILD};callback=3"),
+    ("execute-as-local-admin", f"target=ws01;target_domain={CHILD};callback=3"),
+])
+def test_a_malformed_or_unsupported_row_names_no_host_and_keeps_its_task_reference(technique, target):
+    scope = _scope(FOLLOW_UP, _engagement_hops=[_row(target, technique, mythic_task_id=77)])
+
+    assert _added_hosts(scope) == frozenset()
+    _assert_no_encoded_names(scope)
+    assert not scope.names_target(WS01) and not scope.names_target("ws01")
+    assert "77" in scope.tasks
+
+
+@pytest.mark.parametrize("status", ["failed", "blocked", "pending", "legacy_unverified", ""])
+def test_a_well_formed_row_that_is_not_achieved_names_no_host(status):
+    scope = _scope(FOLLOW_UP, _engagement_hops=[_row(f"target=ws01;target_domain={CHILD};callback=3",
+                                                     status=status)])
+    assert _added_hosts(scope) == frozenset()
+
+
+@pytest.mark.parametrize("technique, target, status", [
+    (_EXEC, "TARGET=WS01;Target_Domain=Child.Example.Test;CALLBACK=3", "achieved"),
+    (_EXEC, f"target=ws01;target_domain={CHILD}.;callback=3", "ACHIEVED"),
+    (_EXEC, f"callback=3;target_domain={CHILD};target=ws01", "achieved"),
+    (_EXEC, f"target=ws01.;target_domain={CHILD};callback=3", "achieved"),
+    (_EXEC, f"target={WS01};target_domain={CHILD};callback=3", "achieved"),
+    (_EXEC, f"target=WS01.Child.Example.Test.;target_domain={CHILD};callback=3", "achieved"),
+    ("Capability:Use-Managed-Local-Admin-Secret", "target=ws01;target_domain=CHILD.EXAMPLE.TEST.;callback=3",
+     "achieved"),
+    ("capability:read-managed-local-admin-secret",
+     f"callback=3;target=ws01;account_domain={CHILD};account=ops;target_domain={CHILD}", "achieved"),
+])
+def test_equivalent_spellings_of_a_supported_row_name_the_same_host(technique, target, status):
+    scope = _scope(FOLLOW_UP, _engagement_hops=[_row(target, technique, status)])
+
+    assert _added_hosts(scope) == {WS01} and CHILD in scope.domains
+    assert scope.names_target("ws01")
+
+
+@pytest.mark.parametrize("predicate", [
+    f"can-read-managed-local-admin-secret:account_domain={CHILD};target=ws01;target_domain={CHILD}",
+    f"can-read-managed-local-admin-secret:account=ops;account_domain={CHILD};target=ws01;target_domain={CHILD};"
+    "callback=3",
+    f"can-read-managed-local-admin-secret:account=ops;account_domain={CHILD};target=ws01;target=ws02;"
+    f"target_domain={CHILD}",
+    f"can-read-managed-local-admin-secret:account=;account_domain={CHILD};target=ws01;target_domain={CHILD}",
+    f"can-read-managed-local-admin-secret:account=ops;account_domain={CHILD};target=ws01.{OTHER};"
+    f"target_domain={CHILD}",
+    f"can-read-managed-local-admin-secret:account=ops;account_domain={CHILD};target=ws01:x;target_domain={CHILD}",
+    f"can-read-managed-local-admin-secret:account=ops;account_domain={CHILD};target=ws01;target_domain=child",
+    f"can-read-laps:account=ops;account_domain={CHILD};target=ws01;target_domain={CHILD}",
+    f"can-read-managed-local-admin-secret:ops:ws01:{CHILD}",
+    "generic-write:computer:ws01",
+])
+def test_a_malformed_or_unsupported_graph_fact_names_no_host(predicate):
+    scope = _scope(FOLLOW_UP, _engagement_graph_facts=[_fact(predicate)])
+
+    assert _added_hosts(scope) == frozenset()
+    _assert_no_encoded_names(scope)
+    assert not scope.names_target(WS01) and not scope.names_target("ws01")
+
+
+@pytest.mark.parametrize("predicate", [
+    f"CAN-READ-MANAGED-LOCAL-ADMIN-SECRET:TARGET_DOMAIN={CHILD.upper()}.;target=WS01;account=ops;"
+    f"account_domain={CHILD}",
+    f"can-read-managed-local-admin-secret:account=ops;account_domain={CHILD};target={WS01};target_domain={CHILD}",
+])
+def test_equivalent_spellings_of_the_managed_secret_fact_name_the_same_host(predicate):
+    scope = _scope(FOLLOW_UP, _engagement_graph_facts=[_fact(predicate)])
+
+    assert _added_hosts(scope) == {WS01} and CHILD in scope.domains
+
+
+@pytest.mark.parametrize("reference, ok", [
+    ("task:41", True),
+    ("cred:12", True),
+    ("task:999", False),
+    (f"cred:ops@{CHILD}", False),
+])
+def test_references_resolve_as_before_alongside_a_recorded_host(reference, ok):
+    scope = _scope(FOLLOW_UP, _engagement_hops=_recorded(), _task_source_request_ids={41: "chat:1:request:1"},
+                   _cred_cache=[{"id": 12}])
+    assert (_errors(_brief(targets=[WS01], inputs_by_reference=[reference]), scope) == ()) is ok
+
+
+def test_a_recorded_host_does_not_admit_a_callback_other_than_the_bound_one():
+    scope = hb.known_scope(_client(_engagement_hops=_recorded()), operator_input=FOLLOW_UP, bound_callback="3")
+    errors = _errors(_brief(targets=[WS01], callback_display_id=4), scope)
+    assert len(errors) == 1 and errors[0].startswith("callback_display_id")
+
+
+# --- assembled: a follow-up that omits the host it acts on ---------------------------------------------------------
+
+_RECORDED_HOST_HANDOFF = {
+    "handoff_title": "Run the staged payload", "handoff_instruction": "Run the staged payload on WS01.",
+    "callback_display_id": "3", "targets": ["WS01.CHILD.EXAMPLE.TEST"],
+    "expected_result": "A new callback from WS01.", "allowed_tools": TASK_TOOL,
+}
+
+
+def _refuse_network(monkeypatch) -> None:
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("brief scope test attempted network")
+
+    monkeypatch.setattr(socket.socket, "connect", refuse)
+    monkeypatch.setattr(socket.socket, "connect_ex", refuse)
+    monkeypatch.setattr(socket, "getaddrinfo", refuse)
+
+
+def _assert_no_mythic_tasking(harness) -> None:
+    for forbidden in ("issue_task", "execute_custom_query", "login", "issue_task_and_waitfor_task_output"):
+        assert not getattr(harness.mythic, forbidden).called, f"brief scope test called Mythic.{forbidden}"
+
+
+@pytest.mark.parametrize("autonomous_solve", [False, True], ids=["actions-complete", "autonomous-solve"])
+@pytest.mark.parametrize("source", ["capability-row", "graph-fact"])
+def test_a_recorded_host_dispatches_on_a_follow_up_that_omits_it(monkeypatch, source, autonomous_solve):
+    _refuse_network(monkeypatch)
+    seeded = {"hops": _recorded()} if source == "capability-row" else {"facts": _laps_facts()}
+    harness, result = _run([_handoff(_RECORDED_HOST_HANDOFF), AIMessage(content="worker done"),
+                            AIMessage(content="final")], prompt=FOLLOW_UP, autonomous_solve=autonomous_solve,
+                           **seeded)
+
+    expected = hb.HandoffBrief.from_args(**{key: value for key, value in _RECORDED_HOST_HANDOFF.items()
+                                            if not key.startswith("handoff_")}).as_metadata()
+    delegated = _delegated(result)
+    assert [message.content for message in delegated] == [FOLLOW_UP]
+    assert delegated[0].additional_kwargs["_handoff_brief"] == expected
+    events = _brief_events(harness)
+    assert [event.phase for event in events] == ["accepted"]
+    assert dict(events[0].metadata)["brief"] == json.dumps(expected, sort_keys=True)
+    _assert_no_mythic_tasking(harness)
+
+
+@pytest.mark.parametrize("autonomous_solve", [False, True], ids=["actions-complete", "autonomous-solve"])
+@pytest.mark.parametrize("remaining", ["nothing", "domain-only", "unadmitted-row"])
+def test_without_its_supporting_record_the_same_brief_reaches_no_worker(monkeypatch, remaining, autonomous_solve):
+    _refuse_network(monkeypatch)
+    seeded = {
+        "nothing": {},
+        "domain-only": {"facts": [_fact(f"domain-collected:{CHILD}")]},
+        "unadmitted-row": {"hops": _recorded(state=es.EngagementState(objective="synthetic", engagement_id="eng-1",
+                                                                      runtime_scope=True))},
+    }[remaining]
+    harness, result = _run([_handoff(_RECORDED_HOST_HANDOFF), AIMessage(content="final")], prompt=FOLLOW_UP,
+                           autonomous_solve=autonomous_solve, **seeded)
+
+    assert _delegated(result) == []
+    events = _brief_events(harness)
+    assert [event.phase for event in events] == ["rejected"]
+    assert "targets: WS01.CHILD.EXAMPLE.TEST named neither" in events[0].content
+    _assert_no_mythic_tasking(harness)

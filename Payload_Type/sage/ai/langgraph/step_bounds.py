@@ -298,8 +298,10 @@ def bound_procedure_call(brief: Any, known_hosts: Iterable[str]) -> dict[str, An
 
     Bound means the brief names exactly one procedure in BRIEF_BOUND_PROCEDURES and a callback (which brief
     validation has already matched to one Sage observed). At most one target: it becomes the domain unless it names a
-    host Sage has seen, in which case the collector's own default (the callback user's domain) applies. Several
-    targets leave the choice to the worker. Nothing about the network needs to be known beforehand."""
+    host Sage has seen, in which case the collector's own default (the callback user's domain) applies. A bare label
+    names a host when exactly one known full host name carries it; when several do, the choice is left to the worker
+    rather than sending a host label as the domain. Several targets leave the choice to the worker. Nothing about the
+    network needs to be known beforehand."""
     capabilities, tools = _brief_scope(brief)
     if tools or len(capabilities) != 1 or capabilities[0] not in BRIEF_BOUND_PROCEDURES:
         return None
@@ -311,5 +313,11 @@ def bound_procedure_call(brief: Any, known_hosts: Iterable[str]) -> dict[str, An
     action = {"capability": capabilities[0], "callback_id": callback}
     hosts = {str(item).strip().casefold() for item in known_hosts if str(item).strip()}
     if targets and targets[0] not in hosts and targets[0].split(".", 1)[0] not in hosts:
-        action["domain"] = targets[0]
+        target = targets[0]
+        carriers = set() if "." in target else {
+            host for host in hosts if "." in host and host.split(".", 1)[0] == target}
+        if len(carriers) > 1:
+            return None
+        if not carriers:
+            action["domain"] = target
     return {"action": action}

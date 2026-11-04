@@ -25,6 +25,8 @@ _harness = importlib.util.module_from_spec(_SPEC)
 assert _SPEC and _SPEC.loader
 _SPEC.loader.exec_module(_harness)
 
+from ai.langgraph import capabilities as caps  # noqa: E402
+from ai.langgraph import engagement_state as es  # noqa: E402
 from ai.langgraph import model as model_module  # noqa: E402
 from ai.langgraph import step_bounds as sb  # noqa: E402
 from ai.langgraph.mythic_tools import GUARDED_TOOLS, MythicTools  # noqa: E402
@@ -521,8 +523,11 @@ def test_only_a_fully_bound_procedure_is_proposed_by_sage(brief, call):
     assert sb.bound_procedure_call(brief, {"castelblack"}) == call
 
 
-def _bound_step(monkeypatch, brief: dict, decision: str, worker_replies: int, *, footholds: bool = True):
-    """Run a supervised collect-graph step on callback 5; return the worker's model calls and the capability runs."""
+def _bound_step(monkeypatch, brief: dict, decision: str, worker_replies: int, *, footholds: bool = True,
+                hops: Any = ()):
+    """Run a supervised collect-graph step on callback 5; return the worker's model calls and the capability runs.
+
+    `hops` seeds the engagement rows Sage's capability recorder wrote."""
     ran: list[dict] = []
     worker_calls: list[int] = []
     cards: list[str] = []
@@ -543,6 +548,7 @@ def _bound_step(monkeypatch, brief: dict, decision: str, worker_replies: int, *,
         if footholds:
             sink._engagement_footholds = [SimpleNamespace(callback_id="5", host="WORKSTATION-5", forest="north.test",
                                                           identity="NORTH\\operator")]
+        sink._engagement_hops = list(hops)
         return original(self, *args, **kwargs)
 
     monkeypatch.setattr(model_module.Model, "_rebuild_graph", rebuild)
@@ -601,6 +607,56 @@ def test_a_collection_step_with_several_targets_is_left_to_the_worker_model(monk
     worker_calls, ran = _bound_step(monkeypatch, brief, "", worker_replies=1)
 
     assert ran == [] and len(worker_calls) == 1
+
+
+# --- a bare alias of a host Sage recorded under its full name ------------------------------------------------------
+
+RECORDED_HOSTS = {"ws01.child.example.test", "ws02.child.example.test", "ws02.other.example.test"}
+
+
+@pytest.mark.parametrize("target, call", [
+    ("WS01.CHILD.EXAMPLE.TEST", {"action": CG}),          # an exact known host
+    ("ws01", {"action": CG}),                            # the unique alias of one known host is a host
+    ("WS01.", {"action": CG}),
+    ("ws02", None),                                      # two known hosts share the label: left to the worker
+    ("child.example.test", {"action": {**CG, "domain": "child.example.test"}}),   # a domain stays a domain
+    ("ws03", {"action": {**CG, "domain": "ws03"}}),      # no known host carries it: unchanged domain treatment
+])
+def test_a_bare_alias_of_one_full_host_name_is_never_sent_as_the_domain(target, call):
+    brief = {"allowed_capabilities": ["collect-graph"], "callback_display_id": "3", "targets": [target]}
+    assert sb.bound_procedure_call(brief, RECORDED_HOSTS) == call
+
+
+def _recorded_host_rows() -> list:
+    """An achieved row as the real factory and recorder write it, naming ws01.child.example.test on callback 5."""
+    action = caps._execute_as_local_admin_action("child.example.test", "WS01", "5")
+    state, _verification = caps.record_capability_result(
+        es.EngagementState(objective="synthetic"), action,
+        {"remote_execution_proven": True, "callback_id": "5", "target_host": "ws01",
+         "target_domain": "child.example.test"}, "2026-11-03T00:00:00+00:00")
+    assert [hop.status for hop in state.hops] == ["achieved"]
+    return list(state.hops)
+
+
+def _brief_phases() -> list[str]:
+    return [event.phase for event in _native.last.model._request_event_ledger.actual_events(kind="brief")]
+
+
+@pytest.mark.parametrize("target", ["WS01", "WS01.CHILD.EXAMPLE.TEST"])
+def test_a_collection_on_a_recorded_host_binds_without_sending_the_host_as_domain(monkeypatch, target):
+    brief = {"allowed_capabilities": ["collect-graph"], "targets": [target]}
+    worker_calls, ran = _bound_step(monkeypatch, brief, "accept", worker_replies=1, hops=_recorded_host_rows())
+
+    assert _brief_phases() == ["accepted"]
+    assert ran == [{"action": {"capability": "collect-graph", "callback_id": "5"}, "inputs": None}]
+
+
+def test_a_rejected_collection_on_a_recorded_host_runs_nothing(monkeypatch):
+    brief = {"allowed_capabilities": ["collect-graph"], "targets": ["WS01"]}
+    worker_calls, ran = _bound_step(monkeypatch, brief, "reject", worker_replies=1, hops=_recorded_host_rows())
+
+    assert _brief_phases() == ["accepted"]   # recognizing the host admitted the step, not its action
+    assert _bound_step.cards and ran == []
 
 
 def test_a_sage_proposed_call_id_is_one_every_provider_accepts():

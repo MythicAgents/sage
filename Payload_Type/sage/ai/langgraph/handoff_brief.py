@@ -178,6 +178,75 @@ def _graph_fact_names(predicate: str) -> tuple[set[str], set[str]]:
     return set(), set()
 
 
+# Structured `key=value;...` records that name a host with its domain, in the exact field sets their producers write.
+# Capability rows as `capabilities` records them (`capability:{name}` with the action's target):
+_HOST_CAPABILITY_FIELDS = {
+    "capability:read-managed-local-admin-secret": frozenset(
+        {"account", "account_domain", "target", "target_domain", "callback"}),
+    "capability:use-managed-local-admin-secret": frozenset({"target", "target_domain", "callback"}),
+    "capability:execute-as-local-admin": frozenset({"target", "target_domain", "callback"}),
+}
+# and the graph fact `graph_reconciler` writes for a readable managed local admin secret.
+_MANAGED_SECRET_FACT = "can-read-managed-local-admin-secret"
+_MANAGED_SECRET_FACT_FIELDS = frozenset({"account", "account_domain", "target", "target_domain"})
+# Whitespace and the field, principal, path and predicate delimiters never occur in a host or domain name.
+_NOT_IN_IDENTITY = re.compile(r"[\s;=@\\/:]")
+
+
+def _encoded(text: str) -> bool:
+    """Whether a target or fact segment is a structured record rather than one name."""
+    return "=" in text or ";" in text
+
+
+def _structured_fields(text: str, required: frozenset[str]) -> dict[str, str] | None:
+    """Exactly the `required` keys as `key=value` segments joined by `;`, in any order; None for any other shape.
+
+    Duplicate, missing or extra keys, empty values, segments without `=` and a second `=` in a value all reject the
+    whole record rather than being skipped or overwritten.
+    """
+    fields: dict[str, str] = {}
+    for segment in text.split(";"):
+        key, found, value = segment.partition("=")
+        key = key.casefold()
+        if not found or not value or "=" in value or key in fields:
+            return None
+        fields[key] = value
+    return fields if fields.keys() == required else None
+
+
+def _host_identity(fields: Mapping[str, str]) -> tuple[str, str] | None:
+    """The full host name and its domain from explicit `target` and `target_domain` fields; None unless both are
+    well formed and agree. A short target is qualified by its stated domain; a qualified one must already end in
+    exactly that domain. Nothing is resolved, searched or inferred."""
+    host = fields["target"].casefold().rstrip(".")
+    domain = fields["target_domain"].casefold().rstrip(".")
+    if not host or not domain or _NOT_IN_IDENTITY.search(host) or _NOT_IN_IDENTITY.search(domain):
+        return None
+    if "." not in domain or not all(domain.split(".")) or not all(host.split(".")):
+        return None
+    if "." not in host:
+        return f"{host}.{domain}", domain
+    return (host, domain) if host.split(".", 1)[1] == domain else None
+
+
+def _capability_host(hop: Any) -> tuple[str, str] | None:
+    """The host an achieved capability row names in its structured target; None for any other row."""
+    required = _HOST_CAPABILITY_FIELDS.get(str(getattr(hop, "technique", "") or "").strip().casefold())
+    if required is None or str(getattr(hop, "status", "") or "").strip().casefold() != "achieved":
+        return None
+    fields = _structured_fields(str(getattr(hop, "target", "") or ""), required)
+    return _host_identity(fields) if fields else None
+
+
+def _managed_secret_host(predicate: str) -> tuple[str, str] | None:
+    """The target computer a managed-secret graph fact names; None for any other fact. Its account is not a host."""
+    kind, _, rest = predicate.partition(":")
+    if kind.strip().casefold() != _MANAGED_SECRET_FACT:
+        return None
+    fields = _structured_fields(rest, _MANAGED_SECRET_FACT_FIELDS)
+    return _host_identity(fields) if fields else None
+
+
 def known_scope(mythic_client: Any, *, operator_input: str = "", bound_callback: Any = "") -> KnownScope:
     """Collect callbacks, names, tasks and credentials Sage already holds in memory. Never queries Mythic."""
     callbacks: set[str] = set()
@@ -215,7 +284,14 @@ def known_scope(mythic_client: Any, *, operator_input: str = "", bound_callback:
         principal(getattr(foothold, "identity", ""))
     for hop in attr("_engagement_hops", list):
         target = _name(getattr(hop, "target", ""))
-        (domains if "." in target and "\\" not in target and "@" not in target else hosts).add(target)
+        if _encoded(target):
+            # A structured target is never one name; only a supported achieved row contributes its host.
+            identity = _capability_host(hop)
+            if identity:
+                hosts.add(identity[0])
+                domains.add(identity[1])
+        else:
+            (domains if "." in target and "\\" not in target and "@" not in target else hosts).add(target)
         evidence = getattr(hop, "evidence", None)
         if isinstance(evidence, Mapping):
             tasks.update(_items(evidence.get(key) for key in ("mythic_task_id", "task_id", "display_id")
@@ -223,11 +299,15 @@ def known_scope(mythic_client: Any, *, operator_input: str = "", bound_callback:
     for fact in attr("_engagement_graph_facts", list):
         predicate = str(getattr(fact, "predicate", "") or "")
         for segment in predicate.split(":")[1:]:
-            if "." in segment:
+            if "." in segment and not _encoded(segment):
                 domains.add(_name(segment))
         fact_hosts, fact_objects = _graph_fact_names(predicate)
         hosts.update(fact_hosts)
         objects.update(fact_objects)
+        identity = _managed_secret_host(predicate)
+        if identity:
+            hosts.add(identity[0])
+            domains.add(identity[1])
     for cache in ("_task_source_request_ids", "_task_output_record_cache", "_task_output_cache"):
         tasks.update(str(key) for key in attr(cache, dict))
     last_task = getattr(mythic_client, "_last_issued_task_display_id", None)
