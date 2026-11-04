@@ -225,6 +225,19 @@ def _parse_restart_env(values: list[str]) -> dict[str, str]:
     return parsed
 
 
+def _resolved_ludus_range_id(value: Any, mcp_server: Any) -> str:
+    """The range ID every phase and probe uses. Ludus addresses a range by its ID (e.g. GOADf255df); a bare range
+    number is resolved once here, by the maintained Ludus helper, so no derived command carries a number."""
+    text = str(value or "").strip()
+    if not text.isdigit():
+        return text
+    ludus = _load_module("sage_reset_ludus_range_id", RESET_DIR / "scripts" / "ludus.py")
+    try:
+        return str(ludus.resolve_cli_range_id(text, str(mcp_server or "").strip() or None) or "")
+    except RuntimeError as exc:
+        raise ResetError(str(exc)) from exc
+
+
 def _config_from_args(args: argparse.Namespace) -> dict[str, Any]:
     snapshot = str(args.snapshot or "").strip()
     if not snapshot:
@@ -262,7 +275,7 @@ def _config_from_args(args: argparse.Namespace) -> dict[str, Any]:
     config = {
         "snapshot": snapshot,
         "range_profile_id": profile["id"],
-        "ludus_range_id": str(args.ludus_range_id or "").strip(),
+        "ludus_range_id": _resolved_ludus_range_id(args.ludus_range_id, args.ludus_mcp_server),
         "ludus_mcp_server": str(args.ludus_mcp_server or "").strip(),
         "bootstrap_mode": bootstrap_mode,
         "retained_callback_config": retained_path,

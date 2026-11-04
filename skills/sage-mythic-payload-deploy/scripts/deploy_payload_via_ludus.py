@@ -399,7 +399,37 @@ def ludus_creds(mcp_path: Path, mcp_server: str | None = None) -> tuple[str, str
 
 def selected_ludus_range_id(range_id: str | None = None) -> str | None:
     value = str(range_id or os.environ.get(LUDUS_RANGE_ID_ENV) or "").strip()
+    if value.isdigit():
+        # Ludus addresses a range by its ID (e.g. GOADf255df); a range number answers 404 "not found". The CLI
+        # resolves a number first (`resolve_ludus_range_id`), so one arriving here was not resolved.
+        raise DeployError(
+            f"{value} is a Ludus range number, not a range ID; pass the range ID that "
+            "`skills/sage-goad-reset/scripts/ludus.py status` prints"
+        )
     return value or None
+
+
+@functools.lru_cache(maxsize=1)
+def maintained_ludus_module() -> Any:
+    """`skills/sage-goad-reset/scripts/ludus.py`, which owns range-ID resolution."""
+    path = REPO_ROOT / "skills" / "sage-goad-reset" / "scripts" / "ludus.py"
+    spec = importlib.util.spec_from_file_location("sage_payload_deploy_ludus", path)
+    if spec is None or spec.loader is None:
+        raise DeployError("could not load the maintained Ludus helper")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def resolve_ludus_range_id(range_id: str | None, mcp_path: Path, mcp_server: str | None = None) -> str | None:
+    """The range ID to use for this run: a range ID as given, a bare range number resolved to the one accessible
+    range carrying it (refused otherwise), or None for the API user's default range."""
+    raw = range_id if str(range_id or "").strip() else os.environ.get(LUDUS_RANGE_ID_ENV)
+    try:
+        return maintained_ludus_module().resolve_range_id(
+            raw, lambda: ludus_get("/api/v2/ranges/accessible", mcp_path, mcp_server=mcp_server, scoped=False))
+    except RuntimeError as exc:
+        raise DeployError(str(exc)) from exc
 
 
 def with_ludus_range_id(path: str, range_id: str | None = None) -> str:
@@ -418,9 +448,12 @@ def ludus_get(
     mcp_path: Path,
     range_id: str | None = None,
     mcp_server: str | None = None,
+    *,
+    scoped: bool = True,
 ) -> Any:
     url, api_key = ludus_creds(mcp_path, mcp_server)
-    path = with_ludus_range_id(path, range_id)
+    if scoped:
+        path = with_ludus_range_id(path, range_id)
     request = urllib.request.Request(
         url + path,
         method="GET",
@@ -1762,7 +1795,8 @@ def add_ludus_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--ludus-range-id",
         default=os.environ.get(LUDUS_RANGE_ID_ENV),
-        help=f"Ludus range ID override (default: ${LUDUS_RANGE_ID_ENV} or API user's default range).",
+        help=(f"Ludus range ID, e.g. GOADf255df (default: ${LUDUS_RANGE_ID_ENV} or the API user's default "
+              "range). A bare range number is resolved to its ID when exactly one accessible range has it."),
     )
     parser.add_argument(
         "--ludus-mcp-server",
@@ -1931,6 +1965,9 @@ async def async_main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if hasattr(args, "ludus_range_id"):
+            args.ludus_range_id = resolve_ludus_range_id(
+                args.ludus_range_id, Path(args.mcp_path), getattr(args, "ludus_mcp_server", None))
         await args.func(args)
         return 0
     except DeployError as exc:

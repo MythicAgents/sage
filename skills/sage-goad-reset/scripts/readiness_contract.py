@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import functools
 import json
 import math
 import os
@@ -968,6 +969,22 @@ async def probe_bloodhound_mcp_tools(directory: str | Path | None = None) -> dic
     return bloodhound_mcp_status(path, names)
 
 
+def resolved_ludus_range_id(value: Any, mcp_server: str | None = None) -> str | None:
+    """The range a probe scopes its requests to: the given value, else `$SAGE_LUDUS_RANGE_ID`, else None (the API
+    key's default range). Ludus addresses a range by its ID (e.g. GOADf255df); a bare range number is resolved by
+    the maintained Ludus helper, once per process, so a polling loop does not repeat the lookup."""
+    text = str(value or os.environ.get("SAGE_LUDUS_RANGE_ID") or "").strip()
+    if not text.isdigit():
+        return text or None
+    return _resolve_range_number(text, mcp_server or None)
+
+
+@functools.lru_cache(maxsize=None)
+def _resolve_range_number(number: str, mcp_server: str | None) -> str | None:
+    module = _load_module("sage_readiness_ludus_range_id", REPO_ROOT / "skills" / "sage-goad-reset" / "scripts" / "ludus.py")
+    return module.resolve_cli_range_id(number, mcp_server)
+
+
 def probe_ludus_status(
     range_id: str | None = None,
     mcp_server: str | None = None,
@@ -975,6 +992,7 @@ def probe_ludus_status(
     *,
     qualification_observation: bool = False,
 ) -> dict[str, Any]:
+    range_id = resolved_ludus_range_id(range_id, mcp_server)
     module = _load_module("sage_readiness_ludus", REPO_ROOT / "skills" / "sage-goad-reset" / "scripts" / "ludus.py")
     code, payload = module._call(
         "GET", "/api/v2/range", range_id=range_id, mcp_server=mcp_server
@@ -992,6 +1010,7 @@ def probe_clock_status(
     range_id: str | None = None,
     mcp_server: str | None = None,
 ) -> dict[str, Any]:
+    range_id = resolved_ludus_range_id(range_id, mcp_server)
     module = _load_module(
         "sage_readiness_clock",
         REPO_ROOT / "skills" / "sage-goad-reset" / "scripts" / "sync_range_time.py",
@@ -1076,6 +1095,7 @@ async def collect_operator_readiness(
     ludus_mcp_server: str | None = None,
 ) -> dict[str, Any]:
     selected_profile = range_profile or os.environ.get("SAGE_RANGE_PROFILE_ID")
+    # The probes resolve a bare range number themselves, so supplied observations cost no lookup.
     range_id = ludus_range_id or os.environ.get("SAGE_LUDUS_RANGE_ID")
     mcp_server = ludus_mcp_server or os.environ.get("SAGE_LUDUS_MCP_SERVER")
     ludus_section = (

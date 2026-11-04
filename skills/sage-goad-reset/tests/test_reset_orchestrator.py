@@ -1483,3 +1483,56 @@ def test_task_observation_shape_drift_fails_closed_before_runner(tmp_path):
             variant,
             match="invalid reset checkpoint",
         )
+
+
+# --- Ludus addresses a range by its ID, never by its number ----------------------------------------------------
+
+def _plan_args(*extra: str):
+    return reset.build_parser().parse_args(
+        ["plan", "--snapshot", "exact-clean-snapshot", "--callback-host", "http://100.64.0.1", *extra])
+
+
+def _stub_ludus(monkeypatch, resolved: dict):
+    """Replace only the maintained Ludus helper the orchestrator loads, recording what it is asked to resolve."""
+    asked: list = []
+    original = reset._load_module
+
+    def load(name, path):
+        if Path(path).name != "ludus.py":
+            return original(name, path)
+
+        def resolve_cli_range_id(value=None, mcp_server=None):
+            asked.append((value, mcp_server))
+            if value not in resolved:
+                raise RuntimeError(f"{value} is a Ludus range number, not a range ID; Accessible ranges: GOADf255df (number 4)")
+            return resolved[value]
+
+        return SimpleNamespace(resolve_cli_range_id=resolve_cli_range_id)
+
+    monkeypatch.setattr(reset, "_load_module", load)
+    return asked
+
+
+def test_a_range_number_becomes_its_range_id_in_every_derived_command(monkeypatch):
+    asked = _stub_ludus(monkeypatch, {"4": "GOADf255df"})
+    config = reset._config_from_args(_plan_args("--ludus-range-id", "4"))
+
+    assert config["ludus_range_id"] == "GOADf255df" and asked == [("4", None)]
+    commands = reset._phase_commands(config)
+    for phase in ("rollback-range", "poweron-range", "sync-range-time"):
+        index = commands[phase].index("--range-id")
+        assert commands[phase][index + 1] == "GOADf255df"
+
+
+@pytest.mark.parametrize("value, expected", [("GOADf255df", "GOADf255df"), ("", "")])
+def test_a_range_id_or_no_range_is_kept_without_a_lookup(monkeypatch, value, expected):
+    asked = _stub_ludus(monkeypatch, {})
+    config = reset._config_from_args(_plan_args(*(["--ludus-range-id", value] if value else [])))
+
+    assert config["ludus_range_id"] == expected and asked == []
+
+
+def test_an_unresolvable_range_number_stops_the_plan(monkeypatch):
+    _stub_ludus(monkeypatch, {})
+    with pytest.raises(reset.ResetError, match="range number"):
+        reset._config_from_args(_plan_args("--ludus-range-id", "9"))

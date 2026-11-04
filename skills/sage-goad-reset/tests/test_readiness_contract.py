@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -695,3 +697,76 @@ def test_local_sage_probe_ignores_the_calling_shell(tmp_path, monkeypatch):
     (proc / "20").mkdir()
     (proc / "20" / "cmdline").write_bytes(b"/repo/.venv/bin/python\0-u\0main.py\0")
     assert MODULE.probe_local_sage_running(Path("/repo"), proc) is True
+
+
+# --- Ludus addresses a range by its ID, never by its number ----------------------------------------------------
+
+def _stub_range_helpers(monkeypatch, *, env=None, resolved=None):
+    """Replace only the Ludus and clock helpers the probes load, recording the range each request is scoped to."""
+    scoped: list = []
+    asked: list = []
+    if env is None:
+        monkeypatch.delenv("SAGE_LUDUS_RANGE_ID", raising=False)
+    else:
+        monkeypatch.setenv("SAGE_LUDUS_RANGE_ID", env)
+    MODULE._resolve_range_number.cache_clear()
+    original = MODULE._load_module
+
+    def resolve_cli_range_id(value=None, mcp_server=None):
+        asked.append(value)
+        return (resolved or {})[value]
+
+    def call(method, path, body=None, range_id=None, mcp_server=None):
+        scoped.append(("ludus", range_id))
+        return 200, {"rangeID": range_id, "rangeNumber": 4, "rangeState": "SUCCESS", "VMs": []}
+
+    def load_inventory(mcp_path, range_id=None, mcp_server=None):
+        scoped.append(("clock", range_id))
+        return {}
+
+    stubs = {
+        "ludus.py": SimpleNamespace(resolve_cli_range_id=resolve_cli_range_id, _call=call),
+        "sync_range_time.py": SimpleNamespace(
+            DEFAULT_MCP_PATH=Path("/unused"), DEFAULT_MAX_SKEW_SECONDS=60.0, load_inventory=load_inventory,
+            windows_hosts=lambda inventory: [], check_clocks=lambda hosts, skew: {"ready": False, "hosts": []}),
+    }
+    monkeypatch.setattr(MODULE, "_load_module",
+                        lambda name, path: stubs.get(Path(path).name) or original(name, path))
+    return scoped, asked
+
+
+@pytest.mark.parametrize("argument, env", [("4", None), (None, "4")])
+def test_every_range_probe_uses_the_range_id_for_a_range_number(monkeypatch, argument, env):
+    scoped, asked = _stub_range_helpers(monkeypatch, env=env, resolved={"4": "GOADf255df"})
+
+    for _poll in range(3):     # a readiness poll repeats the probes; the number is looked up once
+        MODULE.range_boot_observation(argument)
+        MODULE.callback_readiness_observation(argument)
+    MODULE.range_fixture_inventory_observation(argument)
+
+    assert asked == ["4"]
+    assert scoped and all(range_id == "GOADf255df" for _probe, range_id in scoped)
+    assert {probe for probe, _range_id in scoped} == {"ludus", "clock"}
+
+
+def test_a_range_probe_uses_a_range_id_or_the_default_range_without_a_lookup(monkeypatch):
+    scoped, asked = _stub_range_helpers(monkeypatch)
+    MODULE.callback_readiness_observation("GOADf255df")
+    MODULE.callback_readiness_observation()
+
+    assert asked == []
+    assert scoped == [("clock", "GOADf255df"), ("ludus", "GOADf255df"), ("clock", None), ("ludus", None)]
+
+
+def test_collected_readiness_resolves_through_the_probes_and_not_when_observations_are_supplied(monkeypatch):
+    scoped, asked = _stub_range_helpers(monkeypatch, env="4", resolved={"4": "GOADf255df"})
+    common = dict(callback_summary={}, chat_containers=[], api_token=None, channel=None,
+                  bloodhound_api_observation={"ready": True}, bloodhound_mcp_observation={"ready": True},
+                  sage_deployment_observation={"ready": True})
+
+    asyncio.run(MODULE.collect_operator_readiness(**common, ludus_observation={"ready": True},
+                                                  clock_observation={"ready": True}))
+    assert asked == [] and scoped == []
+
+    asyncio.run(MODULE.collect_operator_readiness(**common))
+    assert asked == ["4"] and all(range_id == "GOADf255df" for _probe, range_id in scoped)

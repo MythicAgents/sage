@@ -209,9 +209,65 @@ def _verified_call(method, url, path, data, key, trust, ledger):
     finally:
         connection.close()
 
+class RangeIDError(RuntimeError):
+    """A Ludus range argument that is not a range ID and could not be resolved to exactly one."""
+
+
 def _selected_range_id(range_id=None):
     value = str(range_id or os.environ.get(RANGE_ID_ENV) or "").strip()
+    if value.isdigit():
+        # The API addresses a range by its ID (e.g. GOADf255df); a range number answers 404 "not found".
+        # Entry points resolve a number with `resolve_range_id` first, so one arriving here was not resolved.
+        raise RangeIDError(
+            f"{value} is a Ludus range number, not a range ID; pass the range ID that "
+            "`ludus.py status` prints, or let the command resolve it"
+        )
     return value or None
+
+
+def resolve_range_id(value, fetch_accessible):
+    """The range ID to send to Ludus for an operator-supplied value; None selects the API key's default range.
+
+    A value that is not purely digits is taken as a range ID unchanged. A purely numeric value is a range number:
+    it resolves only when exactly one range the API key can access carries it, and is refused otherwise, naming the
+    accessible range IDs. `fetch_accessible` returns the `/api/v2/ranges/accessible` rows; it is read only for a
+    number.
+    """
+    text = str(value if value is not None else "").strip()
+    if not text:
+        return None
+    if not text.isdigit():
+        return text
+    try:
+        rows = fetch_accessible()
+    except Exception as exc:
+        raise RangeIDError(
+            f"{text} is a Ludus range number, not a range ID, and the accessible ranges could not be listed to "
+            f"resolve it ({exc}); pass the range ID that `ludus.py status` prints"
+        ) from exc
+    rows = [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+    matches = sorted({str(row.get("rangeID")) for row in rows
+                      if str(row.get("rangeNumber")) == text and str(row.get("rangeID") or "").strip()})
+    if len(matches) == 1:
+        print(f"Ludus range number {text} is range ID {matches[0]}; using the ID", file=sys.stderr)
+        return matches[0]
+    known = ", ".join(f"{row.get('rangeID')} (number {row.get('rangeNumber')})" for row in rows) or "none"
+    reason = "no accessible range has it" if not matches else "more than one accessible range has it"
+    raise RangeIDError(f"{text} is a Ludus range number, not a range ID, and {reason}; pass a range ID. "
+                       f"Accessible ranges: {known}")
+
+
+def _accessible_ranges(mcp_server=None):
+    code, rows = _request("GET", "/api/v2/ranges/accessible", mcp_server=mcp_server)
+    if code != 200 or not isinstance(rows, list):
+        raise RangeIDError(f"GET /api/v2/ranges/accessible answered HTTP {code}")
+    return rows
+
+
+def resolve_cli_range_id(value=None, mcp_server=None):
+    """`resolve_range_id` for this CLI's own credentials, reading `$SAGE_LUDUS_RANGE_ID` when no value is given."""
+    raw = value if str(value or "").strip() else os.environ.get(RANGE_ID_ENV)
+    return resolve_range_id(raw, lambda: _accessible_ranges(mcp_server))
 
 
 def _with_range_id(path, range_id=None):
@@ -226,8 +282,12 @@ def _with_range_id(path, range_id=None):
 
 
 def _call(method, path, body=None, range_id=None, mcp_server=None):
+    return _request(method, _with_range_id(path, range_id), body, mcp_server)
+
+
+def _request(method, path, body=None, mcp_server=None):
+    """One Ludus API request for an already range-scoped path."""
     url, key = _creds(mcp_server)
-    path = _with_range_id(path, range_id)
     data = json.dumps(body).encode() if body is not None else None
     trust = _verified_tls_config(mcp_server)
     if trust is not None:
@@ -252,7 +312,9 @@ def _call(method, path, body=None, range_id=None, mcp_server=None):
 def status(range_id=None, mcp_server=None):
     code, r = _call("GET", "/api/v2/range", range_id=range_id, mcp_server=mcp_server)
     if isinstance(r, dict):
-        print(f"range #{r.get('rangeNumber')} state={r.get('rangeState')} lastDeploy={r.get('lastDeployment')}")
+        # The ID first: it is what every --range-id expects. The number is only the range's IP octet.
+        print(f"range {r.get('rangeID')} (number {r.get('rangeNumber')}) state={r.get('rangeState')} "
+              f"lastDeploy={r.get('lastDeployment')}")
         for vm in r.get("VMs", []):
             print(f"  {'ON ' if vm.get('poweredOn') else 'off'} {vm.get('name')}  ip={vm.get('ip')}  pmx={vm.get('proxmoxID')}")
     else:
@@ -378,7 +440,8 @@ def _add_ludus_args(parser):
     parser.add_argument(
         "--range-id",
         default=argparse.SUPPRESS,
-        help=f"Ludus range ID override (default: ${RANGE_ID_ENV} or API user's default range).",
+        help=(f"Ludus range ID, e.g. GOADf255df (default: ${RANGE_ID_ENV} or the API user's default range). "
+              "A bare range number is resolved to its ID when exactly one accessible range has it."),
     )
     parser.add_argument(
         "--mcp-server",
@@ -418,8 +481,8 @@ def main(argv=None):
     try:
         args = build_parser().parse_args(argv)
         command = args.command or "status"
-        range_id = getattr(args, "range_id", None)
         mcp_server = getattr(args, "mcp_server", None)
+        range_id = resolve_cli_range_id(getattr(args, "range_id", None), mcp_server)
         if command == "status":
             status(range_id, mcp_server)
         elif command == "logs":

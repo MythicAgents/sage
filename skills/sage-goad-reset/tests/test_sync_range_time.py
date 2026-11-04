@@ -317,3 +317,54 @@ def test_main_refreshes_inventory_before_syncing_late_credentials(monkeypatch):
     assert len(inventory_calls) == 2
     assert len(synced) == 5
     assert all(host["ansible_user"] == "operator" for host in synced)
+
+
+# --- Ludus addresses a range by its ID, never by its number ----------------------------------------------------
+
+_ACCESSIBLE = [
+    {"rangeNumber": 1, "rangeID": "SAGEPOLICY20260712", "accessType": "Direct"},
+    {"rangeNumber": 4, "rangeID": "GOADf255df", "accessType": "Direct"},
+]
+
+
+def _run_main(monkeypatch, argv: list) -> tuple[list, Exception]:
+    """Run the CLI with the Ludus reads recorded; the empty inventory stops it before any guest is touched."""
+    paths: list = []
+
+    def fake_json(mcp_path, path, mcp_server=None):
+        paths.append(path)
+        return _ACCESSIBLE if path == "/api/v2/ranges/accessible" else {"all": {"hosts": {}}}
+
+    monkeypatch.setattr(MODULE, "_ludus_json", fake_json)
+    monkeypatch.setattr(MODULE.sys, "argv", ["sync_range_time.py", *argv])
+    with pytest.raises(RuntimeError) as error:
+        MODULE.main()
+    return paths, error.value
+
+
+def test_a_range_number_on_the_cli_reads_the_inventory_of_its_range_id(monkeypatch):
+    monkeypatch.delenv(MODULE.RANGE_ID_ENV, raising=False)
+    paths, error = _run_main(monkeypatch, ["check", "--range-id", "4"])
+
+    assert "No Windows hosts" in str(error)
+    assert paths == ["/api/v2/ranges/accessible", "/api/v2/range/ansibleinventory?rangeID=GOADf255df"]
+
+
+def test_a_range_id_on_the_cli_is_used_without_a_lookup(monkeypatch):
+    monkeypatch.delenv(MODULE.RANGE_ID_ENV, raising=False)
+    paths, _error = _run_main(monkeypatch, ["check", "--range-id", "GOADf255df"])
+
+    assert paths == ["/api/v2/range/ansibleinventory?rangeID=GOADf255df"]
+
+
+def test_an_unknown_range_number_fails_before_any_range_request(monkeypatch):
+    monkeypatch.delenv(MODULE.RANGE_ID_ENV, raising=False)
+    paths, error = _run_main(monkeypatch, ["check", "--range-id", "9"])
+
+    assert paths == ["/api/v2/ranges/accessible"]
+    assert "GOADf255df (number 4)" in str(error)
+
+
+def test_a_range_number_never_reaches_the_api_unresolved():
+    with pytest.raises(RuntimeError, match="range number"):
+        MODULE.with_range_id("/api/v2/range/ansibleinventory", "4")

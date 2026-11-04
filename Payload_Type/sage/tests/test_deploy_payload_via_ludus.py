@@ -825,3 +825,92 @@ def test_command_launch_existing_rejects_duplicate_settled_callback_lanes(monkey
     output = json.loads(capsys.readouterr().out)
     assert [row["display_id"] for row in output["callback_settle"]["matching_advanced_active_callbacks"]] == [2, 3]
     assert disconnects == ["4"]
+
+
+# --- Ludus addresses a range by its ID, never by its number ----------------------------------------------------
+
+_ACCESSIBLE = [
+    {"rangeNumber": 1, "rangeID": "SAGEPOLICY20260712", "accessType": "Direct"},
+    {"rangeNumber": 4, "rangeID": "GOADf255df", "accessType": "Direct"},
+]
+
+
+_BASE = "https://ludus.invalid"
+
+
+def _stub_ludus_http(monkeypatch, paths: list) -> None:
+    """Stub only the HTTP exchange under `ludus_get`, so its own range scoping is what the tests exercise."""
+    class Response:
+        def __init__(self, payload):
+            self._raw = json.dumps(payload).encode()
+
+        def read(self):
+            return self._raw
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    def urlopen(request, *, timeout, context):
+        path = request.full_url[len(_BASE):]
+        paths.append(path)
+        if path == "/api/v2/ranges/accessible":
+            return Response(_ACCESSIBLE)
+        return Response({"inventory": {"all": {"hosts": {}}}})
+
+    monkeypatch.setattr(deploy, "ludus_creds", lambda *_args: (_BASE, "unit-key"))
+    monkeypatch.setattr(deploy, "metered_ludus_urlopen", urlopen)
+
+
+def _run_logoff(monkeypatch, argv: list) -> tuple[int, list, list]:
+    """Run the CLI's `logoff-user` entry with the command body replaced by an inventory read."""
+    paths: list = []
+    seen: list = []
+    _stub_ludus_http(monkeypatch, paths)
+
+    async def command(args):
+        seen.append(args.ludus_range_id)
+        deploy.ludus_get("/api/v2/range/ansibleinventory", Path(args.mcp_path), args.ludus_range_id,
+                         args.ludus_mcp_server)
+
+    monkeypatch.setattr(deploy, "command_logoff_user", command)
+    code = asyncio.run(deploy.async_main(["logoff-user", *argv]))
+    return code, paths, seen
+
+
+@pytest.mark.parametrize("env", [None, "4"])
+def test_a_range_number_on_the_cli_reads_the_inventory_of_its_range_id(monkeypatch, env):
+    monkeypatch.delenv(deploy.LUDUS_RANGE_ID_ENV, raising=False)
+    argv = ["--ludus-range-id", "4"]
+    if env is not None:
+        monkeypatch.setenv(deploy.LUDUS_RANGE_ID_ENV, env)
+        argv = []
+
+    code, paths, seen = _run_logoff(monkeypatch, argv)
+
+    assert code == 0 and seen == ["GOADf255df"]
+    assert paths == ["/api/v2/ranges/accessible", "/api/v2/range/ansibleinventory?rangeID=GOADf255df"]
+
+
+def test_a_range_id_on_the_cli_is_used_without_a_lookup(monkeypatch):
+    monkeypatch.delenv(deploy.LUDUS_RANGE_ID_ENV, raising=False)
+    code, paths, seen = _run_logoff(monkeypatch, ["--ludus-range-id", "GOADf255df"])
+
+    assert code == 0 and seen == ["GOADf255df"]
+    assert paths == ["/api/v2/range/ansibleinventory?rangeID=GOADf255df"]
+
+
+def test_an_unknown_range_number_fails_before_any_range_request(monkeypatch, capsys):
+    monkeypatch.delenv(deploy.LUDUS_RANGE_ID_ENV, raising=False)
+    code, paths, seen = _run_logoff(monkeypatch, ["--ludus-range-id", "9"])
+
+    assert code == 2 and seen == []
+    assert paths == ["/api/v2/ranges/accessible"]
+    assert "GOADf255df (number 4)" in capsys.readouterr().err
+
+
+def test_a_range_number_never_reaches_the_api_unresolved(monkeypatch):
+    with pytest.raises(deploy.DeployError, match="range number"):
+        deploy.with_ludus_range_id("/api/v2/range/ansibleinventory", "4")

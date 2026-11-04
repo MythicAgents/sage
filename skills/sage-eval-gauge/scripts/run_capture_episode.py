@@ -610,6 +610,20 @@ async def _collect_native(expected_operation_id: int | None = None) -> dict[str,
     )
 
 
+def _range_status_observation(text: str, expected_vmids: Any) -> tuple[bool, dict[str, Any]]:
+    """Whether `ludus.py status` shows the range deployed with exactly the expected VMs, all powered off.
+
+    Reads the line as `ludus.py` prints it, `range <ID> (number <N>) state=...`, and the earlier `range #<N> state=...`.
+    """
+    state = re.search(r"^range (?:#\d+|\S+ \(number \d+\)) state=(\S+)", text, re.MULTILINE)
+    rows = re.findall(r"^  (ON |off).*pmx=(\d+)$", text, re.MULTILINE)
+    ids = [int(value) for _power, value in rows]
+    ok = bool(state and state.group(1) == "SUCCESS" and ids == expected_vmids
+              and all(power == "off" for power, _id in rows))
+    all_off = bool(rows) and all(power == "off" for power, _id in rows)
+    return ok, {"range_state": state.group(1) if state else "unknown", "vmids": ids, "all_off": all_off}
+
+
 def _cleanup(spec: Mapping[str, Any], env: Mapping[str, str], *, after_stop: Callable[[bool], None] | None = None) -> dict[str, Any]:
     range_binding = spec["range"]; cleanup_env = dict(env); cleanup_env.pop("SAGE_RESOURCE_EPISODE_ID", None)
     cleanup_env["SAGE_RESOURCE_BUDGET_PHASE"] = "cleanup"
@@ -629,14 +643,8 @@ def _cleanup(spec: Mapping[str, Any], env: Mapping[str, str], *, after_stop: Cal
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
             ok = completed.returncode == 0; safe = {}
             if name == "status" and ok:
-                text = completed.stdout.decode("utf-8", "replace")
-                state = re.search(r"^range #\d+ state=([^ ]+)", text, re.MULTILINE)
-                rows = re.findall(r"^  (ON |off).*pmx=(\d+)$", text, re.MULTILINE)
-                ids = [int(value) for _power, value in rows]
-                ok = bool(state and state.group(1) == "SUCCESS" and ids == range_binding["expected_vmids"]
-                          and all(power == "off" for power, _id in rows))
-                safe = {"range_state": state.group(1) if state else "unknown", "vmids": ids,
-                        "all_off": bool(rows) and all(power == "off" for power, _id in rows)}
+                ok, safe = _range_status_observation(completed.stdout.decode("utf-8", "replace"),
+                                                     range_binding["expected_vmids"])
             result.append({"name": name, "ok": ok, **safe,
                            "output_sha256": _digest(completed.stdout), "error_sha256": _digest(completed.stderr)})
             if name == "stop_sage" and after_stop is not None:

@@ -211,6 +211,11 @@ prepared channel readiness.
 
 ## GOAD
 
+Ludus addresses a range by its **ID** (`GOADf255df`), not its number (`4`, which is only the range's IP octet).
+`ludus.py status` prints `range <ID> (number <N>)`. Every helper defaults to the API key's own range, so omit
+`--range-id` / `--ludus-range-id` / `$SAGE_LUDUS_RANGE_ID` unless you mean another range. A bare number is
+resolved to its ID when exactly one accessible range carries it and refused otherwise, before any range request.
+
 ```bash
 .venv/bin/python skills/sage-goad-reset/scripts/ludus.py status
 .venv/bin/python skills/sage-goad-reset/scripts/ludus.py snapshots

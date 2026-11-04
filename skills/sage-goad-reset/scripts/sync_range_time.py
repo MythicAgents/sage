@@ -76,7 +76,26 @@ def ludus_creds(mcp_path: Path, mcp_server: str | None = None) -> tuple[str, str
 
 def selected_range_id(range_id: str | None = None) -> str | None:
     value = str(range_id or os.environ.get(RANGE_ID_ENV) or "").strip()
+    if value.isdigit():
+        # Ludus addresses a range by its ID (e.g. GOADf255df); a range number answers 404 "not found". The CLI
+        # resolves a number first (`resolve_cli_range_id`), so one arriving here was not resolved.
+        raise RuntimeError(
+            f"{value} is a Ludus range number, not a range ID; pass the range ID that `ludus.py status` prints"
+        )
     return value or None
+
+
+def resolve_cli_range_id(range_id: str | None, mcp_path: Path, mcp_server: str | None = None) -> str | None:
+    """A range ID as given, a bare range number resolved to the one accessible range carrying it (refused
+    otherwise), or None for the API user's default range. Resolution is owned by `ludus.py`."""
+    path = REPO_ROOT / "skills" / "sage-goad-reset" / "scripts" / "ludus.py"
+    spec = importlib.util.spec_from_file_location("sage_sync_range_time_ludus", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("could not load the maintained Ludus helper")
+    ludus = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ludus)
+    raw = range_id if str(range_id or "").strip() else os.environ.get(RANGE_ID_ENV)
+    return ludus.resolve_range_id(raw, lambda: _ludus_json(mcp_path, "/api/v2/ranges/accessible", mcp_server))
 
 
 def with_range_id(path: str, range_id: str | None = None) -> str:
@@ -90,21 +109,23 @@ def with_range_id(path: str, range_id: str | None = None) -> str:
     return urlunsplit(("", "", parts.path, urlencode(query), parts.fragment))
 
 
+def _ludus_json(mcp_path: Path, path: str, mcp_server: str | None = None) -> Any:
+    """One Ludus GET for an already range-scoped path, decoded as JSON."""
+    url, api_key = ludus_creds(mcp_path, mcp_server)
+    request = urllib.request.Request(f"{url}{path}", headers={"X-API-KEY": api_key})
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    with metered_ludus_urlopen(request, timeout=30, context=context) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
 def load_inventory(
     mcp_path: Path,
     range_id: str | None = None,
     mcp_server: str | None = None,
 ) -> dict[str, Any]:
-    url, api_key = ludus_creds(mcp_path, mcp_server)
-    request = urllib.request.Request(
-        f"{url}{with_range_id('/api/v2/range/ansibleinventory', range_id)}",
-        headers={"X-API-KEY": api_key},
-    )
-    context = ssl.create_default_context()
-    context.check_hostname = False
-    context.verify_mode = ssl.CERT_NONE
-    with metered_ludus_urlopen(request, timeout=30, context=context) as response:
-        payload: Any = json.loads(response.read().decode("utf-8"))
+    payload: Any = _ludus_json(mcp_path, with_range_id("/api/v2/range/ansibleinventory", range_id), mcp_server)
     if isinstance(payload, dict):
         for key in ("inventory", "ansible_inventory", "result", "data"):
             if payload.get(key):
@@ -370,7 +391,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--range-id",
         default=os.environ.get(RANGE_ID_ENV),
-        help=f"Ludus range ID override (default: ${RANGE_ID_ENV} or API user's default range).",
+        help=(f"Ludus range ID, e.g. GOADf255df (default: ${RANGE_ID_ENV} or the API user's default range). "
+              "A bare range number is resolved to its ID when exactly one accessible range has it."),
     )
     parser.add_argument(
         "--mcp-server",
@@ -393,6 +415,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    args.range_id = resolve_cli_range_id(args.range_id, Path(args.mcp_path), args.mcp_server)
     hosts = windows_hosts(load_inventory(Path(args.mcp_path), args.range_id, args.mcp_server))
     if not hosts:
         raise RuntimeError("No Windows hosts found in Ludus inventory")

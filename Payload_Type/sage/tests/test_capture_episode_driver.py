@@ -713,3 +713,35 @@ def test_engagement_snapshot_allows_initial_absence_but_rejects_corrupt_final(tm
         driver._strict_engagement_snapshot(tmp_path,"engagement",allow_missing=False)
     path.write_text(json.dumps({"engagement_id":"engagement","hops":[],"graph_facts":[]}))
     assert driver._strict_engagement_snapshot(tmp_path,"engagement",allow_missing=False)["graph_facts"]==[]
+
+
+# --- the cleanup reads `ludus.py status` as that script prints it -----------------------------------------------
+
+def _ludus_status_text(monkeypatch, capsys, *, powered_on: bool) -> str:
+    """Real `ludus.py status` output for a powered-off (or on) range; only the Ludus request is stubbed."""
+    script = Path(__file__).resolve().parents[3] / "skills" / "sage-goad-reset" / "scripts" / "ludus.py"
+    spec = importlib.util.spec_from_file_location("capture_cleanup_ludus", script)
+    ludus = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ludus)
+    vms = [{"name": f"vm{vmid}", "poweredOn": powered_on, "ip": "10.4.10.1", "proxmoxID": vmid} for vmid in (114, 119)]
+    monkeypatch.setattr(ludus, "_request", lambda *_a, **_k: (200, {
+        "rangeID": "GOADf255df", "rangeNumber": 4, "rangeState": "SUCCESS", "lastDeployment": "x", "VMs": vms}))
+    monkeypatch.delenv(ludus.RANGE_ID_ENV, raising=False)
+    capsys.readouterr()
+    assert ludus.main(["status", "--range-id", "GOADf255df"]) == 0
+    return capsys.readouterr().out
+
+
+@pytest.mark.parametrize("powered_on, ok", [(False, True), (True, False)])
+def test_cleanup_reads_the_status_line_ludus_prints(monkeypatch, capsys, powered_on, ok):
+    text = _ludus_status_text(monkeypatch, capsys, powered_on=powered_on)
+    observed_ok, safe = driver._range_status_observation(text, [114, 119])
+
+    assert observed_ok is ok
+    assert safe["range_state"] == "SUCCESS" and safe["vmids"] == [114, 119] and safe["all_off"] is (not powered_on)
+
+
+def test_cleanup_still_reads_the_earlier_status_line():
+    text = "range #4 state=SUCCESS lastDeploy=x\n  off vm114  ip=10.4.10.1  pmx=114\n"
+    assert driver._range_status_observation(text, [114]) == (
+        True, {"range_state": "SUCCESS", "vmids": [114], "all_off": True})

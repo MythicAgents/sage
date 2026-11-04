@@ -393,3 +393,119 @@ def test_rollback_cli_prerequisite_rejects_before_restore_reservation(monkeypatc
         MODULE, "_reserve_effect", lambda *_a, **_k: pytest.fail("restore reservation made"),
     )
     assert MODULE.main(["rollback", "clean"]) == 2
+
+
+# --- Ludus addresses a range by its ID, never by its number ----------------------------------------------------
+
+ACCESSIBLE = [
+    {"rangeNumber": 1, "rangeID": "SAGEPOLICY20260712", "accessType": "Direct"},
+    {"rangeNumber": 4, "rangeID": "GOADf255df", "accessType": "Direct"},
+]
+
+
+def _never():
+    pytest.fail("the accessible-range list was read for a value that needs no resolution")
+
+
+@pytest.mark.parametrize("value, expected", [
+    (None, None),
+    ("", None),
+    ("  ", None),
+    ("GOADf255df", "GOADf255df"),
+    (" GOADf255df ", "GOADf255df"),
+    ("SAGEPOLICY20260712", "SAGEPOLICY20260712"),
+])
+def test_an_empty_value_or_a_range_id_is_used_without_a_lookup(value, expected):
+    assert MODULE.resolve_range_id(value, _never) == expected
+
+
+@pytest.mark.parametrize("value, expected", [("4", "GOADf255df"), (4, "GOADf255df"), ("1", "SAGEPOLICY20260712")])
+def test_a_range_number_resolves_to_the_one_accessible_range_carrying_it(value, expected, capsys):
+    assert MODULE.resolve_range_id(value, lambda: ACCESSIBLE) == expected
+    assert f"range number {value} is range ID {expected}" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("rows", [
+    ACCESSIBLE,                                                                   # no range has number 7
+    [*ACCESSIBLE, {"rangeNumber": 7, "rangeID": "A"}, {"rangeNumber": 7, "rangeID": "B"}],   # two do
+])
+def test_a_range_number_that_does_not_name_exactly_one_range_is_refused_with_the_ids(rows):
+    with pytest.raises(MODULE.RangeIDError) as error:
+        MODULE.resolve_range_id("7", lambda: rows)
+    message = str(error.value)
+    assert "7 is a Ludus range number" in message and "GOADf255df (number 4)" in message
+
+
+def test_a_range_number_is_refused_when_the_accessible_ranges_cannot_be_listed():
+    def broken():
+        raise MODULE.RangeIDError("HTTP 500")
+
+    with pytest.raises(MODULE.RangeIDError, match="could not be listed"):
+        MODULE.resolve_range_id("4", broken)
+
+
+@pytest.mark.parametrize("value", ["4", " 4 "])
+def test_a_range_number_never_reaches_the_api_unresolved(value, monkeypatch):
+    with pytest.raises(MODULE.RangeIDError):
+        MODULE._with_range_id("/api/v2/range", value)
+    monkeypatch.setenv(MODULE.RANGE_ID_ENV, value)
+    monkeypatch.setattr(MODULE, "_request", lambda *_a, **_k: pytest.fail("a range number reached the API"))
+    with pytest.raises(MODULE.RangeIDError):
+        MODULE._call("GET", "/api/v2/range")
+
+
+class _FakeLudus:
+    """Answers the two reads `ludus.py status` makes, recording every request path."""
+
+    def __init__(self):
+        self.paths: list[str] = []
+
+    def __call__(self, method, path, body=None, mcp_server=None):
+        self.paths.append(path)
+        if path == "/api/v2/ranges/accessible":
+            return 200, ACCESSIBLE
+        if path.startswith("/api/v2/range?"):
+            return 200, {"rangeID": "GOADf255df", "rangeNumber": 4, "rangeState": "SUCCESS", "VMs": []}
+        if path == "/api/v2/range":
+            return 200, {"rangeID": "GOADf255df", "rangeNumber": 4, "rangeState": "SUCCESS", "VMs": []}
+        return 404, {"error": f"unexpected {path}"}
+
+
+@pytest.mark.parametrize("argv", [["--range-id", "4", "status"], ["status", "--range-id", "4"]])
+def test_the_cli_turns_a_range_number_into_its_id_before_any_range_request(argv, monkeypatch, capsys):
+    fake = _FakeLudus()
+    monkeypatch.setattr(MODULE, "_request", fake)
+    monkeypatch.delenv(MODULE.RANGE_ID_ENV, raising=False)
+
+    assert MODULE.main(argv) == 0
+    assert fake.paths == ["/api/v2/ranges/accessible", "/api/v2/range?rangeID=GOADf255df"]
+    assert capsys.readouterr().out.startswith("range GOADf255df (number 4) state=SUCCESS")
+
+
+def test_the_cli_resolves_a_range_number_from_the_environment(monkeypatch):
+    fake = _FakeLudus()
+    monkeypatch.setattr(MODULE, "_request", fake)
+    monkeypatch.setenv(MODULE.RANGE_ID_ENV, "4")
+
+    assert MODULE.main(["status"]) == 0
+    assert fake.paths[-1] == "/api/v2/range?rangeID=GOADf255df"
+
+
+def test_the_cli_refuses_an_unknown_range_number_before_any_range_request(monkeypatch, capsys):
+    fake = _FakeLudus()
+    monkeypatch.setattr(MODULE, "_request", fake)
+    monkeypatch.delenv(MODULE.RANGE_ID_ENV, raising=False)
+
+    assert MODULE.main(["--range-id", "9", "status"]) == 2
+    assert fake.paths == ["/api/v2/ranges/accessible"]
+    assert "GOADf255df (number 4)" in capsys.readouterr().err
+
+
+def test_status_without_a_range_uses_the_default_range_and_names_its_id(monkeypatch, capsys):
+    fake = _FakeLudus()
+    monkeypatch.setattr(MODULE, "_request", fake)
+    monkeypatch.delenv(MODULE.RANGE_ID_ENV, raising=False)
+
+    assert MODULE.main(["status"]) == 0
+    assert fake.paths == ["/api/v2/range"]
+    assert capsys.readouterr().out.startswith("range GOADf255df (number 4)")
