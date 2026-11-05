@@ -22,7 +22,7 @@ from typing import Any
 
 import pytest
 
-from ai.langgraph import access_reconciler, capabilities, engagement_state
+from ai.langgraph import access_reconciler, autonomous_controller, capabilities, engagement_state
 from ai.langgraph import controller_recovery, engagement_ledger, engagement_store
 from ai.langgraph import model as model_module
 from ai.langgraph import mythic_tools as mythic_tools_module
@@ -420,6 +420,86 @@ def test_a_recovered_auto_run_restores_its_attempts_and_an_old_journal_is_blocke
         model_module.Model._restore_controller_request_attempts(
             SimpleNamespace(mythic_client=other), resources, "chat:3:request:2"
         )
+
+
+class _ProcessDied(Exception):
+    """The auto run's process ends at a clean controller boundary; only its recovery journal survives."""
+
+
+def _auto_model(tools: MythicTools, resume_state: dict | None = None):
+    """A Model on the auto lane carrying only the identity the recovery journal binds. Symbolic policy: no provider."""
+    model = object.__new__(model_module.Model)
+    model.mythic_client = tools
+    model.mode = "auto"
+    model._autonomous_solve = True
+    model.policy_mode = "symbolic"
+    model.provider = model.model = "fixture"
+    model.operation_id, model.channel_id, model.apitoken_id = 1, 3, 1
+    model._chat_request_config_signature = "fixture"
+    model._request_contract = tools._request_contract
+    model._controller_resume_state = resume_state
+    return model
+
+
+@pytest.fixture
+def journal(monkeypatch, tmp_path):
+    """The controller recovery journal on a scratch sage.db, under the explicitly unbounded auto arm it requires.
+    The controller dies right after each `clean` journal write, the only boundary recovery resumes from."""
+    path = str(tmp_path / "sage.db")
+
+    class ScratchStore(controller_recovery.ControllerRecoveryStore):
+        def __init__(self, operation_id, channel_id):
+            super().__init__(operation_id, channel_id, db_path=path)
+
+    monkeypatch.setenv("SAGE_AUTO_CONTROLLER_RECOVERY", "1")
+    monkeypatch.setenv("SAGE_EVAL_UNBOUNDED_ARM", "1")
+    monkeypatch.setattr(controller_recovery, "ControllerRecoveryStore", ScratchStore)
+    write = autonomous_controller.AutonomousController._recovery_write
+
+    def write_then_die(controller, phase):
+        write(controller, phase)
+        if phase == "clean":
+            raise _ProcessDied(phase)
+
+    monkeypatch.setattr(autonomous_controller.AutonomousController, "_recovery_write", write_then_die)
+    return ScratchStore(1, 3)
+
+
+def _run_auto(tools: MythicTools, resume_state: dict | None = None) -> None:
+    asyncio.run(_auto_model(tools, resume_state)._run_autonomous_controller("obtain control of the GPO"))
+
+
+def test_the_auto_journal_write_carries_the_attempt_memory_into_the_recovered_run(operation, journal):
+    """The production journal path, not the restore helper alone: the controller writes its journal through the
+    model's recovery resources, the process dies, and the recovered run restores the attempts from that journal."""
+    tools = operation("channel-a", channel=3, request=1, mode="auto")
+    _seed_gpo_control(tools)
+    action = _frontier(tools)[0]
+    key = (action.name, action.target)
+    assert _record_terminal_failure(tools, action)  # a terminal failure earlier in this request
+    with pytest.raises(_ProcessDied):
+        _run_auto(tools)
+    binding = controller_recovery.binding_for_model(_auto_model(tools), tools._request_contract)
+    saved = journal.require_clean(binding, "chat:3:request:1")
+    written = saved["resources"]["request_attempts"]
+    assert written["request_id"] == "chat:3:request:1" and len(written["attempts"]) == 1, written
+
+    fresh = operation("channel-a-after-restart", channel=3, request=1, mode="auto")  # same original request ID
+    assert key in _names(_frontier(fresh)), "a new process starts with an empty attempt memory"
+    with pytest.raises(_ProcessDied):
+        _run_auto(fresh, resume_state=saved)
+    assert key not in _names(_frontier(fresh)), "the recovered run must keep the request's terminal failure"
+    rewritten = journal.require_clean(binding, "chat:3:request:1")["resources"]["request_attempts"]
+    assert rewritten["attempts"] == written["attempts"], "the recovered run's own journal keeps the attempts"
+
+    stripped = {**saved, "resources": {k: v for k, v in saved["resources"].items() if k != "request_attempts"}}
+    journal.acquire()
+    journal.write(binding, "clean", stripped)
+    journal.release()
+    old_journal = operation("channel-a-old-journal", channel=3, request=1, mode="auto")
+    with pytest.raises(controller_recovery.RecoveryBlocked, match="missing"):
+        _run_auto(old_journal, resume_state=stripped)
+    assert key in _names(_frontier(old_journal)), "a blocked recovery restores nothing"
 
 
 # --- credential material is not a working credential ---------------------------------------------------------------
