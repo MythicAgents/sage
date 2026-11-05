@@ -84,13 +84,17 @@ _TERMINAL_SUCCESS = frozenset({"completed", "complete", "success", "succeeded"})
 
 @dataclass(frozen=True)
 class OperationTask:
-    """A Mythic task in the operation, from any issuer."""
+    """A Mythic task in the operation, from any issuer.
+
+    ``issued_at`` is when Mythic created the task record (``status_timestamp_preprocessing``, UTC). It is not the
+    task's mutable ``timestamp``, which is its last update, nor when the payload ran it.
+    """
 
     task_id: int
     callback_display_id: int | None
     command: str
     status: str
-    timestamp: str
+    issued_at: str
 
     @property
     def succeeded(self) -> bool:
@@ -117,13 +121,15 @@ def _privilege_effects(context: CallbackContext) -> list[str]:
 
 
 def _credit_new_callback(context: CallbackContext, tasks: Iterable[OperationTask], window: float) -> OperationTask | None:
-    """The latest task issued before the callback first checked in, within the window."""
+    """The latest task created before the callback first checked in, within the window (inclusive at both
+    ends). A task without a valid creation time gets no time-based credit; no other clock stands in for it.
+    """
     checked_in = _when(context.init_callback)
     if checked_in is None:
         return None
     best: tuple[datetime, OperationTask] | None = None
     for task in tasks:
-        issued = _when(task.timestamp)
+        issued = _when(task.issued_at)
         if issued is None or not (0.0 <= (checked_in - issued).total_seconds() <= window):
             continue
         if best is None or issued > best[0]:
@@ -145,10 +151,10 @@ def context_gains(callbacks: Iterable[CallbackContext], baseline: Mapping[str, s
                   tasks: Iterable[OperationTask], *, window: float = ATTRIBUTION_WINDOW_SECONDS) -> list[ContextGain]:
     """Gains between the stored baseline and Mythic's current callbacks.
 
-    `tasks` are operation tasks from any issuer, with Mythic timestamps. A new callback is credited by time, so a
-    payload that checks in after its task finished is still credited at the next reconciliation. A rise in integrity
-    is credited to the latest task on that same callback. Each gain also names the latest completed task on the
-    gained callback, which proves the gain when no task can be credited.
+    `tasks` are operation tasks from any issuer, with their Mythic creation times. A new callback is credited by
+    time, so a payload that checks in after its task finished is still credited at the next reconciliation. A rise
+    in integrity is credited to the latest task on that same callback. Each gain also names the latest completed
+    task on the gained callback, which proves the gain when no task can be credited.
     """
     tasks = list(tasks)
     gains: list[ContextGain] = []

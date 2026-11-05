@@ -268,7 +268,8 @@ def stub_mythic_operation(monkeypatch, *, operation_id: int = 1) -> dict:
     async def credit_tasks(client, op, since, until, callback_ids):
         reachable()
         return [{"display_id": task["display_id"], "status": task.get("status"), "completed": task.get("completed"),
-                 "command_name": task.get("command_name"), "timestamp": task.get("timestamp", ""),
+                 "command_name": task.get("command_name"),
+                 "status_timestamp_preprocessing": task.get("status_timestamp_preprocessing", ""),
                  "callback": {"display_id": (task.get("callback") or {}).get("display_id")}}
                 for task in sorted(records["tasks"], key=key) if in_operation(task)]
 

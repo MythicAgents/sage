@@ -42,7 +42,7 @@ def _ctx(*args, **kwargs) -> sl.CallbackContext:
 
 def _task(task_id: int, callback: int = 1, status: str = "success", at: str = TASK_AT) -> sl.OperationTask:
     return sl.OperationTask(task_id=task_id, callback_display_id=callback, command="jump_psexec", status=status,
-                            timestamp=at)
+                            issued_at=at)
 
 
 def _baseline(*contexts) -> dict[str, str]:
@@ -70,6 +70,21 @@ def test_a_new_callback_is_credited_to_the_latest_task_before_it_checked_in():
 def test_a_callback_outside_the_window_or_before_the_task_is_not_credited(init):
     [gain] = sl.context_gains([_ctx(7, "SRV02", "CONTOSO\\svc", 2, init=init)], {}, [_task(90)])
     assert gain.task is None and gain.proof_task is None
+
+
+@pytest.mark.parametrize("issued, credited", [
+    ("2026-10-30T10:02:00", True),  # created at the check-in: a zero gap
+    ("2026-10-30T09:52:00", True),  # exactly the 600 s window
+    ("2026-10-30T10:02:00.000001", False),  # just after the check-in
+    ("2026-10-30T09:51:59.999999", False),  # just beyond the window
+    ("2026-10-30T04:00:00-06:00", True),  # timezone-aware: 10:00 UTC
+    ("2026-10-30T10:00:00Z", True),
+    ("2026-10-30T10:00:00+02:00", False),  # 08:00 UTC: outside the window once the zone is applied
+    ("", False), ("not-a-time", False),
+])
+def test_a_new_callback_is_credited_only_by_a_valid_creation_time_inside_the_inclusive_window(issued, credited):
+    [gain] = sl.context_gains([_ctx(7, "SRV02", "CONTOSO\\svc", 2)], {}, [_task(90, callback=1, at=issued)])
+    assert (gain.task is not None) is credited
 
 
 def test_an_integrity_rise_is_credited_to_the_latest_task_on_that_callback_from_any_issuer():
@@ -160,7 +175,7 @@ def ledger(tmp_path, monkeypatch):
         if sage:
             tools._task_source_request_ids[task_id] = "chat:1:request:1"
         state["tasks"][task_id] = {"status": status, "completed": True, "command_name": "jump_psexec",
-                                   "callback": {"display_id": callback}, "timestamp": at}
+                                   "callback": {"display_id": callback}, "status_timestamp_preprocessing": at}
 
     def step(task_ids: list[int], credential_refs: list[dict] | None = None) -> dict:
         references = {"tasks": [{"task_id": i} for i in task_ids], "credentials": credential_refs or [],
@@ -336,7 +351,7 @@ def test_a_supervised_step_writes_its_gain_to_the_ledger_on_the_real_graph(monke
     async def credit_tasks(client, operation_id, since, until, callback_ids):  # Mythic transport stub
         issued = 90 in tools._task_source_request_ids
         return [{"display_id": 90, "status": "success", "command_name": "jump_psexec",
-                 "callback": {"display_id": 1}, "timestamp": TASK_AT}] if issued else []
+                 "callback": {"display_id": 1}, "status_timestamp_preprocessing": TASK_AT}] if issued else []
 
     async def rows(task_id):
         return [], False

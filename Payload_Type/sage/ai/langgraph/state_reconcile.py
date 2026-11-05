@@ -129,14 +129,18 @@ async def fetch_cited_credential(client, operation_id, credential_id: int) -> tu
 
 
 async def fetch_callback_credit_tasks(client, operation_id, since: str, until: str, callback_ids) -> list[dict]:
-    """Operation tasks that may be credited with a callback gain: tasks issued in the attribution window, and the
-    latest tasks on the gained callbacks. Any issuer."""
+    """Operation tasks that may be credited with a callback gain: tasks created in the attribution window, and the
+    latest tasks on the gained callbacks. Any issuer.
+
+    A task's issue time is when Mythic created its record (``status_timestamp_preprocessing``). ``timestamp`` is the
+    task's last update, which moves with every response, so it is neither filtered on nor selected.
+    """
     op_filter = ", operation_id: {_eq: $op}" if operation_id is not None else ""
     op_param = ", $op: Int!" if operation_id is not None else ""
-    fields = "display_id status completed command_name timestamp callback { display_id }"
+    fields = "display_id status completed command_name status_timestamp_preprocessing callback { display_id }"
     query = (
         f"query SageCreditTasks($since: timestamp!, $until: timestamp!, $cbs: [Int!]!, $limit: Int!{op_param}) {{ "
-        f"window: task(where: {{timestamp: {{_gte: $since, _lte: $until}}{op_filter}}}, "
+        f"window: task(where: {{status_timestamp_preprocessing: {{_gte: $since, _lte: $until}}{op_filter}}}, "
         f"order_by: {{display_id: desc}}, limit: $limit) {{ {fields} }} "
         f"on_callback: task(where: {{callback: {{display_id: {{_in: $cbs}}}}{op_filter}}}, "
         f"order_by: {{display_id: desc}}, limit: $limit) {{ {fields} }} }}"

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sqlite3
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -61,10 +62,10 @@ def _foothold(callback_id: str = "3") -> engagement_state.Foothold:
     )
 
 
-def _session(name: str, channel: int, request: int) -> MythicTools:
+def _session(name: str, channel: int, request: int, mode: str = "supervised") -> MythicTools:
     tools = MythicTools(agent_task_id=name)
     tools.client = object()
-    tools.set_request_contract(_contract(f"chat:{channel}:request:{request}", f"channel-{channel}"))
+    tools.set_request_contract(_contract(f"chat:{channel}:request:{request}", f"channel-{channel}", mode))
     tools._engagement_footholds = [_foothold()]
     tools._engagement_objective = lambda: ""  # type: ignore[method-assign]
     tools._require_ledger_binding()
@@ -168,7 +169,7 @@ def _task(display_id: int, command: str = "ps", *, callback: int = 13, status: s
           at: str = "2026-11-05T10:00:00", operation_id: int = 1, params: str = "") -> dict:
     return {"display_id": display_id, "id": display_id, "operation_id": operation_id, "command_name": command,
             "original_params": params, "status": status, "completed": status not in _RUNNING,
-            "timestamp": at, "operator": {"username": "operator_by_hand"},
+            "timestamp": at, "status_timestamp_preprocessing": at, "operator": {"username": "operator_by_hand"},
             "callback": {"display_id": callback, "host": "CASTELBLACK", "user": "samwell.tarly"}}
 
 
@@ -845,3 +846,320 @@ def test_a_cited_task_whose_row_the_operator_retracted_says_so(operation, mythic
                                   actor=engagement_store.Actor(kind="operator", name="op"))
     assert asyncio.run(tools._reconcile_operation(["17"]))[0] == (
         "- 17: row #1 is retracted; `/state restore 1` counts it again.")
+
+
+# --- callback attribution from task creation time --------------------------------------------------------------
+#
+# Live run 1 (2026-11-05, conversation channel 7): the operator hand-ran task 53 (`spawn` on callback 2) and
+# callback 3 checked in 29.63 s after the task was created, but Mythic's mutable `timestamp` (the last update)
+# read 1.84 s after the check-in, so no callback-gain row was written. These keep the recorded UTC times and the
+# task/callback relationship; hosts, users and callback UUIDs are synthetic. Only `mythic.execute_custom_query`
+# and the output reader are stubbed: the transport below evaluates each query's own predicate, bounds, operation
+# filter and selection set against the recorded rows, so the production query builder, adapter, verifier, proof
+# boundary and SQLite store all run.
+
+T53_CREATED = "2026-11-05T16:46:30.21"  # status_timestamp_preprocessing
+T53_SUBMITTED = "2026-11-05T16:46:38.31"
+T53_PROCESSED = "2026-11-05T16:46:44.82"
+T53_UPDATED = "2026-11-05T16:47:01.68"  # timestamp
+CB3_CHECKED_IN = "2026-11-05T16:46:59.84"
+FAVORABLE = "2026-11-05T16:46:40.00"  # inside callback 3's window, for clocks that must not be read
+LIVE_BASELINE = {"1": "medium", "2": "medium"}
+CB3_SESSION = "session:fixture\\user-3@host-3"
+NO_REFERENCES = {"tasks": [], "credentials": [], "graph_reads": []}
+_ABSENT = object()
+
+
+def _live_callback(display_id: int, init: str, *, operation_id: int = 1) -> dict:
+    return {"display_id": display_id, "operation_id": operation_id,
+            "agent_callback_id": f"00000000-0000-4000-8000-{display_id:012d}", "host": f"HOST-{display_id}",
+            "user": f"FIXTURE\\user-{display_id}", "domain": "FIXTURE", "integrity_level": 2, "init_callback": init}
+
+
+def _live_task(display_id: int = 53, *, callback: int = 2, created: Any = T53_CREATED, updated: str = T53_UPDATED,
+               submitted: str = T53_SUBMITTED, processed: str = T53_PROCESSED, status: str = "completed",
+               operation_id: int = 1) -> dict:
+    row = {"id": 1000 + display_id, "display_id": display_id, "operation_id": operation_id, "command_name": "spawn",
+           "original_params": "", "display_params": "", "status": status, "completed": status not in _RUNNING,
+           "timestamp": updated, "status_timestamp_submitted": submitted, "status_timestamp_processed": processed,
+           "operator": {"username": "operator_by_hand"},
+           "callback": {"display_id": callback, "host": f"HOST-{callback}", "user": f"FIXTURE\\user-{callback}",
+                        "domain": "FIXTURE"}}
+    if created is not _ABSENT:
+        row["status_timestamp_preprocessing"] = created
+    return row
+
+
+def _balanced(text: str, start: int, opening: str, closing: str) -> tuple[str, int]:
+    """The text inside the bracket pair opening at ``start``, and the index just past it."""
+    depth = 0
+    for index in range(start, len(text)):
+        depth += (text[index] == opening) - (text[index] == closing)
+        if depth == 0:
+            return text[start + 1:index], index + 1
+    raise AssertionError(f"unbalanced {opening}{closing}: {text!r}")
+
+
+def _field(query: str, head: str) -> tuple[str, dict]:
+    """The arguments and parsed selection set of the query field that starts with ``head``."""
+    start = query.index(head) + len(head)
+    args, after = ("", start) if query[start] != "(" else _balanced(query, start, "(", ")")
+    selection, _ = _balanced(query, query.index("{", after), "{", "}")
+    spec: dict = {}
+    stack, last = [spec], ""
+    for token in re.findall(r"[{}]|\w+", selection):
+        if token == "{":
+            stack[-1][last] = {}
+            stack.append(stack[-1][last])
+        elif token == "}":
+            stack.pop()
+        else:
+            stack[-1][token], last = None, token
+    return " ".join(args.split()), spec
+
+
+def _project(row: dict, spec: dict) -> dict:
+    """What Hasura returns for ``row``: only the selected fields."""
+    return {name: _project(row[name], nested) if nested and isinstance(row.get(name), dict) else row.get(name)
+            for name, nested in spec.items()}
+
+
+def _moment(value: Any) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+
+_SCOPED = r"(, operation_id: \{_eq: \$op\})?"
+_BOUNDED = r", order_by: \{display_id: desc\}, limit: \$limit"
+_WINDOW = re.compile(r"where: \{(\w+): \{_gte: \$since, _lte: \$until\}" + _SCOPED + r"\}" + _BOUNDED)
+_ON_CALLBACK = re.compile(r"where: \{callback: \{display_id: \{_in: \$cbs\}\}" + _SCOPED + r"\}" + _BOUNDED)
+
+
+def _credit_branches(records: dict, query: str, variables: dict) -> dict:
+    """Both SageCreditTasks branches, each evaluated from its own emitted predicate."""
+    result = {}
+    for alias, shape in (("window", _WINDOW), ("on_callback", _ON_CALLBACK)):
+        args, spec = _field(query, f"{alias}: task")
+        match = shape.fullmatch(args)
+        assert match, f"unexpected {alias} branch: {args}"
+        rows = list(records["tasks"])
+        if alias == "window":
+            since, until = _moment(variables["since"]), _moment(variables["until"])
+            if not records["lax_window"]:  # a timestamp column compares; a NULL or absent value never matches
+                rows = [row for row in rows
+                        if (moment := _moment(row.get(match.group(1)))) is not None and since <= moment <= until]
+        else:
+            rows = [row for row in rows if (row.get("callback") or {}).get("display_id") in variables["cbs"]]
+        if match.groups()[-1]:
+            rows = [row for row in rows if row["operation_id"] == variables["op"]]
+        rows = sorted(rows, key=lambda row: row["display_id"], reverse=True)[:variables["limit"]]
+        result[alias] = [_project(row, spec) for row in rows]
+    return result
+
+
+@pytest.fixture
+def live_mythic(monkeypatch):
+    """Mythic's GraphQL transport serving the recorded operation: callbacks 1–3 and task 53, operation 1."""
+    from mythic import mythic as mythic_module
+
+    records: dict = {"callbacks": [_live_callback(1, "2026-11-05T16:00:00.00"),
+                                   _live_callback(2, "2026-11-05T16:05:00.00"),
+                                   _live_callback(3, CB3_CHECKED_IN)],
+                     "tasks": [_live_task()], "lax_window": False, "queries": [], "credit": [], "errors": []}
+
+    def serve(name: str, query: str, variables: dict) -> dict:
+        op = variables.get("op")
+        if name == "SageOpList":
+            return {"operation": [{"id": 1, "name": "Operation Fixture"}]}
+        if name == "sageStepCallbacks":
+            _args, spec = _field(query, "callback")
+            return {"callback": [_project(row, spec) for row in records["callbacks"]
+                                 if op is None or row["operation_id"] == op]}
+        if name == "SageReconcileTasks":
+            _args, spec = _field(query, "task")
+            rows = [row for row in records["tasks"] if (op is None or row["operation_id"] == op)
+                    and (row["display_id"] > variables["cursor"] or row["display_id"] in variables["held"])]
+            rows = sorted(rows, key=lambda row: row["display_id"])[:variables["limit"]]
+            return {"task": [_project(row, spec) for row in rows]}
+        if name == "SageCitedTask":
+            _args, spec = _field(query, "task")
+            return {"task": [_project(row, spec) for row in records["tasks"] if row["display_id"] == variables["id"]]}
+        if name == "SageTaskCredentials":
+            return {"credential": []}
+        if name == "SageCreditTasks":
+            records["credit"].append((query, dict(variables)))
+            return _credit_branches(records, query, variables)
+        raise AssertionError(f"unexpected Mythic query {name}")
+
+    async def execute_custom_query(*args, **kwargs):
+        query = kwargs.get("query", args[1] if len(args) > 1 else "")
+        variables = dict(kwargs.get("variables", args[2] if len(args) > 2 else None) or {})
+        name = re.match(r"\s*query (\w+)", query).group(1)
+        records["queries"].append(name)
+        try:
+            return serve(name, query, variables)
+        except Exception as exc:  # the readers fail open; keep the reason for the assertion
+            records["errors"].append(f"{name}: {exc!r}")
+            raise
+
+    async def task_output(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(mythic_module, "execute_custom_query", execute_custom_query)
+    monkeypatch.setattr(mythic_module, "get_all_task_output_by_id", task_output)
+    return records
+
+
+def _seed_position(tools: MythicTools, cursor: int = 0) -> None:
+    """The stored position the run started from: callbacks 1 and 2 in the baseline, callback 3 not yet."""
+    position = engagement_store.ReconciliationUpdate(task_cursor=cursor, callback_baseline_initial=dict(LIVE_BASELINE))
+    tools._ledger_store().apply(tools._require_ledger_binding(), [], reconciliation=position)
+
+
+def _callback_rows(tools: MythicTools) -> dict:
+    return {hop.effect: hop for hop in tools._ledger_view().hops if hop.technique == "callback-context"}
+
+
+def _assert_callback_3_credited_to(tools: MythicTools, task_id: int = 53, credited: Any = 53) -> None:
+    rows = _callback_rows(tools)
+    assert set(rows) == {CB3_SESSION}
+    hop = rows[CB3_SESSION]
+    assert (hop.status, str(hop.evidence["mythic_task_id"]), hop.evidence["credited_task"]) == (
+        "achieved", str(task_id), credited)
+    assert hop.proof_envelope["origin"] == "mythic_callback"
+    assert _position(tools).callback_baseline == {**LIVE_BASELINE, "3": "medium"}
+    # A fresh session reads the shared store through the runtime load quarantine: the proof is admitted again.
+    reloaded = _session("reload", channel=8, request=1, mode="conversation")
+    assert _callback_rows(reloaded)[CB3_SESSION].status == "achieved"
+
+
+def _assert_nothing_for_callback_3(tools: MythicTools) -> None:
+    assert _callback_rows(tools) == {} and "3" not in _position(tools).callback_baseline
+
+
+@pytest.mark.parametrize("cursor", [0, 60], ids=["cursor-before-task", "cursor-past-task"])
+def test_task_53s_creation_time_credits_callback_3_at_a_conversation_turn_end(operation, live_mythic, cursor):
+    tools = operation("channel-7", channel=7, request=53, mode="conversation")  # this session issued nothing
+    _seed_position(tools, cursor)
+
+    _turn_end(tools)
+    assert live_mythic["errors"] == []
+    _assert_callback_3_credited_to(tools)
+    rows = [(row.number, row.identity) for row in tools._ledger_snapshot().hop_rows()]
+    position = _position(tools)
+
+    _turn_end(tools)  # replay: callback 3 is in the baseline now, so nothing is written again
+    reloaded = _session("channel-7-reload", channel=7, request=54, mode="conversation")
+    assert [(row.number, row.identity) for row in reloaded._ledger_snapshot().hop_rows()] == rows
+    assert _position(reloaded) == position and position.callback_baseline == {**LIVE_BASELINE, "3": "medium"}
+
+
+def test_the_old_update_time_predicate_returns_no_task_53(operation, live_mythic):
+    tools = operation("channel-7", channel=7, request=53, mode="conversation")
+    _seed_position(tools)
+    _turn_end(tools)
+    [(query, variables)] = live_mythic["credit"][:1]
+    assert [row["display_id"] for row in _credit_branches(live_mythic, query, variables)["window"]] == [53]
+    old = re.sub(r"window: task\(where: \{\w+:", "window: task(where: {timestamp:", query)
+    assert _credit_branches(live_mythic, old, variables) == {"window": [], "on_callback": []}  # nothing to rescue it
+
+
+def test_the_supervised_step_writer_credits_task_53_from_the_same_mythic_rows(operation, live_mythic):
+    tools = operation("channel-7", channel=7, request=53)
+    _seed_position(tools)
+    summary = asyncio.run(tools._record_step_ledger(NO_REFERENCES, []))
+    assert live_mythic["errors"] == []
+    assert summary["recorded"] == [{"effect": CB3_SESSION, "task_id": 53, "status": "achieved"}]
+    _assert_callback_3_credited_to(tools)
+
+
+def test_citing_task_53_credits_callback_3_and_leaves_the_cursor(operation, live_mythic):
+    tools = operation("channel-7", channel=7, request=53, mode="conversation")
+    _seed_position(tools)
+    lines = asyncio.run(tools._reconcile_operation(["53"]))
+    assert live_mythic["errors"] == [] and lines[0] == "- 53: added row #1."
+    _assert_callback_3_credited_to(tools)
+    assert _position(tools).task_cursor == 0
+
+
+@pytest.mark.parametrize("updated", ["2026-11-05T16:46:50.00", T53_UPDATED, "2026-11-06T09:00:00.00"],
+                         ids=["before-check-in", "after-check-in", "far-after"])
+def test_the_mutable_update_time_does_not_change_eligibility(operation, live_mythic, updated):
+    live_mythic["tasks"] = [_live_task(updated=updated)]
+    tools = operation("channel-7", channel=7, request=53, mode="conversation")
+    _seed_position(tools)
+    _turn_end(tools)
+    _assert_callback_3_credited_to(tools)
+
+
+@pytest.mark.parametrize("created, credited", [
+    (CB3_CHECKED_IN, True),  # created at the check-in: a zero gap
+    ("2026-11-05T16:36:59.84", True),  # exactly 600 s before it
+    ("2026-11-05T16:46:59.85", False),  # 0.01 s after the check-in
+    ("2026-11-05T16:36:59.83", False),  # 600.01 s before it
+], ids=["zero-gap", "600s", "after-check-in", "beyond-600s"])
+@pytest.mark.parametrize("lax", [False, True], ids=["query-window", "adapter-decides"])
+def test_the_window_bounds_are_inclusive_and_only_the_creation_time_counts(operation, live_mythic, created, credited,
+                                                                           lax):
+    live_mythic["lax_window"] = lax  # True: the row reaches the adapter and verifier whatever the query bounds say
+    live_mythic["tasks"] = [_live_task(created=created, updated=FAVORABLE, submitted=FAVORABLE, processed=FAVORABLE)]
+    tools = operation("channel-7", channel=7, request=53, mode="conversation")
+    _seed_position(tools)
+    _turn_end(tools)
+    assert live_mythic["errors"] == []
+    if credited:
+        _assert_callback_3_credited_to(tools)
+    else:
+        _assert_nothing_for_callback_3(tools)
+
+
+@pytest.mark.parametrize("created", [_ABSENT, None, "", "yesterday 16:46"],
+                         ids=["absent", "null", "empty", "malformed"])
+def test_a_missing_or_malformed_creation_time_is_never_replaced_by_another_clock(operation, live_mythic, created):
+    live_mythic["lax_window"] = True  # the row reaches the adapter anyway: only the adapter and the verifier decide
+    live_mythic["tasks"] = [_live_task(created=created, updated=FAVORABLE, submitted=FAVORABLE, processed=FAVORABLE)]
+    tools = operation("channel-7", channel=7, request=53)
+    _seed_position(tools)
+    summary = asyncio.run(tools._record_step_ledger(NO_REFERENCES, []))  # the lane that writes even unproven gains
+    assert live_mythic["errors"] == [] and summary["recorded"] == []
+    assert summary["unattributed"] == [{"callback_display_id": 3, "kind": "new_callback", "effects": [CB3_SESSION]}]
+    _assert_nothing_for_callback_3(tools)
+
+
+def test_a_task_in_another_operation_enters_through_neither_branch(operation, live_mythic):
+    live_mythic["tasks"] = [_live_task(operation_id=2), _live_task(70, callback=3, created="2026-11-05T16:47:10.00",
+                                                                   updated=FAVORABLE, operation_id=2)]
+    tools = operation("channel-7", channel=7, request=53, mode="conversation")
+    _seed_position(tools)
+    _turn_end(tools)
+    assert asyncio.run(tools._record_step_ledger(NO_REFERENCES, []))["recorded"] == []
+    assert live_mythic["errors"] == [] and live_mythic["credit"]
+    assert all(_credit_branches(live_mythic, query, variables) == {"window": [], "on_callback": []}
+               for query, variables in live_mythic["credit"])
+    _assert_nothing_for_callback_3(tools)
+
+
+@pytest.mark.parametrize("status", ["error: the service did not respond", "processing"])
+def test_an_errored_or_running_task_53_gives_no_achieved_row_or_baseline_entry(operation, live_mythic, status):
+    live_mythic["tasks"] = [_live_task(status=status)]
+    tools = operation("channel-7", channel=7, request=53)
+    _seed_position(tools)
+    _turn_end(tools)
+    _assert_nothing_for_callback_3(tools)
+    summary = asyncio.run(tools._record_step_ledger(NO_REFERENCES, []))
+    assert summary["recorded"] == [{"effect": CB3_SESSION, "task_id": 53, "status": "pending"}]
+    assert {(hop.status, hop.pending_reason, hop.evidence["credited_task"])
+            for hop in _callback_rows(tools).values()} == {("pending", "proof_missing", 53)}
+    assert "3" not in _position(tools).callback_baseline
+
+
+def test_with_no_valid_creation_time_a_completed_task_on_callback_3_still_proves_the_gain(operation, live_mythic):
+    live_mythic["tasks"] = [_live_task(created="2026-11-05T16:30:00.00"),  # 1,019.84 s before the check-in
+                            _live_task(70, callback=3, created=_ABSENT, updated=FAVORABLE)]
+    tools = operation("channel-7", channel=7, request=53, mode="conversation")
+    _seed_position(tools)
+    _turn_end(tools)
+    assert live_mythic["errors"] == []
+    _assert_callback_3_credited_to(tools, task_id=70, credited="none")

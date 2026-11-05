@@ -19540,7 +19540,7 @@ class MythicTools:
                 tasks.append(step_ledger.OperationTask(
                     task_id=row["display_id"], callback_display_id=callback.get("display_id"),
                     command=str(row.get("command_name") or ""), status=str(row.get("status") or "").strip().casefold(),
-                    timestamp=str(row.get("timestamp") or ""),
+                    issued_at=str(row.get("status_timestamp_preprocessing") or ""),
                 ))
 
         def status_of(effect: str) -> str:
