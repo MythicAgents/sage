@@ -267,6 +267,20 @@ def known_scope(mythic_client: Any, *, operator_input: str = "", bound_callback:
         value = getattr(mythic_client, name, None)
         return value if isinstance(value, kind) else kind()
 
+    # One fresh ledger snapshot for this scope. An unavailable ledger contributes no names, which narrows (never
+    # widens) what a brief may name.
+    ledger_hops: list = []
+    ledger_facts: list = []
+    view_fn = getattr(mythic_client, "_ledger_view", None)
+    if callable(view_fn):
+        try:
+            view = view_fn()
+            ledger_hops, ledger_facts = list(view.hops), list(view.graph_facts)
+        except Exception:
+            ledger_hops, ledger_facts = [], []
+    else:
+        ledger_hops, ledger_facts = attr("_engagement_hops", list), attr("_engagement_graph_facts", list)
+
     snapshots = attr("_recon_snapshot_cache", dict).get(("list_callbacks", "all"))
     for row in snapshots if isinstance(snapshots, list) else []:
         if isinstance(row, Mapping):
@@ -282,7 +296,7 @@ def known_scope(mythic_client: Any, *, operator_input: str = "", bound_callback:
         if host and forest and "." not in host:
             hosts.add(f"{host}.{forest}")
         principal(getattr(foothold, "identity", ""))
-    for hop in attr("_engagement_hops", list):
+    for hop in ledger_hops:
         target = _name(getattr(hop, "target", ""))
         if _encoded(target):
             # A structured target is never one name; only a supported achieved row contributes its host.
@@ -296,7 +310,7 @@ def known_scope(mythic_client: Any, *, operator_input: str = "", bound_callback:
         if isinstance(evidence, Mapping):
             tasks.update(_items(evidence.get(key) for key in ("mythic_task_id", "task_id", "display_id")
                                 if evidence.get(key) is not None))
-    for fact in attr("_engagement_graph_facts", list):
+    for fact in ledger_facts:
         predicate = str(getattr(fact, "predicate", "") or "")
         for segment in predicate.split(":")[1:]:
             if "." in segment and not _encoded(segment):

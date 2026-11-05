@@ -11,6 +11,7 @@ No live Mythic. The `mythic` lib functions are monkeypatched. Mirrors the repo's
 convention (asyncio.run for the few async methods).
 """
 
+from tests.esl_fixtures import seed_ledger  # noqa: E402
 import asyncio
 import io
 import sys
@@ -59,51 +60,63 @@ def test_operation_key_sanitizes_and_orders():
 
 def test_resolve_operation_none_client():
     assert _run(oc.resolve_operation(None)) is None
-    assert _run(oc.resolve_operation_key(None)) is None
+    assert _run(oc.resolve_operation_by_id(None, 1)) is None
 
 
 FIXED_UUID = "3f2a8c1d-1111-2222-3333-444455556666"
 
 
-def _fake_mythic(monkeypatch, *, ops=(), callback_op=None, marker_uuid=None, capture=None):
-    """Route execute_custom_query by query (op-list / callback / engagement marker) and mock the marker
-    write. `marker_uuid` present => the marker already exists; None => absent (forces a generate+persist)."""
+def _fake_mythic(monkeypatch, *, ops=(), callback_op=None, marker_uuid=None, capture=None, by_id=None):
+    """Route execute_custom_query by query and keep written markers: a persisted marker is read back, as Mythic
+    does. `marker_uuid` present => the marker already exists; None => absent (forces a generate+persist)."""
+    markers = [marker_uuid] if marker_uuid else []
+    names = dict(by_id or {})
+    for op in ops:
+        names.setdefault(int(op["id"]), op["name"])
+
     async def fake_q(client, query, variables=None):
         if "SageOpList" in query:
             return {"operation": list(ops)}
+        if "SageOperationById" in query:
+            op = int((variables or {}).get("op"))
+            return {"operation_by_pk": {"id": op, "name": names[op]} if op in names else None}
         if "SageOpFromCallback" in query:
             return {"callback": ([{"operation_id": callback_op[0],
                                    "operation": {"id": callback_op[0], "name": callback_op[1]}}]
                                  if callback_op else [])}
         if "SageEngagementMarker" in query:
-            return {"operationeventlog": ([{"message": f"id: {marker_uuid}"}] if marker_uuid else [])}
+            return {"operationeventlog": [{"message": f"id: {m}"} for m in markers[:1]]}
         return {}
 
     async def fake_send(client, message, level="info", source=""):
         if capture is not None:
             capture.append((message, source))
+        found = oc._UUID_RE.search(message)
+        if found:
+            markers.append(found.group(0))
         return {"status": "success"}
     monkeypatch.setattr(MM, "execute_custom_query", fake_q)
     monkeypatch.setattr(MM, "send_event_log_message", fake_send)
+    return markers
 
 
 def test_resolve_operation_from_callback(monkeypatch):
     _fake_mythic(monkeypatch, ops=[], callback_op=(1, "Operation Chimera"), marker_uuid=FIXED_UUID)
     assert _run(oc.resolve_operation(object())) == (1, "Operation Chimera")
-    assert _run(oc.resolve_operation_key(object())) == f"Operation_Chimera_1_{FIXED_UUID}"
+    assert _run(oc.resolve_operation(object())) == (1, "Operation Chimera")
 
 
 def test_resolve_operation_prefers_single_scoped_op(monkeypatch):
     # A scoped token sees exactly one op -> use it directly (works even with zero callbacks).
     _fake_mythic(monkeypatch, ops=[{"id": 9, "name": "Solo Op"}], callback_op=None, marker_uuid=FIXED_UUID)
-    assert _run(oc.resolve_operation_key(object())) == f"Solo_Op_9_{FIXED_UUID}"
+    assert _run(oc.resolve_operation(object())) == (9, "Solo Op")
 
 
 def test_resolve_operation_multi_op_uses_callback(monkeypatch):
     # Ambiguous (admin sees >1 op) -> anchor on the most recent callback's own operation, not a guess.
     _fake_mythic(monkeypatch, ops=[{"id": 1, "name": "Op A"}, {"id": 2, "name": "Op B"}],
                  callback_op=(2, "Op B"), marker_uuid=FIXED_UUID)
-    assert _run(oc.resolve_operation_key(object())) == f"Op_B_2_{FIXED_UUID}"
+    assert _run(oc.resolve_operation(object())) == (2, "Op B")
 
 
 def test_operation_key_int_str_id_identical():
@@ -140,20 +153,25 @@ async def _mint_with(monkeypatch):
     return await oc.get_or_create_engagement_uuid(object(), 1)
 
 
-def test_resolve_key_falls_back_to_base_when_marker_unpersistable(monkeypatch):
+def test_marker_that_cannot_be_read_back_leaves_the_ledger_unbound(monkeypatch):
     async def fake_q(client, query, variables=None):
-        if "SageOpList" in query:
-            return {"operation": [{"id": 1, "name": "Operation Chimera"}]}
         if "SageEngagementMarker" in query:
             return {"operationeventlog": []}
         return {}
 
-    async def fake_send_fail(client, message, level="info", source=""):
-        raise RuntimeError("mythic unreachable")
+    async def fake_send(client, message, level="info", source=""):
+        return {"status": "success"}  # claims success, but the marker never becomes readable
     monkeypatch.setattr(MM, "execute_custom_query", fake_q)
-    monkeypatch.setattr(MM, "send_event_log_message", fake_send_fail)
-    # Can't persist the marker -> non-durable base key (best effort), never a half-baked uuid.
-    assert _run(oc.resolve_operation_key(object())) == "Operation_Chimera_1"
+    monkeypatch.setattr(MM, "send_event_log_message", fake_send)
+    assert _run(oc.get_or_create_engagement_uuid(object(), 1)) is None
+
+
+def test_concurrent_first_sessions_converge_on_the_earliest_marker(monkeypatch):
+    markers = _fake_mythic(monkeypatch, ops=[{"id": 1, "name": "Operation Chimera"}], marker_uuid=None)
+    first = _run(oc.get_or_create_engagement_uuid(object(), 1))
+    markers.insert(0, "11111111-2222-4333-8444-555555555555")  # another session's marker landed earlier
+    markers.append("99999999-2222-4333-8444-555555555555")
+    assert first and _run(oc.get_or_create_engagement_uuid(object(), 1)) == "11111111-2222-4333-8444-555555555555"
 
 
 # ---------------------------------------------------------------------------
@@ -165,18 +183,6 @@ def test_ledger_prefix_is_state(monkeypatch, tmp_path):
     p = el.ledger_path("Operation_Chimera_1")
     assert Path(p).name == "state_Operation_Chimera_1.json"
     assert "engagement_" not in Path(p).name
-
-
-def test_agent_and_ledger_resolve_same_path(monkeypatch, tmp_path):
-    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
-    assert mythic_tools._engagement_ledger_file("Operation_Chimera_1") == el.ledger_path("Operation_Chimera_1")
-
-
-def test_list_engagements_scans_state_prefix(monkeypatch, tmp_path):
-    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
-    el.save({"hops": []}, "Operation_Chimera_1")
-    (tmp_path / "engagement_old.json").write_text("{}")   # legacy file is NOT listed (clean break)
-    assert el.list_engagements() == ["Operation_Chimera_1"]
 
 
 def test_hostile_operation_name_no_path_traversal(monkeypatch, tmp_path):
@@ -192,77 +198,84 @@ def test_hostile_operation_name_no_path_traversal(monkeypatch, tmp_path):
 # MythicTools: operation-key resolution + persist
 # ---------------------------------------------------------------------------
 
-def test_ensure_engagement_key_resolves_operation(monkeypatch, tmp_path):
-    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
+def _operation_session(monkeypatch, op_id=1, name="Operation Chimera", marker=FIXED_UUID):
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "default")
-
-    async def fake_key(client):
-        return "Operation_Chimera_1"
-    monkeypatch.setattr(oc, "resolve_operation_key", fake_key)
-
-    mt = mythic_tools.MythicTools(agent_task_id="x")
+    _fake_mythic(monkeypatch, marker_uuid=marker, by_id={op_id: name})
+    mt = mythic_tools.MythicTools(operation_id=op_id, channel_id=3)
     mt.client = object()
-    assert mt._eng_key() == "default"          # before resolution
+    return mt
+
+
+def test_ensure_engagement_key_binds_the_sessions_own_operation(monkeypatch):
+    mt = _operation_session(monkeypatch)
+    assert mt._eng_key() == ""                      # unbound: no default key
     _run(mt._ensure_engagement_key())
-    assert mt._eng_key() == "Operation_Chimera_1"
-    # A recorded hop persists under the operation-named file.
+    assert mt._eng_key() == f"Operation_Chimera_1_{FIXED_UUID}"
     mt._pending_engagement_hop = ("dcsync", "sevenkingdoms.local", "2026-06-08T00:00:00Z")
     mt._record_engagement_success("  Hash NTLM: 2b576acbe6bcfda7294d6bd18041b8fe")
-    assert Path(mt._engagement_ledger_path()).name == "state_Operation_Chimera_1.json"
-    assert Path(mt._engagement_ledger_path()).exists()
+    assert [row["technique"] for row in mt._ledger_snapshot().display_hops()] == ["dcsync"]
 
 
-def test_default_ledger_not_loaded_before_operation_key(monkeypatch, tmp_path):
-    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
+def test_unbound_session_is_explicitly_unavailable_not_default(monkeypatch):
+    import engagement_store
+
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "default")
-    el.save({
-        "hops": [_ledger_hop("collect-graph", "stale", "graph-built:stale")],
-    }, "default")
-
     mt = mythic_tools.MythicTools(agent_task_id="x")
+    _run(mt._ensure_engagement_key())               # no operation id and no namespace
+    assert mt._eng_key() == "" and mt._engagement_key is None
+    with pytest.raises(engagement_store.LedgerUnavailable):
+        mt._engagement_hops
 
-    assert mt._engagement_hops == []
 
+def test_unreadable_operation_leaves_the_ledger_unavailable(monkeypatch):
+    import engagement_store
 
-def test_operation_key_load_replaces_stale_default_state(monkeypatch, tmp_path):
-    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
-    monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "default")
-    el.save({
-        "hops": [_ledger_hop("collect-graph", "stale", "graph-built:stale")],
-    }, "default")
-    el.save({
-        "hops": [_ledger_hop("capability:forge-golden-ticket", "domain=child.local;target_domain=parent.local", "da:parent.local")],
-    }, "Operation_Chimera_1")
-
-    async def fake_key(client):
-        return "Operation_Chimera_1"
-    monkeypatch.setattr(oc, "resolve_operation_key", fake_key)
-
-    mt = mythic_tools.MythicTools(agent_task_id="x")
-    mt.client = object()
-    mt._engagement_hops = es.hops_from_dicts([
-        _ledger_hop("collect-graph", "stale", "graph-built:stale"),
-    ])
-
+    mt = _operation_session(monkeypatch, op_id=7)
+    _fake_mythic(monkeypatch, marker_uuid=FIXED_UUID, by_id={})   # operation 7 not readable
     _run(mt._ensure_engagement_key())
-
-    effects = {getattr(h, "effect", "") for h in mt._engagement_hops}
-    assert "da:parent.local" in effects
-    assert "graph-built:stale" not in effects
+    with pytest.raises(engagement_store.LedgerUnavailable, match="operation 7"):
+        mt._engagement_hops
 
 
-def test_explicit_engagement_id_overrides_operation(monkeypatch, tmp_path):
-    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
+def test_reused_numeric_id_with_a_new_marker_is_a_separate_ledger(monkeypatch):
+    old = _operation_session(monkeypatch)
+    _run(old._ensure_engagement_key())
+    seed_ledger(old, hops=es.hops_from_dicts([_ledger_hop("collect-graph", "stale", "graph-built:stale")]))
+    after_reset = _operation_session(monkeypatch, marker="aaaaaaaa-1111-4222-8333-444444444444")
+    _run(after_reset._ensure_engagement_key())
+    assert after_reset._eng_key().endswith("aaaaaaaa-1111-4222-8333-444444444444")
+    assert after_reset._engagement_hops == []
+
+
+def test_operation_rename_keeps_the_ledger_and_its_proof_key(monkeypatch):
+    first = _operation_session(monkeypatch)
+    _run(first._ensure_engagement_key())
+    seed_ledger(first, hops=es.hops_from_dicts([_ledger_hop("dcsync", "lab.local", "krbtgt-hash:lab.local")]))
+    renamed = _operation_session(monkeypatch, name="Renamed Operation")
+    _run(renamed._ensure_engagement_key())
+    assert renamed._eng_key() == f"Operation_Chimera_1_{FIXED_UUID}"   # first canonical key retained
+    assert [hop.status for hop in renamed._engagement_hops] == ["achieved"]  # proof still matches the key
+
+
+def test_other_operation_cannot_read_this_operations_rows(monkeypatch):
+    one = _operation_session(monkeypatch, op_id=1)
+    _run(one._ensure_engagement_key())
+    seed_ledger(one, hops=es.hops_from_dicts([_ledger_hop("dcsync", "lab.local", "krbtgt-hash:lab.local")]))
+    two = _operation_session(monkeypatch, op_id=2, name="Other", marker="bbbbbbbb-1111-4222-8333-444444444444")
+    _run(two._ensure_engagement_key())
+    assert two._engagement_hops == []
+
+
+def test_explicit_namespace_binds_only_sessions_without_an_operation(monkeypatch):
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "manual-eng")
+    offline = mythic_tools.MythicTools(agent_task_id="x")
+    assert offline._eng_key() == "manual-eng"        # bound at construction, no Mythic query
 
-    async def boom(client):
-        raise AssertionError("must not query Mythic when SAGE_ENGAGEMENT_ID is explicit")
-    monkeypatch.setattr(oc, "resolve_operation_key", boom)
-
-    mt = mythic_tools.MythicTools(agent_task_id="x")
-    mt.client = object()
-    _run(mt._ensure_engagement_key())
-    assert mt._eng_key() == "manual-eng"
+    _fake_mythic(monkeypatch, marker_uuid=FIXED_UUID, by_id={1: "Operation Chimera"})
+    chat = mythic_tools.MythicTools(operation_id=1, channel_id=3)
+    chat.client = object()
+    _run(chat._ensure_engagement_key())
+    assert chat._eng_key() == f"Operation_Chimera_1_{FIXED_UUID}"   # a native-chat session keeps its operation
 
 
 def test_engagement_objective_env_override(monkeypatch):
@@ -282,25 +295,21 @@ def test_bloodhound_collection_zip_shape_validation():
     assert mythic_tools._looks_like_bloodhound_collection_zip(b"SharpHound help text") is False
 
 
-def test_ensure_engagement_key_idempotent(monkeypatch, tmp_path):
-    # The lock + double-check means a second call (or a concurrent one) does NOT re-query or re-reload.
-    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
-    monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "default")
+def test_ensure_engagement_key_idempotent(monkeypatch):
+    mt = _operation_session(monkeypatch)
     calls = {"n": 0}
+    real = oc.resolve_operation_by_id
 
-    async def fake_key(client):
+    async def counting(client, op_id):
         calls["n"] += 1
-        return "Operation_Chimera_1"
-    monkeypatch.setattr(oc, "resolve_operation_key", fake_key)
-
-    mt = mythic_tools.MythicTools(agent_task_id="x")
-    mt.client = object()
+        return await real(client, op_id)
+    monkeypatch.setattr(oc, "resolve_operation_by_id", counting)
 
     async def run_twice():
         await mt._ensure_engagement_key()
         await mt._ensure_engagement_key()
     _run(run_twice())
-    assert calls["n"] == 1 and mt._eng_key() == "Operation_Chimera_1"
+    assert calls["n"] == 1 and mt._eng_key() == f"Operation_Chimera_1_{FIXED_UUID}"
 
 
 # ---------------------------------------------------------------------------

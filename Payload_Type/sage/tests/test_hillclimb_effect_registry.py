@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph")
 
 import effect_registry as er  # noqa: E402
 import engagement_ledger  # noqa: E402
+import evaluator_observations  # noqa: E402
 import fitness  # noqa: E402
 import live_runner  # noqa: E402
 import probes  # noqa: E402
@@ -273,6 +274,6 @@ def test_live_capture_replay_and_direct_scoring_share_one_typed_result_path(tmp_
         == fitness.score({}, replay, scenario=scenario).proof_dispositions
     )
     assert (
-        engagement_ledger.load(scenario.engagement_id)["ground_truth_probes"]["_verifier_hash"]
+        evaluator_observations.read_observations(scenario.engagement_id)["_verifier_hash"]
         == fitness.verifier_hash(scenario)
     )

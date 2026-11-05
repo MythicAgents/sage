@@ -6,6 +6,7 @@ ingest the transaction makes must be covered by it and nothing else. External ef
 `test_private_collection_transaction.py`, whose fixture this module reuses.
 """
 
+from tests.esl_fixtures import seed_ledger  # noqa: E402
 import asyncio
 import json
 from types import SimpleNamespace
@@ -381,6 +382,8 @@ def _real_recorder(case, monkeypatch, tmp_path):
 
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path / "ledger"))
     monkeypatch.setattr(mt, "SAGE_ENGAGEMENT_ID", LEDGER_KEY)
+    case.client._ledger_binding = None  # the fixture client was built before the namespace was chosen
+    case.client._bind_explicit_namespace()
     monkeypatch.setattr(case.client, "_record_graph_built", mt.MythicTools._record_graph_built.__get__(case.client))
 
     async def live_footholds(_client, _now):  # Mythic's live callbacks, as the access reconciler reports them
@@ -403,9 +406,8 @@ def _graph_hops(client):
 
 def _reloaded(case):
     """A fresh client that knows only the persisted ledger, plus the same live footholds."""
-    fresh = mt.MythicTools()
+    fresh = mt.MythicTools()  # binds the same isolated namespace and reads the shared store
     fresh.client = object()
-    fresh._load_engagement_ledger(replace=True)
     fresh._engagement_footholds = list(case.state.footholds)
     state = es.EngagementState(
         objective=case.state.objective, footholds=list(case.state.footholds),
@@ -513,9 +515,9 @@ def test_upload_acceptance_and_a_populated_graph_are_not_completion(collection, 
     streamed = _streamed(case)
     case.ingest_tool.statuses = [(6, "Ingesting")]
     # BloodHound already lists the domain as collected, and the cached graph says so too.
-    case.client._engagement_graph_facts = [es.GraphFact(
+    seed_ledger(case.client, graph_facts=[es.GraphFact(
         predicate="domain-collected:corp.test", source="bloodhound:domain_info", timestamp="", ttl_seconds=3600,
-    )]
+    )])
     _approve(case, ACTION)
 
     result = _run(case, ACTION)

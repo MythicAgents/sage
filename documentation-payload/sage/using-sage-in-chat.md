@@ -39,10 +39,11 @@ up front rather than failing mid-run.
 | `/watcher apply` | From the exact active locked `Sage Watcher` channel, claim or advance the immutable operation profile and rehydrate any requesting-user secret after restart |
 | `/watcher scan` · `/watcher pause` · `/watcher resume` | From the exact owner only, request an immediate read-only poll, pause the scheduler, or resume it |
 | `/watcher interval <seconds>` · `/watcher interval default` | From the exact owner only, persist cadence for the applied profile; accepted range is 5–86,400 integer seconds |
-| `/state` | Show the [engagement ledger](/agents/sage/engagement-ledger/) — the hop table of proven effects for this channel |
+| `/state` | Show the [engagement ledger](/agents/sage/engagement-ledger/) — the hop table of proven effects shared by every channel of this operation |
 | `/state objective <text>` | Set the engagement objective |
-| `/state reconcile [task_id] [apply]` | Import verified effects and credentials from completed Mythic tasks — dry-run unless `apply` is given |
-| `/state set <#> <status>` · `/state remove <#>` · `/state wipe` | Edit or clear ledger rows by hop number (the `#` column) or hop id (you cannot hand-promote a row to `achieved`) |
+| `/state reconcile [task_id] [apply]` | Record verified effects from completed Mythic tasks; credential import is dry-run unless `apply` is given |
+| `/state remove <#>[,…] [--reason <text>]` · `/state restore <#>[,…]` · `/state invalidate <#>[,…]` | Retract a row, undo a retraction, or mark a row "no longer holds", by hop number (the `#` column) or hop id. Rows are kept and numbered; you cannot hand-promote a row to `achieved` |
+| `/state wipe` | Retract every row and every current graph fact; nothing is deleted or renumbered |
 | `/mode [conversation\|supervised\|auto]` | Show or switch the channel's mode |
 | `/list` | List active Sage chat sessions |
 | `/stop` | Cooperatively stop the running agent on this channel |

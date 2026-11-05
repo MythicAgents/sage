@@ -562,13 +562,27 @@ def _engagement_ledger_mod():
 
 
 def _engagement_state_dir() -> str:
-    """Directory for the durable per-engagement ledger (delegated). SAGE_ENGAGEMENT_STATE_DIR overrides."""
+    """The `.sage_engagement` directory (artifacts, decision records, legacy ledger files). SAGE_ENGAGEMENT_STATE_DIR
+    overrides. The live ledger is in sage.db (engagement_store), never here."""
     return _engagement_ledger_mod().state_dir()
 
 
-def _engagement_ledger_file(engagement_id: str | None = None) -> str:
-    """Absolute path to the JSON ledger for an engagement key (delegated to the shared module)."""
-    return _engagement_ledger_mod().ledger_path(engagement_id or SAGE_ENGAGEMENT_ID)
+try:
+    from . import engagement_store as _esl
+except ImportError:  # when ai/langgraph is on sys.path directly (tests, some runtimes)
+    import engagement_store as _esl
+
+
+class _LedgerView:
+    """One calculation's runtime projection of a fresh ESL snapshot. Never cached across awaits."""
+
+    __slots__ = ("snapshot", "hops", "corrected_hops", "graph_facts")
+
+    def __init__(self, *, snapshot, hops, corrected_hops, graph_facts):
+        self.snapshot = snapshot
+        self.hops = hops
+        self.corrected_hops = corrected_hops
+        self.graph_facts = graph_facts
 import asyncio
 import ast
 import base64
@@ -1996,7 +2010,13 @@ class MythicTools:
         # is lazy-loaded from private env/file context and remains disabled for
         # ordinary Sage sessions.
         self._evaluation_authorization_runtime_state = None
-        self._engagement_hops: list = []
+        # Engagement State Ledger binding (engagement_store in sage.db). `_engagement_hops` and
+        # `_engagement_graph_facts` are read-only properties over a fresh operation snapshot.
+        self._esl_store = None
+        self._ledger_binding = None
+        self._ledger_binding_error: str = ""
+        self._ledger_own_rows: set[tuple[str, int]] = set()
+        self._ledger_last_write_error: str = ""
         self._engagement_objective_text: str = ""
         # Provenance of the cached ledger objective: "operator" (set via `state objective`), "autonomous_seed"
         # (auto-adopted from a solve prompt), or "" (none/legacy). Legacy/provenance-less objectives are
@@ -2021,9 +2041,7 @@ class MythicTools:
         # so the per-turn injection can DIRECT the operator to the next available hop instead of letting it
         # re-collect in a loop. SUGGESTION-ONLY: these feed available_hops / the injected
         # render, NOT the gate's enforcement state — so a reconciliation miss can never newly DEFER a real
-        # hop (suggest-on-known; blocking stays conservative / unknown != false).
-        self._engagement_graph_facts: list = []
-        self._engagement_graph_facts_ts: str | None = None
+        # hop (suggest-on-known; blocking stays conservative / unknown != false). Stored as ESL graph-fact rows.
         # Objective+coverage key of the last path-shaped probe, so it fires at most once per
         # objective/coverage horizon (re-fires only when the objective text or covered domains change).
         self._objective_path_probe_key: str | None = None
@@ -2104,25 +2122,15 @@ class MythicTools:
         # supervisor control loops. Per-process; a lab reset + Sage restart clears it.
         self._ingested_collection_hashes: dict[str, str] = {}
         self._last_bloodhound_ingest_proof_envelope: dict = {}
-        # The durable-ledger key. Defaults to the explicit SAGE_ENGAGEMENT_ID (env/test override); when
-        # that is unset ("default") it is resolved lazily from the current Mythic OPERATION the first time
-        # the gate fires (client exists by then) -> `state_<OperationName>_<OperationId>.json`. The lock
-        # serializes that one-time resolve+reload so two concurrent hook calls can't both reload and stomp
-        # an appended hop.
+        # The bound operation's canonical engagement key (mirrors the ledger binding once bound). The lock
+        # serializes the one-time operation binding.
         self._engagement_key: str | None = None
         self._engagement_key_lock = asyncio.Lock()
         # Live footholds cache (populated by the issue hook after reconcile) so the per-turn state render in
         # model.py can show footholds without an extra network round-trip on every model call.
         self._engagement_footholds: list = []
-        # Durable cross-run resume: when an explicit engagement key is configured, load it now. The normal
-        # operation-named key needs a Mythic client, so it is resolved after login; loading state_default here
-        # would let stale default state drive planning before the first gated task.
-        if SAGE_ENGAGEMENT_ID and SAGE_ENGAGEMENT_ID != "default":
-            self._engagement_key = SAGE_ENGAGEMENT_ID
-            try:
-                self._load_engagement_ledger(replace=True)
-            except Exception:
-                pass
+        # The ledger binds lazily: an explicit isolated namespace (offline/evaluation session without an operation)
+        # on first ledger use, an operation-bound session after login, before any ledger-dependent decision.
         # No-progress guard: count how many times each task_id has been fetched and come back FAILED
         # this session. On the 2nd+ failed re-read we return a short escalation directive instead of
         # the full (unchanged) failed output — re-reading a statically-failed task at hundreds of
@@ -3569,10 +3577,11 @@ class MythicTools:
                              if str(getattr(f, "callback_id", "")) == str(callback_display_id or "").strip()), None)
             if foothold is None:
                 return False
+            view = self._ledger_view()
             state = engagement_state.EngagementState(
                 objective=self._engagement_objective(), footholds=footholds,
-                hops=list(getattr(self, "_engagement_hops", []) or []),
-                graph_facts=list(getattr(self, "_engagement_graph_facts", []) or []),
+                hops=list(view.hops),
+                graph_facts=list(view.graph_facts),
                 engagement_id=self._eng_key(), runtime_scope=True,
             )
             return bool(engagement_state.graph_collection_covers_scope(
@@ -7417,6 +7426,7 @@ class MythicTools:
             except Exception:
                 pass
             try:
+                self._ledger_last_write_error = ""
                 self._record_engagement_success(
                     results_str,
                     task_id=self._last_issued_task_display_id,
@@ -7424,6 +7434,12 @@ class MythicTools:
                     terminal_status=self._last_issued_task_terminal_status,
                     command=command,
                 )
+                if getattr(self, "_ledger_last_write_error", ""):
+                    # The task ran; only its ledger record failed. Say so, and never repeat the task for it.
+                    results_str = (
+                        f"{results_str}\n\n[engagement-ledger] The observed result could not be recorded "
+                        "(the engagement ledger is unavailable). Do not repeat the task to record it."
+                    )
             except Exception:
                 pass  # fail-open: recording must never break the issue path
             try:
@@ -7479,8 +7495,7 @@ class MythicTools:
         if classified is None:
             return None
 
-        # Resolve the durable-ledger key from the current Mythic operation (and reload the ledger under
-        # it) before the first issue-time decision — __init__ loaded under 'default' with no client yet.
+        # Bind this session's ledger to its operation before the first issue-time decision.
         await self._ensure_engagement_key()
 
         technique, target_key = classified
@@ -7489,6 +7504,15 @@ class MythicTools:
             footholds = await access_reconciler.reconcile_access(self, now)
         except Exception:
             footholds = []
+        try:
+            view = self._ledger_view()
+        except _esl.LedgerUnavailable as exc:
+            # A database error is not an empty ledger: no stale authorization, and no result could be recorded.
+            self._pending_engagement_hop = None
+            return (
+                f"[engagement-gate] {technique} not attempted: the engagement ledger is unavailable ({exc}). "
+                "Its result could not be recorded or checked against prior proof; resolve the ledger store, then retry."
+            )
 
         # Cache the reconciled footholds so the per-turn state render (model.py) can show them without
         # an extra reconcile round-trip on every model call. Best-effort; never blocks the gate.
@@ -7505,11 +7529,11 @@ class MythicTools:
         # recorded by ingest_collection on graph_verified (not on SharpHound success), so we do NOT set a pending
         # hop here.
         if technique == "collect-graph":
-            graph_facts = list(getattr(self, "_engagement_graph_facts", []) or [])
+            graph_facts = list(view.graph_facts)
             cg_state = engagement_state.EngagementState(
                 objective=self._engagement_objective(),
                 footholds=footholds,
-                hops=list(self._engagement_hops),
+                hops=list(view.hops),
                 graph_facts=graph_facts,
                 engagement_id=self._eng_key(),
                 runtime_scope=True,
@@ -7615,10 +7639,19 @@ class MythicTools:
             corroboration = await self._corroboration_facts(now)
         except Exception:
             corroboration = []
+        # The awaits above may span an operator correction: decide on a fresh snapshot.
+        try:
+            view = self._ledger_view()
+        except _esl.LedgerUnavailable as exc:
+            self._pending_engagement_hop = None
+            return (
+                f"[engagement-gate] {technique} not attempted: the engagement ledger is unavailable ({exc}). "
+                "Its result could not be recorded or checked against prior proof; resolve the ledger store, then retry."
+            )
         state = engagement_state.EngagementState(
             objective=self._engagement_objective(),
             footholds=footholds,
-            hops=list(self._engagement_hops),
+            hops=list(view.hops),
             graph_facts=corroboration,
             probed_effect_prefixes={"creds", "krbtgt-hash"},  # the cred-store probe definitively read these
             engagement_id=self._eng_key(),
@@ -7635,7 +7668,7 @@ class MythicTools:
         )
         reason = f"missing precondition(s): ds-replication-rights:{dom}" if rights_missing else ""
         if self._should_block_premature_dcsync(
-            technique, reason, bool(self._engagement_graph_facts),
+            technique, reason, bool(view.graph_facts),
             self._dcsync_precheck_blocks.get((technique, dom), 0), self._DCSYNC_PRECHECK_MAX_BLOCKS,
         ):
             self._dcsync_precheck_blocks[(technique, dom)] = \
@@ -7708,7 +7741,8 @@ class MythicTools:
         if objective and not supersedes:
             return objective
         if seed:
-            if not self._autonomous_objective_persisted and self._engagement_key is not None:
+            bound = self._engagement_key is not None or bool(self._explicit_engagement_namespace())
+            if not self._autonomous_objective_persisted and bound:
                 self._persist_autonomous_objective_seed(seed)
             return seed
         return f"sage-engagement:{self.agent_task_id}" if self.agent_task_id else "sage-engagement"
@@ -7716,47 +7750,36 @@ class MythicTools:
     def operator_objective_binding(self) -> str:
         """Return the exact current operator-set objective, or fail closed.
 
-        Stored-objective start phrases are execution-authority requests, so they must bind to the
-        operation-resolved ledger on disk rather than a cached objective or an autonomous seed. A
-        missing key, unreadable ledger, legacy provenance, or any source other than ``operator``
+        Stored-objective start phrases are execution-authority requests, so they bind to the operation's
+        current compatibility setting (read fresh from sage.db), never a cached objective or an autonomous seed.
+        An unbound session, an unreadable store, legacy provenance, or any source other than ``operator``
         returns an empty binding and cannot start the controller.
         """
-        if self._engagement_key is None:
-            return ""
         try:
-            with open(self._engagement_ledger_path(), "r", encoding="utf-8") as fh:
-                payload = json.load(fh)
+            settings = self._ledger_store().legacy_settings(self._require_ledger_binding())
         except Exception:
+            return ""  # unbound (no operation, no explicit namespace) or unreadable: fail closed
+        if str(settings.get("objective_source") or "").strip().casefold() != "operator":
             return ""
-        if not isinstance(payload, dict):
-            return ""
-        if str(payload.get("objective_source") or "").strip().casefold() != "operator":
-            return ""
-        return self._human_engagement_objective(payload.get("objective"))
+        return self._human_engagement_objective(settings.get("objective"))
 
     def _persist_autonomous_objective_seed(self, text: str) -> None:
-        """Write an adopted autonomous objective to the durable ledger ONCE, under the now-resolved key.
-        Re-reads the ledger immediately before writing and NEVER overwrites an operator-set or legacy
-        (provenance-less) objective — only an absent or prior autonomous_seed objective is (re)written —
-        matching state.py's own load→set-objective→save pattern. Stamps objective_source='autonomous_seed'.
-        Latches on success so it runs at most once per seed; a transient I/O error leaves the latch unset so
-        the next call retries. Fail-open: never breaks the solve.
+        """Write an adopted autonomous objective to the operation's compatibility setting ONCE.
+
+        The check and write are one transaction: an operator-set or legacy (provenance-less) objective is never
+        overwritten; only an absent or prior autonomous_seed objective is (re)written. Writes only the objective
+        setting (never ledger rows). Latches on success; a transient error leaves the latch unset for a retry.
         """
         try:
-            try:
-                from . import engagement_ledger
-            except ImportError:
-                import engagement_ledger
-            key = self._eng_key()
-            data = engagement_ledger.load_runtime(key)
-            existing = self._human_engagement_objective(data.get("objective"))
-            existing_source = str(data.get("objective_source") or "")
-            # Operator/legacy objective on disk -> never clobber. None or prior autonomous_seed -> (re)write.
-            if not existing or existing_source == "autonomous_seed":
-                data["objective"] = text
-                data["objective_source"] = "autonomous_seed"
-                data["updated"] = datetime.now(timezone.utc).isoformat()
-                engagement_ledger.save_runtime(data, key)
+            binding = self._require_ledger_binding()
+
+            def replace_if(existing: str, existing_source: str) -> bool:
+                return not self._human_engagement_objective(existing) or existing_source == "autonomous_seed"
+
+            objective, source = self._ledger_store().update_objective(
+                binding, text, "autonomous_seed", replace_if=replace_if,
+            )
+            if objective == text and source == "autonomous_seed":
                 self._engagement_objective_text = text
                 self._engagement_objective_source = "autonomous_seed"
             self._autonomous_objective_persisted = True
@@ -7774,26 +7797,25 @@ class MythicTools:
         return text
 
     def _refresh_engagement_objective_from_ledger(self) -> str:
-        """Return the human/operator objective from the active ledger, if one exists.
+        """Return the human/operator objective from the operation's compatibility setting, if one exists.
 
-        The operator-facing `state objective ...` command edits the same durable ledger while Sage may
-        already be running. Refreshing here prevents later write-throughs from replacing that objective with
-        the fallback `sage-engagement:<task>` identifier.
+        `/state objective ...` updates that setting while Sage may already be running; reading it fresh here
+        keeps a running session on the operator's current objective. Temporary bridge until channel goals.
         """
         try:
-            path = self._engagement_ledger_path()
-            if os.path.exists(path):
-                with open(path, "r", encoding="utf-8") as fh:
-                    payload = json.load(fh)
-                if isinstance(payload, dict):
-                    objective = self._human_engagement_objective(payload.get("objective"))
-                    if objective:
-                        self._engagement_objective_text = objective
-                        # INVARIANT: the source mirror is set only alongside a non-empty objective, and the
-                        # only consumer (the supersede check in _engagement_objective) is itself gated behind a
-                        # non-empty objective — so a stale mirror is never read. Preserve that gating if you
-                        # add a new consumer, else this becomes a live stale-read window.
-                        self._engagement_objective_source = str(payload.get("objective_source") or "")
+            binding = getattr(self, "_ledger_binding", None)
+            if binding is None:
+                self._bind_explicit_namespace()
+                binding = getattr(self, "_ledger_binding", None)
+            if binding is not None:
+                settings = self._ledger_store().legacy_settings(binding)
+                objective = self._human_engagement_objective(settings.get("objective"))
+                if objective:
+                    self._engagement_objective_text = objective
+                    # INVARIANT: the source mirror is set only alongside a non-empty objective, and the
+                    # only consumer (the supersede check in _engagement_objective) is itself gated behind a
+                    # non-empty objective — so a stale mirror is never read.
+                    self._engagement_objective_source = str(settings.get("objective_source") or "")
         except Exception:
             pass
         return self._engagement_objective_text
@@ -7983,11 +8005,12 @@ class MythicTools:
             if not footholds:
                 footholds = list(await access_reconciler.reconcile_access(self, now) or [])
                 self._engagement_footholds = list(footholds)
+            view = self._ledger_view()
             state = engagement_state.EngagementState(
                 objective=str(prompt or ""),
                 footholds=footholds,
-                hops=list(self._engagement_hops),
-                graph_facts=list(getattr(self, "_engagement_graph_facts", []) or []),
+                hops=list(view.hops),
+                graph_facts=list(view.graph_facts),
                 engagement_id=self._eng_key(),
                 runtime_scope=True,
             )
@@ -8002,9 +8025,13 @@ class MythicTools:
             )
             return [getattr(fact, "predicate", "") for fact in facts or []]
 
+        try:
+            current_facts = list(self._ledger_view().graph_facts)
+        except _esl.LedgerUnavailable:
+            current_facts = []  # advisory consult only; no ledger-dependent decision is made here
         trust_domains = [
             str(getattr(fact, "predicate", "")).split(":", 1)[1]
-            for fact in getattr(self, "_engagement_graph_facts", []) or []
+            for fact in current_facts
             if str(getattr(fact, "predicate", "")).startswith("trust-reachable:")
         ]
         return await knowledge_sources.consult_attack_graph(
@@ -8058,11 +8085,12 @@ class MythicTools:
                 except Exception:
                     footholds = []
 
+            view = self._ledger_view()
             state = engagement_state.EngagementState(
                 objective=self._engagement_objective(),
                 footholds=footholds,
-                hops=list(self._engagement_hops),
-                graph_facts=list(getattr(self, "_engagement_graph_facts", []) or []),
+                hops=list(view.hops),
+                graph_facts=list(view.graph_facts),
                 engagement_id=self._eng_key(),
                 runtime_scope=True,
             )
@@ -8079,11 +8107,12 @@ class MythicTools:
             # A new DA/kerberos-context can unlock DCSync over a domain after the last graph refresh; in that
             # case we must query again immediately so BloodHound can surface useful real-user targets.
             missing_domain_targets = _graph_facts_missing_credential_domains(
-                getattr(self, "_engagement_graph_facts", []) or [],
+                list(view.graph_facts),
                 credential_domains,
             )
-            if not force and self._engagement_graph_facts and self._engagement_graph_facts_ts and not missing_domain_targets:
-                last = engagement_state._parse_iso(self._engagement_graph_facts_ts)
+            facts_updated = view.snapshot.graph_facts_updated
+            if not force and view.graph_facts and facts_updated and not missing_domain_targets:
+                last = engagement_state._parse_iso(facts_updated)
                 cur = engagement_state._parse_iso(now)
                 if last is not None and cur is not None:
                     if (cur - last).total_seconds() < self._GRAPH_FACTS_REFRESH_INTERVAL_SECONDS:
@@ -8148,12 +8177,9 @@ class MythicTools:
             # Non-clobbering: a pending/empty reconcile (graph not ingested yet) must NOT wipe good facts
             # from a prior refresh. Only overwrite when this reconcile actually returned edges.
             if reconciled_facts:
-                self._engagement_graph_facts = facts
-                self._engagement_graph_facts_ts = now
-                try:
-                    self._persist_engagement_ledger()
-                except Exception:
-                    pass
+                # Each fact updates only its own identity; facts this refresh did not observe stay stored and
+                # stop being current. A partial (probe) addition or an empty result removes nothing.
+                self._ledger_commit_facts(facts, complete=True, refreshed_at=now)
 
             # Pathfinding-first: when BloodHound has data AND the objective is a path-shaped ask,
             # ask the graph ONCE per objective whether a path exists from the controlled principals to
@@ -8176,22 +8202,21 @@ class MythicTools:
                         if probe_facts:
                             existing = {
                                 getattr(fact, "predicate", "")
-                                for fact in self._engagement_graph_facts
+                                for fact in self._ledger_view().graph_facts
                             }
-                            for fact in probe_facts:
-                                if getattr(fact, "predicate", "") not in existing:
-                                    self._engagement_graph_facts.append(fact)
-                            try:
-                                self._persist_engagement_ledger()
-                            except Exception:
-                                pass
+                            additions = [
+                                fact for fact in probe_facts if getattr(fact, "predicate", "") not in existing
+                            ]
+                            if additions:
+                                self._ledger_commit_facts(additions, complete=False, refreshed_at=now)
             except Exception as probe_exc:
                 logger.info(f"🧭 [graph-facts] path probe skipped (fail-open): {probe_exc}")
 
+            current_facts = self._ledger_view().graph_facts
             logger.info(
                 f"🧭 [graph-facts] refresh: principals={len(principals)} new_facts={len(facts)} "
-                f"cached={len(self._engagement_graph_facts)} "
-                f"preds={[getattr(f, 'predicate', '') for f in self._engagement_graph_facts][:6]}"
+                f"current={len(current_facts)} "
+                f"preds={[getattr(f, 'predicate', '') for f in current_facts][:6]}"
             )
         except Exception as exc:
             logger.info(f"🧭 [graph-facts] refresh error (fail-open): {exc}")
@@ -8578,9 +8603,10 @@ class MythicTools:
             )
             if fh is None:
                 return
+            view = self._ledger_view()
             state = engagement_state.EngagementState(
-                objective=self._engagement_objective(), footholds=footholds, hops=list(self._engagement_hops),
-                engagement_id=self._eng_key(), runtime_scope=True,
+                objective=self._engagement_objective(), footholds=footholds, hops=list(view.hops),
+                graph_facts=list(view.graph_facts), engagement_id=self._eng_key(), runtime_scope=True,
             )
             collection_key = engagement_state.collection_target_key(state, fh, collection_scope_domain)
             if not collection_key:
@@ -8614,13 +8640,9 @@ class MythicTools:
                 require_admissible_proof=True,
                 engagement_id=self._eng_key(),
             )
-            self._engagement_hops = updated.hops
-            try:
-                self._persist_engagement_ledger()
-            except Exception:
-                pass
-        except Exception:
-            pass
+            self._ledger_commit_hops(state.hops, updated.hops, what="collection result")
+        except Exception as exc:
+            logger.debug(f"collection ledger record skipped: {exc}")
 
     def _runtime_task_proof_envelope(
         self,
@@ -9432,7 +9454,7 @@ class MythicTools:
             state = engagement_state.EngagementState(
                 objective=self._engagement_objective(),
                 footholds=[],
-                hops=list(self._engagement_hops),
+                hops=list(self._ledger_view().hops),
                 engagement_id=self._eng_key(),
                 runtime_scope=True,
             )
@@ -9520,12 +9542,12 @@ class MythicTools:
                     require_admissible_proof=True,
                     engagement_id=self._eng_key(),
                 )
-            self._engagement_hops = updated.hops
-            # Write-through to the durable per-engagement ledger so the hop survives runs/restarts.
-            try:
-                self._persist_engagement_ledger()
-            except Exception:
-                pass  # fail-open: persistence must never break the issue path
+            # Persist only the produced row(s). A failed write is reported as unrecorded and never repeats
+            # the target action.
+            self._ledger_commit_hops(state.hops, updated.hops, what=f"{technique} {target_key}")
+        except _esl.LedgerUnavailable as exc:
+            # No snapshot means no basis for a verdict: report unrecorded, never fabricate an empty ledger.
+            self._ledger_unrecorded(f"{pending[0]} {pending[1]}" if pending else "hop result", exc)
         finally:
             self._pending_engagement_hop = None
 
@@ -9616,13 +9638,14 @@ class MythicTools:
         except ImportError:
             import engagement_state
         targets = {f"{p}{domain}" for p in ("da:", "ea:", "ds-replication-rights:")}
-        now = datetime.now(timezone.utc).isoformat()
-        state = engagement_state.EngagementState(
-            objective=self._engagement_objective(), footholds=[], hops=list(self._engagement_hops),
-            engagement_id=self._eng_key(), runtime_scope=True,
-        )
+        try:
+            hops = list(self._ledger_view().hops)
+        except _esl.LedgerUnavailable as exc:
+            self._ledger_unrecorded("contradiction marker", exc)
+            return
+        identities: list[str] = []
         downgraded: list[str] = []
-        for hop in list(self._engagement_hops):
+        for hop in hops:
             if self._capability_text(getattr(hop, "status", "")).casefold() != "achieved":
                 continue
             ev_existing = getattr(hop, "evidence", {}) or {}
@@ -9632,32 +9655,32 @@ class MythicTools:
             effects.update(self._capability_text(e).casefold() for e in (getattr(hop, "satisfied_effects", []) or []))
             if not (effects & targets):
                 continue
-            evidence = {
-                "source": "contradiction-downgrade",
-                "provenance": "run",
-                "contradicted_by_command": self._capability_text(command),
-                "contradicted_by_task": getattr(self, "_last_issued_task_display_id", None),
-                "refutation": f"replication ACCESS_DENIED (0x2105/8453) on {domain}: the actor lacks DS-Replication rights",
-                "note": "this effect could not produce the dependent action; re-verify it, or fix the Kerberos "
-                        "execution context if you hold a valid DA ticket. Do NOT blindly retry the dcsync.",
-            }
-            state = engagement_state.record_effect_result(
-                state, getattr(hop, "technique", ""), getattr(hop, "target", ""),
-                self._capability_text(getattr(hop, "effect", "")), "failed", evidence, now,
-                preconditions=list(getattr(hop, "preconditions", []) or []),
-                satisfied_effects=list(getattr(hop, "satisfied_effects", []) or []),
-            )
+            identities.append(_esl.hop_identity(getattr(hop, "technique", ""), getattr(hop, "target", "")))
             downgraded.append(self._capability_text(getattr(hop, "effect", "")))
-        if downgraded:
-            self._engagement_hops = state.hops
-            try:
-                self._persist_engagement_ledger()
-            except Exception:
-                pass
-            logger.warning(
-                f"🔻 [contradiction-downgrade] {command} returned replication ACCESS_DENIED for {domain} — "
-                f"downgraded {downgraded} achieved->failed (false premise reopened, not a retry)."
+        if not identities:
+            return
+        # Historical achievement stays; the contradiction is an automatic "no longer holds" marker with its
+        # evidence, so capabilities stop relying on the row until a later proof re-establishes the effect.
+        evidence = {
+            "source": "contradiction-downgrade",
+            "contradicted_by_command": self._capability_text(command),
+            "contradicted_by_task": getattr(self, "_last_issued_task_display_id", None),
+            "refutation": f"replication ACCESS_DENIED (0x2105/8453) on {domain}: the actor lacks DS-Replication rights",
+        }
+        try:
+            self._ledger_store().mark_no_longer_holds(
+                self._require_ledger_binding(), identities,
+                reason=(f"replication ACCESS_DENIED on {domain}: re-verify the effect or fix the Kerberos execution "
+                        "context; do not blindly retry the dcsync"),
+                evidence=evidence,
             )
+        except Exception as exc:
+            self._ledger_unrecorded("contradiction marker", exc)
+            return
+        logger.warning(
+            f"🔻 [contradiction-downgrade] {command} returned replication ACCESS_DENIED for {domain} — "
+            f"marked {downgraded} no longer holding (false premise reopened, not a retry)."
+        )
 
     def _assembly_name_from_params(self, parameters) -> str:
         """The by-name assembly reference (e.g. 'SharpGPOAbuse.exe') from execute_assembly params, or '' when
@@ -10259,11 +10282,12 @@ class MythicTools:
                 import capabilities
                 import engagement_state
             now = now or datetime.now(timezone.utc).isoformat()
+            view = self._ledger_view()
             state = engagement_state.EngagementState(
                 objective=self._engagement_objective(),
                 footholds=list(getattr(self, "_engagement_footholds", []) or []),
-                hops=list(getattr(self, "_engagement_hops", []) or []),
-                graph_facts=list(getattr(self, "_engagement_graph_facts", []) or []),
+                hops=list(view.hops),
+                graph_facts=list(view.graph_facts),
                 engagement_id=self._eng_key(),
                 runtime_scope=True,
             )
@@ -10369,11 +10393,14 @@ class MythicTools:
                 evidence=evidence,
                 proof_envelope=proof_envelope,
             )
-            self._engagement_hops = updated.hops
-            try:
-                self._persist_engagement_ledger()
-            except Exception:
-                pass
+            if not self._ledger_commit_hops(state.hops, updated.hops, what=f"capability {action_name}"):
+                # A verifier verdict must not conceal that the result was not recorded.
+                return capabilities.CapabilityVerification(
+                    "failed",
+                    f"verifier verdict {verification.verdict!r} could not be recorded in the engagement ledger: "
+                    f"{self._ledger_last_write_error}",
+                    dict(getattr(verification, "evidence", {}) or {}, ledger_unrecorded=True),
+                )
             return verification
         except Exception as exc:
             try:
@@ -11460,9 +11487,14 @@ class MythicTools:
         # The executor report reads `issued` and `recorded_effects`; report what this collection actually did.
         result.setdefault("issued", issued_tasks)
         if "recorded_effects" not in result:
+            try:
+                hops_after = list(self._ledger_view().hops)
+            except _esl.LedgerUnavailable as exc:
+                hops_after = []
+                result["ledger_unavailable"] = f"collection effects could not be read back: {exc}"
             result["recorded_effects"] = [
                 str(getattr(hop, "effect", ""))
-                for hop in (getattr(self, "_engagement_hops", []) or [])
+                for hop in hops_after
                 if str(getattr(hop, "technique", "")).casefold() == COLLECTION_CAPABILITY
                 and str(getattr(hop, "status", "")).casefold() == "achieved"
                 and getattr(hop, "effect", "")
@@ -12432,7 +12464,7 @@ class MythicTools:
                 }, sort_keys=True)
 
             await self._ensure_engagement_key()
-            ledger = engagement_ledger.load_runtime(self._eng_key())
+            ledger = self._ledger_runtime_dict()
             artifact_dir = Path(_engagement_state_dir()) / "artifacts"
             ca_password = self._capability_text(
                 input_values.get("ca_pfx_password")
@@ -16171,8 +16203,10 @@ class MythicTools:
                 or target_fields.get("guid")
                 or target_fields.get("gpo_object_guid")
             ).strip().strip("{}").casefold()
+            # One fresh snapshot for this input resolution.
+            graph_facts_now = list(self._ledger_view().graph_facts)
             if gpo_guid_input and (not gpo or gpo.strip().strip("{}") == gpo_guid_input):
-                for graph_fact in list(getattr(self, "_engagement_graph_facts", []) or []):
+                for graph_fact in graph_facts_now:
                     predicate = self._capability_text(getattr(graph_fact, "predicate", "")).casefold()
                     if not predicate.startswith("gpo-guid:"):
                         continue
@@ -16188,7 +16222,7 @@ class MythicTools:
                 inputs["domain"] = domain
             if not self._capability_text(inputs.get("gpo_guid") or inputs.get("guid") or inputs.get("gpo_object_guid")) and gpo:
                 prefix = f"gpo-guid:{gpo}:"
-                for graph_fact in list(getattr(self, "_engagement_graph_facts", []) or []):
+                for graph_fact in graph_facts_now:
                     predicate = self._capability_text(getattr(graph_fact, "predicate", "")).casefold()
                     if predicate.startswith(prefix):
                         guid = predicate[len(prefix):].strip()
@@ -16198,7 +16232,7 @@ class MythicTools:
             if not inputs.get("affected_hosts") and gpo and domain:
                 prefix = f"gpo-affects-computer:{gpo}:"
                 hosts = []
-                for graph_fact in list(getattr(self, "_engagement_graph_facts", []) or []):
+                for graph_fact in graph_facts_now:
                     predicate = self._capability_text(getattr(graph_fact, "predicate", "")).casefold()
                     if not predicate.startswith(prefix):
                         continue
@@ -16215,7 +16249,7 @@ class MythicTools:
             if not inputs.get("affected_dc_hosts") and gpo and domain:
                 prefix = f"gpo-affects-dc:{gpo}:"
                 hosts = []
-                for graph_fact in list(getattr(self, "_engagement_graph_facts", []) or []):
+                for graph_fact in graph_facts_now:
                     predicate = self._capability_text(getattr(graph_fact, "predicate", "")).casefold()
                     if not predicate.startswith(prefix):
                         continue
@@ -18752,203 +18786,278 @@ class MythicTools:
                 return h
         return None
 
+    # ── Engagement State Ledger: binding, fresh views and row mutations ─────────────────────
+    # The ESL lives in sage.db (engagement_store) and is shared by every session of an operation. A session
+    # never holds the authoritative ledger: each ledger-dependent calculation reads a fresh snapshot, and each
+    # producer writes only the rows it produced. A database error is never an empty ledger.
+
+    def _explicit_engagement_namespace(self) -> str:
+        """An explicit isolated namespace (SAGE_ENGAGEMENT_ID) applies only without a native-chat operation."""
+        namespace = str(SAGE_ENGAGEMENT_ID or "").strip()
+        if not namespace or namespace == "default":
+            return ""
+        if self._positive_operation_id() is not None:
+            return ""
+        return namespace
+
+    def _positive_operation_id(self) -> int | None:
+        value = getattr(self, "operation_id", None)
+        if isinstance(value, bool):
+            return None
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return None
+        return number if number > 0 else None
+
+    def _ledger_store(self):
+        try:
+            from . import engagement_store
+        except ImportError:
+            import engagement_store
+        store = getattr(self, "_esl_store", None)
+        if store is None:
+            store = engagement_store.EngagementStore()
+            self._esl_store = store
+        return store
+
     def _eng_key(self) -> str:
-        """The active durable-ledger key: the operation-resolved key once known, else the explicit
-        SAGE_ENGAGEMENT_ID (env/test override or 'default').
-        """
-        return self._engagement_key or SAGE_ENGAGEMENT_ID
+        """The bound operation's canonical engagement key (used in proof envelopes), or "" when unbound."""
+        binding = getattr(self, "_ledger_binding", None)
+        if binding is not None:
+            return binding.engagement_key
+        return self._explicit_engagement_namespace()
+
+    def _bind_explicit_namespace(self) -> None:
+        namespace = self._explicit_engagement_namespace()
+        if not namespace or getattr(self, "_ledger_binding", None) is not None:
+            return
+        try:
+            self._ledger_binding = self._ledger_store().bind_namespace(namespace)
+            self._engagement_key = self._ledger_binding.engagement_key
+            self._ledger_binding_error = ""
+        except Exception as exc:
+            self._ledger_binding_error = f"engagement ledger unavailable: {exc}"
+            logger.warning(f"🗃️ [engagement-state] {self._ledger_binding_error}")
 
     async def _ensure_engagement_key(self) -> None:
-        """Resolve the durable-ledger key from the current Mythic operation the first time it's needed,
-        then reload the ledger under that key. No-op if already resolved, if SAGE_ENGAGEMENT_ID is an
-        explicit override (!= 'default'), or if resolution fails (keeps the 'default' key). The
-        resolve+reload is serialized under a lock so concurrent gate calls can't double-reload. Fail-open.
+        """Bind this session's ledger to its explicit Mythic operation (numeric id + reset marker).
+
+        Native-chat sessions bind from their own ``operation_id``; never from a process-global key, another
+        operation's newest callback, or the first of several visible operations. An explicit SAGE_ENGAGEMENT_ID
+        namespace binds only isolated offline/evaluation sessions that have no operation. Anything absent,
+        ambiguous or unreadable leaves the ledger explicitly unavailable; nothing falls back to ``default``.
         """
-        if self._engagement_key is not None:
+        if getattr(self, "_ledger_binding", None) is not None:
             return
-        if SAGE_ENGAGEMENT_ID and SAGE_ENGAGEMENT_ID != "default":
-            self._engagement_key = SAGE_ENGAGEMENT_ID   # explicit override wins; pin it, never query
-            try:
-                self._load_engagement_ledger(replace=True)
-            except Exception:
-                pass
+        if self._explicit_engagement_namespace():
+            self._bind_explicit_namespace()
             return
         async with self._engagement_key_lock:
-            if self._engagement_key is not None:        # another coroutine resolved while we waited
+            if getattr(self, "_ledger_binding", None) is not None:
+                return
+            op_id = self._positive_operation_id()
+            if op_id is None:
+                self._ledger_binding_error = "engagement ledger unavailable: this session has no Mythic operation id"
                 return
             try:
                 try:
                     from . import operation_context
                 except ImportError:
                     import operation_context
-                key = await operation_context.resolve_operation_key(self.client)
-            except Exception:
-                key = None
-            if key:
-                self._engagement_key = key
-                # Reload under the operation key before any planner/gate decision uses durable state.
-                try:
-                    self._load_engagement_ledger(replace=True)
-                except Exception:
-                    pass
-                self._notice_legacy_ledgers()
-
-    _legacy_notice_done = False
-
-    def _notice_legacy_ledgers(self) -> None:
-        """One-time INFO if pre-rename `engagement_*.json` ledgers are present but unused — the clean break
-        makes them invisible to `list_engagements`, so surface that they exist rather than letting it look
-        like data vanished. Best-effort; never raises.
-        """
-        if MythicTools._legacy_notice_done:
-            return
-        try:
-            directory = _engagement_state_dir()
-            legacy = [n for n in os.listdir(directory) if n.startswith("engagement_") and n.endswith(".json")]
-            if legacy:
-                MythicTools._legacy_notice_done = True
-                logger.info(
-                    f"🗃️ [engagement-state] {len(legacy)} legacy engagement_*.json ledger(s) present but NOT "
-                    f"loaded (clean break to state_<operation>_<id>.json): {legacy[:5]} in {directory}. They are "
-                    f"untouched; set SAGE_ENGAGEMENT_ID=<name> to force a specific ledger key if you need one."
+                resolved = await operation_context.resolve_operation_by_id(self.client, op_id)
+                marker = await operation_context.get_or_create_engagement_uuid(self.client, op_id) if resolved else None
+            except Exception as exc:
+                resolved, marker = None, None
+                logger.debug(f"engagement operation resolution failed: {exc}")
+            if not resolved or not marker:
+                self._ledger_binding_error = (
+                    f"engagement ledger unavailable: Mythic operation {op_id} or its engagement marker could not be read"
                 )
-        except Exception:
-            pass
-
-    def _engagement_ledger_path(self) -> str:
-        """Path to this engagement's durable JSON hop ledger (keyed per Mythic operation, not per-solve)."""
-        return _engagement_ledger_file(self._eng_key())
-
-    def _load_engagement_ledger(self, *, replace: bool = False) -> None:
-        """Load the durable hop ledger from disk into self._engagement_hops. Fail-open: any error
-        (missing file, bad JSON, unreadable) leaves the in-memory ledger untouched. NO LLM inference.
-        """
-        path = self._engagement_ledger_path()
-        if not os.path.exists(path):
-            if replace:
-                self._engagement_hops = []
-            return
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                payload = json.load(fh)
-        except Exception:
-            return
-        if isinstance(payload, dict):
-            objective = self._human_engagement_objective(payload.get("objective"))
-            if objective:
-                self._engagement_objective_text = objective
-                self._engagement_objective_source = str(payload.get("objective_source") or "")
-        items = payload.get("hops") if isinstance(payload, dict) else payload
-        try:
-            from . import engagement_state
-        except ImportError:
-            import engagement_state
-        try:
+                return
+            _, op_name = resolved
+            proposed = f"{operation_context.operation_key(op_name, op_id)}_{marker}"
             try:
-                from . import engagement_ledger
-            except ImportError:
-                import engagement_ledger
-            if isinstance(payload, dict):
-                engagement_ledger._quarantine_unproven_achievements(payload, self._eng_key())
-        except Exception:
-            pass
-        loaded = engagement_state.hops_from_dicts(items)
-        graph_facts = (
-            engagement_state.graph_facts_from_dicts(payload.get("graph_facts"))
-            if isinstance(payload, dict) else []
-        )
-        for graph_fact in reversed(graph_facts):
-            proof = getattr(graph_fact, "proof_envelope", {}) or {}
-            if isinstance(proof, dict) and proof:
-                self._last_bloodhound_ingest_proof_envelope = dict(proof)
-                break
-        # Tag every loaded hop with 'durable' provenance: the gate will NOT silently hard-SKIP a durable
-        # hop unless live footholds corroborate it (run-provenance hops keep the trustworthy hard-SKIP).
-        for _h in loaded:
+                binding = self._ledger_store().bind_operation(
+                    mythic_operation_id=op_id, marker_uuid=marker, display_name=op_name, proposed_key=proposed,
+                )
+            except Exception as exc:
+                self._ledger_binding_error = f"engagement ledger unavailable: {exc}"
+                logger.warning(f"🗃️ [engagement-state] {self._ledger_binding_error}")
+                return
+            self._ledger_binding = binding
+            self._engagement_key = binding.engagement_key
+            self._ledger_binding_error = ""
             try:
-                if isinstance(getattr(_h, "evidence", None), dict):
-                    _h.evidence["provenance"] = "durable"
-                else:
-                    _h.evidence = {"provenance": "durable"}
+                facts = self._ledger_view().graph_facts
+                for graph_fact in reversed(facts):
+                    proof = getattr(graph_fact, "proof_envelope", {}) or {}
+                    if isinstance(proof, dict) and proof:
+                        self._last_bloodhound_ingest_proof_envelope = dict(proof)
+                        break
             except Exception:
                 pass
-        # Expire stale beliefs by TTL (cheap first line against a post-redeploy stale ledger).
-        ttl = _engagement_hop_ttl_hours()
-        _dropped = 0
-        if ttl > 0:
-            from datetime import datetime, timezone
-            loaded, _dropped = engagement_state.filter_hops_by_ttl(
-                loaded, datetime.now(timezone.utc).isoformat(), ttl
-            )
-        if loaded or replace:
-            self._engagement_hops = loaded
-            if graph_facts or replace:
-                self._engagement_graph_facts = graph_facts
-                self._engagement_graph_facts_ts = (
-                    payload.get("graph_facts_updated") or payload.get("updated")
-                    if isinstance(payload, dict) else None
-                )
-            # Make durable resume LOUD, not silent: a loaded "achieved" hop is a BELIEF, not verified
-            # live, so the operator must SEE what was resumed (and from when). Durable hops are
-            # corroborated by live footholds before any hard-SKIP, and shown as "(durable, unverified)"
-            # in the per-turn state when not corroborated. Use a fresh SAGE_ENGAGEMENT_ID per engagement.
-            _updated = payload.get("updated") if isinstance(payload, dict) else "?"
-            _achieved = sum(1 for h in loaded if getattr(h, "status", "") == "achieved")
-            _ttl_note = f" ttl={ttl}h dropped={_dropped}" if ttl > 0 else " ttl=disabled"
-            logger.info(
-                f"🗃️ [engagement-state] resumed {len(loaded)} hop(s) ({_achieved} achieved) from durable "
-                f"ledger key={self._eng_key()} updated={_updated}{_ttl_note} path={path} — durable beliefs "
-                f"are corroborated by live footholds before any SKIP (never silently). Fresh "
-                f"SAGE_ENGAGEMENT_ID after a lab redeploy."
-            )
 
-    def _persist_engagement_ledger(self) -> None:
-        """Atomically write the current hop ledger to the durable per-engagement JSON. Fail-open."""
+    def _require_ledger_binding(self):
+        binding = getattr(self, "_ledger_binding", None)
+        if binding is None:
+            self._bind_explicit_namespace()
+            binding = getattr(self, "_ledger_binding", None)
+        if binding is None:
+            try:
+                from . import engagement_store
+            except ImportError:
+                import engagement_store
+            raise engagement_store.LedgerUnavailable(
+                getattr(self, "_ledger_binding_error", "") or "engagement ledger not bound to an operation yet"
+            )
+        return binding
+
+    def _ledger_snapshot(self):
+        """One fresh operation snapshot (hops, facts, corrections, revision) from a single read transaction."""
+        return self._ledger_store().snapshot(self._require_ledger_binding())
+
+    def _ledger_view(self, snapshot=None):
+        """Runtime projection of a fresh snapshot for ONE calculation: eligible hops, corrected hops, facts.
+
+        Eligible hops passed proof admission (unproven achievements read as legacy_unverified) and carry no
+        effective retraction, "no longer holds" marker or applicable expiry. Rows this session did not produce
+        are tagged durable, so a refresh never manufactures current-run provenance.
+        """
         try:
             from . import engagement_state
         except ImportError:
             import engagement_state
-        path = self._engagement_ledger_path()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        payload = {
-            "engagement_id": self._eng_key(),
-            "objective": self._engagement_objective(),
-            # _engagement_objective() above refreshes/adopts and updates the source mirror; preserve it so a
-            # hop-persist never silently drops provenance (which would make an auto objective look operator-set).
-            "objective_source": getattr(self, "_engagement_objective_source", "") or None,
-            "updated": datetime.now(timezone.utc).isoformat(),
-            "hops": engagement_state.hops_to_dicts(self._engagement_hops),
-            "graph_facts": engagement_state.graph_facts_to_dicts(
-                getattr(self, "_engagement_graph_facts", []) or []
-            ),
-            "graph_facts_updated": getattr(self, "_engagement_graph_facts_ts", None),
+        snapshot = snapshot or self._ledger_snapshot()
+        eligible, ineligible = snapshot.runtime_hop_dicts(ttl_hours=_engagement_hop_ttl_hours())
+        own = getattr(self, "_ledger_own_rows", set())
+        for hop in eligible + ineligible:
+            identity = f"{str(hop.get('technique') or '').strip().casefold()}:{str(hop.get('target') or '').strip().casefold()}"
+            if (identity, int(hop.get("revision") or 0)) not in own:
+                evidence = dict(hop.get("evidence") if isinstance(hop.get("evidence"), dict) else {})
+                evidence["provenance"] = "durable"
+                hop["evidence"] = evidence
+        current_facts, _stale = snapshot.runtime_fact_dicts()
+        return _LedgerView(
+            snapshot=snapshot,
+            hops=engagement_state.hops_from_dicts(eligible),
+            corrected_hops=engagement_state.hops_from_dicts(ineligible),
+            graph_facts=engagement_state.graph_facts_from_dicts(current_facts),
+        )
+
+    @property
+    def _engagement_hops(self) -> list:
+        """Runtime-eligible hops from a FRESH operation snapshot (read-only; raises when unavailable)."""
+        return list(self._ledger_view().hops)
+
+    @property
+    def _engagement_graph_facts(self) -> list:
+        """Current graph facts from a FRESH operation snapshot (read-only; raises when unavailable)."""
+        return list(self._ledger_view().graph_facts)
+
+    @property
+    def _engagement_graph_facts_ts(self) -> str | None:
+        return self._ledger_snapshot().graph_facts_updated or None
+
+    def _ledger_runtime_dict(self) -> dict:
+        """Runtime-eligible rows as plain dicts, for consumers written against the ledger dict shape."""
+        view = self._ledger_view()
+        try:
+            from . import engagement_state
+        except ImportError:
+            import engagement_state
+        return {
+            "engagement_id": view.snapshot.engagement_key,
+            "hops": engagement_state.hops_to_dicts(view.hops),
+            "graph_facts": engagement_state.graph_facts_to_dicts(view.graph_facts),
         }
+
+    def _ledger_unrecorded(self, what: str, exc: Exception) -> None:
+        message = f"observed result could not be recorded in the engagement ledger ({what}): {exc}"
+        self._ledger_last_write_error = message
+        logger.warning(f"🗃️ [engagement-state] {message}")
+
+    def _ledger_commit_hops(self, before, after, *, what: str = "hop result") -> bool:
+        """Persist only the rows a reducer produced (``after`` vs ``before``) as one transaction.
+
+        Returns False when the write did not commit; the caller must not treat the result as recorded and must
+        not repeat a target action to repair local persistence.
+        """
         try:
-            try:
-                from . import engagement_ledger
-            except ImportError:
-                import engagement_ledger
-            engagement_ledger._quarantine_unproven_achievements(payload, self._eng_key())
-        except Exception:
-            pass
+            from . import engagement_store
+        except ImportError:
+            import engagement_store
+        mutations = engagement_store.hop_mutations(before, after)
+        if not mutations:
+            return True
         try:
-            # Hop dataclasses carry no display number; keep each hop's permanent number from the ledger
-            # as last written, and never reuse a number the operator or model may have referred to.
-            previous = None
-            try:
-                with open(path, "r", encoding="utf-8") as fh:
-                    previous = json.load(fh)
-            except (OSError, ValueError):
-                previous = None
-            engagement_ledger.assign_hop_numbers(
-                payload, previous=previous if isinstance(previous, dict) else None,
-            )
-        except Exception:
-            pass
-        tmp = f"{path}.{os.getpid()}.tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, default=str)
-        os.replace(tmp, path)  # atomic on POSIX — never leaves a half-written ledger
+            binding = self._require_ledger_binding()
+            result = self._ledger_store().apply(binding, mutations)
+        except Exception as exc:
+            self._ledger_unrecorded(what, exc)
+            return False
+        self._ledger_last_write_error = ""
+        own = getattr(self, "_ledger_own_rows", None)
+        if own is None:
+            own = self._ledger_own_rows = set()
+        own.update(result.row_revisions)
+        return True
+
+    def _ledger_commit_facts(self, facts, *, complete: bool, refreshed_at: str = "") -> bool:
+        """Persist refreshed graph facts by identity. A complete refresh defines the current generation."""
+        try:
+            from . import engagement_store
+        except ImportError:
+            import engagement_store
+        mutations = engagement_store.fact_mutations(facts)
+        try:
+            binding = self._require_ledger_binding()
+            for start in range(0, max(len(mutations), 1), engagement_store.MAX_BATCH):
+                self._ledger_store().apply(
+                    binding,
+                    mutations[start:start + engagement_store.MAX_BATCH],
+                    complete_graph_refresh=complete and start == 0,
+                    graph_refresh_time=refreshed_at,
+                )
+        except Exception as exc:
+            self._ledger_unrecorded("graph facts", exc)
+            return False
+        return True
+
+    async def _reconcile_ledger_from_task_history(
+        self, task_id: str = "", callback_id: str = "", limit: int = 25, *, apply: bool = False,
+    ) -> list[str]:
+        """Derive row changes from completed Mythic task history and apply them to the shared ledger.
+
+        The same path serves `/state reconcile` and the end-of-turn reconciliation. Only rows the evidence
+        changed are written; numbers, corrections and untouched rows stay as stored. Credential import stays
+        dry-run unless ``apply``.
+        """
+        try:
+            from . import state_reconcile
+        except ImportError:
+            import state_reconcile
+        await self._ensure_engagement_key()
+        view = self._ledger_view()
+        now = datetime.now(timezone.utc).isoformat()
+        mutations, notes = await state_reconcile.reconcile_task_history(
+            self.client, list(view.hops), task_id, callback_id, limit, now, apply=apply,
+            engagement_id=self._eng_key(), objective=self._engagement_objective(),
+        )
+        if not mutations:
+            return notes
+        try:
+            binding = self._require_ledger_binding()
+            for start in range(0, len(mutations), _esl.MAX_BATCH):
+                result = self._ledger_store().apply(binding, mutations[start:start + _esl.MAX_BATCH])
+                own = getattr(self, "_ledger_own_rows", None)
+                if own is None:
+                    own = self._ledger_own_rows = set()
+                own.update(result.row_revisions)
+        except Exception as exc:
+            self._ledger_unrecorded("task-history reconciliation", exc)
+            notes.append(f"- reconciled rows were NOT recorded: {exc}")
+        return notes
 
     @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def list_open_artifacts(self) -> str:
@@ -19145,8 +19254,14 @@ class MythicTools:
         if not lineage and not credentials:
             return summary  # nothing this process issued can be credited with anything
         now = datetime.now(timezone.utc).isoformat()
+        try:
+            initial_hops = list(self._ledger_view().hops)
+        except _esl.LedgerUnavailable as exc:
+            self._ledger_unrecorded("step ledger", exc)
+            summary["unrecorded"] = str(exc)
+            return summary
         state = engagement_state.EngagementState(
-            objective=self._engagement_objective(), footholds=[], hops=list(self._engagement_hops),
+            objective=self._engagement_objective(), footholds=[], hops=initial_hops,
             engagement_id=self._eng_key(), runtime_scope=True,
         )
         hops_before = len(state.hops)
@@ -19226,11 +19341,8 @@ class MythicTools:
                                             "status": status_of("credential-store", target)})
                 changed = True
         if changed:
-            self._engagement_hops = state.hops
-            try:
-                self._persist_engagement_ledger()
-            except Exception:
-                pass  # fail-open: persistence must never break the handback
+            if not self._ledger_commit_hops(initial_hops, state.hops, what="step ledger"):
+                summary["unrecorded"] = self._ledger_last_write_error
             logger.info(f"📒 [step ledger] {len(state.hops) - hops_before} new rows; recorded {summary['recorded']}")
         return summary
 

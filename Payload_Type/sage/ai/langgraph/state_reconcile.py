@@ -14,6 +14,7 @@ DRY-RUN by default — nothing is written to the Mythic credential store without
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 from datetime import datetime, timezone
 
@@ -285,29 +286,61 @@ async def _candidate_reconcile_tasks(client, task_id: str, callback_id: str, lim
     return sorted(out, key=lambda row: int(row.get("display_id") or row.get("id") or 0), reverse=True)[:limit]
 
 
-async def reconcile_task_history(client, data: dict, task_id: str, callback_id: str, limit: int, now: str, apply: bool = False) -> tuple[dict, list[str]]:
-    """Inspect completed Mythic task history, record any achieved modeled effects into the ledger, and
-    (dry-run by default) import discovered credential material. Returns (updated_ledger, notes).
+def _reconcile_mutation_id(engagement_id: str, display_id, identity: str, evidence: dict) -> str:
+    """Stable per (operation, task, row, verified result): replaying the same evidence is idempotent."""
+    proof = evidence.get("proof_envelope") if isinstance(evidence.get("proof_envelope"), dict) else {}
+    commitment = str(proof.get("verifier_result_sha256") or "")
+    if not commitment:
+        stable = {k: v for k, v in evidence.items() if k not in {"timestamp", "captured_at", "provenance"}}
+        commitment = hashlib.sha256(json.dumps(stable, sort_keys=True, default=str).encode()).hexdigest()
+    return hashlib.sha256(
+        f"reconcile|{engagement_id}|{display_id}|{identity}|{commitment}".encode()
+    ).hexdigest()
+
+
+async def reconcile_task_history(
+    client,
+    hops: list,
+    task_id: str,
+    callback_id: str,
+    limit: int,
+    now: str,
+    apply: bool = False,
+    *,
+    engagement_id: str,
+    objective: str = "",
+) -> tuple[list, list[str]]:
+    """Inspect completed Mythic task history and return (row mutations, notes).
+
+    ``hops`` is the caller's current runtime projection of the operation ledger. Only rows whose verified task
+    evidence produced a change become mutations; untouched rows are never write input, so their permanent
+    numbers, corrections and history stay exactly as stored. Credential material import stays dry-run unless
+    ``apply``. The caller applies the mutations through the shared store.
     """
     if _task_reconciler is None or _es is None:
-        return data, ["task reconciliation unavailable in this Sage build."]
+        return [], ["task reconciliation unavailable in this Sage build."]
+    try:
+        from ai.langgraph import engagement_store as _store
+    except ImportError:  # pragma: no cover - import-path fallback
+        from . import engagement_store as _store  # type: ignore
     tasks = await _candidate_reconcile_tasks(client, task_id, callback_id, limit)
     if not tasks:
-        return data, ["No candidate Mythic tasks found."]
+        return [], ["No candidate Mythic tasks found."]
     footholds = await _reconcile_state_footholds_from_client(client)
     foothold_by_callback = {
         str(getattr(foothold, "callback_id", "")): foothold
         for foothold in footholds
         if str(getattr(foothold, "callback_id", ""))
     }
-
+    initial = list(hops or [])
     state = _es.EngagementState(
-        objective=str(data.get("objective") or data.get("engagement_id") or ""),
-        hops=_es.hops_from_dicts(data.get("hops") or []),
-        engagement_id=str(data.get("engagement_id") or ""),
+        objective=str(objective or engagement_id or ""),
+        hops=list(initial),
+        engagement_id=str(engagement_id or ""),
         runtime_scope=True,
     )
     notes: list[str] = []
+    mutation_ids: dict[str, str] = {}
     imported = 0
     inspected = 0
     for task in tasks:
@@ -323,7 +356,7 @@ async def reconcile_task_history(client, data: dict, task_id: str, callback_id: 
             task_for_reconcile,
             output,
             now,
-            engagement_id=str(data.get("engagement_id") or ""),
+            engagement_id=str(engagement_id or ""),
         )
         if record is None:
             notes.append(
@@ -353,17 +386,22 @@ async def reconcile_task_history(client, data: dict, task_id: str, callback_id: 
             now,
             proof_envelope=evidence.get("proof_envelope") if isinstance(evidence.get("proof_envelope"), dict) else None,
             require_admissible_proof=True,
-            engagement_id=str(data.get("engagement_id") or ""),
+            engagement_id=str(engagement_id or ""),
         )
+        identity = _store.hop_identity(record.technique, record.target)
+        mutation_ids[identity] = _reconcile_mutation_id(str(engagement_id or ""), display_id, identity, evidence)
         after = {(hop.technique, hop.target, hop.status) for hop in state.hops}
         imported += 1
         action = "updated" if before == after else "imported"
-        notes.append(
-            f"- {action} task {display_id}: {record.technique} -> {record.target} "
-            f"({state.hops[-1].effect})"
-        )
+        effect = next((hop.effect for hop in state.hops if _store.hop_identity(hop.technique, hop.target) == identity), "")
+        notes.append(f"- {action} task {display_id}: {record.technique} -> {record.target} ({effect})")
 
-    data["hops"] = _es.hops_to_dicts(state.hops)
-    data["updated"] = now
+    mutations = [
+        _store.RowMutation(
+            kind=item.kind, identity=item.identity, payload=item.payload,
+            expected_revision=item.expected_revision, mutation_id=mutation_ids.get(item.identity, ""),
+        )
+        for item in _store.hop_mutations(initial, state.hops)
+    ]
     notes.insert(0, f"Reconciled {imported} achieved effect(s) from {inspected} inspected task(s).")
-    return data, notes
+    return mutations, notes

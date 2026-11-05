@@ -8,7 +8,6 @@ from mythic_container.ChatBase import ChatMessageContext, ChatSlashCommandInvoca
 from sage_chat.headless import HeadlessSageChat, build_chat_request
 import sage_chat.service as service
 import sage_chat.slash as slash
-from ai.langgraph import engagement_ledger
 
 
 class _NoModelChat(HeadlessSageChat):
@@ -47,14 +46,21 @@ def restarted_channel(monkeypatch):
 def test_read_only_state_on_restarted_channel_uses_exact_operation_ledger(
     monkeypatch, restarted_channel, argument, operation_id,
 ):
+    from ai.langgraph import mythic_tools
+
+    sessions = {}
+    for op in (7, 8):
+        key = f"Operation_{op}_retained"
+        monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", key)
+        tools = mythic_tools.MythicTools(agent_task_id="state")
+        tools._ledger_store().update_objective(tools._require_ledger_binding(), f"objective for {key}", "operator")
+        sessions[op] = tools
+
     async def resolve(_model, request):
         assert _model is None
-        return f"Operation_{request.OperationID}_retained"
+        return sessions[request.OperationID]
 
-    monkeypatch.setattr(slash, "_resolve_chat_engagement_id", resolve)
-    monkeypatch.setattr(engagement_ledger, "load_runtime", lambda engagement_id: {
-        "objective": f"objective for {engagement_id}", "hops": [],
-    })
+    monkeypatch.setattr(slash, "_resolve_chat_ledger", resolve)
     chat = _NoModelChat()
     asyncio.run(chat.chat(restarted_channel(name="state", argument=argument,
                                            operation_id=operation_id)))

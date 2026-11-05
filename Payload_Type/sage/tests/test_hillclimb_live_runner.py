@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "hillclimb")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph"))
 
 import engagement_ledger  # noqa: E402
+import evaluator_observations  # noqa: E402
 import effect_registry as er  # noqa: E402
 import live_runner as lr  # noqa: E402
 import gate_experiment as gx  # noqa: E402
@@ -141,7 +142,7 @@ def test_run_batch_capture_persists_ground_truth_probes_by_engagement_id(monkeyp
     runner.run_batch(lr.LiveConfig("prod"), scn, seeds=1)
 
     assert len(tokens) == 1
-    data = engagement_ledger.load(tokens[0])
+    data = {"ground_truth_probes": evaluator_observations.read_observations(tokens[0])}
     assert data["ground_truth_probes"]["DA_CHILD"]["disposition"] == "proven"
     assert data["ground_truth_probes"]["KRBTGT_DUMPED"]["disposition"] == "disproven"
     assert "FOOTHOLD" not in data["ground_truth_probes"]
@@ -162,7 +163,8 @@ def test_capture_persists_non_secret_verifier_cost_vector(monkeypatch, tmp_path)
         recorded_milestones={Milestone.GRAPH_COLLECTED},
         verifier_costs={Milestone.GRAPH_COLLECTED: cost},
     )
-    record = engagement_ledger.load("cost-vector")["ground_truth_probes"]["_verifier_costs"]
+    record = evaluator_observations.read_observations("cost-vector")["_verifier_costs"]
+    assert not Path(engagement_ledger.ledger_path("cost-vector")).exists()  # never the runtime ledger
     assert record["GRAPH_COLLECTED"]["monetary_cost_usd"] is None
     assert record["GRAPH_COLLECTED"]["monetary_cost_status"] == "unavailable"
 

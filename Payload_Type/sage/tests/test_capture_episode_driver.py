@@ -705,14 +705,27 @@ def test_configured_route_must_match_bound_generation(monkeypatch):
     assert route["SAGE_FINDINGS_SLACK_WEBHOOK_URL"] == "" \
         and route["SAGE_FINDINGS_SLACK_CHANNEL_ID"] == "" and route["SAGE_EVAL_TEMPERATURE"] == "0"
 
-def test_engagement_snapshot_allows_initial_absence_but_rejects_corrupt_final(tmp_path):
+def test_engagement_snapshot_allows_initial_absence_but_rejects_missing_or_unreadable_final(tmp_path):
+    from ai.langgraph import engagement_store
+
     assert driver._strict_engagement_snapshot(tmp_path,"engagement",allow_missing=True)=={
         "engagement_id":"engagement","hops":[],"graph_facts":[]}
-    path=tmp_path/"state_engagement.json";path.write_text('{"engagement_id":"engagement","hops":[]}')
-    with pytest.raises(driver.CaptureEpisodeError,match="invalid"):
+    with pytest.raises(driver.CaptureEpisodeError,match="unavailable"):
         driver._strict_engagement_snapshot(tmp_path,"engagement",allow_missing=False)
-    path.write_text(json.dumps({"engagement_id":"engagement","hops":[],"graph_facts":[]}))
-    assert driver._strict_engagement_snapshot(tmp_path,"engagement",allow_missing=False)["graph_facts"]==[]
+    # A legacy file in the isolated directory is not the ledger: only the isolated database counts.
+    (tmp_path/"state_engagement.json").write_text(json.dumps({"engagement_id":"engagement","hops":[],"graph_facts":[]}))
+    with pytest.raises(driver.CaptureEpisodeError,match="unavailable"):
+        driver._strict_engagement_snapshot(tmp_path,"engagement",allow_missing=False)
+    store=engagement_store.EngagementStore(tmp_path/"sage.db",legacy_dir=str(tmp_path/"none"))
+    binding=store.bind_namespace("engagement")
+    store.apply(binding,engagement_store.hop_mutations([],[{"technique":"dcsync","target":"lab.local","status":"pending"}]))
+    exported=driver._strict_engagement_snapshot(tmp_path,"engagement",allow_missing=False)
+    assert exported["graph_facts"]==[] and [hop["number"] for hop in exported["hops"]]==[1]
+    (tmp_path/"sage.db").write_bytes(b"not a database")
+    for suffix in ("-wal","-shm"):
+        (tmp_path/("sage.db"+suffix)).unlink(missing_ok=True)
+    with pytest.raises(driver.CaptureEpisodeError,match="unavailable"):
+        driver._strict_engagement_snapshot(tmp_path,"engagement",allow_missing=False)
 
 
 # --- the cleanup reads `ludus.py status` as that script prints it -----------------------------------------------

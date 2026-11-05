@@ -147,9 +147,11 @@ def test_footholds_are_never_persisted_so_corroboration_is_live_only(monkeypatch
     mt._engagement_footholds = [_foothold("winterfell", "system")]  # live cache — must NOT be persisted
     mt._pending_engagement_hop = ("gpo-abuse", "winterfell", "2026-06-07T00:00:00+00:00")
     _record_success(mt, "whoami\r\nnt authority\\system\r\n")
-    payload = json.loads(Path(mt._engagement_ledger_path()).read_text())
-    assert "footholds" not in payload
+    payload = mt._ledger_store().export(mt._require_ledger_binding())  # everything the shared store holds
+    assert payload["hops"] and "footholds" not in payload
     assert all("footholds" not in h for h in payload["hops"])
+    assert "winterfell" not in json.dumps(payload.get("history", [])) or all(
+        "footholds" not in json.dumps(event) for event in payload["history"])
     # A fresh load starts with NO footholds (live reconcile repopulates them at gate time).
     mt2 = mythic_tools.MythicTools(agent_task_id="r2")
     assert mt2._engagement_footholds == []

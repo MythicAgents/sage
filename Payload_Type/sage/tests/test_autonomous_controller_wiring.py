@@ -1291,6 +1291,9 @@ def test_controller_exact_approval_reaches_real_final_sink_with_card_bytes_uncha
     m._request_event_ledger = None
     m.state = {"messages": []}
     m.mythic_client = mt.MythicTools(agent_task_id=1)
+    # The controller re-reads the shared ledger after its graph refresh: the observed hop lives there.
+    from tests.esl_fixtures import seed_ledger
+    seed_ledger(m.mythic_client, hops=state.hops)
     m.install_request_contract(build_request_contract(
         request_id="request-final-sink",
         channel_id="channel-1",

@@ -15,6 +15,7 @@ every value is synthetic. Identifiers are generic (`lab.local`, `ca01`).
 """
 
 from __future__ import annotations
+from tests.esl_fixtures import seed_ledger  # noqa: E402
 
 import asyncio
 import base64
@@ -73,11 +74,11 @@ def _tools(monkeypatch, tmp_path):
 
 def _export_ca(mt, monkeypatch, tmp_path, *, ca_host="ca01", task_id=7401) -> bytes:
     """Prove a CA private-key export through the production executor and recorder; return the PFX bytes."""
-    mt._engagement_hops = [
+    seed_ledger(mt, hops=[
         *list(getattr(mt, "_engagement_hops", []) or []),
         _proof_hop(f"remote-exec:{ca_host}@lab.local", task_id - 100, callback_id="13"),
         _proof_hop(f"local-admin:{ca_host}@lab.local", task_id - 99, callback_id="13"),
-    ]
+    ])
 
     async def fake_select(target_host, target_domain, local_account):
         return {"id": 91, "account": local_account, "realm": f"{target_host}.{target_domain}",
@@ -177,14 +178,9 @@ def _tamper_artifact(mt):
     path.write_bytes(path.read_bytes() + b"\0")
 
 
-def _other_engagement(mt):
-    mt._engagement_key = "another-engagement"
-
-
 @pytest.mark.parametrize("break_it, check", [
     (_tamper_artifact, "sha-256"),
-    (_other_engagement, "engagement"),
-], ids=["wrong-hash", "wrong-engagement"])
+], ids=["wrong-hash"])
 def test_a_verified_artifact_failing_a_check_stops_before_the_forge(monkeypatch, tmp_path, break_it, check):
     mt = _tools(monkeypatch, tmp_path)
     _export_ca(mt, monkeypatch, tmp_path)
@@ -236,9 +232,30 @@ def test_another_cas_artifact_is_never_staged(monkeypatch, tmp_path):
     assert "adcs-ca-private-key:ca01@lab.local" in result["missing"]
 
 
+def test_an_export_proved_for_another_engagement_is_never_the_proved_input(monkeypatch, tmp_path):
+    mt = _tools(monkeypatch, tmp_path)
+    _export_ca(mt, monkeypatch, tmp_path)
+    exported = [h for h in mt._engagement_hops if str(h.effect).startswith("adcs-ca-private-key:")]
+    # The same row stored in another engagement's ledger (for example an imported historical row).
+    mt._ledger_binding = mt._ledger_store().bind_namespace("another-engagement")
+    mt._engagement_key = mt._ledger_binding.engagement_key
+    seed_ledger(mt, hops=exported, prove=False)
+    assert [h.status for h in mt._engagement_hops if str(h.effect).startswith("adcs-ca-private-key:")] == [
+        "legacy_unverified"]
+    staged = _stage_recorder(mt, monkeypatch)
+
+    result, _ = _cert_auth(mt, {"ca_pfx_password": CA_PASSWORD, "ca_pfx_path": GUESSED,
+                                "proof_host": "dc01.lab.local"})
+
+    # Nothing proved in THIS engagement is staged; the caller's path stays the explicit input it is.
+    assert staged["registered"] == [] and staged["uploads"] == []
+    [forge] = _forges(result)
+    assert f"forge --ca-cert {GUESSED} " in forge
+
+
 def test_an_unproved_explicit_path_stays_explicit_and_is_never_a_proved_export(monkeypatch, tmp_path):
     mt = _tools(monkeypatch, tmp_path)
-    mt._engagement_hops = []
+    seed_ledger(mt, hops=[])
     staged = _stage_recorder(mt, monkeypatch)
 
     result, _ = _cert_auth(mt, {"ca_pfx_password": CA_PASSWORD, "ca_pfx_path": GUESSED,
@@ -254,8 +271,8 @@ def test_an_unproved_explicit_path_stays_explicit_and_is_never_a_proved_export(m
 def test_a_proved_enrolled_certificate_is_not_overridden_by_a_caller_path(monkeypatch, tmp_path):
     mt = _tools(monkeypatch, tmp_path)
     _export_ca(mt, monkeypatch, tmp_path)
-    mt._engagement_hops.append(_proof_hop("adcs-enrolled-certificate:administrator@lab.local", 7700,
-                                          callback_id="13", target="enrolled"))
+    seed_ledger(mt, hops=[_proof_hop("adcs-enrolled-certificate:administrator@lab.local", 7700,
+                                     callback_id="13", target="enrolled")])
     staged = _stage_recorder(mt, monkeypatch)
 
     result, _ = _cert_auth(mt, {"ca_pfx_password": CA_PASSWORD, "ca_pfx_path": GUESSED,
@@ -389,7 +406,7 @@ def test_the_card_preview_plans_a_proved_ca_export_instead_of_blocking_the_card(
 
 def test_without_a_proved_export_certificate_auth_still_needs_an_explicit_input(monkeypatch, tmp_path):
     mt = _tools(monkeypatch, tmp_path)
-    mt._engagement_hops = []
+    seed_ledger(mt, hops=[])
 
     message, record = _ground(mt, {"proof_host": "dc01.lab.local"})
 
@@ -594,7 +611,7 @@ TYPED_KEY_IDS = ["key", "krbtgt_aes256", "secret", "credential_text", "credentia
 @pytest.mark.parametrize("inputs, action", TYPED_KEY_FORMS, ids=TYPED_KEY_IDS)
 def test_an_operator_asserted_krbtgt_key_never_reaches_a_forge(monkeypatch, tmp_path, inputs, action):
     mt, _ = _krbtgt_tools(monkeypatch, tmp_path)
-    mt._engagement_hops = []
+    seed_ledger(mt, hops=[])
 
     _assert_no_forge(mt, inputs, action)
 
@@ -615,7 +632,7 @@ def test_a_typed_key_beside_a_proved_one_is_neither_shown_nor_used(monkeypatch, 
 
 def test_a_historical_task_read_is_not_an_admitted_krbtgt(monkeypatch, tmp_path):
     mt, store = _krbtgt_tools(monkeypatch, tmp_path)
-    mt._engagement_hops = []
+    seed_ledger(mt, hops=[])
 
     store["task_outputs"][24] = DCSYNC_OK  # a task this request never issued, holding real-looking material
     read = asyncio.run(mt.get_all_task_output_by_task_id(24))
@@ -627,7 +644,7 @@ def test_a_historical_task_read_is_not_an_admitted_krbtgt(monkeypatch, tmp_path)
 
 def test_a_krbtgt_row_typed_into_the_credential_store_is_not_proof(monkeypatch, tmp_path):
     mt, store = _krbtgt_tools(monkeypatch, tmp_path)
-    mt._engagement_hops = []
+    seed_ledger(mt, hops=[])
     store["rows"].append({"id": 700, "account": "krbtgt", "realm": "lab.local", "type": "key",
                           "credential_text": "f" * 64, "comment": "entered by hand", "task": None})
 
@@ -636,7 +653,7 @@ def test_a_krbtgt_row_typed_into_the_credential_store_is_not_proof(monkeypatch, 
 
 def test_a_krbtgt_row_an_agent_reported_from_a_completed_task_is_proof(monkeypatch, tmp_path):
     mt, store = _krbtgt_tools(monkeypatch, tmp_path)
-    mt._engagement_hops = []
+    seed_ledger(mt, hops=[])
     store["rows"].append({"id": 701, "account": "krbtgt", "realm": "lab.local", "type": "key",
                           "credential_text": KRBTGT_KEY, "comment": "reported by the agent",
                           "task": {"display_id": 24, "status": "completed", "completed": True,
@@ -654,9 +671,9 @@ def test_a_krbtgt_row_an_agent_reported_from_a_completed_task_is_proof(monkeypat
 @pytest.mark.parametrize("predecessor", ["wrong-domain", "failed", "no-parsed-secret"])
 def test_an_unadmitted_predecessor_never_reaches_a_forge(monkeypatch, tmp_path, predecessor):
     mt, store = _krbtgt_tools(monkeypatch, tmp_path)
-    mt._engagement_hops = []
+    seed_ledger(mt, hops=[])
     if predecessor == "wrong-domain":
-        mt._engagement_hops = [_proof_hop("krbtgt-hash:other.local", 22, callback_id="13")]
+        seed_ledger(mt, hops=[_proof_hop("krbtgt-hash:other.local", 22, callback_id="13")])
     else:
         output = BAD_DN if predecessor == "failed" else "[DC] 'lab.local' will be the domain\n[DC] ms-DRSR connected"
         result, _ = _run_dcsync(mt, output, iter([22]))
@@ -780,7 +797,7 @@ def test_a_forge_for_its_source_domain_binds_that_domains_key_and_sid(monkeypatc
 ], ids=["source-domain-input", "action-target-domain"])
 def test_another_domains_key_never_forges_the_source_domain(monkeypatch, tmp_path, inputs, action):
     mt, store = _two_domain_tools(monkeypatch, tmp_path)
-    mt._engagement_hops = []
+    seed_ledger(mt, hops=[])
     _add_reported_krbtgt(store, row_id=701, realm="parent.local", key=PARENT_KEY, task_id=24)
 
     _assert_no_forge(mt, inputs, action)
@@ -832,7 +849,7 @@ def test_a_kerberos_context_whose_approved_key_is_gone_runs_no_other_plan(monkey
 
 def test_a_refused_forge_never_says_its_earlier_checks_did_not_run(monkeypatch, tmp_path):
     mt, _ = _krbtgt_tools(monkeypatch, tmp_path)
-    mt._engagement_hops = []
+    seed_ledger(mt, hops=[])
 
     result, calls = _forge_from(mt, {})
 

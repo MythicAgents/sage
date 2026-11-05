@@ -11,6 +11,7 @@ No live Mythic is required — MythicTools.__init__ does no network (login is se
 pure filesystem I/O against a tmp dir. Mirrors the repo's no-pytest-asyncio convention.
 """
 
+from tests.esl_fixtures import seed_ledger  # noqa: E402
 import asyncio
 import io
 import json
@@ -111,37 +112,47 @@ def test_to_dicts_skips_non_dataclass():
 # ---------------------------------------------------------------------------
 
 
+def _store():
+    import engagement_store
+    return engagement_store.EngagementStore()
+
+
+def _settings(namespace):
+    store = _store()
+    return store.legacy_settings(store.bind_namespace(namespace))
+
+
+def _set_objective(namespace, objective, source=""):
+    store = _store()
+    store.update_objective(store.bind_namespace(namespace), objective, source)
+
+
 def test_cross_run_resume(tmp_path, monkeypatch):
-    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "test-eng")
 
-    # First run: fresh ledger, record an achieved hop -> write-through to disk.
+    # First session records an achieved hop -> one row in the shared store.
     mt1 = mythic_tools.MythicTools(agent_task_id="solve-1")
     _arm_runtime_lineage(mt1)
-    assert mt1._engagement_hops == []  # nothing on disk yet
+    assert mt1._engagement_hops == []
     mt1._pending_engagement_hop = (
         "gpo-abuse", "winterfell.north.sevenkingdoms.local", "2026-06-07T00:00:00Z",
     )
     _record_success(mt1, "whoami\r\nnt authority\\system\r\n")
-    ledger = mt1._engagement_ledger_path()
-    assert Path(ledger).exists()
-    # File holds the hop under the per-engagement key.
-    payload = json.loads(Path(ledger).read_text())
-    assert payload["engagement_id"] == "test-eng"
-    assert any(h.get("technique") == "gpo-abuse" for h in payload["hops"])
+    rows = mt1._ledger_snapshot().display_hops()
+    assert mt1._ledger_snapshot().engagement_key == "test-eng"
+    assert [row["technique"] for row in rows] == ["gpo-abuse"] and rows[0]["number"] == 1
 
-    # Second run (a new solve == a new MythicTools): __init__ auto-loads the ledger.
+    # A second session (new solve) reads the same row; it was not produced by this session -> durable.
     mt2 = mythic_tools.MythicTools(agent_task_id="solve-2")
-    assert any(getattr(h, "technique", "") == "gpo-abuse" for h in mt2._engagement_hops)
-    assert any(getattr(h, "status", "") == "achieved" for h in mt2._engagement_hops)
+    hop = next(h for h in mt2._engagement_hops if h.technique == "gpo-abuse")
+    assert hop.status == "achieved" and hop.evidence["provenance"] == "durable"
 
 
 def test_cross_run_resume_restores_graph_facts(tmp_path, monkeypatch):
-    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "test-graph")
 
     mt1 = mythic_tools.MythicTools(agent_task_id="solve-1")
-    mt1._engagement_graph_facts = [
+    assert mt1._ledger_commit_facts([
         engagement_state.GraphFact(
             "generic-write:gpo:starkwallpaper",
             "bloodhound:cypher",
@@ -154,18 +165,14 @@ def test_cross_run_resume_restores_graph_facts(tmp_path, monkeypatch):
             "2026-06-07T00:00:00Z",
             600,
         ),
-    ]
-    mt1._engagement_graph_facts_ts = "2026-06-07T00:00:00Z"
-    mt1._persist_engagement_ledger()
-
-    payload = json.loads(Path(mt1._engagement_ledger_path()).read_text())
-    assert len(payload["graph_facts"]) == 2
+    ], complete=True, refreshed_at="2026-06-07T00:00:00Z")
 
     mt2 = mythic_tools.MythicTools(agent_task_id="solve-2")
     assert [fact.predicate for fact in mt2._engagement_graph_facts] == [
         "generic-write:gpo:starkwallpaper",
         "gpo-domain:starkwallpaper:north.sevenkingdoms.local",
     ]
+    assert mt2._engagement_graph_facts_ts == "2026-06-07T00:00:00Z"
 
     state = engagement_state.EngagementState(
         objective="obtain administrative control of essos.local",
@@ -191,71 +198,42 @@ def test_cross_run_resume_restores_graph_facts(tmp_path, monkeypatch):
     assert "NEXT GROUNDED ACTIONS" not in rendered
 
 
-def test_ledger_objective_is_preserved_across_runtime_persist(tmp_path, monkeypatch):
-    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
+def test_hop_writes_never_touch_the_objective_setting(tmp_path, monkeypatch):
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "objective-test")
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_OBJECTIVE", "")
-
-    path = Path(el.ledger_path("objective-test"))
-    path.write_text(json.dumps({
-        "engagement_id": "objective-test",
-        "objective": "obtain administrative control of essos.local",
-        "hops": [],
-    }))
+    _set_objective("objective-test", "obtain administrative control of essos.local")
 
     mt = mythic_tools.MythicTools(agent_task_id="solve-1")
     assert mt._engagement_objective() == "obtain administrative control of essos.local"
-
-    mt._persist_engagement_ledger()
-    payload = json.loads(path.read_text())
-    assert payload["objective"] == "obtain administrative control of essos.local"
+    _arm_runtime_lineage(mt)
+    mt._pending_engagement_hop = ("gpo-abuse", "winterfell.north.sevenkingdoms.local", "2026-06-07T00:00:00Z")
+    _record_success(mt, "whoami\r\nnt authority\\system\r\n")
+    assert _settings("objective-test")["objective"] == "obtain administrative control of essos.local"
+    assert "objective" not in mt._ledger_store().export(mt._require_ledger_binding())
 
 
 def test_running_objective_refreshes_when_state_command_updates_ledger(tmp_path, monkeypatch):
-    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "objective-refresh")
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_OBJECTIVE", "")
 
-    path = Path(el.ledger_path("objective-refresh"))
-    path.write_text(json.dumps({
-        "engagement_id": "objective-refresh",
-        "objective": "obtain administrative control of north.sevenkingdoms.local",
-        "hops": [],
-    }))
+    _set_objective("objective-refresh", "obtain administrative control of north.sevenkingdoms.local")
     mt = mythic_tools.MythicTools(agent_task_id="solve-1")
     assert mt._engagement_objective() == "obtain administrative control of north.sevenkingdoms.local"
 
-    path.write_text(json.dumps({
-        "engagement_id": "objective-refresh",
-        "objective": "obtain administrative control of essos.local",
-        "hops": [],
-    }))
+    _set_objective("objective-refresh", "obtain administrative control of essos.local", "operator")
     assert mt._engagement_objective() == "obtain administrative control of essos.local"
 
 
 def test_opaque_ledger_objective_is_not_treated_as_human_goal(tmp_path, monkeypatch):
-    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "objective-opaque")
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_OBJECTIVE", "")
-
-    path = Path(el.ledger_path("objective-opaque"))
-    path.write_text(json.dumps({
-        "engagement_id": "objective-opaque",
-        "objective": "sage-engagement:older-task",
-        "hops": [],
-    }))
+    _set_objective("objective-opaque", "sage-engagement:older-task")
 
     mt = mythic_tools.MythicTools(agent_task_id="solve-2")
     assert mt._engagement_objective() == "sage-engagement:solve-2"
 
 
-# ---------------------------------------------------------------------------
-# 3. Gate-OFF no-op on the load side
-# ---------------------------------------------------------------------------
-
-
-def test_fresh_instance_loads_durable_ledger_unconditionally(tmp_path, monkeypatch):
-    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
+def test_fresh_instance_reads_the_shared_ledger(tmp_path, monkeypatch):
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "test-eng2")
 
     seed = mythic_tools.MythicTools(agent_task_id="seed")
@@ -264,230 +242,192 @@ def test_fresh_instance_loads_durable_ledger_unconditionally(tmp_path, monkeypat
         "gpo-abuse", "winterfell.north.sevenkingdoms.local", "2026-06-07T00:00:00Z",
     )
     _record_success(seed, "whoami\r\nnt authority\\system\r\n")
-    assert Path(seed._engagement_ledger_path()).exists()
 
     fresh = mythic_tools.MythicTools(agent_task_id="fresh")
     assert any(getattr(h, "technique", "") == "gpo-abuse" for h in fresh._engagement_hops)
 
 
 # ---------------------------------------------------------------------------
-# Autonomous-solve objective adoption (generic completion-recognition fix).
-# An autonomous_solve prompt IS the mission, so it is adopted as the engagement
-# objective when none is set — otherwise the opaque sage-engagement:<task> fallback
-# makes COMPLETE-CANDIDATE unreachable and the solve over-reaches until the stall
-# detector halts it. Generic to any caller; never overrides operator/env objectives.
+# Autonomous-solve objective adoption through the temporary objective-settings bridge. Never overrides
+# operator/env/legacy objectives; writes only the separate settings table, never ledger rows.
 # ---------------------------------------------------------------------------
 
 _SEED = "escalate to Domain Admin of north.sevenkingdoms.local and DCSync its krbtgt account"
 
 
 def test_autonomous_seed_adopted_and_persisted(tmp_path, monkeypatch):
-    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "seed-adopt")
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_OBJECTIVE", "")
     mt = mythic_tools.MythicTools(agent_task_id="solve-1")
     mt._autonomous_objective_seed = _SEED
-    # Returned in-memory for the running solve, and persisted under the resolved key.
     assert mt._engagement_objective() == _SEED
-    assert el.load("seed-adopt")["objective"] == _SEED
-    # Survives a fresh instance / reload (durable, not memory-only).
+    assert _settings("seed-adopt") == {"objective": _SEED, "objective_source": "autonomous_seed"}
     fresh = mythic_tools.MythicTools(agent_task_id="solve-2")
     assert fresh._engagement_objective() == _SEED
 
 
 def test_autonomous_seed_never_overrides_operator_objective(tmp_path, monkeypatch):
-    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "seed-precedence")
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_OBJECTIVE", "")
-    data = el.load("seed-precedence")
-    data["objective"] = "obtain administrative control of essos.local"
-    el.save(data, "seed-precedence")
+    _set_objective("seed-precedence", "obtain administrative control of essos.local")
     mt = mythic_tools.MythicTools(agent_task_id="solve-1")
     mt._autonomous_objective_seed = _SEED
     assert mt._engagement_objective() == "obtain administrative control of essos.local"
-    # The operator objective on disk is untouched.
-    assert el.load("seed-precedence")["objective"] == "obtain administrative control of essos.local"
+    assert _settings("seed-precedence")["objective"] == "obtain administrative control of essos.local"
 
 
 def test_env_objective_wins_over_autonomous_seed(tmp_path, monkeypatch):
-    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "seed-env")
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_OBJECTIVE", "env mission: control example.local")
     mt = mythic_tools.MythicTools(agent_task_id="solve-1")
     mt._autonomous_objective_seed = _SEED
     assert mt._engagement_objective() == "env mission: control example.local"
-    # Env short-circuits before the seed branch — nothing is persisted.
-    assert not el.load("seed-env").get("objective")
+    assert not _settings("seed-env").get("objective")
 
 
-def test_autonomous_seed_not_orphaned_before_key_resolves(tmp_path, monkeypatch):
-    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
-    monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "default")   # unresolved transient key
+def test_autonomous_seed_not_persisted_before_the_ledger_binds(tmp_path, monkeypatch):
+    monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "default")   # no namespace: needs an operation
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_OBJECTIVE", "")
     mt = mythic_tools.MythicTools(agent_task_id="solve-1")
-    assert mt._engagement_key is None
+    assert mt._engagement_key is None and mt._eng_key() == ""
     mt._autonomous_objective_seed = _SEED
-    # In-memory for the running solve, but NOT written to the transient 'default' ledger.
+    # In-memory for the running solve, but nothing is written anywhere until the session binds.
     assert mt._engagement_objective() == _SEED
     assert mt._autonomous_objective_persisted is False
-    assert not el.load("default").get("objective")
-    # Once the operation key resolves, the next resolution persists exactly once under the real key.
-    mt._engagement_key = "resolved-op"
+    store = _store()
+    mt._ledger_binding = store.bind_namespace("resolved-op")
+    mt._engagement_key = mt._ledger_binding.engagement_key
     assert mt._engagement_objective() == _SEED
     assert mt._autonomous_objective_persisted is True
-    assert el.load("resolved-op")["objective"] == _SEED
-    assert not el.load("default").get("objective")
+    assert _settings("resolved-op")["objective"] == _SEED
 
 
 def test_no_seed_keeps_opaque_fallback(tmp_path, monkeypatch):
-    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "seed-none")
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_OBJECTIVE", "")
     mt = mythic_tools.MythicTools(agent_task_id="solve-9")
-    # No seed -> opaque fallback preserved (so _objective_is_complete still refuses it). No regression.
     assert mt._engagement_objective() == "sage-engagement:solve-9"
     assert mt._autonomous_objective_persisted is False
 
 
-# --- objective provenance: auto-adopted objectives are replaceable; operator/legacy ones are sticky ---
-
-def test_operator_objective_binding_reads_current_operator_ledger_only(tmp_path, monkeypatch):
-    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
+def test_operator_objective_binding_reads_current_operator_setting_only(tmp_path, monkeypatch):
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "stored-trigger")
     mt = mythic_tools.MythicTools(agent_task_id="solve-stored-trigger")
     objective = "collect and ingest the graph, then read available credentials"
 
-    data = el.load("stored-trigger")
-    data["objective"] = objective
-    data["objective_source"] = "operator"
-    el.save(data, "stored-trigger")
+    _set_objective("stored-trigger", objective, "operator")
     assert mt.operator_objective_binding() == objective
 
-    # The accessor rereads the current ledger rather than trusting the objective cached at construction.
-    data["objective"] = "a replacement operator objective"
-    el.save(data, "stored-trigger")
+    _set_objective("stored-trigger", "a replacement operator objective", "operator")
     assert mt.operator_objective_binding() == "a replacement operator objective"
 
-    data["objective_source"] = "autonomous_seed"
-    el.save(data, "stored-trigger")
+    _set_objective("stored-trigger", "a replacement operator objective", "autonomous_seed")
     assert mt.operator_objective_binding() == ""
 
-    data.pop("objective_source")
-    el.save(data, "stored-trigger")
+    _set_objective("stored-trigger", "a replacement operator objective", "")
     assert mt.operator_objective_binding() == ""
 
-    Path(mt._engagement_ledger_path()).write_text("not json", encoding="utf-8")
+    def unavailable(_binding):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(mt._ledger_store(), "legacy_settings", unavailable)
     assert mt.operator_objective_binding() == ""
 
 
-def test_operator_objective_binding_requires_resolved_operation_key(tmp_path, monkeypatch):
-    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
+def test_operator_objective_binding_requires_a_bound_ledger(tmp_path, monkeypatch):
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "stored-trigger")
     mt = mythic_tools.MythicTools(agent_task_id="solve-stored-trigger")
-    mt._engagement_key = None
+    mt._ledger_binding = None
 
     assert mt.operator_objective_binding() == ""
 
 
 def test_reused_client_new_autonomous_seed_supersedes_prior_autonomous(tmp_path, monkeypatch):
-    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "seed-reuse")
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_OBJECTIVE", "")
     mt = mythic_tools.MythicTools(agent_task_id="solve-1")
     mt._autonomous_objective_seed = "mission A: DA of north.sevenkingdoms.local"
     assert mt._engagement_objective() == "mission A: DA of north.sevenkingdoms.local"
-    assert el.load("seed-reuse")["objective_source"] == "autonomous_seed"
-    # Solve B on the SAME client: new seed + latch reset (mirrors Model.invoke()) -> re-adopts B's mission.
+    assert _settings("seed-reuse")["objective_source"] == "autonomous_seed"
     mt._autonomous_objective_seed = "mission B: control essos.local"
     mt._autonomous_objective_persisted = False
     assert mt._engagement_objective() == "mission B: control essos.local"
-    assert el.load("seed-reuse")["objective"] == "mission B: control essos.local"
-    assert el.load("seed-reuse")["objective_source"] == "autonomous_seed"
+    assert _settings("seed-reuse") == {"objective": "mission B: control essos.local",
+                                        "objective_source": "autonomous_seed"}
 
 
 def test_operator_objective_sticky_against_autonomous_seed(tmp_path, monkeypatch):
-    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "seed-op-sticky")
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_OBJECTIVE", "")
-    data = el.load("seed-op-sticky")
-    data["objective"] = "obtain administrative control of essos.local"
-    data["objective_source"] = "operator"
-    el.save(data, "seed-op-sticky")
+    _set_objective("seed-op-sticky", "obtain administrative control of essos.local", "operator")
     mt = mythic_tools.MythicTools(agent_task_id="solve-1")
     mt._autonomous_objective_seed = "mission: DA of north.sevenkingdoms.local"
     assert mt._engagement_objective() == "obtain administrative control of essos.local"
-    assert el.load("seed-op-sticky")["objective"] == "obtain administrative control of essos.local"
+    assert _settings("seed-op-sticky")["objective"] == "obtain administrative control of essos.local"
 
 
 def test_legacy_objective_without_provenance_is_sticky(tmp_path, monkeypatch):
-    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "seed-legacy")
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_OBJECTIVE", "")
-    data = el.load("seed-legacy")
-    data["objective"] = "legacy objective on example.local"   # NO objective_source (legacy ledger)
-    el.save(data, "seed-legacy")
+    _set_objective("seed-legacy", "legacy objective on example.local")   # NO provenance (legacy)
     mt = mythic_tools.MythicTools(agent_task_id="solve-1")
     mt._autonomous_objective_seed = "mission: something else"
     assert mt._engagement_objective() == "legacy objective on example.local"
-    assert el.load("seed-legacy")["objective"] == "legacy objective on example.local"
+    assert _settings("seed-legacy")["objective"] == "legacy objective on example.local"
 
 
-def test_autonomous_seed_persist_retries_after_transient_save_error(tmp_path, monkeypatch):
-    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
+def test_autonomous_seed_persist_retries_after_transient_store_error(tmp_path, monkeypatch):
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "seed-retry")
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_OBJECTIVE", "")
     mt = mythic_tools.MythicTools(agent_task_id="solve-1")
     mt._autonomous_objective_seed = "mission: DA of north.sevenkingdoms.local"
-    real_save = el.save
+    store = mt._ledger_store()
+    real_update = store.update_objective
     calls = {"n": 0}
-    def flaky_save(data, engagement_id=None):
+
+    def flaky_update(*args, **kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
             raise OSError("transient disk error")
-        return real_save(data, engagement_id)
-    monkeypatch.setattr(el, "save", flaky_save)
-    # First call: save raises -> caught -> latch unset, nothing persisted, but seed returned in-memory.
+        return real_update(*args, **kwargs)
+
+    monkeypatch.setattr(store, "update_objective", flaky_update)
     assert mt._engagement_objective() == "mission: DA of north.sevenkingdoms.local"
     assert mt._autonomous_objective_persisted is False
-    # Second call: save succeeds -> persisted durably.
     assert mt._engagement_objective() == "mission: DA of north.sevenkingdoms.local"
     assert mt._autonomous_objective_persisted is True
-    assert el.load("seed-retry")["objective"] == "mission: DA of north.sevenkingdoms.local"
+    assert _settings("seed-retry")["objective"] == "mission: DA of north.sevenkingdoms.local"
 
 
 def test_autonomous_seed_persists_exactly_once_then_reads(tmp_path, monkeypatch):
-    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "seed-once")
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_OBJECTIVE", "")
     mt = mythic_tools.MythicTools(agent_task_id="solve-1")
     mt._autonomous_objective_seed = "mission: DA of north.sevenkingdoms.local"
-    real_save = el.save
-    saves = {"n": 0}
-    def counting_save(data, engagement_id=None):
-        saves["n"] += 1
-        return real_save(data, engagement_id)
-    monkeypatch.setattr(el, "save", counting_save)
+    store = mt._ledger_store()
+    real_update = store.update_objective
+    writes = {"n": 0}
+
+    def counting_update(*args, **kwargs):
+        writes["n"] += 1
+        return real_update(*args, **kwargs)
+
+    monkeypatch.setattr(store, "update_objective", counting_update)
     for _ in range(5):
         assert mt._engagement_objective() == "mission: DA of north.sevenkingdoms.local"
-    assert saves["n"] == 1   # one durable write, then steady-state reads (no write amplification)
+    assert writes["n"] == 1
 
 
 def test_operator_objective_overrides_prior_autonomous_seed_mid_run(tmp_path, monkeypatch):
-    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "seed-op-override")
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_OBJECTIVE", "")
     mt = mythic_tools.MythicTools(agent_task_id="solve-1")
     mt._autonomous_objective_seed = "auto mission: DA of north.sevenkingdoms.local"
     assert mt._engagement_objective() == "auto mission: DA of north.sevenkingdoms.local"
-    assert el.load("seed-op-override")["objective_source"] == "autonomous_seed"
-    # Operator overrides mid-run (a separate-process `state objective` writes operator provenance to disk).
-    data = el.load("seed-op-override")
-    data["objective"] = "obtain administrative control of essos.local"
-    data["objective_source"] = "operator"
-    el.save(data, "seed-op-override")
-    # The still-set autonomous seed must NOT re-supersede the now-operator objective.
+    assert _settings("seed-op-override")["objective_source"] == "autonomous_seed"
+    _set_objective("seed-op-override", "obtain administrative control of essos.local", "operator")
     assert mt._engagement_objective() == "obtain administrative control of essos.local"
-    assert el.load("seed-op-override")["objective"] == "obtain administrative control of essos.local"
+    assert _settings("seed-op-override")["objective"] == "obtain administrative control of essos.local"
 
 
 # --- knob A: coerce a free-handed native dcsync into the only form proven to dump a hash in-lab ---

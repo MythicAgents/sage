@@ -78,20 +78,24 @@ def test_actual_strace_kinds_feed_config_and_secret_classifiers():
     assert "runtime-secret-value" not in str(result)
 
 
-def test_actual_runtime_ledger_atomic_save_is_bound_to_private_engagement_prefix(tmp_path):
+def test_actual_runtime_ledger_writes_and_export_are_bound_to_private_engagement_prefix(tmp_path):
+    """The capture's isolated ledger (sage.db under the private engagement prefix) and its atomic JSON export."""
     strace=shutil.which("strace")
     if not strace:pytest.skip("strace unavailable")
     root=SCRIPTS.parents[2]; engagement=tmp_path/"engagement";engagement.mkdir(mode=0o700)
     trace=tmp_path/"trace"; runtime=root/"Payload_Type/sage"
     code=("import os,sys;sys.path.insert(0,sys.argv[1]);os.environ['SAGE_ENGAGEMENT_STATE_DIR']=sys.argv[2];"
-          "from ai.langgraph.engagement_ledger import save_runtime;"
-          "save_runtime({'engagement_id':'fixture','hops':[]},'fixture')")
+          "os.environ['SAGE_DATABASE_PATH']=os.path.join(sys.argv[2],'sage.db');"
+          "from ai.langgraph import engagement_store as s;st=s.EngagementStore();b=st.bind_namespace('fixture');"
+          "st.apply(b,s.hop_mutations([],[{'technique':'t','target':'a','status':'pending'}]));"
+          "s.export_operation(b,os.path.join(sys.argv[2],'exports'))")
     subprocess.run([strace,"-f","-qq","-ttt","--decode-fds=path","-s","65536","-e",
         "trace=write,pwrite64,writev,pwritev,pwritev2,open,openat,mkdir,mkdirat,unlink,unlinkat,rename,renameat,renameat2",
         "-o",str(trace),sys.executable,"-P","-c",code,str(runtime),str(engagement)],check=True,
         stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=30)
     lines=[line for line in trace.read_bytes().splitlines() if os.fsencode(str(engagement)) in line]
-    assert any(b" rename" in line for line in lines) and any(b" write" in line for line in lines)
+    assert any(b"sage.db" in line and b"write" in line for line in lines)  # row mutation in the isolated db
+    assert any(b" rename" in line for line in lines)                        # atomic export
 
     def result(prefixes, *, changed=None, config_paths=None):
         inv=inventory(start_ns=1,end_ns=10**30,trusted_state_prefixes=prefixes,
@@ -110,14 +114,16 @@ def test_actual_runtime_ledger_atomic_save_is_bound_to_private_engagement_prefix
         assert "undeclared_write_sink" in negative[risk.SECRET]["unknowns"]
         assert "trusted_state_atomic_rename_unresolved" in negative[risk.SECRET]["unknowns"]
 
-    state=engagement/"state_fixture.json"; outside=tmp_path/"outside.tmp"
-    crossed=[line.replace(os.fsencode(str(state)+".tmp"),os.fsencode(str(outside)))
-             if b" rename" in line else line for line in lines]
+    import re as _re
+    rename=next(line for line in lines if b" rename" in line)
+    temporary=_re.search(rb'rename(?:at2?)?\((?:[^,"]*, )?"([^"]+)"',rename).group(1)
+    exported=next(path for path in (engagement/"exports").glob("*.esl.json"))
+    outside=tmp_path/"outside.tmp"
+    crossed=[line.replace(temporary,os.fsencode(str(outside))) if b" rename" in line else line for line in lines]
     cross=result([str(engagement)],changed=crossed)
     assert "trusted_state_atomic_rename_unresolved" in cross[risk.SECRET]["unknowns"]
-    config=result([str(engagement)],config_paths=[str(state)])
+    config=result([str(engagement)],config_paths=[str(exported)])
     assert config[risk.CONFIG]["lower_bound"]>=1
-    assert "trusted_state_atomic_rename_unresolved" in config[risk.SECRET]["unknowns"]
 
 
 def test_trusted_state_write_prefix_requires_canonical_component_boundary():

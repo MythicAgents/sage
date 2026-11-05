@@ -1,25 +1,27 @@
-"""Single source of truth for the durable per-engagement hop ledger on disk.
+"""Engagement State Ledger formatting and historical JSON helpers.
 
-Used by BOTH the LangGraph agent (`ai/langgraph/mythic_tools.py`, which records achieved hops during a solve)
-and the operator-facing `state` Mythic command (`container/agent_functions/state.py`, which shows and
-edits the ledger). Keeping the path + I/O + edit operations in one place stops the agent and the command from
-drifting onto different files or formats. Pure stdlib; never raises on a missing/corrupt file (returns an empty
-ledger). Edits operate on the plain ledger dict so they are trivially testable without the agent runtime.
+Live ledger persistence is in :mod:`engagement_store` (``sage.db``): sessions read fresh operation snapshots and
+write explicit row mutations there. This module keeps what does not touch the live store: the legacy JSON file
+location and neutral reader used by migration, archive and evaluation tooling; selectors; per-hop proof
+admission; and the one markdown table every ledger view renders. Pure stdlib.
 """
 import json
 import os
+from pathlib import Path
 import re
 
 _FILENAME_SAFE = re.compile(r"[^A-Za-z0-9._-]")
 
 
 def default_engagement_id() -> str:
-    return os.environ.get("SAGE_ENGAGEMENT_ID", "").strip() or "default"
+    """The explicit legacy namespace (``SAGE_ENGAGEMENT_ID``), or ``""``. ``default`` is not a namespace."""
+    value = os.environ.get("SAGE_ENGAGEMENT_ID", "").strip()
+    return "" if value == "default" else value
 
 
 def state_dir() -> str:
-    """Directory holding the per-engagement ledgers. `SAGE_ENGAGEMENT_STATE_DIR` overrides; default is
-    `.sage_engagement` next to the Sage process cwd (same persistence guarantee as the operational db).
+    """Directory of legacy ``state_*.json`` files (``SAGE_ENGAGEMENT_STATE_DIR``; default ``.sage_engagement`` in
+    the process cwd). It also holds decision records and artifacts. It is never the live ledger store.
     """
     override = os.environ.get("SAGE_ENGAGEMENT_STATE_DIR", "").strip()
     if override:
@@ -27,27 +29,24 @@ def state_dir() -> str:
     return os.path.join(os.getcwd(), ".sage_engagement")
 
 
-# Ledger filename prefix. Named `state_` (the operator-facing `state` command) and keyed per Mythic
-# OPERATION — e.g. `state_Operation_Chimera_1.json`.
 _LEDGER_PREFIX = "state_"
 
 
-def ledger_path(engagement_id: str | None = None) -> str:
-    """Absolute path to the JSON ledger for an engagement/operation key (sanitized to a safe filename)."""
-    key = (engagement_id or default_engagement_id() or "default").strip() or "default"
+def ledger_path(engagement_id: str) -> str:
+    """Path of the LEGACY JSON ledger file for a key, as the pre-SQLite runtime named it (migration input)."""
+    key = (engagement_id or "").strip()
+    if not key:
+        raise ValueError("a legacy ledger path needs an explicit engagement key")
     safe = _FILENAME_SAFE.sub("_", key)[:128]
     return os.path.join(state_dir(), f"{_LEDGER_PREFIX}{safe}.json")
 
 
-def load(engagement_id: str | None = None) -> dict:
-    """Return the raw ledger dict for an engagement; an empty skeleton if missing/corrupt. Never raises.
+def load_file(path) -> dict:
+    """Neutral reader for a historical JSON ledger or ESL export. Never applies runtime proof admission.
 
-    This is intentionally a neutral serializer. Runtime consumers that can influence autonomous state must use
-    :func:`load_runtime`, which quarantines historical ``achieved`` rows that lack an admissible proof envelope.
-    Eval readers and migration tooling need raw historical rows so they can apply their own verifier policy
-    without mutating the source ledger as a side effect of reading it.
+    Returns an empty skeleton when the file is missing or corrupt. Callers that need runtime eligibility apply
+    their own verifier policy; this reader never mutates the source.
     """
-    path = ledger_path(engagement_id)
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -56,60 +55,48 @@ def load(engagement_id: str | None = None) -> dict:
             return data
     except (FileNotFoundError, ValueError, OSError):
         pass
-    return {"engagement_id": engagement_id or default_engagement_id(), "hops": []}
+    return {"hops": []}
 
 
-def save(data: dict, engagement_id: str | None = None) -> str:
-    """Write the raw ledger dict (atomic replace). Creates the directory if needed. Returns the path.
-
-    Runtime callers should use :func:`save_runtime` so unbound achievements cannot be re-persisted as active
-    runtime proof. Raw save exists for evaluator fixtures, archival/migration tooling, and other consumers whose
-    own verifier policy is separate from the live autonomous ledger.
-    """
-    path = ledger_path(engagement_id)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = f"{path}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, sort_keys=True)
-    os.replace(tmp, path)
-    return path
-
-
-def load_runtime(engagement_id: str | None = None) -> dict:
-    """Load a ledger for live runtime use and quarantine unbound historical achievements in memory."""
-    data = load(engagement_id)
-    _quarantine_unproven_achievements(data, engagement_id or data.get("engagement_id") or default_engagement_id())
-    assign_hop_numbers(data)
+def load(engagement_id: str) -> dict:
+    """Neutral reader for the legacy JSON ledger file of a key (historical/migration use only)."""
+    data = load_file(ledger_path(engagement_id))
+    data.setdefault("engagement_id", engagement_id)
     return data
 
 
-def save_runtime(data: dict, engagement_id: str | None = None) -> str:
-    """Persist a live runtime ledger after quarantining unbound historical achievements."""
-    _quarantine_unproven_achievements(data, engagement_id or data.get("engagement_id") or default_engagement_id())
-    assign_hop_numbers(data)
-    return save(data, engagement_id)
+def save_file(data: dict, path) -> str:
+    """Write a raw ledger/export dict to an explicit file (atomic replace). Never touches the live store."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+    os.replace(tmp, target)
+    return str(target)
 
 
-def wipe(engagement_id: str | None = None) -> bool:
-    """Delete the ledger file for an engagement. Returns True if a file was removed."""
-    path = ledger_path(engagement_id)
-    try:
-        os.remove(path)
-        return True
-    except OSError:
+def correction_label(hop: dict) -> str:
+    """``achieved — operator retracted`` style presentation of a row's status plus its effective correction."""
+    status = str(hop.get("status") or "-") if isinstance(hop, dict) else "-"
+    corrections = hop.get("corrections") if isinstance(hop, dict) and isinstance(hop.get("corrections"), dict) else {}
+    if corrections.get("retracted"):
+        return f"{status} — operator retracted"
+    marker = corrections.get("no_longer_holds") if isinstance(corrections.get("no_longer_holds"), dict) else {}
+    if marker.get("effective"):
+        return f"{status} — no longer holds"
+    return status
+
+
+def hop_corrected(hop) -> bool:
+    """Whether a hop (dict or Hop) carries an effective retraction or "no longer holds" marker."""
+    corrections = hop.get("corrections") if isinstance(hop, dict) else getattr(hop, "corrections", None)
+    if not isinstance(corrections, dict):
         return False
-
-
-def list_engagements() -> list[str]:
-    """Engagement ids that currently have a ledger on disk."""
-    out: list[str] = []
-    try:
-        for name in os.listdir(state_dir()):
-            if name.startswith(_LEDGER_PREFIX) and name.endswith(".json"):
-                out.append(name[len(_LEDGER_PREFIX):-len(".json")])
-    except OSError:
-        pass
-    return sorted(out)
+    if corrections.get("retracted"):
+        return True
+    marker = corrections.get("no_longer_holds")
+    return isinstance(marker, dict) and bool(marker.get("effective"))
 
 
 # --- hop selection + edit operations (operate on the ledger dict's "hops" list) ------------------------
@@ -145,54 +132,6 @@ def hop_number(hop: dict) -> int:
     return value
 
 
-def assign_hop_numbers(data: dict, previous: dict | None = None) -> dict:
-    """Give every hop a permanent number. Idempotent; mutates and returns `data`.
-
-    A number is assigned once and never reused: removing a hop leaves a gap, and `next_hop_number` keeps the
-    high-water mark. Numbering is what the operator and the model both refer to as "hop N", so it must not
-    shift when rows are removed. Unnumbered hops (older ledgers, or writers that rebuild hop dicts from
-    dataclasses) take their number from `previous` (the ledger as last written) by hop label, else the next
-    free number in list order. The first hop claiming a number keeps it; a duplicate is renumbered.
-    """
-    hops = data.get("hops")
-    if not isinstance(hops, list):
-        return data
-    high = 0
-    for source in (previous, data):
-        if isinstance(source, dict):
-            try:
-                high = max(high, int(source.get("next_hop_number") or 1) - 1)
-            except (TypeError, ValueError):
-                pass
-    earlier: dict[str, int] = {}
-    if isinstance(previous, dict):
-        for hop in previous.get("hops") or []:
-            number = hop_number(hop)
-            if number:
-                earlier.setdefault(hop_label(hop), number)
-                high = max(high, number)
-    claimed: set[int] = set()
-    unnumbered: list[dict] = []
-    for hop in hops:
-        if not isinstance(hop, dict):
-            continue
-        number = hop_number(hop)
-        if number and number not in claimed:
-            claimed.add(number)
-            high = max(high, number)
-        else:
-            unnumbered.append(hop)
-    for hop in unnumbered:
-        number = earlier.get(hop_label(hop), 0)
-        if not number or number in claimed:
-            high += 1
-            number = high
-        hop["number"] = number
-        claimed.add(number)
-    data["next_hop_number"] = high + 1
-    return data
-
-
 def _resolve_index(selector: str, hops: list) -> int | None:
     """If `selector` is a hop number (the `#` column of `/state`), return that hop's 0-based index, else None.
     Hop labels are never bare integers, so a numeric selector unambiguously means a hop number.
@@ -206,106 +145,59 @@ def _resolve_index(selector: str, hops: list) -> int | None:
     return None
 
 
-def remove_hop(data: dict, selector: str) -> tuple[dict, int]:
-    """Remove hops matching `selector` — a HOP NUMBER (the `#` column of `/state`) OR a label/effect/technique.
-    Returns (data, removed_count). Single-selector convenience over remove_hops.
-    """
-    return remove_hops(data, [selector])
-
-
-def remove_hops(data: dict, selectors) -> tuple[dict, int]:
-    """Remove every hop matching ANY selector in `selectors` (each a HOP NUMBER OR a label/effect/technique).
-    Hop numbers are permanent, so a CSV like `9,10,11` removes those exact hops and leaves the remaining
-    hops' numbers unchanged. Returns (data, removed_count).
-    """
-    assign_hop_numbers(data)
-    hops = list(data.get("hops") or [])
-    targets: set[int] = set()
-    for sel in selectors:
-        idx = _resolve_index(sel, hops)
-        if idx is not None:
-            targets.add(idx)
-            continue
-        sel_cf = (sel or "").strip().casefold()
-        if not sel_cf:
-            continue
-        for i, hop in enumerate(hops):
-            if _hop_matches(hop, sel_cf):
-                targets.add(i)
-    kept = [hop for i, hop in enumerate(hops) if i not in targets]
-    data["hops"] = kept
-    return data, len(hops) - len(kept)
-
-
-def set_hop_status(data: dict, selector: str, status: str) -> tuple[dict, int]:
-    """Set the `status` of hops matching `selector` — a HOP NUMBER OR a label/effect/technique.
-    Returns (data, changed_count).
-    """
-    assign_hop_numbers(data)
-    hops = data.get("hops") or []
-    new_status = (status or "").strip()
-    if new_status.casefold() == "achieved":
-        return data, 0
-    idx = _resolve_index(selector, hops)
-    if idx is not None:
-        hops[idx]["status"] = new_status
-        return data, 1
-    sel = (selector or "").strip().casefold()
-    changed = 0
-    for hop in hops:
-        if _hop_matches(hop, sel):
-            hop["status"] = new_status
-            changed += 1
-    return data, changed
-
-
-def _quarantine_unproven_achievements(data: dict, engagement_id: str) -> None:
-    """Keep legacy ledger rows visible without letting them represent runtime proof.
-
-    Old ledgers predate proof envelopes. They remain useful operator context, but an
-    unbound ``achieved`` row must not survive a load as runtime achievement.
-    """
+def hop_proof_admission(hop: dict, engagement_id: str) -> tuple[bool, str]:
+    """Runtime proof admission for one stored hop (the same checks every runtime projection applies)."""
     try:
         try:
             from . import proof_boundary
         except ImportError:
             import proof_boundary
     except Exception:
-        proof_boundary = None
+        return False, "proof admission failed closed"
+    evidence = hop.get("evidence") if isinstance(hop.get("evidence"), dict) else {}
+    proof = hop.get("proof_envelope") if isinstance(hop.get("proof_envelope"), dict) and hop.get("proof_envelope") \
+        else evidence.get("proof_envelope")
+    try:
+        admission = proof_boundary.admit_runtime_envelope(
+            proof_boundary.ProofEnvelope.from_dict(proof),
+            current_engagement_id=str(engagement_id or ""),
+            expected_callback_id=evidence.get("callback_id") or evidence.get("callback_display_id") or "",
+            expected_transaction_id=evidence.get("transaction_id") or "",
+            expected_task_id=evidence.get("mythic_task_id") or evidence.get("task_id") or "",
+            expected_terminal_status=evidence.get("terminal_task_status") or evidence.get("terminal_status") or "",
+            expected_verifier_id=evidence.get("verifier_id") or "",
+            expected_verifier_input_sha256=evidence.get("verifier_input_sha256") or "",
+            expected_verifier_result_sha256=evidence.get("verifier_result_sha256") or "",
+            expected_artifact_id=evidence.get("artifact_id") or "",
+            expected_authorization=evidence,
+        )
+        return admission.admitted, admission.reason
+    except Exception:
+        return False, "proof admission failed closed"
+
+
+def quarantine_hop(hop: dict, engagement_id: str) -> dict:
+    """In a runtime view only: an ``achieved`` row without admissible proof reads as ``legacy_unverified``.
+
+    The stored historical row is unchanged; this never turns a historical row into live proof.
+    """
+    if not isinstance(hop, dict) or str(hop.get("status") or "").casefold() != "achieved":
+        return hop
+    admitted, reason = hop_proof_admission(hop, engagement_id)
+    if admitted:
+        return hop
+    hop["status"] = "legacy_unverified"
+    evidence = dict(hop.get("evidence") if isinstance(hop.get("evidence"), dict) else {})
+    evidence["proof_persistence_state"] = "legacy_unverified"
+    evidence["proof_admission_reason"] = reason
+    hop["evidence"] = evidence
+    return hop
+
+
+def _quarantine_unproven_achievements(data: dict, engagement_id: str) -> None:
+    """Quarantine every unproven ``achieved`` row of a ledger dict in place (historical-reader helper)."""
     for hop in data.get("hops") or []:
-        if not isinstance(hop, dict) or str(hop.get("status") or "").casefold() != "achieved":
-            continue
-        evidence = hop.get("evidence") if isinstance(hop.get("evidence"), dict) else {}
-        proof = hop.get("proof_envelope") if isinstance(hop.get("proof_envelope"), dict) else evidence.get("proof_envelope")
-        admitted = False
-        reason = "missing proof envelope"
-        if proof_boundary is not None:
-            try:
-                admission = proof_boundary.admit_runtime_envelope(
-                    proof_boundary.ProofEnvelope.from_dict(proof),
-                    current_engagement_id=str(engagement_id or ""),
-                    expected_callback_id=evidence.get("callback_id") or evidence.get("callback_display_id") or "",
-                    expected_transaction_id=evidence.get("transaction_id") or "",
-                    expected_task_id=evidence.get("mythic_task_id") or evidence.get("task_id") or "",
-                    expected_terminal_status=evidence.get("terminal_task_status") or evidence.get("terminal_status") or "",
-                    expected_verifier_id=evidence.get("verifier_id") or "",
-                    expected_verifier_input_sha256=evidence.get("verifier_input_sha256") or "",
-                    expected_verifier_result_sha256=evidence.get("verifier_result_sha256") or "",
-                    expected_artifact_id=evidence.get("artifact_id") or "",
-                    expected_authorization=evidence,
-                )
-                admitted = admission.admitted
-                reason = admission.reason
-            except Exception:
-                admitted = False
-                reason = "proof admission failed closed"
-        if admitted:
-            continue
-        hop["status"] = "legacy_unverified"
-        evidence = dict(evidence)
-        evidence["proof_persistence_state"] = "legacy_unverified"
-        evidence["proof_admission_reason"] = reason
-        hop["evidence"] = evidence
+        quarantine_hop(hop, engagement_id)
 
 
 # --- shared ledger view (one table for every surface that shows hops) -----------------------------------
@@ -349,12 +241,29 @@ def render_hop_table(hops, *, include_evidence: bool = True, limit: int = 0) -> 
         number = hop_number(hop)
         line = (
             f"| {number or '-'} | `{md_cell(hop_label(hop), 48)}` | {md_cell(hop.get('effect'))} | "
-            f"`{md_cell(hop.get('status') or '-', 16)}` | {task_id if task_id is not None else '-'} | "
+            f"`{md_cell(correction_label(hop), 40)}` | {task_id if task_id is not None else '-'} | "
             f"{cb_id if cb_id is not None else '-'} |"
         )
         if include_evidence:
             line += f" {md_cell(ev.get('result_preview') or ev.get('source') or '', 60)} |"
         lines.append(line)
+    return lines
+
+
+def correction_notes(hops, *, limit: int = 0) -> list[str]:
+    """One bounded line per corrected row: who/what corrected it and why. No evidence previews."""
+    rows = sorted((h for h in (hops or []) if isinstance(h, dict) and hop_corrected(h)), key=hop_number)
+    if limit and len(rows) > limit:
+        rows = rows[-limit:]
+    lines = []
+    for hop in rows:
+        corrections = hop.get("corrections") or {}
+        marker = corrections.get("retracted") or corrections.get("no_longer_holds") or {}
+        what = "operator retracted" if corrections.get("retracted") else (
+            "operator marked no longer holds" if marker.get("scope") == "operator" else "no longer holds (Sage observation)"
+        )
+        reason = md_cell(marker.get("reason") or "", 80)
+        lines.append(f"- hop {hop_number(hop) or '-'} `{md_cell(hop_label(hop), 48)}`: {what} — {reason}")
     return lines
 
 
@@ -384,6 +293,10 @@ def operator_view_text(data: dict, shown_via: str, *, limit: int = 0) -> str:
         if limit and len(hops) > limit:
             lines.append(f"Showing the {limit} newest of {len(hops)} hops.")
         lines.extend(render_hop_table(hops, include_evidence=False, limit=limit))
+        notes = correction_notes(hops, limit=limit)
+        if notes:
+            lines.append("Corrections (retracted or no-longer-holding rows are history, not current proof):")
+            lines.extend(notes)
     return "\n".join(lines)
 
 

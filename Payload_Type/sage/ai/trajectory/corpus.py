@@ -17,7 +17,11 @@ def artifact_kind(path: Path) -> str | None:
         return "phoenix_db"
     if path.suffix.lower() == ".db" and name.startswith("sage"):
         return "sage_db"
-    if path.suffix.lower() == ".json" and (name.startswith("state_") or ".sage_engagement" in parts):
+    if name == "esl_exports.json":
+        return None  # export manifest: an index, not a ledger
+    if path.suffix.lower() == ".json" and (
+        name.startswith("state_") or name.endswith(".esl.json") or ".sage_engagement" in parts
+    ):
         return "engagement_ledger"
     if name.startswith("essos_da") and path.suffix.lower() in {".out", ".log", ".txt"}:
         return "solve_log"

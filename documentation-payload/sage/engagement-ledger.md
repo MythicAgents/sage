@@ -24,9 +24,13 @@ and can never count as proof — the model cannot write itself a success it did 
 
 ## Where it lives
 
-`.sage_engagement/state_<operation>.json`, next to the running Sage process (`SAGE_ENGAGEMENT_STATE_DIR`
-overrides the directory). Keyed per Mythic operation, it is the portable, exportable record of the assessment —
-not a checkpoint or a trace, both of which live elsewhere and prove nothing on their own.
+Sage's application database, `sage.db` (`SAGE_DATABASE_PATH` overrides it), keyed by the Mythic operation and the
+reset marker Sage stores in that operation. Every chat channel of the operation reads and writes the same ledger:
+each change touches only its own rows and appends to their history, and `/state` corrections reach running sessions
+on their next read. Rows keep permanent numbers; retracted and "no longer holds" rows stay visible and marked. An
+operator export (`engagement_ledger_migrate.py export`) is the portable record of the assessment; ledgers from
+releases that stored `.sage_engagement/state_*.json` files are imported once with the same script, with Sage
+stopped. It is not a checkpoint or a trace, both of which live elsewhere and prove nothing on their own.
 
 ## Why a ledger at all
 

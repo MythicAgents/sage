@@ -96,15 +96,21 @@ def _drop_log_handlers_on_closed_streams():
 
 @pytest.fixture(autouse=True)
 def _isolate_engagement_ledger(tmp_path, monkeypatch):
-    """Keep the durable engagement ledger out of the repo working tree during tests.
+    """Keep the engagement ledger and legacy state directory out of the repo working tree during tests.
 
-    The durable hop ledger (mythic_tools._persist_engagement_ledger) write-through fires whenever a
-    test enables SAGE_ENGAGEMENT_GATE and records an achieved hop. Without this, such a test would
-    write `.sage_engagement/engagement_default.json` into the cwd (the repo). Point the ledger dir at
-    a per-test tmp dir by default; a test that needs its own location simply calls
-    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", ...) after this fixture (its value wins).
+    The ledger lives in sage.db: point SAGE_DATABASE_PATH and the legacy state directory at a per-test tmp dir.
+    Sessions without a Mythic operation bind an explicit isolated namespace, the supported offline binding;
+    tests of operation binding override SAGE_ENGAGEMENT_ID / mythic_tools.SAGE_ENGAGEMENT_ID themselves.
     """
+    import sys
+
+    monkeypatch.setenv("SAGE_ENGAGEMENT_ID", "sage-test-isolated")
+    for module_name in ("ai.langgraph.mythic_tools", "mythic_tools"):
+        module = sys.modules.get(module_name)
+        if module is not None and hasattr(module, "SAGE_ENGAGEMENT_ID"):
+            monkeypatch.setattr(module, "SAGE_ENGAGEMENT_ID", "sage-test-isolated")
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path / "engagement"))
+    monkeypatch.setenv("SAGE_EVAL_OBSERVATIONS_DIR", str(tmp_path / "evaluator-observations"))
     monkeypatch.setenv("SAGE_TRAJECTORY_STORE", str(tmp_path / "trajectory" / "transitions.jsonl"))
     monkeypatch.setenv("SAGE_DATABASE_PATH", str(tmp_path / "sage.db"))
     # Native chat marks first-seen channels in Sage's runtime SQLite file. Test

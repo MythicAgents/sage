@@ -7,7 +7,9 @@ safe while the Sage container and Mythic are still running:
 
 * SQLite databases in the installed service directory (``sage*.db`` and ``.phoenix/phoenix*.db``) are copied with
   SQLite's online backup API from read-only connections, so pages still in the WAL are included.
-* The installed ``.sage_engagement`` tree (engagement state and sealed decision records) is copied as is.
+* The installed ``.sage_engagement`` tree (legacy engagement files and sealed decision records) is copied as is.
+* Each copied database that holds the Engagement State Ledger also gets JSON exports generated from that backup
+  (``installed/esl_exports/<database>/``), so the database and its exports are the same cut.
 * Mythic's database is dumped with ``pg_dump`` inside its Postgres container using that container's own
   credentials, so no secret is passed on a command line or leaves the container. Mythic's reset wipes this
   database, and it holds the task output that runtime proof depends on.
@@ -119,6 +121,16 @@ def dump_mythic(container: str, destination: Path, *, run: Runner = subprocess.r
     return {"kind": "pg_dump -Fc", "table_data_entries": tables}
 
 
+def _export_esl(copy: Path, destination_dir: Path) -> list[Path]:
+    """Export the ESL held by a database backup (none when the copy has no ESL tables)."""
+    archiver = _load_local_archiver()
+    if not archiver.esl_present(copy):
+        return []
+    store = archiver._engagement_store(REPO_ROOT)
+    written = store.export_database(copy, destination_dir)
+    return [*(Path(path) for path in written.values()), destination_dir / store.MANIFEST_NAME]
+
+
 def _source_stat(source: Path, relative: Path) -> dict[str, Any]:
     wal = source.with_name(source.name + "-wal")
     stat, wal_stat = source.stat(), (wal.stat() if wal.exists() else None)
@@ -187,12 +199,17 @@ def preserve_evidence(
             target = destination / "installed" / relative
             stat = _source_stat(source, relative)
             known = by_source.get(_source_key(stat))
+            exports_dir = destination / "installed" / "esl_exports" / str(relative).replace("/", "_")
             if known:
                 items.append({"path": str(target.relative_to(destination)), "kind": "sqlite-backup",
                               "bytes": known["bytes"], "sha256": known["sha256"],
                               "already_preserved": known["held"], "source": stat})
+                for path in _export_esl(destination.parent / known["held"], exports_dir):
+                    record(path, {"kind": "esl-export", "from_backup": known["held"]})
                 continue
             info = backup_sqlite(source, target)
+            for path in _export_esl(target, exports_dir):  # before any duplicate copy is removed
+                record(path, {"kind": "esl-export", "from_backup": str(target.relative_to(destination))})
             # Record the source identity only if the file did not change while it was backed up; a write
             # after the snapshot that kept the size would otherwise let a later reset skip that write.
             if _source_stat(source, relative) != stat:

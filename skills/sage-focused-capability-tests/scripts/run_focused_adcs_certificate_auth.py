@@ -26,6 +26,8 @@ from mythic import mythic  # noqa: E402
 from sage_task import resolve_password  # noqa: E402
 
 sys.path.insert(0, str(ROOT / "Payload_Type" / "sage" / "ai" / "langgraph"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _focused_ledger  # noqa: E402
 import mythic_tools  # noqa: E402
 
 SERVER = "127.0.0.1"
@@ -98,9 +100,7 @@ async def main() -> int:
         f"host={callback.get('host')} user={callback.get('user')}"
     )
 
-    tools = mythic_tools.MythicTools(agent_task_id="focused-adcs-certificate-auth")
-    tools.client = client
-    await tools._ensure_engagement_key()
+    tools = await _focused_ledger.bound_tools(mythic_tools, client, "focused-adcs-certificate-auth", args.callback)
     print(f"engagement: {tools._eng_key()}")
 
     domain = args.domain.strip().casefold()

@@ -34,7 +34,7 @@ try:  # package import
     from .gate_experiment import build_scorecard_from_run
     from .fitness import GAUGE_VERSION, ScoreCard, verifier_hash as current_verifier_hash
     from .range_state import Milestone, PROBEABLE_MILESTONES
-    from ..langgraph import engagement_ledger
+    from . import evaluator_observations
 except Exception:  # script / sys.path import
     import sys
 
@@ -44,7 +44,7 @@ except Exception:  # script / sys.path import
     from gate_experiment import build_scorecard_from_run  # type: ignore
     from fitness import GAUGE_VERSION, ScoreCard, verifier_hash as current_verifier_hash  # type: ignore
     from range_state import Milestone, PROBEABLE_MILESTONES  # type: ignore
-    import engagement_ledger  # type: ignore
+    import evaluator_observations  # type: ignore
 
 SAGE_ROOT = Path(__file__).resolve().parents[2]
 
@@ -95,9 +95,9 @@ def _persist_ground_truth_probe_results(
     verifier_hash: str | None = None,
     verifier_costs: dict | None = None,
 ) -> dict:
-    """Add the captured live-probe vector to the engagement ledger.
+    """Record the captured live-probe vector in the evaluation-side observation store for this run.
 
-    The write is deliberately additive: existing hop/evidence keys are preserved. Only registry-validated
+    Only registry-validated
     ``ProofResult`` records from this capture are written, keyed by stable ``Milestone.name`` values.
     """
     values: dict[str, dict] = {}
@@ -122,9 +122,8 @@ def _persist_ground_truth_probe_results(
             for milestone, cost in verifier_costs.items()
             if milestone in recorded_milestones
         }
-    data = engagement_ledger.load(engagement_id)
-    data["ground_truth_probes"] = record
-    engagement_ledger.save(data, engagement_id)
+    # Evaluation plane only: never written into Sage's runtime ledger or its model context.
+    evaluator_observations.write_observations(engagement_id, record)
     return record
 
 

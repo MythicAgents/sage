@@ -170,12 +170,15 @@ context resets, restarts, and even a change of model.
   <br><em><code>/state</code> renders the hop ledger: each proven effect with its status, task, and evidence.</em>
 </p>
 
-- **What it is.** One JSON file per Mythic operation — a table of hops toward the objective, each with a status.
-  You read and edit it in chat with [`/state`](#slash-commands). Each hop keeps a permanent number (the `#`
-  column): removing a hop leaves a gap rather than renumbering the rest. When `/state` or the end-of-turn table
-  shows you the ledger, Sage also sees that table on your next message, so you can ask about "hop 4" directly.
-  The ledger records capability-verified effects, not every task: a task whose effect Sage cannot verify leaves
-  no achieved hop, even when the task itself succeeded.
+- **What it is.** One ledger per Mythic operation, shared live by every chat channel of that operation — a table
+  of hops toward the objective, each with a status. You read and correct it in chat with
+  [`/state`](#slash-commands). Each hop keeps a permanent number (the `#` column), assigned once and never
+  reused. A correction never deletes a row: `/state remove` records a retraction (who, when, why) that you can undo
+  with `/state restore`, and `/state invalidate` marks a row "no longer holds". The row keeps its number and shows
+  the correction, and no session relies on it again. When `/state` or the end-of-turn table shows you the ledger,
+  Sage also sees that table on your next message, so you can ask about "hop 4" directly. The ledger records
+  capability-verified effects, not every task: a task whose effect Sage cannot verify leaves no achieved hop, even
+  when the task itself succeeded.
 
 - **Why it is proof-gated.** A hop flips to *achieved* only when a verifier confirms the effect from real
   evidence. Each achieved hop carries a **proof envelope** recording the Mythic callback, task, and transaction
@@ -183,10 +186,13 @@ context resets, restarts, and even a change of model.
   envelope is quarantined as `legacy_unverified` and can never count as proof — the model cannot write itself a
   success it did not earn.
 
-- **Where it lives.** `.sage_engagement/state_<operation>.json`, next to the running Sage process
-  (`SAGE_ENGAGEMENT_STATE_DIR` overrides the directory). Keyed per Mythic operation, it is the portable,
-  exportable record of the assessment — not a checkpoint or a trace, both of which live elsewhere and prove
-  nothing on their own.
+- **Where it lives.** In Sage's application database, `sage.db` (`SAGE_DATABASE_PATH` overrides it), keyed by
+  the Mythic operation and the reset marker Sage stores in that operation. Every change is a short transaction
+  that touches only the rows it changes and appends to the row's history, so concurrent channels never overwrite
+  each other. `skills/sage-goad-reset/scripts/engagement_ledger_migrate.py export` writes the portable JSON record
+  of an operation; the reset archives the database together with those exports. It is not a checkpoint or a
+  trace, both of which live elsewhere and prove nothing on their own. Ledgers from releases that stored
+  `.sage_engagement/state_*.json` files are imported once with that script's `import` command, with Sage stopped.
 
 **Why a ledger at all.** An autonomous agent that reasons only over its own transcript re-runs steps it has
 already completed and attempts steps whose preconditions it never met: it substitutes recitation for perception.
@@ -430,8 +436,9 @@ the token has no read scope for.
 |---|---|
 | `/state` | Show the [engagement ledger](#the-engagement-ledger) — the durable hop table of proven effects shared by chats in the current Mythic operation engagement |
 | `/state objective <text>` | Set the engagement objective |
-| `/state reconcile [task_id] [apply]` | Import verified effects and credentials from completed Mythic tasks — **dry-run unless `apply`** is given, because task output is attacker-influenceable |
-| `/state set <#> <status>` · `/state remove <#>` · `/state wipe` | Edit or clear ledger rows by hop number (the `#` column) or hop id (you cannot hand-promote a row to `achieved` — that needs a real proof envelope) |
+| `/state reconcile [task_id] [apply]` | Record verified effects from completed Mythic tasks; credential import is **dry-run unless `apply`** is given, because task output is attacker-influenceable |
+| `/state remove <#>[,…] [--reason <text>]` · `/state restore <#>[,…]` · `/state invalidate <#>[,…]` | Retract a row, undo a retraction, or mark a row "no longer holds", by hop number (the `#` column) or hop id. Rows are kept and numbered; you cannot hand-promote a row to `achieved` — that needs a real proof envelope |
+| `/state wipe` | Retract every row and every current graph fact; nothing is deleted or renumbered |
 | `/mode [conversation\|supervised\|auto]` | Show or switch the channel's mode |
 | `/list` | List active Sage chat sessions |
 | `/tools` | List Sage's public Mythic tool functions, descriptions, and access requirements |

@@ -7,6 +7,28 @@ between minor releases.
 
 ## [Unreleased]
 
+### Changed
+
+- The engagement ledger is now one shared store per Mythic operation in `sage.db`. Every chat channel of an
+  operation reads it fresh and writes only the rows it changes, so two sessions no longer erase each other's
+  rows, and a `/state` correction reaches running sessions on their next read. Hop numbers are assigned once
+  and never change or get reused: a ledger numbered 23–29 stays 23–29 and the next hop is 30.
+- `/state remove` now records a retraction (who, when and why) instead of deleting the row; `/state restore`
+  undoes it and `/state invalidate` marks a row "no longer holds". Corrected rows stay listed with their numbers
+  and are shown as `achieved — operator retracted` or `achieved — no longer holds`; no gate, capability input
+  or completion check relies on them. `/state wipe` retracts every row and every current graph fact without
+  deleting or renumbering anything. `/state set` is disabled.
+- A once-proven achievement stays historical: a contradicting observation adds a "no longer holds" marker with
+  its evidence instead of rewriting the row to failed.
+- Evaluator observations are stored on the evaluation side (`SAGE_EVAL_OBSERVATIONS_DIR`), never in Sage's
+  ledger or model context.
+
+### Upgrade
+
+- Stop Sage and import existing `.sage_engagement/state_*.json` ledgers with
+  `skills/sage-goad-reset/scripts/engagement_ledger_migrate.py import --sage-stopped`. Sage reports the ledger
+  as unavailable until every legacy file is imported or explicitly excluded. Source files are never modified.
+
 ## [0.3.0] - 2026-11-03
 
 Sage 0.3.0 bounds and scopes each supervised step, reads every step's results from Mythic rather than from the

@@ -1,3 +1,4 @@
+from tests.esl_fixtures import seed_ledger  # noqa: E402
 import asyncio
 import base64
 import hashlib
@@ -238,7 +239,7 @@ def _seed_hop(mt: MythicTools, technique: str, target: str) -> None:
         {"source": "test", "task_id": "seed"},
         "2026-06-06T12:00:00Z",
     )
-    mt._engagement_hops = state.hops
+    seed_ledger(mt, hops=state.hops)
 
 
 def _seeded_reconcile(mt: MythicTools):
@@ -254,7 +255,9 @@ _AGENT_REPORTED_TASK = {"display_id": 77, "status": "completed", "completed": Tr
                         "callback": {"display_id": 2}}
 
 
-def _proof_hop(effect, task_id, callback_id="", technique="capability:seed", target="seed", transaction_id=None):
+def _proof_hop(effect, task_id, callback_id="", technique="capability:seed", target=None, transaction_id=None):
+    # One ledger row per (technique, target) identity, as the store enforces: default the target to the effect.
+    target = effect if target is None else target
     proof = _task_proof(task_id, callback_id or "13", transaction_id=transaction_id)
     evidence, admission = proof_boundary.attach_proof(
         {"source": "test"},
@@ -298,6 +301,8 @@ def _ca_artifact_hop(path: Path, *, engagement_id="test-op", callback_id="13", t
     assert admission.admitted
     return {
         "id": "capability:adcs-ca-private-key-export:target=ca01;target_domain=lab.local;callback=13",
+        "technique": "capability:adcs-ca-private-key-export",
+        "target": "target=ca01;target_domain=lab.local;callback=13",
         "effect": "adcs-ca-private-key:ca01@lab.local",
         "status": "achieved",
         "satisfied_effects": ["adcs-ca-private-key:ca01@lab.local"],
@@ -597,15 +602,15 @@ def test_collect_graph_targeted_scope_uses_distinct_inflight_key(monkeypatch, sc
     mt = _make_tools()
     _arm_unenrolled_executable_fixture(mt, "SharpHound.exe")
     mt._assembly_file_checks.add("sharphound.exe")
-    mt._engagement_hops = achieved.hops
-    mt._engagement_graph_facts = [
+    seed_ledger(mt, hops=achieved.hops)
+    seed_ledger(mt, graph_facts=[
         engagement_state.GraphFact(
             "domain-collected:north.sevenkingdoms.local",
             "bloodhound:domain_info",
             "2026-06-17T00:00:00Z",
             600,
         )
-    ]
+    ])
     with patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
         patch.object(mythic_tools.mythic, "get_all_tasks", fake_tasks), \
         _split_issue("SharpHound completed", calls, display_id=778):
@@ -906,7 +911,7 @@ def test_stage_b_collect_graph_skip_requires_graph_corroboration(monkeypatch):
     mt = _make_tools()
     _arm_unenrolled_executable_fixture(mt, "SharpHound.exe")
     mt._assembly_file_checks.add("sharphound.exe")
-    mt._engagement_hops = achieved.hops
+    seed_ledger(mt, hops=achieved.hops)
     calls = {"issue": 0}
     with patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
         patch.object(mythic_tools.mythic, "get_all_tasks", fake_tasks), \
@@ -925,8 +930,8 @@ def test_stage_b_collect_graph_skip_requires_graph_corroboration(monkeypatch):
 
     mt2 = _make_tools()
     mt2._assembly_file_checks.add("sharphound.exe")
-    mt2._engagement_hops = achieved.hops
-    mt2._engagement_graph_facts = [
+    seed_ledger(mt2, hops=achieved.hops)
+    seed_ledger(mt2, graph_facts=[
         engagement_state.GraphFact(
             "domain-collected:north.sevenkingdoms.local",
             "bloodhound:domain_info",
@@ -934,7 +939,7 @@ def test_stage_b_collect_graph_skip_requires_graph_corroboration(monkeypatch):
             600,
             proof_envelope=proof,
         )
-    ]
+    ])
     calls2 = {"issue": 0}
     with patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
         patch.object(mythic_tools.mythic, "get_all_tasks", fake_tasks), \
@@ -985,15 +990,15 @@ def test_operator_requested_collection_overrides_same_scope_graph_skip(monkeypat
     mt = _make_tools()
     _arm_unenrolled_executable_fixture(mt, "SharpHound.exe")
     mt._assembly_file_checks.add("sharphound.exe")
-    mt._engagement_hops = achieved.hops
-    mt._engagement_graph_facts = [
+    seed_ledger(mt, hops=achieved.hops)
+    seed_ledger(mt, graph_facts=[
         engagement_state.GraphFact(
             "domain-collected:north.sevenkingdoms.local",
             "bloodhound:domain_info",
             "2026-06-17T00:00:00Z",
             600,
         )
-    ]
+    ])
     mt.begin_operator_turn(
         "Run a SharpHound collection against north.sevenkingdoms.local and ingest the data into BloodHound."
     )
@@ -1102,14 +1107,14 @@ def test_stage_b_dcsync_precheck_blocks_then_caps_through_issue_hook(monkeypatch
         return [foothold]
 
     mt = _make_tools()
-    mt._engagement_graph_facts = [
+    seed_ledger(mt, graph_facts=[
         engagement_state.GraphFact(
             "domain:north.sevenkingdoms.local",
             "bloodhound:domain_info",
             "2026-06-17T00:00:00Z",
             600,
         )
-    ]
+    ])
     calls = {"issue": 0}
     params = {"domain": "north.sevenkingdoms.local"}
 
@@ -1126,6 +1131,35 @@ def test_stage_b_dcsync_precheck_blocks_then_caps_through_issue_hook(monkeypatch
     assert mt._dcsync_precheck_blocks[("dcsync", "north.sevenkingdoms.local")] == mt._DCSYNC_PRECHECK_MAX_BLOCKS
 
 
+def test_an_unrecorded_result_is_reported_on_the_issue_path_and_the_task_is_not_repeated(monkeypatch):
+    from ai.langgraph import engagement_store
+
+    foothold = _foothold(host="CASTELBLACK", forest="north.sevenkingdoms.local")
+
+    async def fake_reconcile(mythic_tools_obj, now):
+        return [foothold]
+
+    mt = _make_tools()
+    mt._dcsync_precheck_blocks[("dcsync", "north.sevenkingdoms.local")] = mt._DCSYNC_PRECHECK_MAX_BLOCKS
+    store = mt._ledger_store()
+
+    def disk_full(*_args, **_kwargs):
+        raise engagement_store.LedgerWriteFailed("disk full")
+
+    monkeypatch.setattr(store, "apply", disk_full)
+    calls = {"issue": 0}
+    with patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
+        _split_issue("Hash NTLM: 2b576acbe6bcfda7294d6bd18041b8fe", calls):
+        output = asyncio.run(mt.issue_task_and_waitfor_task_output(
+            "dcsync", {"domain": "north.sevenkingdoms.local"}, 50, timeout=5))
+
+    assert calls["issue"] == 1
+    assert "Hash NTLM:" in output
+    assert "[engagement-ledger] The observed result could not be recorded" in output
+    assert "Do not repeat the task" in output
+    assert mt._engagement_hops == []
+
+
 def test_ticket_gate_blocks_prompt_built_rubeus_before_tasking():
     calls = {"issue": 0}
 
@@ -1133,14 +1167,14 @@ def test_ticket_gate_blocks_prompt_built_rubeus_before_tasking():
         return [_foothold(host="CASTELBLACK", forest="north.sevenkingdoms.local")]
 
     mt = _make_tools()
-    mt._engagement_hops = engagement_state.record_hop_result(
+    seed_ledger(mt, hops=engagement_state.record_hop_result(
         engagement_state.EngagementState(objective="test"),
         "dcsync",
         "north.sevenkingdoms.local",
         "achieved",
         {"source": "test", "provenance": "run", "artifact_present": True},
         "2026-06-11T00:00:00Z",
-    ).hops
+    ).hops)
 
     with patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
         _split_issue("should not issue", calls):
@@ -1201,14 +1235,14 @@ def test_ticket_gate_allows_builder_emitted_managed_kerberos_forge_command():
 
     mt = _make_tools()
     _arm_unenrolled_executable_fixture(mt, "Rubeus.exe")
-    mt._engagement_hops = engagement_state.record_hop_result(
+    seed_ledger(mt, hops=engagement_state.record_hop_result(
         engagement_state.EngagementState(objective="test"),
         "dcsync",
         "north.sevenkingdoms.local",
         "achieved",
         {"source": "test", "provenance": "run", "artifact_present": True},
         "2026-06-11T00:00:00Z",
-    ).hops
+    ).hops)
     command = {
         "assembly_name": "Rubeus.exe",
         "assembly_arguments": (
@@ -1247,14 +1281,14 @@ def test_ensure_kerberos_context_forge_is_not_skipped_by_durable_da():
 
     mt = _make_tools()
     _arm_unenrolled_executable_fixture(mt, "Rubeus.exe")
-    mt._engagement_hops = engagement_state.record_hop_result(
+    seed_ledger(mt, hops=engagement_state.record_hop_result(
         engagement_state.EngagementState(objective="test"),
         "sid-history-escalation",
         "north.sevenkingdoms.local",
         "achieved",
         {"source": "test", "provenance": "durable", "artifact_present": True},
         "2026-06-11T00:00:00Z",
-    ).hops
+    ).hops)
     command = {
         "assembly_name": "Rubeus.exe",
         "assembly_arguments": (
@@ -1389,14 +1423,14 @@ def test_ticket_gate_blocks_builder_shaped_command_not_emitted_by_builder():
         return [_foothold(host="CASTELBLACK", forest="north.sevenkingdoms.local")]
 
     mt = _make_tools()
-    mt._engagement_hops = engagement_state.record_hop_result(
+    seed_ledger(mt, hops=engagement_state.record_hop_result(
         engagement_state.EngagementState(objective="test"),
         "dcsync",
         "north.sevenkingdoms.local",
         "achieved",
         {"source": "test", "provenance": "run", "artifact_present": True},
         "2026-06-11T00:00:00Z",
-    ).hops
+    ).hops)
 
     with patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
         _split_issue("should not issue", calls):
@@ -1504,10 +1538,9 @@ Administrator            arya
 The command completed successfully.
 """
 
-    with patch.object(mt, "_persist_engagement_ledger") as persist:
-        _record_success(mt, output)
+    _record_success(mt, output)
 
-    persist.assert_called_once()
+    assert len(mt._ledger_snapshot().hop_rows()) == 1  # committed to the shared store
     assert len(mt._engagement_hops) == 1
     hop = mt._engagement_hops[0]
     assert hop.technique == "domain-admin-membership-check"
@@ -1562,8 +1595,7 @@ def test_record_capability_result_bridge_records_and_persists():
         effects=["ds-replication-rights:lab.local"],
     )
 
-    with patch.object(mt, "_persist_engagement_ledger") as persist:
-        verification = mt.record_capability_result(
+    verification = mt.record_capability_result(
             action,
             {"ds_replication_rights": True},
             now="2026-06-10T13:00:00Z",
@@ -1577,7 +1609,7 @@ def test_record_capability_result_bridge_records_and_persists():
         )
 
     assert verification.verdict == "achieved"
-    persist.assert_called_once()
+    assert len(mt._ledger_snapshot().hop_rows()) == 1
     assert len(mt._engagement_hops) == 1
     hop = mt._engagement_hops[0]
     assert hop.technique == "capability:grant-directory-rights"
@@ -1611,12 +1643,11 @@ def test_record_graph_built_persists_policy_decision_provenance():
         },
     })
     try:
-        with patch.object(mt, "_persist_engagement_ledger") as persist:
-            asyncio.run(mt._record_graph_built("50", True, covered_domains=["north.local"]))
+        asyncio.run(mt._record_graph_built("50", True, covered_domains=["north.local"]))
     finally:
         mythic_tools._task_visibility_context.reset(token)
 
-    persist.assert_called_once()
+    assert len(mt._ledger_snapshot().hop_rows()) == 1
     hop = mt._engagement_hops[0]
     assert hop.technique == "collect-graph"
     assert hop.evidence["decision_id"] == "decision-collect"
@@ -1994,7 +2025,7 @@ def test_build_capability_commands_gpo_fallback_augments_guid_from_graph_facts()
             timestamp="2026-06-15T20:00:00Z",
         )
     ]
-    mt._engagement_graph_facts = [
+    seed_ledger(mt, graph_facts=[
         engagement_state.GraphFact(
             "gpo-guid:starkwallpaper:0a93e998-2599-4da8-9717-6744993ded3a",
             "bloodhound:cypher",
@@ -2007,7 +2038,7 @@ def test_build_capability_commands_gpo_fallback_augments_guid_from_graph_facts()
             "2026-06-15T20:00:00Z",
             600,
         ),
-    ]
+    ])
 
     plan = json.loads(asyncio.run(mt.build_capability_commands(
         {
@@ -2043,7 +2074,7 @@ def test_build_capability_commands_dc_scoped_gpo_overrides_initial_fallback_whoa
             timestamp="2026-06-15T20:00:00Z",
         )
     ]
-    mt._engagement_graph_facts = [
+    seed_ledger(mt, graph_facts=[
         engagement_state.GraphFact(
             "gpo-guid:starkwallpaper:0a93e998-2599-4da8-9717-6744993ded3a",
             "bloodhound:cypher",
@@ -2056,7 +2087,7 @@ def test_build_capability_commands_dc_scoped_gpo_overrides_initial_fallback_whoa
             "2026-06-15T20:00:00Z",
             600,
         ),
-    ]
+    ])
 
     plan = json.loads(asyncio.run(mt.build_capability_commands(
         {
@@ -2103,7 +2134,7 @@ def test_build_capability_commands_dc_scoped_sparse_gpo_defaults_to_group_add():
             timestamp="2026-06-15T20:00:00Z",
         )
     ]
-    mt._engagement_graph_facts = [
+    seed_ledger(mt, graph_facts=[
         engagement_state.GraphFact(
             "gpo-guid:starkwallpaper:0a93e998-2599-4da8-9717-6744993ded3a",
             "bloodhound:cypher",
@@ -2116,7 +2147,7 @@ def test_build_capability_commands_dc_scoped_sparse_gpo_defaults_to_group_add():
             "2026-06-15T20:00:00Z",
             600,
         ),
-    ]
+    ])
 
     plan = json.loads(asyncio.run(mt.build_capability_commands(
         {
@@ -2363,7 +2394,7 @@ def test_gpo_action_dict_preserves_affected_hosts_to_skip_wrong_local_gpupdate()
 
 def test_build_capability_commands_gpo_fallback_augments_gpo_from_guid_graph_fact():
     mt = _make_tools()
-    mt._engagement_graph_facts = [
+    seed_ledger(mt, graph_facts=[
         engagement_state.GraphFact(
             "gpo-guid:starkwallpaper:0a93e998-2599-4da8-9717-6744993ded3a",
             "bloodhound:cypher",
@@ -2376,7 +2407,7 @@ def test_build_capability_commands_gpo_fallback_augments_gpo_from_guid_graph_fac
             "2026-06-15T20:00:00Z",
             600,
         ),
-    ]
+    ])
 
     plan = json.loads(asyncio.run(mt.build_capability_commands(
         {
@@ -2863,14 +2894,14 @@ def test_execute_capability_gpo_direct_invalid_xml_waits_for_membership_before_r
             timestamp="2026-06-15T20:00:00Z",
         )
     ]
-    mt._engagement_graph_facts = [
+    seed_ledger(mt, graph_facts=[
         engagement_state.GraphFact(
             "gpo-affects-dc:starkwallpaper:winterfell:north.sevenkingdoms.local",
             "bloodhound:cypher",
             "2026-06-15T20:00:00Z",
             600,
         ),
-    ]
+    ])
     waits = []
 
     async def fake_sleep(seconds, result=None):
@@ -3039,14 +3070,14 @@ def test_execute_capability_gpo_proof_reconciles_the_pending_setup_hop_shown_in_
             timestamp="2026-11-03T16:25:00Z",
         )
     ]
-    mt._engagement_graph_facts = [
+    seed_ledger(mt, graph_facts=[
         engagement_state.GraphFact(
             "gpo-affects-dc:starkwallpaper:winterfell:north.sevenkingdoms.local",
             "bloodhound:cypher",
             "2026-11-03T16:25:00Z",
             600,
         ),
-    ]
+    ])
 
     async def fake_sleep(seconds, result=None):
         return result
@@ -3119,11 +3150,9 @@ def test_execute_capability_gpo_proof_reconciles_the_pending_setup_hop_shown_in_
         setup_hop,
     )
 
-    # The operator's /state view: the same renderer, after the persist-time quarantine of unproven rows.
-    payload = {"hops": engagement_state.hops_to_dicts(mt._engagement_hops)}
-    engagement_ledger._quarantine_unproven_achievements(payload, mt._eng_key())
-    engagement_ledger.assign_hop_numbers(payload)
-    rows = [line for line in engagement_ledger.render_hop_table(payload["hops"]) if "gpo-abuse:starkwallpaper" in line]
+    # The operator's /state view: the same renderer over the stored rows, quarantined as the runtime view is.
+    eligible, _ineligible = mt._ledger_snapshot().runtime_hop_dicts()
+    rows = [line for line in engagement_ledger.render_hop_table(eligible) if "gpo-abuse:starkwallpaper" in line]
     assert len(rows) == 1
     assert "`pending`" not in rows[0]
     assert "`achieved`" in rows[0]
@@ -4034,13 +4063,13 @@ def test_deterministic_managed_secret_read_records_redacted_effect():
 
 def test_execute_capability_managed_secret_read_refreshes_stale_account_context(monkeypatch):
     mt = _make_tools()
-    mt._engagement_hops = [_proof_hop(
+    seed_ledger(mt, hops=[_proof_hop(
         "kerberos-account-context:alice@lab.local@callback:13",
         7000,
         callback_id="13",
         technique="capability:ensure-account-kerberos-context",
         target="domain=lab.local;account=alice;callback=13",
-    )]
+    )])
     mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
     mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
     mt._resolve_domain_controller_host = lambda domain: asyncio.sleep(
@@ -4291,13 +4320,13 @@ def test_read_managed_secret_imports_plaintext_credential(monkeypatch):
 
 def test_select_account_credential_recovers_from_recorded_dcsync_task(monkeypatch):
     mt = _make_tools()
-    mt._engagement_hops = [_proof_hop(
+    seed_ledger(mt, hops=[_proof_hop(
         r"creds:sevenkingdoms\cersei.lannister@sevenkingdoms.local",
         8901,
         callback_id="13",
         technique="dcsync-user",
         target=r"sevenkingdoms\cersei.lannister@sevenkingdoms.local",
-    )]
+    )])
     mt._fetch_credentials_cached = lambda now: asyncio.sleep(0, result=[])
     mt._fetch_plain_task_output = lambda task_id: asyncio.sleep(
         0,
@@ -4332,13 +4361,13 @@ def test_select_account_credential_recovers_from_recorded_dcsync_task(monkeypatc
 
 def test_managed_secret_selector_recovers_from_recorded_task(monkeypatch):
     mt = _make_tools()
-    mt._engagement_hops = [_proof_hop(
+    seed_ledger(mt, hops=[_proof_hop(
         "managed-local-admin-secret:ws01@child.lab.local",
         7101,
         callback_id="13",
         technique="capability:read-managed-local-admin-secret",
         target="account=alice;account_domain=lab.local;target=ws01;target_domain=child.lab.local;callback=13",
-    )]
+    )])
     mt._fetch_credentials_cached = lambda now: asyncio.sleep(0, result=[])
     mt._fetch_plain_task_output = lambda task_id: asyncio.sleep(
         0,
@@ -4410,11 +4439,11 @@ def test_build_capability_commands_adcs_ca_export_uses_current_context_powerpick
 
 def test_execute_capability_rejects_wrong_host_ca_export_scope(monkeypatch):
     mt = _make_tools()
-    mt._engagement_hops = [
+    seed_ledger(mt, hops=[
         _proof_hop("managed-local-admin-secret:braavos@essos.local", 7201, callback_id="13"),
         _proof_hop("local-admin:braavos@essos.local", 7202, callback_id="13"),
         _proof_hop("remote-exec:braavos@essos.local", 7203, callback_id="13"),
-    ]
+    ])
 
     async def no_matching_secret(target_host, target_domain, local_account):
         return {}
@@ -4440,10 +4469,10 @@ def test_execute_capability_rejects_wrong_host_ca_export_scope(monkeypatch):
 
 def test_build_capability_commands_adcs_ca_export_uses_wmiexecute_after_remote_exec(monkeypatch):
     mt = _make_tools()
-    mt._engagement_hops = [
+    seed_ledger(mt, hops=[
         _proof_hop("remote-exec:ca01@lab.local", 7301, callback_id="13"),
         _proof_hop("local-admin:ca01@lab.local", 7302, callback_id="13"),
-    ]
+    ])
 
     async def fake_select(target_host, target_domain, local_account):
         return {
@@ -4497,10 +4526,10 @@ def test_build_capability_commands_adcs_ca_export_uses_wmiexecute_after_remote_e
 
 def test_build_capability_commands_adcs_ca_export_apollo_defaults_to_token_backed_wmiexecute(monkeypatch):
     mt = _make_tools()
-    mt._engagement_hops = [
+    seed_ledger(mt, hops=[
         _proof_hop("remote-exec:ca01@lab.local", 7301, callback_id="13"),
         _proof_hop("local-admin:ca01@lab.local", 7302, callback_id="13"),
-    ]
+    ])
 
     async def fake_payload_type(callback_id):
         return "apollo"
@@ -4552,10 +4581,10 @@ def test_build_capability_commands_adcs_ca_export_apollo_defaults_to_token_backe
 
 def test_build_capability_commands_adcs_ca_export_uses_merlin_profile_after_remote_exec(monkeypatch):
     mt = _make_tools()
-    mt._engagement_hops = [
+    seed_ledger(mt, hops=[
         _proof_hop("remote-exec:ca01@lab.local", 7301, callback_id="13"),
         _proof_hop("local-admin:ca01@lab.local", 7302, callback_id="13"),
-    ]
+    ])
 
     async def fake_payload_type(callback_id):
         assert callback_id == 13
@@ -4591,10 +4620,10 @@ def test_build_capability_commands_adcs_ca_export_uses_merlin_profile_after_remo
 
 def test_build_capability_commands_adcs_ca_export_apollo_explicit_wmiexecute_still_uses_token_context(monkeypatch):
     mt = _make_tools()
-    mt._engagement_hops = [
+    seed_ledger(mt, hops=[
         _proof_hop("remote-exec:ca01@lab.local", 7301, callback_id="13"),
         _proof_hop("local-admin:ca01@lab.local", 7302, callback_id="13"),
-    ]
+    ])
 
     async def fake_payload_type(callback_id):
         return "apollo"
@@ -4629,10 +4658,10 @@ def test_build_capability_commands_adcs_ca_export_apollo_explicit_wmiexecute_sti
 
 def test_build_capability_commands_adcs_ca_export_sharpdpapi_uses_powerpick(monkeypatch):
     mt = _make_tools()
-    mt._engagement_hops = [
+    seed_ledger(mt, hops=[
         _proof_hop("remote-exec:ca01@lab.local", 7301, callback_id="13"),
         _proof_hop("local-admin:ca01@lab.local", 7302, callback_id="13"),
-    ]
+    ])
 
     async def fake_select(target_host, target_domain, local_account):
         return {
@@ -4716,14 +4745,14 @@ def test_build_capability_commands_supports_local_admin_secret_use_from_credenti
 
 def test_execute_local_admin_secret_use_tasks_mythic_credential_reference(monkeypatch):
     mt = _make_tools()
-    mt._engagement_hops = [
+    seed_ledger(mt, hops=[
         _proof_hop(
             "managed-local-admin-secret:ws01@child.lab.local",
             7200,
             callback_id="13",
             technique="capability:read-managed-local-admin-secret",
         )
-    ]
+    ])
     mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(
         0,
         result=_apollo_make_token_schema() if command == "make_token" else [],
@@ -5060,9 +5089,9 @@ def test_deterministic_remote_execution_records_effect_without_secret():
 
 def test_execute_capability_remote_execution_records_final_proof(monkeypatch):
     mt = _make_tools()
-    mt._engagement_hops = [
+    seed_ledger(mt, hops=[
         _proof_hop("local-admin:ws01@child.lab.local", 7299, callback_id="13"),
-    ]
+    ])
     mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
     mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
 
@@ -5108,9 +5137,9 @@ def test_execute_capability_remote_execution_records_final_proof(monkeypatch):
 
 def test_execute_capability_retries_missing_remote_exec_proof(monkeypatch):
     mt = _make_tools()
-    mt._engagement_hops = [
+    seed_ledger(mt, hops=[
         _proof_hop("local-admin:ws01@child.lab.local", 7299, callback_id="13"),
-    ]
+    ])
     mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
     mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
 
@@ -5158,9 +5187,9 @@ def test_execute_capability_retries_missing_remote_exec_proof(monkeypatch):
 
 def test_execute_capability_apollo_remote_exec_records_local_admin_context_proof(monkeypatch):
     mt = _make_tools()
-    mt._engagement_hops = [
+    seed_ledger(mt, hops=[
         _proof_hop("local-admin:ws01@child.lab.local", 7299, callback_id="13"),
-    ]
+    ])
     mt._kerberos_logon_context_keys.add((13, "ws01", "administrator", True))
     mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
     mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
@@ -5216,9 +5245,9 @@ def test_execute_capability_apollo_remote_exec_records_local_admin_context_proof
 
 def test_execute_capability_apollo_remote_exec_refreshes_replaced_local_admin_context(monkeypatch):
     mt = _make_tools()
-    mt._engagement_hops = [
+    seed_ledger(mt, hops=[
         _proof_hop("local-admin:oak-ops01@oak.ridge.local", 7299, callback_id="13"),
-    ]
+    ])
     mt._kerberos_logon_context_keys.add((13, "pine-ops01", "administrator", True))
     mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
     mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
@@ -5272,10 +5301,10 @@ def test_execute_capability_apollo_remote_exec_refreshes_replaced_local_admin_co
 def test_execute_capability_adcs_ca_export_records_wmiexecute_readback(monkeypatch, tmp_path):
     mt = _make_tools()
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
-    mt._engagement_hops = [
+    seed_ledger(mt, hops=[
         _proof_hop("remote-exec:ca01@lab.local", 7301, callback_id="13"),
         _proof_hop("local-admin:ca01@lab.local", 7302, callback_id="13"),
-    ]
+    ])
     mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
     mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
 
@@ -5338,10 +5367,10 @@ def test_execute_capability_adcs_ca_export_records_wmiexecute_readback(monkeypat
 def test_execute_capability_apollo_adcs_ca_export_uses_token_backed_wmiexecute_readback(monkeypatch, tmp_path):
     mt = _make_tools()
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
-    mt._engagement_hops = [
+    seed_ledger(mt, hops=[
         _proof_hop("remote-exec:ca01@lab.local", 7301, callback_id="13"),
         _proof_hop("local-admin:ca01@lab.local", 7302, callback_id="13"),
-    ]
+    ])
     mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
     mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
 
@@ -5408,9 +5437,9 @@ def test_execute_capability_apollo_adcs_ca_export_uses_token_backed_wmiexecute_r
 
 def test_execute_capability_adcs_esc_enroll_records_certificate_effect():
     mt = _make_tools()
-    mt._engagement_hops = [
+    seed_ledger(mt, hops=[
         _proof_hop("adcs-ca-key-export-blocked:ca01@lab.local", 7401, callback_id="13"),
-    ]
+    ])
     mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
     mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
     pfx = base64.b64encode(b"0" + b"B" * 512).decode("ascii")
@@ -5451,10 +5480,10 @@ def test_execute_capability_adcs_esc_enroll_records_certificate_effect():
 
 def test_execute_capability_adcs_ca_export_returns_key_not_exportable_blocker(monkeypatch):
     mt = _make_tools()
-    mt._engagement_hops = [
+    seed_ledger(mt, hops=[
         _proof_hop("remote-exec:ca01@lab.local", 7301, callback_id="13"),
         _proof_hop("local-admin:ca01@lab.local", 7302, callback_id="13"),
-    ]
+    ])
     mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
     mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
 
@@ -5501,10 +5530,10 @@ def test_execute_capability_adcs_ca_export_returns_key_not_exportable_blocker(mo
 
 def test_execute_capability_adcs_ca_export_does_not_auto_retry_sharpdpapi(monkeypatch):
     mt = _make_tools()
-    mt._engagement_hops = [
+    seed_ledger(mt, hops=[
         _proof_hop("remote-exec:ca01@lab.local", 7301, callback_id="13"),
         _proof_hop("local-admin:ca01@lab.local", 7302, callback_id="13"),
-    ]
+    ])
     mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
     mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
 
@@ -5550,10 +5579,10 @@ def test_execute_capability_adcs_ca_export_does_not_auto_retry_sharpdpapi(monkey
 
 def test_execute_capability_adcs_ca_export_retries_sharpdpapi_when_key_not_exportable(monkeypatch):
     mt = _make_tools()
-    mt._engagement_hops = [
+    seed_ledger(mt, hops=[
         _proof_hop("remote-exec:ca01@lab.local", 7301, callback_id="13"),
         _proof_hop("local-admin:ca01@lab.local", 7302, callback_id="13"),
-    ]
+    ])
     mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
     mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
 
@@ -5705,7 +5734,7 @@ def test_build_capability_commands_forge_selects_krbtgt_key_and_parent_ea_sid():
 def test_build_capability_commands_recovers_krbtgt_key_from_recorded_dcsync_task(monkeypatch):
     mt = _make_tools()
     domain = "north.sevenkingdoms.local"
-    mt._engagement_hops = [_proof_hop(f"krbtgt-hash:{domain}", 86, callback_id="2")]
+    seed_ledger(mt, hops=[_proof_hop(f"krbtgt-hash:{domain}", 86, callback_id="2")])
 
     async def empty_credentials(now):
         return []
@@ -6175,8 +6204,9 @@ def test_cross_domain_current_tgt_import_grants_rights_and_precheck_honors_it(mo
     monkeypatch.setattr(access_reconciler, "reconcile_access", _reconcile)
     mt._corroboration_facts = _corro
     mt._refresh_graph_facts_if_stale = _refresh
-    mt._engagement_graph_facts = [object()]  # graph POPULATED -> absence of the right is real evidence
-    mt._engagement_hops = []
+    # graph POPULATED -> absence of the right is real evidence
+    seed_ledger(mt, graph_facts=[engagement_state.GraphFact(
+        "generic-write:gpo:unrelated-policy", "bloodhound:cypher", "2026-06-12T00:00:00Z", 600)])
     mt._engagement_footholds = []
 
     params = {"domain": "sevenkingdoms.local", "user": "SEVENKINGDOMS\\krbtgt", "dc": "kingslanding.sevenkingdoms.local"}
@@ -6369,7 +6399,7 @@ def test_execute_capability_reproves_already_achieved_current_context():
         "2026-06-12T12:00:00Z",
         satisfied_effects=["kerberos-context:essos.local@callback:14"],
     )
-    mt._engagement_hops = state.hops
+    seed_ledger(mt, hops=state.hops)
     outputs = iter([
         "krbtgt/essos.local for Administrator@essos.local",
         "Directory of \\\\braavos.essos.local\\C$\r\nWindows\r\n",
@@ -6396,7 +6426,7 @@ def test_execute_capability_reproves_already_achieved_current_context():
 
 def test_execute_capability_admin_control_proof_alias_reproves_existing_context():
     mt = _make_tools()
-    mt._engagement_hops = [
+    seed_ledger(mt, hops=[
         _proof_hop("da:essos.local", "655", technique="capability:adcs-certificate-auth", target="domain=essos.local"),
         _proof_hop(
             "certificate-auth:administrator@essos.local",
@@ -6413,7 +6443,7 @@ def test_execute_capability_admin_control_proof_alias_reproves_existing_context(
             technique="capability:ensure-kerberos-context",
             target="domain=essos.local;callback=14",
         ),
-    ]
+    ])
     outputs = iter([
         "krbtgt/essos.local for Administrator@essos.local",
         "Directory of \\\\braavos.essos.local\\C$\r\nWindows\r\n",
@@ -6743,12 +6773,9 @@ def test_materialize_capability_inputs_stages_adcs_certificate_then_builder_uses
     state_dir = Path(os.environ["SAGE_ENGAGEMENT_STATE_DIR"])
     artifact_dir = state_dir / "artifacts"
     ca_artifact = _write_test_ca_pfx(artifact_dir / "adcs_ca_test_ca01_lab.local.pfx", "CA Secret!")
-    engagement_ledger.save({
-        "engagement_id": "test-op",
-        "hops": [_ca_artifact_hop(ca_artifact)],
-    }, "test-op")
+    monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "test-op")
     mt = _make_tools()
-    mt._engagement_key = "test-op"
+    seed_ledger(mt, hops=[_ca_artifact_hop(ca_artifact)])
     calls = {}
 
     async def fake_register_file(filename, contents):
@@ -6827,12 +6854,9 @@ def test_materialize_capability_inputs_compacts_merlin_paths_and_uses_registered
     state_dir = Path(os.environ["SAGE_ENGAGEMENT_STATE_DIR"])
     artifact_dir = state_dir / "artifacts"
     ca_artifact = _write_test_ca_pfx(artifact_dir / "adcs_ca_test_ca01_lab.local.pfx", "CA Secret!")
-    engagement_ledger.save({
-        "engagement_id": "test-op",
-        "hops": [_ca_artifact_hop(ca_artifact)],
-    }, "test-op")
+    monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "test-op")
     mt = _make_tools()
-    mt._engagement_key = "test-op"
+    seed_ledger(mt, hops=[_ca_artifact_hop(ca_artifact)])
     calls = {}
 
     async def fake_register_file(filename, contents):
@@ -6894,9 +6918,9 @@ def test_materialize_capability_inputs_compacts_merlin_paths_and_uses_registered
 def test_materialize_capability_inputs_upload_emits_active_transaction_lineage(monkeypatch):
     state_dir = Path(os.environ["SAGE_ENGAGEMENT_STATE_DIR"])
     ca_artifact = _write_test_ca_pfx(state_dir / "artifacts" / "adcs_ca_test_ca01_lab.local.pfx", "CA Secret!")
-    engagement_ledger.save({"engagement_id": "test-op", "hops": [_ca_artifact_hop(ca_artifact)]}, "test-op")
+    monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "test-op")
     mt = _make_tools()
-    mt._engagement_key = "test-op"
+    seed_ledger(mt, hops=[_ca_artifact_hop(ca_artifact)])
     events = []
     mt.set_execution_observer(events.append)
 
@@ -6946,19 +6970,17 @@ def test_materialize_capability_inputs_upload_emits_active_transaction_lineage(m
         "Path": r"C:\Windows\Temp\sage_ca_signing_administrator_lab_local_13.pfx",
     }
     assert events[1]["output"] == "Uploaded forged PFX"
-    assert mt._engagement_hops == []
+    # Materialization records nothing: only the seeded CA artifact row is in the ledger.
+    assert [hop.technique for hop in mt._engagement_hops] == ["capability:adcs-ca-private-key-export"]
 
 
 def test_materialize_capability_inputs_fails_closed_when_adcs_upload_never_issues_task(monkeypatch):
     state_dir = Path(os.environ["SAGE_ENGAGEMENT_STATE_DIR"])
     artifact_dir = state_dir / "artifacts"
     ca_artifact = _write_test_ca_pfx(artifact_dir / "adcs_ca_test_ca01_lab.local.pfx", "CA Secret!")
-    engagement_ledger.save({
-        "engagement_id": "test-op",
-        "hops": [_ca_artifact_hop(ca_artifact)],
-    }, "test-op")
+    monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "test-op")
     mt = _make_tools()
-    mt._engagement_key = "test-op"
+    seed_ledger(mt, hops=[_ca_artifact_hop(ca_artifact)])
     mt._last_issued_task_display_id = 8999
 
     async def fake_register_file(filename, contents):
@@ -7021,12 +7043,9 @@ def test_materialize_capability_inputs_embeds_resolved_administrator_sid(monkeyp
     state_dir = Path(os.environ["SAGE_ENGAGEMENT_STATE_DIR"])
     artifact_dir = state_dir / "artifacts"
     ca_artifact = _write_test_ca_pfx(artifact_dir / "adcs_ca_test_ca01_lab.local.pfx")
-    engagement_ledger.save({
-        "engagement_id": "test-op",
-        "hops": [_ca_artifact_hop(ca_artifact)],
-    }, "test-op")
+    monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "test-op")
     mt = _make_tools()
-    mt._engagement_key = "test-op"
+    seed_ledger(mt, hops=[_ca_artifact_hop(ca_artifact)])
     mt._resolve_domain_sid = lambda domain: asyncio.sleep(0, result="S-1-5-21-111-222-333")
     calls = {}
 
@@ -7196,7 +7215,7 @@ def test_mythic_execution_observer_preserves_raw_adcs_encoded_parameters_and_out
 
 def test_execute_capability_adcs_certificate_auth_materializes_and_records(monkeypatch):
     mt = _make_tools()
-    mt._engagement_hops = [_proof_hop("adcs-ca-private-key:ca01@lab.local", 9000, callback_id="13")]
+    seed_ledger(mt, hops=[_proof_hop("adcs-ca-private-key:ca01@lab.local", 9000, callback_id="13")])
     mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
     mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
     materialize_calls = {"count": 0}
@@ -7296,7 +7315,7 @@ def test_execute_capability_adcs_certificate_auth_materializes_and_records(monke
 
 def test_execute_capability_adcs_certificate_auth_falls_back_to_pkinit_after_schannel_failure(monkeypatch):
     mt = _make_tools()
-    mt._engagement_hops = [_proof_hop("adcs-ca-private-key:ca01@lab.local", 9000, callback_id="13")]
+    seed_ledger(mt, hops=[_proof_hop("adcs-ca-private-key:ca01@lab.local", 9000, callback_id="13")])
     mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
     mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
 
@@ -7400,7 +7419,7 @@ def test_execute_capability_adcs_certificate_auth_falls_back_to_schannel_for_com
     pkinit_failure,
 ):
     mt = _make_tools()
-    mt._engagement_hops = [_proof_hop("adcs-ca-private-key:ca01@lab.local", 9000, callback_id="13")]
+    seed_ledger(mt, hops=[_proof_hop("adcs-ca-private-key:ca01@lab.local", 9000, callback_id="13")])
     mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
     mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
     mt._resolve_domain_controller_host = lambda domain: asyncio.sleep(0, result="dc01.lab.local")
@@ -7625,7 +7644,7 @@ def test_import_capability_credential_material_imports_adcs_certificate_auth_ntl
 
 def test_execute_capability_adcs_certificate_auth_defaults_proof_to_ca_host(monkeypatch):
     mt = _make_tools()
-    mt._engagement_hops = [_proof_hop("adcs-ca-private-key:ca01@lab.local", 9000, callback_id="13")]
+    seed_ledger(mt, hops=[_proof_hop("adcs-ca-private-key:ca01@lab.local", 9000, callback_id="13")])
     mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
     mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
     mt._resolve_domain_controller_host = lambda domain: asyncio.sleep(0, result="")
@@ -7702,7 +7721,7 @@ def test_execute_capability_adcs_certificate_auth_defaults_proof_to_ca_host(monk
 
 def test_execute_capability_adcs_certificate_auth_does_not_reuse_generic_existing_context(monkeypatch):
     mt = _make_tools()
-    mt._engagement_hops = [_proof_hop("adcs-ca-private-key:ca01@lab.local", 9000, callback_id="13")]
+    seed_ledger(mt, hops=[_proof_hop("adcs-ca-private-key:ca01@lab.local", 9000, callback_id="13")])
     mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
     mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
     materialize_calls = {"count": 0}
@@ -7753,7 +7772,7 @@ def test_execute_capability_adcs_certificate_auth_does_not_reuse_generic_existin
 
 def test_execute_capability_adcs_certificate_auth_records_failed_proof_without_achieving(monkeypatch):
     mt = _make_tools()
-    mt._engagement_hops = [_proof_hop("adcs-ca-private-key:ca01@lab.local", 9000, callback_id="13")]
+    seed_ledger(mt, hops=[_proof_hop("adcs-ca-private-key:ca01@lab.local", 9000, callback_id="13")])
     mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
     mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
 
@@ -7922,10 +7941,10 @@ def test_execute_capability_eval_injected_blocker_records_terminal_gpo_failure(m
 
 def test_execute_capability_eval_injected_transient_blocker_releases_after_repair_effect(monkeypatch):
     mt = _make_tools()
-    mt._engagement_hops = [
+    seed_ledger(mt, hops=[
         _proof_hop("local-admin:ca01@range.local", 55),
         _proof_hop("remote-exec:ca01@range.local", 56),
-    ]
+    ])
     monkeypatch.setenv(
         "SAGE_EVAL_INJECT_CAPABILITY_BLOCKER_JSON",
         json.dumps({
@@ -7958,13 +7977,13 @@ def test_execute_capability_eval_injected_transient_blocker_releases_after_repai
     failed = mt._engagement_hops[-1]
     assert failed.evidence["terminal_failure"] is False
     assert failed.evidence["retryable_failure"] is True
-    mt._engagement_hops.append(_proof_hop("endpoint-protection-adjusted:ca01@range.local", 57))
+    seed_ledger(mt, hops=[_proof_hop("endpoint-protection-adjusted:ca01@range.local", 57)])
     assert mt._capability_executor_injected_blocker(action, {"callback_id": "13"}, "13", capabilities) is None
 
 
 def test_execute_capability_eval_injected_blocker_can_record_declared_action_effect(monkeypatch):
     mt = _make_tools()
-    mt._engagement_hops = [_proof_hop("adcs-ca-private-key:ca01@lab.local", 58)]
+    seed_ledger(mt, hops=[_proof_hop("adcs-ca-private-key:ca01@lab.local", 58)])
     monkeypatch.setenv(
         "SAGE_EVAL_INJECT_CAPABILITY_BLOCKER_JSON",
         json.dumps({
@@ -8645,8 +8664,7 @@ def _seed_false_da(mt, monkeypatch, evidence=None):
     state = engagement_state.EngagementState(objective="t", hops=[])
     state = engagement_state.record_hop_result(
         state, "golden-ticket", "north.sevenkingdoms.local", "achieved", evidence or {"source": "issue_task"}, ts)
-    mt._engagement_hops = state.hops
-    monkeypatch.setattr(mt, "_persist_engagement_ledger", lambda: None)
+    seed_ledger(mt, hops=state.hops)
 
 
 def test_contradiction_downgrade_8453_access_denied_reopens_false_da_hop(monkeypatch):
@@ -8655,9 +8673,14 @@ def test_contradiction_downgrade_8453_access_denied_reopens_false_da_hop(monkeyp
     # 0x2105 / 8453 == DS_DRA_ACCESS_DENIED == a real replication-RIGHTS denial
     out = "ERROR kuhl_m_lsadump_dcsync ; GetNCChanges: 0x00002105 (8453)\n"
     mt._apply_contradiction_downgrade("execute_pe", _DCSYNC_PARAMS, out)
-    da_hop = next((h for h in mt._engagement_hops if h.effect == "da:north.sevenkingdoms.local"), None)
-    assert da_hop is not None and da_hop.status == "failed"
-    assert da_hop.evidence.get("source") == "contradiction-downgrade"
+    # Historical achievement stays; an automatic "no longer holds" marker makes the row ineligible.
+    assert not any(h.effect == "da:north.sevenkingdoms.local" for h in mt._engagement_hops)
+    view = mt._ledger_view()
+    da_hop = next((h for h in view.corrected_hops if h.effect == "da:north.sevenkingdoms.local"), None)
+    assert da_hop is not None and da_hop.status == "achieved"
+    marker = da_hop.corrections["no_longer_holds"]
+    assert marker["effective"] is True and marker["scope"] == "automatic"
+    assert marker["evidence"]["source"] == "contradiction-downgrade"
 
 
 def test_contradiction_downgrade_bad_dn_8439_does_NOT_downgrade(monkeypatch):
@@ -8695,8 +8718,7 @@ def test_contradiction_downgrade_leaves_unrelated_and_successful_alone(monkeypat
     state = engagement_state.EngagementState(objective="t", hops=[])
     state = engagement_state.record_hop_result(
         state, "golden-ticket", "north.sevenkingdoms.local", "achieved", {"source": "issue_task"}, ts)
-    mt._engagement_hops = state.hops
-    monkeypatch.setattr(mt, "_persist_engagement_ledger", lambda: None)
+    seed_ledger(mt, hops=state.hops)
     # a SUCCESSFUL dcsync (no 8439) must NOT downgrade anything
     mt._apply_contradiction_downgrade(
         "execute_pe", '{"Arguments":"lsadump::dcsync /domain:north.sevenkingdoms.local"}',

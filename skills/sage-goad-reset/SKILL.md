@@ -147,6 +147,34 @@ exits non-zero if either is still up. An absent `sage` tmux session is an alread
    history is deliberately not needed; the manifest records the skip. `archive_runtime_dbs.py` remains the
    local-only move for callers that do not reset Mythic.
 
+   The Engagement State Ledger (ESL) lives in `sage.db`. Every archive writes JSON exports of it from the
+   archived snapshot (`esl_exports_<stamp>/` beside the archived database, with a manifest); evidence copies get
+   exports from their own backup under `installed/esl_exports/`. The reset (`--include-ledger`, and the installed
+   target) starts the next database without the ESL. A standalone `archive_runtime_dbs.py` without
+   `--include-ledger` (the eval gauge between arms) carries the complete ESL tables, their sequences, import
+   records and objective settings into a fresh `sage.db`; checkpoints and findings are not carried. Every
+   destination is preflighted before anything moves, and a failed export or carry-forward leaves the archived
+   database in place.
+
+### Engagement ledger migration and export
+
+Releases before the shared ESL kept one `.sage_engagement/state_*.json` file per operation. Sage refuses to use a
+ledger while such a file in its legacy state directory is not imported, and names this command. Stop Sage first:
+
+```bash
+.venv/bin/python skills/sage-goad-reset/scripts/engagement_ledger_migrate.py status --database <abs sage.db> --legacy-dir <abs dir>
+.venv/bin/python skills/sage-goad-reset/scripts/engagement_ledger_migrate.py import --sage-stopped --database <abs sage.db> --legacy-dir <abs dir>
+.venv/bin/python skills/sage-goad-reset/scripts/engagement_ledger_migrate.py export --database <abs sage.db> --out <dir>
+```
+
+Import binds each file by its full `<Name>_<id>_<uuid>` engagement id, keeps rows, evidence, proof envelopes,
+graph facts, timestamps and existing numbers (a ledger numbered 23–29 stays 23–29 and continues at 30), and grants
+no new proof. Sources are never modified; an identical repeat is a no-op. A malformed file, a duplicate identity or
+number, a source changed since import, or an operation already in the database fails that file only. Files whose id
+names no operation (`default`, `<Name>_<id>` without a marker) need `--map FILE=KEY` or `--exclude FILE`.
+Evaluator `ground_truth_probes` stay in the retained source; new evaluator observations are written under
+`SAGE_EVAL_OBSERVATIONS_DIR` (default `.hillclimb/evaluator-observations`), never into the runtime ledger.
+
 3. Reset and restart Mythic. This uses the Docker-backed Mythic CLI without `sudo`:
 
 ```bash

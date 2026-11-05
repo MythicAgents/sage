@@ -2421,6 +2421,23 @@ class _BloodHoundConnectionGuardMiddleware(AgentMiddleware):
         return {"jump_to": "end", "messages": [guard_msg]}
 
 
+def _ledger_lists(mythic_client) -> tuple[list, list, list]:
+    """(eligible hops, current graph facts, corrected hops) from ONE fresh ESL snapshot.
+
+    A client with a ledger store always reads sage.db; a database error raises rather than reading as an empty
+    ledger. Objects without a store (plain stand-ins) expose their lists directly.
+    """
+    view_fn = getattr(mythic_client, "_ledger_view", None)
+    if callable(view_fn):
+        view = view_fn()
+        return list(view.hops), list(view.graph_facts), list(view.corrected_hops)
+    return (
+        list(getattr(mythic_client, "_engagement_hops", []) or []),
+        list(getattr(mythic_client, "_engagement_graph_facts", []) or []),
+        [],
+    )
+
+
 def _runtime_engagement_scope(mythic_client) -> tuple[str, bool]:
     """Return strict runtime proof scope only for a real MythicTools-like client."""
     try:
@@ -10897,7 +10914,7 @@ class Model:
             except Exception:
                 footholds = []  # fail-open: state without footholds is still useful
 
-            hops = list(getattr(mythic_client, "_engagement_hops", []) or [])
+            hops, _graph_facts, corrected_hops = _ledger_lists(mythic_client)
 
             try:
                 objective = mythic_client._engagement_objective()
@@ -10912,6 +10929,7 @@ class Model:
                 engagement_id=engagement_id,
                 runtime_scope=runtime_scope,
                 current_account_contexts=_runtime_current_account_contexts(mythic_client),
+                corrected_hops=corrected_hops,
             )
         except Exception:
             return None
@@ -10928,9 +10946,9 @@ class Model:
             mythic_client = getattr(self, "mythic_client", None)
             if mythic_client is None:
                 return None
-            hops = list(getattr(mythic_client, "_engagement_hops", []) or [])
+            hops, graph_facts, corrected_hops = _ledger_lists(mythic_client)
             footholds = list(getattr(mythic_client, "_engagement_footholds", []) or [])
-            if not hops and not footholds:
+            if not hops and not footholds and not corrected_hops:
                 return None
             try:
                 from . import engagement_state as _es
@@ -10941,12 +10959,12 @@ class Model:
             except Exception:
                 objective = "sage-engagement"
             engagement_id, runtime_scope = _runtime_engagement_scope(mythic_client)
-            # Include cached graph facts so durable-hop corroboration markers can be computed.
-            graph_facts = list(getattr(mythic_client, "_engagement_graph_facts", []) or [])
+            # Graph facts from the same snapshot so durable-hop corroboration markers can be computed.
             state = _es.EngagementState(
                 objective=objective, footholds=footholds, hops=hops, graph_facts=graph_facts,
                 engagement_id=engagement_id, runtime_scope=runtime_scope,
                 current_account_contexts=_runtime_current_account_contexts(mythic_client),
+                corrected_hops=corrected_hops,
             )
             rendered = _es.render_engagement_state(state)
             if not rendered:
@@ -10970,7 +10988,7 @@ class Model:
             mythic_client = getattr(self, "mythic_client", None)
             if mythic_client is None:
                 return None
-            hops = list(getattr(mythic_client, "_engagement_hops", []) or [])
+            hops, graph_facts, _corrected = _ledger_lists(mythic_client)
             footholds = list(getattr(mythic_client, "_engagement_footholds", []) or [])
             if not hops or not footholds:
                 return None
@@ -10987,7 +11005,7 @@ class Model:
                 objective=objective,
                 footholds=footholds,
                 hops=hops,
-                graph_facts=list(getattr(mythic_client, "_engagement_graph_facts", []) or []),
+                graph_facts=graph_facts,
                 engagement_id=engagement_id,
                 runtime_scope=runtime_scope,
                 current_account_contexts=_runtime_current_account_contexts(mythic_client),
@@ -12232,10 +12250,12 @@ class Model:
             engagement_id = str(client._eng_key() or "")
         except Exception:
             engagement_id = ""
-        sources = [
-            *list(getattr(client, "_engagement_hops", []) or []),
-            *list(getattr(client, "_engagement_graph_facts", []) or []),
-        ]
+        try:
+            ledger_hops, ledger_facts, _corrected = _ledger_lists(client)
+        except Exception as exc:
+            logger.debug(f"controller proof lineage skipped: engagement ledger unavailable ({exc})")
+            return
+        sources = [*ledger_hops, *ledger_facts]
         changed = False
         for source in sources:
             evidence = getattr(source, "evidence", {}) if isinstance(getattr(source, "evidence", {}), dict) else {}
@@ -12569,9 +12589,17 @@ class Model:
                 try:
                     from datetime import datetime, timezone
                     await self.mythic_client._refresh_graph_facts_if_stale(datetime.now(timezone.utc).isoformat())
-                    state.graph_facts = list(getattr(self.mythic_client, "_engagement_graph_facts", []) or [])
                 except Exception:
-                    pass
+                    pass  # graph refresh is best-effort
+                if callable(getattr(self.mythic_client, "_ledger_view", None)):
+                    try:
+                        # The refresh awaited: re-read hops and facts together from one fresh snapshot.
+                        state.hops, state.graph_facts, state.corrected_hops = _ledger_lists(self.mythic_client)
+                    except Exception as exc:
+                        logger.warning(f"controller observation skipped: engagement ledger unavailable ({exc})")
+                        state = None  # never decide on the snapshot read before the await
+                else:  # a client without a ledger store exposes only its cached graph facts
+                    state.graph_facts = list(getattr(self.mythic_client, "_engagement_graph_facts", []) or [])
             snap["state"] = state
             hops = len(getattr(state, "hops", []) or []) if state is not None else -1
             gf = len(getattr(state, "graph_facts", []) or []) if state is not None else -1
@@ -13336,9 +13364,15 @@ class Model:
         try:
             from datetime import datetime, timezone
             await self.mythic_client._refresh_graph_facts_if_stale(datetime.now(timezone.utc).isoformat())
-            state.graph_facts = list(getattr(self.mythic_client, "_engagement_graph_facts", []) or [])
         except Exception:
-            pass
+            pass  # graph refresh is best-effort
+        if callable(getattr(self.mythic_client, "_ledger_view", None)):
+            try:
+                state.hops, state.graph_facts, state.corrected_hops = _ledger_lists(self.mythic_client)
+            except Exception as exc:
+                return {"ok": False, "status": "no_state", "reason": f"engagement ledger unavailable: {exc}"}
+        else:
+            state.graph_facts = list(getattr(self.mythic_client, "_engagement_graph_facts", []) or [])
         wanted = str(callback_id or "").strip()
         foothold = next((candidate for candidate in self._controller_ordered_supported_footholds(state)
                          if str(getattr(candidate, "callback_id", "") or "").strip() == wanted), None)
@@ -15509,11 +15543,15 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         if foothold is None:
             return ""
         footholds = list(getattr(mythic_client, "_engagement_footholds", []) or [])
+        try:
+            ledger_hops, ledger_facts, _corrected = _ledger_lists(mythic_client)
+        except Exception:
+            return ""  # card note only; the gate decides on its own fresh snapshot
         state = engagement_state.EngagementState(
             objective="sage-engagement",
             footholds=footholds,
-            hops=list(getattr(mythic_client, "_engagement_hops", []) or []),
-            graph_facts=list(getattr(mythic_client, "_engagement_graph_facts", []) or []),
+            hops=ledger_hops,
+            graph_facts=ledger_facts,
             runtime_scope=True,
         )
         return engagement_state.collection_target_key(state, foothold, str(scope_domain or "").strip().casefold())
@@ -15548,48 +15586,36 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         the terminal stays one response.
         """
         client = getattr(self, "mythic_client", None)
-        if client is None or not hasattr(client, "_eng_key"):
+        if client is None or not hasattr(client, "_ledger_snapshot"):
             return ""
         try:
             from . import engagement_ledger
         except ImportError:
             import engagement_ledger  # type: ignore
-        key = client._eng_key()
-        if not key:
-            return ""
-        data = engagement_ledger.load_runtime(key)
+        if not isinstance(getattr(getattr(client, "_ledger_binding", None), "engagement_key", None), str):
+            return ""  # no bound operation ledger (an unbound session, or a stand-in client)
         marker = str(getattr(client, "_last_issued_task_display_id", "") or "")
         last_reconciled = str(getattr(self, "_last_state_reconcile_marker", "") or "")
         if marker and marker != last_reconciled:
             self._last_state_reconcile_marker = marker
             try:
-                from . import state_reconcile
-                raw_client = getattr(client, "client", None)
-                if raw_client is not None:
-                    from datetime import datetime, timezone
-                    now = datetime.now(timezone.utc).isoformat()
-                    data, _notes = await state_reconcile.reconcile_task_history(
-                        raw_client, data, "", "", 10, now, apply=False,
-                    )
-                    engagement_ledger.save_runtime(data, key)
+                if getattr(client, "client", None) is not None:
+                    await client._reconcile_ledger_from_task_history("", "", 10, apply=False)
             except Exception as e:
                 # A turn-end summary must never break the turn: offline/unreachable
                 # Mythic skips the reconciliation and renders the ledger as-is.
                 logger.debug(f"turn-end reconciliation skipped (non-fatal): {e}")
-        hops = data.get("hops") or []
-        objective = str(data.get("objective") or "").strip()
-        signature = (
-            objective,
-            tuple(sorted(
-                (str(h.get("technique") or ""), str(h.get("target") or ""), str(h.get("status") or ""))
-                for h in hops
-                if isinstance(h, dict)
-            )),
-        )
+        try:
+            snapshot = client._ledger_snapshot()  # fresh, after any reconciliation write
+        except Exception as e:
+            return f"📊 Engagement state unavailable: {e}"
+        hops = snapshot.display_hops()
+        objective = client._human_engagement_objective(snapshot.objective_setting()[0]) if hasattr(
+            client, "_human_engagement_objective") else ""
+        signature = (snapshot.engagement_key, objective, snapshot.change_signature())
         if signature == getattr(self, "_last_turn_state_signature", None):
             return "📊 Engagement state unchanged since the last turn."
         self._last_turn_state_signature = signature
-        hops = [hop for hop in hops if isinstance(hop, dict)]
         lines = ["📊 **Engagement state**"]
         if objective:
             lines.append(f"Objective: {objective}")
@@ -15601,12 +15627,16 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             remaining = len(hops) - _TURN_END_STATE_HOP_LIMIT
             if remaining > 0:
                 lines.append(f"_…{remaining} earlier hop(s) not shown — `/state` for the full ledger._")
+            notes = engagement_ledger.correction_notes(hops, limit=_TURN_END_STATE_HOP_LIMIT)
+            if notes:
+                lines.extend(notes)
         # The operator sees this table with the closing message; queue the same rows for the model's next
         # request on this channel so "hop N" resolves against what the operator saw.
         engagement_ledger.record_operator_view(
             getattr(self, "channel_id", None),
             engagement_ledger.operator_view_text(
-                data, "the end-of-turn engagement-state table", limit=_TURN_END_STATE_HOP_LIMIT,
+                {"objective": objective, "hops": hops}, "the end-of-turn engagement-state table",
+                limit=_TURN_END_STATE_HOP_LIMIT,
             ),
         )
         return "\n".join(lines)
@@ -16889,7 +16919,10 @@ def _create_summarize_handback_tool():
 def _build_esl_summary(mythic_client) -> str:
     if mythic_client is None:
         return ""
-    hops = list(getattr(mythic_client, "_engagement_hops", []) or [])
+    try:
+        hops, _facts, _corrected = _ledger_lists(mythic_client)
+    except Exception as exc:
+        return f"📊 **Engagement State Ledger (ESL)**\nunavailable: {exc}"
     achieved = [
         hop for hop in hops
         if str(getattr(hop, "status", "")).casefold() == "achieved"
@@ -16928,11 +16961,12 @@ def _deterministic_post_ingest_owner(mythic_client) -> _HandoffDirective | None:
             import capabilities
             import engagement_state as _es
         engagement_id, runtime_scope = _runtime_engagement_scope(mythic_client)
+        ledger_hops, ledger_facts, _corrected = _ledger_lists(mythic_client)
         snapshot = _es.EngagementState(
             objective=mythic_client._engagement_objective(),
             footholds=list(getattr(mythic_client, "_engagement_footholds", []) or []),
-            hops=list(getattr(mythic_client, "_engagement_hops", []) or []),
-            graph_facts=list(getattr(mythic_client, "_engagement_graph_facts", []) or []),
+            hops=ledger_hops,
+            graph_facts=ledger_facts,
             engagement_id=engagement_id,
             runtime_scope=runtime_scope,
             current_account_contexts=_runtime_current_account_contexts(mythic_client),

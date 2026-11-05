@@ -5,6 +5,7 @@ sent all 30 delegations to the execution worker and never consulted the graph. T
 did not recognise "administrative control", and the bare name "essos" did not resolve to a domain.
 """
 
+from tests.esl_fixtures import seed_ledger  # noqa: E402
 import asyncio
 
 import pytest
@@ -157,8 +158,8 @@ def _mythic_tools():
     from ai.langgraph.mythic_tools import MythicTools
 
     mt = object.__new__(MythicTools)
-    mt._engagement_hops = []
-    mt._engagement_graph_facts = []
+    seed_ledger(mt, hops=[])
+    seed_ledger(mt, graph_facts=[])
     mt._engagement_footholds = []
     mt._eng_key = lambda: "eng-consult"
     return mt
@@ -167,7 +168,7 @@ def _mythic_tools():
 def test_mythic_tools_consult_reports_channel_3_coverage_gap(monkeypatch):
     tools = _bloodhound(monkeypatch, ["north.sevenkingdoms.local", "sevenkingdoms.local"])
     mt = _mythic_tools()
-    mt._engagement_graph_facts = [type("F", (), {"predicate": "trust-reachable:essos.local"})()]
+    seed_ledger(mt, graph_facts=[type("F", (), {"predicate": "trust-reachable:essos.local"})()])
     result = asyncio.run(mt._consult_attack_graph(CHANNEL_3_PROMPT))
     assert result.outcome == ConsultOutcome.CONSULTED_PARTIAL
     assert result.objective_domains == ["essos.local"] and result.missing_domains == ["essos.local"]
@@ -200,7 +201,7 @@ def _supervised_model(consult_fn):
 def test_supervised_objective_turn_gets_a_hidden_consult_message_and_event(monkeypatch):
     tools = _bloodhound(monkeypatch, ["north.sevenkingdoms.local", "sevenkingdoms.local"])
     mt = _mythic_tools()
-    mt._engagement_graph_facts = [type("F", (), {"predicate": "trust-reachable:essos.local"})()]
+    seed_ledger(mt, graph_facts=[type("F", (), {"predicate": "trust-reachable:essos.local"})()])
     m, contract = _supervised_model(mt._consult_attack_graph)
 
     msg = asyncio.run(m._attack_graph_consult_message(CHANNEL_3_PROMPT, contract))

@@ -1515,7 +1515,9 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_m
             "SAGE_EVAL_CAPTURE_REPLAY_CONTEXT": "1",
         }
         if side == "harness":
+            # An isolated run namespace needs an isolated ledger database, not just a state directory.
             capture_env.update(SAGE_ENGAGEMENT_STATE_DIR=str(engagement_state_directory),
+                               SAGE_DATABASE_PATH=str(Path(engagement_state_directory) / "sage.db"),
                                SAGE_ENGAGEMENT_ID=str(engagement_id))
     observer_config = str((route_env or {}).get(PROCESS_OBSERVER_CONFIG_ENV) or "").strip()
     observer_config_sha256 = str(

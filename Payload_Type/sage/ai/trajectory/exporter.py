@@ -161,7 +161,8 @@ def export_ledger_artifact(path: Path, artifact: SourceArtifact | None = None) -
             continue
         technique = str(row.get("technique") or row.get("capability") or "")
         target = str(row.get("target") or "")
-        labels = ("ledger_" + status,)
+        correction = _row_correction(row)
+        labels = ("ledger_" + status,) + ((f"ledger_{correction['kind']}",) if correction else ())
         evidence = row.get("evidence") if isinstance(row.get("evidence"), dict) else {}
         proof = (
             row.get("proof_envelope")
@@ -188,6 +189,10 @@ def export_ledger_artifact(path: Path, artifact: SourceArtifact | None = None) -
             == "admitted"
             and str(proof.get("terminal_status") or "").casefold() in {"completed", "complete", "success", "succeeded"}
         )
+        if correction and correction["kind"] == "operator_retracted":
+            # The operator said this row is not true: history, never an empirical success or negative.
+            proof_admissible = False
+            proof_runtime_lineage = False
         empirical_negative = status in {"failed", "blocked"} and proof_runtime_lineage
         label_source = (
             LABEL_SOURCE_BLOODHOUND
@@ -213,7 +218,7 @@ def export_ledger_artifact(path: Path, artifact: SourceArtifact | None = None) -
             verifier=TransitionVerifier(
                 status=status,
                 labels=labels,
-                evidence={"proof_origin": proof_origin},
+                evidence={"proof_origin": proof_origin, **({"correction": correction} if correction else {})},
                 verifier_id=str(proof.get("verifier_id") or ""),
                 verifier_version=str(proof.get("verifier_version") or "v1"),
                 proof_ids=((proof_hash,) if proof_hash else ()),
@@ -365,6 +370,20 @@ def _interesting_windows(text: str, window: int = 700) -> list[tuple[str | None,
         hi = min(len(text), start + window // 2)
         chunks.append((label, text[lo:hi]))
     return chunks
+
+
+def _row_correction(row: dict[str, Any]) -> dict[str, str] | None:
+    """Effective correction carried by an ESL export row (historical JSON has none)."""
+    corrections = row.get("corrections") if isinstance(row.get("corrections"), dict) else {}
+    retracted = corrections.get("retracted") if isinstance(corrections.get("retracted"), dict) else None
+    if retracted:
+        return {"kind": "operator_retracted", "reason": str(retracted.get("reason") or "")[:200],
+                "recorded_at": str(retracted.get("recorded_at") or "")}
+    marker = corrections.get("no_longer_holds") if isinstance(corrections.get("no_longer_holds"), dict) else None
+    if marker and marker.get("effective"):
+        return {"kind": "no_longer_holds", "reason": str(marker.get("reason") or "")[:200],
+                "recorded_at": str(marker.get("recorded_at") or "")}
+    return None
 
 
 def _ledger_rows(data: Any) -> list[dict[str, Any]]:

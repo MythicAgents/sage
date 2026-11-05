@@ -551,6 +551,7 @@ def _bound_step(monkeypatch, brief: dict, decision: str, worker_replies: int, *,
             sink._engagement_footholds = [SimpleNamespace(callback_id="5", host="WORKSTATION-5", forest="north.test",
                                                           identity="NORTH\\operator")]
         sink._engagement_hops = list(hops)
+        sink._ledger_view = lambda: SimpleNamespace(hops=list(hops), graph_facts=[], corrected_hops=[], snapshot=None)
         return original(self, *args, **kwargs)
 
     monkeypatch.setattr(model_module.Model, "_rebuild_graph", rebuild)

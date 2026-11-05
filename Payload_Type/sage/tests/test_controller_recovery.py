@@ -254,21 +254,18 @@ def test_fresh_model_observes_persisted_admitted_effect(monkeypatch, tmp_path):
         verifier_result={"verdict": "achieved"},
         captured_at=datetime.now(timezone.utc).isoformat(),
     ).to_dict()
-    engagement_ledger.save_runtime({"engagement_id": engagement_id, "hops": [{
+    from tests.esl_fixtures import seed_ledger
+
+    monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", engagement_id)
+    writer = mythic_tools.MythicTools(agent_task_id="writer")
+    seed_ledger(writer, prove=False, hops=[{
         "id": "proof-hop", "technique": "dcsync", "target": "lab.local",
         "effect": "krbtgt-hash:lab.local", "status": "achieved",
         "evidence": {"proof_envelope": proof}, "proof_envelope": proof,
         "satisfied_effects": ["krbtgt-hash:lab.local"],
         "timestamp": datetime.now(timezone.utc).isoformat(),
-    }]}, engagement_id)
-    fresh_client = SimpleNamespace(
-        _engagement_hops=[], _engagement_graph_facts=[],
-        _eng_key=lambda: engagement_id,
-        _engagement_ledger_path=lambda: engagement_ledger.ledger_path(engagement_id),
-        _human_engagement_objective=lambda value: value,
-        _engagement_objective=lambda: "test objective",
-    )
-    mythic_tools.MythicTools._load_engagement_ledger(fresh_client, replace=True)
+    }])
+    fresh_client = mythic_tools.MythicTools(agent_task_id="fresh")  # a clean boundary: reads the shared store
     async def no_footholds(_client, _now):
         return []
     monkeypatch.setattr(access_reconciler, "reconcile_access", no_footholds)

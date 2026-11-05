@@ -77,6 +77,8 @@ async def _native_objective_case(monkeypatch, tmp_path, first_decision):
                   autonomous_solve=True, policy_mode="hybrid", operation_id=1,
                   channel_id=1, apitoken_id=0)
     model.mythic_client = MythicTools(agent_task_id="offline-objective", operation_id=1, channel_id=1)
+    # No Mythic here: bind the session's ledger to an isolated offline namespace (the controller re-reads it).
+    model.mythic_client._ledger_binding = model.mythic_client._ledger_store().bind_namespace("offline-objective")
     model.mythic_client.get_tools = lambda _names: []
     model._payload_names = []
     model.memory = InMemorySaver()

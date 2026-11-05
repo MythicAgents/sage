@@ -1,14 +1,12 @@
-"""Resolve the current Mythic operation (id + name) so the durable state ledger is keyed and named
-per operation: `state_<OperationName>_<OperationId>.json` (e.g. `state_Operation_Chimera_1.json`).
+"""Resolve Mythic operation identity for the Engagement State Ledger binding.
 
-Used by the LangGraph agent (`mythic_tools.py`), which has a live Mythic client and resolves via a
-callback's operation. The operator-facing `state` Mythic command resolves the same key directly from
-`taskData.Callback.OperationID/OperationName` (no query) and does not need this module. `engagement_ledger`
-stays pure stdlib; this is the only place that touches the Mythic client for operation metadata.
+A native-chat session binds its ledger from its own explicit operation id (`resolve_operation_by_id`) plus the
+reset-safe engagement marker stored in Mythic (`get_or_create_engagement_uuid`). The canonical engagement key is
+`<SanitizedName>_<id>_<uuid>`; `engagement_store` keeps the first key it saw for an operation identity.
 
-All functions fail soft: a missing client / unreachable Mythic / unexpected shape returns None so the
-caller falls back to `SAGE_ENGAGEMENT_ID` (or "default"). The `mythic` library is imported lazily so the
-module imports cleanly in unit tests without a Mythic install.
+`resolve_operation` (single visible operation, else newest callback) remains only for read scopes such as the
+credential store; it is never used to bind a ledger. All functions fail soft (None) and import the `mythic`
+library lazily so the module imports in unit tests without a Mythic install.
 """
 
 from __future__ import annotations
@@ -26,6 +24,7 @@ _OP_FROM_CALLBACK = (
     "callback(limit: 1, order_by: {id: desc}) { operation_id operation { id name } } }"
 )
 _OP_LIST = "query SageOpList { operation(where: {complete: {_eq: false}}) { id name } }"
+_OP_BY_ID = "query SageOperationById($op: Int!) { operation_by_pk(id: $op) { id name } }"
 
 # The Mythic operation id (a Postgres serial) is NOT durable — a `mythic-cli database reset` restarts it at
 # 1, so `state_Operation_Chimera_1.json` would be REUSED by a brand-new range after a wipe. To make a clean
@@ -111,13 +110,11 @@ async def resolve_operation(client) -> tuple[int, str] | None:
     return None
 
 
-async def get_or_create_engagement_uuid(client, op_id) -> str | None:
-    """The durable Sage engagement UUID for an operation, stored as an `operationeventlog` marker so it is
-    wiped on a Mythic DB reset (→ a clean run mints a new UUID → a fresh ledger, never the stale one).
+async def resolve_operation_by_id(client, op_id) -> tuple[int, str] | None:
+    """Return ``(operation_id, operation_name)`` for an explicit operation id, or None if unreadable.
 
-    Reads the EARLIEST marker (stable convergence if duplicates ever get written), creating one if absent.
-    Returns None only if Mythic is unreachable OR the new marker could not be persisted — the caller then
-    falls back to the non-durable `<name>_<id>` key rather than keying on an unpersisted UUID. Never raises.
+    Native-chat sessions know their operation; this never substitutes another operation's callback or the first
+    of several visible operations. Never raises.
     """
     if client is None:
         return None
@@ -126,14 +123,46 @@ async def get_or_create_engagement_uuid(client, op_id) -> str | None:
     except Exception:
         return None
     try:
-        resp = await mythic.execute_custom_query(client, _MARKER_READ, variables={"op": int(op_id)})
-        rows = (resp or {}).get("operationeventlog") or []
-        if rows:
-            found = _UUID_RE.search(str(rows[0].get("message") or ""))
-            if found:
-                return found.group(0)
+        resp = await mythic.execute_custom_query(client, _OP_BY_ID, variables={"op": int(op_id)})
+        row = (resp or {}).get("operation_by_pk") or {}
     except Exception:
-        pass
+        return None
+    resolved = _as_op(row.get("id"), row.get("name")) if isinstance(row, dict) else None
+    if resolved is None or resolved[0] != int(op_id):
+        return None
+    return resolved
+
+
+async def _read_earliest_marker(mythic, client, op_id) -> str | None:
+    resp = await mythic.execute_custom_query(client, _MARKER_READ, variables={"op": int(op_id)})
+    rows = (resp or {}).get("operationeventlog") or []
+    if rows:
+        found = _UUID_RE.search(str(rows[0].get("message") or ""))
+        if found:
+            return found.group(0).casefold()
+    return None
+
+
+async def get_or_create_engagement_uuid(client, op_id) -> str | None:
+    """The durable Sage engagement UUID for an operation, stored as an `operationeventlog` marker so it is
+    wiped on a Mythic DB reset (→ a clean run mints a new UUID → a fresh ledger, never the stale one).
+
+    Reads the EARLIEST marker, creating one if absent, then re-reads the earliest persisted marker so concurrent
+    first sessions converge on one identity. Returns None when Mythic is unreachable, the read fails, or no
+    persisted marker can be read back: the caller treats that as an unavailable ledger. Never raises.
+    """
+    if client is None:
+        return None
+    try:
+        from mythic import mythic
+    except Exception:
+        return None
+    try:
+        existing = await _read_earliest_marker(mythic, client, op_id)
+    except Exception:
+        return None
+    if existing:
+        return existing
     new_uuid = str(_uuid.uuid4())
     try:
         result = await mythic.send_event_log_message(
@@ -145,18 +174,7 @@ async def get_or_create_engagement_uuid(client, op_id) -> str | None:
     # createOperationEventLog returns {status, error}; only trust a persisted marker.
     if isinstance(result, dict) and result.get("status") not in (None, "success"):
         return None
-    return new_uuid
-
-
-async def resolve_operation_key(client) -> str | None:
-    """The durable ledger key for the current operation: `<SanitizedName>_<id>_<uuid>`, or None if the
-    operation can't be resolved. Falls back to `<SanitizedName>_<id>` (no uuid) only if the durable marker
-    can't be read/created — the operation id alone is NOT reset-safe, so that path is best-effort.
-    """
-    resolved = await resolve_operation(client)
-    if resolved is None:
+    try:
+        return await _read_earliest_marker(mythic, client, op_id)
+    except Exception:
         return None
-    op_id, op_name = resolved
-    base = operation_key(op_name, op_id)
-    eng_uuid = await get_or_create_engagement_uuid(client, op_id)
-    return f"{base}_{eng_uuid}" if eng_uuid else base

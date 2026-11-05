@@ -662,15 +662,25 @@ def _cleanup(spec: Mapping[str, Any], env: Mapping[str, str], *, after_stop: Cal
     return {"complete": all(item["ok"] for item in result), "steps": result}
 
 
+def _engagement_database(directory:Path)->Path:
+    """The capture harness's isolated ledger database, beside its isolated engagement state directory."""
+    return directory/"sage.db"
+
+
 def _strict_engagement_snapshot(directory:Path,engagement_id:str,*,allow_missing:bool)->dict[str,Any]:
-    safe=re.sub(r"[^A-Za-z0-9_.-]","_",engagement_id)[:128];path=directory/("state_"+safe+".json")
-    try:raw=path.read_bytes()
-    except FileNotFoundError:
-        if allow_missing:return {"engagement_id":engagement_id,"hops":[],"graph_facts":[]}
+    """A fresh explicit ESL export of the run's namespace from the isolated database (read-only)."""
+    if str(RUNTIME) not in sys.path: sys.path.insert(0, str(RUNTIME))
+    from ai.langgraph import engagement_store
+    database=_engagement_database(directory)
+    try:
+        store=engagement_store.EngagementStore(database,legacy_dir=os.devnull)
+        binding=store.find_binding(engagement_id)
+        value=store.export(binding) if binding is not None else None
+    except engagement_store.LedgerUnavailable:
         raise CaptureEpisodeError("engagement evidence is unavailable") from None
-    except OSError:raise CaptureEpisodeError("engagement evidence is unavailable") from None
-    try:value=json.loads(raw)
-    except (UnicodeError,json.JSONDecodeError):raise CaptureEpisodeError("engagement evidence is invalid") from None
+    if value is None:
+        if allow_missing:return {"engagement_id":engagement_id,"hops":[],"graph_facts":[]}
+        raise CaptureEpisodeError("engagement evidence is unavailable")
     if (not isinstance(value,dict) or value.get("engagement_id")!=engagement_id
             or not isinstance(value.get("hops"),list) or not isinstance(value.get("graph_facts"),list)):
         raise CaptureEpisodeError("engagement evidence is invalid")
@@ -774,6 +784,7 @@ def execute_capture(spec: FrozenCaptureSpec, secret_index_factory: Callable, com
                 "SAGE_RESOURCE_BUDGET_CONFIG": str(validated["config"]),
                 "SAGE_RESOURCE_BUDGET_LEDGER": str(validated["ledger"]),
                 "SAGE_ENGAGEMENT_STATE_DIR":str(engagement_dir),
+                "SAGE_DATABASE_PATH":str(_engagement_database(engagement_dir)),
                 **({"SAGE_ENGAGEMENT_ID":str(live_contract.get("current_engagement_id") or "")}
                    if isinstance(live_contract,Mapping) else {}),
                 **frozen_route_env,

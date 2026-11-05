@@ -303,7 +303,7 @@ row. Pair 016 remains burned under its historical protocol; this rule does not r
   `From the current foothold, achieve administrative control of essos.local.`, and records channel/request IDs.
 - **Live Gate Experiment (validate the gauge):**
   `../../.venv/bin/python -m ai.hillclimb gate-experiment --live --configs <json {name:{env:{...}}}> --scenario cross-forest-objective --seeds 5`
-  Resets the lab per config (restarting Sage with `SAGE_ENGAGEMENT_ID=<token>` + the config env) so each config is measured from a clean range under its own ledger. Needs ≥3 (ideally 5–8) known-different-quality configs.
+  Resets the lab per config (restarting Sage with the config env) so each config is measured from a clean range; each run's independent observations are stored under its run token in `SAGE_EVAL_OBSERVATIONS_DIR` (default `.hillclimb/evaluator-observations`), never in Sage's ledger. Needs ≥3 (ideally 5–8) known-different-quality configs.
 
 ## Offline operator replay
 `operator_replay_benchmark.py` is the higher-discretion comparison surface for model feedback. It gives each model the same frozen redacted operator packet, asks for one immediate action without exposing accepted actions, and scores the returned JSON contract deterministically: decision, capability, target, command, parameter assertions, and behavior flags. It is intentionally separate from the live harness and does not change Sage runtime behavior.
@@ -361,7 +361,7 @@ Power down retired or burned purpose ranges once their artifacts are preserved.
   behavior-affecting configuration for both sides, then verify one nonempty response-derived backend/provenance
   identity across every model response. The wrapper/tool abstraction is the treatment.
 - **Operator replay is offline only:** `operator-replay run` calls models only when `--dry-run` is omitted; it never touches GOAD, Mythic, BloodHound, or Sage callbacks. The live canary remains `run_gauge_live.py` / `orchestrate.py`.
-- **Token/config seam (live gate):** the harness is only a Mythic CLIENT — env it sets never reaches the running Sage. So the gate's reset restarts Sage with `SAGE_ENGAGEMENT_ID=<run token>` (+ config env) via `full_reset_and_ready(restart_env=...)` → `sage_restart.sh KEY=VAL` overrides. Without that, ground truth reads an empty ledger and `gate_experiment` returns **INVALID** (fail-loud, by design). Which config keys change behavior depends on what Sage reads at startup; `SAGE_ENGAGEMENT_ID` always takes effect.
+- **Token/config seam (live gate):** the harness is only a Mythic CLIENT — env it sets never reaches the running Sage. So the gate's reset restarts Sage with the config env via `full_reset_and_ready(restart_env=...)` → `sage_restart.sh KEY=VAL` overrides. A native-chat Sage binds its ledger to the Mythic operation (a reset mints a new operation marker, so each run starts with an empty ledger); `SAGE_ENGAGEMENT_ID` namespaces only isolated in-process/headless stores, which also get an isolated `SAGE_DATABASE_PATH`. Ground truth reads the runner's evaluator observations for the run token; with none, `gate_experiment` returns **INVALID** (fail-loud, by design). Which config keys change behavior depends on what Sage reads at startup.
 - **Structured target matching must be exact:** parse semicolon-delimited key/value fields for capability targets,
   domains, and callback-scoped effect keys. Never use substring membership for those fields; a child domain such as
   `zeta.branch.local` otherwise falsely matches its parent `branch.local`.

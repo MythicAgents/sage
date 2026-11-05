@@ -535,9 +535,9 @@ def aggregate_gate_experiment(
             # already-running Sage callback; SAGE_ENGAGEMENT_ID/config set on the harness subprocess do not
             # reach it). Fail LOUD instead of emitting a confident PASS/FAIL on no data.
             verdict, note = "INVALID", (
-                "ground truth uniformly empty/zero across all configs — the per-run engagement-id/config almost "
-                "certainly never reached Sage. Fix the reset to restart Sage with SAGE_ENGAGEMENT_ID=<run token> "
-                "AND the config before trusting any verdict (see gate_live.py honest-seam note).")
+                "ground truth uniformly empty/zero across all configs — no run recorded independent observations "
+                "under its run token (SAGE_EVAL_OBSERVATIONS_DIR), or the config never reached Sage. Check the "
+                "capture step and restart Sage with the config before trusting any verdict.")
         elif len(per_config) < 3 or rho is None:
             verdict, note = "INSUFFICIENT", "need >=3 (ideally 5-8) known-different configs to judge the gauge"
         elif rho >= rho_threshold and not danger:

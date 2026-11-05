@@ -14,15 +14,18 @@ from time import monotonic
 from typing import Callable, Literal
 
 try:  # package import
-    from ..langgraph import engagement_ledger
-    from . import effect_registry
+    from ..langgraph import engagement_ledger, engagement_store
+    from . import effect_registry, evaluator_observations
 except Exception:  # script / sys.path import (mirrors the repo's langgraph pattern)
     import sys
     from pathlib import Path
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "langgraph"))
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
     import engagement_ledger  # type: ignore
+    import engagement_store  # type: ignore
     import effect_registry  # type: ignore
+    import evaluator_observations  # type: ignore
 
 
 class Milestone(IntEnum):
@@ -336,6 +339,23 @@ def _live_probe_cost(milestone: Milestone, probe: Callable[[], object], started:
 
 # --- the reader ---------------------------------------------------------------------------------------
 
+def _historical_bundle(engagement_id: str | None):
+    if not str(engagement_id or "").strip():
+        return None
+    path = engagement_ledger.ledger_path(str(engagement_id))
+    return path if os.path.exists(path) else None
+
+
+def _observations_for(engagement_id: str | None) -> dict:
+    """Independent observations for a run: the evaluation-side store, else a historical ledger bundle."""
+    if not str(engagement_id or "").strip():
+        return {}
+    record = evaluator_observations.read_observations(
+        str(engagement_id), historical_bundle=_historical_bundle(engagement_id),
+    )
+    return record or {}
+
+
 def read_ground_truth(
     scenario: Scenario,
     *,
@@ -350,7 +370,7 @@ def read_ground_truth(
     SAGE_ENGAGEMENT_ID and passes the same id here, so C1 reads that run's clean ledger rather than a
     stale static one (the per-reset-UUID staleness fix)."""
     eid = engagement_id if engagement_id is not None else scenario.engagement_id
-    data = engagement_ledger.load(eid)  # never raises; {} skeleton if missing
+    data = {"ground_truth_probes": _observations_for(eid)}
     spec = scenario.spec()
     candidates = scenario.milestone_subset or tuple(
         m for m in Milestone if m == Milestone.FOOTHOLD or m in spec
@@ -416,23 +436,28 @@ def read_ground_truth(
 # --- no-mutation guard --------------------------------------------------------------------------------
 
 def ledger_state_hash(engagement_id: str | None = None) -> str:
-    """SHA-256 over the on-disk ledger bytes for an engagement (or the whole state dir).
+    """SHA-256 over the canonical logical state a C1 read measures. READ-ONLY.
 
-    Tests assert this is byte-identical before/after a C1 call: a reader that mutates
-    the state it measures is a corrupted gauge.
+    Covers the ESL content and revisions in sage.db (not the shared database's changing bytes), the run's
+    evaluation-side observation file, and any historical legacy ledger file. Tests assert it is identical
+    before/after a C1 call: a reader that mutates the state it measures is a corrupted gauge.
     """
     h = hashlib.sha256()
+    store = engagement_store.EngagementStore(legacy_dir=os.devnull)
     if engagement_id is not None:
-        path = engagement_ledger.ledger_path(engagement_id)
-        paths = [path] if os.path.exists(path) else []
+        binding = store.find_binding(engagement_id)
+        h.update(store.logical_digest(binding).encode() if binding is not None else b"no-esl-operation")
+        h.update(evaluator_observations.observation_file_bytes(engagement_id))
+        paths = [p for p in [_historical_bundle(engagement_id)] if p]
     else:
-        state_dir = engagement_ledger.state_dir()
+        h.update(store.logical_digest().encode())
         paths = []
-        if os.path.isdir(state_dir):
-            for name in sorted(os.listdir(state_dir)):
-                p = os.path.join(state_dir, name)
-                if os.path.isfile(p):
-                    paths.append(p)
+        for root in (engagement_ledger.state_dir(), str(evaluator_observations.observations_dir())):
+            if os.path.isdir(root):
+                for name in sorted(os.listdir(root)):
+                    p = os.path.join(root, name)
+                    if os.path.isfile(p) and name.endswith(".json"):
+                        paths.append(p)
     for p in paths:
         h.update(p.encode("utf-8"))
         with open(p, "rb") as f:

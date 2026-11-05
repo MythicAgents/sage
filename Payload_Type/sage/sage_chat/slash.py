@@ -50,7 +50,7 @@ SAGE_SLASH_COMMANDS = [
         Name="report",
         Description="Show retained identity observations from this operation engagement: /report (or /report identity).",
     ),
-    ChatSlashCommandDefinition(Name="state", Description="Show/edit Sage's engagement state (hop ledger): /state, /state reconcile|remove|set|objective|wipe."),
+    ChatSlashCommandDefinition(Name="state", Description="Show or correct the shared engagement state ledger: /state, /state reconcile|remove|restore|invalidate|objective|wipe."),
     ChatSlashCommandDefinition(Name="list", Description="List active Sage chat sessions."),
     ChatSlashCommandDefinition(
         Name="tools",
@@ -246,164 +246,178 @@ async def _handle_report(chat: Any, request: ChatRequest, model: Any, arg: str) 
     return await chat.handle_identity_report(request, model)
 
 
-async def _handle_state(model: Any, request: ChatRequest, arg: str = "") -> str:
-    """Show or edit Sage's durable engagement state — the hop ledger of achieved effects that grounds
-    the autonomous solve. Re-homed from the PayloadType `state` command; `ai.langgraph.engagement_ledger`
-    is the single source of truth (the running model publishes its active engagement id there).
+_STATE_USAGE = (
+    "Unknown `/state` subcommand. Usage:\n"
+    "- `/state` — show the engagement ledger\n"
+    "- `/state reconcile [task_id] [apply]` — record verified effects from task history (credential import is "
+    "dry-run unless `apply`)\n"
+    "- `/state remove <#|id[,…]> [--reason <text>]` — retract rows (kept, numbered, undoable)\n"
+    "- `/state restore <#|id[,…]> [--reason <text>]` — undo retractions\n"
+    "- `/state invalidate <#|id[,…]> [--reason <text>]` — mark rows as no longer holding\n"
+    "- `/state objective <text>`\n"
+    "- `/state wipe` — retract every row"
+)
 
-    Usage: `/state` (show) · `/state reconcile [task_id] [apply]` · `/state remove <#|id[,…]>` ·
-    `/state set <#|id> <status>` · `/state objective <text>` · `/state wipe`.
-    """
+
+def _split_reason(rest: str) -> tuple[str, str]:
+    head, sep, reason = (rest or "").partition("--reason")
+    return head.strip(), reason.strip() if sep else ""
+
+
+def _state_actor(request: ChatRequest):
+    """The authenticated context of a `/state` request. Chat requests carry no operator identifier, so the actor
+    id is recorded as unavailable; a name typed in the command is never treated as identity."""
     try:
-        from ai.langgraph import engagement_ledger
+        from ai.langgraph import engagement_store
     except ImportError:  # pragma: no cover
-        from ..ai.langgraph import engagement_ledger  # type: ignore
+        from ..ai.langgraph import engagement_store  # type: ignore
+    return engagement_store.Actor(
+        kind="operator",
+        name="operator (identity unavailable in chat request)",
+        actor_id="",
+        channel_id=str(getattr(request, "ChannelID", "") or ""),
+        request_id=(f"request:{getattr(request, 'RequestID', '')};message:{getattr(request, 'RequestMessageID', '')};"
+                    f"apitoken:{getattr(request, 'APITokenID', '')}"),
+    )
 
-    # Resolve the exact current operation on every call. A process-global active key may belong to a
-    # different operation or channel, so it is never authoritative for `/state`.
-    engagement_id = await _resolve_chat_engagement_id(model, request)
-    if not engagement_id:
-        return ("Couldn't resolve this channel's engagement from Mythic (no operation context yet). "
+
+async def _handle_state(model: Any, request: ChatRequest, arg: str = "") -> str:
+    """Show or correct the operation's shared Engagement State Ledger.
+
+    Usage: `/state` (show) · `/state reconcile [task_id] [apply]` · `/state remove <#|id[,…]> [--reason …]` ·
+    `/state restore <#|id[,…]>` · `/state invalidate <#|id[,…]>` · `/state objective <text>` · `/state wipe`.
+    Corrections are recorded events in sage.db: rows, numbers and history are kept, and running sessions see
+    them on their next ledger read.
+    """
+    tools = await _resolve_chat_ledger(model, request)
+    if tools is None:
+        return ("Couldn't resolve this channel's engagement ledger from Mythic (no operation context yet). "
                 "Send one message to start a session, then try `/state` again.")
     parts = (arg or "").strip().split(maxsplit=1)
     sub = parts[0].lower() if parts else ""
     rest = parts[1].strip() if len(parts) > 1 else ""
-
-    if sub == "wipe":
-        engagement_ledger.wipe(engagement_id)
-        return _render_ledger_markdown(engagement_ledger.load_runtime(engagement_id), engagement_id, model, request,
-                                       notice="🧹 Wiped the ledger.")
-    if sub == "objective":
-        if not rest:
-            return "Usage: `/state objective <text>` — set the engagement objective."
-        data = engagement_ledger.load_runtime(engagement_id)
-        data["objective"] = rest
-        data["objective_source"] = "operator"
-        engagement_ledger.save_runtime(data, engagement_id)
-        state = getattr(model, "state", None)
-        if isinstance(state, dict):
-            state["_pending_objective_refinement"] = None
-        return _render_ledger_markdown(data, engagement_id, model, request, notice="🎯 Objective updated.")
-    if sub == "remove":
-        if not rest:
-            return "Usage: `/state remove <#|id[,…]>` — remove hop(s) by hop number (the # column) or id/effect/technique."
-        data = engagement_ledger.load_runtime(engagement_id)
-        selectors = [s.strip() for s in rest.split(",") if s.strip()]
-        data, removed = engagement_ledger.remove_hops(data, selectors)
-        engagement_ledger.save_runtime(data, engagement_id)
-        return _render_ledger_markdown(data, engagement_id, model, request, notice=f"🗑️ Removed {removed} hop(s).")
-    if sub == "set":
-        bits = rest.split(maxsplit=1)
-        if len(bits) < 2:
-            return "Usage: `/state set <#|id> <status>` — change a hop's status (e.g. `/state set 9 pending`)."
-        selector, status = bits[0].strip(), bits[1].strip()
-        if status.casefold() == "achieved":
-            return (
-                "`/state set` cannot promote a hop to `achieved`. Runtime achievements require an "
-                "admissible Mythic/BloodHound proof envelope; use `/state reconcile` for verified task history."
-            )
-        data = engagement_ledger.load_runtime(engagement_id)
-        data, changed = engagement_ledger.set_hop_status(data, selector, status)
-        engagement_ledger.save_runtime(data, engagement_id)
-        return _render_ledger_markdown(data, engagement_id, model, request, notice=f"✏️ Set status on {changed} hop(s) → `{status}`.")
-    if sub == "reconcile":
-        # Re-homed operator action: inspect completed Mythic task history, record achieved effects into
-        # the ledger, and import discovered credential material. DRY-RUN unless `apply` is given (task
-        # output is attacker-influenceable). `/state reconcile [task_id] [apply]`.
-        tools = getattr(model, "mythic_client", None)
-        client = getattr(tools, "client", None) if tools is not None else None
-        if client is None:
-            return ("`/state reconcile` needs an active Mythic session — send one message on this channel "
-                    "first, then retry `/state reconcile [task_id] [apply]`.")
-        try:
-            from ai.langgraph import state_reconcile
-        except ImportError:  # pragma: no cover
-            from ..ai.langgraph import state_reconcile  # type: ignore
-        tokens = rest.split()
-        apply = any(t.lower() == "apply" for t in tokens)
-        task_id = next((t for t in tokens if t.isdigit()), "")
-        data = engagement_ledger.load_runtime(engagement_id)
-        now = datetime.now(timezone.utc).isoformat()
-        data, notes = await state_reconcile.reconcile_task_history(
-            client, data, task_id, "", 25, now, apply=apply,
-        )
-        engagement_ledger.save_runtime(data, engagement_id)
-        return _render_ledger_markdown(data, engagement_id, model, request, notice="\n".join(notes))
-    if sub and sub != "show":
-        return ("Unknown `/state` subcommand. Usage:\n"
-                "- `/state` — show the engagement ledger\n"
-                "- `/state reconcile [task_id] [apply]` — import verified effects/creds from task history (dry-run unless `apply`)\n"
-                "- `/state remove <#|id[,…]>`\n"
-                "- `/state set <#|id> <status>`\n"
-                "- `/state objective <text>`\n"
-                "- `/state wipe`")
-
-    return _render_ledger_markdown(engagement_ledger.load_runtime(engagement_id), engagement_id, model, request)
-
-
-async def _resolve_chat_engagement_id(model: Any, request: ChatRequest) -> str:
-    """Resolve this channel's durable engagement key from Mythic WITHOUT needing a chat turn first.
-
-    The key is `<Operation>_<id>_<uuid>`; the uuid is a per-operation durable marker only Mythic holds
-    (there can be many historical ledgers for one operation), so resolution needs a Mythic client.
-    Prefer the live session's already-logged-in client; otherwise build a short-lived one from the chat
-    request's API token (the same MythicTools init the model uses). Read the resolved key back from that exact
-    client instance after `_ensure_engagement_key`; the process-global published key is not operation-scoped.
-    Returns "" on failure.
-    """
+    store = tools._ledger_store()
     try:
-        from ai.langgraph import engagement_ledger
-    except ImportError:  # pragma: no cover
-        from ..ai.langgraph import engagement_ledger  # type: ignore
+        binding = tools._require_ledger_binding()
+    except Exception as exc:
+        return f"⚠️ The engagement ledger is unavailable: {exc}"
+    actor = _state_actor(request)
 
-    # 1) Reuse the live session's client — cheap, already authenticated/scoped.
+    try:
+        if sub == "wipe":
+            result = store.wipe(binding, actor=actor)
+            return _render_ledger_markdown(
+                tools, request, model,
+                notice=(f"🧹 Retracted {len(result.changed)} hop(s) and marked current graph facts as no longer "
+                        "current. Nothing was deleted: rows keep their numbers and history, and `/state restore` "
+                        "undoes a retraction."),
+            )
+        if sub == "objective":
+            if not rest:
+                return "Usage: `/state objective <text>` — set the engagement objective."
+            store.update_objective(binding, rest, "operator")
+            state = getattr(model, "state", None)
+            if isinstance(state, dict):
+                state["_pending_objective_refinement"] = None
+            return _render_ledger_markdown(tools, request, model, notice="🎯 Objective updated.")
+        if sub in {"remove", "restore", "invalidate"}:
+            selector_text, reason = _split_reason(rest)
+            selectors = [item.strip() for item in selector_text.split(",") if item.strip()]
+            if not selectors:
+                return (f"Usage: `/state {sub} <#|id[,…]> [--reason <text>]` — select hop(s) by hop number "
+                        "(the # column) or id/effect/technique.")
+            if sub == "remove":
+                result = store.retract(binding, selectors, reason=reason, actor=actor)
+                notice = f"🗑️ Retracted {len(result.changed)} hop(s); they stay listed with their numbers."
+            elif sub == "restore":
+                result = store.restore(binding, selectors, reason=reason, actor=actor)
+                notice = (f"↩️ Restored {len(result.changed)} hop(s). A restored row counts again only if its "
+                          "proof still passes; a separate \"no longer holds\" marker stays.")
+            else:
+                result = store.invalidate(binding, selectors, reason=reason, actor=actor)
+                notice = f"⏹️ Marked {len(result.changed)} hop(s) as no longer holding."
+            unchanged = len(result.matched) - len(result.changed)
+            if unchanged:
+                notice += f" ({unchanged} matched row(s) already had that state.)"
+            return _render_ledger_markdown(tools, request, model, notice=notice)
+        if sub == "set":
+            return ("`/state set` is disabled: hop status comes only from verified evidence. Use "
+                    "`/state remove` to retract a row, `/state invalidate` to mark it no longer holding, or "
+                    "`/state reconcile [task_id]` to record verified task history.")
+        if sub == "reconcile":
+            if getattr(tools, "client", None) is None:
+                return ("`/state reconcile` needs an active Mythic session — send one message on this channel "
+                        "first, then retry `/state reconcile [task_id] [apply]`.")
+            tokens = rest.split()
+            apply = any(t.lower() == "apply" for t in tokens)
+            task_id = next((t for t in tokens if t.isdigit()), "")
+            notes = await tools._reconcile_ledger_from_task_history(task_id, "", 25, apply=apply)
+            return _render_ledger_markdown(tools, request, model, notice="\n".join(notes))
+    except Exception as exc:
+        return f"⚠️ The engagement ledger change was not recorded: {exc}"
+    if sub and sub != "show":
+        return _STATE_USAGE
+    return _render_ledger_markdown(tools, request, model)
+
+
+async def _resolve_chat_ledger(model: Any, request: ChatRequest):
+    """A MythicTools bound to exactly this channel's operation, or None.
+
+    Reuse the live session's client only when it belongs to the request's operation; otherwise build a
+    short-lived one from the chat request's API token. The binding comes from that client's own operation id
+    and Mythic engagement marker, never a process-global key.
+    """
+    wanted = getattr(request, "OperationID", None)
     client = getattr(model, "mythic_client", None) if model is not None else None
-    if client is not None:
+    same_operation = str(getattr(client, "operation_id", None) or 0) == str(wanted or 0)
+    if client is not None and hasattr(client, "_ledger_store") and same_operation:
         try:
             await client._ensure_engagement_key()
-            key = str(getattr(client, "_engagement_key", "") or "").strip()
-            if key:
-                return key
+            if getattr(client, "_ledger_binding", None) is not None:
+                return client
         except Exception as e:
-            logger.debug(f"/state: session-client engagement resolution failed: {e}")
-
-    # 2) No session yet (e.g. right after a reboot) — build a short-lived client from the request token.
+            logger.debug(f"/state: session-client ledger binding failed: {e}")
     try:
         try:
             from ai.langgraph.mythic_tools import MythicTools
         except ImportError:  # pragma: no cover
             from ..ai.langgraph.mythic_tools import MythicTools  # type: ignore
         tools = MythicTools(
-            operation_id=getattr(request, "OperationID", None),
+            operation_id=wanted,
             channel_id=getattr(request, "ChannelID", None),
             apitoken_id=getattr(request, "APITokenID", 0),
         )
         await tools.login()
         await tools._ensure_engagement_key()
-        return str(getattr(tools, "_engagement_key", "") or "").strip()
+        if getattr(tools, "_ledger_binding", None) is not None:
+            return tools
     except Exception as e:
-        logger.debug(f"/state: short-lived-client engagement resolution failed: {e}")
-    return ""
+        logger.debug(f"/state: short-lived-client ledger binding failed: {e}")
+    return None
 
 
-def _render_ledger_markdown(data: dict, engagement_id: str, model: Any, request: ChatRequest, notice: str = "") -> str:
-    """Render the engagement ledger as a Mythic-chat markdown view (+ a compact session footer).
+def _render_ledger_markdown(tools: Any, request: ChatRequest, model: Any, notice: str = "") -> str:
+    """Render the operation ledger (every row, corrections marked) from one fresh snapshot.
 
-    The same view, minus evidence previews, is queued for this channel's next model request so the model
-    can resolve the operator's "hop N" against the rows shown here.
+    The same view, minus evidence previews, is queued for this channel's next model request so the model can
+    resolve the operator's "hop N" against the rows shown here.
     """
     try:
         from ai.langgraph import engagement_ledger
     except ImportError:  # pragma: no cover
         from ..ai.langgraph import engagement_ledger  # type: ignore
 
-    engagement_ledger.assign_hop_numbers(data)
-    hops = [hop for hop in (data.get("hops") or []) if isinstance(hop, dict)]
     out: list[str] = []
     if notice:
         out.append(notice + "\n")
-    out.append(f"**Engagement state — `{engagement_id}`**")
-    objective = str(data.get("objective") or "").strip()
+    try:
+        snapshot = tools._ledger_snapshot()
+    except Exception as exc:
+        out.append(f"⚠️ The engagement ledger is unavailable: {exc}")
+        return "\n".join(out)
+    hops = snapshot.display_hops()
+    objective = tools._human_engagement_objective(snapshot.objective_setting()[0])
+    out.append(f"**Engagement state — `{snapshot.engagement_key}`**")
     if objective:
         out.append(f"\n**Objective:** {objective}")
     out.append(f"\n**Hops:** {len(hops)}\n")
@@ -411,15 +425,19 @@ def _render_ledger_markdown(data: dict, engagement_id: str, model: Any, request:
         out.append("_(empty — no hops recorded yet)_")
     else:
         out.extend(engagement_ledger.render_hop_table(hops))
+        notes = engagement_ledger.correction_notes(hops)
+        if notes:
+            out.append("\n**Corrections**")
+            out.extend(notes)
     out.append(
-        "\n**Edit:** `/state remove <#|id[,…]>` · `/state set <#|id> <status>` · "
-        "`/state objective <text>` · `/state wipe`  _(# = the permanent hop number, or a hop id/effect/technique)_"
+        "\n**Edit:** `/state remove <#|id[,…]> [--reason …]` · `/state restore <#|id[,…]>` · "
+        "`/state invalidate <#|id[,…]>` · `/state objective <text>` · `/state wipe`  "
+        "_(# = the permanent hop number, or a hop id/effect/technique)_"
     )
     engagement_ledger.record_operator_view(
         getattr(request, "ChannelID", None),
-        engagement_ledger.operator_view_text(data, "`/state`"),
+        engagement_ledger.operator_view_text({"objective": objective, "hops": hops}, "`/state`"),
     )
-    # Compact session footer so the old /state's session info isn't lost.
     if model is not None:
         out.append(
             f"\n<sub>session: channel `{request.ChannelID}` · mode `{getattr(model, 'mode', 'supervised')}` · "

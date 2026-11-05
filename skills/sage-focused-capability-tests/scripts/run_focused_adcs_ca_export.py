@@ -32,7 +32,8 @@ from sage_task import resolve_password  # noqa: E402
 sys.path.insert(0, str(ROOT / "Payload_Type" / "sage" / "ai" / "langgraph"))
 
 import capabilities  # noqa: E402
-import engagement_ledger  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _focused_ledger  # noqa: E402
 import mythic_tools  # noqa: E402
 
 SERVER = "127.0.0.1"
@@ -215,12 +216,9 @@ async def main() -> int:
             return 1
     secrets = tuple(value for value in (password, args.pfx_password) if value)
 
-    tools = mythic_tools.MythicTools(agent_task_id="focused-adcs-ca-export")
-    tools.client = client
-    await tools._ensure_engagement_key()
+    tools = await _focused_ledger.bound_tools(mythic_tools, client, "focused-adcs-ca-export", args.callback)
     engagement_key = tools._eng_key()
     print(f"engagement: {engagement_key}")
-    original_objective = str(engagement_ledger.load(engagement_key).get("objective") or "")
 
     target_host = args.target_host.casefold()
     target_domain = args.target_domain.casefold()
@@ -355,10 +353,6 @@ async def main() -> int:
             "ca_thumbprint": probe.get("ca_thumbprint"),
         },
     )
-    if original_objective:
-        data = engagement_ledger.load(engagement_key)
-        data["objective"] = original_objective
-        engagement_ledger.save(data, engagement_key)
     print(f"record verdict={recorded.verdict} reason={recorded.reason}")
     print(f"RESULT: achieved adcs-ca-private-key:{target_host}@{target_domain}")
     return 0

@@ -7,9 +7,11 @@ to those tasks, rows by status, and achieved rows carrying a runtime proof envel
 and after a ledger change. A persisted `achieved` row was admitted by Sage's proof boundary when it was written and
 again when the ledger was loaded; the script reads the file as it is and never re-admits proofs.
 
-Inputs are the persisted ledger JSON (`.sage_engagement/state_*.json`) and a Mythic export with the request windows
+Inputs are a ledger JSON — a historical `.sage_engagement/state_*.json` or an ESL export written by
+`skills/sage-goad-reset/scripts/engagement_ledger_migrate.py export` — and a Mythic export with the request windows
 and task identities (`{"requests": [{id, created_at, completed_at}], "tasks": [{display_id, command_name, status,
-timestamp}]}`, UTC). Task parameters, task output and credential values are never read.
+timestamp}]}`, UTC). Task parameters, task output and credential values are never read. An export's retracted or
+"no longer holds" rows are counted separately and never as proven current rows.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ METHODS = {
     "task_linked_rows": "ledger rows whose evidence mythic_task_id is one of the request's tasks",
     "proven_rows": "task-linked rows with status achieved and a proof envelope of a runtime origin",
     "untimed_rows": "ledger rows citing no task in any request window (graph facts are not rows)",
+    "corrected_rows": "rows an export marks operator-retracted or no longer holding (history, not current proof)",
 }
 
 
@@ -46,10 +49,16 @@ def _task_id(value: Any) -> int | None:
     return int(text) if text.isdigit() else None
 
 
+def _corrected(hop: dict[str, Any]) -> bool:
+    corrections = hop.get("corrections") if isinstance(hop.get("corrections"), dict) else {}
+    marker = corrections.get("no_longer_holds") if isinstance(corrections.get("no_longer_holds"), dict) else {}
+    return bool(corrections.get("retracted")) or bool(marker.get("effective"))
+
+
 def _proven(hop: dict[str, Any]) -> bool:
     proof = hop.get("proof_envelope") or (hop.get("evidence") or {}).get("proof_envelope") or {}
     return str(hop.get("status") or "") == "achieved" and isinstance(proof, dict) \
-        and proof.get("origin") in RUNTIME_ORIGINS
+        and proof.get("origin") in RUNTIME_ORIGINS and not _corrected(hop)
 
 
 def build_report(ledger: dict[str, Any], export: dict[str, Any], requests: list[int] | None = None) -> dict[str, Any]:
@@ -78,6 +87,7 @@ def build_report(ledger: dict[str, Any], export: dict[str, Any], requests: list[
             "tasks_with_a_row": len(ids & set(by_task)),
             "rows_by_status": dict(Counter(str(hop.get("status") or "") for hop in linked)),
             "proven_rows": sum(_proven(hop) for hop in linked),
+            "corrected_rows": sum(_corrected(hop) for hop in linked),
             "rows_per_task": round(len(linked) / len(ids), 3) if ids else None,
         })
     return {
@@ -87,6 +97,7 @@ def build_report(ledger: dict[str, Any], export: dict[str, Any], requests: list[
         "untimed_rows": sum(1 for task_id in by_task if task_id not in linked_anywhere)
         + sum(1 for hop in hops if _task_id((hop.get("evidence") or {}).get("mythic_task_id")) is None),
         "next_hop_number": ledger.get("next_hop_number"),
+        "corrected_rows": sum(_corrected(hop) for hop in hops),
         "requests": rows,
     }
 
@@ -96,7 +107,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         "# Engagement-ledger yield",
         "",
         f"Ledger rows: {report['ledger_rows']} ({report['ledger_rows_by_status']}); rows citing no request task: "
-        f"{report['untimed_rows']}; next hop number: {report['next_hop_number']}.",
+        f"{report['untimed_rows']}; corrected rows: {report.get('corrected_rows', 0)}; "
+        f"next hop number: {report['next_hop_number']}.",
         "",
         "| Request | Tasks | Task-linked rows | Tasks with a row | Proven rows | Rows by status |",
         "|---|---|---|---|---|---|",
@@ -110,7 +122,8 @@ def render_markdown(report: dict[str, Any]) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--ledger", type=Path, required=True, help="Persisted engagement ledger JSON.")
+    parser.add_argument("--ledger", type=Path, required=True,
+                        help="Historical ledger JSON or an ESL export (engagement_ledger_migrate.py export).")
     parser.add_argument("--mythic-export", type=Path, required=True, help="Mythic export with requests and tasks.")
     parser.add_argument("--request", type=int, action="append", help="Request id to include; repeatable.")
     parser.add_argument("--json-out", type=Path)

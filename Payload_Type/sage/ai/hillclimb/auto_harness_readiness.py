@@ -41,6 +41,7 @@ from .experiment_contracts import (
     file_sha256,
 )
 from .proposer_canary import ProposerOutcome, ProviderRoute, run_proposer_canary
+from ..langgraph import engagement_store
 from ..trajectory.schema import TransitionRecord, load_jsonl
 
 
@@ -104,12 +105,20 @@ def _runtime_state_hashes(root: Path) -> tuple[str, str, str]:
         root=root,
         absent_label="active-phoenix-db",
     )
-    ledger_hash = _hash_globs(
+    # The active ledger is the ESL in sage.db: hash its canonical logical content (rows, corrections, history,
+    # revisions), plus any legacy state files still beside the runtime. Directory presence alone proves nothing.
+    database = runtime_root / "sage.db"
+    try:
+        esl_digest = engagement_store.EngagementStore(database, legacy_dir=str(runtime_root / ".sage_engagement")).logical_digest()
+    except Exception as exc:
+        esl_digest = f"unavailable:{type(exc).__name__}"
+    legacy_hash = _hash_globs(
         runtime_root / ".sage_engagement",
-        ("*",),
+        ("state_*.json",),
         root=root,
-        absent_label="active-ledger",
+        absent_label="legacy-ledger-files",
     )
+    ledger_hash = content_hash({"esl": esl_digest if database.exists() else "absent", "legacy_files": legacy_hash})
     return sage_db_hash, phoenix_db_hash, ledger_hash
 
 

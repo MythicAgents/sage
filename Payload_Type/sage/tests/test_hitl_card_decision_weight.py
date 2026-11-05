@@ -274,89 +274,66 @@ def test_raw_task_rejection_keeps_generic_message():
 # ── The reconciled ledger surfaces at turn ends, changed-only ────────────────────────
 
 
-class _FakeMythicClient:
-    def __init__(self) -> None:
-        self.engagement_key = f"test-{uuid.uuid4().hex[:12]}"
-        self._last_issued_task_display_id = ""
-        self.client = None
-        self.streamed: list[str] = []
-
-    def _eng_key(self) -> str:
-        return self.engagement_key
-
-
-def _summary_model(monkeypatch: pytest.MonkeyPatch, fake: _FakeMythicClient):
+def _summary_model(monkeypatch: pytest.MonkeyPatch):
+    """A Model whose Mythic client is a real session bound to a fresh isolated ledger namespace."""
     from ai.langgraph import model as model_mod
-    from ai.langgraph import engagement_ledger
+    from ai.langgraph import mythic_tools
 
+    monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", f"test-{uuid.uuid4().hex[:12]}")
+    client = mythic_tools.MythicTools(agent_task_id="turn-end")
+    client._require_ledger_binding()
     model = object.__new__(model_mod.Model)
-    model.mythic_client = fake
-
-    async def _stream(message: str) -> bool:
-        fake.streamed.append(message)
-        return True
-
-    model._stream_message_to_mythic = _stream
-    try:
-        yield model, engagement_ledger
-    finally:
-        engagement_ledger.wipe(fake.engagement_key)
+    model.mythic_client = client
+    return model, client
 
 
 def test_turn_end_summary_renders_ledger(monkeypatch: pytest.MonkeyPatch):
-    for model, ledger in _summary_model(monkeypatch, _FakeMythicClient()):
-        text = asyncio.run(model._engagement_state_turn_summary_text())
-        assert "Engagement state" in text
-        assert "_(empty — no hops recorded yet)_" in text
+    model, _client = _summary_model(monkeypatch)
+    text = asyncio.run(model._engagement_state_turn_summary_text())
+    assert "Engagement state" in text
+    assert "_(empty — no hops recorded yet)_" in text
 
 
 def test_turn_end_summary_one_lines_unchanged_state(monkeypatch: pytest.MonkeyPatch):
-    for model, ledger in _summary_model(monkeypatch, _FakeMythicClient()):
-        first = asyncio.run(model._engagement_state_turn_summary_text())
-        assert "Engagement state" in first
-        second = asyncio.run(model._engagement_state_turn_summary_text())
-        assert "unchanged" in second
-        assert "| Hop |" not in second
+    model, _client = _summary_model(monkeypatch)
+    first = asyncio.run(model._engagement_state_turn_summary_text())
+    assert "Engagement state" in first
+    second = asyncio.run(model._engagement_state_turn_summary_text())
+    assert "unchanged" in second
+    assert "| Hop |" not in second
+
+
+def _fake_reconcile_mutation():
+    from ai.langgraph import engagement_store
+
+    hop = {"technique": "dcsync-krbtgt", "target": "lab.local", "effect": "krbtgt-hash:lab.local",
+           "status": "achieved", "evidence": {"mythic_task_id": 26, "result_preview": "krbtgt: hash dumped"}}
+    return engagement_store.hop_mutations([], [hop])
 
 
 def test_turn_end_reconciliation_corrects_failed_hop(monkeypatch: pytest.MonkeyPatch):
     """Status-only reconciliation runs at the turn end when tasks were issued.
 
-    The fake reconciler injects a hop without a proof envelope, so save_runtime's
-    quarantine discipline downgrades it to legacy_unverified — by design (a fake
-    must not forge admissible proof). The wiring assertions: the reconciler ran
-    status-only (apply=False) and the table reflects the reconciled ledger.
+    The fake reconciler produces a row without a proof envelope, so the runtime view quarantines it to
+    legacy_unverified — by design (a fake must not forge admissible proof). The wiring assertions: the reconciler
+    ran status-only (apply=False), its row went through the shared store, and the table reflects it.
     """
     from ai.langgraph import state_reconcile as state_reconcile_mod
-    from ai.langgraph import engagement_ledger
 
     calls: list[dict] = []
 
-    async def _fake_reconcile(client, data, task_id, callback_id, limit, now, apply=False):
+    async def _fake_reconcile(client, hops, task_id, callback_id, limit, now, apply=False, **kwargs):
         calls.append({"apply": apply, "limit": limit, "task_id": task_id})
-        data = dict(data)
-        data["hops"] = [{
-            "technique": "dcsync-krbtgt",
-            "target": "lab.local",
-            "effect": "krbtgt-hash:lab.local",
-            "status": "achieved",
-            "evidence": {"mythic_task_id": 26, "result_preview": "krbtgt: hash dumped"},
-        }]
-        return data, ["reconciled task 26"]
+        return _fake_reconcile_mutation(), ["reconciled task 26"]
 
-    original = state_reconcile_mod.reconcile_task_history
-    state_reconcile_mod.reconcile_task_history = _fake_reconcile
-    try:
-        for model, ledger in _summary_model(monkeypatch, _FakeMythicClient()):
-            fake = model.mythic_client
-            fake._last_issued_task_display_id = 45
-            fake.client = object()
-            text = asyncio.run(model._engagement_state_turn_summary_text())
-        assert calls and calls[0]["apply"] is False
-        assert "dcsync-krbtgt" in text
-        assert "26" in text
-    finally:
-        state_reconcile_mod.reconcile_task_history = original
+    monkeypatch.setattr(state_reconcile_mod, "reconcile_task_history", _fake_reconcile)
+    model, client = _summary_model(monkeypatch)
+    client._last_issued_task_display_id = 45
+    client.client = object()
+    text = asyncio.run(model._engagement_state_turn_summary_text())
+    assert calls and calls[0]["apply"] is False
+    assert "dcsync-krbtgt" in text and "26" in text
+    assert [row["technique"] for row in client._ledger_snapshot().display_hops()] == ["dcsync-krbtgt"]
 
 
 def test_turn_end_reconciliation_runs_only_when_tasks_issued(monkeypatch: pytest.MonkeyPatch):
@@ -364,20 +341,15 @@ def test_turn_end_reconciliation_runs_only_when_tasks_issued(monkeypatch: pytest
 
     calls: list[dict] = []
 
-    async def _fake_reconcile(client, data, task_id, callback_id, limit, now, apply=False):
+    async def _fake_reconcile(client, hops, task_id, callback_id, limit, now, apply=False, **kwargs):
         calls.append({"limit": limit})
-        return data, []
+        return [], []
 
-    original = state_reconcile_mod.reconcile_task_history
-    state_reconcile_mod.reconcile_task_history = _fake_reconcile
-    try:
-        for model, ledger in _summary_model(monkeypatch, _FakeMythicClient()):
-            fake = model.mythic_client
-            text = asyncio.run(model._engagement_state_turn_summary_text())
-            assert calls == []  # no tasks issued → no reconciliation round-trip
-            fake._last_issued_task_display_id = 45
-            fake.client = object()
-            text = asyncio.run(model._engagement_state_turn_summary_text())
-            assert len(calls) == 1
-    finally:
-        state_reconcile_mod.reconcile_task_history = original
+    monkeypatch.setattr(state_reconcile_mod, "reconcile_task_history", _fake_reconcile)
+    model, client = _summary_model(monkeypatch)
+    asyncio.run(model._engagement_state_turn_summary_text())
+    assert calls == []  # no tasks issued → no reconciliation round-trip
+    client._last_issued_task_display_id = 45
+    client.client = object()
+    asyncio.run(model._engagement_state_turn_summary_text())
+    assert len(calls) == 1

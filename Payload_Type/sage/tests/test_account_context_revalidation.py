@@ -1,5 +1,6 @@
 """Fresh-client account-context revalidation at the native capability boundary."""
 
+from tests.esl_fixtures import seed_ledger  # noqa: E402
 import asyncio
 import copy
 from dataclasses import asdict
@@ -101,7 +102,7 @@ def _assembled_model(state):
     )
     assembled.policy_mode = "symbolic"
     assembled.mythic_client = mt.MythicTools(agent_task_id=1)
-    assembled.mythic_client._engagement_graph_facts = list(state.graph_facts)
+    seed_ledger(assembled.mythic_client, graph_facts=list(state.graph_facts))
 
     async def keep_inert_graph_cache(_now):
         return None

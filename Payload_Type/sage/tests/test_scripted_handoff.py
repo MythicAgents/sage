@@ -124,6 +124,14 @@ class _Harness:
         )
         self.mythic = MagicMock()
         self.mythic.get_payload_names = AsyncMock(return_value=[])
+        # Ledger read surface of this Mythic double: rows a test assigns are what a fresh snapshot returns.
+        mythic = self.mythic
+        mythic._engagement_hops = []
+        mythic._engagement_graph_facts = []
+        mythic._ledger_view = lambda: SimpleNamespace(
+            hops=list(mythic._engagement_hops), graph_facts=list(mythic._engagement_graph_facts),
+            corrected_hops=[], snapshot=None,
+        )
         model.mythic_client = self.mythic
         model._payload_names = []
         if not self.sqlite_checkpoint:

@@ -7,6 +7,7 @@ no productive Mythic work. These pin the two guards:
   2. a hop the gate keeps blocking is STOPped after 3 tries (reset when a task actually passes the gate)
 Run: cd Payload_Type/sage && python3 -m pytest tests/test_deliberation_drain.py -q
 """
+from tests.esl_fixtures import seed_ledger  # noqa: E402
 import asyncio
 import json
 import sys
@@ -134,10 +135,10 @@ def test_corroboration_facts_from_cred_store_and_graph():
         {"account": "empty", "realm": "north.sevenkingdoms.local", "credential_text": ""},  # no secret -> skip
     ]
     mt._cred_cache_ts = NOW
-    mt._engagement_graph_facts = [
+    seed_ledger(mt, graph_facts=[
         es.GraphFact("generic-write:gpo:starkwallpaper", "bloodhound:cypher", NOW, 600),
         es.GraphFact("gpo-domain:starkwallpaper:north.sevenkingdoms.local", "bloodhound:cypher", NOW, 600),
-    ]
+    ])
     facts = {f.predicate for f in asyncio.run(mt._corroboration_facts(NOW))}
     assert "krbtgt-hash:north.sevenkingdoms.local" in facts          # dcsync artifact
     assert "creds:samwell.tarly@north.sevenkingdoms.local" in facts  # dumped-cred artifact
@@ -209,10 +210,10 @@ def test_corroboration_preserves_bloodhound_lineage_for_graph_derived_facts():
     ).to_dict()
     mt._cred_cache = []
     mt._cred_cache_ts = NOW
-    mt._engagement_graph_facts = [
+    seed_ledger(mt, graph_facts=[
         es.GraphFact("generic-write:gpo:starkwallpaper", "bloodhound:cypher", NOW, 600, proof),
         es.GraphFact("gpo-domain:starkwallpaper:north.sevenkingdoms.local", "bloodhound:cypher", NOW, 600, proof),
-    ]
+    ])
 
     facts = asyncio.run(mt._corroboration_facts(NOW))
     by_predicate = {fact.predicate: fact for fact in facts}

@@ -12,6 +12,7 @@ No live Mythic required — MythicTools.__init__ does no network. Mirrors the re
 convention.
 """
 
+from tests.esl_fixtures import seed_ledger  # noqa: E402
 import sys
 from pathlib import Path
 
@@ -222,8 +223,9 @@ def test_record_dcsync_user_no_key_failed_not_achieved(mt):
 def test_failed_credential_hop_persists(mt):
     mt._pending_engagement_hop = ("dcsync-user", USER, TS)
     _record_success(mt, DCSYNC_8439)
-    # Durable trail so `state show` surfaces the honest failure.
-    assert Path(mt._engagement_ledger_path()).exists()
+    # Durable trail in the shared store so `/state` surfaces the honest failure.
+    rows = mt._ledger_snapshot().hop_rows()
+    assert [row.payload["status"] for row in rows if row.payload["technique"] == "dcsync-user"] == ["failed"]
 
 
 def test_record_dcsync_krbtgt_no_key_failed(mt):
@@ -342,10 +344,10 @@ def test_verified_achieved_sticky_across_reload(tmp_path, monkeypatch):
 def test_legacy_false_achieved_overwritten_by_verified_failed(mt):
     # A legacy achieved WITHOUT real-key evidence (artifact_present absent) is cleanup-eligible:
     # a verified no-key result SHOULD overwrite it (this is the false-achieved fix doing its job).
-    mt._engagement_hops = es.record_hop_result(
+    seed_ledger(mt, prove=False, hops=es.record_hop_result(
         es.EngagementState(objective="t"), "dcsync-user", USER, "achieved",
         {"source": "legacy", "provenance": "run"}, TS,
-    ).hops
+    ).hops)
     mt._pending_engagement_hop = ("dcsync-user", USER, "2026-06-08T03:00:00+00:00")
     _record_success(mt, DCSYNC_8439)
     hops = [h for h in mt._engagement_hops if h.technique == "dcsync-user" and h.target == USER]

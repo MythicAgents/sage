@@ -2004,6 +2004,45 @@ class RuntimePilot:
         safe_id = _ENGAGEMENT_FILENAME_SAFE.sub("_", engagement_id)[:128]
         return state_root / f"state_{safe_id}.json"
 
+    def _esl_database(self, arm: str | None = None) -> Path:
+        source_root = getattr(self, "source_roots", {}).get(arm, getattr(self, "source_root", ROOT))
+        configured = os.environ.get("SAGE_DATABASE_PATH", "").strip()
+        return Path(configured) if configured else Path(source_root) / "Payload_Type" / "sage" / "sage.db"
+
+    def _operation_marker(self) -> str | None:
+        """The current operation's Sage engagement marker, read from Mythic without minting one."""
+        from mythic import mythic
+        from ai.langgraph import operation_context
+
+        response = asyncio.run(mythic.execute_custom_query(
+            self.current_client, operation_context._MARKER_READ, variables={"op": int(self.current_operation_id)},
+        ))
+        rows = (response or {}).get("operationeventlog") or []
+        found = operation_context._UUID_RE.search(str(rows[0].get("message") or "")) if rows else None
+        return found.group(0) if found else None
+
+    def _assert_fresh_operation_ledger(self, arm: str) -> dict[str, Any]:
+        """Fresh start means the bound operation's ledger in sage.db holds no rows (file absence proves nothing).
+
+        No marker means Sage has not bound this operation yet, so its ledger is necessarily empty.
+        """
+        from ai.langgraph import engagement_store
+
+        marker = self._operation_marker()
+        database = self._esl_database(arm)
+        evidence = {"database": str(database), "operation_id": self.current_operation_id,
+                    "marker_present": bool(marker), "hop_rows": 0}
+        if marker:
+            count = engagement_store.EngagementStore(database, legacy_dir=os.devnull).operation_hop_count(
+                int(self.current_operation_id), marker,
+            )
+            evidence["hop_rows"] = count or 0
+            if count:
+                raise SetupInvariantError(
+                    f"engagement ledger for operation {self.current_operation_id} already holds {count} row(s)"
+                )
+        return evidence
+
     def _fresh_engagement_state(self, arms: tuple[str, ...] | None = None) -> dict[str, Any]:
         state = {}
         for arm in arms or ("shipping-sage", "raw-mythic-bloodhound"):
@@ -2732,6 +2771,7 @@ class RuntimePilot:
         self.current_operation_id = operation_id
         self.current_callback_id = callback_id
         self.current_arm = arm
+        esl_fresh = self._assert_fresh_operation_ledger(arm)
         self.current_chat_channel_id = None
         self.current_chat_request_id = None
         self.current_deadline_monotonic = None
@@ -2756,6 +2796,7 @@ class RuntimePilot:
             },
             "route": self.safe_route,
             "objective_sha256": hashlib.sha256(OBJECTIVE.encode()).hexdigest(),
+            "engagement_ledger_fresh": esl_fresh,
             "source_identity": source_identity,
             "tool_contract": tool_identity,
             "dependency_identity": dependency_identity,
@@ -3878,8 +3919,13 @@ class RuntimePilot:
     def teardown(self, arm: str, _start: Mapping[str, Any] | None) -> Mapping[str, Any]:
         steps = []
         python = str(self.source_root / ".venv" / "bin" / "python")
+        export_dir = self.artifact_dir / "engagement-ledger" / str(arm)
         for name, argv, timeout in (
             ("stop_sage", ["/bin/bash", "skills/sage-goad-reset/scripts/sage_stop.sh"], 120),
+            # The arm's ledger, exported from the stopped Sage's database before it is archived.
+            ("export_engagement_ledger", [python, "skills/sage-goad-reset/scripts/engagement_ledger_migrate.py",
+                                          "export", "--database", str(self._esl_database(arm)),
+                                          "--out", str(export_dir)], 120),
             ("archive_runtime_dbs", [python, "skills/sage-goad-reset/scripts/archive_runtime_dbs.py"], 180),
             ("poweroff_range", [python, "skills/sage-goad-reset/scripts/ludus.py", "poweroff", "all"], 900),
             ("wipe_bloodhound", ["uv", "--directory", os.environ.get("SAGE_BLOODHOUND_MCP_DIR", ""), "run", "python", str(self.source_root / "skills/sage-goad-reset/scripts/bh_reset.py"), "wipe", "--yes"], 180),

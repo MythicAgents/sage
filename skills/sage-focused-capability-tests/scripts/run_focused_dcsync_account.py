@@ -29,7 +29,8 @@ sys.path.insert(0, str(ROOT / "Payload_Type" / "sage" / "ai" / "langgraph"))
 
 import capabilities  # noqa: E402
 import credential_artifacts  # noqa: E402
-import engagement_ledger  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _focused_ledger  # noqa: E402
 import mythic_tools  # noqa: E402
 
 SERVER = "127.0.0.1"
@@ -118,11 +119,8 @@ async def main() -> int:
         f"host={callback.get('host')} user={callback.get('user')}"
     )
 
-    tools = mythic_tools.MythicTools(agent_task_id="focused-dcsync-account")
-    tools.client = client
-    await tools._ensure_engagement_key()
+    tools = await _focused_ledger.bound_tools(mythic_tools, client, "focused-dcsync-account", args.callback)
     print(f"engagement: {tools._eng_key()}")
-    original_objective = str(engagement_ledger.load(tools._eng_key()).get("objective") or "")
 
     for account in _account_list(args.accounts):
         effect = f"creds:{account.casefold()}@{args.domain.casefold()}"
@@ -166,17 +164,9 @@ async def main() -> int:
 
         reconcile_output = await _reconcile_task(client, args.sage_callback, int(task_id), args.timeout)
         print(f"reconcile_tail:\n{_tail(reconcile_output, 2200)}")
-        if original_objective:
-            data = engagement_ledger.load(tools._eng_key())
-            data["objective"] = original_objective
-            engagement_ledger.save(data, tools._eng_key())
         print(f"RESULT: achieved {effect} from task {task_id}")
         return 0
 
-    if original_objective:
-        data = engagement_ledger.load(tools._eng_key())
-        data["objective"] = original_objective
-        engagement_ledger.save(data, tools._eng_key())
     print("RESULT: no requested account DCSync returned verified secret material")
     return 2
 

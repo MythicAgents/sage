@@ -48,6 +48,8 @@ from sage_task import resolve_password  # noqa: E402
 sys.path.insert(0, str(ROOT / "Payload_Type" / "sage" / "ai" / "langgraph"))
 
 import credential_artifacts  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _focused_ledger  # noqa: E402
 import mythic_tools  # noqa: E402
 
 SERVER = "127.0.0.1"
@@ -101,9 +103,7 @@ async def run(args: argparse.Namespace) -> int:
         f"user={callback.get('user')} payload={(callback.get('payload') or {}).get('payloadtype', {}).get('name')}"
     )
 
-    tools = mythic_tools.MythicTools(agent_task_id="focused-parameter-group-reference")
-    tools.client = client
-    await tools._ensure_engagement_key()
+    tools = await _focused_ledger.bound_tools(mythic_tools, client, "focused-parameter-group-reference", args.callback)
 
     row = await _credential_row(tools, args.credential_id)
     print(

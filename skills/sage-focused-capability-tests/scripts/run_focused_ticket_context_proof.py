@@ -29,7 +29,8 @@ sys.path.insert(0, str(ROOT / "Payload_Type" / "sage" / "ai" / "langgraph"))
 
 import capabilities  # noqa: E402
 import credential_artifacts  # noqa: E402
-import engagement_ledger  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _focused_ledger  # noqa: E402
 import mythic_tools  # noqa: E402
 
 SERVER = "127.0.0.1"
@@ -137,12 +138,9 @@ async def main() -> int:
         f"host={callback.get('host')} user={callback.get('user')}"
     )
 
-    tools = mythic_tools.MythicTools(agent_task_id="focused-ticket-context-proof")
-    tools.client = client
+    tools = await _focused_ledger.bound_tools(mythic_tools, client, "focused-ticket-context-proof", args.callback)
     tools._resolve_domain_controller_host = lambda domain: asyncio.sleep(0, result=args.proof_host)
-    await tools._ensure_engagement_key()
     print(f"engagement: {tools._eng_key()}")
-    original_objective = str(engagement_ledger.load(tools._eng_key()).get("objective") or "")
 
     selected = await tools._select_krbtgt_credential(args.domain)
     if not selected:
@@ -197,10 +195,6 @@ async def main() -> int:
         return 2
 
     _record_context_effect(tools, args.domain, args.callback, proof_task_id, proof_output)
-    if original_objective:
-        data = engagement_ledger.load(tools._eng_key())
-        data["objective"] = original_objective
-        engagement_ledger.save(data, tools._eng_key())
     print("RESULT: achieved service access proof and recorded verified effects")
     print("achieved effects:")
     for effect in sorted({effect for hop in tools._engagement_hops for effect in getattr(hop, "satisfied_effects", [])}):

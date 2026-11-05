@@ -18,6 +18,7 @@ from ai.langgraph import mythic_tools
 from ai.langgraph import engagement_state
 from sage_chat import slash
 from sage_chat.headless import build_chat_request
+from tests.esl_fixtures import seed_ledger
 
 
 @pytest.fixture(autouse=True)
@@ -28,95 +29,95 @@ def _isolated_ledger(monkeypatch, tmp_path):
     el._OPERATOR_VIEWS.clear()
 
 
-# ── permanent hop numbers ────────────────────────────────────────────────────────────────
+# ── permanent hop numbers (allocated by the shared store) ───────────────────────────────
 
 
-def test_numbers_assigned_in_order_and_idempotent():
-    data = {"hops": [{"id": "a"}, {"id": "b"}, {"id": "c"}]}
-    el.assign_hop_numbers(data)
-    assert [h["number"] for h in data["hops"]] == [1, 2, 3]
-    assert data["next_hop_number"] == 4
-    el.assign_hop_numbers(data)
-    assert [h["number"] for h in data["hops"]] == [1, 2, 3]
-    assert data["next_hop_number"] == 4
+def _session(namespace="numbers"):
+    mythic_tools.SAGE_ENGAGEMENT_ID = namespace
+    return mythic_tools.MythicTools(agent_task_id="solve-1")
 
 
-def test_remove_leaves_gap_and_later_numbers_do_not_shift():
-    data = {"hops": [{"id": "a"}, {"id": "b"}, {"id": "c"}]}
-    data, removed = el.remove_hops(data, ["1"])
-    assert removed == 1
-    assert [(h["id"], h["number"]) for h in data["hops"]] == [("b", 2), ("c", 3)]
-    # "3" still means hop c; a positional row number would have pointed past the end.
-    data, changed = el.set_hop_status(data, "3", "failed")
-    assert changed == 1 and data["hops"][1]["status"] == "failed"
-
-
-def test_removed_highest_number_is_never_reused():
-    data = {"hops": [{"id": "a"}, {"id": "b"}]}
-    data, _ = el.remove_hops(data, ["2"])
-    data["hops"].append({"id": "new"})
-    el.assign_hop_numbers(data)
-    assert [h["number"] for h in data["hops"]] == [1, 3]
-
-
-def test_unnumbered_rewrite_keeps_numbers_from_previous_by_label():
-    previous = {"hops": [{"id": "a", "number": 4}, {"id": "b", "number": 7}], "next_hop_number": 9}
-    rebuilt = {"hops": [{"id": "b"}, {"id": "a"}, {"id": "c"}]}  # dataclass round-trip drops numbers
-    el.assign_hop_numbers(rebuilt, previous=previous)
-    assert [(h["id"], h["number"]) for h in rebuilt["hops"]] == [("b", 7), ("a", 4), ("c", 9)]
-    assert rebuilt["next_hop_number"] == 10
-
-
-def test_duplicate_number_is_renumbered_not_shared():
-    data = {"hops": [{"id": "a", "number": 2}, {"id": "b", "number": 2}]}
-    el.assign_hop_numbers(data)
-    assert [h["number"] for h in data["hops"]] == [2, 3]
-
-
-@pytest.mark.parametrize("selector", ["0", "5", "-1", "1.0"])
-def test_selector_that_is_not_an_existing_hop_number_matches_nothing(selector):
-    data = {"hops": [{"id": "a"}, {"id": "b"}]}
-    data, removed = el.remove_hops(data, [selector])
-    assert removed == 0 and len(data["hops"]) == 2
-
-
-def test_runtime_load_numbers_an_old_ledger_and_save_persists_it():
-    el.save({"hops": [{"id": "a", "status": "pending"}, {"id": "b", "status": "failed"}]}, "eng")
-    loaded = el.load_runtime("eng")
-    assert [h["number"] for h in loaded["hops"]] == [1, 2]
-    el.save_runtime(loaded, "eng")
-    raw = el.load("eng")
-    assert [h["number"] for h in raw["hops"]] == [1, 2] and raw["next_hop_number"] == 3
-
-
-def test_in_memory_persist_keeps_disk_numbers(monkeypatch):
-    monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "persist-numbers")
-    mt = mythic_tools.MythicTools(agent_task_id="solve-1")
+def _pending(*targets):
     state = engagement_state.EngagementState(objective="test")
-    for target in ("one.local", "two.local", "three.local"):
+    for target in targets:
         state = engagement_state.record_hop_result(
             state, "gpo-abuse", target, "pending", {"source": "test"}, "2026-10-29T00:00:00Z",
         )
-    mt._engagement_hops = list(state.hops)
-    mt._persist_engagement_ledger()
-    path = Path(mt._engagement_ledger_path())
-    first = json.loads(path.read_text())
-    assert [h["number"] for h in first["hops"]] == [1, 2, 3]
+    return state.hops
 
-    # The operator removes hop 1 on disk; the in-memory writer later persists hops 2 and 3 plus a new one.
-    data = el.load_runtime(mt._eng_key())
-    data, _ = el.remove_hops(data, ["1"])
-    el.save_runtime(data, mt._eng_key())
-    state = engagement_state.record_hop_result(
-        engagement_state.EngagementState(objective="test", hops=list(mt._engagement_hops[1:])),
+
+def _numbers(mt):
+    return [(hop["target"], hop["number"]) for hop in mt._ledger_snapshot().display_hops()]
+
+
+def _state(mt, arg, channel_id=5):
+    model = SimpleNamespace(mythic_client=mt, mode="supervised", provider="test", model="test", state={})
+    request = build_chat_request("x", channel_id=channel_id, operation_id=0)
+    return asyncio.run(slash._handle_state(model, request, arg))
+
+
+@pytest.fixture
+def _restore_namespace(monkeypatch):
+    monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", mythic_tools.SAGE_ENGAGEMENT_ID)
+
+
+def test_numbers_are_assigned_once_in_creation_order(_restore_namespace):
+    mt = _session()
+    seed_ledger(mt, hops=_pending("one.local", "two.local", "three.local"))
+    assert _numbers(mt) == [("one.local", 1), ("two.local", 2), ("three.local", 3)]
+    seed_ledger(mt, hops=_pending("two.local"))  # an identical re-observation allocates nothing
+    assert _numbers(mt) == [("one.local", 1), ("two.local", 2), ("three.local", 3)]
+    assert mt._ledger_snapshot().next_hop_number == 4
+
+
+def test_retraction_keeps_the_row_its_number_and_later_numbers(_restore_namespace):
+    mt = _session()
+    seed_ledger(mt, hops=_pending("one.local", "two.local", "three.local"))
+    shown = _state(mt, "remove 1 --reason duplicate")
+    assert "Retracted 1 hop(s)" in shown and "operator retracted" in shown and "duplicate" in shown
+    assert _numbers(mt) == [("one.local", 1), ("two.local", 2), ("three.local", 3)]
+    assert [hop.target for hop in mt._engagement_hops] == ["two.local", "three.local"]
+
+
+def test_a_number_is_never_reused_after_wipe(_restore_namespace):
+    mt = _session()
+    seed_ledger(mt, hops=_pending("one.local", "two.local"))
+    _state(mt, "wipe")
+    assert mt._engagement_hops == []
+    seed_ledger(mt, hops=_pending("new.local"))
+    assert _numbers(mt)[-1] == ("new.local", 3)
+
+
+def test_a_session_round_trip_keeps_stored_numbers_and_revisions(_restore_namespace):
+    mt = _session()
+    seed_ledger(mt, hops=_pending("one.local", "two.local", "three.local"))
+    _state(mt, "remove 1")
+    other = _session()  # a second session of the same namespace, writing after the operator's retraction
+    hops = list(other._engagement_hops)
+    assert [(hop.number, hop.revision) for hop in hops] == [(2, 1), (3, 1)]
+    updated = engagement_state.record_hop_result(
+        engagement_state.EngagementState(objective="test", hops=hops),
         "gpo-abuse", "four.local", "pending", {"source": "test"}, "2026-10-29T00:00:00Z",
     )
-    mt._engagement_hops = list(state.hops)
-    mt._persist_engagement_ledger()
-    second = json.loads(path.read_text())
-    assert [(h["target"], h["number"]) for h in second["hops"]] == [
-        ("two.local", 2), ("three.local", 3), ("four.local", 4),
-    ]
+    assert [hop.number for hop in updated.hops] == [2, 3, 0]  # dataclasses keep stored numbers; new rows have none
+    assert other._ledger_commit_hops(hops, updated.hops)
+    assert _numbers(mt) == [("one.local", 1), ("two.local", 2), ("three.local", 3), ("four.local", 4)]
+    assert "operator retracted" in _state(mt, "")
+
+
+@pytest.mark.parametrize("selector", ["0", "5", "-1", "1.0"])
+def test_selector_that_is_not_an_existing_hop_number_matches_nothing(_restore_namespace, selector):
+    mt = _session()
+    seed_ledger(mt, hops=_pending("one.local", "two.local"))
+    assert "Retracted 0 hop(s)" in _state(mt, f"remove {selector}")
+    assert len(mt._engagement_hops) == 2
+
+
+def test_state_set_is_disabled_and_changes_nothing(_restore_namespace):
+    mt = _session()
+    seed_ledger(mt, hops=_pending("one.local"))
+    assert "disabled" in _state(mt, "set 1 failed")
+    assert mt._engagement_hops[0].status == "pending"
 
 
 # ── one shared table ─────────────────────────────────────────────────────────────────────
@@ -154,53 +155,54 @@ def test_pending_view_is_per_channel_and_consumed_once():
 # ── /state and the turn-end table both hand their view to the model ─────────────────────
 
 
-def test_state_command_queues_the_shown_rows_for_the_model(monkeypatch):
-    el.save({"objective": "compromise CORP", "hops": _hops()}, "Operation_Chimera_1")
+def _seeded_view_session():
+    mt = _session("view")
+    seed_ledger(mt, hops=[
+        {"id": "kerberoast:svc", "technique": "kerberoast", "target": "svc", "effect": "creds:svc@corp.local",
+         "status": "achieved", "evidence": {"mythic_task_id": 11, "callback_id": 3,
+                                             "result_preview": "TARGET-OUTPUT-PREVIEW"}},
+        {"id": "dcsync:corp.local", "technique": "dcsync", "target": "corp.local",
+         "effect": "krbtgt-hash:corp.local", "status": "pending", "evidence": {"mythic_task_id": 12}},
+    ])
+    mt._ledger_store().update_objective(mt._require_ledger_binding(), "compromise CORP", "operator")
+    return mt
 
-    async def _resolve(_model, _request):
-        return "Operation_Chimera_1"
 
-    monkeypatch.setattr(slash, "_resolve_chat_engagement_id", _resolve)
-    shown = asyncio.run(slash._handle_state(None, build_chat_request("x", channel_id=5), ""))
-    assert "| 4 | `dcsync:corp.local` |" in shown
+def test_state_command_queues_the_shown_rows_for_the_model(_restore_namespace):
+    mt = _seeded_view_session()
+    shown = _state(mt, "")
+    assert "| 2 | `dcsync:corp.local` |" in shown
     view = el.take_operator_view(5)
     assert view.startswith("[Sage ledger view]") and "via `/state`" in view
-    assert "| 4 | `dcsync:corp.local` | krbtgt-hash:corp.local | `pending` | 12 |" in view
+    assert "| 2 | `dcsync:corp.local` | krbtgt-hash:corp.local | `pending` | 12 |" in view
     assert "TARGET-OUTPUT-PREVIEW" not in view
     assert "compromise CORP" in view
 
 
-def test_state_usage_error_does_not_queue_a_view(monkeypatch):
-    async def _resolve(_model, _request):
-        return "Operation_Chimera_1"
-
-    monkeypatch.setattr(slash, "_resolve_chat_engagement_id", _resolve)
-    asyncio.run(slash._handle_state(None, build_chat_request("x", channel_id=5), "set 1"))
+def test_state_usage_error_does_not_queue_a_view(_restore_namespace):
+    mt = _seeded_view_session()
+    _state(mt, "remove")
     assert el.take_operator_view(5) == ""
 
 
-class _SummaryClient:
-    def __init__(self, key):
-        self._key = key
-        self._last_issued_task_display_id = ""
-        self.client = None
-
-    def _eng_key(self):
-        return self._key
-
-
-def test_turn_end_table_queues_the_same_rows_and_unchanged_queues_nothing():
-    el.save({"hops": _hops()}, "eng-turn")
+def test_turn_end_table_queues_the_same_rows_and_unchanged_queues_nothing(_restore_namespace):
+    mt = _seeded_view_session()
     model = object.__new__(graph_model.Model)
-    model.mythic_client = _SummaryClient("eng-turn")
+    model.mythic_client = mt
     model.channel_id = 7
     shown = asyncio.run(model._engagement_state_turn_summary_text())
-    assert "| 1 | `kerberoast:svc` |" in shown and "| 4 | `dcsync:corp.local` |" in shown
+    assert "| 1 | `kerberoast:svc` |" in shown and "| 2 | `dcsync:corp.local` |" in shown
     view = el.take_operator_view(7)
-    assert "end-of-turn engagement-state table" in view and "| 4 | `dcsync:corp.local` |" in view
+    assert "end-of-turn engagement-state table" in view and "| 2 | `dcsync:corp.local` |" in view
 
     assert "unchanged" in asyncio.run(model._engagement_state_turn_summary_text())
     assert el.take_operator_view(7) == ""
+
+    # A retraction changes neither technique, target nor historical status, but it is a change.
+    _state(mt, "remove 1")
+    el.take_operator_view(5)
+    shown = asyncio.run(model._engagement_state_turn_summary_text())
+    assert "unchanged" not in shown and "operator retracted" in shown
 
 
 # ── the assembled request path ───────────────────────────────────────────────────────────

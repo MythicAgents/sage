@@ -7,6 +7,7 @@ the scripted handoff harness with a real MythicTools client whose Mythic readers
 """
 
 from __future__ import annotations
+from tests.esl_fixtures import seed_ledger  # noqa: E402
 
 import asyncio
 import importlib.util
@@ -22,6 +23,7 @@ from ai.langgraph import engagement_state, proof_boundary
 from ai.langgraph import model as model_module
 from ai.langgraph import step_bounds as sb
 from ai.langgraph import step_ledger as sl
+from ai.langgraph import mythic_tools as mythic_tools_module
 from ai.langgraph.mythic_tools import MythicTools
 
 SECRET = "Autumn2026!-unique-secret"
@@ -125,6 +127,7 @@ def _credential(credential_id: int, task_id: int, callback: int | None = 1) -> d
 
 @pytest.fixture
 def ledger(tmp_path, monkeypatch):
+    monkeypatch.setattr(mythic_tools_module, "SAGE_ENGAGEMENT_ID", "eng-step-ledger")
     tools = MythicTools(agent_task_id="step-ledger")
     tools.client = object()
     state: dict[str, Any] = {"callbacks": [], "tasks": {}, "credentials": []}
@@ -140,10 +143,8 @@ def ledger(tmp_path, monkeypatch):
 
     tools._step_callback_rows, tools._step_task_records, tools._fetch_credentials_cached = (
         callbacks, records, credentials)
-    path = tmp_path / "ledger.json"
-    monkeypatch.setattr(tools, "_engagement_ledger_path", lambda: str(path))
     monkeypatch.setattr(tools, "_engagement_objective", lambda: "")
-    monkeypatch.setattr(tools, "_eng_key", lambda: "eng-step-ledger")
+    path = tmp_path / "sage.db"
 
     def issue(task_id: int, callback: int = 1, status: str = "success", at: str = TASK_AT) -> None:
         tools._task_source_request_ids[task_id] = "chat:1:request:1"
@@ -178,10 +179,8 @@ def test_lateral_movement_to_a_new_system_callback_records_proven_session_and_sy
         objective="", hops=tools._engagement_hops, engagement_id="eng-step-ledger", runtime_scope=True,
     ).achieved_effects()
 
-    # Persisted, then reloaded through the load quarantine: the proof is re-admitted, the rows stay achieved.
-    tools._engagement_hops = []
-    tools._load_engagement_ledger(replace=True)
-    assert _hops(tools)["system:srv02"].status == "achieved"
+    # Persisted: a fresh session reads the shared store through the runtime quarantine and the proof is re-admitted.
+    assert _hops(MythicTools(agent_task_id="fresh-session"))["system:srv02"].status == "achieved"
 
 
 def test_a_repeat_gain_updates_its_row_and_the_ledger_does_not_grow(ledger):
@@ -230,11 +229,19 @@ def test_a_steps_credential_is_recorded_with_lineage_proof_and_without_its_secre
     # 12 has full lineage; 13 is the same account with no callback, which must not downgrade the proven row.
     assert [(row["effect"], row["status"]) for row in summary["recorded"]] == [("creds:jdoe@contoso", "achieved")]
     assert _hops(tools)["jdoe@contoso"].status == "achieved"
-    tools._engagement_hops = []
-    step([90], refs[1:])
-    assert _hops(tools)["jdoe@contoso"].status == "legacy_unverified"  # alone, an incomplete lineage is no proof
-    assert SECRET not in path.read_text()
+    step([90], refs[1:])  # the weaker observation never downgrades the proven row
+    assert _hops(tools)["jdoe@contoso"].status == "achieved"
+    export = json.dumps(tools._ledger_store().export(tools._require_ledger_binding()))
+    assert SECRET not in export  # rows, payloads and full history carry no secret
     assert all(hop.evidence.get("credential_id") != 14 for hop in tools._engagement_hops)
+
+
+def test_an_incomplete_credential_lineage_alone_is_no_proof(ledger):
+    tools, state, issue, step, _ = ledger
+    state["credentials"] = [_credential(13, 90, callback=None)]
+    issue(90)
+    step([90], [{"credential_id": 13, "source_task_id": 90}])
+    assert _hops(tools)["jdoe@contoso"].status == "legacy_unverified"
 
 
 def test_nothing_is_read_when_this_process_issued_nothing(ledger):
@@ -273,6 +280,7 @@ def _call(name: str, args: dict, call_id: str) -> AIMessage:
 
 
 def test_a_supervised_step_writes_its_gain_to_the_ledger_on_the_real_graph(monkeypatch, tmp_path):
+    monkeypatch.setattr(mythic_tools_module, "SAGE_ENGAGEMENT_ID", "eng-step-ledger")
     tools = MythicTools(agent_task_id="step-ledger-assembled")
     tools.client = object()
     callbacks = [_callback(1, "WS01", "CONTOSO\\jdoe", 2, init="2026-10-30T09:00:00")]
@@ -300,9 +308,7 @@ def test_a_supervised_step_writes_its_gain_to_the_ledger_on_the_real_graph(monke
 
     tools._step_callback_rows, tools._step_task_records = callback_rows, records
     tools._task_output_rows, tools._fetch_credentials_cached = rows, credentials
-    monkeypatch.setattr(tools, "_engagement_ledger_path", lambda: str(tmp_path / "ledger.json"))
     monkeypatch.setattr(tools, "_engagement_objective", lambda: "")
-    monkeypatch.setattr(tools, "_eng_key", lambda: "eng-step-ledger")
 
     original = model_module.filter_tools_by_frontmatter
     monkeypatch.setattr(model_module, "filter_tools_by_frontmatter",
@@ -327,8 +333,8 @@ def test_a_supervised_step_writes_its_gain_to_the_ledger_on_the_real_graph(monke
                  if "_step_outcome" in m.additional_kwargs]
     assert [(r["effect"], r["status"]) for r in outcome["ledger"]["recorded"]] == [
         ("session:nt authority\\system@srv02", "achieved"), ("system:srv02", "achieved")]
-    saved = json.loads((tmp_path / "ledger.json").read_text())
-    assert {hop["target"] for hop in saved["hops"]} == {"session:nt authority\\system@srv02", "system:srv02"}
+    saved = tools._ledger_snapshot().display_hops()  # committed to the shared store
+    assert {hop["target"] for hop in saved} == {"session:nt authority\\system@srv02", "system:srv02"}
 
 
 def test_the_attribution_window_reads_a_positive_override():

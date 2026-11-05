@@ -6,7 +6,6 @@ from types import SimpleNamespace
 import pytest
 from mythic_container.ChatBase import ChatSlashCommandInvocation
 
-from ai.langgraph import engagement_ledger
 from sage_chat.headless import HeadlessSageChat, build_chat_request
 import sage_chat.service as service
 import sage_chat.slash as slash
@@ -103,30 +102,36 @@ def test_list_renders_real_session_inventory_without_model(monkeypatch, fresh_ch
     assert "| `25` | `bedrock` | `model-b` | `conversation` |" in text
 
 
-def test_state_wipe_removes_only_selected_operation_ledger(
-    monkeypatch, tmp_path, fresh_channel,
-):
-    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
-    selected = "Operation_7_selected"
-    other = "Operation_8_other"
-    engagement_ledger.save_runtime({"engagement_id": selected, "objective": "selected",
-                                    "hops": []}, selected)
-    engagement_ledger.save_runtime({"engagement_id": other, "objective": "other",
-                                    "hops": []}, other)
+def _bound_session(monkeypatch, namespace):
+    from ai.langgraph import mythic_tools
+
+    monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", namespace)
+    tools = mythic_tools.MythicTools(agent_task_id="state")
+    tools._require_ledger_binding()
+    return tools
+
+
+def test_state_wipe_retracts_only_the_selected_operations_rows(monkeypatch, tmp_path, fresh_channel):
+    from tests.esl_fixtures import seed_ledger
+
+    sessions = {7: _bound_session(monkeypatch, "Operation_7_selected"),
+                8: _bound_session(monkeypatch, "Operation_8_other")}
+    for tools in sessions.values():
+        seed_ledger(tools, hops=[{"technique": "t", "target": "a", "effect": "e", "status": "pending"}])
 
     async def resolve(_model, request):
         assert _model is None
-        return selected if request.OperationID == 7 else other
+        return sessions[request.OperationID]
 
-    monkeypatch.setattr(slash, "_resolve_chat_engagement_id", resolve)
+    monkeypatch.setattr(slash, "_resolve_chat_ledger", resolve)
     chat = _NoModelChat()
     asyncio.run(chat.chat(_request("state", "wipe", operation_id=7)))
 
     assert len(chat.terminal_emissions) == 1
-    assert "Wiped the ledger" in chat.terminal_emissions[0]["content"]
-    assert not (tmp_path / "state_Operation_7_selected.json").exists()
-    assert (tmp_path / "state_Operation_8_other.json").exists()
-    assert engagement_ledger.load_runtime(other)["objective"] == "other"
+    text = chat.terminal_emissions[0]["content"]
+    assert "Retracted 1 hop(s)" in text and "Nothing was deleted" in text
+    assert sessions[7]._engagement_hops == [] and len(sessions[7]._ledger_snapshot().hop_rows()) == 1
+    assert [hop.target for hop in sessions[8]._engagement_hops] == ["a"]
 
 
 def test_tools_staged_renders_the_drop_zone_without_model(monkeypatch, fresh_channel, tmp_path):

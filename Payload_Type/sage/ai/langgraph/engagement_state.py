@@ -36,6 +36,12 @@ class Hop:
     source: str
     timestamp: str
     proof_envelope: dict = field(default_factory=dict)
+    # Store metadata (engagement_store): the permanent display number, internal row id, current row revision
+    # and the row's correction state. Writers never set these; they round-trip so no path renumbers a row.
+    number: int = 0
+    row_id: int = 0
+    revision: int = 0
+    corrections: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -45,6 +51,23 @@ class GraphFact:
     timestamp: str
     ttl_seconds: int
     proof_envelope: dict = field(default_factory=dict)
+    row_id: int = 0
+    revision: int = 0
+    corrections: dict = field(default_factory=dict)
+
+
+def row_corrected(row: Any) -> bool:
+    """Whether a hop or graph fact carries an effective operator retraction or "no longer holds" marker.
+
+    Part of the one runtime-eligibility rule: proof admission, no effective correction, no applicable expiry.
+    """
+    corrections = getattr(row, "corrections", None)
+    if not isinstance(corrections, dict):
+        return False
+    if corrections.get("retracted"):
+        return True
+    marker = corrections.get("no_longer_holds")
+    return isinstance(marker, dict) and bool(marker.get("effective"))
 
 
 @dataclass
@@ -62,12 +85,17 @@ class EngagementState:
     # Exact account contexts proven in this MythicTools process. Durable account-context
     # effects survive restart, but these runtime keys deliberately do not.
     current_account_contexts: frozenset[tuple[str, str, str]] = field(default_factory=frozenset)
+    # Rows that are history but not current proof (retracted, no longer holding, expired). Renderers show them;
+    # nothing else reads them.
+    corrected_hops: list[Hop] = field(default_factory=list)
 
     def achieved_effects(self) -> set[str]:
         """Return normalized effects from achieved hops."""
         effects: set[str] = set()
         for hop in self.hops:
             if _text(getattr(hop, "status", "")).casefold() != "achieved":
+                continue
+            if row_corrected(hop):
                 continue
             if self.runtime_scope and not _hop_has_admissible_runtime_proof(hop, self.engagement_id):
                 continue
@@ -133,12 +161,16 @@ def _graph_fact_has_admissible_runtime_proof(graph_fact: "GraphFact", engagement
 def _is_admitted_achieved_hop(state: "EngagementState", hop: "Hop") -> bool:
     if _text(getattr(hop, "status", "")).casefold() != "achieved":
         return False
+    if row_corrected(hop):
+        return False
     if not getattr(state, "runtime_scope", False):
         return True
     return _hop_has_admissible_runtime_proof(hop, getattr(state, "engagement_id", ""))
 
 
 def _is_admitted_graph_fact(state: "EngagementState", graph_fact: "GraphFact") -> bool:
+    if row_corrected(graph_fact):
+        return False
     if not getattr(state, "runtime_scope", False):
         return True
     return _graph_fact_has_admissible_runtime_proof(graph_fact, getattr(state, "engagement_id", ""))
@@ -394,6 +426,8 @@ def foothold_predicates(state: "EngagementState") -> set[str]:
         if host and integrity == "system":
             predicates.add(f"system:{host}")
     for graph_fact in getattr(state, "graph_facts", []) or []:
+        if row_corrected(graph_fact):
+            continue
         if getattr(state, "runtime_scope", False) and not _graph_fact_has_admissible_runtime_proof(
             graph_fact,
             getattr(state, "engagement_id", ""),
@@ -1083,6 +1117,10 @@ def _reconcile_proven_gpo_setup_hops(state: "EngagementState", hops: list[Hop]) 
             source=existing.source,
             timestamp=proof.timestamp,
             proof_envelope=dict(getattr(proof, "proof_envelope", {}) or {}),
+            number=int(getattr(existing, "number", 0) or 0),
+            row_id=int(getattr(existing, "row_id", 0) or 0),
+            revision=int(getattr(existing, "revision", 0) or 0),
+            corrections=dict(getattr(existing, "corrections", {}) or {}),
         ))
     return reconciled
 
@@ -1211,7 +1249,8 @@ def record_effect_result(
     hops: list[Hop] = []
     for existing in state.hops:
         if _same_hop(existing, technique, target):
-            hops.append(hop if not getattr(existing, "id", "") else _replace_hop_id(hop, existing.id))
+            replacement = hop if not getattr(existing, "id", "") else _replace_hop_id(hop, existing.id)
+            hops.append(_with_row_metadata(replacement, existing))
             updated = True
         else:
             hops.append(existing)
@@ -1229,6 +1268,7 @@ def record_effect_result(
         current_account_contexts=frozenset(
             getattr(state, "current_account_contexts", frozenset()) or ()
         ),
+        corrected_hops=list(getattr(state, "corrected_hops", []) or []),
     )
 
 
@@ -1604,6 +1644,22 @@ def _replace_hop_id(hop: Hop, hop_id: str) -> Hop:
         source=hop.source,
         timestamp=hop.timestamp,
         proof_envelope=dict(getattr(hop, "proof_envelope", {}) or {}),
+        number=int(getattr(hop, "number", 0) or 0),
+        row_id=int(getattr(hop, "row_id", 0) or 0),
+        revision=int(getattr(hop, "revision", 0) or 0),
+        corrections=dict(getattr(hop, "corrections", {}) or {}),
+    )
+
+
+def _with_row_metadata(hop: Hop, existing: Any) -> Hop:
+    """Carry the stored row's number, id, revision and corrections onto a replacement observation."""
+    import dataclasses
+    return dataclasses.replace(
+        hop,
+        number=int(getattr(existing, "number", 0) or 0),
+        row_id=int(getattr(existing, "row_id", 0) or 0),
+        revision=int(getattr(existing, "revision", 0) or 0),
+        corrections=dict(getattr(existing, "corrections", {}) or {}),
     )
 
 
@@ -1740,6 +1796,24 @@ def render_engagement_state(state: EngagementState) -> str:
             elif status in {"failed", "blocked", "legacy_unverified"}:
                 blocked_hops.append((sort_key, f"- {status}: {technique} → {target}: {effect}"))
 
+        corrected_lines = []
+        for hop in _render_items(getattr(state, "corrected_hops", [])):
+            corrections = getattr(hop, "corrections", {}) or {}
+            if corrections.get("retracted"):
+                label = "operator retracted"
+            elif (corrections.get("no_longer_holds") or {}).get("effective"):
+                label = "no longer holds"
+            else:
+                label = "expired"
+            technique = _render_value(getattr(hop, "technique", "")) or "(unknown technique)"
+            target = _render_value(getattr(hop, "target", "")) or "(unknown target)"
+            effect = _render_value(getattr(hop, "effect", "")) or "(no effect recorded)"
+            status = _render_value(getattr(hop, "status", "")) or "-"
+            corrected_lines.append((
+                (_normalize_key(technique), _normalize_key(target)),
+                f"- {status} — {label}: {technique} → {target}: {effect}",
+            ))
+
         # Pathfinding-first: surface the read-only BloodHound path probe (does a path to the
         # objective domain exist from what we control?) so the plan anchors on the graph, not recalled
         # tradecraft. Advisory only — these facts carry no enforcement weight.
@@ -1777,6 +1851,10 @@ def render_engagement_state(state: EngagementState) -> str:
             lines.append("Failed/blocked hops:")
             lines.extend(item for _, item in sorted(blocked_hops, key=lambda item: item[0]))
 
+        if corrected_lines:
+            lines.append("Corrected hops (history, not current proof):")
+            lines.extend(item for _, item in sorted(corrected_lines, key=lambda item: item[0]))
+
         if path_lines:
             lines.append("BloodHound attack-path probe:")
             seen_path_lines: set[str] = set()
@@ -1785,7 +1863,7 @@ def render_engagement_state(state: EngagementState) -> str:
                     seen_path_lines.add(item)
                     lines.append(item)
 
-        if not live_footholds and not achieved_hops and not blocked_hops and not path_lines:
+        if not live_footholds and not achieved_hops and not blocked_hops and not path_lines and not corrected_lines:
             lines.append("(no observed state yet)")
 
         return _render_bounded("\n".join(lines))
@@ -1874,10 +1952,20 @@ def hops_from_dicts(items: Any) -> list["Hop"]:
                 source=_text(d.get("source")),
                 timestamp=_text(d.get("timestamp")),
                 proof_envelope=dict(d["proof_envelope"]) if isinstance(d.get("proof_envelope"), dict) else {},
+                number=_int_field(d.get("number")),
+                row_id=_int_field(d.get("row_id")),
+                revision=_int_field(d.get("revision")),
+                corrections=dict(d["corrections"]) if isinstance(d.get("corrections"), dict) else {},
             ))
         except Exception:
             continue
     return out
+
+
+def _int_field(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
 
 
 def graph_facts_to_dicts(graph_facts: Any) -> list[dict]:
@@ -1909,6 +1997,9 @@ def graph_facts_from_dicts(items: Any) -> list["GraphFact"]:
                 timestamp=_text(d.get("timestamp")),
                 ttl_seconds=int(d.get("ttl_seconds") or 0),
                 proof_envelope=dict(d["proof_envelope"]) if isinstance(d.get("proof_envelope"), dict) else {},
+                row_id=_int_field(d.get("row_id")),
+                revision=_int_field(d.get("revision")),
+                corrections=dict(d["corrections"]) if isinstance(d.get("corrections"), dict) else {},
             ))
         except Exception:
             continue

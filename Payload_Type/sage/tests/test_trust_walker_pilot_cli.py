@@ -1711,6 +1711,7 @@ def test_reset_propagates_attempt_scoped_engagement_id_to_sage_restart(monkeypat
     runtime.orchestrate = SimpleNamespace(full_reset_and_ready=full_reset_and_ready)
     runtime.native = SimpleNamespace(login=login, inspect_readiness=inspect_readiness)
     runtime._staged_interactive_foothold = lambda: object()
+    runtime._operation_marker = lambda: None  # Sage has not bound the fresh operation yet
     runtime._operation_snapshot = lambda *_args: {
         "task": [],
         "credential": [],
@@ -1869,6 +1870,7 @@ def test_alternate_reset_threads_fixture_through_launcher_and_both_readiness_con
     runtime.alternate_start = binding
     runtime.orchestrate = SimpleNamespace(FootholdSpec=FootholdSpec, full_reset_and_ready=full_reset_and_ready)
     runtime.native = SimpleNamespace(login=alternate_login)
+    runtime._operation_marker = lambda: None  # Sage has not bound the fresh operation yet
     runtime._operation_snapshot = lambda *_args: {
         "task": [], "credential": [],
         "callback": [{
@@ -3724,3 +3726,25 @@ def test_preserved_inspection_command_loads_root_env_without_printing_secrets(mo
     )
     assert "inspect-preserved --artifact-dir .sage_history/evaluation/attempt" in command
     assert "API_KEY" not in command
+
+
+def test_fresh_start_reads_the_bound_operations_ledger_not_file_absence(monkeypatch, tmp_path):
+    from ai.langgraph import engagement_store
+
+    database = tmp_path / "sage.db"
+    monkeypatch.setenv("SAGE_DATABASE_PATH", str(database))
+    runtime = object.__new__(cli.RuntimePilot)
+    runtime.current_operation_id = 1
+    marker = "11111111-2222-4333-8444-555555555555"
+    runtime._operation_marker = lambda: marker
+    assert runtime._assert_fresh_operation_ledger("shipping-sage")["hop_rows"] == 0  # no ESL operation yet
+
+    store = engagement_store.EngagementStore(database, legacy_dir=str(tmp_path / "legacy"))
+    binding = store.bind_operation(mythic_operation_id=1, marker_uuid=marker, display_name="Op",
+                                   proposed_key=f"Op_1_{marker}")
+    store.apply(binding, engagement_store.hop_mutations([], [{"technique": "dcsync", "target": "lab.local",
+                                                               "status": "pending"}]))
+    with pytest.raises(cli.SetupInvariantError, match="already holds 1 row"):
+        runtime._assert_fresh_operation_ledger("shipping-sage")
+    runtime._operation_marker = lambda: None
+    assert runtime._assert_fresh_operation_ledger("shipping-sage")["marker_present"] is False

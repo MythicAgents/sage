@@ -39,8 +39,10 @@ def _scenario(eid):
 
 
 def _seed_ledger(tmp_path, monkeypatch):
+    """A HISTORICAL ledger bundle (legacy JSON), which stays readable as evaluation input."""
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
-    engagement_ledger.save({"hops": [
+    monkeypatch.setenv("SAGE_EVAL_OBSERVATIONS_DIR", str(tmp_path / "observations"))
+    engagement_ledger.save_file({"hops": [
         _hop("collect-graph", f"graph-built:{CHILD}|x", evidence={"graph_verified": True}),
         _hop("gpo-abuse", "system:winterfell", evidence={"system_command_succeeded": True}),
         _hop("golden-ticket", f"da:{CHILD}", evidence={"domain_admin": True}),
@@ -48,7 +50,7 @@ def _seed_ledger(tmp_path, monkeypatch):
         _hop("dcsync", f"krbtgt-hash:{CHILD}", evidence={"verified_on_record": True, "verify_verdict": "achieved"}),
         # achieved but NO proof -> must be rejected (the false-achieved guard):
         _hop("dcsync", f"krbtgt-hash:{PARENT}", evidence={}),
-    ]}, engagement_id="run1")
+    ]}, engagement_ledger.ledger_path("run1"))
 
 
 def test_sage_hops_and_verify_verdicts_cannot_award_ground_truth(tmp_path, monkeypatch):
@@ -64,10 +66,10 @@ def test_sage_hops_and_verify_verdicts_cannot_award_ground_truth(tmp_path, monke
 def test_unverified_only_scores_foothold_floor(tmp_path, monkeypatch):
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     # All hops achieved-but-unproven -> no milestone beyond the foothold floor counts.
-    engagement_ledger.save({"hops": [
+    engagement_ledger.save_file({"hops": [
         _hop("collect-graph", f"graph-built:{CHILD}|x", evidence={}),
         _hop("dcsync", f"krbtgt-hash:{CHILD}", evidence={"verify_verdict": "partial"}),
-    ]}, engagement_id="run2")
+    ]}, engagement_ledger.ledger_path("run2"))
     gt = rs.read_ground_truth(_scenario("run2"), foothold_seen=True)
     assert gt.milestones[rs.Milestone.GRAPH_COLLECTED] is False
     assert gt.milestones[rs.Milestone.KRBTGT_DUMPED] is False
@@ -184,7 +186,7 @@ def test_recorded_probe_is_revalidated_and_ignores_conflicting_self_report(tmp_p
         "_source": "independent_evaluator",
         "_registry_version": er.REGISTRY_VERSION,
     }
-    engagement_ledger.save(data, engagement_id="run1")
+    engagement_ledger.save_file(data, engagement_ledger.ledger_path("run1"))
 
     scn = rs.Scenario(
         name="recorded-krbtgt",
@@ -203,7 +205,7 @@ def test_legacy_boolean_record_is_invalid_not_upgraded(tmp_path, monkeypatch):
     _seed_ledger(tmp_path, monkeypatch)
     data = engagement_ledger.load("run1")
     data["ground_truth_probes"] = {"KRBTGT_DUMPED": True}
-    engagement_ledger.save(data, engagement_id="run1")
+    engagement_ledger.save_file(data, engagement_ledger.ledger_path("run1"))
     scn = rs.Scenario(
         name="legacy",
         engagement_id="run1",
@@ -246,7 +248,7 @@ def test_legacy_recorded_probe_cost_is_unknown_not_zero(tmp_path, monkeypatch):
         "_captured_at": "2026-06-21T00:00:00+00:00",
         "_source": "independent_evaluator", "_registry_version": er.REGISTRY_VERSION,
     }
-    engagement_ledger.save(data, engagement_id="run1")
+    engagement_ledger.save_file(data, engagement_ledger.ledger_path("run1"))
     scn = rs.Scenario(
         name="legacy-cost", engagement_id="run1", domains={"child": CHILD},
         milestone_subset=(rs.Milestone.KRBTGT_DUMPED,),
@@ -256,3 +258,29 @@ def test_legacy_recorded_probe_cost_is_unknown_not_zero(tmp_path, monkeypatch):
     assert cost.monetary_cost_usd is None
     assert cost.monetary_cost_status == "legacy_unknown"
     assert cost.completeness == "legacy_unknown"
+
+
+def test_new_observations_live_in_the_evaluation_plane_and_win_over_history(tmp_path, monkeypatch):
+    import evaluator_observations as eo
+    import engagement_store
+
+    _seed_ledger(tmp_path, monkeypatch)
+    contract = er.contract_for(rs.Milestone.KRBTGT_DUMPED)
+    observation = er.OracleObservation(
+        registry_version=er.REGISTRY_VERSION, oracle_id=contract.oracle_id,
+        origin=er.ProofOrigin.MYTHIC_CREDENTIAL_STORE, proof_kind="krbtgt_material", outcome=True,
+        observation_id="capture-2", target=CHILD,
+    )
+    eo.write_observations("run1", {
+        "KRBTGT_DUMPED": er.admit_observation(rs.Milestone.KRBTGT_DUMPED, observation, expected_target=CHILD).to_record(),
+        "_captured_at": "2026-06-21T00:00:00+00:00", "_source": "independent_evaluator",
+        "_registry_version": er.REGISTRY_VERSION,
+    })
+    scn = rs.Scenario(name="recorded", engagement_id="run1", domains={"child": CHILD},
+                      milestone_subset=(rs.Milestone.KRBTGT_DUMPED,))
+    before = rs.ledger_state_hash("run1")
+    assert rs.read_ground_truth(scn).milestones[rs.Milestone.KRBTGT_DUMPED] is True
+    assert rs.ledger_state_hash("run1") == before
+    # Nothing evaluator-side entered the runtime ledger store.
+    store = engagement_store.EngagementStore(legacy_dir=str(tmp_path / "none"))
+    assert store.find_binding("run1") is None

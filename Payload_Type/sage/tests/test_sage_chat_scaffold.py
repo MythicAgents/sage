@@ -2539,9 +2539,9 @@ def test_slash_state_no_session_is_handled_with_one_terminal(monkeypatch):
     from sage_chat import slash
 
     async def _no_resolve(model, request):  # no Mythic in unit tests — simulate an unresolvable operation
-        return ""
+        return None
 
-    monkeypatch.setattr(slash, "_resolve_chat_engagement_id", _no_resolve)
+    monkeypatch.setattr(slash, "_resolve_chat_ledger", _no_resolve)
     chat = HeadlessSageChat()
     handled = _run(handle_slash(chat, _slash_req("state"), None, "slash:1"))
     assert handled is True
@@ -5551,126 +5551,71 @@ def test_tool_result_is_error_ignores_nested_errors_in_a_listing():
 # /state slash command — re-homed engagement-ledger show + edit
 # --------------------------------------------------------------------------------------
 
+def _state_session(monkeypatch, namespace="Operation_Chimera_1"):
+    from ai.langgraph import mythic_tools
+    from tests.esl_fixtures import seed_ledger
+
+    monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", namespace)
+    tools = mythic_tools.MythicTools(agent_task_id="state")
+    return tools, seed_ledger
+
+
+def _state_model(tools, state=None):
+    return type("_Model", (), {"mythic_client": tools, "state": state or {}, "mode": "supervised"})()
+
+
 def test_handle_state_shows_engagement_ledger(monkeypatch):
-    """/state (no arg) renders the engagement hop ledger, not just session info."""
+    """/state (no arg) renders the operation's shared ledger, not just session info."""
     from sage_chat import slash
-    from ai.langgraph import engagement_ledger
 
-    ledger = {
-        "objective": "compromise CORP",
-        "hops": [
-            {"id": "da:corp.local", "effect": "da:corp.local", "status": "achieved",
-             "evidence": {"mythic_task_id": 31, "callback_id": 1, "result_preview": "dcsync ok"}},
-        ],
-    }
-    async def _resolve(_model, _request):
-        return "Operation_Chimera_1"
-
-    monkeypatch.setattr(slash, "_resolve_chat_engagement_id", _resolve)
-    monkeypatch.setattr(engagement_ledger, "load", lambda eid=None: {"objective": ledger["objective"],
-                                                                     "hops": [dict(h) for h in ledger["hops"]]})
-    text = _run(slash._handle_state(None, build_chat_request("x"), ""))
+    tools, seed_ledger = _state_session(monkeypatch)
+    seed_ledger(tools, hops=[{"technique": "golden-ticket", "target": "corp.local", "effect": "da:corp.local",
+                              "status": "achieved",
+                              "evidence": {"mythic_task_id": 31, "callback_id": 1, "result_preview": "dcsync ok"}}])
+    tools._ledger_store().update_objective(tools._require_ledger_binding(), "compromise CORP", "operator")
+    text = _run(slash._handle_state(_state_model(tools), build_chat_request("x", operation_id=0), ""))
     assert "Operation_Chimera_1" in text          # the engagement, not the channel
     assert "compromise CORP" in text              # objective surfaced
     assert "da:corp.local" in text                # a hop row
-    assert "**Hops:** 1" in text  # counts every hop, not only achieved ones
+    assert "**Hops:** 1" in text
 
 
-def test_handle_state_remove_mutates_and_saves(monkeypatch):
-    """/state remove <row> drops the hop and persists via engagement_ledger.save."""
+def test_handle_state_remove_records_a_retraction_and_keeps_the_row(monkeypatch):
+    """/state remove <#> retracts the hop: it stays listed with its number, marked, and is no longer used."""
     from sage_chat import slash
-    from ai.langgraph import engagement_ledger
 
-    hops = [{"id": "a", "effect": "e1", "status": "x"}, {"id": "b", "effect": "e2", "status": "y"}]
-    saved = {}
-    async def _resolve(_model, _request):
-        return "op"
-
-    monkeypatch.setattr(slash, "_resolve_chat_engagement_id", _resolve)
-    monkeypatch.setattr(engagement_ledger, "load", lambda eid=None: {"hops": [dict(h) for h in hops]})
-    monkeypatch.setattr(engagement_ledger, "save", lambda d, eid=None: saved.update(data=d) or "path")
-
-    text = _run(slash._handle_state(None, build_chat_request("x"), "remove 1"))
-    assert "Removed 1 hop" in text
-    assert [h["id"] for h in saved["data"]["hops"]] == ["b"]   # row 1 (1-based) removed
+    tools, seed_ledger = _state_session(monkeypatch, "op")
+    seed_ledger(tools, hops=[{"technique": "t", "target": "a", "effect": "e1", "status": "pending"},
+                             {"technique": "t", "target": "b", "effect": "e2", "status": "pending"}])
+    text = _run(slash._handle_state(_state_model(tools), build_chat_request("x", operation_id=0), "remove 1"))
+    assert "Retracted 1 hop(s)" in text and "**Hops:** 2" in text
+    assert "operator retracted" in text
+    assert [hop.target for hop in tools._engagement_hops] == ["b"]
 
 
-def test_handle_state_set_status_mutates_and_saves(monkeypatch):
-    """/state set <row> <status> flips a hop's status and persists it."""
+def test_handle_state_set_is_disabled(monkeypatch):
+    """/state set no longer edits statuses: status comes only from verified evidence."""
     from sage_chat import slash
-    from ai.langgraph import engagement_ledger
 
-    saved = {}
-    async def _resolve(_model, _request):
-        return "op"
-
-    monkeypatch.setattr(slash, "_resolve_chat_engagement_id", _resolve)
-    monkeypatch.setattr(engagement_ledger, "load",
-                        lambda eid=None: {"hops": [{"id": "a", "effect": "e1", "status": "achieved"}]})
-    monkeypatch.setattr(engagement_ledger, "save", lambda d, eid=None: saved.update(data=d) or "path")
-
-    text = _run(slash._handle_state(None, build_chat_request("x"), "set 1 pending"))
-    assert saved["data"]["hops"][0]["status"] == "pending"
-    assert "pending" in text
+    tools, seed_ledger = _state_session(monkeypatch, "op")
+    seed_ledger(tools, hops=[{"technique": "t", "target": "a", "effect": "e1", "status": "achieved"}])
+    for arg in ("set 1 pending", "set 1 achieved"):
+        text = _run(slash._handle_state(_state_model(tools), build_chat_request("x", operation_id=0), arg))
+        assert "disabled" in text
+    assert tools._engagement_hops[0].status == "achieved"
 
 
-def test_handle_state_set_cannot_promote_to_achieved(monkeypatch):
+def test_state_objective_writes_the_bound_operation_setting_and_clears_pending_refinement(monkeypatch):
     from sage_chat import slash
-    from ai.langgraph import engagement_ledger
 
-    saved = {}
-    async def _resolve(_model, _request):
-        return "op"
-
-    monkeypatch.setattr(slash, "_resolve_chat_engagement_id", _resolve)
-    monkeypatch.setattr(engagement_ledger, "load",
-                        lambda eid=None: {"hops": [{"id": "a", "effect": "e1", "status": "pending"}]})
-    monkeypatch.setattr(engagement_ledger, "save", lambda d, eid=None: saved.update(data=d) or "path")
-
-    text = _run(slash._handle_state(None, build_chat_request("x"), "set 1 achieved"))
-    assert "cannot promote" in text
-    assert saved == {}
-
-
-def test_state_objective_uses_current_client_engagement_key_and_clears_pending_refinement(monkeypatch):
-    from sage_chat import slash
-    from ai.langgraph import engagement_ledger
-
-    loads = []
-    saves = []
-
-    class _Client:
-        _engagement_key = "Operation_Chimera_1_current"
-
-        async def _ensure_engagement_key(self):
-            return None
-
-    model = type(
-        "_Model",
-        (),
-        {
-            "mythic_client": _Client(),
-            "state": {"_pending_objective_refinement": {"objective_text": "stale"}},
-        },
-    )()
-
-    monkeypatch.setattr(
-        engagement_ledger,
-        "load",
-        lambda eid=None: loads.append(eid) or {"engagement_id": eid, "hops": []},
-    )
-    monkeypatch.setattr(
-        engagement_ledger,
-        "save",
-        lambda data, eid=None: saves.append((eid, dict(data))) or "path",
-    )
-
-    text = _run(slash._handle_state(model, build_chat_request("x"), "objective collect graph"))
+    tools, _seed = _state_session(monkeypatch, "Operation_Chimera_1_current")
+    model = _state_model(tools, {"_pending_objective_refinement": {"objective_text": "stale"}})
+    text = _run(slash._handle_state(model, build_chat_request("x", operation_id=0), "objective collect graph"))
 
     assert "Objective updated" in text
-    assert loads == ["Operation_Chimera_1_current"]
-    assert saves[0][0] == "Operation_Chimera_1_current"
-    assert saves[0][1]["objective"] == "collect graph"
+    assert tools._ledger_snapshot().objective_setting() == ("collect graph", "operator")
+    assert tools._ledger_snapshot().engagement_key == "Operation_Chimera_1_current"
+    assert tools._engagement_hops == []  # the objective write touches no ledger rows
     assert model.state["_pending_objective_refinement"] is None
 
 
