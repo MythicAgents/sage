@@ -1582,10 +1582,9 @@ def record_capability_result(
 ) -> tuple[Any, CapabilityVerification]:
     """Record a capability verifier result into an EngagementState-shaped ledger.
 
-    The effect is durable only when the capability verifier returns ``achieved``.
-    Partial outcomes are recorded as failed attempts with the partial verdict in
-    evidence; this keeps ``achieved_effects`` strict while preserving debugging
-    context for repair.
+    The ledger records progress only. An ``achieved`` verdict writes the effect row. Any other verdict (partial,
+    failed, blocked) writes no row and returns ``state`` unchanged; the runtime caller keeps that outcome in its
+    request attempt memory through :func:`capability_attempt`.
     """
     verification_probe = dict(probe_result) if isinstance(probe_result, dict) else probe_result
     if isinstance(verification_probe, dict) and isinstance(evidence, dict):
@@ -1593,8 +1592,93 @@ def record_capability_result(
             if key in evidence and not _input_text(verification_probe, key):
                 verification_probe[key] = evidence[key]
     verification = verify_capability(action.name, verification_probe)
-    status = _record_status_from_verdict(verification.verdict)
+    if _normalize(verification.verdict) != "achieved":
+        return state, verification
     effect = action.effects[0] if action.effects else f"{action.name}:{action.target}"
+    evidence_dict = _capability_result_evidence(action, verification, evidence)
+
+    satisfied_effects = list(action.effects)
+    admin_effect = _ensure_context_admin_effect(
+        action,
+        verification_probe if isinstance(verification_probe, dict) else {},
+    )
+    if admin_effect and admin_effect not in satisfied_effects:
+        satisfied_effects.insert(0, admin_effect)
+    credential_effect = _certificate_auth_credential_effect(
+        action,
+        verification_probe if isinstance(verification_probe, dict) else {},
+    )
+    if credential_effect and credential_effect not in satisfied_effects:
+        satisfied_effects.append(credential_effect)
+    proves_callback_context = _probe_proves_callback_kerberos_context(
+        action,
+        verification_probe if isinstance(verification_probe, dict) else {},
+    )
+    callback_id = _normalize_callback_id(
+        _input_text(verification_probe if isinstance(verification_probe, dict) else {}, "callback_id", "callback", "callback_display_id")
+    )
+    if callback_id and proves_callback_context:
+        for action_effect in list(satisfied_effects):
+            prefix, _, domain = _normalize(action_effect).partition(":")
+            if prefix in {"da", "ea"} and domain:
+                context_effect = _kerberos_context_effect(domain, callback_id)
+                if context_effect not in satisfied_effects:
+                    satisfied_effects.append(context_effect)
+
+    try:
+        try:
+            from . import engagement_state
+        except ImportError:
+            import engagement_state
+        updated = engagement_state.record_effect_result(
+            state,
+            f"capability:{action.name}",
+            action.target,
+            effect,
+            "achieved",
+            evidence_dict,
+            now,
+            preconditions=list(action.preconditions),
+            satisfied_effects=satisfied_effects,
+            proof_envelope=proof_envelope,
+        )
+    except Exception:
+        updated = state
+    return updated, verification
+
+
+def capability_attempt(
+    action: CapabilityAction,
+    verification: CapabilityVerification,
+    evidence: dict[str, Any] | None = None,
+):
+    """The request attempt for a capability verdict that did not achieve its effect.
+
+    It carries the same evidence a capability row would carry, so blocker readers see the same fields.
+    """
+    try:
+        from . import request_attempts
+    except ImportError:
+        import request_attempts
+    effect = action.effects[0] if action.effects else f"{action.name}:{action.target}"
+    raw = evidence if isinstance(evidence, dict) else {}
+    return request_attempts.make_attempt(
+        technique=f"capability:{action.name}",
+        target=action.target,
+        effect=effect,
+        satisfied_effects=list(action.effects) or [effect],
+        verdict=verification.verdict,
+        evidence=_capability_result_evidence(action, verification, evidence),
+        task_id=raw.get("mythic_task_id") or raw.get("task_id"),
+        callback_id=raw.get("callback_id") or raw.get("callback_display_id"),
+    )
+
+
+def _capability_result_evidence(
+    action: CapabilityAction,
+    verification: CapabilityVerification,
+    evidence: dict[str, Any] | None,
+) -> dict[str, Any]:
     base_evidence: dict[str, Any] = {
         "source": "capability_verifier",
         "provenance": "run",
@@ -1645,55 +1729,7 @@ def record_capability_result(
                 }:
                     evidence_dict[key] = value
 
-    satisfied_effects = list(action.effects)
-    if status == "achieved":
-        admin_effect = _ensure_context_admin_effect(
-            action,
-            verification_probe if isinstance(verification_probe, dict) else {},
-        )
-        if admin_effect and admin_effect not in satisfied_effects:
-            satisfied_effects.insert(0, admin_effect)
-        credential_effect = _certificate_auth_credential_effect(
-            action,
-            verification_probe if isinstance(verification_probe, dict) else {},
-        )
-        if credential_effect and credential_effect not in satisfied_effects:
-            satisfied_effects.append(credential_effect)
-        proves_callback_context = _probe_proves_callback_kerberos_context(
-            action,
-            verification_probe if isinstance(verification_probe, dict) else {},
-        )
-        callback_id = _normalize_callback_id(
-            _input_text(verification_probe if isinstance(verification_probe, dict) else {}, "callback_id", "callback", "callback_display_id")
-        )
-        if callback_id and proves_callback_context:
-            for action_effect in list(satisfied_effects):
-                prefix, _, domain = _normalize(action_effect).partition(":")
-                if prefix in {"da", "ea"} and domain:
-                    context_effect = _kerberos_context_effect(domain, callback_id)
-                    if context_effect not in satisfied_effects:
-                        satisfied_effects.append(context_effect)
-
-    try:
-        try:
-            from . import engagement_state
-        except ImportError:
-            import engagement_state
-        updated = engagement_state.record_effect_result(
-            state,
-            f"capability:{action.name}",
-            action.target,
-            effect,
-            status,
-            evidence_dict,
-            now,
-            preconditions=list(action.preconditions),
-            satisfied_effects=satisfied_effects,
-            proof_envelope=proof_envelope,
-        )
-    except Exception:
-        updated = state
-    return updated, verification
+    return evidence_dict
 
 
 def _probe_proves_callback_kerberos_context(action: CapabilityAction, probe_result: dict[str, Any]) -> bool:
@@ -6591,12 +6627,9 @@ def _certificate_auth_target_accounts(facts: set[str], achieved: set[str], domai
 
 
 def _adcs_ca_private_key_blocked_targets(state: Any) -> set[tuple[str, str]]:
-    """Targets where prior CA signing-key extraction failed for material/export reasons."""
+    """Targets where CA signing-key extraction failed in this request for material/export reasons."""
     out: set[tuple[str, str]] = set()
-    for hop in getattr(state, "hops", []) or []:
-        status = _normalize(getattr(hop, "status", ""))
-        if status == "achieved":
-            continue
+    for hop in _request_attempts(state):
         technique = _normalize(getattr(hop, "technique", ""))
         effect = _normalize(getattr(hop, "effect", ""))
         evidence = getattr(hop, "evidence", {}) if isinstance(getattr(hop, "evidence", {}), dict) else {}
@@ -6922,12 +6955,9 @@ def _live_account_kerberos_context_callbacks(
 
 
 def _endpoint_protection_blocked_targets(state: Any) -> set[tuple[str, str]]:
-    """Targets with explicit endpoint-control blocker evidence in failed/blocked hops."""
+    """Targets with explicit endpoint-control blocker evidence in this request's failed attempts."""
     out: set[tuple[str, str]] = set()
-    for hop in getattr(state, "hops", []) or []:
-        status = _normalize(getattr(hop, "status", ""))
-        if status == "achieved":
-            continue
+    for hop in _request_attempts(state):
         evidence = getattr(hop, "evidence", {}) if isinstance(getattr(hop, "evidence", {}), dict) else {}
         evidence_text = " ".join(
             _text(value)
@@ -7295,30 +7325,25 @@ def _achieved_effects(state: Any) -> set[str]:
         return set()
 
 
-def _terminal_failed_effects(state: Any) -> set[str]:
-    effects: set[str] = set()
+def _request_attempts(state: Any) -> list[Any]:
+    """The current request's failed capability attempts (never ESL rows; see ``request_attempts``)."""
     try:
-        hops = list(getattr(state, "hops", []) or [])
+        return list(getattr(state, "request_attempts", ()) or ())
     except Exception:
-        return effects
-    for hop in hops:
-        status = _normalize(getattr(hop, "status", ""))
-        if status not in {"failed", "blocked"}:
-            continue
-        evidence = getattr(hop, "evidence", {})
-        if isinstance(evidence, dict) and evidence.get("terminal_failure") is False:
-            continue
-        effect = _canonical_effect(getattr(hop, "effect", ""))
-        if effect:
-            effects.add(effect)
-        try:
-            for item in list(getattr(hop, "satisfied_effects", []) or []):
-                canonical = _canonical_effect(item)
-                if canonical:
-                    effects.add(canonical)
-        except Exception:
-            pass
-    return effects
+        return []
+
+
+def _terminal_failed_effects(state: Any) -> set[str]:
+    """Effects a terminal attempt in the current request suppresses for the rest of that request."""
+    try:
+        from . import request_attempts
+    except ImportError:
+        import request_attempts
+    return {
+        canonical
+        for canonical in (_canonical_effect(item) for item in request_attempts.terminal_effects(_request_attempts(state)))
+        if canonical
+    }
 
 
 def _canonical_effect(effect: Any) -> str:
@@ -7503,15 +7528,6 @@ def _parse_probe_bool(value: Any) -> bool | None:
     if normalized in {"false", "0", "no", "disabled", "off"}:
         return False
     return None
-
-
-def _record_status_from_verdict(verdict: str) -> str:
-    normalized = _normalize(verdict)
-    if normalized == "achieved":
-        return "achieved"
-    if normalized == "blocked":
-        return "blocked"
-    return "failed"
 
 
 _SYSTEM_IDENTITY_RE = re.compile(

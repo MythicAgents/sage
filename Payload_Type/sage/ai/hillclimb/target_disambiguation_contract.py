@@ -22,7 +22,7 @@ from typing import Any
 try:  # package import
     from . import frontier_census
     from . import policy_replay_selector_experiment as selector_experiment
-    from ..langgraph import capabilities, engagement_state, policy
+    from ..langgraph import capabilities, engagement_state, policy, request_attempts
 except Exception:  # script / flat import
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "langgraph"))
@@ -30,6 +30,7 @@ except Exception:  # script / flat import
     import policy_replay_selector_experiment as selector_experiment  # type: ignore
     import capabilities  # type: ignore
     import engagement_state  # type: ignore
+    import request_attempts  # type: ignore
     import policy  # type: ignore
 
 
@@ -76,14 +77,14 @@ def _foothold(domain: str, *, callback_id: str = "1") -> engagement_state.Footho
     )
 
 
-def _blocked_ca_export_hop() -> engagement_state.Hop:
+def _blocked_ca_export_attempt() -> request_attempts.Attempt:
     effect = f"adcs-ca-private-key:{ADCS_CA_HOST}@{ADCS_DOMAIN}"
-    return engagement_state.Hop(
-        id="target-disambiguation-blocked-ca-export",
+    # A blocked CA key export is a request attempt, not a ledger row.
+    return request_attempts.make_attempt(
         technique="capability:adcs-ca-private-key-export",
         target=f"target={ADCS_CA_HOST};target_domain={ADCS_DOMAIN};callback=1",
         effect=effect,
-        status="blocked",
+        verdict="blocked",
         evidence={
             "source": "target_disambiguation_contract",
             "verify_reason": "key not exportable",
@@ -92,10 +93,6 @@ def _blocked_ca_export_hop() -> engagement_state.Hop:
             "target_domain": ADCS_DOMAIN,
             "terminal_failure": True,
         },
-        preconditions=[],
-        satisfied_effects=[],
-        source="target_disambiguation_contract",
-        timestamp=_now(),
     )
 
 
@@ -103,7 +100,7 @@ def _adcs_proposal_state() -> engagement_state.EngagementState:
     return engagement_state.EngagementState(
         objective=f"From the current foothold, achieve administrative control of {ADCS_DOMAIN}.",
         footholds=[_foothold(ADCS_DOMAIN)],
-        hops=[_blocked_ca_export_hop()],
+        request_attempts=(_blocked_ca_export_attempt(),),
         graph_facts=[
             _fact(f"certificate-auth-target:administrator@{ADCS_DOMAIN}"),
             _fact(f"certificate-auth-target:helpdesk@{ADCS_DOMAIN}"),

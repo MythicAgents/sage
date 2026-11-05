@@ -303,53 +303,27 @@ def test_turn_end_summary_one_lines_unchanged_state(monkeypatch: pytest.MonkeyPa
     assert "| Hop |" not in second
 
 
-def _fake_reconcile_mutation():
-    from ai.langgraph import engagement_store
+def test_turn_end_reconciliation_records_operator_history_without_a_sage_task(monkeypatch: pytest.MonkeyPatch):
+    """Every turn end runs one pass over the operation's task history, whether or not this session issued a task.
 
-    hop = {"technique": "dcsync-krbtgt", "target": "lab.local", "effect": "krbtgt-hash:lab.local",
-           "status": "achieved", "evidence": {"mythic_task_id": 26, "result_preview": "krbtgt: hash dumped"}}
-    return engagement_store.hop_mutations([], [hop])
-
-
-def test_turn_end_reconciliation_corrects_failed_hop(monkeypatch: pytest.MonkeyPatch):
-    """Status-only reconciliation runs at the turn end when tasks were issued.
-
-    The fake reconciler produces a row without a proof envelope, so the runtime view quarantines it to
-    legacy_unverified — by design (a fake must not forge admissible proof). The wiring assertions: the reconciler
-    ran status-only (apply=False), its row went through the shared store, and the table reflects it.
+    Only the Mythic transport is stubbed; the pass, verifiers, proof boundary and store are real.
     """
-    from ai.langgraph import state_reconcile as state_reconcile_mod
+    from tests.esl_fixtures import stub_mythic_operation
 
-    calls: list[dict] = []
-
-    async def _fake_reconcile(client, hops, task_id, callback_id, limit, now, apply=False, **kwargs):
-        calls.append({"apply": apply, "limit": limit, "task_id": task_id})
-        return _fake_reconcile_mutation(), ["reconciled task 26"]
-
-    monkeypatch.setattr(state_reconcile_mod, "reconcile_task_history", _fake_reconcile)
+    records = stub_mythic_operation(monkeypatch)
+    records["tasks"] = [{
+        "display_id": 26, "operation_id": 1, "command_name": "dcsync", "status": "completed", "completed": True,
+        "original_params": '{"Domain": "lab.local", "User": "krbtgt"}', "timestamp": "",
+        "operator": {"username": "operator"}, "callback": {"display_id": 3, "host": "WS01", "user": "jdoe"},
+    }]
+    records["outputs"] = {26: (  # synthetic, secret-free DCSync-shaped output
+        "Object RDN           : krbtgt\n** SAM ACCOUNT **\nCredentials:\n"
+        "  Hash NTLM: 0123456789abcdef0123456789abcdef\n* Primary:Kerberos-Newer-Keys *\n    Credentials\n"
+        "      aes256_hmac       (4096) : " + "00112233445566778899aabbccddeeff" * 2 + "\n")}
     model, client = _summary_model(monkeypatch)
-    client._last_issued_task_display_id = 45
+    assert asyncio.run(model._engagement_state_turn_summary_text()) and records["queries"] == 0  # no Mythic client
     client.client = object()
+    assert getattr(client, "_last_issued_task_display_id", None) is None  # this session issued nothing
     text = asyncio.run(model._engagement_state_turn_summary_text())
-    assert calls and calls[0]["apply"] is False
-    assert "dcsync-krbtgt" in text and "26" in text
-    assert [row["technique"] for row in client._ledger_snapshot().display_hops()] == ["dcsync-krbtgt"]
-
-
-def test_turn_end_reconciliation_runs_only_when_tasks_issued(monkeypatch: pytest.MonkeyPatch):
-    from ai.langgraph import state_reconcile as state_reconcile_mod
-
-    calls: list[dict] = []
-
-    async def _fake_reconcile(client, hops, task_id, callback_id, limit, now, apply=False, **kwargs):
-        calls.append({"limit": limit})
-        return [], []
-
-    monkeypatch.setattr(state_reconcile_mod, "reconcile_task_history", _fake_reconcile)
-    model, client = _summary_model(monkeypatch)
-    asyncio.run(model._engagement_state_turn_summary_text())
-    assert calls == []  # no tasks issued → no reconciliation round-trip
-    client._last_issued_task_display_id = 45
-    client.client = object()
-    asyncio.run(model._engagement_state_turn_summary_text())
-    assert len(calls) == 1
+    assert "krbtgt-hash:lab.local" in text and "26" in text
+    assert [row["technique"] for row in client._ledger_snapshot().display_hops()] == ["dcsync"]

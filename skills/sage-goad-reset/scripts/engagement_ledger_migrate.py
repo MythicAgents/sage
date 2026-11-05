@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Offline import and export of the Engagement State Ledger (ESL) in sage.db.
 
-``status``   lists legacy ``state_*.json`` files that are not yet imported (or changed since import). Read-only.
+``status``   lists legacy ``state_*.json`` files that are not yet imported (or changed since import), and each
+             operation's schema version with the number of rows the schema migration retracted or moved to
+             ``pending``. Read-only: the migration itself runs when Sage next opens the database.
 ``import``   imports legacy files into sage.db. Sage must be stopped. Each file is verified and committed on its
              own; a malformed file, duplicate identity or number, changed source, or an operation already in the
              destination fails that file and leaves the destination unchanged. Sources are never modified, and an
@@ -60,7 +62,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    status = sub.add_parser("status", help="list legacy files still needing import")
+    status = sub.add_parser(
+        "status", help="list legacy files still needing import, and each operation's schema version (read-only)"
+    )
     status.add_argument("--database", type=Path)
     status.add_argument("--legacy-dir", type=Path)
 
@@ -85,7 +89,13 @@ def main(argv: list[str] | None = None) -> int:
         pending = store.pending_legacy_files() if database.exists() else [
             str(path) for path in engagement_store._legacy_files(_legacy_dir(args.legacy_dir))
         ]
-        print(json.dumps({"database": str(database), "pending": pending}, indent=2))
+        operations = engagement_store.schema_status(database)
+        print(json.dumps({
+            "database": str(database),
+            "pending": pending,
+            "current_schema_version": engagement_store.SCHEMA_VERSION,
+            "operations": operations,
+        }, indent=2))
         return 1 if pending else 0
 
     if args.command == "import":

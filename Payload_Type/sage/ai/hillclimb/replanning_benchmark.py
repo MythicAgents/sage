@@ -13,7 +13,7 @@ from typing import Any
 
 try:
     from . import frontier_census, purpose_range
-    from ..langgraph import capabilities, engagement_state
+    from ..langgraph import capabilities, engagement_state, request_attempts
 except Exception:
     import sys
     from pathlib import Path
@@ -24,6 +24,7 @@ except Exception:
     import purpose_range  # type: ignore
     import capabilities  # type: ignore
     import engagement_state  # type: ignore
+    import request_attempts  # type: ignore
 
 
 SHARED_PREFIX = (
@@ -141,17 +142,15 @@ def _blocked_state(
         "retryable_failure": True,
         **dict(REPLANNING_BENCHMARK.blocker_probe),
     }
-    return engagement_state.record_effect_result(
-        state,
-        f"replanning-benchmark:{getattr(action, 'name', 'action')}",
-        str(getattr(action, "target", "") or ""),
-        effect,
-        "blocked",
-        evidence,
-        _now(),
-        preconditions=list(getattr(action, "preconditions", None) or []),
+    # A blocked step is a request attempt, not a ledger row.
+    return request_attempts.with_attempts(state, request_attempts.make_attempt(
+        technique=f"replanning-benchmark:{getattr(action, 'name', 'action')}",
+        target=str(getattr(action, "target", "") or ""),
+        effect=effect,
         satisfied_effects=effects or [effect],
-    )
+        verdict="blocked",
+        evidence=evidence,
+    ))
 
 
 def validate_replanning_benchmark() -> dict[str, Any]:
@@ -198,13 +197,14 @@ def validate_replanning_benchmark() -> dict[str, Any]:
         ),
         "blocker_is_verifier_backed_and_repairable": (
             getattr(blocker_verification, "verdict", "") == "blocked"
-            and any(
-                getattr(hop, "status", "") == "blocked"
-                and getattr(hop, "evidence", {}).get("verify_reason") == REPLANNING_BENCHMARK.blocker_reason
-                and getattr(hop, "evidence", {}).get("defender_blocked") is True
-                and getattr(hop, "evidence", {}).get("tool_execution_failed") is True
-                and getattr(hop, "evidence", {}).get("terminal_failure") is False
-                for hop in blocked_state.hops
+            and any(  # the blocker is a request attempt, never a ledger row
+                getattr(attempt, "verdict", "") == "blocked"
+                and getattr(attempt, "evidence", {}).get("verify_reason") == REPLANNING_BENCHMARK.blocker_reason
+                and getattr(attempt, "evidence", {}).get("defender_blocked") is True
+                and getattr(attempt, "evidence", {}).get("tool_execution_failed") is True
+                and getattr(attempt, "evidence", {}).get("terminal_failure") is False
+                and not getattr(attempt, "terminal", True)
+                for attempt in blocked_state.request_attempts
             )
         ),
         "post_blocker_frontier_has_multiple_recovery_families": (

@@ -1,12 +1,14 @@
-"""Capability gains a supervised step proved, ready for the engagement ledger.
+"""Callback context gains Mythic recorded, ready for the engagement ledger.
 
 The ledger records progress, not events: a row is a capability the engagement now holds, keyed by its effect, so a
 repeat updates its row rather than adding one. This module finds callback context gains: a new session on a host,
-or a rise in a callback's integrity, as Mythic recorded them. Each gain is credited to the task, issued by this Sage
-process, that caused it. Losing a context, a token or impersonation change, and a task that merely ran produce
-nothing; a gain no task can be credited with is reported as unattributed and recorded nowhere.
+or a rise in a callback's integrity, measured against the operation's stored callback baseline. Each gain is
+credited to the operation task that caused it, whoever issued it. A gain no task can be credited with is proven by a
+completed task on the gained callback itself. Losing a context, a token or impersonation change, and a task that
+merely ran produce nothing; a gain with neither a credited task nor a completed task on its callback is reported as
+unattributed and recorded nowhere.
 
-Pure: callers pass Mythic's callback and task rows and the contexts last seen.
+Pure: callers pass Mythic's callback and task rows and the stored baseline.
 """
 from __future__ import annotations
 
@@ -77,13 +79,22 @@ def callback_context(row: Mapping[str, Any]) -> CallbackContext | None:
     )
 
 
+_TERMINAL_SUCCESS = frozenset({"completed", "complete", "success", "succeeded"})
+
+
 @dataclass(frozen=True)
-class IssuedTask:
+class OperationTask:
+    """A Mythic task in the operation, from any issuer."""
+
     task_id: int
     callback_display_id: int | None
     command: str
     status: str
     timestamp: str
+
+    @property
+    def succeeded(self) -> bool:
+        return _text(self.status).casefold() in _TERMINAL_SUCCESS
 
 
 @dataclass(frozen=True)
@@ -91,7 +102,8 @@ class ContextGain:
     kind: str  # new_callback | integrity_rise
     context: CallbackContext
     effects: tuple[str, ...]
-    task: IssuedTask | None
+    task: OperationTask | None  # the task credited with causing the gain
+    proof_task: OperationTask | None = None  # the latest completed task on the gained callback
 
 
 def _privilege_effects(context: CallbackContext) -> list[str]:
@@ -104,12 +116,12 @@ def _privilege_effects(context: CallbackContext) -> list[str]:
     return []
 
 
-def _credit_new_callback(context: CallbackContext, tasks: Iterable[IssuedTask], window: float) -> IssuedTask | None:
+def _credit_new_callback(context: CallbackContext, tasks: Iterable[OperationTask], window: float) -> OperationTask | None:
     """The latest task issued before the callback first checked in, within the window."""
     checked_in = _when(context.init_callback)
     if checked_in is None:
         return None
-    best: tuple[datetime, IssuedTask] | None = None
+    best: tuple[datetime, OperationTask] | None = None
     for task in tasks:
         issued = _when(task.timestamp)
         if issued is None or not (0.0 <= (checked_in - issued).total_seconds() <= window):
@@ -119,41 +131,49 @@ def _credit_new_callback(context: CallbackContext, tasks: Iterable[IssuedTask], 
     return best[1] if best else None
 
 
-def context_gains(callbacks: Iterable[CallbackContext], seen: Mapping[int, CallbackContext],
-                  issued: Iterable[IssuedTask], step_tasks: Iterable[int], *,
-                  window: float = ATTRIBUTION_WINDOW_SECONDS) -> list[ContextGain]:
-    """Gains between the contexts last seen and Mythic's current callbacks.
+def checked_in(context: CallbackContext) -> datetime | None:
+    """When the callback first checked in, per Mythic."""
+    return _when(context.init_callback)
 
-    `issued` is every task this Sage process issued that may be credited (recent ones, with Mythic timestamps); a
-    new callback is credited by time, so a payload that checks in after its step ended is still credited at the next
-    step boundary. A rise in integrity is credited only to one of this step's tasks on that same callback. A callback
-    seen for the first time is a new session only if a task can be credited with it; otherwise it is the baseline.
+
+def baseline_of(callbacks: Iterable[CallbackContext]) -> dict[str, str]:
+    """The stored form of a callback baseline: display ID to integrity level."""
+    return {str(context.display_id): context.integrity for context in callbacks}
+
+
+def context_gains(callbacks: Iterable[CallbackContext], baseline: Mapping[str, str],
+                  tasks: Iterable[OperationTask], *, window: float = ATTRIBUTION_WINDOW_SECONDS) -> list[ContextGain]:
+    """Gains between the stored baseline and Mythic's current callbacks.
+
+    `tasks` are operation tasks from any issuer, with Mythic timestamps. A new callback is credited by time, so a
+    payload that checks in after its task finished is still credited at the next reconciliation. A rise in integrity
+    is credited to the latest task on that same callback. Each gain also names the latest completed task on the
+    gained callback, which proves the gain when no task can be credited.
     """
-    issued = list(issued)
-    step = set(step_tasks)
+    tasks = list(tasks)
     gains: list[ContextGain] = []
     for context in callbacks:
-        prior = seen.get(context.display_id)
+        prior = baseline.get(str(context.display_id))
+        on_callback = [task for task in tasks if task.callback_display_id == context.display_id]
+        succeeded = [task for task in on_callback if task.succeeded]
+        proof = max(succeeded, key=lambda task: task.task_id) if succeeded else None
         if prior is None:
             effects = ([f"session:{context.user}@{context.host}"] if context.user and context.host else []) \
                 + _privilege_effects(context)
             if effects:
                 gains.append(ContextGain("new_callback", context, tuple(effects),
-                                         _credit_new_callback(context, issued, window)))
+                                         _credit_new_callback(context, tasks, window), proof))
             continue
-        if _RANK.get(context.integrity, 0) > _RANK.get(prior.integrity, 0):
+        if _RANK.get(context.integrity, 0) > _RANK.get(prior, 0):
             effects = _privilege_effects(context)
-            on_callback = [task for task in issued
-                           if task.task_id in step and task.callback_display_id == context.display_id]
             if effects:
                 gains.append(ContextGain("integrity_rise", context, tuple(effects),
-                                         max(on_callback, key=lambda task: task.task_id) if on_callback else None))
+                                         max(on_callback, key=lambda task: task.task_id) if on_callback else None,
+                                         proof))
     return gains
 
 
-def unattributed(gains: Iterable[ContextGain], *, first_observation: bool) -> list[dict[str, Any]]:
-    """Gains no task could be credited with, for the step's references. A first observation is the baseline."""
-    if first_observation:
-        return []
+def unattributed(gains: Iterable[ContextGain]) -> list[dict[str, Any]]:
+    """Gains with neither a credited task nor a completed task on the gained callback."""
     return [{"callback_display_id": gain.context.display_id, "kind": gain.kind, "effects": list(gain.effects)}
-            for gain in gains if gain.task is None]
+            for gain in gains if gain.task is None and gain.proof_task is None]

@@ -23,13 +23,14 @@ from typing import Any, Callable
 
 try:  # package import
     from . import frontier_census
-    from ..langgraph import capabilities, engagement_state, policy
+    from ..langgraph import capabilities, engagement_state, policy, request_attempts
 except Exception:  # script / flat import
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "langgraph"))
     import frontier_census  # type: ignore
     import capabilities  # type: ignore
     import engagement_state  # type: ignore
+    import request_attempts  # type: ignore
     import policy  # type: ignore
 
 
@@ -96,23 +97,25 @@ def _state(
     objective_domain: str = TARGET_DOMAIN,
     graph_facts: list[str] | None = None,
     hops: list[engagement_state.Hop] | None = None,
+    request_attempts: tuple = (),
 ) -> engagement_state.EngagementState:
     return engagement_state.EngagementState(
         objective=f"From the current foothold, achieve administrative control of {objective_domain}.",
         footholds=[_foothold(objective_domain)],
         graph_facts=[_fact(predicate) for predicate in list(graph_facts or [])],
         hops=list(hops or []),
+        request_attempts=tuple(request_attempts),
     )
 
 
-def _blocked_ca_export_hop() -> engagement_state.Hop:
+def _blocked_ca_export_attempt() -> request_attempts.Attempt:
     effect = f"adcs-ca-private-key:ca01@{TARGET_DOMAIN}"
-    return engagement_state.Hop(
-        id="target-value-census-blocked-ca-export",
+    # A blocked CA key export is a request attempt, not a ledger row.
+    return request_attempts.make_attempt(
         technique="capability:adcs-ca-private-key-export",
         target=f"target=ca01;target_domain={TARGET_DOMAIN};callback=1",
         effect=effect,
-        status="blocked",
+        verdict="blocked",
         evidence={
             "source": "target_value_census",
             "verify_reason": "key not exportable",
@@ -121,10 +124,6 @@ def _blocked_ca_export_hop() -> engagement_state.Hop:
             "target_domain": TARGET_DOMAIN,
             "terminal_failure": True,
         },
-        preconditions=[],
-        satisfied_effects=[],
-        source="target_value_census",
-        timestamp=_now(),
     )
 
 
@@ -152,7 +151,7 @@ def _adcs_enrollment_account_state() -> engagement_state.EngagementState:
             f"certificate-auth-target:administrator@{TARGET_DOMAIN}",
             f"certificate-auth-target:helpdesk@{TARGET_DOMAIN}",
         ],
-        hops=[_blocked_ca_export_hop()],
+        request_attempts=(_blocked_ca_export_attempt(),),
     )
 
 

@@ -187,6 +187,12 @@ def _last(mt):
     return mt._engagement_hops[-1]
 
 
+def _last_attempt(mt):
+    """A result that does not prove its effect is a request attempt; the ledger records progress only."""
+    assert not any(hop.status in {"failed", "blocked"} for hop in mt._engagement_hops)
+    return mt._request_attempt_view()[-1]
+
+
 def test_record_dcsync_user_with_key_achieved(mt):
     mt._pending_engagement_hop = ("dcsync-user", USER, TS)
     _record_success(mt, MIMIKATZ_OK)
@@ -214,25 +220,26 @@ def test_stage_b_dcsync_key_records_verified_credential_without_gate_flag(mt):
 def test_record_dcsync_user_no_key_failed_not_achieved(mt):
     mt._pending_engagement_hop = ("dcsync-user", USER, TS)
     _record_success(mt, DCSYNC_8439)
-    hop = _last(mt)
-    assert hop.status == "failed"                       # the false-achieved lie is dead
+    hop = _last_attempt(mt)
+    assert hop.verdict == "failed" and hop.terminal                       # the false-achieved lie is dead
     assert hop.evidence.get("verify_verdict") != "achieved"   # "partial" (ran, no key) or "failed"
     assert hop.evidence.get("artifact_present") is False
 
 
-def test_failed_credential_hop_persists(mt):
+def test_a_failed_credential_result_writes_no_row(mt):
     mt._pending_engagement_hop = ("dcsync-user", USER, TS)
     _record_success(mt, DCSYNC_8439)
-    # Durable trail in the shared store so `/state` surfaces the honest failure.
+    # The failure stays in this request's attempt memory; Mythic's task history is the durable trail.
     rows = mt._ledger_snapshot().hop_rows()
-    assert [row.payload["status"] for row in rows if row.payload["technique"] == "dcsync-user"] == ["failed"]
+    assert [row for row in rows if row.payload["technique"] == "dcsync-user"] == []
+    assert _last_attempt(mt).technique == "dcsync-user"
 
 
 def test_record_dcsync_krbtgt_no_key_failed(mt):
     mt._pending_engagement_hop = ("dcsync", DOM, TS)
     _record_success(mt, TRUNCATED)
-    hop = _last(mt)
-    assert hop.status == "failed"
+    hop = _last_attempt(mt)
+    assert hop.verdict == "failed" and hop.effect == f"krbtgt-hash:{DOM}"
 
 
 def test_gpo_abuse_system_proof_achieved(mt):
@@ -341,9 +348,9 @@ def test_verified_achieved_sticky_across_reload(tmp_path, monkeypatch):
     assert len(hops) == 1 and hops[0].status == "achieved"
 
 
-def test_legacy_false_achieved_overwritten_by_verified_failed(mt):
-    # A legacy achieved WITHOUT real-key evidence (artifact_present absent) is cleanup-eligible:
-    # a verified no-key result SHOULD overwrite it (this is the false-achieved fix doing its job).
+def test_an_unproven_legacy_achievement_stays_unproven_after_a_failed_result(mt):
+    # A legacy achieved WITHOUT proof reads as pending (proof missing); a verified no-key result is a request
+    # attempt and never turns it into progress.
     seed_ledger(mt, prove=False, hops=es.record_hop_result(
         es.EngagementState(objective="t"), "dcsync-user", USER, "achieved",
         {"source": "legacy", "provenance": "run"}, TS,
@@ -351,7 +358,8 @@ def test_legacy_false_achieved_overwritten_by_verified_failed(mt):
     mt._pending_engagement_hop = ("dcsync-user", USER, "2026-06-08T03:00:00+00:00")
     _record_success(mt, DCSYNC_8439)
     hops = [h for h in mt._engagement_hops if h.technique == "dcsync-user" and h.target == USER]
-    assert len(hops) == 1 and hops[0].status == "failed"
+    assert len(hops) == 1 and (hops[0].status, hops[0].pending_reason) == ("pending", "proof_missing")
+    assert _last_attempt(mt).verdict == "failed"
 
 
 # ---------------------------------------------------------------------------
@@ -435,15 +443,15 @@ def test_record_grant_denied_failed_not_achieved(mt):
     # The false-achieved-grant lie is dead: Access-denied records FAILED, never achieved.
     mt._pending_engagement_hop = ("dcsync-rights-grant", GRANT_DOM, TS)
     _record_success(mt, GRANT_DENIED)
-    hop = _last(mt)
-    assert hop.status == "failed"
+    hop = _last_attempt(mt)
+    assert hop.verdict == "failed"
     assert hop.evidence.get("artifact_present") is False
 
 
 def test_record_grant_empty_failed(mt):
     mt._pending_engagement_hop = ("dcsync-rights-grant", GRANT_DOM, TS)
     _record_success(mt, GRANT_EMPTY)
-    assert _last(mt).status == "failed"
+    assert _last_attempt(mt).verdict == "failed"
 
 
 def test_verified_achieved_grant_not_downgraded(mt):
@@ -532,9 +540,9 @@ def test_ticket_probe_group_proof_achieved():
 def test_record_sid_history_rubeus_exception_failed_not_achieved(mt):
     mt._pending_engagement_hop = ("sid-history-escalation", CHILD_DOM, TS)
     _record_success(mt, RUBEUS_SDDL_EXCEPTION)
-    hop = _last(mt)
+    hop = _last_attempt(mt)
     assert hop.technique == "sid-history-escalation"
-    assert hop.status == "failed"
+    assert hop.verdict == "failed"
     assert hop.effect == f"da:{ROOT_DOM}"
     assert hop.evidence["verified_on_record"] is True
     assert hop.evidence["verify_verdict"] == "failed"
@@ -544,8 +552,8 @@ def test_record_sid_history_rubeus_exception_failed_not_achieved(mt):
 def test_record_sid_history_forge_only_failed_with_partial_verdict(mt):
     mt._pending_engagement_hop = ("sid-history-escalation", CHILD_DOM, TS)
     _record_success(mt, MIMIKATZ_GOLDEN_FORGE_ONLY)
-    hop = _last(mt)
-    assert hop.status == "failed"
+    hop = _last_attempt(mt)
+    assert hop.verdict == "failed"
     assert hop.evidence["verify_verdict"] == "partial"
     assert hop.evidence["ticket_forged"] is True
     assert hop.evidence["artifact_present"] is False
@@ -743,7 +751,7 @@ def test_record_gpo_abuse_setup_only_records_pending_not_achieved(mt):
 def test_record_gpo_abuse_guid_only_records_failed_not_waitable(mt):
     mt._pending_engagement_hop = ("gpo-abuse", "starkwallpaper", TS)
     _record_success(mt, GPO_ABUSE_GUID_ONLY)
-    hop = _last(mt)
-    assert hop is not None and hop.technique == "gpo-abuse" and hop.status == "failed"
+    hop = _last_attempt(mt)
+    assert hop is not None and hop.technique == "gpo-abuse" and hop.verdict == "failed"
     assert hop.evidence.get("verify_verdict") == "failed"
     assert hop.evidence.get("artifact_present") is False

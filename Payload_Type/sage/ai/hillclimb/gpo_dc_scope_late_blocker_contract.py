@@ -25,7 +25,7 @@ try:  # package import
     from . import policy_replay_selector_experiment as selector_experiment
     from . import purpose_range
     from . import replanning_benchmark
-    from ..langgraph import capabilities, engagement_state, policy
+    from ..langgraph import capabilities, engagement_state, policy, request_attempts
 except Exception:  # script / flat import
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "langgraph"))
@@ -35,6 +35,7 @@ except Exception:  # script / flat import
     import replanning_benchmark  # type: ignore
     import capabilities  # type: ignore
     import engagement_state  # type: ignore
+    import request_attempts  # type: ignore
     import policy  # type: ignore
 
 
@@ -192,20 +193,16 @@ def _blocked_state(
         "failure_class": GPO_DC_SCOPE_LATE_BLOCKER.blocker_failure_class,
         **dict(GPO_DC_SCOPE_LATE_BLOCKER.blocker_probe),
     }
-    return (
-        engagement_state.record_effect_result(
-            state,
-            f"gpo-dc-scope-late-blocker:{getattr(action, 'name', 'action')}",
-            str(getattr(action, "target", "") or ""),
-            effect,
-            "blocked",
-            evidence,
-            _now(),
-            preconditions=list(getattr(action, "preconditions", None) or []),
-            satisfied_effects=[effect],
-        ),
-        effect,
+    # A blocked step is a request attempt, not a ledger row.
+    attempt = request_attempts.make_attempt(
+        technique=f"gpo-dc-scope-late-blocker:{getattr(action, 'name', 'action')}",
+        target=str(getattr(action, "target", "") or ""),
+        effect=effect,
+        satisfied_effects=[effect],
+        verdict="blocked",
+        evidence=evidence,
     )
+    return request_attempts.with_attempts(state, attempt), effect
 
 
 def _decision_packet(
@@ -314,11 +311,11 @@ def validate_gpo_dc_scope_late_blocker_contract() -> dict[str, Any]:
         for index in best_indices
         if 0 <= index < len(post_blocker_frontier)
     ]
-    blocked_hops = [
-        hop
-        for hop in blocked_state.hops
-        if getattr(hop, "status", "") == "blocked"
-        and getattr(hop, "technique", "") == f"gpo-dc-scope-late-blocker:{GPO_DC_SCOPE_LATE_BLOCKER.blocked_action}"
+    blocked_hops = [  # the blocker is a request attempt, never a ledger row
+        attempt
+        for attempt in blocked_state.request_attempts
+        if getattr(attempt, "verdict", "") == "blocked"
+        and getattr(attempt, "technique", "") == f"gpo-dc-scope-late-blocker:{GPO_DC_SCOPE_LATE_BLOCKER.blocked_action}"
     ]
     catalog_names = {item["name"] for item in capabilities.capability_catalog()}
     declared_actions = {
@@ -335,7 +332,7 @@ def validate_gpo_dc_scope_late_blocker_contract() -> dict[str, Any]:
             blocker_verification.verdict == "blocked"
             and len(blocked_hops) == 1
             and blocked_hops[0].effect == blocked_effect
-            and blocked_hops[0].satisfied_effects == [blocked_effect]
+            and list(blocked_hops[0].satisfied_effects) == [blocked_effect]
             and blocked_hops[0].evidence.get("terminal_failure") is True
         ),
         "post_blocker_frontier_is_exact_two_gpo_targets": (

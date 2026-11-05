@@ -31,6 +31,7 @@ from ai.langgraph import autonomous_controller as controller  # noqa: E402
 from ai.langgraph import capabilities  # noqa: E402
 from ai.langgraph import engagement_state as es  # noqa: E402
 from ai.langgraph import mythic_tools as mt  # noqa: E402
+from ai.langgraph import request_attempts  # noqa: E402
 from tests.test_bloodhound_ingest_contract import FakeIngestTool, install_bloodhound  # noqa: E402
 
 
@@ -3160,22 +3161,18 @@ def test_collection_request_does_not_expand_scope_after_retryable_capability_fai
         source="test",
         timestamp="",
     )
-    retryable_failure = es.Hop(
-        id="failed-cert-auth",
+    retryable_failure = request_attempts.make_attempt(
         technique="capability:adcs-certificate-auth",
         target="domain=essos.local;account=administrator;ca_host=braavos;callback=2",
         effect="da:essos.local",
-        status="failed",
-        evidence={"terminal_failure": False, "failure_class": "transient"},
-        preconditions=[],
         satisfied_effects=["da:essos.local", "certificate-auth:administrator@essos.local"],
-        source="test",
-        timestamp="",
+        evidence={"terminal_failure": False, "failure_class": "transient"},
     )
     state = es.EngagementState(
         objective="obtain administrative control of essos.local",
         footholds=[foothold],
-        hops=[baseline_hop, retryable_failure],
+        hops=[baseline_hop],
+        request_attempts=(retryable_failure,),
         graph_facts=[
             es.GraphFact("domain-collected:north.local", "test", "", 600),
             es.GraphFact("trust-reachable:north.local:essos.local", "test", "", 600),
@@ -3363,23 +3360,18 @@ def test_eval_forced_capability_prefix_filters_until_release_on_failure(monkeypa
             ),
         ],
     )
+    # The blocked export is an attempt in the current request, not a ledger row.
     blocked_export = es.EngagementState(
         objective="x",
-        hops=[
-            *achieved_read.hops,
-            es.Hop(
-                id="export",
+        hops=list(achieved_read.hops),
+        request_attempts=(
+            request_attempts.make_attempt(
                 technique="capability:adcs-ca-private-key-export",
                 target=export_action.target,
                 effect="adcs-ca-private-key:ca01@range.local",
-                status="blocked",
-                evidence={},
-                preconditions=[],
-                satisfied_effects=["adcs-ca-private-key:ca01@range.local"],
-                source="test",
-                timestamp="",
+                verdict="blocked",
             ),
-        ],
+        ),
     )
 
     assert [item.name for item in model._eval_forced_capability_prefix_candidates(actions, empty)] == [

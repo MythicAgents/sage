@@ -174,7 +174,7 @@ def test_state_command_queues_the_shown_rows_for_the_model(_restore_namespace):
     assert "| 2 | `dcsync:corp.local` |" in shown
     view = el.take_operator_view(5)
     assert view.startswith("[Sage ledger view]") and "via `/state`" in view
-    assert "| 2 | `dcsync:corp.local` | krbtgt-hash:corp.local | `pending` | 12 |" in view
+    assert "| 2 | `dcsync:corp.local` | krbtgt-hash:corp.local | `pending (awaiting effect)` | 12 |" in view
     assert "TARGET-OUTPUT-PREVIEW" not in view
     assert "compromise CORP" in view
 

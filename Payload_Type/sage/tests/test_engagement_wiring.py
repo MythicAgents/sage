@@ -1512,12 +1512,13 @@ def test_gate_proceed_annotates_gpo_guid_only_noop():
 
     assert "Do NOT wait for Group Policy refresh" in result
     assert calls["issue"] == 1
-    hop = mt._engagement_hops[0]
+    assert not any(hop.status in {"failed", "blocked"} for hop in mt._engagement_hops)  # progress only
+    hop = mt._request_attempt_view()[0]  # the no-op is a request attempt, not a ledger row
     assert hop.technique == "gpo-abuse"
     assert hop.target == "starkwallpaper"
-    assert hop.status == "failed"
+    assert hop.verdict == "failed" and hop.terminal
     assert hop.evidence["verify_verdict"] == "failed"
-    assert hop.evidence.get("mythic_task_id") == "2713"
+    assert hop.task_id == "2713"
 
 
 def test_record_engagement_success_records_domain_admin_membership_probe():
@@ -1655,6 +1656,11 @@ def test_record_graph_built_persists_policy_decision_provenance():
     assert hop.evidence["selected_is_first_admissible"] is True
     assert hop.evidence["raw_disposition"] == "select"
     assert hop.evidence["effective_backend"] == "runtime-provider:runtime-model"
+    # A collection record is knowledge coverage: who collected, at what access, when, from which artifact.
+    foothold = mt._engagement_footholds[0]
+    assert (hop.evidence["collecting_callback_id"], hop.evidence["collecting_identity"],
+            hop.evidence["access_level"]) == ("50", foothold.identity, foothold.integrity)
+    assert hop.evidence["collected_at"]  # the source artifact comes from the ingest proof when present
 
 
 def test_build_capability_execution_plan_bridge_delegates_to_pure_builder():
@@ -7849,8 +7855,9 @@ def test_execute_capability_adcs_certificate_auth_records_failed_proof_without_a
         if hop.status == "achieved"
         for effect in hop.satisfied_effects
     }
-    failed = mt._engagement_hops[-1]
-    assert failed.status == "failed"
+    assert not any(hop.status in {"failed", "blocked"} for hop in mt._engagement_hops)  # progress only
+    failed = mt._request_attempt_view()[-1]
+    assert failed.verdict == "partial" and failed.terminal
     assert failed.technique == "capability:adcs-certificate-auth"
     assert failed.evidence["terminal_failure"] is True
     assert failed.evidence["failure_class"] == "genuine"
@@ -7890,8 +7897,9 @@ def test_capability_executor_records_transient_failure_as_retryable():
     assert recorded == ["certificate-auth:administrator@lab.local", "da:lab.local"]
     assert payload["failure_class"] == "transient"
     assert payload["retryable_failure"] is True
-    failed = mt._engagement_hops[-1]
-    assert failed.status == "failed"
+    assert not any(hop.status in {"failed", "blocked"} for hop in mt._engagement_hops)  # progress only
+    failed = mt._request_attempt_view()[-1]
+    assert failed.verdict == "failed" and failed.failure_class == "transient"
     assert failed.evidence["terminal_failure"] is False
     assert failed.evidence["retryable_failure"] is True
     assert mt._capability_failed_effects() == set()
@@ -7931,8 +7939,9 @@ def test_execute_capability_eval_injected_blocker_records_terminal_gpo_failure(m
     assert result["eval_injected_blocker"] is True
     assert result["issued"] == []
     assert result["recorded_failed_effects"] == ["system-exec:gpo:srv02-policy@range.local"]
-    failed = mt._engagement_hops[-1]
-    assert failed.status == "blocked"
+    assert not any(hop.status in {"failed", "blocked"} for hop in mt._engagement_hops)  # progress only
+    failed = mt._request_attempt_view()[-1]
+    assert failed.verdict == "blocked" and failed.terminal
     assert failed.evidence["defender_blocked"] is True
     assert failed.evidence["terminal_failure"] is True
     assert failed.evidence["failure_class"] == "genuine"
@@ -7974,7 +7983,8 @@ def test_execute_capability_eval_injected_transient_blocker_releases_after_repai
     assert result["ok"] is False
     assert result["verdict"] == "blocked"
     assert result["failure_class"] == "transient"
-    failed = mt._engagement_hops[-1]
+    assert not any(hop.status in {"failed", "blocked"} for hop in mt._engagement_hops)  # progress only
+    failed = mt._request_attempt_view()[-1]
     assert failed.evidence["terminal_failure"] is False
     assert failed.evidence["retryable_failure"] is True
     seed_ledger(mt, hops=[_proof_hop("endpoint-protection-adjusted:ca01@range.local", 57)])
@@ -8019,10 +8029,11 @@ def test_execute_capability_eval_injected_blocker_can_record_declared_action_eff
     assert result["ok"] is False
     assert result["verdict"] == "blocked"
     assert result["record_failed_effect"] == "certificate-auth:administrator@lab.local"
-    failed = mt._engagement_hops[-1]
-    assert failed.status == "blocked"
+    assert not any(hop.status in {"failed", "blocked"} for hop in mt._engagement_hops)  # progress only
+    failed = mt._request_attempt_view()[-1]
+    assert failed.verdict == "blocked"
     assert failed.effect == "certificate-auth:administrator@lab.local"
-    assert failed.satisfied_effects == [
+    assert list(failed.satisfied_effects) == [
         "certificate-auth:administrator@lab.local",
         "da:lab.local",
     ]

@@ -2459,6 +2459,12 @@ def _runtime_current_account_contexts(mythic_client) -> frozenset[tuple[str, str
         return frozenset()
 
 
+def _runtime_request_attempts(mythic_client) -> tuple:
+    """The session's failed capability attempts in the current request (never ESL row status)."""
+    view = getattr(mythic_client, "_request_attempt_view", None)
+    return tuple(view() or ()) if callable(view) else ()
+
+
 # Imperative directive paired with the observed-state block. A bare status LIST is informational; the
 # operator can still favor an overlay checklist that lists an already-achieved hop. This makes the
 # instruction explicit ("ACHIEVED = DONE, do NOT re-issue"). Shared by the per-turn middleware injection
@@ -10929,6 +10935,7 @@ class Model:
                 engagement_id=engagement_id,
                 runtime_scope=runtime_scope,
                 current_account_contexts=_runtime_current_account_contexts(mythic_client),
+                request_attempts=_runtime_request_attempts(mythic_client),
                 corrected_hops=corrected_hops,
             )
         except Exception:
@@ -10964,6 +10971,7 @@ class Model:
                 objective=objective, footholds=footholds, hops=hops, graph_facts=graph_facts,
                 engagement_id=engagement_id, runtime_scope=runtime_scope,
                 current_account_contexts=_runtime_current_account_contexts(mythic_client),
+                request_attempts=_runtime_request_attempts(mythic_client),
                 corrected_hops=corrected_hops,
             )
             rendered = _es.render_engagement_state(state)
@@ -11009,6 +11017,7 @@ class Model:
                 engagement_id=engagement_id,
                 runtime_scope=runtime_scope,
                 current_account_contexts=_runtime_current_account_contexts(mythic_client),
+                request_attempts=_runtime_request_attempts(mythic_client),
             )
         except Exception:
             return None
@@ -13185,6 +13194,7 @@ class Model:
                     controller._recovery_snapshot.update(recovered)
                     controller._recovery_state = recovered
                     resources = recovered.get("resources") or {}
+                    self._restore_controller_request_attempts(resources, original_request_id)
                     self._policy_model_calls = int(resources.get("policy_model_calls", 0))
                     self._controller_observed_decisions = list(resources.get("observed_decisions") or [])
                     self._controller_observed_transactions = list(resources.get("observed_transactions") or [])
@@ -13193,6 +13203,11 @@ class Model:
                 controller._recovery_store = recovery_store
                 controller._recovery_binding = recovery_binding
                 controller._recovery_resources = lambda: {
+                    "request_attempts": (
+                        self.mythic_client._request_attempts_payload()
+                        if self.mythic_client is not None
+                        else {}
+                    ),
                     "policy_model_calls": int(self._policy_model_calls),
                     "observed_decisions": list(self._controller_observed_decisions),
                     "observed_transactions": list(self._controller_observed_transactions),
@@ -13433,26 +13448,41 @@ class Model:
             key=stable_key,
         )
 
+    def _restore_controller_request_attempts(self, resources: dict, original_request_id: str) -> None:
+        """Restore the recovered run's request attempt memory, for its original request ID only.
+
+        A journal saved before the memory existed, or one that belongs to another request, cannot resume: the
+        run would retry capabilities it already found terminal in this request.
+        """
+        try:
+            from . import controller_recovery as _recovery
+        except ImportError:  # pragma: no cover
+            import controller_recovery as _recovery
+        saved = (resources or {}).get("request_attempts") if isinstance(resources, dict) else None
+        if not isinstance(saved, dict):
+            raise _recovery.RecoveryBlocked("request attempt memory missing from controller recovery")
+        client = getattr(self, "mythic_client", None)
+        if client is None:
+            return
+        try:
+            client._restore_request_attempts(saved, original_request_id)
+        except (TypeError, ValueError) as exc:
+            raise _recovery.RecoveryBlocked(f"request attempt memory not restorable: {exc}") from exc
+
     def _controller_latest_capability_failure_is_retryable(self, state) -> bool:
         """Do not turn a repairable capability failure into an unrelated graph collection.
 
-        The executor records construction/transient failures for traceability, but marks
-        them non-terminal so the same grounded action can be repaired or retried. If the
-        latest capability hop has that marker, an empty frontier is a repair/control
-        problem, not evidence that BloodHound coverage is missing.
+        The executor keeps construction/transient failures in the request attempt memory as
+        non-terminal, so the same grounded action can be repaired or retried. If the latest
+        capability attempt in the current request is non-terminal, an empty frontier is a
+        repair/control problem, not evidence that BloodHound coverage is missing.
         """
         try:
-            for hop in reversed(list(getattr(state, "hops", []) or [])):
-                technique = str(getattr(hop, "technique", "") or "").strip().casefold()
+            for attempt in reversed(list(getattr(state, "request_attempts", ()) or ())):
+                technique = str(getattr(attempt, "technique", "") or "").strip().casefold()
                 if not technique.startswith("capability:"):
                     continue
-                status = str(getattr(hop, "status", "") or "").strip().casefold()
-                evidence = getattr(hop, "evidence", {})
-                return (
-                    status in {"failed", "blocked"}
-                    and isinstance(evidence, dict)
-                    and evidence.get("terminal_failure") is False
-                )
+                return not bool(getattr(attempt, "terminal", True))
         except Exception:
             return False
         return False
@@ -15577,10 +15607,10 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
     async def _engagement_state_turn_summary_text(self) -> str:
         """Build the compact reconciled engagement ledger for a turn end.
 
-        Status-only reconciliation runs first (bounded: only when a new Mythic task was
-        issued since the last reconcile), so a hop whose verified task history proves the
-        effect is corrected without operator action. Credential material stays behind the
-        operator's `/state reconcile apply`. Returns "" when there is no client/ledger,
+        One operation reconciliation pass runs first (tasks above the stored cursor, from
+        every issuer, at most one bounded batch), so a task whose verified history proves an
+        effect is recorded without operator action. Credential material import stays behind
+        the operator's `/state reconcile <id> apply`. Returns "" when there is no client/ledger,
         the one-line "unchanged" notice when the state matches the last shown table, and
         the table text otherwise. The caller appends it to the turn's closing content, so
         the terminal stays one response.
@@ -15594,17 +15624,15 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             import engagement_ledger  # type: ignore
         if not isinstance(getattr(getattr(client, "_ledger_binding", None), "engagement_key", None), str):
             return ""  # no bound operation ledger (an unbound session, or a stand-in client)
-        marker = str(getattr(client, "_last_issued_task_display_id", "") or "")
-        last_reconciled = str(getattr(self, "_last_state_reconcile_marker", "") or "")
-        if marker and marker != last_reconciled:
-            self._last_state_reconcile_marker = marker
-            try:
-                if getattr(client, "client", None) is not None:
-                    await client._reconcile_ledger_from_task_history("", "", 10, apply=False)
-            except Exception as e:
-                # A turn-end summary must never break the turn: offline/unreachable
-                # Mythic skips the reconciliation and renders the ledger as-is.
-                logger.debug(f"turn-end reconciliation skipped (non-fatal): {e}")
+        try:
+            if getattr(client, "client", None) is not None and hasattr(client, "_reconcile_operation"):
+                # One pass over the operation's task history, whoever issued the tasks: operator work from
+                # another channel is recorded at this turn end even when this session issued nothing.
+                await client._reconcile_operation()
+        except Exception as e:
+            # A turn-end summary must never break the turn: a Mythic or store error skips the pass, leaves
+            # the cursor where it was, and renders the ledger as-is (a store error is reported below).
+            logger.debug(f"turn-end reconciliation skipped (non-fatal): {e}")
         try:
             snapshot = client._ledger_snapshot()  # fresh, after any reconciliation write
         except Exception as e:
@@ -16970,6 +16998,7 @@ def _deterministic_post_ingest_owner(mythic_client) -> _HandoffDirective | None:
             engagement_id=engagement_id,
             runtime_scope=runtime_scope,
             current_account_contexts=_runtime_current_account_contexts(mythic_client),
+            request_attempts=_runtime_request_attempts(mythic_client),
         )
         if capabilities.actions_from_state(snapshot):
             return None
@@ -18436,9 +18465,7 @@ def _eval_forced_capability_prefix_candidates(
         if any(_matches(hop, spec) and str(getattr(hop, "status", "") or "").strip().casefold() == "achieved" for hop in hops):
             continue
         if spec.get("release_on_failure") is True and any(
-            _matches(hop, spec)
-            and str(getattr(hop, "status", "") or "").strip().casefold() in {"failed", "blocked"}
-            for hop in hops
+            _matches(attempt, spec) for attempt in list(getattr(state, "request_attempts", ()) or ())
         ):
             continue
         matched = [action for action in candidates if _matches(action, spec)]

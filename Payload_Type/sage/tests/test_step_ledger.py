@@ -1,8 +1,9 @@
 """Supervised steps record proven capability gains in the engagement ledger.
 
-The ledger records progress, not events. Pure cases cover how callback context gains are found and credited and the
-`mythic_callback` proof origin. Writer cases drive `MythicTools._record_step_ledger` with recorded Mythic rows,
-including persistence and a reload through the load quarantine. An assembled case drives the real graph through
+The ledger records progress, not events. Pure cases cover how callback context gains are found against the
+operation's stored baseline and credited to operation tasks from any issuer, and the `mythic_callback` proof origin.
+Writer cases drive `MythicTools._record_step_ledger` with recorded Mythic rows, including persistence and a reload
+through the load quarantine. An assembled case drives the real graph through
 the scripted handoff harness with a real MythicTools client whose Mythic readers serve recorded rows.
 """
 
@@ -19,7 +20,7 @@ from langchain_core.messages import AIMessage
 from langchain_core.tools import tool
 import pytest
 
-from ai.langgraph import engagement_state, proof_boundary
+from ai.langgraph import engagement_state, engagement_store, proof_boundary, state_reconcile
 from ai.langgraph import model as model_module
 from ai.langgraph import step_bounds as sb
 from ai.langgraph import step_ledger as sl
@@ -39,9 +40,13 @@ def _ctx(*args, **kwargs) -> sl.CallbackContext:
     return sl.callback_context(_callback(*args, **kwargs))
 
 
-def _task(task_id: int, callback: int = 1, status: str = "success", at: str = TASK_AT) -> sl.IssuedTask:
-    return sl.IssuedTask(task_id=task_id, callback_display_id=callback, command="jump_psexec", status=status,
-                         timestamp=at)
+def _task(task_id: int, callback: int = 1, status: str = "success", at: str = TASK_AT) -> sl.OperationTask:
+    return sl.OperationTask(task_id=task_id, callback_display_id=callback, command="jump_psexec", status=status,
+                            timestamp=at)
+
+
+def _baseline(*contexts) -> dict[str, str]:
+    return sl.baseline_of(contexts)
 
 
 # --- finding and crediting gains -------------------------------------------------------------------------------
@@ -55,8 +60,7 @@ def test_a_callback_context_normalizes_mythic_integrity_and_identity():
 
 def test_a_new_callback_is_credited_to_the_latest_task_before_it_checked_in():
     gains = sl.context_gains([_ctx(7, "SRV02", "NT AUTHORITY\\SYSTEM", 4)], {},
-                             [_task(89, at="2026-10-30T09:55:00"), _task(90), _task(91, at="2026-10-30T10:05:00")],
-                             step_tasks=[90])
+                             [_task(89, at="2026-10-30T09:55:00"), _task(90), _task(91, at="2026-10-30T10:05:00")])
     [gain] = gains
     assert (gain.kind, gain.task.task_id) == ("new_callback", 90)
     assert gain.effects == ("session:nt authority\\system@srv02", "system:srv02")
@@ -64,17 +68,17 @@ def test_a_new_callback_is_credited_to_the_latest_task_before_it_checked_in():
 
 @pytest.mark.parametrize("init", ["2026-10-30T10:11:00", "2026-10-30T09:59:00"])
 def test_a_callback_outside_the_window_or_before_the_task_is_not_credited(init):
-    [gain] = sl.context_gains([_ctx(7, "SRV02", "CONTOSO\\svc", 2, init=init)], {}, [_task(90)], step_tasks=[90])
-    assert gain.task is None
+    [gain] = sl.context_gains([_ctx(7, "SRV02", "CONTOSO\\svc", 2, init=init)], {}, [_task(90)])
+    assert gain.task is None and gain.proof_task is None
 
 
-def test_an_integrity_rise_is_credited_to_this_steps_task_on_that_callback():
-    seen = {3: _ctx(3, "WS01", "CONTOSO\\jdoe", 2)}
+def test_an_integrity_rise_is_credited_to_the_latest_task_on_that_callback_from_any_issuer():
+    seen = _baseline(_ctx(3, "WS01", "CONTOSO\\jdoe", 2))
     risen = [_ctx(3, "WS01", "CONTOSO\\jdoe", 4)]
-    [gain] = sl.context_gains(risen, seen, [_task(90, callback=3)], step_tasks=[90])
+    [gain] = sl.context_gains(risen, seen, [_task(88, callback=3), _task(90, callback=3)])
     assert (gain.kind, gain.effects, gain.task.task_id) == ("integrity_rise", ("system:ws01",), 90)
-    [elsewhere] = sl.context_gains(risen, seen, [_task(90, callback=4)], step_tasks=[90])
-    assert elsewhere.task is None  # a task on another callback did not raise this one
+    [elsewhere] = sl.context_gains(risen, seen, [_task(90, callback=4)])
+    assert elsewhere.task is None and elsewhere.proof_task is None  # a task on another callback did not raise it
 
 
 @pytest.mark.parametrize("now", [
@@ -83,14 +87,18 @@ def test_an_integrity_rise_is_credited_to_this_steps_task_on_that_callback():
     [],                                         # callback died
 ])
 def test_unchanged_or_lost_contexts_are_not_gains(now):
-    assert sl.context_gains(now, {3: _ctx(3, "WS01", "CONTOSO\\jdoe", 2)}, [_task(90, callback=3)], [90]) == []
+    assert sl.context_gains(now, _baseline(_ctx(3, "WS01", "CONTOSO\\jdoe", 2)), [_task(90, callback=3)]) == []
 
 
-def test_the_first_observation_is_a_baseline_not_unattributed_gains():
-    gains = sl.context_gains([_ctx(3, "WS01", "CONTOSO\\jdoe", 2)], {}, [], step_tasks=[])
-    assert sl.unattributed(gains, first_observation=True) == []
-    assert sl.unattributed(gains, first_observation=False) == [
+def test_a_gain_with_no_credited_task_is_proven_only_by_a_completed_task_on_its_callback():
+    gained = [_ctx(3, "WS01", "CONTOSO\\jdoe", 2, init="2026-10-30T12:00:00")]  # nothing in its window
+    [gain] = sl.context_gains(gained, {}, [])
+    assert sl.unattributed([gain]) == [
         {"callback_display_id": 3, "kind": "new_callback", "effects": ["session:contoso\\jdoe@ws01"]}]
+    [running] = sl.context_gains(gained, {}, [_task(95, callback=3, status="submitted", at="2026-10-30T12:05:00")])
+    assert running.proof_task is None  # a task still running on the callback proves nothing yet
+    [proven] = sl.context_gains(gained, {}, [_task(95, callback=3, at="2026-10-30T12:05:00")])
+    assert (proven.task, proven.proof_task.task_id, sl.unattributed([proven])) == (None, 95, [])
 
 
 # --- the mythic_callback proof origin --------------------------------------------------------------------------
@@ -137,21 +145,22 @@ def ledger(tmp_path, monkeypatch):
     async def callbacks():
         return state["callbacks"]
 
-    async def records(task_ids):
-        return {i: state["tasks"][i] for i in task_ids if i in state["tasks"]}
+    async def credit_tasks(client, operation_id, since, until, callback_ids):  # Mythic transport stub
+        return [{"display_id": i, **record} for i, record in sorted(state["tasks"].items())]
 
     async def credentials(now, force=False):
         return state["credentials"]
 
-    tools._step_callback_rows, tools._step_task_records, tools._fetch_credentials_cached = (
-        callbacks, records, credentials)
+    monkeypatch.setattr(state_reconcile, "fetch_callback_credit_tasks", credit_tasks)
+    tools._step_callback_rows, tools._fetch_credentials_cached = callbacks, credentials
     monkeypatch.setattr(tools, "_engagement_objective", lambda: "")
     path = tmp_path / "sage.db"
 
-    def issue(task_id: int, callback: int = 1, status: str = "success", at: str = TASK_AT) -> None:
-        tools._task_source_request_ids[task_id] = "chat:1:request:1"
-        state["tasks"][task_id] = {"status": status, "completed": True, "command": "jump_psexec",
-                                   "callback_display_id": callback, "timestamp": at}
+    def issue(task_id: int, callback: int = 1, status: str = "success", at: str = TASK_AT, *, sage: bool = True) -> None:
+        if sage:
+            tools._task_source_request_ids[task_id] = "chat:1:request:1"
+        state["tasks"][task_id] = {"status": status, "completed": True, "command_name": "jump_psexec",
+                                   "callback": {"display_id": callback}, "timestamp": at}
 
     def step(task_ids: list[int], credential_refs: list[dict] | None = None) -> dict:
         references = {"tasks": [{"task_id": i} for i in task_ids], "credentials": credential_refs or [],
@@ -199,17 +208,21 @@ def test_a_repeat_gain_updates_its_row_and_the_ledger_does_not_grow(ledger):
     assert len(tools._engagement_hops) == count and str(_hops(tools)["system:srv02"].evidence["mythic_task_id"]) == "95"
 
 
-def test_a_gain_credited_to_an_errored_task_is_never_achieved(ledger):
+def test_a_gain_credited_to_an_errored_task_stays_pending_until_a_task_on_its_callback_completes(ledger):
     tools, state, issue, step, _ = ledger
     state["callbacks"] = []
     issue(90, status="error: the service did not respond")
     step([90])
     state["callbacks"] = [_callback(7, "SRV02", "NT AUTHORITY\\SYSTEM", 4)]
     step([])
-    assert {hop.status for hop in tools._engagement_hops} == {"legacy_unverified"}
+    assert {(hop.status, hop.pending_reason) for hop in tools._engagement_hops} == {("pending", "proof_missing")}
+    issue(91, callback=7, at="2026-10-30T10:30:00", sage=False)  # an unproven gain is not part of the baseline
+    step([])
+    assert {(hop.status, hop.evidence["mythic_task_id"], hop.evidence["credited_task"])
+            for hop in tools._engagement_hops} == {("achieved", "91", 90)}
 
 
-def test_gains_with_no_sage_task_and_lost_contexts_write_nothing(ledger):
+def test_gains_with_no_task_to_credit_or_prove_them_and_lost_contexts_write_nothing(ledger):
     tools, state, issue, step, _ = ledger
     state["callbacks"] = [_callback(1, "WS01", "CONTOSO\\jdoe", 2, init="2026-10-30T09:00:00")]
     issue(90)
@@ -243,17 +256,36 @@ def test_an_incomplete_credential_lineage_alone_is_no_proof(ledger):
     state["credentials"] = [_credential(13, 90, callback=None)]
     issue(90)
     step([90], [{"credential_id": 13, "source_task_id": 90}])
-    assert _hops(tools)["jdoe@contoso"].status == "legacy_unverified"
+    hop = _hops(tools)["jdoe@contoso"]
+    assert (hop.status, hop.pending_reason) == ("pending", "proof_missing")
 
 
-def test_nothing_is_read_when_this_process_issued_nothing(ledger):
+def test_a_gain_from_an_operator_task_this_process_never_issued_is_credited(ledger):
     tools, state, issue, step, _ = ledger
+    state["callbacks"] = [_callback(1, "WS01", "CONTOSO\\jdoe", 2, init="2026-10-30T09:00:00")]
+    assert step([]) == {"recorded": [], "unattributed": []}  # the first boundary stores the baseline
+    issue(70, sage=False)  # the operator ran it by hand, from another channel
+    state["callbacks"].append(_callback(7, "SRV02", "NT AUTHORITY\\SYSTEM", 4))
+    summary = step([])
+    assert [(r["effect"], r["task_id"], r["status"]) for r in summary["recorded"]] == [
+        ("session:nt authority\\system@srv02", 70, "achieved"), ("system:srv02", 70, "achieved")]
+    assert _hops(tools)["system:srv02"].evidence["credited_task"] == 70
 
-    async def unexpected(*args, **kwargs):
-        raise AssertionError("no read expected")
 
-    tools._step_callback_rows = tools._step_task_records = unexpected
-    assert step([]) == {"recorded": [], "unattributed": []}
+def test_the_baseline_is_stored_per_operation_and_read_by_a_later_process(ledger):
+    tools, state, issue, step, _ = ledger
+    state["callbacks"] = [_callback(1, "WS01", "CONTOSO\\jdoe", 2, init="2026-10-30T09:00:00")]
+    step([])
+    later = MythicTools(agent_task_id="step-ledger-later-process")  # a restart or another channel
+    later.client = object()
+    later._step_callback_rows, later._fetch_credentials_cached = tools._step_callback_rows, tools._fetch_credentials_cached
+    later._engagement_objective = lambda: ""  # type: ignore[method-assign]
+    issue(90)
+    state["callbacks"].append(_callback(7, "SRV02", "NT AUTHORITY\\SYSTEM", 4))
+    references = {"tasks": [], "credentials": [], "graph_reads": []}
+    summary = asyncio.run(later._record_step_ledger(references, []))
+    assert [r["effect"] for r in summary["recorded"]] == ["session:nt authority\\system@srv02", "system:srv02"]
+    assert asyncio.run(later._record_step_ledger(references, []))["recorded"] == []  # now in the stored baseline
 
 
 def test_the_rendered_outcome_names_what_the_ledger_recorded():
@@ -286,7 +318,10 @@ def test_a_supervised_step_writes_its_gain_to_the_ledger_on_the_real_graph(monke
     tools = MythicTools(agent_task_id="step-ledger-assembled")
     tools.client = object()
     callbacks = [_callback(1, "WS01", "CONTOSO\\jdoe", 2, init="2026-10-30T09:00:00")]
-    tools._callback_contexts_seen = {1: sl.callback_context(callbacks[0])}  # an earlier boundary saw the foothold
+    tools._ledger_store().apply(  # an earlier reconciliation stored the foothold as the operation's baseline
+        tools._require_ledger_binding(), [],
+        reconciliation=engagement_store.ReconciliationUpdate(callback_baseline_initial={"1": "medium"}),
+    )
 
     @tool
     def baseline_probe_step(step: int) -> str:
@@ -298,9 +333,10 @@ def test_a_supervised_step_writes_its_gain_to_the_ledger_on_the_real_graph(monke
     async def callback_rows():
         return list(callbacks)
 
-    async def records(task_ids):
-        return {90: {"status": "success", "completed": True, "command": "jump_psexec", "callback_display_id": 1,
-                     "timestamp": TASK_AT}} if 90 in task_ids else {}
+    async def credit_tasks(client, operation_id, since, until, callback_ids):  # Mythic transport stub
+        issued = 90 in tools._task_source_request_ids
+        return [{"display_id": 90, "status": "success", "command_name": "jump_psexec",
+                 "callback": {"display_id": 1}, "timestamp": TASK_AT}] if issued else []
 
     async def rows(task_id):
         return [], False
@@ -308,7 +344,8 @@ def test_a_supervised_step_writes_its_gain_to_the_ledger_on_the_real_graph(monke
     async def credentials(now, force=False):
         return []
 
-    tools._step_callback_rows, tools._step_task_records = callback_rows, records
+    tools._step_callback_rows = callback_rows
+    monkeypatch.setattr(state_reconcile, "fetch_callback_credit_tasks", credit_tasks)
     tools._task_output_rows, tools._fetch_credentials_cached = rows, credentials
     monkeypatch.setattr(tools, "_engagement_objective", lambda: "")
 

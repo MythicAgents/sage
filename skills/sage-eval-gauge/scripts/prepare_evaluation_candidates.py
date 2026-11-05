@@ -73,7 +73,7 @@ POLICY_PATH = "Payload_Type/sage/ai/langgraph/policy.py"
 VARIANTS = (
     ("history-12", "for item in history[-8:]", "for item in history[-12:]",
      "Four additional actual prior decisions may preserve relevant context or add distraction."),
-    ("outcomes-24", 'for item in values("hops")[-12:]', 'for item in values("hops")[-24:]',
+    ("outcomes-24", "        ][-12:],", "        ][-24:],",
      "A longer observed-outcome window may preserve failed-route context or dilute current evidence."),
     ("outcome-effect-links", '"status": str(getattr(item, "status", "") or ""),',
      '"status": str(getattr(item, "status", "") or ""),\n'

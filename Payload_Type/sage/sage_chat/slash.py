@@ -249,8 +249,8 @@ async def _handle_report(chat: Any, request: ChatRequest, model: Any, arg: str) 
 _STATE_USAGE = (
     "Unknown `/state` subcommand. Usage:\n"
     "- `/state` — show the engagement ledger\n"
-    "- `/state reconcile [task_id] [apply]` — record verified effects from task history (credential import is "
-    "dry-run unless `apply`)\n"
+    "- `/state reconcile [<id>[,<id>…]] [apply]` — record verified effects from the operation's task history, or "
+    "from the cited task IDs and `cred:<id>` entries (credential import is dry-run unless `apply`)\n"
     "- `/state remove <#|id[,…]> [--reason <text>]` — retract rows (kept, numbered, undoable)\n"
     "- `/state restore <#|id[,…]> [--reason <text>]` — undo retractions\n"
     "- `/state invalidate <#|id[,…]> [--reason <text>]` — mark rows as no longer holding\n"
@@ -284,7 +284,7 @@ def _state_actor(request: ChatRequest):
 async def _handle_state(model: Any, request: ChatRequest, arg: str = "") -> str:
     """Show or correct the operation's shared Engagement State Ledger.
 
-    Usage: `/state` (show) · `/state reconcile [task_id] [apply]` · `/state remove <#|id[,…]> [--reason …]` ·
+    Usage: `/state` (show) · `/state reconcile [<id>[,<id>…]] [apply]` · `/state remove <#|id[,…]> [--reason …]` ·
     `/state restore <#|id[,…]>` · `/state invalidate <#|id[,…]>` · `/state objective <text>` · `/state wipe`.
     Corrections are recorded events in sage.db: rows, numbers and history are kept, and running sessions see
     them on their next ledger read.
@@ -342,22 +342,41 @@ async def _handle_state(model: Any, request: ChatRequest, arg: str = "") -> str:
             return _render_ledger_markdown(tools, request, model, notice=notice)
         if sub == "set":
             return ("`/state set` is disabled: hop status comes only from verified evidence. Use "
-                    "`/state remove` to retract a row, `/state invalidate` to mark it no longer holding, or "
-                    "`/state reconcile [task_id]` to record verified task history.")
+                    "`/state reconcile <id>` to record what a Mythic task (or `cred:<id>`) proved, "
+                    "`/state remove` to retract a row, or `/state invalidate` to mark it no longer holding.")
         if sub == "reconcile":
             if getattr(tools, "client", None) is None:
                 return ("`/state reconcile` needs an active Mythic session — send one message on this channel "
-                        "first, then retry `/state reconcile [task_id] [apply]`.")
-            tokens = rest.split()
-            apply = any(t.lower() == "apply" for t in tokens)
-            task_id = next((t for t in tokens if t.isdigit()), "")
-            notes = await tools._reconcile_ledger_from_task_history(task_id, "", 25, apply=apply)
+                        "first, then retry `/state reconcile [<id>[,<id>…]] [apply]`.")
+            cited, apply, invalid = _reconcile_citations(rest)
+            if invalid:
+                return (f"`/state reconcile` takes Mythic task display IDs or `cred:<credential id>`, separated by "
+                        f"commas, then an optional `apply`; not {', '.join(f'`{item}`' for item in invalid)}.")
+            notes = await tools._reconcile_operation(cited, apply=apply)
             return _render_ledger_markdown(tools, request, model, notice="\n".join(notes))
     except Exception as exc:
         return f"⚠️ The engagement ledger change was not recorded: {exc}"
     if sub and sub != "show":
         return _STATE_USAGE
     return _render_ledger_markdown(tools, request, model)
+
+
+def _reconcile_citations(text: str) -> tuple[list[str], bool, list[str]]:
+    """Parse `[<id>[,<id>…]] [apply]`: task display IDs and `cred:<id>`. Returns (cited, apply, invalid)."""
+    cited: list[str] = []
+    invalid: list[str] = []
+    apply = False
+    for token in text.replace(",", " ").split():
+        lowered = token.casefold()
+        if lowered == "apply":
+            apply = True
+        elif token.isdigit():
+            cited.append(str(int(token)))
+        elif lowered.startswith("cred:") and lowered[len("cred:"):].isdigit():
+            cited.append(f"cred:{int(lowered[len('cred:'):])}")
+        else:
+            invalid.append(token)
+    return list(dict.fromkeys(cited)), apply, invalid
 
 
 async def _resolve_chat_ledger(model: Any, request: ChatRequest):

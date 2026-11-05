@@ -8,6 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph"))
 import capabilities  # noqa: E402
 import engagement_state as es  # noqa: E402
+import request_attempts  # noqa: E402
 
 NOW = "2026-06-10T12:00:00Z"
 TTL = 600
@@ -59,6 +60,18 @@ def _failed_hop(effect):
         source="test",
         timestamp=NOW,
     )
+
+
+def _attempt(hop):
+    """A failed or blocked outcome as an attempt in the current request (the ledger keeps progress only)."""
+    return request_attempts.make_attempt(
+        technique=hop.technique, target=hop.target, effect=hop.effect, satisfied_effects=hop.satisfied_effects,
+        verdict=hop.status, evidence=hop.evidence,
+    )
+
+
+def _failed_attempt(effect):
+    return _attempt(_failed_hop(effect))
 
 
 def test_gpo_controlled_system_exec_candidate_is_generic():
@@ -204,7 +217,7 @@ def test_terminal_gpo_failure_suppresses_same_lane_but_preserves_laps_alternativ
     state = es.EngagementState(
         objective="domain admin",
         footholds=[_foothold("range.local", identity=r"RANGE\user1")],
-        hops=[blocked_gpo],
+        request_attempts=(_attempt(blocked_gpo),),
         graph_facts=[
             _fact("generic-write:gpo:srv02-policy"),
             _fact("gpo-domain:srv02-policy:range.local"),
@@ -531,8 +544,11 @@ def test_record_capability_result_requires_achieved_verdict_for_effect():
 
     assert partial.verdict == "partial"
     assert "system-exec:gpo:workstation-policy@lab.local" not in partial_state.achieved_effects()
-    assert partial_state.hops[0].status == "failed"
-    assert partial_state.hops[0].evidence["verify_verdict"] == "partial"
+    # The ledger records progress only: a partial verdict writes no row; it is the caller's request attempt.
+    assert partial_state.hops == []
+    attempt = capabilities.capability_attempt(action, partial)
+    assert attempt.terminal and attempt.effect == "system-exec:gpo:workstation-policy@lab.local"
+    assert attempt.evidence["verify_verdict"] == "partial"
 
     achieved_state, achieved = capabilities.record_capability_result(
         partial_state,
@@ -844,9 +860,14 @@ def test_record_adcs_certificate_auth_rejects_generic_service_access_only():
 
     assert verification.verdict == "partial"
     assert "da:essos.local" not in updated.achieved_effects()
-    hop = updated.hops[-1]
-    assert hop.status == "failed"
-    assert hop.evidence["verify_reason"] == "service access was proven, but no certificate-auth-specific proof was present"
+    assert updated.hops == state.hops  # no row for a verdict that did not achieve the effect
+    attempt = capabilities.capability_attempt(
+        action, verification, {"provenance": "current_context_preflight", "mythic_task_id": 286}
+    )
+    assert attempt.task_id == "286"
+    assert attempt.evidence["verify_reason"] == (
+        "service access was proven, but no certificate-auth-specific proof was present"
+    )
 
 
 def test_certificate_auth_admin_material_prompts_account_context_before_dcsync():
@@ -3110,8 +3131,8 @@ def test_equivalent_downstream_route_falls_back_after_selected_credential_failur
         hops=[
             _hop("ds-replication-rights:lab.local"),
             _hop("kerberos-context:lab.local@callback:13"),
-            _failed_hop("creds:alice@lab.local"),
         ],
+        request_attempts=(_failed_attempt("creds:alice@lab.local"),),
         graph_facts=[
             _fact("credential-target:alice@lab.local"),
             _fact("credential-target:bob@lab.local"),
@@ -3147,8 +3168,8 @@ def test_equivalent_downstream_route_falls_back_after_selected_context_failure()
             _hop("ds-replication-rights:lab.local"),
             _hop("kerberos-context:lab.local@callback:13"),
             _hop("creds:alice@lab.local"),
-            _failed_hop("kerberos-account-context:alice@lab.local@callback:13"),
         ],
+        request_attempts=(_failed_attempt("kerberos-account-context:alice@lab.local@callback:13"),),
         graph_facts=[
             _fact("credential-target:alice@lab.local"),
             _fact("credential-target:bob@lab.local"),
@@ -3212,8 +3233,8 @@ def test_failed_account_dcsync_suppresses_same_account_retry():
         hops=[
             _hop("ds-replication-rights:sevenkingdoms.local"),
             _hop("kerberos-context:sevenkingdoms.local@callback:13"),
-            _failed_hop("creds:guest@sevenkingdoms.local"),
         ],
+        request_attempts=(_failed_attempt("creds:guest@sevenkingdoms.local"),),
         graph_facts=[_fact("credential-target:guest@sevenkingdoms.local")],
     )
 
@@ -3236,8 +3257,8 @@ def test_non_admin_credential_material_preempts_sibling_account_harvesting():
             _hop("kerberos-context:sevenkingdoms.local@callback:13"),
             _hop("krbtgt-hash:sevenkingdoms.local"),
             _hop(r"creds:sevenkingdoms\cersei.lannister@sevenkingdoms.local"),
-            _failed_hop("creds:guest@sevenkingdoms.local"),
         ],
+        request_attempts=(_failed_attempt("creds:guest@sevenkingdoms.local"),),
         graph_facts=[
             _fact("credential-target:guest@sevenkingdoms.local"),
             _fact("credential-target:jaime.lannister@sevenkingdoms.local"),
@@ -3703,8 +3724,8 @@ def test_ca_key_blocker_suppresses_repeat_export_and_exposes_esc_enrollment():
         hops=[
             _hop("local-admin:ca01@lab.local"),
             _hop("remote-exec:ca01@lab.local"),
-            blocked_hop,
         ],
+        request_attempts=(_attempt(blocked_hop),),
     )
 
     names = [action.name for action in capabilities.actions_from_state(state)]
@@ -3741,8 +3762,8 @@ def test_endpoint_protection_adjustment_candidate_requires_endpoint_blocker():
         hops=[
             _hop("local-admin:ca01@lab.local"),
             _hop("remote-exec:ca01@lab.local"),
-            blocked_hop,
         ],
+        request_attempts=(_attempt(blocked_hop),),
     )
 
     actions = [action for action in capabilities.actions_from_state(state) if action.name == "endpoint-protection-adjustment"]
@@ -4071,8 +4092,8 @@ def test_failed_certificate_auth_suppresses_repeat_candidate():
         footholds=[_foothold("lab.local", callback_id="13")],
         hops=[
             _hop("adcs-ca-private-key:ca01@lab.local"),
-            failed_cert_auth,
         ],
+        request_attempts=(_attempt(failed_cert_auth),),
     )
 
     actions = [action for action in capabilities.actions_from_state(state) if action.name == "adcs-certificate-auth"]
@@ -4102,8 +4123,8 @@ def test_retryable_failed_certificate_auth_does_not_suppress_repeat_candidate():
         footholds=[_foothold("lab.local", callback_id="13")],
         hops=[
             _hop("adcs-ca-private-key:ca01@lab.local"),
-            failed_cert_auth,
         ],
+        request_attempts=(_attempt(failed_cert_auth),),
     )
 
     actions = [action for action in capabilities.actions_from_state(state) if action.name == "adcs-certificate-auth"]

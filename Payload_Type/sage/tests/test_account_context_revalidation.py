@@ -283,11 +283,13 @@ def test_transient_projection_survives_same_process_state_copy_and_safe_client_f
         objective="test",
         current_account_contexts=frozenset({key}),
     )
+    state.request_attempts = ("attempt",)
     updated = es.record_effect_result(
-        state, "test", "target", "effect", "failed", {}, "",
+        state, "test", "target", "effect", "pending", {}, "",
     )
 
     assert updated.current_account_contexts == frozenset({key})
+    assert updated.request_attempts == ("attempt",)  # the request attempt view survives the copy too
     assert model._runtime_current_account_contexts(SimpleNamespace()) == frozenset()
 
     class BrokenProjector:

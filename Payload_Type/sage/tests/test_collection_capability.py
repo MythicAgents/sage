@@ -444,6 +444,9 @@ def test_a_completed_ingest_persists_one_verified_hop_and_the_unchanged_gate_sup
     )
     assert (proof["callback_id"], proof["source_artifact_id"], proof["task_id"]) == ("7", "collection-file-test", "5")
     assert proof["persistence_state"] == "admitted"
+    evidence = hops[0].evidence  # the collection record names its collector and source artifact
+    assert (evidence["collecting_callback_id"], evidence["source_artifact_id"], evidence["collected_at"]) == (
+        "7", "collection-file-test", proof["captured_at"])
 
     # Persisted and reloaded: the unchanged gate now covers this callback's authority epoch and scope.
     fresh, state = _reloaded(case)

@@ -100,13 +100,13 @@ def test_concurrent_updates_to_one_identity_keep_one_row_both_observations_and_t
     assert "merged onto current revision 2" in history[-1]["reason"]
 
 
-def test_historical_achievement_is_not_replaced_by_a_later_failure():
+def test_historical_achievement_is_not_replaced_by_a_later_pending_observation():
     tools = _session()
     seed_ledger(tools, hops=[_hop("dcsync", "lab.local", "krbtgt-hash:lab.local", artifact_present=True)])
     before = list(tools._engagement_hops)
-    failed = es.record_effect_result(es.EngagementState("t", hops=before), "dcsync", "lab.local",
-                                     "krbtgt-hash:lab.local", "failed", {"note": "denied"}, NOW)
-    assert tools._ledger_commit_hops(before, failed.hops)
+    later = es.record_effect_result(es.EngagementState("t", hops=before), "dcsync", "lab.local",
+                                    "krbtgt-hash:lab.local", "pending", {"note": "re-observed"}, NOW)
+    assert tools._ledger_commit_hops(before, later.hops)
     [row] = tools._ledger_snapshot().hop_rows()
     assert row.payload["status"] == "achieved" and row.revision == 1
     history = tools._ledger_store().history(tools._require_ledger_binding(), row_id=row.row_id)
@@ -142,8 +142,8 @@ def test_restore_rechecks_proof_and_never_clears_a_separate_invalidation():
     assert tools._engagement_hops == []
     shown = _state(tools, "restore 1,2,3")
     assert "Restored 3 hop(s)" in shown
-    eligible = {hop.technique: hop.status for hop in tools._engagement_hops}
-    assert eligible == {"dcsync": "achieved", "golden-ticket": "legacy_unverified"}  # unproven stays unproven
+    eligible = {hop.technique: (hop.status, hop.pending_reason) for hop in tools._engagement_hops}
+    assert eligible == {"dcsync": ("achieved", ""), "golden-ticket": ("pending", "proof_missing")}  # unproven stays unproven
     corrected = {hop.technique: hop.corrections for hop in tools._ledger_view().corrected_hops}
     assert corrected["dcsync-user"]["no_longer_holds"]["reason"] == "password rotated"
     assert "da:lab.local" not in es.EngagementState("t", hops=tools._engagement_hops, engagement_id=tools._eng_key(),
@@ -231,7 +231,7 @@ def test_missing_or_foreign_proof_never_becomes_active_achievement():
     foreign = _hop("dcsync", "other.local", "krbtgt-hash:other.local", mythic_task_id="9", callback_id="3")
     foreign["proof_envelope"] = task_proof("another-operation", task_id="9")
     seed_ledger(tools, prove=False, hops=[_hop("dcsync", "lab.local", "krbtgt-hash:lab.local"), foreign])
-    assert {hop.status for hop in tools._engagement_hops} == {"legacy_unverified"}
+    assert {(hop.status, hop.pending_reason) for hop in tools._engagement_hops} == {("pending", "proof_missing")}
     assert es.EngagementState("t", hops=tools._engagement_hops, engagement_id=tools._eng_key(),
                               runtime_scope=True).achieved_effects() == set()
 

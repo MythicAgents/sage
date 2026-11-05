@@ -164,7 +164,7 @@ def test_runtime_state_quarantines_unproven_and_synthetic_achievements():
     assert state.achieved_effects() == {"krbtgt-hash:good.local"}
 
 
-def test_recording_runtime_achievement_without_proof_becomes_legacy_unverified():
+def test_recording_runtime_achievement_without_proof_becomes_pending_proof_missing():
     state = es.EngagementState(objective="x", engagement_id=ENGAGEMENT, runtime_scope=True)
     updated = es.record_effect_result(
         state,
@@ -176,9 +176,11 @@ def test_recording_runtime_achievement_without_proof_becomes_legacy_unverified()
         NOW,
     )
 
-    assert updated.hops[0].status == "legacy_unverified"
+    assert (updated.hops[0].status, updated.hops[0].pending_reason) == ("pending", "proof_missing")
     assert updated.achieved_effects() == set()
+    # The evidence and the admission reason are kept.
     assert updated.hops[0].evidence["proof_persistence_state"] == pb.LEGACY_UNVERIFIED
+    assert updated.hops[0].evidence["proof_admission_reason"]
 
 
 def test_runtime_graph_facts_accept_credential_proof_only_for_credential_predicates():

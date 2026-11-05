@@ -586,7 +586,7 @@ class _LedgerView:
 import asyncio
 import ast
 import base64
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import inspect
 import re
@@ -2154,7 +2154,6 @@ class MythicTools:
         self._added_credential_ids: list[int] = []
         # Callback contexts as last seen at a supervised step boundary, by display id; None until the first
         # observation, which is the baseline a later gain is measured against (step ledger).
-        self._callback_contexts_seen: dict | None = None
         self._cred_cache_ts: str | None = None
         self._credential_reference_bindings: dict[tuple[str, str, str, str], str] = {}
         self._credential_reference_lock = asyncio.Lock()
@@ -2224,21 +2223,57 @@ class MythicTools:
         self._turn_authority = authority
 
     def _request_shape_counts(self) -> dict:
-        """The same-request rotation-cap counts, defensively materialized: harnesses may
-        construct MythicTools without running __init__ (mirror of model.py's getattr rule).
+        """The same-request rotation-cap counts for the current logical request ID.
+
+        They follow the same request rule as the request attempt memory: when the current request ID differs from
+        the one the counts belong to, they start empty; a contract digest change under the same request ID keeps
+        them. Defensively materialized: harnesses may construct MythicTools without running __init__.
         """
         counts = getattr(self, "_task_failure_shape_counts", None)
-        if not isinstance(counts, dict):
+        request_id = self._current_request_id()
+        if not isinstance(counts, dict) or getattr(self, "_task_failure_shape_request_id", None) != request_id:
             counts = self._task_failure_shape_counts = {}
+            self._task_failure_shape_request_id = request_id
         return counts
 
     def reset_request_loop_guards(self) -> None:
-        """Same-request loop-guard window reset. Called when a NEW request
-        contract binds (and directly by request-boundary harnesses): the rotation-proof
-        (command, callback) shape cap counts failures within the current request only,
-        so a fresh request — operator steering or a new objective — starts clean.
+        """Clear the same-request rotation-cap counts (request-boundary harnesses).
+
+        Production code does not need this: the counts are keyed by the current request ID, so a new request
+        starts clean on its own. The session breakers are not request-scoped and are never cleared here.
         """
         self._request_shape_counts().clear()
+
+    def _request_attempt_memory(self):
+        """The per-request capability attempt memory, defensively materialized like the shape counts."""
+        memory = getattr(self, "_request_attempts", None)
+        if memory is None:
+            try:
+                from . import request_attempts
+            except ImportError:  # pragma: no cover
+                import request_attempts  # type: ignore
+            memory = self._request_attempts = request_attempts.RequestAttemptMemory()
+        return memory
+
+    def _request_attempt_view(self) -> tuple:
+        """Attempts in the current request that did not achieve their effect. Runtime retry and recovery decisions
+        read this, never ESL row status. Empty after the request ID changes."""
+        return self._request_attempt_memory().view(self._current_request_id())
+
+    def _record_request_attempt(self, attempt) -> None:
+        self._request_attempt_memory().record(self._current_request_id(), attempt)
+
+    def _request_attempts_payload(self) -> dict:
+        """The current request's attempts for the controller recovery journal."""
+        return self._request_attempt_memory().to_payload(self._current_request_id())
+
+    def _restore_request_attempts(self, payload: dict, request_id: str) -> None:
+        """Restore a recovery journal's attempts. ``request_id`` must be the bound request; a journal is never
+        restored into a different request."""
+        current = self._current_request_id()
+        if str(request_id or "").strip() != current:
+            raise ValueError(f"recovery belongs to {request_id!r}, but the bound request is {current!r}")
+        self._request_attempt_memory().restore(payload, current)
 
     def set_request_contract(self, contract) -> None:
         """Bind the typed native request contract at the final effect sink."""
@@ -2251,10 +2286,8 @@ class MythicTools:
         prior = getattr(self, "_request_contract", None)
         if prior is None or getattr(prior, "digest", "") != contract.digest:
             self._active_approval_claim = None
-            # Same-request loop-guard window: the rotation-proof shape cap counts
-            # failures of a (command, callback) pair within the CURRENT request only. A fresh
-            # request — operator steering or a new objective — starts it clean.
-            self.reset_request_loop_guards()
+        # Request-scoped retry limits (the rotation-proof shape counts and the request attempt memory) are keyed by
+        # the request ID and start empty when it changes; a same-request digest change keeps them.
         self._request_contract_required = True
         self._request_contract = contract
 
@@ -8670,6 +8703,12 @@ class MythicTools:
                 "source": "ingest_collection",
                 "provenance": "run",
                 "graph_verified": True,
+                # Knowledge coverage: who collected, at what access, and when. The source Mythic artifact and
+                # ingest job come from the ingest proof envelope, which the proof boundary projects.
+                "collecting_callback_id": str(callback_display_id),
+                "collecting_identity": str(getattr(fh, "identity", "") or ""),
+                "access_level": str(getattr(fh, "integrity", "") or ""),
+                "collected_at": str(proof_envelope.get("captured_at") or now),
                 "collection_scope_domain": str(collection_scope_domain or "").strip().casefold(),
                 "covered_domains": sorted({
                     str(domain or "").strip().casefold()
@@ -9332,7 +9371,7 @@ class MythicTools:
                         return
                     logger.warning(
                         f"🔒 [verify-on-record] {technique} {target_key}: NO usable key in task output "
-                        f"(verdict={verdict}) — recording FAILED, not achieved (prevents placeholder forgery)."
+                        f"(verdict={verdict}) — a request attempt, not achieved (prevents placeholder forgery)."
                     )
             elif technique in credential_artifacts.GRANT_TECHNIQUES:
                 # Verify-on-record for the DS-Replication rights grant: recording `achieved` for a
@@ -9362,7 +9401,7 @@ class MythicTools:
                         return
                     logger.warning(
                         f"🔒 [verify-on-record] {technique} {target_key}: NO applied DS-Replication ACE in "
-                        f"task output (verdict={verdict}) — recording FAILED, not achieved (the grant did not land)."
+                        f"task output (verdict={verdict}) — a request attempt, not achieved (the grant did not land)."
                     )
             elif technique in credential_artifacts.TICKET_TECHNIQUES:
                 # Strict ticket verification (blocks false-achieved SID-history): Rubeus/Mimikatz
@@ -9399,7 +9438,7 @@ class MythicTools:
                         return
                     logger.warning(
                         f"🔒 [verify-on-record] {technique} {target_key}: no usable ticket/access proof "
-                        f"(verdict={verdict}) — recording FAILED, not achieved."
+                        f"(verdict={verdict}) — a request attempt, not achieved."
                     )
             elif technique == "domain-admin-membership-check":
                 # No output-echo domain correlation here: a `net group "Domain Admins" /domain` is implicitly
@@ -9417,7 +9456,7 @@ class MythicTools:
                 if status != "achieved":
                     logger.info(
                         f"🔒 [verify-on-record] {technique} {target_key}: Domain Admin membership not proven "
-                        f"(verdict={verdict}) — recording failed/partial evidence, not da:{target_key}."
+                        f"(verdict={verdict}) — a request attempt, not da:{target_key}."
                     )
             elif technique == "gpo-abuse":
                 # Legacy SharpGPOAbuse writes are setup, not proof. A clean "GPO was modified; wait for refresh"
@@ -9440,7 +9479,7 @@ class MythicTools:
                     }
                     logger.info(
                         f"🔒 [verify-on-record] {technique} {target_key}: SharpGPOAbuse GUID-only output "
-                        "is a no-op — recording failed, not pending/achieved."
+                        "is a no-op — a request attempt, not pending/achieved."
                     )
                 else:
                     try:
@@ -9537,6 +9576,19 @@ class MythicTools:
                 "verifier_result_sha256": proof_reference.get("verifier_result_sha256"),
                 **extra,
             }
+            if status in {"failed", "blocked"}:
+                # The ledger records progress only. A raw task that did not achieve its effect is a terminal
+                # attempt for the rest of this request, as its failed row was before.
+                try:
+                    from . import request_attempts
+                except ImportError:  # pragma: no cover
+                    import request_attempts  # type: ignore
+                effect = engagement_state._technique_effect(technique, target_key)
+                self._record_request_attempt(request_attempts.make_attempt(
+                    technique=technique, target=target_key, effect=effect, satisfied_effects=[effect],
+                    verdict=status, evidence=evidence,
+                ))
+                return
             proof_envelope = self._runtime_task_proof_envelope(
                 f"engagement_state:{technique}",
                 now,
@@ -10439,6 +10491,10 @@ class MythicTools:
                 evidence=evidence,
                 proof_envelope=proof_envelope,
             )
+            if self._capability_text(getattr(verification, "verdict", "")).casefold() != "achieved":
+                # Progress only in the ledger: the attempt is remembered for the rest of this request.
+                self._record_request_attempt(capabilities.capability_attempt(action, verification, evidence))
+                return verification
             if not self._ledger_commit_hops(state.hops, updated.hops, what=f"capability {action_name}"):
                 # A verifier verdict must not conceal that the result was not recorded.
                 return capabilities.CapabilityVerification(
@@ -15496,18 +15552,19 @@ class MythicTools:
         return public
 
     def _capability_failed_effects(self) -> set[str]:
-        effects: set[str] = set()
-        for hop in list(getattr(self, "_engagement_hops", []) or []):
-            if self._capability_text(getattr(hop, "status", "")).casefold() not in {"failed", "blocked"}:
-                continue
-            evidence = getattr(hop, "evidence", {})
-            if isinstance(evidence, dict) and evidence.get("terminal_failure") is False:
-                continue
-            for effect in list(getattr(hop, "satisfied_effects", []) or []) or [getattr(hop, "effect", "")]:
-                text = self._capability_text(effect)
-                if text:
-                    effects.add(self._canonical_capability_effect(text))
-        return effects
+        """Effects a terminal attempt already suppresses in the current request."""
+        try:
+            from . import request_attempts
+        except ImportError:  # pragma: no cover
+            import request_attempts  # type: ignore
+        return {
+            self._canonical_capability_effect(text)
+            for text in (
+                self._capability_text(item)
+                for item in request_attempts.terminal_effects(self._request_attempt_view())
+            )
+            if text
+        }
 
     def _capability_executor_failure_class(
         self,
@@ -18966,7 +19023,7 @@ class MythicTools:
     def _ledger_view(self, snapshot=None):
         """Runtime projection of a fresh snapshot for ONE calculation: eligible hops, corrected hops, facts.
 
-        Eligible hops passed proof admission (unproven achievements read as legacy_unverified) and carry no
+        Eligible hops passed proof admission (unproven achievements read as pending, proof missing) and carry no
         effective retraction, "no longer holds" marker or applicable expiry. Rows this session did not produce
         are tagged durable, so a refresh never manufactures current-run provenance.
         """
@@ -19023,22 +19080,23 @@ class MythicTools:
         self._ledger_last_write_error = message
         logger.warning(f"🗃️ [engagement-state] {message}")
 
-    def _ledger_commit_hops(self, before, after, *, what: str = "hop result") -> bool:
+    def _ledger_commit_hops(self, before, after, *, what: str = "hop result", reconciliation=None) -> bool:
         """Persist only the rows a reducer produced (``after`` vs ``before``) as one transaction.
 
-        Returns False when the write did not commit; the caller must not treat the result as recorded and must
-        not repeat a target action to repair local persistence.
+        ``reconciliation`` moves the operation's reconciliation position in the same transaction. Returns False
+        when the write did not commit; the caller must not treat the result as recorded and must not repeat a
+        target action to repair local persistence.
         """
         try:
             from . import engagement_store
         except ImportError:
             import engagement_store
         mutations = engagement_store.hop_mutations(before, after)
-        if not mutations:
+        if not mutations and reconciliation is None:
             return True
         try:
             binding = self._require_ledger_binding()
-            result = self._ledger_store().apply(binding, mutations)
+            result = self._ledger_store().apply(binding, mutations, reconciliation=reconciliation)
         except Exception as exc:
             self._ledger_unrecorded(what, exc)
             return False
@@ -19070,40 +19128,188 @@ class MythicTools:
             return False
         return True
 
-    async def _reconcile_ledger_from_task_history(
-        self, task_id: str = "", callback_id: str = "", limit: int = 25, *, apply: bool = False,
-    ) -> list[str]:
-        """Derive row changes from completed Mythic task history and apply them to the shared ledger.
+    async def _ledger_operation_id(self):
+        """The Mythic operation ID the ledger is bound to, else the client's current operation, else None."""
+        binding = getattr(self, "_ledger_binding", None)
+        bound = getattr(binding, "mythic_operation_id", None)
+        if type(bound) is int:
+            return bound
+        try:
+            from . import operation_context
+        except ImportError:
+            import operation_context
+        try:
+            resolved = await operation_context.resolve_operation(self.client)
+            return resolved[0] if resolved else None
+        except Exception:
+            return None
 
-        The same path serves `/state reconcile` and the end-of-turn reconciliation. Only rows the evidence
-        changed are written; numbers, corrections and untouched rows stay as stored. Credential import stays
-        dry-run unless ``apply``.
+    async def _reconcile_operation(self, cited=(), *, apply: bool = False) -> list[str]:
+        """One reconciliation pass over the operation's task history, or the cited tasks and credentials.
+
+        A pass reads the operation's tasks above the stored cursor, from every callback and every issuer, sends each
+        completed one through the task, credential and callback verifiers, and commits the verified rows with the
+        new cursor in one store transaction. A Mythic or store error raises before the cursor moves, and a replayed
+        task changes nothing. A citation (a task display ID or ``cred:<id>``) runs the same verifiers on exactly
+        what it names, never moves the cursor, and gets one reply line per ID. Credential material parsed from task
+        output is imported into the Mythic credential store only with ``apply``.
         """
         try:
-            from . import state_reconcile
+            from . import engagement_state, engagement_store, state_reconcile
         except ImportError:
+            import engagement_state
+            import engagement_store
             import state_reconcile
         await self._ensure_engagement_key()
-        view = self._ledger_view()
+        binding = self._require_ledger_binding()
+        store = self._ledger_store()
+        position = store.reconciliation_state(binding)
+        operation_id = await self._ledger_operation_id()
         now = datetime.now(timezone.utc).isoformat()
-        mutations, notes = await state_reconcile.reconcile_task_history(
-            self.client, list(view.hops), task_id, callback_id, limit, now, apply=apply,
-            engagement_id=self._eng_key(), objective=self._engagement_objective(),
+        initial = list(self._ledger_view().hops)
+        state = engagement_state.EngagementState(
+            objective=self._engagement_objective(), hops=list(initial), engagement_id=self._eng_key(),
+            runtime_scope=True,
         )
-        if not mutations:
-            return notes
+        reasons: dict[str, str] = {}
+        produced: dict[str, list[str]] = {}
+        evaluate: list[tuple[str, dict]] = []
+        credentials: list[tuple[str, dict]] = []
+        update = None
+        if cited:
+            for item in cited:
+                if item.startswith("cred:"):
+                    row, reason = await state_reconcile.fetch_cited_credential(
+                        self.client, operation_id, int(item[len("cred:"):]))
+                    if reason:
+                        reasons[item] = reason
+                    else:
+                        credentials.append((item, row))
+                    continue
+                task, reason = await state_reconcile.fetch_cited_task(self.client, operation_id, int(item))
+                if not reason and not state_reconcile.is_terminal(task):
+                    reason = "task not terminal"
+                if reason:
+                    reasons[item] = reason
+                else:
+                    evaluate.append((item, task))
+        else:
+            batch = await state_reconcile.fetch_operation_tasks(
+                self.client, operation_id, position.task_cursor, position.held_tasks)
+            step = state_reconcile.plan_cursor(position.task_cursor, position.held_tasks, batch)
+            evaluate = [(str(task["display_id"]), task) for task in step.evaluate]
+            update = engagement_store.ReconciliationUpdate(
+                task_cursor=step.cursor, held_added=step.held_added, held_resolved=step.held_resolved)
+        if evaluate:
+            for row in await state_reconcile.fetch_task_credentials(
+                self.client, operation_id, [int(task["display_id"]) for _key, task in evaluate]
+            ):
+                credentials.append((str((row.get("task") or {}).get("display_id")), row))
+        foothold_map = state_reconcile.footholds_from_tasks([task for _key, task in evaluate], now)
+        mutation_ids: dict[str, str] = {}
+        notes: list[str] = []
+        for key, task in evaluate:
+            verified = await state_reconcile.verify_task(
+                self.client, task, now, engagement_id=self._eng_key(), foothold_by_callback=foothold_map, apply=apply,
+            )
+            if verified is None:
+                continue
+            notes.extend(verified.notes)
+            proof = verified.evidence.get("proof_envelope")
+            state = engagement_state.record_hop_result(
+                state, verified.technique, verified.target, "achieved", verified.evidence, now,
+                proof_envelope=proof if isinstance(proof, dict) else None,
+                require_admissible_proof=True, engagement_id=self._eng_key(),
+            )
+            identity = engagement_store.hop_identity(verified.technique, verified.target)
+            mutation_ids[identity] = state_reconcile._reconcile_mutation_id(
+                self._eng_key(), task["display_id"], identity, verified.evidence)
+            produced.setdefault(key, []).append(identity)
+        for key, row in credentials:
+            state, identity, _effect, reason = self._credential_hop(
+                state, row, now, source="operation_reconcile", require_admitted=True)
+            if identity:
+                produced.setdefault(key, []).append(identity)
+                # Stable per (operation, credential, row): replaying the same entry is idempotent.
+                mutation_ids.setdefault(identity, state_reconcile._reconcile_mutation_id(
+                    self._eng_key(), (row.get("task") or {}).get("display_id"), identity,
+                    {"credential_id": row.get("id")}))
+            elif reason and key not in produced:
+                reasons.setdefault(key, reason)
+        only = {int(key) for key, _task in evaluate} if cited else None
+        state, _recorded, _unattributed, baseline, by_task = await self._callback_gain_hops(
+            state, now, position.callback_baseline, source="operation_reconcile", require_admitted=True,
+            only_tasks=only,
+        )
+        for task_id, identities in by_task.items():
+            produced.setdefault(str(task_id), []).extend(identities)
+            for identity in identities:
+                mutation_ids.setdefault(identity, state_reconcile._reconcile_mutation_id(
+                    self._eng_key(), task_id, identity, {"verifier": "callback-context"}))
+        if baseline is not None:
+            update = baseline if update is None else engagement_store.ReconciliationUpdate(
+                task_cursor=update.task_cursor, held_added=update.held_added, held_resolved=update.held_resolved,
+                callback_baseline_initial=baseline.callback_baseline_initial,
+                callback_baseline_entries=baseline.callback_baseline_entries,
+            )
+        mutations = [
+            engagement_store.RowMutation(
+                kind=item.kind, identity=item.identity, payload=item.payload,
+                expected_revision=item.expected_revision, mutation_id=mutation_ids.get(item.identity, ""),
+            )
+            for item in engagement_store.hop_mutations(initial, state.hops)
+        ]
+        written = self._ledger_apply_reconciliation(binding, mutations, update)
+        if not cited:
+            held = len(set(position.held_tasks) | set(update.held_added)) - len(update.held_resolved)
+            return [f"Reconciled {len(evaluate)} completed task(s) from the operation's history: "
+                    f"{len(written)} row(s) recorded; cursor at task {update.task_cursor}"
+                    + (f", {held} running task(s) held." if held > 0 else "."), *notes]
+        rows = {row.identity: row for row in self._ledger_snapshot().hop_rows()}
+        before = {engagement_store.hop_identity(hop.technique, hop.target) for hop in initial}
+        lines = []
+        for item in cited:
+            identities = list(dict.fromkeys(produced.get(item, ())))
+            if not identities:
+                lines.append(f"- {item}: not added, {reasons.get(item) or 'no proven gain'}.")
+                continue
+            for identity in identities:
+                row = rows.get(identity)
+                number = row.number if row is not None else None
+                if row is not None and row.retraction:
+                    lines.append(f"- {item}: row #{number} is retracted; `/state restore {number}` counts it again.")
+                elif identity not in written:
+                    lines.append(f"- {item}: already recorded (row #{number}).")
+                else:
+                    lines.append(f"- {item}: {'updated' if identity in before else 'added'} row #{number}.")
+        return [*lines, *notes]
+
+    def _ledger_apply_reconciliation(self, binding, mutations, update) -> set[str]:
+        """Apply reconciliation rows in bounded batches; the last batch carries the cursor. Returns the identities
+        that changed. A failed write is recorded and raised, so the cursor stays where it was."""
         try:
-            binding = self._require_ledger_binding()
-            for start in range(0, len(mutations), _esl.MAX_BATCH):
-                result = self._ledger_store().apply(binding, mutations[start:start + _esl.MAX_BATCH])
+            from . import engagement_store
+        except ImportError:
+            import engagement_store
+        if not mutations and update is None:
+            return set()
+        store = self._ledger_store()
+        batches = [mutations[start:start + engagement_store.MAX_BATCH]
+                   for start in range(0, len(mutations), engagement_store.MAX_BATCH)] or [[]]
+        written: set[str] = set()
+        try:
+            for index, batch in enumerate(batches):
+                result = store.apply(binding, batch, reconciliation=update if index == len(batches) - 1 else None)
                 own = getattr(self, "_ledger_own_rows", None)
                 if own is None:
                     own = self._ledger_own_rows = set()
                 own.update(result.row_revisions)
+                written.update(result.changed_identities)
         except Exception as exc:
             self._ledger_unrecorded("task-history reconciliation", exc)
-            notes.append(f"- reconciled rows were NOT recorded: {exc}")
-        return notes
+            raise
+        self._ledger_last_write_error = ""
+        return written
 
     @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def list_open_artifacts(self) -> str:
@@ -19254,8 +19460,8 @@ class MythicTools:
         rows = (resp or {}).get("callback") if isinstance(resp, dict) else None
         return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
 
-    def _runtime_callback_proof_envelope(self, gain, now: str) -> dict:
-        """Proof for a callback context gain credited to the task that caused it; {} when not admissible."""
+    def _runtime_callback_proof_envelope(self, gain, task, now: str) -> dict:
+        """Proof for a callback context gain from one operation task; {} when not admissible."""
         if self._evaluation_authorization_proof_lineage_missing(None):
             return {}
         try:
@@ -19264,7 +19470,6 @@ class MythicTools:
             except ImportError:
                 import proof_boundary
                 import step_ledger
-            task = gain.task
             row = gain.context.row()
             envelope = proof_boundary.make_runtime_callback_envelope(
                 engagement_id=self._eng_key(), callback_id=gain.context.display_id, task_id=task.task_id,
@@ -19282,25 +19487,184 @@ class MythicTools:
         except Exception:
             return {}
 
-    async def _record_step_ledger(self, references: dict, step_task_ids) -> dict[str, Any]:
-        """Record the capability gains a supervised step proved; returns what was recorded and left unattributed.
+    async def _callback_gain_hops(self, state, now: str, baseline, *, source: str, require_admitted: bool,
+                                  only_tasks=None):
+        """Callback context gains against the operation's stored baseline, credited to tasks from any issuer.
 
-        Callback context gains are credited to tasks this process issued; credentials are recorded when their
-        source task is one of the step's tasks. Rows go through the proof boundary like every other writer, so an
-        unadmitted gain lands as `legacy_unverified`, never `achieved`. Reads are bounded and fail open.
+        A gain is proven by the task credited with it, else by the latest completed task on the gained callback.
+        Only an achieved gain enters the baseline, so an unproven one is evaluated again by a later reconciliation.
+        ``require_admitted`` writes no row for an unproven gain; otherwise it lands as `pending` (proof missing).
+        ``only_tasks`` limits rows to gains those tasks prove. Reads are bounded and fail open without moving the
+        baseline. Returns (state, recorded, unattributed, reconciliation update or None, {task id: identities}).
         """
         try:
-            from . import engagement_state, step_ledger
+            from . import engagement_state, engagement_store, state_reconcile, step_ledger
         except ImportError:
             import engagement_state
+            import engagement_store
+            import state_reconcile
             import step_ledger
+        recorded: list[dict] = []
+        unattributed: list[dict] = []
+        by_task: dict[int, list[str]] = {}
+        try:
+            rows = await asyncio.wait_for(self._step_callback_rows(), timeout=5.0)
+        except Exception as exc:
+            logger.debug(f"callback gains: callbacks unreadable: {exc}")
+            return state, recorded, unattributed, None, by_task
+        contexts = [c for c in (step_ledger.callback_context(row) for row in rows) if c is not None]
+        if baseline is None:  # the operation's first reconciliation: what exists now is the baseline
+            update = engagement_store.ReconciliationUpdate(callback_baseline_initial=step_ledger.baseline_of(contexts))
+            return state, recorded, unattributed, update, by_task
+        window = step_ledger.attribution_window()
+        gained = [gain.context for gain in step_ledger.context_gains(contexts, baseline, [], window=window)]
+        if not gained:
+            return state, recorded, unattributed, None, by_task
+        checked_in = [moment for moment in (step_ledger.checked_in(c) for c in gained) if moment is not None]
+        latest = max(checked_in) if checked_in else datetime.now(timezone.utc)
+        earliest = min(checked_in) if checked_in else latest
+        try:
+            task_rows = await asyncio.wait_for(state_reconcile.fetch_callback_credit_tasks(
+                self.client, await self._ledger_operation_id(),
+                (earliest - timedelta(seconds=window)).astimezone(timezone.utc).replace(tzinfo=None).isoformat(),
+                latest.astimezone(timezone.utc).replace(tzinfo=None).isoformat(),
+                [c.display_id for c in gained],
+            ), timeout=5.0)
+        except Exception as exc:
+            logger.debug(f"callback gains: operation tasks unreadable: {exc}")
+            return state, recorded, unattributed, None, by_task
+        tasks = []
+        for row in task_rows:
+            callback = row.get("callback") if isinstance(row.get("callback"), dict) else {}
+            if type(row.get("display_id")) is int:
+                tasks.append(step_ledger.OperationTask(
+                    task_id=row["display_id"], callback_display_id=callback.get("display_id"),
+                    command=str(row.get("command_name") or ""), status=str(row.get("status") or "").strip().casefold(),
+                    timestamp=str(row.get("timestamp") or ""),
+                ))
+
+        def status_of(effect: str) -> str:
+            return next((hop.status for hop in state.hops
+                         if hop.technique == step_ledger.TECHNIQUE and hop.target == effect), "")
+
+        entries: dict[str, str] = {}
+        for gain in step_ledger.context_gains(gained, baseline, tasks, window=window):
+            candidates = list(dict.fromkeys(task for task in (gain.task, gain.proof_task) if task is not None))
+            if not candidates:
+                unattributed.extend(step_ledger.unattributed([gain]))
+                continue
+            if only_tasks is not None:
+                candidates = [task for task in candidates if task.task_id in only_tasks]
+            chosen, proof = None, {}
+            for task in candidates:
+                proof = self._runtime_callback_proof_envelope(gain, task, now)
+                if proof:
+                    chosen = task
+                    break
+            if not proof:
+                if require_admitted or gain.task is None or gain.task not in candidates:
+                    continue
+                chosen = gain.task
+            for effect in gain.effects:
+                if not proof and status_of(effect) == "achieved":
+                    continue  # a proven row is never downgraded by an unproven observation of the same effect
+                evidence = {
+                    "source": source, "kind": gain.kind, "mythic_task_id": chosen.task_id,
+                    "credited_task": gain.task.task_id if gain.task is not None else "none",
+                    "callback_id": gain.context.display_id, "host": gain.context.host, "user": gain.context.user,
+                    "integrity": gain.context.integrity,
+                    "transaction_id": f"callback-context:{gain.context.display_id}:{chosen.task_id}",
+                    "terminal_task_status": chosen.status, "artifact_id": gain.context.agent_callback_id,
+                    "verifier_id": step_ledger.VERIFIER_ID,
+                }
+                state = engagement_state.record_effect_result(
+                    state, step_ledger.TECHNIQUE, effect, effect, "achieved", evidence, now,
+                    proof_envelope=proof, require_admissible_proof=True, engagement_id=self._eng_key(),
+                )
+                recorded.append({"effect": effect, "task_id": chosen.task_id, "status": status_of(effect)})
+                by_task.setdefault(chosen.task_id, []).append(engagement_store.hop_identity(step_ledger.TECHNIQUE, effect))
+            if proof:
+                entries[str(gain.context.display_id)] = gain.context.integrity
+        update = engagement_store.ReconciliationUpdate(callback_baseline_entries=entries) if entries else None
+        return state, recorded, unattributed, update, by_task
+
+    def _credential_hop(self, state, credential: dict, now: str, *, source: str, require_admitted: bool):
+        """One Mythic credential-store entry as a ledger row, classified by the technique of the task that produced it.
+
+        Directory replication and PKINIT give a working credential (`creds:<account>@<realm>`, or
+        `krbtgt-hash:<realm>` for krbtgt); anything else,
+        including a hash from a host's memory or a Kerberoast, is credential material
+        (`cred-material:<kind>:<account>@<realm>`). An entry with no producing task gets no row. Returns
+        (state, identity, effect, reason); identity is "" when no row was written, with the reason.
+        """
+        try:
+            from . import engagement_state, engagement_store
+        except ImportError:
+            import engagement_state
+            import engagement_store
+        task = credential.get("task") if isinstance(credential.get("task"), dict) else {}
+        if task.get("display_id") is None:
+            return state, "", "", "no producing task (a later action must prove it; not supported yet)"
+        if (credential.get("operation_id") is not None and task.get("operation_id") is not None
+                and credential.get("operation_id") != task.get("operation_id")):
+            return state, "", "", "the producing task is not in this operation"
+        callback = task.get("callback") if isinstance(task.get("callback"), dict) else {}
+        account, realm = str(credential.get("account") or ""), str(credential.get("realm") or "")
+        principal = f"{account}@{realm}".casefold()
+        credential_source = _credential_source(task)
+        if credential_source and account.strip().casefold() == "krbtgt":
+            technique, target, effect = "credential-store", principal, f"krbtgt-hash:{realm.strip().casefold()}"
+        elif credential_source:
+            technique, target, effect = "credential-store", principal, f"creds:{principal}"
+        else:
+            technique, target = "credential-material", f"{_credential_material_kind(credential)}:{principal}"
+            effect = f"cred-material:{target}"
+        identity = engagement_store.hop_identity(technique, target)
+        current = next((hop for hop in state.hops
+                        if engagement_store.hop_identity(hop.technique, hop.target) == identity), None)
+        held = current is not None and current.status == "achieved"
+        if not held and effect in state.achieved_effects():
+            return state, "", effect, "already recorded"  # another verified row already holds this effect
+        proof = self._credential_store_proof_envelope(credential, now)
+        if not proof:
+            if require_admitted:
+                return state, "", effect, "no proven gain (the producing task's lineage is incomplete)"
+            if held:
+                return state, "", effect, "already recorded"  # never downgrade a proven row
+        evidence = {
+            "source": source, "credential_id": credential.get("id"),
+            "credential_source": credential_source or "material",
+            "credential_type": str(credential.get("type") or ""), "mythic_task_id": task.get("display_id"),
+            "callback_id": callback.get("display_id"),
+            "transaction_id": f"credential-observation:{task.get('display_id')}",
+            "terminal_task_status": self._credential_task_terminal_success_status(task),
+            "verifier_id": "mythic_credential_store:observed",
+        }
+        state = engagement_state.record_effect_result(
+            state, technique, target, effect, "achieved", evidence, now, proof_envelope=proof,
+            require_admissible_proof=True, engagement_id=self._eng_key(),
+        )
+        return state, identity, effect, ""
+
+    async def _record_step_ledger(self, references: dict, step_task_ids) -> dict[str, Any]:
+        """Record the capability gains a supervised step boundary can prove; returns what was recorded and left
+        unattributed.
+
+        Callback context gains are measured against the operation's stored baseline and credited to operation tasks
+        from any issuer; credentials are recorded when their source task is one of the step's references, classified
+        by the technique that produced them. Rows go through the proof boundary like every other writer, so an
+        unadmitted gain lands as `pending` (proof missing), never `achieved`. Reads are bounded and fail open.
+        """
+        try:
+            from . import engagement_state
+        except ImportError:
+            import engagement_state
         summary: dict[str, Any] = {"recorded": [], "unattributed": []}
-        lineage = sorted(i for i in getattr(self, "_task_source_request_ids", {}) if type(i) is int)
         credentials = [c for c in (references.get("credentials") or []) if "source_task_id" in c]
-        if not lineage and not credentials:
-            return summary  # nothing this process issued can be credited with anything
         now = datetime.now(timezone.utc).isoformat()
         try:
+            binding = self._require_ledger_binding()
+            position = self._ledger_store().reconciliation_state(binding)
             initial_hops = list(self._ledger_view().hops)
         except _esl.LedgerUnavailable as exc:
             self._ledger_unrecorded("step ledger", exc)
@@ -19311,93 +19675,28 @@ class MythicTools:
             engagement_id=self._eng_key(), runtime_scope=True,
         )
         hops_before = len(state.hops)
-        changed = False
-        def status_of(technique: str, target: str) -> str:
-            return next((hop.status for hop in state.hops if hop.technique == technique and hop.target == target), "")
-
-        def keeps_proof(technique: str, target: str, proof: dict) -> bool:
-            # A proven row is never downgraded by a weaker observation of the same effect.
-            return not proof and status_of(technique, target) == "achieved"
-
-        try:
-            rows = await asyncio.wait_for(self._step_callback_rows(), timeout=5.0) if lineage else []
-            records = await asyncio.wait_for(self._step_task_records(lineage[-16:]), timeout=5.0) if lineage else {}
-        except Exception as exc:
-            logger.debug(f"step ledger: callback context unreadable: {exc}")
-            lineage, rows, records = [], [], {}
-        if lineage:
-            issued = [step_ledger.IssuedTask(task_id=task_id, callback_display_id=record.get("callback_display_id"),
-                                             command=record.get("command") or "", status=record.get("status") or "",
-                                             timestamp=record.get("timestamp") or "")
-                      for task_id, record in sorted(records.items())]
-            contexts = [c for c in (step_ledger.callback_context(row) for row in rows) if c is not None]
-            first = self._callback_contexts_seen is None
-            gains = step_ledger.context_gains(contexts, self._callback_contexts_seen or {}, issued, step_task_ids,
-                                              window=step_ledger.attribution_window())
-            summary["unattributed"] = step_ledger.unattributed(gains, first_observation=first)
-            self._callback_contexts_seen = {c.display_id: c for c in contexts}
-            for gain in gains:
-                if gain.task is None:
-                    continue
-                proof = self._runtime_callback_proof_envelope(gain, now)
-                for effect in gain.effects:
-                    if keeps_proof(step_ledger.TECHNIQUE, effect, proof):
-                        continue
-                    evidence = {
-                        "source": "supervised_step", "kind": gain.kind, "mythic_task_id": gain.task.task_id,
-                        "callback_id": gain.context.display_id, "host": gain.context.host,
-                        "user": gain.context.user, "integrity": gain.context.integrity,
-                        "transaction_id": f"callback-context:{gain.context.display_id}:{gain.task.task_id}",
-                        "terminal_task_status": gain.task.status, "artifact_id": gain.context.agent_callback_id,
-                        "verifier_id": step_ledger.VERIFIER_ID,
-                    }
-                    state = engagement_state.record_effect_result(
-                        state, step_ledger.TECHNIQUE, effect, effect, "achieved", evidence, now,
-                        proof_envelope=proof, require_admissible_proof=True, engagement_id=self._eng_key(),
-                    )
-                    summary["recorded"].append({"effect": effect, "task_id": gain.task.task_id,
-                                                "status": status_of(step_ledger.TECHNIQUE, effect)})
-                    changed = True
+        state, recorded, unattributed, update, _by_task = await self._callback_gain_hops(
+            state, now, position.callback_baseline, source="supervised_step", require_admitted=False,
+        )
+        summary["recorded"].extend(recorded)
+        summary["unattributed"] = unattributed
         if credentials:
             wanted = {c["credential_id"] for c in credentials}
             for row in await self._fetch_credentials_cached(now):
                 if not isinstance(row, dict) or row.get("id") not in wanted:
                     continue
-                task = row.get("task") if isinstance(row.get("task"), dict) else {}
-                callback = task.get("callback") if isinstance(task.get("callback"), dict) else {}
-                account, realm = str(row.get("account") or ""), str(row.get("realm") or "")
-                principal = f"{account}@{realm}".casefold()
-                credential_source = _credential_source(task)
-                if credential_source:
-                    technique, target, effect = "credential-store", principal, f"creds:{principal}"
-                else:
-                    kind = _credential_material_kind(row)
-                    technique, target = "credential-material", f"{kind}:{principal}"
-                    effect = f"cred-material:{target}"
-                evidence = {
-                    "source": "supervised_step", "credential_id": row["id"],
-                    "credential_source": credential_source or "material",
-                    "credential_type": str(row.get("type") or ""), "mythic_task_id": task.get("display_id"),
-                    "callback_id": callback.get("display_id"),
-                    "transaction_id": f"credential-observation:{task.get('display_id')}",
-                    "terminal_task_status": self._credential_task_terminal_success_status(task),
-                    "verifier_id": "mythic_credential_store:observed",
-                }
-                proof = self._credential_store_proof_envelope(row, now)
-                if keeps_proof(technique, target, proof):
-                    continue
-                state = engagement_state.record_effect_result(
-                    state, technique, target, effect, "achieved", evidence, now,
-                    proof_envelope=proof,
-                    require_admissible_proof=True, engagement_id=self._eng_key(),
-                )
-                summary["recorded"].append({"effect": effect, "task_id": task.get("display_id"),
-                                            "status": status_of(technique, target)})
-                changed = True
-        if changed:
-            if not self._ledger_commit_hops(initial_hops, state.hops, what="step ledger"):
+                state, identity, effect, _reason = self._credential_hop(
+                    state, row, now, source="supervised_step", require_admitted=False)
+                if identity:
+                    status = next((hop.status for hop in state.hops if hop.effect == effect), "")
+                    summary["recorded"].append({"effect": effect, "task_id": (row.get("task") or {}).get("display_id"),
+                                                "status": status})
+        if summary["recorded"] or update is not None:
+            if not self._ledger_commit_hops(initial_hops, state.hops, what="step ledger", reconciliation=update):
                 summary["unrecorded"] = self._ledger_last_write_error
-            logger.info(f"📒 [step ledger] {len(state.hops) - hops_before} new rows; recorded {summary['recorded']}")
+            elif summary["recorded"]:
+                logger.info(f"📒 [step ledger] {len(state.hops) - hops_before} new rows; "
+                            f"recorded {summary['recorded']}")
         return summary
 
     async def _task_output_rows(self, exact_task_id: int) -> tuple[Any, bool]:

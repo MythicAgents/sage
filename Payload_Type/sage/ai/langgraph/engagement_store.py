@@ -31,7 +31,9 @@ try:  # package import (runtime) or flat import (tests that put ai/langgraph on 
 except ImportError:  # pragma: no cover - import-path fallback
     import engagement_ledger as _ledger  # type: ignore
 
-SCHEMA_VERSION = 1
+# Version 2: hop rows carry only achieved or pending. Store initialization migrates version-1 operations.
+SCHEMA_VERSION = 2
+LEGACY_ROW_SCHEMA_VERSION = 1
 MIGRATION_VERSION = 1
 EXPORT_SCHEMA = "sage.esl.export.v1"
 BUSY_TIMEOUT_MS = 5000
@@ -48,6 +50,12 @@ _UUID_TAIL = re.compile(
 )
 _NUMERIC_ONLY = re.compile(r"^(?P<name>.+)_(?P<op>\d+)$")
 _VOLATILE_KEYS = frozenset({"timestamp", "captured_at", "provenance", "updated", "recorded_at"})
+_ATTEMPT_STATUSES = frozenset({"failed", "blocked"})
+_ROW_STATUSES = frozenset({"achieved", "pending"})
+_UNVERIFIED_STATUS = "legacy_unverified"
+SCHEMA_MIGRATION_REASON = "attempt record, not progress"
+SCHEMA_MIGRATION_PROOF_REASON = "unverified achievement: proof missing"
+SCHEMA_MIGRATION_LAPSE_REASON = "attempt record superseded by a verified achievement"
 
 
 class LedgerUnavailable(RuntimeError):
@@ -118,6 +126,38 @@ class ApplyResult:
     revision: int = 0
     # (identity, row revision) of every head this batch wrote.
     row_revisions: set = field(default_factory=set)
+    # Identities whose head this batch changed (a kept observation leaves the head as it was).
+    changed_identities: set = field(default_factory=set)
+
+
+@dataclass(frozen=True)
+class ReconciliationState:
+    """Where the operation's task-history reconciliation stands.
+
+    Every task at or below ``task_cursor`` has been evaluated, except the still-running ``held_tasks``, which each
+    pass reads again. ``callback_baseline`` maps a callback display ID to the integrity level already accounted for;
+    None until the operation's first reconciliation stores it.
+    """
+
+    task_cursor: int = 0
+    held_tasks: tuple[int, ...] = ()
+    callback_baseline: dict[str, str] | None = None
+
+
+@dataclass(frozen=True)
+class ReconciliationUpdate:
+    """A reconciliation pass's position change, written in the same transaction as its rows.
+
+    The cursor only moves forward. Held tasks are the stored set plus ``held_added`` minus ``held_resolved``, so two
+    passes that overlap never drop a running task. ``callback_baseline_initial`` is stored only when the operation
+    has no baseline yet; ``callback_baseline_entries`` are merged into it.
+    """
+
+    task_cursor: int | None = None
+    held_added: tuple[int, ...] = ()
+    held_resolved: tuple[int, ...] = ()
+    callback_baseline_initial: Mapping[str, str] | None = None
+    callback_baseline_entries: Mapping[str, str] | None = None
 
 
 @dataclass
@@ -278,6 +318,13 @@ _SCHEMA = (
         updated_at TEXT NOT NULL,
         PRIMARY KEY (operation_id, name)
     )""",
+    """CREATE TABLE IF NOT EXISTS esl_reconciliation (
+        operation_id INTEGER PRIMARY KEY REFERENCES esl_operations(id),
+        task_cursor INTEGER NOT NULL DEFAULT 0 CHECK (task_cursor >= 0),
+        held_tasks TEXT NOT NULL DEFAULT '[]',
+        callback_baseline TEXT,
+        updated_at TEXT NOT NULL
+    )""",
     "CREATE INDEX IF NOT EXISTS esl_events_row ON esl_events(row_id, id)",
     """CREATE TRIGGER IF NOT EXISTS esl_events_append_only_update BEFORE UPDATE ON esl_events
         BEGIN SELECT RAISE(ABORT, 'esl_events is append-only'); END""",
@@ -290,6 +337,8 @@ _SCHEMA = (
         BEGIN SELECT RAISE(ABORT, 'row identity and number are permanent'); END""",
 )
 ESL_TABLES = ("esl_operations", "esl_rows", "esl_events", "esl_imports", "esl_legacy_settings")
+# Tables a store from before them may lack. They are copied when present and never required to read.
+OPTIONAL_ESL_TABLES = ("esl_reconciliation",)
 
 
 def _connect(path: str | Path, *, write: bool = True) -> sqlite3.Connection:
@@ -355,6 +404,7 @@ class EngagementStore:
                 connection.execute("BEGIN IMMEDIATE")
                 ensure_schema(connection)
                 connection.execute("COMMIT")
+                migrate_row_statuses(connection)
                 self._schema_ready = True
             connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
             yield connection
@@ -596,6 +646,7 @@ class EngagementStore:
         actor: Actor = SAGE_ACTOR,
         complete_graph_refresh: bool = False,
         graph_refresh_time: str = "",
+        reconciliation: ReconciliationUpdate | None = None,
     ) -> ApplyResult:
         """Apply a bounded batch of produced rows. Unrelated heads are untouched.
 
@@ -604,6 +655,7 @@ class EngagementStore:
         observation is kept in the row's history and never replaces it. Retractions and markers are row flags
         that no update clears. ``complete_graph_refresh`` marks a full graph reconcile, which defines the current
         graph-fact generation (facts it did not observe stay stored but are no longer current).
+        ``reconciliation`` moves the task-history cursor and callback baseline in the same transaction.
         """
         batch = list(mutations)
         if len(batch) > MAX_BATCH:
@@ -632,6 +684,8 @@ class EngagementStore:
                     continue
                 changed = True
                 (result.observations if kind == "observation" else result.applied).append(row_id)
+                if kind == "applied":
+                    result.changed_identities.add(mutation.identity)
             if changed:
                 connection.execute(
                     "UPDATE esl_operations SET revision=?, updated_at=? WHERE id=?", (revision, stamp, op["id"])
@@ -639,7 +693,21 @@ class EngagementStore:
                 result.revision = revision
             else:
                 result.revision = int(op["revision"])
+            if reconciliation is not None:
+                _write_reconciliation(connection, int(op["id"]), reconciliation, stamp)
         return result
+
+    def reconciliation_state(self, binding: OperationBinding) -> ReconciliationState:
+        """The operation's reconciliation cursor, held tasks and callback baseline. A store from before them reads
+        as a fresh start."""
+        with self._transaction(write=False) as connection:
+            _operation_row(connection, binding)
+            present = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='esl_reconciliation'"
+            ).fetchone()
+            if not present:
+                return ReconciliationState()
+            return _read_reconciliation(connection, binding.store_operation_id)
 
     # ── operator corrections ──────────────────────────────────────────────────────────────
     def retract(self, binding: OperationBinding, selectors: Iterable[str], *, reason: str, actor: Actor) -> CorrectionResult:
@@ -799,6 +867,170 @@ class EngagementStore:
         return objective, source
 
 
+def _schema_migration_actor() -> Actor:
+    return Actor(kind="system", name=_ledger.SCHEMA_MIGRATION_ACTOR)
+
+
+def migrate_row_statuses(connection: sqlite3.Connection) -> dict[int, dict[str, int]]:
+    """Upgrade every operation below the current schema, one transaction per operation.
+
+    The caller holds no open transaction. Returns ``{operation id: counts}`` for the operations it upgraded.
+    """
+    stamp = now_iso()
+    upgraded: dict[int, dict[str, int]] = {}
+    pending = [
+        int(row["id"]) for row in connection.execute(
+            "SELECT id FROM esl_operations WHERE schema_version < ? ORDER BY id", (SCHEMA_VERSION,)
+        ).fetchall()
+    ]
+    for operation_id in pending:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = connection.execute(
+                "SELECT schema_version FROM esl_operations WHERE id=?", (operation_id,)
+            ).fetchone()
+            if row is None or int(row["schema_version"]) >= SCHEMA_VERSION:
+                connection.execute("COMMIT")
+                continue
+            upgraded[operation_id] = _migrate_operation(connection, operation_id, stamp)
+            connection.execute("COMMIT")
+        except BaseException:
+            _rollback(connection)
+            raise
+    return upgraded
+
+
+def _migrate_operation(connection: sqlite3.Connection, operation_id: int, stamp: str) -> dict[str, int]:
+    """Append the schema-2 events for one operation inside the caller's transaction. Idempotent; never deletes.
+
+    A ``failed`` or ``blocked`` head is an attempt record, not progress: it gets a system retraction and keeps its
+    number, payload and history. A ``legacy_unverified`` head gets an appended update to ``pending`` /
+    ``proof_missing``; the original payload stays in history. Corrections, numbers, the high-water mark and graph
+    facts are unchanged.
+    """
+    actor = _schema_migration_actor()
+    counts = {"retracted": 0, "pending": 0}
+    op = connection.execute("SELECT revision FROM esl_operations WHERE id=?", (operation_id,)).fetchone()
+    revision = int(op["revision"]) + 1
+    rows = connection.execute(
+        "SELECT * FROM esl_rows WHERE operation_id=? AND kind='hop' ORDER BY number", (operation_id,)
+    ).fetchall()
+
+    def recorded(mutation_id: str) -> bool:
+        return connection.execute(
+            "SELECT 1 FROM esl_events WHERE operation_id=? AND mutation_id=?", (operation_id, mutation_id)
+        ).fetchone() is not None
+
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"])
+        except ValueError:
+            continue
+        status = _norm(payload.get("status"))
+        row_id = int(row["id"])
+        if status in _ATTEMPT_STATUSES:
+            mutation_id = f"schema-migration:v{SCHEMA_VERSION}:retract:{row_id}"
+            if row["retraction_event_id"] is not None or recorded(mutation_id):
+                continue
+            event_id = _insert_event(
+                connection, operation_id, row_id, mutation_id, "retract", actor, stamp,
+                reason=SCHEMA_MIGRATION_REASON, row_revision=int(row["revision"]), revision=revision,
+            )
+            connection.execute("UPDATE esl_rows SET retraction_event_id=? WHERE id=?", (event_id, row_id))
+            counts["retracted"] += 1
+        elif status == _UNVERIFIED_STATUS:
+            mutation_id = f"schema-migration:v{SCHEMA_VERSION}:pending:{row_id}"
+            if recorded(mutation_id):
+                continue
+            upgraded = dict(payload, status="pending", pending_reason="proof_missing")
+            encoded = _canonical(upgraded)
+            new_revision = int(row["revision"]) + 1
+            event_id = _insert_event(
+                connection, operation_id, row_id, mutation_id, "update", actor, stamp, payload=encoded,
+                reason=SCHEMA_MIGRATION_PROOF_REASON, row_revision=new_revision, revision=revision,
+            )
+            connection.execute(
+                "UPDATE esl_rows SET payload=?, revision=?, head_event_id=?, updated_at=? WHERE id=?",
+                (encoded, new_revision, event_id, stamp, row_id),
+            )
+            counts["pending"] += 1
+    if counts["retracted"] or counts["pending"]:
+        connection.execute(
+            "UPDATE esl_operations SET revision=?, schema_version=?, updated_at=? WHERE id=?",
+            (revision, SCHEMA_VERSION, stamp, operation_id),
+        )
+    else:
+        connection.execute(
+            "UPDATE esl_operations SET schema_version=? WHERE id=?", (SCHEMA_VERSION, operation_id)
+        )
+    return counts
+
+
+def schema_status(database: str | Path) -> list[dict[str, Any]]:
+    """Read-only: each operation's schema version and how many rows the schema migration changed."""
+    target = Path(database)
+    if not target.exists():
+        return []
+    actor = _schema_migration_actor()
+    with contextlib.closing(_connect(target, write=False)) as connection:
+        present = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if not {"esl_operations", "esl_events"} <= present:
+            return []
+        out = []
+        for op in connection.execute("SELECT id, engagement_key, schema_version FROM esl_operations ORDER BY id"):
+            counts = {
+                row["kind"]: int(row["n"]) for row in connection.execute(
+                    "SELECT kind, COUNT(*) AS n FROM esl_events WHERE operation_id=? AND actor_kind=? "
+                    "AND actor_name=? GROUP BY kind", (op["id"], actor.kind, actor.name),
+                )
+            }
+            out.append({
+                "engagement_key": op["engagement_key"],
+                "schema_version": int(op["schema_version"]),
+                "migrated_rows": {"retracted": counts.get("retract", 0), "pending": counts.get("update", 0)},
+            })
+        return out
+
+
+def _read_reconciliation(connection: sqlite3.Connection, operation_id: int) -> ReconciliationState:
+    row = connection.execute(
+        "SELECT task_cursor, held_tasks, callback_baseline FROM esl_reconciliation WHERE operation_id=?",
+        (operation_id,),
+    ).fetchone()
+    if row is None:
+        return ReconciliationState()
+    held = json.loads(row["held_tasks"] or "[]")
+    baseline = json.loads(row["callback_baseline"]) if row["callback_baseline"] is not None else None
+    return ReconciliationState(
+        task_cursor=int(row["task_cursor"]),
+        held_tasks=tuple(sorted({int(item) for item in held})),
+        callback_baseline={str(k): str(v) for k, v in baseline.items()} if isinstance(baseline, dict) else None,
+    )
+
+
+def _write_reconciliation(
+    connection: sqlite3.Connection, operation_id: int, update: ReconciliationUpdate, stamp: str
+) -> None:
+    current = _read_reconciliation(connection, operation_id)
+    cursor = current.task_cursor
+    if update.task_cursor is not None:
+        cursor = max(cursor, int(update.task_cursor))
+    held = (set(current.held_tasks) | {int(i) for i in update.held_added}) - {int(i) for i in update.held_resolved}
+    baseline = None if current.callback_baseline is None else dict(current.callback_baseline)
+    if baseline is None and update.callback_baseline_initial is not None:
+        baseline = {str(k): str(v) for k, v in update.callback_baseline_initial.items()}
+    if update.callback_baseline_entries:
+        baseline = dict(baseline or {})
+        baseline.update({str(k): str(v) for k, v in update.callback_baseline_entries.items()})
+    connection.execute(
+        "INSERT INTO esl_reconciliation (operation_id, task_cursor, held_tasks, callback_baseline, updated_at) "
+        "VALUES (?, ?, ?, ?, ?) ON CONFLICT(operation_id) DO UPDATE SET task_cursor=excluded.task_cursor, "
+        "held_tasks=excluded.held_tasks, callback_baseline=excluded.callback_baseline, updated_at=excluded.updated_at",
+        (operation_id, cursor, json.dumps(sorted(held)),
+         json.dumps(baseline, sort_keys=True) if baseline is not None else None, stamp),
+    )
+
+
 def _rollback(connection: sqlite3.Connection) -> None:
     try:
         if connection.in_transaction:
@@ -865,6 +1097,9 @@ def _apply_one(
     identity = mutation.identity or _identity_for(kind, payload)
     if not identity or identity in {":", "|"}:
         raise LedgerWriteFailed("ledger mutation has no row identity")
+    if kind == "hop" and _norm(payload.get("status")) not in _ROW_STATUSES:
+        # The ledger records progress only; a failed or blocked attempt belongs to the request attempt memory.
+        raise LedgerWriteFailed(f"hop status {payload.get('status')!r} is not a ledger row status")
     head = connection.execute(
         "SELECT * FROM esl_rows WHERE operation_id=? AND kind=? AND identity=?", (op["id"], kind, identity)
     ).fetchone()
@@ -930,14 +1165,43 @@ def _apply_one(
         "UPDATE esl_rows SET payload=?, revision=?, observed_revision=?, head_event_id=?, updated_at=? WHERE id=?",
         (encoded, new_revision, revision, event_id, stamp, row_id),
     )
+    if kind == "hop" and head["retraction_event_id"] and _is_admitted_achieved(payload, binding.engagement_key):
+        _lapse_attempt_record_retraction(connection, op["id"], row_id, int(head["retraction_event_id"]),
+                                         new_revision, revision, stamp)
     return ("applied", row_id, identity, new_revision)
+
+
+def _lapse_attempt_record_retraction(
+    connection: sqlite3.Connection, operation_id: int, row_id: int, retraction_event_id: int, row_revision: int,
+    revision: int, stamp: str,
+) -> None:
+    """A verified achievement supersedes the schema migration's retraction of a former attempt record.
+
+    Only that retraction lapses, as an appended undo event; an operator's retraction stays in force.
+    """
+    event = connection.execute(
+        "SELECT actor_kind, actor_name FROM esl_events WHERE id=?", (retraction_event_id,)
+    ).fetchone()
+    actor = _schema_migration_actor()
+    if event is None or (event["actor_kind"], event["actor_name"]) != (actor.kind, actor.name):
+        return
+    _insert_event(
+        connection, operation_id, row_id, f"schema-migration:lapse:{row_id}:{retraction_event_id}",
+        "undo_retraction", actor, stamp, reason=SCHEMA_MIGRATION_LAPSE_REASON,
+        target_event_id=retraction_event_id, row_revision=row_revision, revision=revision,
+    )
+    connection.execute("UPDATE esl_rows SET retraction_event_id=NULL WHERE id=?", (row_id,))
 
 
 _METADATA_KEYS = ("number", "row_id", "revision", "corrections")
 
 
 def _payload_without_metadata(payload: Mapping[str, Any]) -> dict:
-    return {k: v for k, v in dict(payload).items() if k not in _METADATA_KEYS}
+    out = {k: v for k, v in dict(payload).items() if k not in _METADATA_KEYS}
+    if not out.get("pending_reason"):
+        # Only pending rows carry a reason; an empty one is not part of the stored row.
+        out.pop("pending_reason", None)
+    return out
 
 
 def _identity_for(kind: str, payload: Mapping[str, Any]) -> str:
@@ -1088,7 +1352,7 @@ class LedgerSnapshot:
     def runtime_hop_dicts(self, *, ttl_hours: float = 0, now: str = "") -> tuple[list[dict], list[dict]]:
         """(eligible, ineligible) hop dicts for runtime use.
 
-        Achieved rows without an admissible proof envelope are quarantined to ``legacy_unverified`` in this view
+        Achieved rows without an admissible proof envelope read as ``pending`` / ``proof_missing`` in this view
         only. A row with an effective retraction or "no longer holds" marker, or past the configured hop TTL, is
         ineligible: it stays visible to renderers, but no gate, selector or completion decision may use it.
         """
@@ -1378,13 +1642,13 @@ def import_legacy_file(
                 "INSERT INTO esl_operations (mythic_operation_id, marker_uuid, engagement_key, display_name, "
                 "schema_version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (identity["operation_id"], identity["marker_uuid"], key, identity["name"].replace("_", " "),
-                 SCHEMA_VERSION, stamp, stamp),
+                 LEGACY_ROW_SCHEMA_VERSION, stamp, stamp),
             )
         else:
             cursor = connection.execute(
                 "INSERT INTO esl_operations (namespace, engagement_key, display_name, schema_version, created_at, "
                 "updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (key, key, key, SCHEMA_VERSION, stamp, stamp),
+                (key, key, key, LEGACY_ROW_SCHEMA_VERSION, stamp, stamp),
             )
         op_id = int(cursor.lastrowid)
         revision = 1
@@ -1471,6 +1735,9 @@ def import_legacy_file(
             "numbering_mode) VALUES (?, ?, ?, ?, ?, 'preserved')",
             (str(path), digest, op_id, MIGRATION_VERSION, stamp),
         )
+        # The imported rows keep their historical statuses in the import events; the schema migration then
+        # appends the current-schema events in the same transaction.
+        _migrate_operation(connection, op_id, stamp)
     return "imported"
 
 
@@ -1620,6 +1887,10 @@ def copy_ledger_tables(source: str | Path, destination: str | Path) -> dict[str,
         columns = {
             table: [row[1] for row in reader.execute(f"PRAGMA table_info({table})")] for table in ESL_TABLES
         }
+        optional = [table for table in OPTIONAL_ESL_TABLES if table in present]
+        for table in optional:
+            data[table] = reader.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+            columns[table] = [row[1] for row in reader.execute(f"PRAGMA table_info({table})")]
         sequences = reader.execute(
             "SELECT name, seq FROM sqlite_sequence WHERE name IN (%s)" % ",".join("?" * len(ESL_TABLES)),
             ESL_TABLES,
@@ -1631,7 +1902,7 @@ def copy_ledger_tables(source: str | Path, destination: str | Path) -> dict[str,
             for table in ESL_TABLES:
                 if writer.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone():
                     raise LedgerImportError(f"destination {dst} already holds {table} rows")
-            for table in ESL_TABLES:
+            for table in (*ESL_TABLES, *optional):
                 cols = columns[table]
                 placeholders = ",".join("?" * len(cols))
                 writer.executemany(

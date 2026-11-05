@@ -68,10 +68,10 @@ def test_quarantine_keeps_admitted_proof_and_demotes_unproven_rows():
     proven = el.quarantine_hop(_achieved(_proof("e")), "e")
     assert proven["status"] == "achieved"
     unproven = el.quarantine_hop(_achieved(), "e")
-    assert unproven["status"] == "legacy_unverified"
+    assert (unproven["status"], unproven["pending_reason"]) == ("pending", "proof_missing")
     assert unproven["evidence"]["proof_admission_reason"] == "missing proof envelope"
     other_operation = el.quarantine_hop(_achieved(_proof("other")), "e")
-    assert other_operation["status"] == "legacy_unverified"
+    assert (other_operation["status"], other_operation["pending_reason"]) == ("pending", "proof_missing")
 
 
 def test_hop_label():

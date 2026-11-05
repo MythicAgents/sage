@@ -312,4 +312,4 @@ def test_runtime_record_effect_result_and_achieved_effects_reject_disallowed_ori
             {"proof_envelope": _disallowed_envelope(origin)}, NOW,
         )
     assert state.achieved_effects() == set()
-    assert all(hop.status == "legacy_unverified" for hop in state.hops)
+    assert all((hop.status, hop.pending_reason) == ("pending", "proof_missing") for hop in state.hops)

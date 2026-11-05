@@ -768,10 +768,12 @@ def test_an_achieved_capability_row_names_its_full_host_and_unique_alias(capabil
 
 @pytest.mark.parametrize("capability", list(_HOST_CAPABILITIES))
 @pytest.mark.parametrize("probe, runtime_scoped, status", [
-    ({"callback_id": "3", "target_host": "ws01", "target_domain": CHILD}, False, "failed"),
-    ({"access_denied": True, "callback_id": "3", "target_host": "ws01", "target_domain": CHILD}, False, "blocked"),
-    ("proven-without-domain", False, "failed"),          # a partial verdict, recorded as failed
-    ("proven", True, "legacy_unverified"),               # runtime scope without admissible proof
+    # A failed, blocked or partial verdict writes no row (it is a request attempt); an achievement without
+    # admissible proof is a pending row with proof missing.
+    ({"callback_id": "3", "target_host": "ws01", "target_domain": CHILD}, False, None),
+    ({"access_denied": True, "callback_id": "3", "target_host": "ws01", "target_domain": CHILD}, False, None),
+    ("proven-without-domain", False, None),
+    ("proven", True, "pending"),                         # runtime scope without admissible proof
 ], ids=["failed", "blocked", "partial", "unadmitted"])
 def test_a_row_that_did_not_achieve_its_effect_names_no_host(capability, probe, runtime_scoped, status):
     proven = _HOST_CAPABILITIES[capability][1]
@@ -782,7 +784,7 @@ def test_a_row_that_did_not_achieve_its_effect_names_no_host(capability, probe, 
     state = es.EngagementState(objective="synthetic", engagement_id="eng-1", runtime_scope=True) \
         if runtime_scoped else None
     hops = _recorded(capability, verifier_input=probe, state=state)
-    assert [hop.status for hop in hops] == [status]
+    assert [hop.status for hop in hops] == ([status] if status else [])
 
     scope = _scope(FOLLOW_UP, _engagement_hops=hops)
 

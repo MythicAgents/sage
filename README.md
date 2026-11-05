@@ -436,7 +436,7 @@ the token has no read scope for.
 |---|---|
 | `/state` | Show the [engagement ledger](#the-engagement-ledger) — the durable hop table of proven effects shared by chats in the current Mythic operation engagement |
 | `/state objective <text>` | Set the engagement objective |
-| `/state reconcile [task_id] [apply]` | Record verified effects from completed Mythic tasks; credential import is **dry-run unless `apply`** is given, because task output is attacker-influenceable |
+| `/state reconcile [<id>[,<id>…]] [apply]` | Record verified effects from the operation's completed Mythic tasks, from any issuer, or from the cited task IDs and `cred:<id>` entries; credential import is **dry-run unless `apply`** is given, because task output is attacker-influenceable |
 | `/state remove <#>[,…] [--reason <text>]` · `/state restore <#>[,…]` · `/state invalidate <#>[,…]` | Retract a row, undo a retraction, or mark a row "no longer holds", by hop number (the `#` column) or hop id. Rows are kept and numbered; you cannot hand-promote a row to `achieved` — that needs a real proof envelope |
 | `/state wipe` | Retract every row and every current graph fact; nothing is deleted or renumbered |
 | `/mode [conversation\|supervised\|auto]` | Show or switch the channel's mode |

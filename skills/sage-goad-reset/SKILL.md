@@ -175,6 +175,12 @@ names no operation (`default`, `<Name>_<id>` without a marker) need `--map FILE=
 Evaluator `ground_truth_probes` stay in the retained source; new evaluator observations are written under
 `SAGE_EVAL_OBSERVATIONS_DIR` (default `.hillclimb/evaluator-observations`), never into the runtime ledger.
 
+Ledger rows carry only `achieved` or `pending`. When Sage first opens a database from an earlier schema, it
+migrates each operation once: a stored `failed` or `blocked` row is retracted as an attempt record (number and
+history kept), and a `legacy_unverified` row becomes `pending` (proof missing). Archive the database with the
+reset's archive script before that first start. `status` reports each operation's schema version and migrated
+row counts without changing anything.
+
 3. Reset and restart Mythic. This uses the Docker-backed Mythic CLI without `sudo`:
 
 ```bash

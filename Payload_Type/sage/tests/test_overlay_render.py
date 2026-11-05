@@ -46,7 +46,7 @@ def _state():
         footholds=[_foothold()],
         hops=[
             _hop("gpo-abuse", "WINTERFELL", "system:winterfell", "achieved"),
-            _hop("dcsync", "essos.local", "krbtgt-hash:essos.local", "failed"),
+            _hop("dcsync", "essos.local", "krbtgt-hash:essos.local", "pending"),
         ],
     )
 
@@ -58,7 +58,7 @@ def test_render_engagement_state_compactly_reports_live_state_and_hops():
     assert "WINTERFELL" in output
     assert "north.local" in output
     assert "gpo-abuse → WINTERFELL" in output
-    assert "dcsync → essos.local" in output
+    assert "pending (awaiting effect): dcsync → essos.local" in output
     assert len(output) <= 1600
 
 

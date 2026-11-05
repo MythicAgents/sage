@@ -11,6 +11,8 @@ from pathlib import Path
 import re
 
 _FILENAME_SAFE = re.compile(r"[^A-Za-z0-9._-]")
+# Actor of the one-time schema migration that retracts stored failed/blocked rows as attempt records.
+SCHEMA_MIGRATION_ACTOR = "system:schema-migration"
 
 
 def default_engagement_id() -> str:
@@ -76,10 +78,34 @@ def save_file(data: dict, path) -> str:
     return str(target)
 
 
+def status_label(hop) -> str:
+    """A row's status for display: ``achieved``, ``pending (awaiting effect)`` or ``pending (proof missing)``.
+
+    Rows stored before the two-status schema keep their historical status word in history views.
+    """
+    if isinstance(hop, dict):
+        status, reason = hop.get("status"), hop.get("pending_reason")
+    else:
+        status, reason = getattr(hop, "status", ""), getattr(hop, "pending_reason", "")
+    status = str(status or "").strip() or "-"
+    if status.casefold() != "pending":
+        return status
+    reason = str(reason or "").strip().casefold() or "awaiting_effect"
+    return f"pending ({reason.replace('_', ' ')})"
+
+
+def is_attempt_record_retraction(corrections) -> bool:
+    """Whether a row's retraction is the schema migration's: a former failed/blocked attempt record."""
+    retracted = corrections.get("retracted") if isinstance(corrections, dict) else None
+    return isinstance(retracted, dict) and str(retracted.get("actor") or "") == SCHEMA_MIGRATION_ACTOR
+
+
 def correction_label(hop: dict) -> str:
     """``achieved — operator retracted`` style presentation of a row's status plus its effective correction."""
-    status = str(hop.get("status") or "-") if isinstance(hop, dict) else "-"
+    status = status_label(hop) if isinstance(hop, dict) else "-"
     corrections = hop.get("corrections") if isinstance(hop, dict) and isinstance(hop.get("corrections"), dict) else {}
+    if is_attempt_record_retraction(corrections):
+        return f"{status} — retracted attempt record"
     if corrections.get("retracted"):
         return f"{status} — operator retracted"
     marker = corrections.get("no_longer_holds") if isinstance(corrections.get("no_longer_holds"), dict) else {}
@@ -177,7 +203,7 @@ def hop_proof_admission(hop: dict, engagement_id: str) -> tuple[bool, str]:
 
 
 def quarantine_hop(hop: dict, engagement_id: str) -> dict:
-    """In a runtime view only: an ``achieved`` row without admissible proof reads as ``legacy_unverified``.
+    """In a runtime view only: an ``achieved`` row without admissible proof reads as ``pending`` / ``proof_missing``.
 
     The stored historical row is unchanged; this never turns a historical row into live proof.
     """
@@ -186,7 +212,8 @@ def quarantine_hop(hop: dict, engagement_id: str) -> dict:
     admitted, reason = hop_proof_admission(hop, engagement_id)
     if admitted:
         return hop
-    hop["status"] = "legacy_unverified"
+    hop["status"] = "pending"
+    hop["pending_reason"] = "proof_missing"
     evidence = dict(hop.get("evidence") if isinstance(hop.get("evidence"), dict) else {})
     evidence["proof_persistence_state"] = "legacy_unverified"
     evidence["proof_admission_reason"] = reason
@@ -259,7 +286,9 @@ def correction_notes(hops, *, limit: int = 0) -> list[str]:
     for hop in rows:
         corrections = hop.get("corrections") or {}
         marker = corrections.get("retracted") or corrections.get("no_longer_holds") or {}
-        what = "operator retracted" if corrections.get("retracted") else (
+        what = "attempt record, not progress" if is_attempt_record_retraction(corrections) else (
+            "operator retracted"
+        ) if corrections.get("retracted") else (
             "operator marked no longer holds" if marker.get("scope") == "operator" else "no longer holds (Sage observation)"
         )
         reason = md_cell(marker.get("reason") or "", 80)

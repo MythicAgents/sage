@@ -36,6 +36,9 @@ class Hop:
     source: str
     timestamp: str
     proof_envelope: dict = field(default_factory=dict)
+    # Why a ``pending`` row is not achieved: ``awaiting_effect`` (a setup waiting for its effect, such as a GPO
+    # write waiting for SYSTEM execution) or ``proof_missing`` (an achievement that failed proof admission).
+    pending_reason: str = ""
     # Store metadata (engagement_store): the permanent display number, internal row id, current row revision
     # and the row's correction state. Writers never set these; they round-trip so no path renumbers a row.
     number: int = 0
@@ -88,6 +91,10 @@ class EngagementState:
     # Rows that are history but not current proof (retracted, no longer holding, expired). Renderers show them;
     # nothing else reads them.
     corrected_hops: list[Hop] = field(default_factory=list)
+    # Capability attempts in the current request that did not achieve their effect (request_attempts.Attempt).
+    # Runtime retry and recovery decisions read only this, never ESL row status. Like the account contexts
+    # above, it belongs to the MythicTools session and is never persisted with the ledger.
+    request_attempts: tuple = ()
 
     def achieved_effects(self) -> set[str]:
         """Return normalized effects from achieved hops."""
@@ -721,7 +728,17 @@ TECHNIQUE_MODEL: dict[str, dict] = {
 }
 
 _ADMIN_INTEGRITY = {"admin", "administrator", "elevated", "high", "system"}
-_HOP_STATUSES = {"achieved", "failed", "blocked", "pending", "legacy_unverified"}
+# The ESL records progress only. A failed or blocked attempt is request attempt memory, not a row.
+_HOP_STATUSES = {"achieved", "pending"}
+PENDING_REASONS = ("awaiting_effect", "proof_missing")
+
+
+def _ledger_format():
+    try:
+        from . import engagement_ledger
+    except ImportError:  # pragma: no cover
+        import engagement_ledger  # type: ignore
+    return engagement_ledger
 
 
 _OBJECTIVE_DOMAIN_RE = r"[a-z0-9][a-z0-9.-]*\.[a-z]{2,}"
@@ -1138,6 +1155,7 @@ def record_hop_result(
     proof_envelope: dict | None = None,
     require_admissible_proof: bool = False,
     engagement_id: str = "",
+    pending_reason: str = "",
 ) -> EngagementState:
     """Return state with a hop result appended or updated by technique and target."""
     effect = _technique_effect(technique, target)
@@ -1155,6 +1173,7 @@ def record_hop_result(
         proof_envelope=proof_envelope,
         require_admissible_proof=require_admissible_proof,
         engagement_id=engagement_id,
+        pending_reason=pending_reason,
     )
 
 
@@ -1171,16 +1190,24 @@ def record_effect_result(
     proof_envelope: dict | None = None,
     require_admissible_proof: bool = False,
     engagement_id: str = "",
+    pending_reason: str = "",
 ) -> EngagementState:
     """Return state with an explicit effect recorded.
 
     This is the generic counterpart to ``record_hop_result``. It lets capability
     code record effects that are not part of the legacy STRIPS technique model
     while preserving the same hop ledger/update semantics.
+
+    Rows carry only ``achieved`` or ``pending``. A ``pending`` row names why: ``awaiting_effect`` by default,
+    or ``proof_missing`` when an achievement fails proof admission (its evidence and admission reason are kept).
+    Failed and blocked outcomes are attempts for the request attempt memory and are rejected here.
     """
     normalized_status = _normalize_key(status)
     if normalized_status not in _HOP_STATUSES:
-        raise ValueError(f"invalid hop status: {status!r}")
+        raise ValueError(f"invalid hop status: {status!r} (the ledger records only achieved or pending rows)")
+    normalized_reason = _normalize_key(pending_reason)
+    if normalized_reason and normalized_reason not in PENDING_REASONS:
+        raise ValueError(f"invalid pending reason: {pending_reason!r}")
     require_admissible_proof = bool(require_admissible_proof or getattr(state, "runtime_scope", False))
     engagement_id = _text(engagement_id or getattr(state, "engagement_id", ""))
 
@@ -1231,7 +1258,16 @@ def record_effect_result(
             evidence_dict["proof_admission_reason"] = "proof admission failed closed"
     if require_admissible_proof and normalized_status == "achieved":
         if admission is None or not admission.admitted:
-            normalized_status = "legacy_unverified"
+            normalized_status = "pending"
+            normalized_reason = "proof_missing"
+            evidence_dict.setdefault(
+                "proof_admission_reason",
+                getattr(admission, "reason", "") or "proof admission failed closed",
+            )
+    if normalized_status == "pending":
+        normalized_reason = normalized_reason or "awaiting_effect"
+    else:
+        normalized_reason = ""
     source = _text(evidence_dict.get("source")) if isinstance(evidence_dict, dict) else ""
     hop = Hop(
         id=_hop_id(technique, target),
@@ -1245,6 +1281,7 @@ def record_effect_result(
         source=source or "record_effect_result",
         timestamp=now,
         proof_envelope=proof_dict,
+        pending_reason=normalized_reason,
     )
 
     updated = False
@@ -1271,6 +1308,7 @@ def record_effect_result(
             getattr(state, "current_account_contexts", frozenset()) or ()
         ),
         corrected_hops=list(getattr(state, "corrected_hops", []) or []),
+        request_attempts=tuple(getattr(state, "request_attempts", ()) or ()),
     )
 
 
@@ -1772,7 +1810,6 @@ def render_engagement_state(state: EngagementState) -> str:
 
         achieved_hops = []
         pending_hops = []
-        blocked_hops = []
         for hop in _render_items(getattr(state, "hops", [])):
             status = _normalize_key(getattr(hop, "status", ""))
             technique = _render_value(getattr(hop, "technique", "")) or "(unknown technique)"
@@ -1794,14 +1831,14 @@ def render_engagement_state(state: EngagementState) -> str:
             elif status == "pending":
                 if _pending_hop_superseded(state, hop):
                     continue
-                pending_hops.append((sort_key, f"- pending: {technique} → {target}: {effect}"))
-            elif status in {"failed", "blocked", "legacy_unverified"}:
-                blocked_hops.append((sort_key, f"- {status}: {technique} → {target}: {effect}"))
+                pending_hops.append((sort_key, f"- {_ledger_format().status_label(hop)}: {technique} → {target}: {effect}"))
 
         corrected_lines = []
         for hop in _render_items(getattr(state, "corrected_hops", [])):
             corrections = getattr(hop, "corrections", {}) or {}
-            if corrections.get("retracted"):
+            if _ledger_format().is_attempt_record_retraction(corrections):
+                label = "retracted attempt record"
+            elif corrections.get("retracted"):
                 label = "operator retracted"
             elif (corrections.get("no_longer_holds") or {}).get("effective"):
                 label = "no longer holds"
@@ -1849,10 +1886,6 @@ def render_engagement_state(state: EngagementState) -> str:
         if pending_hops:
             lines.append("Pending hops:")
             lines.extend(item for _, item in sorted(pending_hops, key=lambda item: item[0]))
-        if blocked_hops:
-            lines.append("Failed/blocked hops:")
-            lines.extend(item for _, item in sorted(blocked_hops, key=lambda item: item[0]))
-
         if corrected_lines:
             lines.append("Corrected hops (history, not current proof):")
             lines.extend(item for _, item in sorted(corrected_lines, key=lambda item: item[0]))
@@ -1865,7 +1898,7 @@ def render_engagement_state(state: EngagementState) -> str:
                     seen_path_lines.add(item)
                     lines.append(item)
 
-        if not live_footholds and not achieved_hops and not blocked_hops and not path_lines and not corrected_lines:
+        if not live_footholds and not achieved_hops and not pending_hops and not path_lines and not corrected_lines:
             lines.append("(no observed state yet)")
 
         return _render_bounded("\n".join(lines))
@@ -1954,6 +1987,7 @@ def hops_from_dicts(items: Any) -> list["Hop"]:
                 source=_text(d.get("source")),
                 timestamp=_text(d.get("timestamp")),
                 proof_envelope=dict(d["proof_envelope"]) if isinstance(d.get("proof_envelope"), dict) else {},
+                pending_reason=_normalize_key(d.get("pending_reason")),
                 number=_int_field(d.get("number")),
                 row_id=_int_field(d.get("row_id")),
                 revision=_int_field(d.get("revision")),

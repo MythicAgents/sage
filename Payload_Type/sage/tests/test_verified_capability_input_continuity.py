@@ -240,8 +240,8 @@ def test_an_export_proved_for_another_engagement_is_never_the_proved_input(monke
     mt._ledger_binding = mt._ledger_store().bind_namespace("another-engagement")
     mt._engagement_key = mt._ledger_binding.engagement_key
     seed_ledger(mt, hops=exported, prove=False)
-    assert [h.status for h in mt._engagement_hops if str(h.effect).startswith("adcs-ca-private-key:")] == [
-        "legacy_unverified"]
+    assert [(h.status, h.pending_reason) for h in mt._engagement_hops
+            if str(h.effect).startswith("adcs-ca-private-key:")] == [("pending", "proof_missing")]
     staged = _stage_recorder(mt, monkeypatch)
 
     result, _ = _cert_auth(mt, {"ca_pfx_password": CA_PASSWORD, "ca_pfx_path": GUESSED,

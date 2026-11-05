@@ -41,7 +41,7 @@ up front rather than failing mid-run.
 | `/watcher interval <seconds>` · `/watcher interval default` | From the exact owner only, persist cadence for the applied profile; accepted range is 5–86,400 integer seconds |
 | `/state` | Show the [engagement ledger](/agents/sage/engagement-ledger/) — the hop table of proven effects shared by every channel of this operation |
 | `/state objective <text>` | Set the engagement objective |
-| `/state reconcile [task_id] [apply]` | Record verified effects from completed Mythic tasks; credential import is dry-run unless `apply` is given |
+| `/state reconcile [<id>[,<id>…]] [apply]` | Record verified effects from the operation's completed Mythic tasks, from any issuer, or from the cited task IDs and `cred:<id>` entries; credential import is dry-run unless `apply` is given |
 | `/state remove <#>[,…] [--reason <text>]` · `/state restore <#>[,…]` · `/state invalidate <#>[,…]` | Retract a row, undo a retraction, or mark a row "no longer holds", by hop number (the `#` column) or hop id. Rows are kept and numbered; you cannot hand-promote a row to `achieved` |
 | `/state wipe` | Retract every row and every current graph fact; nothing is deleted or renumbered |
 | `/mode [conversation\|supervised\|auto]` | Show or switch the channel's mode |

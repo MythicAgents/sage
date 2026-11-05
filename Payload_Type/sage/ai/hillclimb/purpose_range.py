@@ -15,7 +15,7 @@ from typing import Any
 
 try:
     from . import frontier_census
-    from ..langgraph import capabilities, engagement_state, policy
+    from ..langgraph import capabilities, engagement_state, policy, request_attempts
 except Exception:
     import sys
     from pathlib import Path
@@ -25,6 +25,7 @@ except Exception:
     import frontier_census  # type: ignore
     import capabilities  # type: ignore
     import engagement_state  # type: ignore
+    import request_attempts  # type: ignore
     import policy  # type: ignore
 
 
@@ -231,17 +232,15 @@ def _blocked_state(
     }
     effects = list(getattr(action, "effects", None) or [])
     effect = effects[0] if effects else f"blocked:{getattr(action, 'name', 'action')}"
-    return engagement_state.record_effect_result(
-        state,
-        f"purpose-range:{getattr(action, 'name', 'action')}",
-        str(getattr(action, "target", "") or ""),
-        effect,
-        "blocked",
-        evidence,
-        _now(),
-        preconditions=list(getattr(action, "preconditions", None) or []),
+    # A blocked step is a request attempt, not a ledger row.
+    return request_attempts.with_attempts(state, request_attempts.make_attempt(
+        technique=f"purpose-range:{getattr(action, 'name', 'action')}",
+        target=str(getattr(action, "target", "") or ""),
+        effect=effect,
         satisfied_effects=effects or [effect],
-    )
+        verdict="blocked",
+        evidence=evidence,
+    ))
 
 
 def validate_purpose_range() -> dict[str, Any]:
@@ -291,9 +290,9 @@ def validate_purpose_range() -> dict[str, Any]:
         "passes": (
             blocked_action is not None
             and any(item["name"] == "read-managed-local-admin-secret" for item in post_blocker_frontier)
-            and any(
-                getattr(hop, "evidence", {}).get("defender_blocked") is True
-                for hop in blocked_state.hops
+            and any(  # the blocker is a request attempt, never a ledger row
+                getattr(attempt, "evidence", {}).get("defender_blocked") is True
+                for attempt in blocked_state.request_attempts
             )
         ),
     }

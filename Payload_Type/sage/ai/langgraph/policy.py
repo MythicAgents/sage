@@ -182,15 +182,27 @@ def _normalized_state_payload(state: Any) -> dict[str, Any]:
             for item in values("graph_facts")
             if str(getattr(item, "predicate", item) or "")
         ),
+        # Ledger rows (progress) followed by the current request's failed attempts, which are not rows.
         "recent_outcomes": [
-            {
-                "capability": str(getattr(item, "technique", "") or ""),
-                "target": str(getattr(item, "target", "") or ""),
-                "effect": str(getattr(item, "effect", "") or ""),
-                "status": str(getattr(item, "status", "") or ""),
-            }
-            for item in values("hops")[-12:]
-        ],
+            *(
+                {
+                    "capability": str(getattr(item, "technique", "") or ""),
+                    "target": str(getattr(item, "target", "") or ""),
+                    "effect": str(getattr(item, "effect", "") or ""),
+                    "status": str(getattr(item, "status", "") or ""),
+                }
+                for item in values("hops")
+            ),
+            *(
+                {
+                    "capability": str(getattr(item, "technique", "") or ""),
+                    "target": str(getattr(item, "target", "") or ""),
+                    "effect": str(getattr(item, "effect", "") or ""),
+                    "status": "blocked" if str(getattr(item, "verdict", "") or "") == "blocked" else "failed",
+                }
+                for item in values("request_attempts")
+            ),
+        ][-12:],
     }
 
 

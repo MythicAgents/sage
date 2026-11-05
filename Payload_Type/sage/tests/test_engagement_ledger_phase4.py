@@ -14,19 +14,22 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from ai.langgraph import capabilities, engagement_state
+from ai.langgraph import access_reconciler, capabilities, engagement_state
+from ai.langgraph import controller_recovery, engagement_ledger, engagement_store
 from ai.langgraph import model as model_module
 from ai.langgraph import mythic_tools as mythic_tools_module
 from ai.langgraph import state_reconcile as sr
 from ai.langgraph.mythic_tools import MythicTools
 from ai.langgraph.request_contract import build_request_contract
-from tests.esl_fixtures import ingest_proof, seed_ledger
+from ai.langgraph.turn_authority import authority_from_request_contract
+from tests.esl_fixtures import channel34_ledger, ingest_proof, seed_ledger, stub_mythic_operation, write_legacy_ledger
 
 ENGAGEMENT = "eng-phase4"
 DOMAIN = "sevenkingdoms.local"
@@ -71,16 +74,19 @@ def _session(name: str, channel: int, request: int) -> MythicTools:
 @pytest.fixture
 def operation(monkeypatch):
     monkeypatch.setattr(mythic_tools_module, "SAGE_ENGAGEMENT_ID", ENGAGEMENT)
+
+    async def live_footholds(client, _now):  # Mythic transport stub: the session's callbacks are live
+        return list(client._engagement_footholds)
+
+    monkeypatch.setattr(access_reconciler, "reconcile_access", live_footholds)
     return _session
 
 
 def _frontier(tools: MythicTools) -> list:
-    """The capability frontier as the runtime builds it for this session's current request."""
-    view = tools._ledger_view()
-    state = engagement_state.EngagementState(
-        objective="", footholds=list(tools._engagement_footholds), hops=list(view.hops),
-        graph_facts=list(view.graph_facts), engagement_id=tools._eng_key(), runtime_scope=True,
-    )
+    """The capability frontier as the auto controller observes it for this session's current request."""
+    model = SimpleNamespace(mythic_client=tools)
+    state = asyncio.run(model_module.Model._build_current_engagement_state(model))
+    state.hops, state.graph_facts, state.corrected_hops = model_module._ledger_lists(tools)
     return capabilities.actions_from_state(state)
 
 
@@ -90,7 +96,7 @@ def _achieved(tools: MythicTools) -> set[str]:
     ).achieved_effects()
 
 
-# --- operator work from another channel -------------------------------------------------------------------------
+# --- operator work from another channel ----------------------------------------------------------------------------
 
 def _dcsync_task(display_id: int, callback: int) -> dict:
     return {
@@ -116,30 +122,8 @@ def _dcsync_output() -> str:
 
 @pytest.fixture
 def mythic_records(monkeypatch):
-    """Stub the Mythic transport readers the reconciliation uses with an operation's recorded tasks."""
-    records: dict[str, Any] = {"callbacks": [{"display_id": 13, "id": 13}], "tasks": [], "outputs": {}}
-
-    async def active_callbacks(client):
-        return records["callbacks"]
-
-    async def tasks(mythic=None, callback_display_id=None, **_kwargs):
-        return [t for t in records["tasks"] if callback_display_id in (None, t["callback_display_id"])]
-
-    async def task_by_id(client, task_id):
-        return next((t for t in records["tasks"] if t["display_id"] == task_id), {})
-
-    async def output(client, task_id):
-        return records["outputs"].get(task_id, "")
-
-    async def footholds(client):
-        return []
-
-    monkeypatch.setattr(sr.mythic, "get_all_active_callbacks", active_callbacks)
-    monkeypatch.setattr(sr.mythic, "get_all_tasks", tasks)
-    monkeypatch.setattr(sr, "_fetch_task_by_display_id", task_by_id)
-    monkeypatch.setattr(sr, "_fetch_task_output_text", output)
-    monkeypatch.setattr(sr, "_reconcile_state_footholds_from_client", footholds)
-    return records
+    """Serve the operation's recorded tasks, outputs, credentials and callbacks through stubbed Mythic transport."""
+    return stub_mythic_operation(monkeypatch)
 
 
 def _turn_end(tools: MythicTools) -> str:
@@ -147,7 +131,14 @@ def _turn_end(tools: MythicTools) -> str:
     return asyncio.run(model_module.Model._engagement_state_turn_summary_text(model))
 
 
-@pytest.mark.xfail(strict=True, reason="reproduction: fixed by operation-wide reconciliation (plan section 3)")
+def _position(tools: MythicTools) -> engagement_store.ReconciliationState:
+    return tools._ledger_store().reconciliation_state(tools._require_ledger_binding())
+
+
+def _rows(tools: MythicTools, effect_prefix: str) -> list:
+    return [hop for hop in tools._ledger_view().hops if hop.effect.startswith(effect_prefix)]
+
+
 def test_a_task_the_operator_ran_by_hand_is_recorded_at_the_next_turn_end(operation, mythic_records):
     channel_a = operation("channel-a", channel=3, request=1)
     mythic_records["tasks"] = [_dcsync_task(17, callback=13)]
@@ -157,12 +148,198 @@ def test_a_task_the_operator_ran_by_hand_is_recorded_at_the_next_turn_end(operat
 
     rows = [hop for hop in channel_a._engagement_hops if hop.effect == f"krbtgt-hash:{DOMAIN}"]
     assert [(hop.status, str(hop.evidence.get("mythic_task_id"))) for hop in rows] == [("achieved", "17")]
-    count = len(channel_a._ledger_snapshot().hop_rows)
+    count = len(channel_a._ledger_snapshot().hop_rows())
+    events = len(channel_a._ledger_store().export(channel_a._require_ledger_binding())["history"])
     _turn_end(channel_a)  # replaying the pass changes nothing
-    assert len(channel_a._ledger_snapshot().hop_rows) == count
+    assert len(channel_a._ledger_snapshot().hop_rows()) == count
+    channel_b = operation("channel-b", channel=4, request=1)
+    asyncio.run(channel_b._reconcile_operation(["17"]))  # another channel citing the same task adds nothing
+    assert len(channel_a._ledger_store().export(channel_a._require_ledger_binding())["history"]) == events
 
 
-# --- retry memory ends with the request (D18) -------------------------------------------------------------------
+# --- callback gains from any issuer ----------------------------------------------------------------------------
+
+def _callback_row(display_id: int, host: str, user: str, integrity: int, init: str) -> dict:
+    return {"display_id": display_id, "agent_callback_id": f"agent-{display_id}", "host": host, "user": user,
+            "integrity_level": integrity, "init_callback": init}
+
+
+def _task(display_id: int, command: str = "ps", *, callback: int = 13, status: str = "completed",
+          at: str = "2026-11-05T10:00:00", operation_id: int = 1, params: str = "") -> dict:
+    return {"display_id": display_id, "id": display_id, "operation_id": operation_id, "command_name": command,
+            "original_params": params, "status": status, "completed": status not in _RUNNING,
+            "timestamp": at, "operator": {"username": "operator_by_hand"},
+            "callback": {"display_id": callback, "host": "CASTELBLACK", "user": "samwell.tarly"}}
+
+
+_RUNNING = {"submitted", "processing", "preprocessing"}
+FOOTHOLD = _callback_row(13, "CASTELBLACK", "NORTH\\samwell.tarly", 2, "2026-11-05T09:00:00")
+
+
+def test_a_new_callback_spawned_by_another_channels_task_is_credited_to_that_task(operation, mythic_records):
+    tools = operation("channel-a", channel=3, request=1)
+    mythic_records["callbacks"] = [FOOTHOLD]
+    _turn_end(tools)  # the operation's first reconciliation stores the baseline
+    assert _position(tools).callback_baseline == {"13": "medium"} and _rows(tools, "session:") == []
+
+    mythic_records["tasks"] = [_task(20, "spawn", at="2026-11-05T10:00:00")]
+    mythic_records["callbacks"].append(_callback_row(21, "WINTERFELL", "NORTH\\eddard.stark", 3, "2026-11-05T10:01:00"))
+    _turn_end(tools)
+
+    rows = {hop.effect: hop for hop in _rows(tools, "session:") + _rows(tools, "admin:")}
+    assert set(rows) == {"session:north\\eddard.stark@winterfell", "admin:winterfell"}
+    assert {(hop.status, hop.evidence["mythic_task_id"], hop.evidence["credited_task"]) for hop in rows.values()} == {
+        ("achieved", "20", 20)}
+    assert _position(tools).callback_baseline == {"13": "medium", "21": "high"}
+
+
+def test_an_uncredited_callback_is_admitted_only_once_a_task_on_it_completes(operation, mythic_records):
+    tools = operation("channel-a", channel=3, request=1)
+    mythic_records["callbacks"] = [FOOTHOLD]
+    _turn_end(tools)
+    mythic_records["callbacks"].append(_callback_row(22, "MEEREEN", "ESSOS\\daenerys", 2, "2026-11-05T12:00:00"))
+    _turn_end(tools)
+    assert _rows(tools, "session:") == []  # nothing to credit and nothing completed on it
+
+    mythic_records["tasks"] = [_task(23, callback=22, status="submitted", at="2026-11-05T12:30:00")]
+    _turn_end(tools)
+    assert _rows(tools, "session:") == [] and _position(tools).held_tasks == (23,)
+
+    mythic_records["tasks"] = [_task(23, callback=22, at="2026-11-05T12:30:00")]
+    _turn_end(tools)
+    [row] = _rows(tools, "session:")
+    assert (row.effect, row.status, row.evidence["mythic_task_id"], row.evidence["credited_task"]) == (
+        "session:essos\\daenerys@meereen", "achieved", "23", "none")
+    assert _position(tools).held_tasks == () and _position(tools).task_cursor == 23
+
+
+@pytest.mark.parametrize("baseline, integrity, expected", [
+    (2, 4, ["system:castelblack"]), (2, 3, ["admin:castelblack"]), (2, 2, []), (2, 1, []),
+    (3, 3, []), (4, 4, []), (4, 3, []),
+])
+def test_an_integrity_rise_on_an_existing_callback_records_only_a_higher_level(operation, mythic_records, baseline,
+                                                                                 integrity, expected):
+    tools = operation("channel-a", channel=3, request=1)
+    mythic_records["callbacks"] = [{**FOOTHOLD, "integrity_level": baseline}]
+    _turn_end(tools)
+    mythic_records["tasks"] = [_task(25, "getsystem")]
+    mythic_records["callbacks"] = [{**FOOTHOLD, "integrity_level": integrity}]
+    _turn_end(tools)
+    assert [hop.effect for hop in _rows(tools, "system:") + _rows(tools, "admin:")] == expected
+
+
+# --- credential material from the operation --------------------------------------------------------------------
+
+def _store_credential(credential_id: int, task: dict | None, *, account: str = "svc_fixture",
+                      text: str = TGS_HASH, operation_id: int = 1) -> dict:
+    linked = None if task is None else {
+        "display_id": task["display_id"], "operation_id": task.get("operation_id", 1), "status": task["status"],
+        "completed": task["completed"], "command_name": task["command_name"], "original_params": task["original_params"],
+        "callback": {"display_id": task["callback"]["display_id"]}}
+    return {"id": credential_id, "operation_id": operation_id, "account": account, "realm": DOMAIN.upper(),
+            "type": "hash", "credential_text": text, "comment": "", "task": linked}
+
+
+KERBEROAST = json.dumps({"assembly_name": "Rubeus.exe", "assembly_arguments": "kerberoast /nowrap"})
+
+
+def test_a_task_linked_hash_from_any_issuer_is_material_and_opens_no_working_credential(operation, mythic_records):
+    tools = operation("channel-a", channel=3, request=1)
+    roast = _task(30, "execute_assembly", params=KERBEROAST)
+    mythic_records["tasks"] = [roast]
+    mythic_records["credentials"] = [_store_credential(41, roast)]
+    _turn_end(tools)
+
+    [row] = _rows(tools, "cred-material:")
+    assert (row.effect, row.status, row.evidence["mythic_task_id"]) == (
+        f"cred-material:hash:svc_fixture@{DOMAIN}", "achieved", "30")
+    assert f"creds:svc_fixture@{DOMAIN}" not in _achieved(tools)  # a working-credential precondition stays unmet
+
+
+def test_cited_ids_reply_one_line_each_with_the_row_or_the_reason(operation, mythic_records):
+    tools = operation("channel-a", channel=3, request=1)
+    roast = _task(30, "execute_assembly", params=KERBEROAST)
+    mythic_records["tasks"] = [_dcsync_task(17, callback=13) | {"operation_id": 1, "timestamp": ""}, roast,
+                               _task(31, status="submitted"), _task(32, operation_id=2)]
+    mythic_records["outputs"] = {17: _dcsync_output()}
+    mythic_records["credentials"] = [_store_credential(41, roast), _store_credential(42, None, account="hand")]
+
+    lines = asyncio.run(tools._reconcile_operation(["17", "30", "31", "32", "99", "cred:42"]))
+    assert lines[:6] == [
+        "- 17: added row #1.",
+        "- 30: added row #2.",
+        "- 31: not added, task not terminal.",
+        "- 32: not added, not in this operation.",
+        "- 99: not added, no such task.",
+        "- cred:42: not added, no producing task (a later action must prove it; not supported yet).",
+    ]
+    assert asyncio.run(tools._reconcile_operation(["17", "cred:41"]))[:2] == [
+        "- 17: already recorded (row #1).", "- cred:41: already recorded (row #2)."]
+    assert asyncio.run(tools._reconcile_operation(["5"]))[0] == "- 5: not added, no such task."
+    assert _position(tools).task_cursor == 0  # citations never move the cursor
+
+
+def test_near_matches_write_no_row(operation, mythic_records):
+    tools = operation("channel-a", channel=3, request=1)
+    elsewhere = _dcsync_task(40, callback=13) | {"operation_id": 2}
+    errored = _task(41, "execute_assembly", status="error: access denied", params=KERBEROAST)
+    other_op = _task(42, "execute_assembly", operation_id=2, params=KERBEROAST)
+    mythic_records["tasks"] = [elsewhere, errored, other_op, _task(43, status="processing")]
+    mythic_records["outputs"] = {40: _dcsync_output()}
+    mythic_records["credentials"] = [_store_credential(51, errored), _store_credential(52, other_op),
+                                     _store_credential(53, _task(41, "execute_assembly", operation_id=2,
+                                                                 params=KERBEROAST))]
+    _turn_end(tools)
+    assert tools._ledger_view().hops == [] and _position(tools).held_tasks == (43,)
+    assert asyncio.run(tools._reconcile_operation(["40", "cred:52", "cred:51"]))[:3] == [
+        "- 40: not added, not in this operation.",
+        "- cred:52: not added, the producing task is not in this operation.",
+        "- cred:51: not added, no proven gain (the producing task's lineage is incomplete)."]
+
+
+# --- the cursor ------------------------------------------------------------------------------------------------
+
+def test_a_task_that_never_finishes_does_not_stall_later_reconciliation(operation, mythic_records):
+    tools = operation("channel-a", channel=3, request=1)
+    # A task queued on a dead callback stays running; 50 per pass would otherwise re-read 100..149 forever.
+    mythic_records["tasks"] = ([_task(100, status="submitted")] + [_task(i) for i in range(101, 160)]
+                               + [_dcsync_task(160, callback=13) | {"operation_id": 1, "timestamp": ""}])
+    mythic_records["outputs"] = {160: _dcsync_output()}
+    _turn_end(tools)
+    assert (_position(tools).task_cursor, _position(tools).held_tasks) == (149, (100,))  # 50 per pass
+    assert _rows(tools, "krbtgt-hash:") == []
+    _turn_end(tools)
+    assert [hop.status for hop in _rows(tools, "krbtgt-hash:")] == ["achieved"]
+    assert (_position(tools).task_cursor, _position(tools).held_tasks) == (160, (100,))
+    mythic_records["tasks"][0] = _task(100)  # it finally completes: evaluated once and released
+    _turn_end(tools)
+    assert (_position(tools).task_cursor, _position(tools).held_tasks) == (160, ())
+
+
+def test_a_mythic_or_store_error_skips_the_pass_and_still_renders_the_ledger(operation, mythic_records, monkeypatch):
+    tools = operation("channel-a", channel=3, request=1)
+    seed_ledger(tools, hops=[{"id": "h1", "technique": "dcsync", "target": DOMAIN, "effect": f"krbtgt-hash:{DOMAIN}",
+                              "status": "achieved", "evidence": {"mythic_task_id": 5}, "preconditions": [],
+                              "satisfied_effects": [f"krbtgt-hash:{DOMAIN}"], "source": "test", "timestamp": _now()}])
+    mythic_records["tasks"] = [_dcsync_task(17, callback=13)]
+    mythic_records["outputs"] = {17: _dcsync_output()}
+    mythic_records["fail"] = True
+    text = _turn_end(tools)
+    assert "krbtgt-hash" in text and _position(tools).task_cursor == 0  # the stored rows, not an empty ledger
+
+    mythic_records["fail"] = False
+    store = tools._ledger_store()
+
+    def refuse(*args, **kwargs):
+        raise engagement_store.LedgerWriteFailed("disk full")
+
+    monkeypatch.setattr(store, "apply", refuse)
+    text = _turn_end(tools)
+    assert "krbtgt-hash" in text and _position(tools).task_cursor == 0
+    assert "disk full" in tools._ledger_last_write_error
+
+
+# --- retry memory ends with the request ----------------------------------------------------------------------------
 
 def _seed_gpo_control(tools: MythicTools) -> None:
     proof = ingest_proof(tools._eng_key(), task_id="101", job_id="11")
@@ -183,7 +360,6 @@ def _names(actions) -> set[tuple[str, str]]:
     return {(action.name, action.target) for action in actions}
 
 
-@pytest.mark.xfail(strict=True, reason="reproduction: fixed by per-request attempt memory (plan section 2)")
 def test_a_terminal_failure_suppresses_its_capability_only_for_the_rest_of_its_request(operation):
     channel_a = operation("channel-a", channel=3, request=1)
     _seed_gpo_control(channel_a)
@@ -199,9 +375,53 @@ def test_a_terminal_failure_suppresses_its_capability_only_for_the_rest_of_its_r
 
     channel_a.set_request_contract(_contract("chat:3:request:2", "channel-3"))
     assert (action.name, action.target) in _names(_frontier(channel_a))  # the next request: offered again
+    assert not any(hop.status in {"failed", "blocked"} for hop in channel_a._ledger_view().hops)  # no ESL row
 
 
-# --- credential material is not a working credential (D20) ------------------------------------------------------
+def _failed_once(operation):
+    tools = operation("channel-a", channel=3, request=1)
+    _seed_gpo_control(tools)
+    action = _frontier(tools)[0]
+    assert _record_terminal_failure(tools, action)
+    return tools, (action.name, action.target)
+
+
+def test_an_approval_resume_and_a_same_request_authority_change_keep_the_suppression(operation):
+    tools, key = _failed_once(operation)
+    # The approval resume reinstalls the same request; an authority change alters only the contract digest.
+    resumed = _contract("chat:3:request:1", "channel-3", mode="auto")
+    assert resumed.digest != tools._request_contract.digest
+    tools.set_request_contract(resumed)
+    assert key not in _names(_frontier(tools))
+
+
+def test_an_unbound_session_never_inherits_a_bound_request_attempt(operation):
+    tools, key = _failed_once(operation)
+    tools._request_contract = None  # a session with no bound request
+    assert tools._current_request_id() == "request:unbound"
+    assert key in _names(_frontier(tools))
+
+
+def test_a_recovered_auto_run_restores_its_attempts_and_an_old_journal_is_blocked(operation):
+    tools, key = _failed_once(operation)
+    resources = {"request_attempts": tools._request_attempts_payload()}
+
+    fresh = operation("channel-a-after-restart", channel=3, request=1)  # same original request ID
+    assert key in _names(_frontier(fresh))
+    model = SimpleNamespace(mythic_client=fresh)
+    model_module.Model._restore_controller_request_attempts(model, resources, "chat:3:request:1")
+    assert key not in _names(_frontier(fresh))
+
+    with pytest.raises(controller_recovery.RecoveryBlocked, match="missing"):
+        model_module.Model._restore_controller_request_attempts(model, {"policy_model_calls": 1}, "chat:3:request:1")
+    other = operation("channel-a-other-request", channel=3, request=2)
+    with pytest.raises(controller_recovery.RecoveryBlocked, match="not restorable"):
+        model_module.Model._restore_controller_request_attempts(
+            SimpleNamespace(mythic_client=other), resources, "chat:3:request:2"
+        )
+
+
+# --- credential material is not a working credential ---------------------------------------------------------------
 
 def _credential_task(display_id: int, command: str, params: dict) -> dict:
     return {"display_id": display_id, "status": "success", "completed": True, "command_name": command,
@@ -248,3 +468,380 @@ def test_a_dcsync_key_in_the_credential_store_stays_a_working_credential(operati
     })
 
     assert f"creds:eddard.stark@{DOMAIN}" in _achieved(tools)
+
+
+# --- the ledger records only achieved and pending rows ---------------------------------------------------------
+
+@pytest.mark.parametrize("status", ["failed", "blocked", "legacy_unverified"])
+def test_no_writer_can_record_an_attempt_status_as_a_row(operation, status):
+    tools = operation("channel-a", channel=3, request=1)
+    state = engagement_state.EngagementState(objective="", engagement_id=tools._eng_key(), runtime_scope=True)
+    with pytest.raises(ValueError, match="invalid hop status"):
+        engagement_state.record_effect_result(state, "dcsync", DOMAIN, f"krbtgt-hash:{DOMAIN}", status, {}, _now())
+    # The store refuses the status too, so no writer can bypass the reducer.
+    row = {"technique": "dcsync", "target": DOMAIN, "effect": f"krbtgt-hash:{DOMAIN}", "status": status}
+    with pytest.raises(engagement_store.LedgerWriteFailed, match="not a ledger row status"):
+        tools._ledger_store().apply(tools._require_ledger_binding(), engagement_store.hop_mutations([], [row]))
+    assert tools._ledger_snapshot().hop_rows() == []
+
+
+def test_a_pending_row_satisfies_no_precondition(operation):
+    tools = operation("channel-a", channel=3, request=1)
+    state = engagement_state.EngagementState(objective="", engagement_id=tools._eng_key(), runtime_scope=True)
+    for reason in ("awaiting_effect", "proof_missing"):
+        pending = engagement_state.record_effect_result(
+            state, "dcsync", DOMAIN, f"krbtgt-hash:{DOMAIN}", "pending", {}, _now(), pending_reason=reason)
+        assert pending.hops[0].pending_reason == reason
+        assert pending.achieved_effects() == set()
+        assert "forge-golden-ticket" not in {
+            action.name for action in capabilities.actions_from_state(
+                engagement_state.EngagementState(objective="", footholds=[_foothold()], hops=pending.hops))
+        }
+    with pytest.raises(ValueError, match="invalid pending reason"):
+        engagement_state.record_effect_result(
+            state, "dcsync", DOMAIN, f"krbtgt-hash:{DOMAIN}", "pending", {}, _now(), pending_reason="failed")
+
+
+def test_a_raw_task_that_does_not_prove_its_effect_is_a_request_attempt(operation):
+    tools = operation("channel-a", channel=3, request=1)
+    tools._pending_engagement_hop = ("dcsync", DOMAIN, _now())
+    tools._record_engagement_success("ERROR_DS_DRA_ACCESS_DENIED", task_id=55, callback_id="3",
+                                     terminal_status="completed", command="dcsync")
+    assert tools._ledger_snapshot().hop_rows() == []
+    [attempt] = tools._request_attempt_view()
+    assert (attempt.effect, attempt.terminal, attempt.task_id) == (f"krbtgt-hash:{DOMAIN}", True, "55")
+    tools.set_request_contract(_contract("chat:3:request:2", "channel-3"))
+    assert tools._request_attempt_view() == ()
+
+
+# --- stored rows are migrated once ------------------------------------------------------------------------------
+
+def _phase3_database(tmp_path, monkeypatch):
+    """A schema-1 store as the Phase 3 import wrote it: blocked, failed, legacy_unverified and achieved rows, plus
+    an operator retraction and a "no longer holds" marker."""
+    data = channel34_ledger("phase3-fixture")
+    data["hops"].append({**data["hops"][4], "number": 30, "id": "dcsync-user:x", "technique": "dcsync-user",
+                         "target": f"x@{NORTH}", "effect": f"creds:x@{NORTH}", "status": "failed",
+                         "satisfied_effects": [f"creds:x@{NORTH}"]})
+    data["hops"].append({**data["hops"][4], "number": 31, "id": "dcsync-user:y", "technique": "dcsync-user",
+                         "target": f"y@{NORTH}", "effect": f"creds:y@{NORTH}", "status": "failed",
+                         "satisfied_effects": [f"creds:y@{NORTH}"]})
+    data["next_hop_number"] = 32
+    legacy = tmp_path / "phase3-legacy"
+    source = write_legacy_ledger(legacy, data)
+    database = tmp_path / "phase3.db"
+    with monkeypatch.context() as patch:  # Phase 3 had no status migration
+        patch.setattr(engagement_store, "_migrate_operation", lambda *_args: {"retracted": 0, "pending": 0})
+        patch.setattr(engagement_store, "migrate_row_statuses", lambda _connection: {})
+        engagement_store.import_legacy_file(source, database=database)
+        store = engagement_store.EngagementStore(database, legacy_dir=str(legacy))
+        binding = store.find_binding("phase3-fixture")
+        operator = engagement_store.Actor(kind="operator", name="op")
+        store.retract(binding, ["31"], reason="operator removed", actor=operator)
+        store.invalidate(binding, ["25"], reason="password rotated", actor=operator)
+    assert engagement_store.schema_status(database)[0]["schema_version"] == 1
+    return database, legacy
+
+
+def _ledger_state(database, legacy):
+    store = engagement_store.EngagementStore(database, legacy_dir=str(legacy))
+    binding = store.bind_namespace("phase3-fixture")  # the first write transaction initializes the store
+    snapshot = store.snapshot(binding)
+    connection = sqlite3.connect(database)
+    events = connection.execute("SELECT id, row_id, kind, actor_name, reason FROM esl_events ORDER BY id").fetchall()
+    op = connection.execute("SELECT next_hop_number, schema_version FROM esl_operations").fetchone()
+    connection.close()
+    return store, binding, snapshot, events, op
+
+
+def test_store_initialization_migrates_each_legacy_status_once(tmp_path, monkeypatch):
+    database, legacy = _phase3_database(tmp_path, monkeypatch)
+    before = sqlite3.connect(database)
+    numbers_before = dict(before.execute("SELECT identity, number FROM esl_rows WHERE kind='hop'").fetchall())
+    facts_before = before.execute("SELECT identity, payload FROM esl_rows WHERE kind='graph_fact'").fetchall()
+    before.close()
+
+    store, binding, snapshot, events, op = _ledger_state(database, legacy)
+    rows = {row.number: row for row in snapshot.hop_rows()}
+    migration = [event for event in events if event[3] == "system:schema-migration"]
+    assert sorted((rows_by_id := {row.row_id: row.number for row in rows.values()})[event[1]] for event in migration) == [27, 28, 30]
+    assert {rows_by_id[event[1]]: (event[2], event[4]) for event in migration} == {
+        27: ("retract", "attempt record, not progress"),
+        28: ("update", "unverified achievement: proof missing"),
+        30: ("retract", "attempt record, not progress"),
+    }
+    assert rows[27].payload["status"] == "blocked" and rows[27].retraction["actor"] == "system:schema-migration"
+    assert rows[30].payload["status"] == "failed" and rows[30].retraction["actor"] == "system:schema-migration"
+    assert rows[31].retraction["actor"] == "op"  # the operator's retraction is kept, not replaced
+    assert (rows[28].payload["status"], rows[28].payload["pending_reason"]) == ("pending", "proof_missing")
+    assert rows[25].invalidation["reason"] == "password rotated" and rows[25].payload["status"] == "achieved"
+    assert op == (32, engagement_store.SCHEMA_VERSION)
+    after = sqlite3.connect(database)
+    assert dict(after.execute("SELECT identity, number FROM esl_rows WHERE kind='hop'").fetchall()) == numbers_before
+    assert after.execute("SELECT identity, payload FROM esl_rows WHERE kind='graph_fact'").fetchall() == facts_before
+    after.close()
+
+    # The runtime view shows the migrated rows as retracted attempt records, never as current failures.
+    eligible, ineligible = snapshot.runtime_hop_dicts()
+    assert not any(hop["status"] in {"failed", "blocked", "legacy_unverified"} for hop in eligible)
+    table = "\n".join(engagement_ledger.render_hop_table(snapshot.display_hops()))
+    assert "`blocked — retracted attempt record`" in table
+    assert "`pending (proof missing)`" in table
+    assert engagement_store.schema_status(database) == [{
+        "engagement_key": "phase3-fixture", "schema_version": engagement_store.SCHEMA_VERSION,
+        "migrated_rows": {"retracted": 2, "pending": 1},
+    }]
+
+    # A second initialization changes nothing.
+    _store, _binding, _snapshot, events_again, op_again = _ledger_state(database, legacy)
+    assert events_again == events and op_again == op
+
+
+def test_a_legacy_import_is_migrated_in_the_same_transaction(tmp_path):
+    legacy = tmp_path / "legacy"
+    source = write_legacy_ledger(legacy, channel34_ledger("imported-fixture"))
+    database = tmp_path / "imported.db"
+    assert engagement_store.import_legacy_file(source, database=database) == "imported"
+    [status] = engagement_store.schema_status(database)
+    assert status["schema_version"] == engagement_store.SCHEMA_VERSION
+    assert status["migrated_rows"] == {"retracted": 1, "pending": 1}
+
+
+# --- request-scoped windows follow the request ID; the session breakers do not ------------------------------------
+
+_ROTATION_FAIL = "[-] failed to parse arguments for ldap_query: ldap_query takes no command line arguments."
+_ROTATIONS = ({"user": "a"}, {"user": "b"}, {"user": "c"}, {"user": "d"})
+
+
+def _bind(tools: MythicTools, request: int, *, autonomous_solve: bool = True) -> None:
+    contract = build_request_contract(
+        request_id=f"chat:3:request:{request}", channel_id="channel-3", operation_id="operation-1",
+        mode="auto", autonomous_solve=autonomous_solve,
+    )
+    tools.set_request_contract(contract)
+    tools._turn_authority = authority_from_request_contract(contract)  # the final-sink projection of that request
+
+
+@pytest.fixture
+def mythic_issue(monkeypatch):
+    """Mythic transport stub for task issue: every task fails with ``output``; issued parameters are recorded."""
+    issued: list = []
+    output = {"text": _ROTATION_FAIL}
+
+    async def issue_task(mythic, command_name, parameters, callback_display_id, wait_for_complete=True, timeout=None):
+        issued.append((command_name, parameters))
+        return {"display_id": 4000 + len(issued)}
+
+    async def waitfor(mythic, task_display_id, timeout=None):
+        return output["text"]
+
+    monkeypatch.setattr(mythic_tools_module.mythic, "issue_task", issue_task)
+    monkeypatch.setattr(mythic_tools_module.mythic, "waitfor_for_task_output", waitfor)
+    return issued, output
+
+
+def _issue(tools: MythicTools, command: str, params, callback: int = 7) -> str:
+    return asyncio.run(tools.issue_task_and_waitfor_task_output(command, params, callback))
+
+
+def test_the_shape_window_follows_the_request_id_not_the_contract_digest(mythic_issue):
+    issued, _output = mythic_issue
+    tools = MythicTools(agent_task_id="shape-window")
+    tools.client = object()
+    _bind(tools, 1)
+    _issue(tools, "ldap_query", _ROTATIONS[0])
+    _issue(tools, "ldap_query", _ROTATIONS[1])
+    _bind(tools, 1, autonomous_solve=False)  # same request, different authority: a digest change only
+    kept = _issue(tools, "ldap_query", _ROTATIONS[2])
+    _bind(tools, 2)  # a new request
+    fresh = _issue(tools, "ldap_query", _ROTATIONS[3])
+    assert kept.startswith("STOP"), f"a same-request digest change must keep the window: {kept[:200]}"
+    assert not fresh.startswith("STOP"), f"a new request opens its own window: {fresh[:200]}"
+    assert len(issued) == 3
+
+
+def test_the_session_breaker_still_refuses_an_identical_failed_command_in_a_new_request(mythic_issue):
+    """Two identical failures in request 1, then a real new request binds on the same channel: the session
+    breaker keeps refusing the identical command, while request-scoped retry memory starts empty."""
+    issued, output = mythic_issue
+    output["text"] = "[-] failed to parse arguments for rev2self: rev2self takes no command line arguments."
+    tools = MythicTools(agent_task_id="session-breaker")
+    tools.client = object()
+    _bind(tools, 1)
+    _issue(tools, "rev2self", {}, 11)
+    _issue(tools, "rev2self", {}, 11)
+    _bind(tools, 2)
+    assert tools._request_attempt_view() == () and tools._request_shape_counts() == {}
+    again = _issue(tools, "rev2self", {}, 11)
+    assert again.startswith("STOP"), f"the session breaker must survive the request boundary: {again[:200]}"
+    assert len(issued) == 2
+
+
+# --- the reconciliation position in the store ------------------------------------------------------------------
+
+def test_the_store_moves_the_cursor_forward_and_never_drops_a_held_task(tmp_path):
+    store = engagement_store.EngagementStore(tmp_path / "sage.db", legacy_dir=str(tmp_path / "legacy"))
+    binding = store.bind_namespace("position")
+    assert store.reconciliation_state(binding) == engagement_store.ReconciliationState()
+    update = engagement_store.ReconciliationUpdate
+    store.apply(binding, [], reconciliation=update(task_cursor=20, held_added=(12, 15),
+                                                   callback_baseline_initial={"3": "medium"}))
+    store.apply(binding, [], reconciliation=update(task_cursor=18, held_added=(17,), held_resolved=(12,),
+                                                   callback_baseline_initial={"9": "system"}))  # a stale pass
+    store.apply(binding, [], reconciliation=update(callback_baseline_entries={"9": "high"}))
+    assert store.reconciliation_state(binding) == engagement_store.ReconciliationState(
+        task_cursor=20, held_tasks=(15, 17), callback_baseline={"3": "medium", "9": "high"})
+    assert store.snapshot(binding).revision == 0  # the position is not a ledger row change
+
+    copy = tmp_path / "copy.db"
+    engagement_store.copy_ledger_tables(tmp_path / "sage.db", copy)
+    copied = engagement_store.EngagementStore(copy, legacy_dir=str(tmp_path / "legacy"))
+    assert copied.reconciliation_state(copied.bind_namespace("position")).task_cursor == 20
+
+
+def test_a_store_from_before_the_position_table_reads_as_a_fresh_start(tmp_path):
+    database = tmp_path / "sage.db"
+    store = engagement_store.EngagementStore(database, legacy_dir=str(tmp_path / "legacy"))
+    binding = store.bind_namespace("old-store")
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP TABLE esl_reconciliation")
+    reader = engagement_store.EngagementStore(database, legacy_dir=str(tmp_path / "legacy"))
+    assert reader.reconciliation_state(binding) == engagement_store.ReconciliationState()
+
+
+# --- the real Mythic queries -----------------------------------------------------------------------------------
+
+def test_the_operation_queries_are_scoped_to_the_operation_and_bounded(monkeypatch):
+    seen: list[tuple[str, dict]] = []
+
+    async def query(client, text, variables=None):
+        seen.append((text, dict(variables or {})))
+        if "SageCitedTask" in text:
+            return {"task": [{"display_id": 7, "operation_id": 2}, {"display_id": 7, "operation_id": 1}]}
+        if "SageCitedCredential" in text:
+            return {"credential": [{"id": 4, "operation_id": 2}]}
+        if "SageCreditTasks" in text:
+            return {"window": [{"display_id": 5}], "on_callback": [{"display_id": 5}, {"display_id": 3}]}
+        return {"task": [], "credential": []}
+
+    monkeypatch.setattr(sr.mythic, "execute_custom_query", query)
+    asyncio.run(sr.fetch_operation_tasks(object(), 1, 40, [33, 31]))
+    text, variables = seen[-1]
+    assert "operation_id: {_eq: $op}" in text and "order_by: {display_id: asc}" in text
+    assert "callback { display_id host user domain " in text  # a dead callback's forest comes from its own row
+    assert variables == {"cursor": 40, "held": [31, 33], "limit": sr.PASS_LIMIT + 2, "op": 1}
+    assert asyncio.run(sr.fetch_cited_task(object(), 1, 7)) == ({"display_id": 7, "operation_id": 1}, "")
+    assert asyncio.run(sr.fetch_cited_task(object(), 3, 7)) == ({}, "not in this operation")
+    assert asyncio.run(sr.fetch_cited_credential(object(), 1, 4)) == ({}, "not in this operation")
+    asyncio.run(sr.fetch_task_credentials(object(), 1, [9, 8]))
+    assert "task: {display_id: {_in: $ids}, operation_id: {_eq: $op}}" in seen[-1][0]
+    assert [row["display_id"] for row in asyncio.run(
+        sr.fetch_callback_credit_tasks(object(), 1, "2026-11-05T09:50:00", "2026-11-05T10:00:00", [21]))] == [3, 5]
+
+    async def unreachable(client, text, variables=None):
+        return {"errors": ["permission denied"]}
+
+    monkeypatch.setattr(sr.mythic, "execute_custom_query", unreachable)
+    with pytest.raises(RuntimeError):  # never an empty batch that would advance the cursor
+        asyncio.run(sr.fetch_operation_tasks(object(), 1, 0, []))
+
+
+# --- /state reconcile ------------------------------------------------------------------------------------------
+
+def test_state_reconcile_cites_tasks_and_credentials_through_the_chat_command(operation, mythic_records):
+    from sage_chat import slash
+    from sage_chat.headless import build_chat_request
+
+    tools = operation("channel-a", channel=3, request=1)
+    mythic_records["tasks"] = [_dcsync_task(17, callback=13) | {"operation_id": 1, "timestamp": ""}]
+    mythic_records["outputs"] = {17: _dcsync_output()}
+    mythic_records["credentials"] = [_store_credential(42, None, account="hand")]
+    assert slash._reconcile_citations("17,cred:42 apply") == (["17", "cred:42"], True, [])
+    assert slash._reconcile_citations("17 #3 cred:x") == (["17"], False, ["#3", "cred:x"])
+
+    model = SimpleNamespace(mythic_client=tools, mode="supervised", provider="t", model="t", state={})
+    request = build_chat_request("x", channel_id=3, operation_id=0)
+    reply = asyncio.run(slash._handle_state(model, request, "reconcile 17, cred:42"))
+    assert "- 17: added row #1." in reply and "- cred:42: not added, no producing task" in reply
+    assert "`/state reconcile <id>`" in asyncio.run(slash._handle_state(model, request, "set 1 achieved"))
+
+
+# --- cold-review regressions -----------------------------------------------------------------------------------
+
+DA_OUTPUT = ("Group name     Domain Admins\nComment        Designated administrators of the domain\n\nMembers\n\n"
+             "-------------------------------------------------------------------------------\n"
+             "Administrator            eddard.stark            samwell.tarly\nThe command completed successfully.\n")
+
+
+@pytest.mark.parametrize("domain, netbios_map", [(NORTH, ""), ("NORTH", json.dumps({"NORTH": NORTH}))])
+def test_a_task_on_a_dead_callback_is_verified_from_its_own_callback_row(operation, mythic_records, monkeypatch,
+                                                                          domain, netbios_map):
+    monkeypatch.setenv("SAGE_ENGAGEMENT_NETBIOS_MAP", netbios_map)
+    tools = operation("channel-a", channel=3, request=1)
+    task = _task(30, "shell", params='net group "Domain Admins" /domain')
+    task["callback"] = {"display_id": 13, "host": "CASTELBLACK", "user": "samwell.tarly", "domain": domain}
+    mythic_records["tasks"], mythic_records["outputs"] = [task], {30: DA_OUTPUT}
+    mythic_records["callbacks"] = []  # the callback died before the turn end; no live foothold names its forest
+
+    _turn_end(tools)
+    assert f"da:{NORTH}" in _achieved(tools) and _position(tools).task_cursor == 30
+
+
+def test_a_verified_achievement_lifts_the_migration_retraction_but_not_an_operator_retraction(
+        operation, mythic_records, monkeypatch):
+    import os
+    legacy = os.environ["SAGE_ENGAGEMENT_STATE_DIR"]
+    database = os.environ["SAGE_DATABASE_PATH"]
+    data = channel34_ledger(ENGAGEMENT)
+    template = data["hops"][4]
+    data["hops"] = [
+        {**template, "number": 1, "id": f"dcsync:{DOMAIN}", "technique": "dcsync", "target": DOMAIN,
+         "effect": f"krbtgt-hash:{DOMAIN}", "status": "failed", "satisfied_effects": [f"krbtgt-hash:{DOMAIN}"]},
+        {**template, "number": 2, "id": f"dcsync:{NORTH}", "technique": "dcsync", "target": NORTH,
+         "effect": f"krbtgt-hash:{NORTH}", "status": "achieved", "satisfied_effects": [f"krbtgt-hash:{NORTH}"]},
+    ]
+    data["next_hop_number"] = 3
+    source = write_legacy_ledger(legacy, data)
+    with monkeypatch.context() as patch:  # the stored rows as Phase 3 left them
+        patch.setattr(engagement_store, "_migrate_operation", lambda *_args: {"retracted": 0, "pending": 0})
+        patch.setattr(engagement_store, "migrate_row_statuses", lambda _connection: {})
+        assert engagement_store.import_legacy_file(source, database=database) == "imported"
+        store = engagement_store.EngagementStore(database, legacy_dir=legacy)
+        store.retract(store.find_binding(ENGAGEMENT), ["2"], reason="operator removed",
+                      actor=engagement_store.Actor(kind="operator", name="op"))
+    source.unlink()
+
+    tools = operation("channel-a", channel=3, request=1)  # first open after deployment: the migration runs
+    north = _dcsync_task(18, callback=13) | {"original_params": json.dumps({"Domain": NORTH, "User": "krbtgt"})}
+    mythic_records["tasks"] = [_dcsync_task(17, callback=13), north]
+    mythic_records["outputs"] = {17: _dcsync_output(), 18: _dcsync_output()}
+    _turn_end(tools)
+
+    rows = {row.number: row for row in tools._ledger_snapshot().hop_rows()}
+    assert (rows[1].payload["status"], rows[1].retraction) == ("achieved", None)
+    assert f"krbtgt-hash:{DOMAIN}" in _achieved(tools)
+    assert rows[2].retraction["actor"] == "op" and f"krbtgt-hash:{NORTH}" not in _achieved(tools)
+    history = tools._ledger_store().export(tools._require_ledger_binding())["history"]
+    assert [(event["kind"], event["actor_name"]) for event in history if event.get("row_id") == 1][-1] == (
+        "undo_retraction", "system:schema-migration")
+
+
+def test_a_dcsync_krbtgt_entry_is_the_krbtgt_key_and_a_cleared_task_is_not_held(operation, mythic_records):
+    tools = operation("channel-a", channel=3, request=1)
+    dcsync = _task(60, "dcsync", params=json.dumps({"Domain": DOMAIN, "User": "krbtgt"}))
+    mythic_records["tasks"] = [dcsync, _task(61, status="cleared")]
+    mythic_records["credentials"] = [_store_credential(70, dcsync, account="krbtgt", text=NTLM)]
+    _turn_end(tools)
+    assert [hop.effect for hop in _rows(tools, "krbtgt-hash:")] == [f"krbtgt-hash:{DOMAIN}"]
+    assert not _rows(tools, "creds:krbtgt") and _position(tools).held_tasks == ()
+
+
+def test_a_cited_task_whose_row_the_operator_retracted_says_so(operation, mythic_records):
+    tools = operation("channel-a", channel=3, request=1)
+    mythic_records["tasks"] = [_dcsync_task(17, callback=13) | {"operation_id": 1, "timestamp": ""}]
+    mythic_records["outputs"] = {17: _dcsync_output()}
+    asyncio.run(tools._reconcile_operation(["17"]))
+    tools._ledger_store().retract(tools._require_ledger_binding(), ["1"], reason="operator removed",
+                                  actor=engagement_store.Actor(kind="operator", name="op"))
+    assert asyncio.run(tools._reconcile_operation(["17"]))[0] == (
+        "- 17: row #1 is retracted; `/state restore 1` counts it again.")

@@ -212,3 +212,79 @@ def seed_ledger(tools, *, hops=(), graph_facts=(), prove: bool = True, own: bool
     if facts:
         store.apply(binding, store_mod.fact_mutations(facts))
     return tools
+
+
+def stub_mythic_operation(monkeypatch, *, operation_id: int = 1) -> dict:
+    """Stub only the Mythic transport readers that operation reconciliation and the callback verifier use.
+
+    The readers serve an operation's recorded tasks, outputs, credential-store entries and callbacks with the same
+    selection the real GraphQL queries make: operation scope, display IDs above the cursor plus held tasks in
+    ascending order, at most the pass limit, credentials by producing task. The store, reducers, proof boundary,
+    verifiers and request contract stay real. Set ``records["fail"]`` to make Mythic unreachable.
+    """
+    from ai.langgraph import mythic_tools as mythic_tools_module
+    from ai.langgraph import state_reconcile as sr
+
+    records: dict = {"tasks": [], "outputs": {}, "credentials": [], "callbacks": [], "fail": False,
+                     "operation_id": operation_id, "queries": 0}
+
+    def reachable():
+        records["queries"] += 1
+        if records["fail"]:
+            raise RuntimeError("Mythic unreachable")
+
+    def in_operation(row: dict) -> bool:
+        return row.get("operation_id", operation_id) == records["operation_id"]
+
+    def key(row: dict) -> int:
+        return int(row["display_id"])
+
+    async def operation_tasks(client, op, cursor, held, limit=sr.PASS_LIMIT):
+        reachable()
+        rows = [task for task in records["tasks"] if in_operation(task)]
+        held = {int(item) for item in held or ()}
+        above = sorted((task for task in rows if key(task) > cursor), key=key)[:limit]
+        return sorted([task for task in rows if key(task) in held] + above, key=key)
+
+    async def cited_task(client, op, display_id):
+        reachable()
+        rows = [task for task in records["tasks"] if key(task) == int(display_id)]
+        mine = [task for task in rows if in_operation(task)]
+        return (mine[0], "") if mine else ({}, "not in this operation" if rows else "no such task")
+
+    async def task_credentials(client, op, task_ids):
+        reachable()
+        wanted = {int(item) for item in task_ids}
+        return [row for row in records["credentials"] if in_operation(row)
+                and (row.get("task") or {}).get("display_id") in wanted
+                and in_operation(row.get("task") or {})]
+
+    async def cited_credential(client, op, credential_id):
+        reachable()
+        rows = [row for row in records["credentials"] if row["id"] == int(credential_id)]
+        mine = [row for row in rows if in_operation(row)]
+        return (mine[0], "") if mine else ({}, "not in this operation" if rows else "no such credential")
+
+    async def credit_tasks(client, op, since, until, callback_ids):
+        reachable()
+        return [{"display_id": task["display_id"], "status": task.get("status"), "completed": task.get("completed"),
+                 "command_name": task.get("command_name"), "timestamp": task.get("timestamp", ""),
+                 "callback": {"display_id": (task.get("callback") or {}).get("display_id")}}
+                for task in sorted(records["tasks"], key=key) if in_operation(task)]
+
+    async def output(client, task_id):
+        reachable()
+        return records["outputs"].get(int(task_id), "")
+
+    async def callback_rows(self):
+        reachable()
+        return [dict(row) for row in records["callbacks"]]
+
+    monkeypatch.setattr(sr, "fetch_operation_tasks", operation_tasks)
+    monkeypatch.setattr(sr, "fetch_cited_task", cited_task)
+    monkeypatch.setattr(sr, "fetch_task_credentials", task_credentials)
+    monkeypatch.setattr(sr, "fetch_cited_credential", cited_credential)
+    monkeypatch.setattr(sr, "fetch_callback_credit_tasks", credit_tasks)
+    monkeypatch.setattr(sr, "_fetch_task_output_text", output)
+    monkeypatch.setattr(mythic_tools_module.MythicTools, "_step_callback_rows", callback_rows)
+    return records
