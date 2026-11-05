@@ -621,9 +621,11 @@ TECHNIQUE_MODEL: dict[str, dict] = {
             "partial_any": ["scheduled_task_present", "gpo_modified", "task_xml_present", "callback_alive"],
         },
     },
+    # A host memory dump is credential material, not a working credential: the keys it holds can be stale. Only
+    # directory replication (dcsync / dcsync-user) and PKINIT yield working credentials.
     "lsass-dump": {
         "target_type": "host",
-        "effect": "creds:{host}",
+        "effect": "cred-material:dump:{host}",
         "preconditions": ["system-or-admin:{host}"],
         "verify": {
             "achieved_all": ["credentials_dumped"],

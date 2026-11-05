@@ -119,7 +119,9 @@ def test_a_callback_proof_is_admitted_only_with_its_callback_row_and_a_successfu
 # --- the writer ------------------------------------------------------------------------------------------------
 
 def _credential(credential_id: int, task_id: int, callback: int | None = 1) -> dict:
-    task = {"display_id": task_id, "status": "success", "completed": True, "command_name": "mimikatz",
+    # A DCSync producing task: directory replication yields a working credential (a host dump would be material).
+    task = {"display_id": task_id, "status": "success", "completed": True, "command_name": "dcsync",
+            "original_params": json.dumps({"Domain": "contoso.local", "User": "jdoe"}),
             "callback": {"display_id": callback} if callback is not None else None}
     return {"id": credential_id, "account": "jdoe", "realm": "CONTOSO", "type": "plaintext",
             "credential_text": SECRET, "task": task}

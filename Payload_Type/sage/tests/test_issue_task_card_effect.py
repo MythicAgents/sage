@@ -68,7 +68,7 @@ def test_domain_effect_resolves_from_the_command():
 
 def test_host_scoped_effect_uses_the_callback_host():
     params = '{"custom_preview": "sekurlsa::logonpasswords"}'
-    assert "Intended effect: creds:castelblack.north.lab.local" in _card("mimikatz", params, [_foothold()])
+    assert "Intended effect: cred-material:dump:castelblack.north.lab.local" in _card("mimikatz", params, [_foothold()])
     unresolved = _card("mimikatz", params)
     assert "Intended effect" not in unresolved
     assert "{" not in unresolved

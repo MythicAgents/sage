@@ -1221,6 +1221,48 @@ def _ticket_command_key(command: str, parameters) -> str:
     return ""
 
 
+_CREDENTIAL_REPLICATION_TECHNIQUES = frozenset({"dcsync", "dcsync-user"})
+_CREDENTIAL_MATERIAL_KINDS = frozenset({"plaintext", "hash", "key", "ticket", "certificate"})
+
+
+def _credential_source(task: Any) -> str:
+    """The technique class that obtained a Mythic credential-store entry, from its producing task.
+
+    Directory replication from a domain controller is the authoritative source, and PKINIT returns a hash the KDC
+    issued, so both give a working credential (``"replication"`` / ``"pkinit"``). Anything else, including a dump
+    of a domain controller's own memory and any task no rule identifies, is credential material (``""``).
+    """
+    if not isinstance(task, dict):
+        return ""
+    command = str(task.get("command_name") or task.get("command") or "").strip()
+    params = task.get("original_params")
+    if params in (None, ""):
+        params = task.get("display_params") or task.get("params") or ""
+    if not command:
+        return ""
+    try:
+        try:
+            from . import intent_classifier
+        except ImportError:
+            import intent_classifier
+        classified = intent_classifier.classify_tool_call(command, params)
+    except Exception:
+        classified = None
+    if classified and classified[0] in _CREDENTIAL_REPLICATION_TECHNIQUES:
+        return "replication"
+    try:
+        if _ticket_command_key(command, params).startswith("kerberos-pkinit:"):
+            return "pkinit"
+    except Exception:
+        pass
+    return ""
+
+
+def _credential_material_kind(credential: Any) -> str:
+    kind = str((credential or {}).get("type") or "").strip().casefold() if isinstance(credential, dict) else ""
+    return kind if kind in _CREDENTIAL_MATERIAL_KINDS else "unknown"
+
+
 def _is_deterministic_ticket_command(command: str, parameters) -> bool:
     """True for a syntactically builder-shaped ticket command."""
     return bool(_ticket_command_key(command, parameters))
@@ -7889,12 +7931,12 @@ class MythicTools:
                 query = ("query SageReadCredentials($op: Int) { credential(where: {deleted: {_eq: false}, "
                          "operation_id: {_eq: $op}}, order_by: {id: desc}, limit: 200) "
                          "{ id account realm type credential_text comment timestamp "
-                         "task { display_id status completed command_name callback { display_id } } } }")
+                         "task { display_id status completed command_name original_params callback { display_id } } } }")
                 variables = {"op": op_id}
             else:
                 query = ("query SageReadCredentials { credential(where: {deleted: {_eq: false}}, "
                          "order_by: {id: desc}, limit: 200) { id account realm type credential_text comment timestamp "
-                         "task { display_id status completed command_name callback { display_id } } } }")
+                         "task { display_id status completed command_name original_params callback { display_id } } } }")
                 variables = None
             resp = await mythic.execute_custom_query(self.client, query, variables=variables)
             creds = (resp or {}).get("credential") or []
@@ -7935,12 +7977,16 @@ class MythicTools:
                 proof_envelope=proof,
             )
 
-        # 1. Credential store -> creds:{account@realm}, krbtgt-hash:{realm} (the dcsync/lsass artifacts).
+        # 1. Credential store -> creds:{account@realm}, krbtgt-hash:{realm}, only for keys whose producing task
+        #    was directory replication or PKINIT. A key dumped from a host's memory is material, not a working
+        #    credential, so it corroborates nothing here.
         try:
             for c in await self._fetch_credentials_cached(now):
                 acct = self._canonical_credential_account(c.get("account"))
                 realm = str(c.get("realm") or "").strip().casefold()
                 if not str(c.get("credential_text") or "").strip():
+                    continue
+                if not _credential_source(c.get("task")):
                     continue
                 credential_proof = self._credential_store_proof_envelope(c, now)
                 if acct and realm:
@@ -19320,9 +19366,17 @@ class MythicTools:
                 task = row.get("task") if isinstance(row.get("task"), dict) else {}
                 callback = task.get("callback") if isinstance(task.get("callback"), dict) else {}
                 account, realm = str(row.get("account") or ""), str(row.get("realm") or "")
-                target = f"{account}@{realm}".casefold()
+                principal = f"{account}@{realm}".casefold()
+                credential_source = _credential_source(task)
+                if credential_source:
+                    technique, target, effect = "credential-store", principal, f"creds:{principal}"
+                else:
+                    kind = _credential_material_kind(row)
+                    technique, target = "credential-material", f"{kind}:{principal}"
+                    effect = f"cred-material:{target}"
                 evidence = {
                     "source": "supervised_step", "credential_id": row["id"],
+                    "credential_source": credential_source or "material",
                     "credential_type": str(row.get("type") or ""), "mythic_task_id": task.get("display_id"),
                     "callback_id": callback.get("display_id"),
                     "transaction_id": f"credential-observation:{task.get('display_id')}",
@@ -19330,15 +19384,15 @@ class MythicTools:
                     "verifier_id": "mythic_credential_store:observed",
                 }
                 proof = self._credential_store_proof_envelope(row, now)
-                if keeps_proof("credential-store", target, proof):
+                if keeps_proof(technique, target, proof):
                     continue
                 state = engagement_state.record_effect_result(
-                    state, "credential-store", target, f"creds:{target}", "achieved", evidence, now,
+                    state, technique, target, effect, "achieved", evidence, now,
                     proof_envelope=proof,
                     require_admissible_proof=True, engagement_id=self._eng_key(),
                 )
-                summary["recorded"].append({"effect": f"creds:{target}", "task_id": task.get("display_id"),
-                                            "status": status_of("credential-store", target)})
+                summary["recorded"].append({"effect": effect, "task_id": task.get("display_id"),
+                                            "status": status_of(technique, target)})
                 changed = True
         if changed:
             if not self._ledger_commit_hops(initial_hops, state.hops, what="step ledger"):

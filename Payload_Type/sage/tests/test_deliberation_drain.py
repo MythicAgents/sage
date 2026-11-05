@@ -128,11 +128,16 @@ def test_fetch_credentials_cached_serves_from_cache():
 
 def test_corroboration_facts_from_cred_store_and_graph():
     mt = _make_tools()
+    dcsync = {"display_id": 450, "command_name": "dcsync", "original_params": '{"Domain": "north.sevenkingdoms.local"}'}
+    host_dump = {"display_id": 451, "command_name": "mimikatz", "original_params": "sekurlsa::logonpasswords"}
     mt._cred_cache = [
-        {"account": "krbtgt", "realm": "north.sevenkingdoms.local", "credential_text": "deadbeef"},
-        {"account": "samwell.tarly", "realm": "north.sevenkingdoms.local", "credential_text": "x"},
-        {"account": "SEVENKINGDOMS\\cersei.lannister", "realm": "sevenkingdoms.local", "credential_text": "x"},
-        {"account": "empty", "realm": "north.sevenkingdoms.local", "credential_text": ""},  # no secret -> skip
+        {"account": "krbtgt", "realm": "north.sevenkingdoms.local", "credential_text": "deadbeef", "task": dcsync},
+        {"account": "samwell.tarly", "realm": "north.sevenkingdoms.local", "credential_text": "x", "task": dcsync},
+        {"account": "SEVENKINGDOMS\\cersei.lannister", "realm": "sevenkingdoms.local", "credential_text": "x",
+         "task": dcsync},
+        {"account": "jon.snow", "realm": "north.sevenkingdoms.local", "credential_text": "x", "task": host_dump},
+        {"account": "arya.stark", "realm": "north.sevenkingdoms.local", "credential_text": "x"},  # no producing task
+        {"account": "empty", "realm": "north.sevenkingdoms.local", "credential_text": "", "task": dcsync},  # no secret
     ]
     mt._cred_cache_ts = NOW
     seed_ledger(mt, graph_facts=[
@@ -141,7 +146,9 @@ def test_corroboration_facts_from_cred_store_and_graph():
     ])
     facts = {f.predicate for f in asyncio.run(mt._corroboration_facts(NOW))}
     assert "krbtgt-hash:north.sevenkingdoms.local" in facts          # dcsync artifact
-    assert "creds:samwell.tarly@north.sevenkingdoms.local" in facts  # dumped-cred artifact
+    assert "creds:samwell.tarly@north.sevenkingdoms.local" in facts  # replicated-key artifact
+    assert "creds:jon.snow@north.sevenkingdoms.local" not in facts   # a host dump is material, not a working credential
+    assert "creds:arya.stark@north.sevenkingdoms.local" not in facts  # no producing task identifies the source
     assert "creds:cersei.lannister@sevenkingdoms.local" in facts     # NETBIOS-qualified accounts canonicalize
     assert "creds:sevenkingdoms\\cersei.lannister@sevenkingdoms.local" not in facts
     assert "system:starkwallpaper" in facts                          # gpo-abuse still-controlled artifact
@@ -185,7 +192,7 @@ def test_runtime_corroboration_admits_only_task_linked_credential_rows():
     )
 
     assert by_predicate["krbtgt-hash:north.sevenkingdoms.local"].proof_envelope["origin"] == pb.ORIGIN_MYTHIC_CREDENTIAL
-    assert by_predicate["creds:unbound@north.sevenkingdoms.local"].proof_envelope == {}
+    assert "creds:unbound@north.sevenkingdoms.local" not in by_predicate  # no producing task: material, no fact
     assert "krbtgt-hash:north.sevenkingdoms.local" in state.satisfied_predicates()
     assert "creds:unbound@north.sevenkingdoms.local" not in state.satisfied_predicates()
 
