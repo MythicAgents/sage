@@ -28,6 +28,12 @@ assert READINESS_SPEC and READINESS_SPEC.loader
 READINESS_SPEC.loader.exec_module(readiness)
 
 
+@pytest.fixture(autouse=True)
+def _no_operator_snapshot_registry(monkeypatch):
+    """The operator's private registry must never leak into these tests."""
+    monkeypatch.delenv(reset.SNAPSHOT_REGISTRY_ENV, raising=False)
+
+
 def _ready_sections(lane: str) -> dict:
     return {
         name: {"ready": True, "blockers": []}
@@ -215,7 +221,8 @@ def test_bloodhound_wipe_resolves_the_mcp_checkout_at_run_time_not_from_a_siblin
 def test_default_restart_env_leaves_the_bloodhound_dir_to_the_runtime_lookup():
     config = reset._config_from_args(
         reset.build_parser().parse_args(
-            ["plan", "--snapshot", "exact-clean-snapshot", "--callback-host", "http://100.64.0.1"]
+            ["plan", "--snapshot", "exact-clean-snapshot", "--callback-host", "http://100.64.0.1",
+             "--bootstrap-mode", "fresh-apollo"]
         )
     )
     assert "SAGE_BLOODHOUND_MCP_DIR" not in config["restart_env"]
@@ -267,7 +274,8 @@ def test_local_mode_keeps_the_tmux_restart_and_local_archive():
 def test_start_requires_an_explicit_deployment_mode(monkeypatch):
     monkeypatch.delenv("SAGE_DEPLOYMENT_MODE", raising=False)
     start = reset.build_parser().parse_args(
-        ["start", "--snapshot", "exact-clean-snapshot", "--callback-host", "http://100.64.0.1", "--yes"]
+        ["start", "--snapshot", "exact-clean-snapshot", "--callback-host", "http://100.64.0.1", "--yes",
+         "--bootstrap-mode", "fresh-apollo"]
     )
     with pytest.raises(reset.ResetError, match="SAGE_DEPLOYMENT_MODE"):
         reset._config_from_args(start)
@@ -276,7 +284,7 @@ def test_start_requires_an_explicit_deployment_mode(monkeypatch):
     assert reset._config_from_args(start)["deployment_mode"] == "container"
     flagged = reset.build_parser().parse_args(
         ["start", "--snapshot", "exact-clean-snapshot", "--callback-host", "http://100.64.0.1", "--yes",
-         "--deployment-mode", "local"]
+         "--bootstrap-mode", "fresh-apollo", "--deployment-mode", "local"]
     )
     assert reset._config_from_args(flagged)["deployment_mode"] == "local", "the flag wins over the env"
 
@@ -316,6 +324,7 @@ def test_unqualified_profile_can_be_planned_but_not_started(capsys):
     common = [
         "--snapshot", "snapshot-v1",
         "--range-profile", "sage-structural-b",
+        "--bootstrap-mode", "fresh-apollo",
         "--callback-host", "http://example.invalid",
         "--mythic-env-path", "/tmp/mythic.env",
     ]
@@ -339,6 +348,7 @@ def test_reset_plan_propagates_explicit_external_source_to_manifest_validation(t
         "--snapshot", manifest["snapshot_id"],
         "--range-profile", manifest["profile_id"],
         "--scenario-manifest", str(manifest_path),
+        "--bootstrap-mode", "fresh-apollo",
         "--callback-host", "http://example.invalid",
         "--mythic-env-path", "/tmp/mythic.env",
     ]
@@ -816,7 +826,7 @@ def test_explicit_manifest_capture_is_persisted_before_synthetic_reset_steps(tmp
     args = reset.build_parser().parse_args([
         "plan", "--snapshot", manifest["snapshot_id"], "--range-profile", selected["id"],
         "--callback-host", "http://example.invalid", "--mythic-env-path", "/tmp/mythic.env",
-        "--scenario-manifest", str(manifest_path),
+        "--scenario-manifest", str(manifest_path), "--bootstrap-mode", "fresh-apollo",
     ])
     config = reset._config_from_args(args)
     capture = reset._scenario_manifest_capture(args, config)
@@ -843,7 +853,7 @@ def test_explicit_manifest_capture_is_persisted_before_synthetic_reset_steps(tmp
     mismatched = reset.build_parser().parse_args([
         "plan", "--snapshot", "wrong-snapshot", "--range-profile", selected["id"],
         "--callback-host", "http://example.invalid", "--mythic-env-path", "/tmp/mythic.env",
-        "--scenario-manifest", str(manifest_path),
+        "--scenario-manifest", str(manifest_path), "--bootstrap-mode", "fresh-apollo",
     ])
     with pytest.raises(reset.ResetError, match="snapshot does not match"):
         reset._scenario_manifest_capture(mismatched, reset._config_from_args(mismatched))
@@ -902,6 +912,8 @@ def test_cli_rejects_outer_timeout_not_greater_than_child_plus_grace():
             "plan",
             "--snapshot",
             "exact-clean-snapshot",
+            "--bootstrap-mode",
+            "fresh-apollo",
             "--callback-host",
             "http://100.64.0.1",
             "--range-ready-timeout",
@@ -1251,6 +1263,8 @@ def test_plan_command_is_read_only_and_redacts_no_secret_values(
             "plan",
             "--snapshot",
             "exact-clean-snapshot",
+            "--bootstrap-mode",
+            "fresh-apollo",
             "--callback-host",
             "http://100.64.0.1",
         ]
@@ -1593,7 +1607,8 @@ def test_task_observation_shape_drift_fails_closed_before_runner(tmp_path):
 
 def _plan_args(*extra: str):
     return reset.build_parser().parse_args(
-        ["plan", "--snapshot", "exact-clean-snapshot", "--callback-host", "http://100.64.0.1", *extra])
+        ["plan", "--snapshot", "exact-clean-snapshot", "--callback-host", "http://100.64.0.1",
+         "--bootstrap-mode", "fresh-apollo", *extra])
 
 
 def _stub_ludus(monkeypatch, resolved: dict):
@@ -1640,3 +1655,198 @@ def test_an_unresolvable_range_number_stops_the_plan(monkeypatch):
     _stub_ludus(monkeypatch, {})
     with pytest.raises(reset.ResetError, match="range number"):
         reset._config_from_args(_plan_args("--ludus-range-id", "9"))
+
+
+# --- private snapshot registry ---------------------------------------------------------------------------------
+
+def _registry(tmp_path, entries):
+    path = tmp_path / "registry.json"
+    path.write_text(json.dumps({"schema": reset.SNAPSHOT_REGISTRY_SCHEMA, "snapshots": entries}), encoding="utf-8")
+    return path
+
+
+def _retained_entry(config_path, sha=None, **extra):
+    return {"supported": True, "apollo_staged": True, "bootstrap_mode": "retained-callback",
+            "retained_callback_config": str(config_path),
+            "retained_callback_config_sha256": sha or hashlib.sha256(config_path.read_bytes()).hexdigest(),
+            "foothold": {"host": "WS01", "user": "alice", "payload_type": "apollo"},
+            "launcher": "launch-existing", "notes": "staged", **extra}
+
+
+def _registry_plan_args(*extra):
+    return reset.build_parser().parse_args(
+        ["plan", "--snapshot", "staged-snap", "--callback-host", "http://example.invalid", *extra])
+
+
+def test_the_registry_fills_bootstrap_fields_from_the_snapshot(tmp_path, monkeypatch):
+    retained = tmp_path / "cb.json"
+    retained.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv(reset.SNAPSHOT_REGISTRY_ENV, str(_registry(tmp_path, {"staged-snap": _retained_entry(retained)})))
+
+    config = reset._config_from_args(_registry_plan_args())
+
+    assert config["bootstrap_mode"] == "retained-callback"
+    assert config["retained_callback_config"] == str(retained)
+    assert (config["foothold_host"], config["foothold_user_match"]) == ("WS01", "alice")
+    assert set(config) == reset.INPUT_KEYS  # the checkpoint schema is unchanged
+
+
+def test_an_explicit_flag_that_matches_the_registry_is_accepted(tmp_path):
+    retained = tmp_path / "cb.json"
+    retained.write_text("{}", encoding="utf-8")
+    registry = _registry(tmp_path, {"staged-snap": _retained_entry(retained)})
+
+    config = reset._config_from_args(_registry_plan_args("--snapshot-registry", str(registry),
+                                                "--bootstrap-mode", "retained-callback",
+                                                "--retained-callback-config", str(retained),
+                                                "--foothold-host", "WS01"))
+
+    assert config["bootstrap_mode"] == "retained-callback"
+
+
+@pytest.mark.parametrize("flag, value", [
+    ("--bootstrap-mode", "fresh-apollo"),
+    ("--foothold-host", "CASTELBLACK"),
+    ("--foothold-user-match", "samwell.tarly"),
+])
+def test_an_explicit_flag_that_conflicts_with_the_registry_fails(tmp_path, flag, value):
+    retained = tmp_path / "cb.json"
+    retained.write_text("{}", encoding="utf-8")
+    registry = _registry(tmp_path, {"staged-snap": _retained_entry(retained)})
+
+    with pytest.raises(reset.ResetError, match="conflicts with the snapshot registry"):
+        reset._config_from_args(_registry_plan_args("--snapshot-registry", str(registry), flag, value))
+
+
+def test_a_different_retained_config_file_conflicts_with_the_registry(tmp_path):
+    retained, other = tmp_path / "cb.json", tmp_path / "other.json"
+    retained.write_text("{}", encoding="utf-8")
+    other.write_text("{}", encoding="utf-8")
+    registry = _registry(tmp_path, {"staged-snap": _retained_entry(retained)})
+
+    with pytest.raises(reset.ResetError, match="--retained-callback-config"):
+        reset._config_from_args(_registry_plan_args("--snapshot-registry", str(registry),
+                                           "--retained-callback-config", str(other)))
+
+
+def test_an_unlisted_snapshot_fails_naming_the_registry(tmp_path):
+    registry = _registry(tmp_path, {})
+
+    with pytest.raises(reset.ResetError, match="'staged-snap' is not listed in the snapshot registry"):
+        reset._config_from_args(_registry_plan_args("--snapshot-registry", str(registry)))
+
+
+def test_an_unsupported_snapshot_fails_with_its_notes(tmp_path):
+    registry = _registry(tmp_path, {"staged-snap": {"supported": False, "notes": "older payload uuid"}})
+
+    with pytest.raises(reset.ResetError, match="unsupported.*older payload uuid"):
+        reset._config_from_args(_registry_plan_args("--snapshot-registry", str(registry)))
+
+
+def test_a_retained_config_whose_hash_drifted_fails(tmp_path):
+    retained = tmp_path / "cb.json"
+    retained.write_text("{}", encoding="utf-8")
+    registry = _registry(tmp_path, {"staged-snap": _retained_entry(retained, sha="0" * 64)})
+
+    with pytest.raises(reset.ResetError, match="sha256"):
+        reset._config_from_args(_registry_plan_args("--snapshot-registry", str(registry)))
+
+
+def test_a_repo_relative_retained_config_resolves_under_the_repo_root(tmp_path, monkeypatch):
+    retained = tmp_path / "cb.json"
+    retained.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(reset, "REPO_ROOT", tmp_path)
+    entry = _retained_entry(retained)
+    entry["retained_callback_config"] = "cb.json"
+    registry = _registry(tmp_path, {"staged-snap": entry})
+
+    assert reset._config_from_args(_registry_plan_args("--snapshot-registry", str(registry)))["retained_callback_config"] == str(retained)
+
+
+def test_a_fresh_apollo_entry_needs_no_retained_config(tmp_path):
+    registry = _registry(tmp_path, {"staged-snap": {
+        "supported": True, "apollo_staged": False, "bootstrap_mode": "fresh-apollo",
+        "foothold": {"host": "CASTELBLACK", "user": "samwell.tarly", "payload_type": "apollo"},
+        "launcher": "deploy-scheduled-task-interactive"}})
+
+    config = reset._config_from_args(_registry_plan_args("--snapshot-registry", str(registry)))
+
+    assert config["bootstrap_mode"] == "fresh-apollo" and config["retained_callback_config"] == ""
+
+
+def test_without_a_registry_an_omitted_bootstrap_mode_fails_closed():
+    with pytest.raises(reset.ResetError, match=reset.SNAPSHOT_REGISTRY_ENV):
+        reset._config_from_args(_registry_plan_args())
+
+
+def test_without_a_registry_explicit_flags_behave_as_before():
+    config = reset._config_from_args(_registry_plan_args("--bootstrap-mode", "fresh-apollo"))
+
+    assert (config["bootstrap_mode"], config["foothold_host"], config["foothold_user_match"],
+            config["foothold_payload_type"]) == ("fresh-apollo", "CASTELBLACK", "samwell.tarly", "apollo")
+
+
+def test_plan_reports_the_resolved_fixture_and_the_launcher(tmp_path, capsys):
+    retained = tmp_path / "cb.json"
+    retained.write_text("{}", encoding="utf-8")
+    registry = _registry(tmp_path, {"staged-snap": _retained_entry(retained)})
+
+    assert reset.main(["plan", "--snapshot", "staged-snap", "--snapshot-registry", str(registry),
+                       "--mythic-env-path", "/tmp/mythic.env"]) == 0
+    captured = capsys.readouterr()
+    planned = json.loads(captured.out)
+    assert planned["inputs"]["bootstrap_mode"] == "retained-callback"
+    assert planned["snapshot_fixture"]["launcher"] == "launch-existing"
+    assert "Foothold: launch-existing (staged Apollo) on WS01 as alice" in captured.err
+
+
+# The 2026-11-05 reset rolled back the Apollo-staged snapshot and started with no --bootstrap-mode. The parser
+# defaulted to fresh-apollo, so the reset built a new payload and never imported the retained config, and the staged
+# executable's payload UUID was unknown to the fresh Mythic. Reproduce that exact invocation.
+STAGED_SNAPSHOT = "sage-seed-apollo-v252-mythic4-20260829"
+
+
+def _staged_start_args(*extra):
+    return reset.build_parser().parse_args([
+        "start", "--snapshot", STAGED_SNAPSHOT, "--callback-host", "http://100.64.0.1",
+        "--deployment-mode", "container", *extra])
+
+
+def _staged_registry(tmp_path):
+    retained = tmp_path / "apollo_callback_config.json"
+    retained.write_text("{}", encoding="utf-8")
+    path = tmp_path / "registry.json"
+    path.write_text(json.dumps({"schema": "sage-range-snapshot-registry-v1", "snapshots": {STAGED_SNAPSHOT: {
+        "supported": True, "apollo_staged": True, "bootstrap_mode": "retained-callback",
+        "retained_callback_config": str(retained),
+        "retained_callback_config_sha256": hashlib.sha256(retained.read_bytes()).hexdigest(),
+        "foothold": {"host": "CASTELBLACK", "user": "samwell.tarly", "payload_type": "apollo"},
+        "launcher": "launch-existing"}}}), encoding="utf-8")
+    return path, retained
+
+
+def test_the_staged_snapshot_no_longer_defaults_to_a_fresh_payload_without_a_registry(monkeypatch):
+    monkeypatch.delenv("SAGE_RANGE_SNAPSHOT_REGISTRY", raising=False)
+
+    with pytest.raises(reset.ResetError, match="SAGE_RANGE_SNAPSHOT_REGISTRY"):
+        reset._config_from_args(_staged_start_args())
+
+
+def test_the_registry_starts_the_staged_snapshot_with_its_retained_config(tmp_path, monkeypatch):
+    registry, retained = _staged_registry(tmp_path)
+    monkeypatch.setenv("SAGE_RANGE_SNAPSHOT_REGISTRY", str(registry))
+
+    config = reset._config_from_args(_staged_start_args())
+
+    assert (config["bootstrap_mode"], config["retained_callback_config"]) == ("retained-callback", str(retained))
+    bootstrap = reset._phase_commands(config)["bootstrap-chat-and-foothold"]
+    assert bootstrap[bootstrap.index("--retained-callback-config") + 1] == str(retained)
+    assert "--use-retained-callback" in bootstrap and "--callback-host" not in bootstrap
+
+
+def test_the_registry_refuses_a_fresh_payload_for_the_staged_snapshot(tmp_path, monkeypatch):
+    registry, _ = _staged_registry(tmp_path)
+    monkeypatch.setenv("SAGE_RANGE_SNAPSHOT_REGISTRY", str(registry))
+
+    with pytest.raises(reset.ResetError, match="--bootstrap-mode 'fresh-apollo' conflicts"):
+        reset._config_from_args(_staged_start_args("--bootstrap-mode", "fresh-apollo"))

@@ -23,7 +23,11 @@ Treat `full reset`, `reset everything`, or an equivalent request as the entire w
 chat verification, fresh Apollo creation, and Samwell callback establishment through `$sage-callback-bootstrap`. A Ludus-only rollback
 must be requested explicitly as a range-only or GOAD-only reset.
 
-For repeatable operator execution, use the resumable orchestrator. Previewing the plan is read-only:
+For repeatable operator execution, use the resumable orchestrator. Set `SAGE_RANGE_SNAPSHOT_REGISTRY` (or pass
+`--snapshot-registry`) to a private snapshot registry kept outside this repository. It binds each snapshot to its
+bootstrap mode, retained callback config (checked by SHA-256), foothold and launcher, so `--snapshot` alone selects
+them, and an explicit flag that disagrees fails. Without a registry, `--bootstrap-mode` is required. Previewing the
+plan is read-only:
 
 ```bash
 .venv/bin/python skills/sage-goad-reset/scripts/reset_orchestrator.py plan --snapshot <exact-snapshot> --callback-host <mythic-callback-url> --deployment-mode <local|container|published>

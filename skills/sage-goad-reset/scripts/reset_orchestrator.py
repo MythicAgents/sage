@@ -162,6 +162,102 @@ class ResetError(RuntimeError):
     pass
 
 
+SNAPSHOT_REGISTRY_ENV = "SAGE_RANGE_SNAPSHOT_REGISTRY"
+SNAPSHOT_REGISTRY_SCHEMA = "sage-range-snapshot-registry-v1"
+BOOTSTRAP_MODES = ("fresh-apollo", "retained-callback")
+LAUNCHERS = {"launch-existing", "deploy-scheduled-task-interactive", "foothold-launch-batch"}
+FOOTHOLD_DEFAULTS = {"foothold_host": "CASTELBLACK", "foothold_user_match": "samwell.tarly",
+                     "foothold_payload_type": "apollo"}
+
+
+def _registry_path(args: argparse.Namespace) -> Path | None:
+    raw = str(getattr(args, "snapshot_registry", None) or os.environ.get(SNAPSHOT_REGISTRY_ENV) or "").strip()
+    return Path(raw).expanduser() if raw else None
+
+
+def _sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def resolve_snapshot_fixture(args: argparse.Namespace, snapshot: str) -> dict[str, Any] | None:
+    """Fill the bootstrap fields from the private snapshot registry. None when no registry is configured.
+
+    The registry binds each snapshot to its bootstrap mode, retained callback config (by hash), foothold and
+    launcher, so a staged snapshot can never be paired with the wrong config. An explicit flag must agree with it.
+    """
+    path = _registry_path(args)
+    if path is None:
+        return None
+    if not path.is_file():
+        raise ResetError(f"snapshot registry {path} (from --snapshot-registry or {SNAPSHOT_REGISTRY_ENV}) does not exist")
+    try:
+        registry = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ResetError(f"snapshot registry {path} is not readable JSON: {exc}") from exc
+    if not isinstance(registry, dict) or registry.get("schema") != SNAPSHOT_REGISTRY_SCHEMA \
+            or not isinstance(registry.get("snapshots"), dict):
+        raise ResetError(f"snapshot registry {path} is not a {SNAPSHOT_REGISTRY_SCHEMA} document")
+    entry = registry["snapshots"].get(snapshot)
+    if not isinstance(entry, dict):
+        raise ResetError(f"snapshot {snapshot!r} is not listed in the snapshot registry {path}")
+    if entry.get("supported") is not True:
+        raise ResetError(f"snapshot {snapshot!r} is marked unsupported in {path}: {entry.get('notes') or 'no notes'}")
+    mode = entry.get("bootstrap_mode")
+    launcher = entry.get("launcher")
+    foothold = entry.get("foothold") if isinstance(entry.get("foothold"), dict) else {}
+    if mode not in BOOTSTRAP_MODES or launcher not in LAUNCHERS:
+        raise ResetError(f"snapshot {snapshot!r} in {path} needs bootstrap_mode {BOOTSTRAP_MODES} and launcher "
+                         f"{sorted(LAUNCHERS)}")
+    resolved: dict[str, Any] = {
+        "bootstrap_mode": mode,
+        "foothold_host": str(foothold.get("host") or FOOTHOLD_DEFAULTS["foothold_host"]),
+        "foothold_user_match": str(foothold.get("user") or FOOTHOLD_DEFAULTS["foothold_user_match"]),
+        "foothold_payload_type": str(foothold.get("payload_type") or FOOTHOLD_DEFAULTS["foothold_payload_type"]),
+        "retained_callback_config": None,
+    }
+    if mode == "retained-callback":
+        relative = str(entry.get("retained_callback_config") or "").strip()
+        expected = str(entry.get("retained_callback_config_sha256") or "").strip().lower()
+        if not relative or not re.fullmatch(r"[0-9a-f]{64}", expected):
+            raise ResetError(f"snapshot {snapshot!r} in {path} needs retained_callback_config and its sha256")
+        config_path = Path(relative).expanduser()
+        config_path = config_path if config_path.is_absolute() else REPO_ROOT / config_path
+        if not config_path.is_file():
+            raise ResetError(f"retained callback config for {snapshot!r} does not exist: {config_path}")
+        actual = _sha256_file(config_path)
+        if actual != expected:
+            raise ResetError(f"retained callback config {config_path} has sha256 {actual}, but the registry "
+                             f"binds {snapshot!r} to {expected}")
+        resolved["retained_callback_config"] = str(config_path)
+    flags = {"bootstrap_mode": "--bootstrap-mode", "foothold_host": "--foothold-host",
+             "foothold_user_match": "--foothold-user-match", "foothold_payload_type": "--foothold-payload-type",
+             "retained_callback_config": "--retained-callback-config"}
+    for key, flag in flags.items():
+        given = getattr(args, key, None)
+        if given is None:
+            continue
+        expected_value = resolved[key]
+        if key == "retained_callback_config":
+            same = expected_value is not None and Path(given).expanduser().resolve() == Path(expected_value).resolve()
+        else:
+            same = str(given) == str(expected_value)
+        if not same:
+            raise ResetError(f"{flag} {given!r} conflicts with the snapshot registry entry for {snapshot!r} "
+                             f"({expected_value!r}); drop the flag or fix {path}")
+    resolved["launcher"] = launcher
+    resolved["registry"] = str(path)
+    resolved["notes"] = str(entry.get("notes") or "")
+    return resolved
+
+
+def foothold_instruction(config: dict[str, Any], launcher: str | None) -> str:
+    how = {"launch-existing": "launch-existing (staged Apollo)",
+           "deploy-scheduled-task-interactive": "deploy --launch-method scheduled-task-interactive (fresh payload)",
+           "foothold-launch-batch": "sage-foothold-launch (batch logon)"}.get(launcher or "", "per the bootstrap mode")
+    return (f"Foothold: {how} on {config['foothold_host']} as {config['foothold_user_match']} "
+            f"({config['bootstrap_mode']})")
+
+
 def _raise_reset(message: str) -> None:
     raise ResetError(message)
 
@@ -246,10 +342,22 @@ def _config_from_args(args: argparse.Namespace) -> dict[str, Any]:
     snapshot = str(args.snapshot or "").strip()
     if not snapshot:
         raise ResetError("--snapshot must name the exact live restore target")
-    bootstrap_mode = str(args.bootstrap_mode)
+    fixture = resolve_snapshot_fixture(args, snapshot)
+    if fixture is None:
+        if getattr(args, "bootstrap_mode", None) is None:
+            raise ResetError(
+                f"--bootstrap-mode is required when no snapshot registry is configured; set "
+                f"{SNAPSHOT_REGISTRY_ENV} (or --snapshot-registry) to derive it from --snapshot"
+            )
+        fields = {key: getattr(args, key, None) or default for key, default in FOOTHOLD_DEFAULTS.items()}
+        fields["bootstrap_mode"] = args.bootstrap_mode
+        fields["retained_callback_config"] = args.retained_callback_config
+    else:
+        fields = fixture
+    bootstrap_mode = str(fields["bootstrap_mode"])
     retained_path = (
-        str(Path(args.retained_callback_config).expanduser())
-        if args.retained_callback_config
+        str(Path(fields["retained_callback_config"]).expanduser())
+        if fields["retained_callback_config"]
         else ""
     )
     if bootstrap_mode == "retained-callback" and not retained_path:
@@ -298,9 +406,9 @@ def _config_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "ludus_mcp_server": str(args.ludus_mcp_server or "").strip(),
         "bootstrap_mode": bootstrap_mode,
         "retained_callback_config": retained_path,
-        "foothold_payload_type": str(args.foothold_payload_type),
-        "foothold_host": str(args.foothold_host),
-        "foothold_user_match": str(args.foothold_user_match),
+        "foothold_payload_type": str(fields["foothold_payload_type"]),
+        "foothold_host": str(fields["foothold_host"]),
+        "foothold_user_match": str(fields["foothold_user_match"]),
         "callback_host": callback_host,
         "download_dir": str(args.download_dir or ""),
         "prepare_chat": bool(args.prepare_chat),
@@ -2178,14 +2286,16 @@ def _add_start_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--ludus-range-id", default=os.environ.get("SAGE_LUDUS_RANGE_ID") or "")
     parser.add_argument("--ludus-mcp-server", default=os.environ.get("SAGE_LUDUS_MCP_SERVER") or "")
     parser.add_argument(
-        "--bootstrap-mode",
-        choices=("fresh-apollo", "retained-callback"),
-        default="fresh-apollo",
+        "--snapshot-registry",
+        help=f"Private snapshot registry JSON (default: ${SNAPSHOT_REGISTRY_ENV}). It derives the bootstrap mode, "
+             "retained config, foothold and launcher from --snapshot.",
     )
+    # None means "not given", so a flag can be checked against the registry; defaults apply after resolution.
+    parser.add_argument("--bootstrap-mode", choices=BOOTSTRAP_MODES, default=None)
     parser.add_argument("--retained-callback-config")
-    parser.add_argument("--foothold-payload-type", default="apollo")
-    parser.add_argument("--foothold-host", default="CASTELBLACK")
-    parser.add_argument("--foothold-user-match", default="samwell.tarly")
+    parser.add_argument("--foothold-payload-type", default=None)
+    parser.add_argument("--foothold-host", default=None)
+    parser.add_argument("--foothold-user-match", default=None)
     parser.add_argument("--callback-host")
     parser.add_argument("--download-dir", default="/tmp/sage_payloads")
     parser.add_argument(
@@ -2323,9 +2433,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "plan":
             config = _config_from_args(args)
             scenario_manifest_binding = _scenario_manifest_capture(args, config)
+            fixture = resolve_snapshot_fixture(args, config["snapshot"])
+            print(foothold_instruction(config, (fixture or {}).get("launcher")), file=sys.stderr)
             plan = {
                 "schema": SCHEMA,
                 "inputs": _redact(config),
+                "snapshot_fixture": None if fixture is None else {
+                    key: fixture[key] for key in ("registry", "launcher", "notes")},
                 "phases": [
                     {
                         "name": name,
@@ -2352,6 +2466,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "start":
             config = _config_from_args(args)
             scenario_manifest_binding = _scenario_manifest_capture(args, config)
+            fixture = resolve_snapshot_fixture(args, config["snapshot"])
+            print(foothold_instruction(config, (fixture or {}).get("launcher")), file=sys.stderr, flush=True)
             profile_module = _load_module("sage_reset_range_profile_start", RANGE_PROFILE)
             try:
                 profile_module.require_live_qualified(
