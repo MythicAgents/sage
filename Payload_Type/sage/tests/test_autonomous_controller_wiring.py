@@ -80,6 +80,22 @@ def _bare_model(execute_return, state, calls):
     return m
 
 
+class _SelectFirstCandidateLLM:
+    """A configured hybrid policy model that selects the first candidate it is shown."""
+
+    def __init__(self):
+        self.requests = []
+
+    async def ainvoke(self, messages):
+        request = json.loads(messages[-1].content)
+        self.requests.append(request)
+        return type("Response", (), {"content": json.dumps({
+            "disposition": "select",
+            "candidate_id": request["candidates"][0]["candidate_id"],
+            "rationale": "the first candidate advances the objective",
+        })})()
+
+
 def _install_supervised_contract(
     m,
     request_id="request-supervised",
@@ -382,7 +398,8 @@ def test_controller_resume_executes_exact_approved_action_without_second_model_d
     policy_decision = {
         "decision_id": "original",
         "policy_mode": policy_mode,
-        "kernel_singleton_count": 1 if policy_mode == "hybrid" else 0,
+        "model_response_observed": True,
+        "kernel_singleton_count": 0,
     }
     payload["intent"]["policy_decision"] = policy_decision
     payload["intent"]["transaction_id"] = "transaction-approved"
@@ -397,21 +414,18 @@ def test_controller_resume_executes_exact_approved_action_without_second_model_d
     assert len(calls) == 1
     assert calls[0][0]["name"] == action.name
     assert calls[0][0]["target"] == action.target
-    assert events == (["execute", "llm"] if policy_mode == "llm" else ["execute"])
-    if policy_mode == "llm":
-        assert "halted_no_action" in report
-    else:
-        # The static fake state does not record the blocked outcome, so branch-only Hybrid
-        # deterministically reaches the same singleton again and pauses for a fresh approval.
-        assert report == ""
+    # The approved action replays without a model call. The static fake state does not record the blocked
+    # outcome, so the next cycle sees the same singleton, which supervised Hybrid also gives to the model.
+    assert events == ["execute", "llm"]
+    assert "halted_no_action" in report
     telemetry = m.controller_runtime_telemetry()
     assert telemetry["policy_mode"] == policy_mode
     assert telemetry["configured_policy_mode"] == policy_mode
     assert telemetry["policy_identity_valid"] is True
     assert telemetry["policy_switches"] == []
+    assert telemetry["model_calls"] == 1
     if policy_mode == "hybrid":
-        assert telemetry["kernel_singleton_count"] >= 1
-        assert telemetry["model_calls"] == 0
+        assert telemetry["kernel_singleton_count"] == 0
 
 
 def test_hybrid_approved_singleton_reaches_model_for_successor_branch(monkeypatch):
@@ -446,7 +460,7 @@ def test_hybrid_approved_singleton_reaches_model_for_successor_branch(monkeypatc
         async def ainvoke(self, messages):
             request = json.loads(messages[-1].content)
             requests.append(request)
-            assert len(request["candidates"]) == 2
+            assert len(request["candidates"]) == (1 if len(requests) == 1 else 2)
             return type("Response", (), {
                 "content": json.dumps({
                     "disposition": "select",
@@ -470,16 +484,16 @@ def test_hybrid_approved_singleton_reaches_model_for_successor_branch(monkeypatc
 
     assert asyncio.run(m._run_autonomous_controller(objective)) == ""
     assert [card[0]["args"]["action"]["target"] for card in cards] == ["first"]
-    assert requests == []
+    assert len(requests) == 1  # supervised Hybrid gives the first singleton to the model too
     digest = _install_exact_card_claim(m, cards[0], "approval-first")
     assert asyncio.run(m.handle_controller_hitl_resume("approve", expected_action_digest=digest)) == ""
 
     assert effects == ["first"]
-    assert len(requests) == 1  # an actual configured backend invocation, not an owner label
+    assert len(requests) == 2  # the successor branch; the approved replay made no model call
     assert [card[0]["args"]["action"]["target"] for card in cards] == ["first", "second"]
     assert m._controller_hitl_pending["args"]["action"]["target"] == "second"
     telemetry = m.controller_runtime_telemetry()
-    assert telemetry["model_calls"] == 1
+    assert telemetry["model_calls"] == 2
     assert telemetry["model_response_records"]
     assert telemetry["model_response_records"][0]["effective_backend"] == "test:selector"
 
@@ -887,6 +901,7 @@ def test_supervised_controller_deny_is_sage_owned_not_controller_prefixed():
         "key": "pending-key",
     }
     m._controller_hitl_objective = "obtain administrative control of essos.local"
+    m.llm = _SelectFirstCandidateLLM()
     streamed = []
 
     async def _stream(text):
@@ -1010,9 +1025,12 @@ def test_objective_led_supervised_collection_requires_next_card_not_false_comple
         current["state"] = _covered_remote_exec_state()
         return {"ok": True, "status": "ingested", "graph_verified": True}
 
+    policy_requests = []
+
     class SelectAvailable:
         async def ainvoke(self, messages):
             request = json.loads(messages[-1].content)
+            policy_requests.append(request)
             candidates = request["candidates"]
             selected = next(
                 (item for item in candidates if item["name"] == "collect-graph"),
@@ -1034,11 +1052,13 @@ def test_objective_led_supervised_collection_requires_next_card_not_false_comple
     assert asyncio.run(m._run_autonomous_controller(state.objective)) == ""
     assert cards[0][0]["name"] == "collect_graph"
     assert collection_calls == []
+    assert [[c["name"] for c in request["candidates"]] for request in policy_requests] == [["collect-graph"]]
     digest = _install_exact_card_claim(m, cards[0])
     assert asyncio.run(m.handle_controller_hitl_resume(
         "approve", expected_action_digest=digest,
     )) == ""
     assert len(collection_calls) == 1
+    assert len(policy_requests) == 2  # the successor capability only; the approved collection replayed
     assert len(cards) == 2
     assert cards[1][0]["name"] == "execute_capability"
     assert m._controller_hitl_pending["kind"] == "capability"
@@ -1237,6 +1257,7 @@ def test_supervised_chat_controller_pauses_before_execute_capability():
     m.command_name = "chat"
     m._autonomous_solve = True
     m.verbose = False
+    m.llm = _SelectFirstCandidateLLM()
     streamed = []
 
     async def _stream(text):
@@ -1247,6 +1268,7 @@ def test_supervised_chat_controller_pauses_before_execute_capability():
     report = asyncio.run(m._run_autonomous_controller("obtain administrative control of essos.local"))
 
     assert report == ""
+    assert len(m.llm.requests) == 1
     assert calls == []
     assert m._controller_hitl_pending["tool"] == "execute_capability"
     action = m._controller_hitl_pending["args"]["action"]

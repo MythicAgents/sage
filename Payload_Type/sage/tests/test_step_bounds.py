@@ -1000,7 +1000,7 @@ def _proved_krbtgt_client(monkeypatch, tmp_path):
 
 
 async def _rescope_run(mt, split_issue, script: list, *, mode: str = "supervised",
-                       autonomous_solve: bool = False) -> SimpleNamespace:
+                       autonomous_solve: bool = False, policy_answers: list | None = None) -> SimpleNamespace:
     model = model_module.Model(
         provider="openai", model="gpt-4o-mini", system_prompt="offline re-scope",
         config={"configurable": {"api_key": "offline-only", "API_ENDPOINT": "http://127.0.0.1:9/v1"}},
@@ -1012,6 +1012,9 @@ async def _rescope_run(mt, split_issue, script: list, *, mode: str = "supervised
     model.memory = InMemorySaver()
     fake = _NativeScriptedModel(messages=iter(script))
     model._get_base_chat_model = lambda *a, **k: fake
+    if policy_answers is not None:
+        # The controller's semantic policy uses the base model built at construction, separate from the agents.
+        model.llm = _NativeScriptedModel(messages=iter(policy_answers))
     model._native_chat_explicit_hitl = True
     model.command_name = "chat"
     model._rebuild_graph()
@@ -1095,9 +1098,20 @@ def test_conversation_never_cards_or_issues_the_proved_forge(monkeypatch, tmp_pa
 
 def test_supervised_autonomous_solve_still_needs_the_forge_card(monkeypatch, tmp_path):
     mt, split_issue = _proved_krbtgt_client(monkeypatch, tmp_path)
+    policy_requests: list[dict] = []
 
-    run = asyncio.run(_rescope_run(mt, split_issue, _rescope_script(), autonomous_solve=True))
+    def select_the_sole_forge(messages):
+        request = json.loads(messages[-1].content)
+        policy_requests.append(request)
+        [candidate] = request["candidates"]
+        assert candidate["name"] == "forge-golden-ticket", candidate
+        return AIMessage(content=json.dumps({"disposition": "select", "candidate_id": candidate["candidate_id"]}))
 
+    run = asyncio.run(_rescope_run(mt, split_issue, _rescope_script(), autonomous_solve=True,
+                                   policy_answers=[select_the_sole_forge] * 4))
+
+    # The policy judged the sole forge candidate against the objective before any card was offered.
+    assert policy_requests and policy_requests[0]["objective"]
     # The lane asks for approval (a card is offered) and issues nothing the operator has not approved.
     assert run.cards, "supervised with autonomous solve must still offer an approval card"
     issued_before_card = run.issued if not run.cards else []

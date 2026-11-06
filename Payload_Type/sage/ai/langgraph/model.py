@@ -12974,7 +12974,7 @@ class Model:
 
             async def policy_decide(request: dict[str, Any]) -> Any:
                 nonlocal approved_selection_consumed
-                # Hybrid can select an approved singleton without calling this backend. Its
+                # A resumed approval is answered here by replay, never by a new model call. Its
                 # approval is consumed at the execution gate, so a later branch must get a
                 # fresh model decision instead of replaying that now-completed action.
                 approved_key = str(approved_pending.get("key") or "")
@@ -13088,11 +13088,12 @@ class Model:
                 completed_call_token_ceiling=(evaluation_token_ceiling or None),
                 expected_response_provider=os.environ.get("SAGE_EVAL_EXPECTED_RESPONSE_PROVIDER", ""),
                 expected_response_model=os.environ.get("SAGE_EVAL_EXPECTED_RESPONSE_MODEL", ""),
+                # A sole admissible candidate is not necessarily relevant to the operator's objective, so
+                # supervised controller chat asks the policy to judge every singleton before any card. The
+                # approved-action replay in policy_decide still answers a resumed acceptance without a model call.
                 **(
                     {"consult_model_for_singleton": True}
-                    if policy_mode == _policy.POLICY_HYBRID
-                    and self._controller_hitl_enabled()
-                    and str(getattr(self, "_controller_hitl_operator_steer", "") or "").strip()
+                    if policy_mode == _policy.POLICY_HYBRID and self._controller_hitl_enabled()
                     else {}
                 ),
             )
