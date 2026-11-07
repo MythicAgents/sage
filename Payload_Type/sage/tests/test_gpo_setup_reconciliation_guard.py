@@ -244,6 +244,8 @@ def test_a_valid_pending_setup_still_joins_its_execution_through_the_store(sessi
     assert setup.status == "achieved"
     assert str(setup.evidence["reconciled_setup_task_id"]) == SETUP_TASK
     assert str(setup.evidence["mythic_task_id"]) == EXEC_TASK
+    # The setup task is linked by its ID; no task output enters the reconciled row.
+    assert "reconciled_setup_preview" not in setup.evidence and "result_preview" not in setup.evidence
     if before is not None:
         assert (setup.id, setup.number, setup.row_id) == (pending.id, pending.number, pending.row_id)
     assert {SETUP_EFFECT, EXEC_EFFECT} <= stored.achieved_effects()
@@ -397,3 +399,24 @@ def test_a_rejected_setup_keeps_its_diagnostics_beside_an_unrelated_proof(runtim
     elsewhere = _record_execution(_state(ENGAGEMENT, [setup], runtime_scope=runtime_scope),
                                   transaction_id="capability-exec:another")
     assert _hop(elsewhere, "gpo-abuse") == setup
+
+
+def test_historical_previews_never_enter_a_reconciled_setup_row():
+    """Rows stored before previews were removed keep them in history; a reconciled setup row copies neither."""
+    envelope = _task_envelope(ENGAGEMENT)
+    setup = _setup_hop(dict(_admitted_evidence(ENGAGEMENT, envelope), result_preview="SETUP-OUTPUT"), envelope,
+                       storage="top-level")
+    state = _state(ENGAGEMENT, [setup])
+    proof = _task_envelope(ENGAGEMENT, task_id=EXEC_TASK, command="shell")
+    evidence = {"source": "capability", "mythic_task_id": EXEC_TASK, "callback_id": CALLBACK,
+                "transaction_id": TRANSACTION, "terminal_task_status": "completed", "command": "shell",
+                "result_preview": "EXECUTION-OUTPUT"}
+    updated = engagement_state.record_effect_result(
+        state, EXEC_TECHNIQUE, EXEC_TARGET, EXEC_EFFECT, "achieved", evidence, _now(),
+        satisfied_effects=[EXEC_EFFECT], proof_envelope=proof, require_admissible_proof=True,
+        engagement_id=ENGAGEMENT,
+    )
+    assert _hop(updated, EXEC_TECHNIQUE).evidence.get("result_preview") == "EXECUTION-OUTPUT"  # the stored proof
+    promoted = _hop(updated, "gpo-abuse")
+    assert promoted.status == "achieved"
+    assert "result_preview" not in promoted.evidence and "reconciled_setup_preview" not in promoted.evidence

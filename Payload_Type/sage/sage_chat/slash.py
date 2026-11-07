@@ -473,8 +473,8 @@ async def _resolve_chat_ledger(model: Any, request: ChatRequest):
 def _render_ledger_markdown(tools: Any, request: ChatRequest, model: Any, notice: str = "") -> str:
     """Render the operation ledger (every row, corrections marked) from one fresh snapshot.
 
-    The same view, minus evidence previews, is queued for this channel's next model request so the model can
-    resolve the operator's "hop N" against the rows shown here.
+    The same view (task links and structured notes, never task output) is queued for this channel's next model
+    request so the model can resolve the operator's "hop N" against the rows shown here.
     """
     try:
         from ai.langgraph import engagement_ledger
@@ -499,6 +499,10 @@ def _render_ledger_markdown(tools: Any, request: ChatRequest, model: Any, notice
         out.append("_(empty — no hops recorded yet)_")
     else:
         out.extend(engagement_ledger.render_hop_table(hops))
+        evidence = engagement_ledger.evidence_notes(hops)
+        if evidence:
+            out.append("\n**Evidence**")
+            out.extend(evidence)
         notes = engagement_ledger.correction_notes(hops)
         if notes:
             out.append("\n**Corrections**")

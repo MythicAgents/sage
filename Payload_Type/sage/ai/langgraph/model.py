@@ -15661,6 +15661,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         else:
             lines.append("")
             lines.extend(engagement_ledger.render_hop_table(hops, limit=_TURN_END_STATE_HOP_LIMIT))
+            lines.extend(engagement_ledger.evidence_notes(hops, limit=_TURN_END_STATE_HOP_LIMIT))
             remaining = len(hops) - _TURN_END_STATE_HOP_LIMIT
             if remaining > 0:
                 lines.append(f"_…{remaining} earlier hop(s) not shown — `/state` for the full ledger._")
@@ -16957,6 +16958,10 @@ def _build_esl_summary(mythic_client) -> str:
     if mythic_client is None:
         return ""
     try:
+        from . import engagement_ledger
+    except ImportError:
+        import engagement_ledger  # type: ignore
+    try:
         hops, _facts, _corrected = _ledger_lists(mythic_client)
     except Exception as exc:
         return f"📊 **Engagement State Ledger (ESL)**\nunavailable: {exc}"
@@ -16972,13 +16977,11 @@ def _build_esl_summary(mythic_client) -> str:
         technique = str(getattr(hop, "technique", "") or "unknown")
         effect = str(getattr(hop, "effect", "") or getattr(hop, "target", "") or "")
         status = str(getattr(hop, "status", "") or "")
-        evidence = getattr(hop, "evidence", {}) or {}
-        preview = ""
-        if isinstance(evidence, dict):
-            preview = str(evidence.get("result_preview") or evidence.get("task_id") or "")[:80]
+        # Mythic task IDs only: task output is read through the tools, never through a ledger summary.
+        tasks = engagement_ledger.task_ids(hop)
         detail = f"{technique} -> {effect} ({status})"
-        if preview:
-            detail += f": {preview}"
+        if tasks:
+            detail += ": tasks " + ", ".join(task[:24] for task in tasks[:4])
         lines.append(detail)
     cached_footholds = getattr(mythic_client, "_engagement_footholds", None)
     if cached_footholds is not None:

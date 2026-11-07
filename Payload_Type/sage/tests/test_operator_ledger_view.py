@@ -132,12 +132,11 @@ def _hops():
     ]
 
 
-def test_table_rows_use_hop_numbers_and_model_copy_omits_evidence():
-    operator = "\n".join(el.render_hop_table(_hops()))
-    model_copy = "\n".join(el.render_hop_table(_hops(), include_evidence=False))
-    assert "| 4 | `dcsync:corp.local` |" in operator and "| 4 | `dcsync:corp.local` |" in model_copy
-    assert "TARGET-OUTPUT-PREVIEW" in operator
-    assert "TARGET-OUTPUT-PREVIEW" not in model_copy and "Evidence" not in model_copy
+def test_one_table_for_every_view_links_tasks_and_never_shows_output():
+    table = "\n".join(el.render_hop_table(_hops()))
+    assert "| 4 | `dcsync:corp.local` | krbtgt-hash:corp.local | `pending (awaiting effect)` | [12](/new/task/12) | - |" \
+        in table
+    assert "TARGET-OUTPUT-PREVIEW" not in table and "Evidence" not in table
 
 
 def test_table_limit_keeps_newest_numbers():
@@ -174,7 +173,8 @@ def test_state_command_queues_the_shown_rows_for_the_model(_restore_namespace):
     assert "| 2 | `dcsync:corp.local` |" in shown
     view = el.take_operator_view(5)
     assert view.startswith("[Sage ledger view]") and "via `/state`" in view
-    assert "| 2 | `dcsync:corp.local` | krbtgt-hash:corp.local | `pending (awaiting effect)` | 12 |" in view
+    assert "| 2 | `dcsync:corp.local` | krbtgt-hash:corp.local | `pending (awaiting effect)` | [12](/new/task/12) |" \
+        in view
     assert "TARGET-OUTPUT-PREVIEW" not in view
     assert "compromise CORP" in view
 

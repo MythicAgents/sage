@@ -85,7 +85,7 @@ def test_table_presents_corrections_beside_historical_status():
                  corrections={"no_longer_holds": {"reason": "callback died", "effective": True, "scope": "automatic"}})
     lapsed = dict(_achieved(), number=26, id="dcsync:old",
                   corrections={"no_longer_holds": {"reason": "superseded", "effective": False, "scope": "automatic"}})
-    lines = el.render_hop_table([retracted, stale, lapsed], include_evidence=False)
+    lines = el.render_hop_table([retracted, stale, lapsed])
     assert "`achieved — operator retracted`" in lines[2]
     assert "`achieved — no longer holds`" in lines[3]
     assert "`achieved`" in lines[4]

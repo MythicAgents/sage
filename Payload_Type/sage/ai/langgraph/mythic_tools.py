@@ -9963,7 +9963,6 @@ class MythicTools:
             evidence = {
                 "source": "issue_task",
                 "provenance": "run",
-                "result_preview": str(results_str)[:200],
                 "mythic_task_id": task_id,
                 "callback_id": callback_id,
                 "transaction_id": transaction_id,

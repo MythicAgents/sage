@@ -72,7 +72,6 @@ def reconcile_task(
         "verified_on_record": True,
         "artifact_present": True,
         "reconciled_at": now,
-        "result_preview": _preview(output),
         "task_classification": task_class,
         "mythic_task_status": (record.status[: task_evidence.MAX_STATUS_CHARS] if record is not None else ""),
     }
@@ -277,12 +276,6 @@ def _operator_name(value: Any) -> str:
     if isinstance(value, dict):
         return _text(value.get("username") or value.get("name"))
     return _text(value)
-
-
-def _preview(value: Any, limit: int = 240) -> str:
-    text = credential_artifacts.redact_credential_material(_text(value))
-    text = " ".join(text.split())
-    return text[: limit - 1] + "..." if len(text) > limit else text
 
 
 def _text(value: Any) -> str:

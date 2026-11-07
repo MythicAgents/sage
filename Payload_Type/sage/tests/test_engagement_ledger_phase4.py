@@ -676,6 +676,9 @@ def test_store_initialization_migrates_each_legacy_status_once(tmp_path, monkeyp
     assert engagement_store.schema_status(database) == [{
         "engagement_key": "phase3-fixture", "schema_version": engagement_store.SCHEMA_VERSION,
         "migrated_rows": {"retracted": 2, "pending": 1},
+        # Schema 3: the krbtgt row written before the shared task classification is revalidated (the retracted
+        # attempt record for the same secret owns nothing).
+        "revalidated_rows": {"updated": 1, "merged": 0},
     }]
 
     # A second initialization changes nothing.

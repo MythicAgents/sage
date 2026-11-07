@@ -33,8 +33,9 @@ except ImportError:  # pragma: no cover - import-path fallback
     import engagement_ledger as _ledger  # type: ignore
     import task_evidence as _task_evidence  # type: ignore
 
-# Version 2: hop rows carry only achieved or pending. Store initialization migrates version-1 operations.
-SCHEMA_VERSION = 2
+# Version 2: hop rows carry only achieved or pending. Version 3: rows written before the shared task classification
+# for one typed effect are folded into one row and revalidated. Store initialization migrates older operations.
+SCHEMA_VERSION = 3
 LEGACY_ROW_SCHEMA_VERSION = 1
 MIGRATION_VERSION = 1
 EXPORT_SCHEMA = "sage.esl.export.v1"
@@ -58,6 +59,11 @@ _UNVERIFIED_STATUS = "legacy_unverified"
 SCHEMA_MIGRATION_REASON = "attempt record, not progress"
 SCHEMA_MIGRATION_PROOF_REASON = "unverified achievement: proof missing"
 SCHEMA_MIGRATION_LAPSE_REASON = "attempt record superseded by a verified achievement"
+REVALIDATION_ACTOR = _ledger.REVALIDATION_ACTOR
+REVALIDATION_REASON = (
+    "revalidated under the shared task-evidence rule: a proof recorded before task classification is held pending "
+    "until a new observation is admitted"
+)
 
 
 class LedgerUnavailable(RuntimeError):
@@ -908,8 +914,9 @@ def _migrate_operation(connection: sqlite3.Connection, operation_id: int, stamp:
 
     A ``failed`` or ``blocked`` head is an attempt record, not progress: it gets a system retraction and keeps its
     number, payload and history. A ``legacy_unverified`` head gets an appended update to ``pending`` /
-    ``proof_missing``; the original payload stays in history. Corrections, numbers, the high-water mark and graph
-    facts are unchanged.
+    ``proof_missing``; the original payload stays in history. Then rows for a typed effect written before the shared
+    task classification are revalidated (``_revalidate_typed_history``). Corrections, numbers, the high-water mark and
+    graph facts are unchanged.
     """
     actor = _schema_migration_actor()
     counts = {"retracted": 0, "pending": 0}
@@ -932,7 +939,7 @@ def _migrate_operation(connection: sqlite3.Connection, operation_id: int, stamp:
         status = _norm(payload.get("status"))
         row_id = int(row["id"])
         if status in _ATTEMPT_STATUSES:
-            mutation_id = f"schema-migration:v{SCHEMA_VERSION}:retract:{row_id}"
+            mutation_id = f"schema-migration:v2:retract:{row_id}"
             if row["retraction_event_id"] is not None or recorded(mutation_id):
                 continue
             event_id = _insert_event(
@@ -942,7 +949,7 @@ def _migrate_operation(connection: sqlite3.Connection, operation_id: int, stamp:
             connection.execute("UPDATE esl_rows SET retraction_event_id=? WHERE id=?", (event_id, row_id))
             counts["retracted"] += 1
         elif status == _UNVERIFIED_STATUS:
-            mutation_id = f"schema-migration:v{SCHEMA_VERSION}:pending:{row_id}"
+            mutation_id = f"schema-migration:v2:pending:{row_id}"
             if recorded(mutation_id):
                 continue
             upgraded = dict(payload, status="pending", pending_reason="proof_missing")
@@ -957,7 +964,8 @@ def _migrate_operation(connection: sqlite3.Connection, operation_id: int, stamp:
                 (encoded, new_revision, event_id, stamp, row_id),
             )
             counts["pending"] += 1
-    if counts["retracted"] or counts["pending"]:
+    counts.update(_revalidate_typed_history(connection, operation_id, revision, stamp))
+    if any(counts.values()):
         connection.execute(
             "UPDATE esl_operations SET revision=?, schema_version=?, updated_at=? WHERE id=?",
             (revision, SCHEMA_VERSION, stamp, operation_id),
@@ -969,12 +977,129 @@ def _migrate_operation(connection: sqlite3.Connection, operation_id: int, stamp:
     return counts
 
 
+def _revalidate_typed_history(
+    connection: sqlite3.Connection, operation_id: int, revision: int, stamp: str
+) -> dict[str, int]:
+    """Schema 3: fold the rows written before the shared task classification for one typed effect into one row.
+
+    For each typed identity still held by an unretracted non-canonical row, the row ``_typed_owner`` picks gets one
+    update that carries a ``legacy:<hop>`` observation from itself and from every other such row. Admission re-runs
+    under the current rule, so a proof recorded before task classification (for example an output-only capability
+    achievement) is held pending until a new observation is admitted. Each other row is retracted as merged into the
+    owner. Operator-retracted and attempt-record rows are never folded into another row; an attempt record never owns
+    the effect, while an operator-retracted owner keeps its correction in force (as ``_typed_owner`` does for new
+    writes). Typed rows derived before each contribution recorded its admitted writers are re-derived. Earlier events
+    are never changed. Idempotent: a revalidated owner is canonical and a merged row is retracted.
+    """
+    actor = Actor(kind="system", name=REVALIDATION_ACTOR)
+    counts = {"revalidated": 0, "merged": 0}
+    op = connection.execute("SELECT engagement_key FROM esl_operations WHERE id=?", (operation_id,)).fetchone()
+    engagement_key = str(op["engagement_key"]) if op is not None else ""
+    groups: dict[str, list[tuple[sqlite3.Row, dict]]] = {}
+    for row in connection.execute(
+        "SELECT * FROM esl_rows WHERE operation_id=? AND kind='hop' AND retraction_event_id IS NULL ORDER BY number",
+        (operation_id,),
+    ).fetchall():
+        try:
+            payload = json.loads(row["payload"])
+        except ValueError:
+            continue
+        typed = _task_evidence.payload_typed_identity(payload)
+        if typed and not _task_evidence.is_canonical_payload(payload):
+            groups.setdefault(typed, []).append((row, payload))
+
+    def recorded(mutation_id: str) -> bool:
+        return connection.execute(
+            "SELECT 1 FROM esl_events WHERE operation_id=? AND mutation_id=?", (operation_id, mutation_id)
+        ).fetchone() is not None
+
+    for typed, members in groups.items():
+        owner_identity, owner_payload = _typed_owner(connection, operation_id, typed, typed)
+        owner = connection.execute(
+            "SELECT * FROM esl_rows WHERE operation_id=? AND kind='hop' AND identity=?", (operation_id, owner_identity)
+        ).fetchone()
+        if owner is not None and owner["retraction_event_id"] is not None:
+            retraction = connection.execute(
+                "SELECT actor_name FROM esl_events WHERE id=?", (owner["retraction_event_id"],)).fetchone()
+            if retraction is not None and retraction["actor_name"] == _ledger.SCHEMA_MIGRATION_ACTOR:
+                # A retracted attempt record is not progress and owns nothing: the oldest real row does.
+                owner, owner_payload = members[0]
+        if owner is None or not isinstance(owner_payload, dict):
+            continue
+        if _task_evidence.is_canonical_payload(owner_payload):
+            base = owner_payload
+        else:
+            own = _task_evidence.legacy_contribution(owner_payload, writer=f"legacy:{owner['number']}")
+            base = {"id": owner_payload.get("id"), "technique": owner_payload.get("technique"),
+                    "target": owner_payload.get("target"), "canonical_effect": typed,
+                    "contributions": [own] if own else []}
+        others = [(row, payload) for row, payload in members if int(row["id"]) != int(owner["id"])]
+        incoming = [
+            contribution for row, payload in others
+            if (contribution := _task_evidence.legacy_contribution(payload, writer=f"legacy:{row['number']}"))
+        ]
+        merged = _payload_without_metadata(_task_evidence.merge_rows(
+            base, {"canonical_effect": typed, "contributions": incoming}, engagement_key))
+        mutation_id = f"schema-migration:v3:revalidate:{owner['id']}"
+        if merged != owner_payload and not recorded(mutation_id):
+            encoded = _canonical(merged)
+            new_revision = int(owner["revision"]) + 1
+            event_id = _insert_event(
+                connection, operation_id, int(owner["id"]), mutation_id, "update", actor, stamp, payload=encoded,
+                reason=REVALIDATION_REASON, row_revision=new_revision, revision=revision,
+            )
+            connection.execute(
+                "UPDATE esl_rows SET payload=?, revision=?, head_event_id=?, updated_at=? WHERE id=?",
+                (encoded, new_revision, event_id, stamp, int(owner["id"])),
+            )
+            counts["revalidated"] += 1
+        for row, _payload in others:
+            mutation_id = f"schema-migration:v3:merge:{row['id']}"
+            if recorded(mutation_id):
+                continue
+            event_id = _insert_event(
+                connection, operation_id, int(row["id"]), mutation_id, "retract", actor, stamp,
+                reason=f"merged into hop {owner['number']}: one row per canonical effect",
+                row_revision=int(row["revision"]), revision=revision,
+            )
+            connection.execute("UPDATE esl_rows SET retraction_event_id=? WHERE id=?", (event_id, int(row["id"])))
+            counts["merged"] += 1
+    # A typed row derived before views needed each task's admitted writers is re-derived under the current rule.
+    for row in connection.execute(
+        "SELECT * FROM esl_rows WHERE operation_id=? AND kind='hop' ORDER BY number", (operation_id,)
+    ).fetchall():
+        try:
+            payload = json.loads(row["payload"])
+        except ValueError:
+            continue
+        if not _task_evidence.is_canonical_payload(payload) or all(
+                isinstance(c, dict) and "admitted_writers" in c for c in payload["contributions"]):
+            continue
+        mutation_id = f"schema-migration:v3:revalidate:{row['id']}"
+        if recorded(mutation_id):
+            continue
+        rederived = _payload_without_metadata(_task_evidence.derive_row(payload, engagement_key))
+        encoded = _canonical(rederived)
+        new_revision = int(row["revision"]) + 1
+        event_id = _insert_event(
+            connection, operation_id, int(row["id"]), mutation_id, "update", actor, stamp, payload=encoded,
+            reason=REVALIDATION_REASON, row_revision=new_revision, revision=revision,
+        )
+        connection.execute(
+            "UPDATE esl_rows SET payload=?, revision=?, head_event_id=?, updated_at=? WHERE id=?",
+            (encoded, new_revision, event_id, stamp, int(row["id"])),
+        )
+        counts["revalidated"] += 1
+    return counts
+
+
 def schema_status(database: str | Path) -> list[dict[str, Any]]:
     """Read-only: each operation's schema version and how many rows the schema migration changed."""
     target = Path(database)
     if not target.exists():
         return []
     actor = _schema_migration_actor()
+    revalidation = Actor(kind="system", name=REVALIDATION_ACTOR)
     with contextlib.closing(_connect(target, write=False)) as connection:
         present = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if not {"esl_operations", "esl_events"} <= present:
@@ -987,10 +1112,17 @@ def schema_status(database: str | Path) -> list[dict[str, Any]]:
                     "AND actor_name=? GROUP BY kind", (op["id"], actor.kind, actor.name),
                 )
             }
+            revalidated = {
+                row["kind"]: int(row["n"]) for row in connection.execute(
+                    "SELECT kind, COUNT(*) AS n FROM esl_events WHERE operation_id=? AND actor_kind=? "
+                    "AND actor_name=? GROUP BY kind", (op["id"], revalidation.kind, revalidation.name),
+                )
+            }
             out.append({
                 "engagement_key": op["engagement_key"],
                 "schema_version": int(op["schema_version"]),
                 "migrated_rows": {"retracted": counts.get("retract", 0), "pending": counts.get("update", 0)},
+                "revalidated_rows": {"updated": revalidated.get("update", 0), "merged": revalidated.get("retract", 0)},
             })
         return out
 
@@ -1094,6 +1226,7 @@ def _apply_one(
     stamp: str,
 ) -> tuple | None:
     kind = mutation.kind
+    revalidated = False
     if kind not in {"hop", "graph_fact"}:
         raise LedgerWriteFailed(f"unknown ledger row kind {kind!r}")
     payload = _payload_without_metadata(mutation.payload)
@@ -1105,6 +1238,8 @@ def _apply_one(
         # its stored head inside the transaction, so a concurrent writer's observation, an admitted proof, earlier
         # rejected evidence and the row's number and corrections all survive.
         identity, current = _typed_owner(connection, int(op["id"]), identity, str(payload["canonical_effect"]))
+        # Adopting a row written before the shared task classification revalidates its stored proof.
+        revalidated = isinstance(current, dict) and not _task_evidence.is_canonical_payload(current)
         payload = _payload_without_metadata(_task_evidence.merge_rows(current, payload, binding.engagement_key))
     if kind == "hop" and _norm(payload.get("status")) not in _ROW_STATUSES:
         # The ledger records progress only; a failed or blocked attempt belongs to the request attempt memory.
@@ -1166,7 +1301,8 @@ def _apply_one(
     new_revision = int(head["revision"]) + 1
     event_id = _insert_event(
         connection, op["id"], row_id, mutation_id, "update", actor, stamp, payload=encoded,
-        reason="" if int(mutation.expected_revision or 0) in {0, int(head["revision"])}
+        reason=REVALIDATION_REASON if revalidated else "" if int(mutation.expected_revision or 0) in {
+            0, int(head["revision"])}
         else f"merged onto current revision {head['revision']} (derived from {mutation.expected_revision})",
         row_revision=new_revision, revision=revision,
     )

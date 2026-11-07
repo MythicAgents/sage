@@ -295,6 +295,8 @@ def material_effect(canonical: CanonicalEffect, kind: str) -> str:
 _VOLATILE_PROOF_KEYS = frozenset({"captured_at", "persistence_state"})
 _WRITER_ORDER = ("capability", "raw", "reconcile", "credential_store", "review", "operator")
 _OBSERVATION_SLOTS = ("admitted", "rejected")
+# Task output that rows stored before Phase 2 group D carried in evidence.
+_OUTPUT_PREVIEW_KEYS = frozenset({"result_preview", "reconciled_setup_preview"})
 
 
 def writer_kind(technique: str, evidence: Mapping[str, Any] | None) -> str:
@@ -362,11 +364,13 @@ def build_observation(
     }
 
 
-def legacy_contribution(payload: Mapping[str, Any]) -> dict[str, Any] | None:
+def legacy_contribution(payload: Mapping[str, Any], *, writer: str = "legacy") -> dict[str, Any] | None:
     """A row stored before typed rows existed, as one ``legacy`` observation of its task.
 
-    It keeps the stored evidence and envelope verbatim. Admission re-runs under the current rule, so a historical
-    achievement whose proof predates the shared task classification is held pending, never grandfathered.
+    It keeps the stored evidence and envelope, minus task-output previews, which stay only in the row's earlier events
+    and never enter a new one. Admission re-runs under the current rule, so a historical
+    achievement whose proof predates the shared task classification is held pending, never grandfathered. The schema
+    migration names the slot per source row (``legacy:<hop>``) so several old rows for one task stay distinct.
     """
     if not isinstance(payload, Mapping) or not payload.get("effect"):
         return None
@@ -374,6 +378,7 @@ def legacy_contribution(payload: Mapping[str, Any]) -> dict[str, Any] | None:
     proof = payload.get("proof_envelope") if isinstance(payload.get("proof_envelope"), Mapping) else {}
     if not proof and isinstance(evidence.get("proof_envelope"), Mapping):
         proof = evidence["proof_envelope"]
+    evidence = {k: v for k, v in evidence.items() if k not in _OUTPUT_PREVIEW_KEYS}
     achieved = _text(payload.get("status")).casefold() == "achieved"
     observation = build_observation(
         technique=_text(payload.get("technique")), target=_text(payload.get("target")),
@@ -386,7 +391,7 @@ def legacy_contribution(payload: Mapping[str, Any]) -> dict[str, Any] | None:
     return {
         "task_id": _task_key(evidence, proof),
         "callback_id": _callback_key(evidence, proof),
-        "writers": {"legacy": {"admitted" if achieved else "rejected": observation}},
+        "writers": {writer: {"admitted" if achieved else "rejected": observation}},
     }
 
 
@@ -584,11 +589,14 @@ def derive_row(payload: Mapping[str, Any], engagement_id: str) -> dict[str, Any]
         conflict = _binding_conflict(contribution)
         if conflict:
             contribution["binding_conflict"] = conflict
+        # Derived on every merge, for views: which writers' observations of this task the proof boundary admits now.
+        contribution["admitted_writers"] = []
         for writer, slots in contribution.get("writers", {}).items():
             observation = slots.get("admitted")
             if isinstance(observation, Mapping):
                 ok, reason = (False, conflict) if conflict else _admits(observation, contribution, engagement_id)
                 if ok:
+                    contribution["admitted_writers"].append(writer)
                     rank = _STRENGTH_RANK.get(_text(observation.get("strength")), 0)
                     admitted.append((rank, _task_sort_key(contribution["task_id"]), _writer_rank(writer), writer,
                                      dict(observation)))

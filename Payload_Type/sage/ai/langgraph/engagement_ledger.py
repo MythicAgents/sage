@@ -13,6 +13,8 @@ import re
 _FILENAME_SAFE = re.compile(r"[^A-Za-z0-9._-]")
 # Actor of the one-time schema migration that retracts stored failed/blocked rows as attempt records.
 SCHEMA_MIGRATION_ACTOR = "system:schema-migration"
+# Actor of the schema-3 revalidation that folds old rows for one typed effect into one row.
+REVALIDATION_ACTOR = "system:proof-revalidation"
 
 
 def default_engagement_id() -> str:
@@ -100,12 +102,20 @@ def is_attempt_record_retraction(corrections) -> bool:
     return isinstance(retracted, dict) and str(retracted.get("actor") or "") == SCHEMA_MIGRATION_ACTOR
 
 
+def is_revalidation_merge(corrections) -> bool:
+    """Whether a row's retraction is the revalidation's: an old row folded into the one row for its effect."""
+    retracted = corrections.get("retracted") if isinstance(corrections, dict) else None
+    return isinstance(retracted, dict) and str(retracted.get("actor") or "") == REVALIDATION_ACTOR
+
+
 def correction_label(hop: dict) -> str:
     """``achieved — operator retracted`` style presentation of a row's status plus its effective correction."""
     status = status_label(hop) if isinstance(hop, dict) else "-"
     corrections = hop.get("corrections") if isinstance(hop, dict) and isinstance(hop.get("corrections"), dict) else {}
     if is_attempt_record_retraction(corrections):
         return f"{status} — retracted attempt record"
+    if is_revalidation_merge(corrections):
+        return f"{status} — merged into one row per effect"
     if corrections.get("retracted"):
         return f"{status} — operator retracted"
     marker = corrections.get("no_longer_holds") if isinstance(corrections.get("no_longer_holds"), dict) else {}
@@ -254,33 +264,206 @@ def md_cell(value, limit: int = 40) -> str:
     return s or "-"
 
 
-def render_hop_table(hops, *, include_evidence: bool = True, limit: int = 0) -> list[str]:
+def _code(value, limit: int = 60, *, cell: bool = False) -> str:
+    """A value as one inline code span: whitespace collapsed, backticks removed, bounded. Markdown inside it is inert.
+
+    In a table cell a pipe is escaped, as GitHub-flavoured tables require even inside code spans.
+    """
+    text = " ".join(str(value if value is not None else "").replace("`", "").split())
+    if len(text) > limit:
+        text = text[: limit - 1] + "…"
+    if cell:
+        text = text.replace("|", "\\|")
+    return f"`{text}`" if text else "`-`"
+
+
+def _task_link(task: str, text: str = "", *, cell: bool = False) -> str:
+    """A Mythic task-page link for a numeric display ID; anything else is shown as inert text, never a link."""
+    if task.isascii() and task.isdigit():
+        return f"[{text or task}](/new/task/{task})"
+    return f"{text + ' ' if text else ''}{_code(task, 24, cell=cell)}"
+
+
+def task_ids(hop) -> list[str]:
+    """Distinct Mythic task display IDs a row names: every contribution of a typed row, else its evidence task."""
+    get = hop.get if isinstance(hop, dict) else (lambda key, default=None: getattr(hop, key, default))
+    tasks: list[str] = []
+    contributions = get("contributions")
+    if get("canonical_effect") and isinstance(contributions, list):
+        candidates = [c.get("task_id") for c in contributions if isinstance(c, dict)]
+    else:
+        evidence = get("evidence") if isinstance(get("evidence"), dict) else {}
+        candidates = [evidence.get("mythic_task_id") or evidence.get("task_id")]
+    for task in candidates:
+        text = str(task if task is not None else "").strip()
+        if text and text not in tasks:
+            tasks.append(text)
+    return tasks
+
+
+def render_hop_table(hops, *, limit: int = 0) -> list[str]:
     """Render hops as markdown table lines keyed by permanent hop number, ascending.
 
     Every surface that shows hops (`/state`, the turn-end summary, and the model's copy of either) uses this,
-    so "hop N" names the same row everywhere. `limit` keeps the N highest-numbered (newest) hops. The model's
-    copy omits Evidence: those previews are target-influenced task output, which the model reads through its
-    tools rather than as operator-role text.
+    so "hop N" names the same row everywhere. `limit` keeps the N highest-numbered (newest) hops. The Task column
+    links each Mythic task the row names; ``evidence_notes`` explains each one. No task output is rendered.
     """
     rows = sorted((h for h in (hops or []) if isinstance(h, dict)), key=hop_number)
     if limit and len(rows) > limit:
         rows = rows[-limit:]
-    header = "| # | Hop | Effect | Status | Task | CB |" + (" Evidence |" if include_evidence else "")
-    divider = "|---|---|---|---|---|---|" + ("---|" if include_evidence else "")
-    lines = [header, divider]
+    lines = ["| # | Hop | Effect | Status | Task | CB |", "|---|---|---|---|---|---|"]
     for hop in rows:
         ev = hop.get("evidence") if isinstance(hop.get("evidence"), dict) else {}
-        task_id = ev.get("mythic_task_id")
         cb_id = ev.get("callback_id")
         number = hop_number(hop)
-        line = (
+        tasks = ", ".join(_task_link(task, cell=True) for task in task_ids(hop)) or "-"
+        lines.append(
             f"| {number or '-'} | `{md_cell(hop_label(hop), 48)}` | {md_cell(hop.get('effect'))} | "
-            f"`{md_cell(correction_label(hop), 40)}` | {task_id if task_id is not None else '-'} | "
-            f"{cb_id if cb_id is not None else '-'} |"
+            f"`{md_cell(correction_label(hop), 40)}` | {tasks} | "
+            f"{md_cell(cb_id, 12) if cb_id not in (None, '') else '-'} |"
         )
-        if include_evidence:
-            line += f" {md_cell(ev.get('result_preview') or ev.get('source') or '', 60)} |"
-        lines.append(line)
+    return lines
+
+
+_CLASS_LABELS = {
+    "terminal_success": "terminal success",
+    "postprocessing_error_with_output": "completion-function error with output",
+    "agent_error_or_failed": "agent error or failed",
+    "not_agent_processed": "not processed by the agent",
+    "unknown": "unknown",
+}
+_WRITER_LABELS = (
+    ("raw", "raw"), ("capability", "capability"), ("reconcile", "task history"),
+    ("credential_store", "credential store"), ("review", "credential review"), ("operator", "operator review"),
+    ("legacy", "earlier record"),
+)
+
+
+def _writer_label(writer: str) -> str:
+    kind = str(writer or "").split(":", 1)[0]
+    return next((label for name, label in _WRITER_LABELS if name == kind), _code(writer, 32))
+
+
+def _writer_labels(writers) -> list[str]:
+    order = {name: index for index, (name, _label) in enumerate(_WRITER_LABELS)}
+    labels: list[str] = []
+    for writer in sorted(writers, key=lambda w: order.get(str(w).split(":", 1)[0], len(order))):
+        label = _writer_label(writer)
+        if label not in labels:
+            labels.append(label)
+    return labels
+
+
+def _class_label(value) -> str:
+    text = str(value or "").strip()
+    return _CLASS_LABELS.get(text, _code(text, 40)) if text else ""
+
+
+def _observations(contribution: dict):
+    for writer, slots in (contribution.get("writers") or {}).items():
+        if isinstance(slots, dict):
+            for slot in ("admitted", "rejected"):
+                if isinstance(slots.get(slot), dict):
+                    yield str(writer), slots[slot]
+
+
+def _typed_notes(hop: dict, number) -> list[str]:
+    """One line per task on a typed row, from the stored structured fields only."""
+    try:
+        try:
+            from . import task_evidence
+        except ImportError:
+            import task_evidence  # type: ignore
+        canonical = task_evidence.canonical_from_identity(hop.get("canonical_effect"))
+    except Exception:
+        canonical = None
+    subject = _code(canonical.subject if canonical is not None else hop.get("canonical_effect"), 80)
+    lines = []
+    for contribution in hop.get("contributions") or []:
+        if not isinstance(contribution, dict) or not str(contribution.get("task_id") or "").strip():
+            continue
+        task = str(contribution["task_id"]).strip()
+        observations = list(_observations(contribution))
+        writers = list(dict.fromkeys(writer for writer, _obs in observations))
+        if "admitted_writers" in contribution:
+            admitted = [w for w in contribution.get("admitted_writers") or [] if w in writers]
+        elif str(hop.get("status") or "").casefold() != "achieved":  # stored before views needed it
+            admitted = []
+        else:
+            admitted = [w for w in writers if isinstance((contribution["writers"].get(w) or {}).get("admitted"), dict)]
+        reviews = [r for r in (contribution.get("reviews") or {}).values() if isinstance(r, dict)]
+        review = next((r for r in reviews if r.get("verdict") == "valid"), reviews[-1] if reviews else None)
+        if admitted:
+            strengths = {str((contribution["writers"][w].get("admitted") or {}).get("strength") or "") for w in admitted}
+            if "working" in strengths:
+                claim = f"proves working credential for {subject}"
+            else:
+                candidate = review.get("candidate") if isinstance(review, dict) and isinstance(
+                    review.get("candidate"), dict) else {}
+                kind = candidate.get("type") if isinstance(review, dict) and review.get("verdict") == "valid" else ""
+                if not kind:
+                    kind = next((str((contribution["writers"][w].get("admitted") or {}).get("material_kind") or "")
+                                 for w in admitted), "")
+                claim = f"proves {_code(kind or 'unknown', 24)} material for {subject}"
+        else:
+            claim = f"does not prove {subject}"
+        parts = [f"- hop {number or '-'} · {_task_link(task, f'task {task}' if task.isascii() and task.isdigit() else 'task')}: {claim}"]
+        task_class = next((obs.get("evidence", {}).get("task_classification") for _w, obs in observations
+                           if isinstance(obs.get("evidence"), dict) and obs["evidence"].get("task_classification")), "")
+        if task_class:
+            parts.append(f"Mythic: {_class_label(task_class)}")
+        if admitted:
+            parts.append("admitted: " + ", ".join(_writer_labels(admitted)))
+        rejected = [w for w in writers if w not in admitted]
+        if rejected:
+            parts.append("not admitted: " + ", ".join(_writer_labels(rejected)))
+        if isinstance(review, dict):
+            reviewer = _code(review.get("reviewer_kind") or "unknown", 24)[1:-1]
+            who = review.get("model") if review.get("reviewer_kind") == "llm" else (
+                review.get("reviewer_id") if review.get("reviewer_kind") == "operator" else "")
+            reviewer += f" {_code(who, 48)}" if who else ""
+            parts.append(f"reviewer: {reviewer} ({_code(review.get('verdict') or 'unknown', 16)[1:-1]})")
+        lines.append(" · ".join(parts))
+    return lines
+
+
+def evidence_notes(hops, *, limit: int = 0) -> list[str]:
+    """One line per (row, Mythic task), built only from structured fields (no output, candidate or model text).
+
+    Corrected rows are history and are explained by ``correction_notes`` instead.
+    """
+    rows = sorted((h for h in (hops or []) if isinstance(h, dict)), key=hop_number)
+    if limit and len(rows) > limit:
+        rows = rows[-limit:]
+    lines: list[str] = []
+    for hop in rows:
+        if hop_corrected(hop):
+            continue
+        number = hop_number(hop)
+        if hop.get("canonical_effect") and isinstance(hop.get("contributions"), list):
+            lines.extend(_typed_notes(hop, number))
+            continue
+        tasks = task_ids(hop)
+        if not tasks:
+            continue
+        evidence = hop.get("evidence") if isinstance(hop.get("evidence"), dict) else {}
+        verb = "proves" if str(hop.get("status") or "").casefold() == "achieved" else "does not prove"
+        task = tasks[0]
+        parts = [f"- hop {number or '-'} · {_task_link(task, f'task {task}' if task.isascii() and task.isdigit() else 'task')}: "
+                 f"{verb} {_code(hop.get('effect'), 80)}"]
+        if evidence.get("task_classification"):
+            parts.append(f"Mythic: {_class_label(evidence.get('task_classification'))}")
+        try:
+            try:
+                from . import task_evidence
+            except ImportError:
+                import task_evidence  # type: ignore
+            writer = task_evidence.writer_kind(str(hop.get("technique") or ""), evidence)
+        except Exception:
+            writer = str(evidence.get("source") or "")
+        if writer and writer != "writer":
+            parts.append(f"source: {_writer_label(writer)}")
+        lines.append(" · ".join(parts))
     return lines
 
 
@@ -294,6 +477,8 @@ def correction_notes(hops, *, limit: int = 0) -> list[str]:
         corrections = hop.get("corrections") or {}
         marker = corrections.get("retracted") or corrections.get("no_longer_holds") or {}
         what = "attempt record, not progress" if is_attempt_record_retraction(corrections) else (
+            "merged by revalidation"
+        ) if is_revalidation_merge(corrections) else (
             "operator retracted"
         ) if corrections.get("retracted") else (
             "operator marked no longer holds" if marker.get("scope") == "operator" else "no longer holds (Sage observation)"
@@ -313,7 +498,7 @@ _OPERATOR_VIEWS: dict[str, str] = {}
 
 
 def operator_view_text(data: dict, shown_via: str, *, limit: int = 0) -> str:
-    """Model-facing copy of a ledger view the operator was just shown (no evidence previews)."""
+    """Model-facing copy of a ledger view the operator was just shown: the same table, task links and notes."""
     hops = [h for h in (data.get("hops") or []) if isinstance(h, dict)]
     lines = [
         f"[Sage ledger view] The operator was shown this engagement-state table via {shown_via}. It is Sage's "
@@ -328,7 +513,11 @@ def operator_view_text(data: dict, shown_via: str, *, limit: int = 0) -> str:
     else:
         if limit and len(hops) > limit:
             lines.append(f"Showing the {limit} newest of {len(hops)} hops.")
-        lines.extend(render_hop_table(hops, include_evidence=False, limit=limit))
+        lines.extend(render_hop_table(hops, limit=limit))
+        evidence = evidence_notes(hops, limit=limit)
+        if evidence:
+            lines.append("Evidence (one line per Mythic task, from structured ledger fields):")
+            lines.extend(evidence)
         notes = correction_notes(hops, limit=limit)
         if notes:
             lines.append("Corrections (retracted or no-longer-holding rows are history, not current proof):")

@@ -1182,12 +1182,12 @@ def _reconcile_proven_gpo_setup_hops(state: "EngagementState", hops: list[Hop]) 
             continue
         setup_evidence = existing.evidence if isinstance(existing.evidence, dict) else {}
         evidence = dict(proof.evidence) if isinstance(proof.evidence, dict) else {}
+        evidence.pop("result_preview", None)  # task output never enters a new row (historical rows keep theirs)
         evidence.update({
             "verify_verdict": "achieved",
             "verify_reason": f"SYSTEM execution through GPO {gpo} proven by hop {proof.id}",
             "reconciled_from_hop": proof.id,
             "reconciled_setup_task_id": setup_evidence.get("mythic_task_id"),
-            "reconciled_setup_preview": setup_evidence.get("result_preview"),
         })
         reconciled.append(Hop(
             id=existing.id,

@@ -102,8 +102,8 @@ def test_reconcile_manual_krbtgt_dcsync_records_verified_effect():
     assert record.evidence["mythic_task_id"] == 450
     assert record.evidence["callback_id"] == 13
     assert record.evidence["verified_on_record"] is True
-    assert NTLM not in record.evidence["result_preview"]
-    assert AES256 not in record.evidence["result_preview"]
+    assert "result_preview" not in record.evidence  # no task output in row evidence
+    assert NTLM not in json.dumps(record.evidence) and AES256 not in json.dumps(record.evidence)
     material = {(item["secret_type"], item["credential_type"], item["credential"]) for item in record.credential_material}
     assert ("aes256", "key", AES256.lower()) in material
     assert ("ntlm", "hash", NTLM.lower()) in material
