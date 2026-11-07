@@ -324,9 +324,15 @@ def _valid_sha256(value: str) -> bool:
     return bool(_HEX64_RE.fullmatch(_lower(value)))
 
 
-def admit_runtime_envelope(
+def admit_runtime_envelope(envelope: ProofEnvelope | None, **expected: Any) -> ProofAdmission:
+    """Runtime admission: exact lineage and commitments, from a Mythic task Mythic reported as terminal success."""
+    return _admit_runtime_lineage(envelope, terminal_statuses=_TERMINAL_SUCCESS, **expected)
+
+
+def _admit_runtime_lineage(
     envelope: ProofEnvelope | None,
     *,
+    terminal_statuses: frozenset[str],
     current_engagement_id: str,
     expected_callback_id: Any = "",
     expected_transaction_id: Any = "",
@@ -361,7 +367,7 @@ def admit_runtime_envelope(
         return ProofAdmission(False, envelope, "missing Mythic task lineage", REJECTED)
     if _text(expected_task_id) and envelope.task_id != _text(expected_task_id):
         return ProofAdmission(False, envelope, "proof task does not match verifier observation", REJECTED)
-    if envelope.terminal_status not in _TERMINAL_SUCCESS:
+    if envelope.terminal_status not in terminal_statuses:
         return ProofAdmission(False, envelope, "task is not terminal-success", REJECTED)
     if _lower(expected_terminal_status) and envelope.terminal_status != _lower(expected_terminal_status):
         return ProofAdmission(False, envelope, "proof terminal status does not match verifier observation", REJECTED)
@@ -459,14 +465,104 @@ TASK_TERMINAL_SUCCESS = "terminal_success"
 _TASK_LINEAGE_ORIGINS = frozenset({ORIGIN_MYTHIC_TASK, ORIGIN_MYTHIC_ARTIFACT, ORIGIN_MYTHIC_CREDENTIAL})
 
 
-def admit_task_observation(envelope: ProofEnvelope | None, **expected: Any) -> ProofAdmission:
+TASK_POSTPROCESSING_ERROR = "postprocessing_error_with_output"
+# A review-backed credential-material proof (credential_review.py): the only proof form a task whose completion
+# function failed after the agent answered can carry, and it proves material only, never a working credential.
+PROOF_FORM_KEY = "proof_form"
+CREDENTIAL_REVIEW_MATERIAL = "credential_review_material"
+_REVIEW_VERDICT_VALID = "valid"
+_MATERIAL_EFFECT_RE = re.compile(r"^cred-material:[a-z0-9][a-z0-9_-]*:([^:@\s\\]+@[a-z0-9][a-z0-9.-]*)$")
+
+
+def credential_review_verifier_input(task_id: Any, canonical_effect: str, output_sha256: str, rule_version: str,
+                                     reviewer_kind: str) -> dict[str, str]:
+    """What a credential review decided over: one Mythic task's output, for one canonical effect, under one rule."""
+    return {
+        "task_id": _text(task_id),
+        "canonical_effect": _lower(canonical_effect),
+        "output_sha256": _lower(output_sha256),
+        "rule_version": _text(rule_version),
+        "reviewer_kind": _lower(reviewer_kind),
+    }
+
+
+def credential_review_id(task_id: Any, canonical_effect: str, output_sha256: str, rule_version: str,
+                         reviewer_kind: str) -> str:
+    """One review decision per task, effect, output digest, rule and reviewer kind."""
+    return canonical_commitment_sha256(
+        credential_review_verifier_input(task_id, canonical_effect, output_sha256, rule_version, reviewer_kind))
+
+
+def _admit_credential_review(envelope: ProofEnvelope, claimed_effects: Any, expected: Mapping[str, Any]) -> ProofAdmission:
+    """The review-backed material form. Admitted only for a task whose sole failure was Mythic's completion function,
+    with a valid review whose identity and input commitment recompute from the envelope's own task lineage, and only
+    for the one material effect the review names."""
+    if envelope.origin != ORIGIN_MYTHIC_TASK:
+        return ProofAdmission(False, envelope, "review-backed proof requires Mythic task lineage", REJECTED)
+    admission = _admit_runtime_lineage(envelope, terminal_statuses=frozenset({TASK_POSTPROCESSING_ERROR}), **expected)
+    if not admission.admitted:
+        return admission
+    metadata = envelope.metadata
+    if _text(metadata.get(TASK_CLASSIFICATION_KEY)) != TASK_POSTPROCESSING_ERROR:
+        return ProofAdmission(False, envelope, "review-backed proof applies only to a completion-function error",
+                              REJECTED)
+    verdict = _lower(metadata.get("review_verdict"))
+    if verdict != _REVIEW_VERDICT_VALID:
+        return ProofAdmission(False, envelope, f"credential review verdict is {verdict or 'missing'}", REJECTED)
+    claimed = _lower(metadata.get("claimed_effect"))
+    match = _MATERIAL_EFFECT_RE.fullmatch(claimed)
+    if match is None:
+        return ProofAdmission(False, envelope, "review-backed proof must name one credential-material effect", REJECTED)
+    claims = {" ".join(_lower(item).split()) for item in (claimed_effects or []) if _text(item)}
+    if claims != {claimed}:
+        return ProofAdmission(False, envelope, "review-backed proof covers only its credential-material effect",
+                              REJECTED)
+    digest = _lower(metadata.get("review_output_sha256"))
+    rule_version = _text(metadata.get("review_rule_version"))
+    reviewer_kind = _lower(metadata.get("reviewer_kind"))
+    if not _valid_sha256(digest) or not rule_version or not reviewer_kind:
+        return ProofAdmission(False, envelope, "review-backed proof is missing its review commitments", REJECTED)
+    canonical = f"account-secret:{match.group(1)}"
+    review_input = credential_review_verifier_input(envelope.task_id, canonical, digest, rule_version, reviewer_kind)
+    if _lower(metadata.get("review_id")) != canonical_commitment_sha256(review_input):
+        return ProofAdmission(False, envelope, "review identity does not match the task and output", REJECTED)
+    if envelope.verifier_input_sha256 != canonical_commitment_sha256(review_input):
+        return ProofAdmission(False, envelope, "review input commitment mismatch", REJECTED)
+    if envelope.verifier_id != f"credential_review:{rule_version}":
+        return ProofAdmission(False, envelope, "review-backed proof has another verifier", REJECTED)
+    return ProofAdmission(True, envelope, "admitted review-backed credential material", ADMITTED)
+
+
+def row_headline_claims(envelope: ProofEnvelope | None, satisfied_effects: Any) -> list[str]:
+    """The effects a typed row's headline proof must itself cover, for a reader that re-admits only the headline.
+
+    Every observation on the row was admitted separately for its own effects when the row was derived. A
+    review-backed headline covers its one material effect; the row's other credential material came from other
+    admitted observations. Anything stronger on the row (a working credential) must be covered by the headline,
+    so a review-backed headline beside one is rejected.
+    """
+    claims = [_text(item) for item in (satisfied_effects or []) if _text(item)]
+    if envelope is None or envelope.metadata.get(PROOF_FORM_KEY) != CREDENTIAL_REVIEW_MATERIAL:
+        return claims
+    own = _lower(envelope.metadata.get("claimed_effect"))
+    return [item for item in claims if not _lower(item).startswith("cred-material:") or _lower(item) == own]
+
+
+def admit_task_observation(
+    envelope: ProofEnvelope | None, *, claimed_effects: Any = None, **expected: Any
+) -> ProofAdmission:
     """Admission for one writer's observation on a typed-effect row.
 
     The runtime envelope checks, plus the shared task classification committed in the envelope: a task-lineaged
     proof is admitted only when its Mythic task record classified as terminal success. An envelope written before
     that classification existed (for example an output-only capability achievement) is not grandfathered; it stays
     pending until the current rule admits a new observation.
+
+    The one exception is the review-backed material form, admitted for a completion-function-error task only when
+    ``claimed_effects`` is exactly the material effect its review names.
     """
+    if envelope is not None and envelope.metadata.get(PROOF_FORM_KEY) == CREDENTIAL_REVIEW_MATERIAL:
+        return _admit_credential_review(envelope, claimed_effects, expected)
     admission = admit_runtime_envelope(envelope, **expected)
     if not admission.admitted or envelope is None or envelope.origin not in _TASK_LINEAGE_ORIGINS:
         return admission
@@ -509,9 +605,14 @@ def attach_proof(
     expected_verifier_result_sha256: str = "",
     expected_artifact_id: str = "",
     expected_authorization: Mapping[str, Any] | None = None,
+    claimed_effects: Any = None,
 ) -> tuple[dict[str, Any], ProofAdmission]:
+    """Admit ``envelope`` and attach its lineage to ``evidence``. With ``claimed_effects`` (an observation on a
+    typed-effect row) the task-observation rule applies, including the review-backed material form."""
     out = merge_untrusted_evidence({}, evidence or {})
-    admission = admit_runtime_envelope(
+    admit = admit_runtime_envelope if claimed_effects is None else (
+        lambda env, **kw: admit_task_observation(env, claimed_effects=claimed_effects, **kw))
+    admission = admit(
         envelope,
         current_engagement_id=current_engagement_id,
         expected_callback_id=expected_callback_id,

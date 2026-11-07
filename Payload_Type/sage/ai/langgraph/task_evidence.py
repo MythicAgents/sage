@@ -395,11 +395,19 @@ def contribution_row(canonical: CanonicalEffect, writer: str, observation: Mappi
     evidence = observation.get("evidence") if isinstance(observation.get("evidence"), Mapping) else {}
     proof = observation.get("proof_envelope") if isinstance(observation.get("proof_envelope"), Mapping) else {}
     slot = "admitted" if observation.get("admitted") else "rejected"
+    observation = dict(observation)
+    review = evidence.get("credential_review") if isinstance(evidence.get("credential_review"), Mapping) else None
+    if review is not None:
+        # A credential review's record is the task's persisted decision: it lives once on the contribution, keyed by
+        # its review ID, and the observation keeps only the ID.
+        observation["evidence"] = {k: v for k, v in evidence.items() if k != "credential_review"}
     contribution = {
         "task_id": _task_key(evidence, proof),
         "callback_id": _callback_key(evidence, proof),
-        "writers": {writer: {slot: dict(observation)}},
+        "writers": {writer: {slot: observation}},
     }
+    if review is not None and _text(review.get("review_id")):
+        contribution["reviews"] = {_text(review.get("review_id")): dict(review)}
     return {
         "id": canonical.identity,
         "technique": canonical.technique,
@@ -491,9 +499,16 @@ def merge_contributions(current: Iterable[Any], incoming: Iterable[Any]) -> list
             for writer, slots in (contribution.get("writers") or {}).items():
                 if isinstance(slots, Mapping):
                     entry["writers"][str(writer)] = _merge_writer(entry["writers"].get(str(writer)), slots)
-            for key_name in ("review", "binding_conflict"):
-                if contribution.get(key_name) and not entry.get(key_name):
-                    entry[key_name] = contribution[key_name]
+            if contribution.get("binding_conflict") and not entry.get("binding_conflict"):
+                entry["binding_conflict"] = contribution["binding_conflict"]
+            reviews = contribution.get("reviews")
+            if isinstance(reviews, Mapping):
+                # One record per review ID, first write wins: a reload or a repeat writer never regrades. A changed
+                # output or rule is a new review ID beside the old one.
+                stored = entry.setdefault("reviews", {})
+                for review_key, record in reviews.items():
+                    if isinstance(record, Mapping):
+                        stored.setdefault(str(review_key), dict(record))
     return [merged[key] for key in sorted(order, key=_task_sort_key)]
 
 
@@ -512,6 +527,7 @@ def _admits(observation: Mapping[str, Any], contribution: Mapping[str, Any], eng
     try:
         admission = proof_boundary.admit_task_observation(
             proof_boundary.ProofEnvelope.from_dict(dict(proof)),
+            claimed_effects=list(observation.get("satisfied_effects") or [observation.get("effect")]),
             current_engagement_id=engagement_id,
             expected_callback_id=callback,
             expected_task_id=task,

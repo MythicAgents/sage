@@ -16,7 +16,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from mythic import mythic
 
@@ -407,6 +407,9 @@ class VerifiedTask:
     target: str
     evidence: dict
     notes: tuple[str, ...]
+    # The task output, held in memory only for a task whose sole failure was Mythic's completion function, so the
+    # caller can run the credential review over it. Never persisted, logged or rendered.
+    review_output: str = field(default="", repr=False, compare=False)
 
 
 async def verify_task(client, task: dict, now: str, *, engagement_id: str, foothold_by_callback: dict,
@@ -429,7 +432,9 @@ async def verify_task(client, task: dict, now: str, *, engagement_id: str, footh
     if refs:
         evidence["credential_material_imported"] = True
         evidence["credential_store_refs"] = refs
-    return VerifiedTask(record.technique, record.target, evidence, tuple(notes))
+    reviewable = evidence.get("task_classification") == "postprocessing_error_with_output"
+    return VerifiedTask(record.technique, record.target, evidence, tuple(notes),
+                        review_output=str(output or "") if reviewable else "")
 
 
 def footholds_from_tasks(tasks, now: str) -> dict[str, object]:

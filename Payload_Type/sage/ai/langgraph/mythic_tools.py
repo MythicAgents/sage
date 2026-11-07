@@ -9434,6 +9434,53 @@ class MythicTools:
         classification, record = self._task_classification(task_id)
         return classification, task_evidence.envelope_terminal_status(classification, record), record
 
+    def _record_credential_review(
+        self, state, *, effect: str, task_id, callback_id, command: str, transaction_id: str, task_class: str,
+        output, now: str,
+    ):
+        """Add the credential review's observation to a completion-function-error task's account-secret row.
+
+        Runs only for a task Mythic classified ``postprocessing_error_with_output`` and an account-secret effect. A
+        review already stored for this task, effect, output and rule is reused, never regraded. A valid review
+        proves credential material only; a rejected one keeps its record and reason on the task's contribution; no
+        decisive review leaves the row as it was. No candidate value or output text is stored.
+        """
+        try:
+            from . import credential_review, engagement_state, task_evidence
+        except ImportError:  # pragma: no cover
+            import credential_review
+            import engagement_state
+            import task_evidence
+        canonical = task_evidence.canonical_effect(effect)
+        if (canonical is None or task_class != task_evidence.POSTPROCESSING_ERROR_WITH_OUTPUT
+                or task_id is None or not str(output or "").strip()):
+            return state
+        owner = engagement_state.typed_row(getattr(state, "hops", []), canonical.identity)
+        stored: dict = {}
+        for contribution in (getattr(owner, "contributions", None) or []) if owner is not None else []:
+            if isinstance(contribution, dict) and str(contribution.get("task_id")) == str(task_id):
+                stored = dict(contribution.get("reviews") or {})
+        try:
+            outcome = credential_review.review_for_task(
+                output, task_id=str(task_id), canonical_effect=canonical.identity, account=canonical.account,
+                realm=canonical.realm, stored=stored,
+            )
+            built = credential_review.review_observation(
+                outcome, subject=canonical.subject, engagement_id=self._eng_key(), task_id=str(task_id),
+                callback_id=callback_id, command=command, transaction_id=transaction_id, captured_at=now,
+            )
+            if built is None:
+                return state
+            material, evidence, envelope = built
+            return engagement_state.record_effect_result(
+                state, "credential-review", canonical.subject, material, "achieved", evidence, now,
+                satisfied_effects=[material], proof_envelope=envelope, require_admissible_proof=True,
+                engagement_id=self._eng_key(),
+            )
+        except Exception as exc:  # the review fails closed: the row stays as the writers left it
+            logger.warning(f"credential review failed closed for task {task_id}: {type(exc).__name__}")
+            return state
+
     def _record_engagement_success(
         self,
         results_str,
@@ -9757,6 +9804,14 @@ class MythicTools:
                     proof_envelope=proof_envelope,
                     require_admissible_proof=True,
                     engagement_id=self._eng_key(),
+                )
+            if technique in credential_artifacts.CREDENTIAL_TECHNIQUES and status == "achieved":
+                # A task whose only failure was Mythic's completion function may still prove credential material,
+                # through the independent review of the output this writer holds.
+                updated = self._record_credential_review(
+                    updated, effect=engagement_state._technique_effect(technique, target_key), task_id=task_id,
+                    callback_id=callback_id, command=command, transaction_id=transaction_id,
+                    task_class=task_class, output=results_str, now=now,
                 )
             # Persist only the produced row(s). A failed write is reported as unrecorded and never repeats
             # the target action.
@@ -19360,6 +19415,15 @@ class MythicTools:
                 proof_envelope=proof if isinstance(proof, dict) else None,
                 require_admissible_proof=True, engagement_id=self._eng_key(),
             )
+            if verified.review_output:
+                state = self._record_credential_review(
+                    state, effect=engagement_state._technique_effect(verified.technique, verified.target),
+                    task_id=task["display_id"], callback_id=verified.evidence.get("callback_id"),
+                    command=str(verified.evidence.get("command") or ""),
+                    transaction_id=str(verified.evidence.get("transaction_id") or f"operator-task:{task['display_id']}"),
+                    task_class=str(verified.evidence.get("task_classification") or ""),
+                    output=verified.review_output, now=now,
+                )
             identity = engagement_state.typed_row_identity(state, verified.technique, verified.target)
             mutation_ids[identity] = state_reconcile._reconcile_mutation_id(
                 self._eng_key(), task["display_id"], identity, verified.evidence)

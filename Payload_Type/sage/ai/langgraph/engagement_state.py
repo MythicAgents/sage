@@ -138,6 +138,17 @@ def _hop_has_admissible_runtime_proof(hop: "Hop", engagement_id: str) -> bool:
         proof = getattr(hop, "proof_envelope", {}) or {}
         if not proof and isinstance(getattr(hop, "evidence", None), dict):
             proof = getattr(hop, "evidence", {}).get("proof_envelope") or {}
+        if _text(getattr(hop, "canonical_effect", "")):
+            # A typed row's headline proof must cover what the row claims beyond other observations' credential
+            # material: a review-backed headline beside a working credential proves nothing.
+            envelope = proof_boundary.ProofEnvelope.from_dict(proof)
+            admission = proof_boundary.admit_task_observation(
+                envelope,
+                claimed_effects=proof_boundary.row_headline_claims(
+                    envelope, list(getattr(hop, "satisfied_effects", []) or [])),
+                current_engagement_id=engagement_id,
+            )
+            return admission.admitted
         admission = proof_boundary.admit_runtime_envelope(
             proof_boundary.ProofEnvelope.from_dict(proof),
             current_engagement_id=engagement_id,
@@ -851,13 +862,26 @@ def _objective_remote_exec_targets(objective: Any) -> set[tuple[str, str]]:
     return targets
 
 
+def _material_subject(effect: str) -> str:
+    """``<account>@<realm>`` of an account's credential material (``cred-material:<kind>:<account>@<realm>``)."""
+    if not effect.startswith("cred-material:"):
+        return ""
+    _kind, sep, subject = effect[len("cred-material:"):].partition(":")
+    return subject.strip() if sep and "@" in subject else ""
+
+
 def _credential_effect_satisfied(account: str, domain: str, achieved: set[str]) -> bool:
+    """Whether an "obtain the credentials" objective target is met: a working credential (``creds:``) or proven
+    credential material for that account. Material satisfies only this objective match, never a ``creds:`` gate."""
     account = _normalize_key(account).split("\\")[-1]
     domain = _normalize_key(domain)
     for effect in achieved:
-        if not effect.startswith("creds:"):
+        if effect.startswith("creds:"):
+            material = effect.split(":", 1)[1].strip()
+        elif _material_subject(effect):
+            material = _material_subject(effect)
+        else:
             continue
-        material = effect.split(":", 1)[1].strip()
         principal, sep, effect_domain = material.rpartition("@")
         if not sep:
             continue
@@ -938,6 +962,12 @@ def _effect_satisfied(required_effect: str, achieved: set[str]) -> bool:
         p, s, d = eff.partition(":")
         if s and p == prefix and _domains_equivalent(d, dom):
             return True
+        if prefix == "krbtgt-hash" and _material_subject(eff):
+            # The objective's krbtgt witness asks for the secret itself, so proven krbtgt material satisfies it.
+            # Every krbtgt-hash: precondition (ticket forgery) still requires a working credential.
+            principal, _at, material_domain = _material_subject(eff).rpartition("@")
+            if _normalize_key(principal).split("\\")[-1] == "krbtgt" and _domains_equivalent(material_domain, dom):
+                return True
     return False
 
 
@@ -1266,6 +1296,9 @@ def record_effect_result(
     if not proof_dict and isinstance(evidence_dict.get("proof_envelope"), dict):
         proof_dict = dict(evidence_dict["proof_envelope"])
     admission = None
+    # An account secret's observation is admitted under the task-observation rule, which also checks the effects it
+    # claims (a review-backed proof covers credential material only).
+    canonical = _task_evidence().canonical_effect(normalized_effect) if require_admissible_proof else None
     if proof_dict or (require_admissible_proof and normalized_status == "achieved"):
         try:
             try:
@@ -1285,6 +1318,7 @@ def record_effect_result(
                 expected_verifier_result_sha256=evidence_dict.get("verifier_result_sha256") or "",
                 expected_artifact_id=evidence_dict.get("artifact_id") or "",
                 expected_authorization=evidence_dict,
+                claimed_effects=normalized_effects if canonical is not None else None,
             )
             evidence_dict = attached
             proof_dict = dict(attached.get("proof_envelope") or {})
@@ -1304,7 +1338,6 @@ def record_effect_result(
     else:
         normalized_reason = ""
     source = _text(evidence_dict.get("source")) if isinstance(evidence_dict, dict) else ""
-    canonical = _task_evidence().canonical_effect(normalized_effect) if require_admissible_proof else None
     if canonical is not None:
         return _record_canonical_observation(
             state, canonical, technique, target, normalized_effect, normalized_status, evidence_dict, now,

@@ -35,6 +35,8 @@ REALM = "north.example.local"
 ACCOUNT = "fixture.user"
 TYPED = f"account-secret:{ACCOUNT}@{REALM}"
 WORKING = f"creds:{ACCOUNT}@{REALM}"
+# What the credential review may establish for a completion-function-error task: material, never a working credential.
+MATERIAL = f"cred-material:hash:{ACCOUNT}@{REALM}"
 NTLM = "0123456789abcdef0123456789abcdef"
 CALLBACK = 2
 TASK = 18
@@ -165,21 +167,25 @@ def _achieved(tools: MythicTools) -> set[str]:
 
 # --- the task 18 shape --------------------------------------------------------------------------------------------
 
-def test_task_18_two_writers_make_one_pending_row_with_both_observations(session, mythic_issue, mythic_task_records,
-                                                                         monkeypatch):
+def test_task_18_two_writers_make_one_row_and_neither_credits_output_alone(session, mythic_issue,
+                                                                           mythic_task_records, monkeypatch):
     mythic_task_records[TASK] = COMPLETION_ERROR
     tools = session()
     _capability_issue(tools)
 
     [row] = _typed_rows(tools)
     assert len(tools._ledger_snapshot().hop_rows()) == 1
-    assert (row.payload["status"], row.payload["pending_reason"]) == ("pending", "proof_missing")
-    # Both writers saw the same Mythic record and applied the same rule; neither credited output alone.
+    # Both writers saw the same Mythic record and applied the same rule; neither credited output alone. Only the
+    # credential review (test_engagement_ledger_phase2_credential_review.py) adds material, never a working credential.
     assert _observations(row) == {"18": {
         "raw": ("rejected", task_evidence.POSTPROCESSING_ERROR_WITH_OUTPUT),
         "capability": ("rejected", task_evidence.POSTPROCESSING_ERROR_WITH_OUTPUT),
+        "review": ("admitted", task_evidence.POSTPROCESSING_ERROR_WITH_OUTPUT),
     }}
-    assert row.payload["evidence"]["proof_admission_reason"] == "task is not terminal-success"
+    reasons = {slots["rejected"]["admission_reason"] for writer, slots in
+               row.payload["contributions"][0]["writers"].items() if writer != "review"}
+    assert reasons == {"task is not terminal-success"}
+    assert row.payload["satisfied_effects"] == [MATERIAL]
     assert WORKING not in _achieved(tools)
 
     # The same task through end-of-turn reconciliation: still one row, one contribution, a third observation.
@@ -195,7 +201,7 @@ def test_task_18_two_writers_make_one_pending_row_with_both_observations(session
     [stored] = _typed_rows(reader)
     assert stored.number == row.number and len(reader._ledger_snapshot().hop_rows()) == 1
     assert _observations(stored)["18"]["reconcile"] == ("rejected", task_evidence.POSTPROCESSING_ERROR_WITH_OUTPUT)
-    assert stored.payload["status"] == "pending"
+    assert stored.payload["satisfied_effects"] == [MATERIAL]
     assert WORKING not in _achieved(reader)
 
 
@@ -326,12 +332,15 @@ def test_every_writer_classifies_the_task_from_its_mythic_record(session, mythic
     observed = _observations(row)["18"]
     # Reconciliation reads only terminal tasks, and records only a verified secret in the output it read.
     writers = {"raw", "capability"} | ({"reconcile"} if record.get("completed") and not without_output else set())
-    assert set(observed) == writers
+    reviewed = expected == task_evidence.POSTPROCESSING_ERROR_WITH_OUTPUT  # only this class enters review
+    assert set(observed) == writers | ({"review"} if reviewed else set())
     assert {classification for _slot, classification in observed.values()} == {expected}
     achieved = expected == task_evidence.TERMINAL_SUCCESS
-    assert {slot for slot, _c in observed.values()} == {"admitted" if achieved else "rejected"}
-    assert row.payload["status"] == ("achieved" if achieved else "pending")
+    assert {slot for writer, (slot, _c) in observed.items() if writer != "review"} == {
+        "admitted" if achieved else "rejected"}
+    assert row.payload["status"] == ("achieved" if achieved or reviewed else "pending")
     assert (WORKING in _achieved(tools)) is achieved
+    assert (MATERIAL in _achieved(tools)) is reviewed
 
 
 def test_a_task_with_no_mythic_record_is_unknown_and_never_achieved(session, mythic_task_records):
@@ -509,7 +518,8 @@ def test_a_cited_later_task_does_not_hide_an_earlier_tasks_proof(session, monkey
 
     asyncio.run(tools._reconcile_operation(["25"], apply=False))  # /state reconcile 25
     [row] = _typed_rows(_reader())
-    assert ([c["task_id"] for c in row.payload["contributions"]], row.payload["status"]) == (["25"], "pending")
+    assert [c["task_id"] for c in row.payload["contributions"]] == ["25"]
+    assert WORKING not in _achieved(_reader())  # task 25's completion error proves material at most
 
     if second_pass == "cursor":
         asyncio.run(tools._reconcile_operation())  # the end-of-turn pass reads 18 and 25 above the cursor

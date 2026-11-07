@@ -183,8 +183,15 @@ def hop_proof_admission(hop: dict, engagement_id: str) -> tuple[bool, str]:
     evidence = hop.get("evidence") if isinstance(hop.get("evidence"), dict) else {}
     proof = hop.get("proof_envelope") if isinstance(hop.get("proof_envelope"), dict) and hop.get("proof_envelope") \
         else evidence.get("proof_envelope")
+    # A typed row's headline proof must cover every effect the row claims (a review-backed proof covers its credential
+    # material only); other rows keep the runtime rule.
+    admit = proof_boundary.admit_runtime_envelope
+    if hop.get("canonical_effect"):
+        effects = [str(item) for item in hop.get("satisfied_effects") or []]
+        admit = lambda envelope, **kw: proof_boundary.admit_task_observation(  # noqa: E731
+            envelope, claimed_effects=proof_boundary.row_headline_claims(envelope, effects), **kw)
     try:
-        admission = proof_boundary.admit_runtime_envelope(
+        admission = admit(
             proof_boundary.ProofEnvelope.from_dict(proof),
             current_engagement_id=str(engagement_id or ""),
             expected_callback_id=evidence.get("callback_id") or evidence.get("callback_display_id") or "",
