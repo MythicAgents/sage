@@ -3164,6 +3164,145 @@ def test_execute_capability_gpo_proof_reconciles_the_pending_setup_hop_shown_in_
     assert "`achieved`" in rows[0]
 
 
+def test_execute_capability_gpo_proof_does_not_promote_a_setup_task_whose_candidate_was_rejected(monkeypatch):
+    """The assembled path of the test above, with one fault injected: the SharpGPOAbuse task's (task 7) observed
+    terminal status is not terminal-success. The raw writer keeps that rejected candidate for its reason, and the
+    candidate carries the capability's transaction. The same transaction's admitted `net group` proof (task 9) must
+    not use it to promote the setup row, which stays pending with its own rejection and adds no effect."""
+    monkeypatch.setenv("SAGE_TRAJECTORY_DISABLE", "1")
+    mt = _make_tools()
+    mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
+    mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
+    mt._engagement_footholds = [
+        engagement_state.Foothold(
+            callback_id="2",
+            agent="apollo",
+            host="CASTELBLACK",
+            forest="north.sevenkingdoms.local",
+            identity="NORTH\\samwell.tarly",
+            integrity="medium",
+            alive=True,
+            source="test",
+            timestamp="2026-11-03T16:25:00Z",
+        )
+    ]
+    seed_ledger(mt, graph_facts=[
+        engagement_state.GraphFact(
+            "gpo-affects-dc:starkwallpaper:winterfell:north.sevenkingdoms.local",
+            "bloodhound:cypher",
+            "2026-11-03T16:25:00Z",
+            600,
+        ),
+    ])
+
+    async def fake_sleep(seconds, result=None):
+        return result
+
+    monkeypatch.setattr(mythic_tools.asyncio, "sleep", fake_sleep)
+    outputs = iter([
+        (
+            "[+] Domain = north.sevenkingdoms.local\r\n"
+            "[+] Domain Controller = winterfell.north.sevenkingdoms.local\r\n"
+            "[+] Distinguished Name = CN=Policies,CN=System,DC=north,DC=sevenkingdoms,DC=local\r\n"
+            "[+] GUID of \"starkwallpaper\" is: {3F1C08F5-D531-4D99-83B3-5CCF0A3981EF}\r\n"
+            "[+] Creating file \\\\north.sevenkingdoms.local\\SysVol\\north.sevenkingdoms.local\\Policies\\"
+            "{3F1C08F5-D531-4D99-83B3-5CCF0A3981EF}\\Machine\\Preferences\\ScheduledTasks\\ScheduledTasks.xml\r\n"
+            "[+] versionNumber attribute changed successfully\r\n"
+            "[+] The version number in GPT.ini was increased successfully.\r\n"
+            "[+] The GPO was modified to include a new immediate task. Wait for the GPO refresh cycle.\n"
+            "[+] Done!\r\n"
+        ),
+        (
+            "<ScheduledTasks><Task><Properties><Author>NT AUTHORITY\\SYSTEM</Author>"
+            "<Arguments>/c net group &quot;Domain Admins&quot; samwell.tarly /add /domain</Arguments>"
+            "</Properties></Task></ScheduledTasks>"
+        ),
+        (
+            "The request will be processed at a domain controller for domain north.sevenkingdoms.local.\n\n"
+            "Group name     Domain Admins\n"
+            "Comment        Designated administrators of the domain\n\n"
+            "Members\n\n"
+            "-------------------------------------------------------------------------------\n"
+            "Administrator            eddard.stark             samwell.tarly            \n"
+            "The command completed successfully.\n"
+        ),
+    ])
+    task_ids = iter([7, 8, 9])
+    calls = {}
+
+    # Fault injection at the raw writer's input only: the setup task's observation is not terminal-success.
+    # The writer, envelope builder, ledger admission, reconciler and effect computation are the production code.
+    real_record = mt._record_engagement_success
+
+    def record_with_nonterminal_setup(results_str, *, task_id=None, callback_id=None, terminal_status="",
+                                      command=""):
+        if str(task_id) == "7":
+            terminal_status = "submitted"
+        return real_record(results_str, task_id=task_id, callback_id=callback_id, terminal_status=terminal_status,
+                           command=command)
+
+    mt._record_engagement_success = record_with_nonterminal_setup
+
+    with patch.object(access_reconciler, "reconcile_access", _seeded_reconcile(mt)), \
+        _split_issue(lambda: next(outputs), calls, display_id=lambda: next(task_ids)):
+        raw = asyncio.run(mt.execute_capability(
+            {
+                "capability": "gpo-controlled-system-exec",
+                "domain": "north.sevenkingdoms.local",
+                "gpo": "starkwallpaper",
+                "gpo_guid": "{3F1C08F5-D531-4D99-83B3-5CCF0A3981EF}",
+                "callback_id": 2,
+            },
+            {
+                "callback_id": 2,
+                "command": "net",
+                "command_arguments": r'group "Domain Admins" samwell.tarly /add /domain',
+                "wait_seconds": 1,
+                "proof_retries": 0,
+            },
+        ))
+
+    result = json.loads(raw)
+    assert result["verdict"] == "achieved"
+    assert [call["command_name"] for call in calls["issued"]] == ["execute_assembly", "shell", "shell"]
+
+    hops = list(mt._engagement_hops)
+    setup_hop = next(hop for hop in hops if hop.technique == "gpo-abuse")
+    execution = next(hop for hop in hops if hop.technique == "capability:gpo-controlled-system-exec")
+    assert execution.status == "achieved"
+    assert (setup_hop.status, setup_hop.pending_reason) == ("pending", "awaiting_effect")
+    assert setup_hop.evidence["proof_admission_reason"] == "task is not terminal-success"
+    assert setup_hop.evidence["proof_persistence_state"] == proof_boundary.REJECTED
+    assert "reconciled_from_hop" not in setup_hop.evidence
+    candidate = proof_boundary.ProofEnvelope.from_dict(setup_hop.proof_envelope)
+    assert (candidate.task_id, candidate.terminal_status) == ("7", "submitted")
+    # The precondition of the counterexample: the rejected candidate does share the proof's transaction.
+    assert candidate.transaction_id and candidate.transaction_id == execution.proof_envelope["transaction_id"]
+
+    # Against the same admitted execution without the setup row, with a GPO-to-domain mapping in scope.
+    mapping = engagement_state.GraphFact(
+        "gpo-domain:starkwallpaper:north.sevenkingdoms.local", "bloodhound:cypher", "2026-11-03T16:25:00Z", 600,
+        _bloodhound_proof("61", "2", engagement_id=mt._eng_key()),
+    )
+
+    def runtime(rows):
+        return engagement_state.EngagementState(
+            objective="test", footholds=[], hops=list(rows), graph_facts=[mapping],
+            engagement_id=mt._eng_key(), runtime_scope=True,
+        )
+
+    with_setup, control = runtime(hops), runtime([hop for hop in hops if hop is not setup_hop])
+    assert with_setup.achieved_effects() == control.achieved_effects()
+    assert with_setup.satisfied_predicates() == control.satisfied_predicates()
+    assert "system:starkwallpaper" not in with_setup.achieved_effects()
+    assert "system-exec:gpo:starkwallpaper@north.sevenkingdoms.local" in with_setup.achieved_effects()
+
+    eligible, _ineligible = mt._ledger_snapshot().runtime_hop_dicts()
+    rows = [line for line in engagement_ledger.render_hop_table(eligible) if "gpo-abuse:starkwallpaper" in line]
+    assert len(rows) == 1
+    assert "`achieved`" not in rows[0]
+
+
 def _runtime_ledger(*hops):
     return engagement_state.EngagementState(
         objective="test", footholds=[], hops=list(hops),

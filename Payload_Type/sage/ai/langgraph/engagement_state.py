@@ -143,6 +143,31 @@ def _hop_has_admissible_runtime_proof(hop: "Hop", engagement_id: str) -> bool:
         return False
 
 
+def _setup_proof_may_join(hop: "Hop", engagement_id: str) -> bool:
+    """Whether a pending setup row's own proof may associate it, by transaction, with a later proof.
+
+    Applies in every scope, whatever ``runtime_scope`` says. An effective correction, a persisted admission verdict
+    other than admitted (a rejected candidate the raw writer kept for its reason, or a legacy-unverified row), or an
+    envelope that fails current admission excludes the row. The stored verdict is honoured because the proof boundary
+    rewrites the evidence lineage from a rejected candidate, so re-admitting the envelope alone could pass. A row
+    written before verdicts were persisted has no marker and must still pass current admission.
+    """
+    if row_corrected(hop):
+        return False
+    try:
+        try:
+            from . import proof_boundary
+        except ImportError:
+            import proof_boundary
+        evidence = getattr(hop, "evidence", None)
+        verdict = _text(evidence.get("proof_persistence_state")) if isinstance(evidence, dict) else ""
+        if verdict and verdict != proof_boundary.ADMITTED:
+            return False
+    except Exception:
+        return False
+    return _hop_has_admissible_runtime_proof(hop, engagement_id)
+
+
 def _graph_fact_has_admissible_runtime_proof(graph_fact: "GraphFact", engagement_id: str) -> bool:
     try:
         try:
@@ -1072,7 +1097,10 @@ def _reconcile_proven_gpo_setup_hops(state: "EngagementState", hops: list[Hop]) 
     ``system-exec:gpo:{gpo}@{domain}`` (the GPO capability's verifier, the same one the setup hop was checked with),
     the setup hop's effect is proven: re-record it ``achieved`` on that proof, naming the setup task it replaced.
     The proof must come from the setup task's own transaction: a GPO name alone does not identify one GPO across
-    domains. Downstream progress alone (DA, DCSync rights) is inference, not proof, and leaves the hop pending.
+    domains. That transaction is read from the setup row's stored envelope, so the setup row's own proof must be
+    admissible (`_setup_proof_may_join`): a rejected candidate is diagnostic evidence, never a join key, and its row
+    is left unchanged. Downstream progress alone (DA, DCSync rights) is inference, not proof, and leaves the hop
+    pending.
     """
 
     def transaction_of(hop: Hop) -> str:
@@ -1107,6 +1135,9 @@ def _reconcile_proven_gpo_setup_hops(state: "EngagementState", hops: list[Hop]) 
     for existing in hops:
         status = _normalize_key(getattr(existing, "status", ""))
         if status != "pending" or _normalize_key(getattr(existing, "technique", "")) != "gpo-abuse":
+            reconciled.append(existing)
+            continue
+        if not _setup_proof_may_join(existing, getattr(state, "engagement_id", "")):
             reconciled.append(existing)
             continue
         effect = _normalize_key(getattr(existing, "effect", ""))

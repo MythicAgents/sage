@@ -8743,7 +8743,15 @@ class MythicTools:
         verifier_result=None,
         authorization: dict | None = None,
         metadata: dict | None = None,
+        retain_rejected: bool = False,
     ) -> dict:
+        """A runtime task proof envelope for the ledger, or ``{}``.
+
+        By default only an admitted envelope is returned. ``retain_rejected`` also returns a constructed envelope
+        that admission rejected: a candidate, not an admission. The ledger's proof boundary re-admits it, keeps its
+        rejection reason and records the row unachieved. Missing evaluation-authorization lineage and any
+        construction or admission error still return ``{}``.
+        """
         if self._evaluation_authorization_proof_lineage_missing(authorization):
             return {}
         try:
@@ -8777,7 +8785,7 @@ class MythicTools:
                 expected_verifier_result_sha256=proof_boundary.canonical_commitment_sha256(verifier_result),
                 expected_authorization=authorization or {},
             )
-            return envelope.to_dict() if admission.admitted else {}
+            return envelope.to_dict() if admission.admitted or retain_rejected else {}
         except Exception:
             return {}
 
@@ -9600,6 +9608,10 @@ class MythicTools:
                 verifier_input=verifier_input,
                 verifier_result=verifier_result,
                 metadata={"technique": technique, "target": target_key},
+                # A rejected candidate reaches the ledger so the row keeps the admission reason; the ledger still
+                # requires admissible proof before it records the effect achieved, and the GPO setup reconciler
+                # never uses a rejected candidate's transaction to join the row to a later proof.
+                retain_rejected=True,
             )
             context_effect = ""
             if status == "achieved" and technique in {

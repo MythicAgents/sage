@@ -211,3 +211,81 @@ def test_reconciliation_keeps_legacy_numbers_and_continues_from_thirty(monkeypat
 
     _record(tools, "gpo-abuse", "kingslanding", "904")
     assert _state_rows(_session(6))["gpo-abuse:kingslanding"][0] == 30
+
+
+def test_a_rejected_raw_candidate_keeps_its_reason_through_state_and_reconciliation(monkeypatch):
+    """A raw result whose task lineage is missing (fault-injected here) stays ``pending (proof missing)`` with the
+    actual admission reason after end-of-turn reconciliation, ``/state reconcile`` and a fresh session's reload."""
+    _stub_mythic(monkeypatch)
+    writer = _session(3)
+    _record(writer, "gpo-abuse", "kingslanding", None)
+
+    model = object.__new__(graph_model.Model)
+    model.mythic_client = writer
+    model.channel_id = 3
+    asyncio.run(model._engagement_state_turn_summary_text())
+    _state_rows(writer, "reconcile")
+
+    reader = _session(4)
+    assert _state_rows(reader)["gpo-abuse:kingslanding"] == (1, "pending (proof missing)")
+    [hop] = [hop for hop in reader._ledger_view().hops if hop.technique == "gpo-abuse"]
+    assert hop.evidence["proof_admission_reason"] == "missing Mythic task lineage"
+    assert hop.proof_envelope["task_id"] == "" and hop.proof_envelope["callback_id"] == "3"
+    assert "system:kingslanding" not in _runtime_effects(reader)
+    assert "system:kingslanding" not in _runtime_effects(writer)
+
+
+def test_a_rejected_gpo_setup_is_not_promoted_through_state_reconciliation_or_reload(monkeypatch):
+    """A SharpGPOAbuse task whose observation is not terminal-success (fault-injected) leaves a retained, rejected
+    candidate carrying its capability transaction. A later admitted SYSTEM-execution proof in that transaction must
+    not promote the setup row: after end-of-turn reconciliation, ``/state reconcile`` and a fresh session's reload it
+    keeps its row number, ``pending`` status, its own candidate and the actual rejection reason."""
+    _stub_mythic(monkeypatch)
+    transaction = "capability-exec:gpo-kingslanding"
+    effect = "system-exec:gpo:kingslanding@north.sevenkingdoms.local"
+    writer = _session(3)
+    token = mythic_tools._task_visibility_context.set({"transaction_id": transaction})
+    try:
+        writer._pending_engagement_hop = ("gpo-abuse", "kingslanding", "2026-11-04T18:00:00+00:00")
+        writer._record_engagement_success(
+            "whoami\r\nnt authority\\system\r\n", task_id="77", callback_id="3", terminal_status="submitted",
+            command="execute_assembly",
+        )
+    finally:
+        mythic_tools._task_visibility_context.reset(token)
+    number = _state_rows(writer)["gpo-abuse:kingslanding"][0]
+
+    now = "2026-11-04T18:05:00+00:00"
+    proof = writer._runtime_task_proof_envelope(
+        "capability:gpo-controlled-system-exec", now, callback_id="3", task_id="78", terminal_status="completed",
+        command="shell", transaction_id=transaction, verifier_input={"task_id": "78"},
+        verifier_result={"verdict": "achieved"},
+    )
+    assert proof, "the execution proof must be admitted for this control"
+    state = engagement_state.EngagementState(
+        objective="test", hops=list(writer._ledger_view().hops), engagement_id=writer._eng_key(), runtime_scope=True,
+    )
+    updated = engagement_state.record_effect_result(
+        state, "capability:gpo-controlled-system-exec", "gpo=kingslanding", effect, "achieved",
+        {"source": "capability", "mythic_task_id": "78", "callback_id": "3", "transaction_id": transaction,
+         "terminal_task_status": "completed", "command": "shell"},
+        now, satisfied_effects=[effect], proof_envelope=proof, require_admissible_proof=True,
+        engagement_id=writer._eng_key(),
+    )
+    assert writer._ledger_commit_hops(state.hops, updated.hops, what="test execution")
+
+    model = object.__new__(graph_model.Model)
+    model.mythic_client = writer
+    model.channel_id = 3
+    asyncio.run(model._engagement_state_turn_summary_text())
+    _state_rows(writer, "reconcile")
+
+    reader = _session(4)
+    assert _state_rows(reader)["gpo-abuse:kingslanding"] == (number, "pending (proof missing)")
+    [hop] = [hop for hop in reader._ledger_view().hops if hop.technique == "gpo-abuse"]
+    assert hop.evidence["proof_admission_reason"] == "task is not terminal-success"
+    assert "reconciled_from_hop" not in hop.evidence
+    assert (hop.proof_envelope["task_id"], hop.proof_envelope["transaction_id"]) == ("77", transaction)
+    for session in (reader, writer):
+        effects = _runtime_effects(session)
+        assert effect in effects and "system:kingslanding" not in effects
