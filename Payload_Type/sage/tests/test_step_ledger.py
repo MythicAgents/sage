@@ -8,7 +8,7 @@ the scripted handoff harness with a real MythicTools client whose Mythic readers
 """
 
 from __future__ import annotations
-from tests.esl_fixtures import seed_ledger  # noqa: E402
+from tests.esl_fixtures import AGENT_PROCESSED, seed_ledger  # noqa: E402
 
 import asyncio
 import importlib.util
@@ -143,7 +143,7 @@ def test_a_callback_proof_is_admitted_only_with_its_callback_row_and_a_successfu
 
 def _credential(credential_id: int, task_id: int, callback: int | None = 1) -> dict:
     # A DCSync producing task: directory replication yields a working credential (a host dump would be material).
-    task = {"display_id": task_id, "status": "success", "completed": True, "command_name": "dcsync",
+    task = {"display_id": task_id, "status": "success", "completed": True, **AGENT_PROCESSED, "command_name": "dcsync",
             "original_params": json.dumps({"Domain": "contoso.local", "User": "jdoe"}),
             "callback": {"display_id": callback} if callback is not None else None}
     return {"id": credential_id, "account": "jdoe", "realm": "CONTOSO", "type": "plaintext",

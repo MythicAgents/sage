@@ -11,12 +11,13 @@ from dataclasses import dataclass, field
 from typing import Any
 
 try:
-    from . import credential_artifacts, engagement_state, intent_classifier, proof_boundary
+    from . import credential_artifacts, engagement_state, intent_classifier, proof_boundary, task_evidence
 except ImportError:
     import credential_artifacts
     import engagement_state
     import intent_classifier
     import proof_boundary
+    import task_evidence
 
 
 @dataclass(frozen=True)
@@ -79,6 +80,11 @@ def reconcile_task(
         return None
 
     task_id = task.get("display_id") if task.get("display_id") is not None else task.get("id")
+    # The shared terminal-success rule: Mythic's task record decides, as for every live writer. Output presence
+    # comes from the output this pass read.
+    record = task_evidence.task_record_from_row(task, has_output=bool(_text(output).strip()))
+    task_class = task_evidence.classify_task(record)
+    terminal_status = task_evidence.envelope_terminal_status(task_class, record)
     evidence = {
         "source": "task_history_reconcile",
         "provenance": "operator_task",
@@ -91,16 +97,18 @@ def reconcile_task(
         "artifact_present": True,
         "reconciled_at": now,
         "result_preview": _preview(output),
+        "task_classification": task_class,
+        "mythic_task_status": (record.status[: task_evidence.MAX_STATUS_CHARS] if record is not None else ""),
     }
     if engagement_id:
         transaction_id = _text(transaction_id) or f"operator-task:{task_id}"
         evidence["transaction_id"] = transaction_id
-        evidence["terminal_task_status"] = _terminal_status(task)
+        evidence["terminal_task_status"] = terminal_status
         envelope = proof_boundary.make_runtime_task_envelope(
             engagement_id=engagement_id,
             callback_id=evidence["callback_id"],
             task_id=task_id,
-            terminal_status=_terminal_status(task),
+            terminal_status=terminal_status,
             command=command,
             verifier_id=f"task_reconciler:{technique}",
             captured_at=now,
@@ -115,7 +123,7 @@ def reconcile_task(
                 "technique": technique,
                 "target": target,
             },
-            metadata={"reconciled": True},
+            metadata={"reconciled": True, "task_classification": task_class},
         )
         evidence["proof_envelope"] = envelope.to_dict()
     material = _credential_material_for_record(technique, target, output)
@@ -225,13 +233,6 @@ def _is_terminal(task: dict[str, Any]) -> bool:
         return True
     status = _text(task.get("status")).casefold()
     return status in {"success", "completed", "error", "failed"}
-
-
-def _terminal_status(task: dict[str, Any]) -> str:
-    status = _text(task.get("status")).casefold()
-    if status:
-        return status
-    return "completed" if task.get("completed") is True else ""
 
 
 def _operator_name(value: Any) -> str:

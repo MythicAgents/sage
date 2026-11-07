@@ -51,13 +51,16 @@ _TASK_FIELDS = """
         display_params
         status
         completed
+        status_timestamp_processing
+        status_timestamp_processed
         timestamp
         operator { username }
         callback { display_id host user domain integrity_level agent_callback_id init_callback }
 """
 _CREDENTIAL_FIELDS = (
     "id operation_id account realm type credential_text comment timestamp "
-    "task { display_id operation_id status completed command_name original_params callback { display_id } }"
+    "task { display_id operation_id status completed status_timestamp_processing status_timestamp_processed "
+    "command_name original_params callback { display_id } }"
 )
 
 

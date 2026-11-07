@@ -453,6 +453,33 @@ def admit_runtime_envelope(
     return ProofAdmission(True, envelope, "admitted runtime proof", ADMITTED)
 
 
+# The shared task classifier's verdict, committed in a task-lineaged envelope's metadata by every live writer.
+TASK_CLASSIFICATION_KEY = "task_classification"
+TASK_TERMINAL_SUCCESS = "terminal_success"
+_TASK_LINEAGE_ORIGINS = frozenset({ORIGIN_MYTHIC_TASK, ORIGIN_MYTHIC_ARTIFACT, ORIGIN_MYTHIC_CREDENTIAL})
+
+
+def admit_task_observation(envelope: ProofEnvelope | None, **expected: Any) -> ProofAdmission:
+    """Admission for one writer's observation on a typed-effect row.
+
+    The runtime envelope checks, plus the shared task classification committed in the envelope: a task-lineaged
+    proof is admitted only when its Mythic task record classified as terminal success. An envelope written before
+    that classification existed (for example an output-only capability achievement) is not grandfathered; it stays
+    pending until the current rule admits a new observation.
+    """
+    admission = admit_runtime_envelope(envelope, **expected)
+    if not admission.admitted or envelope is None or envelope.origin not in _TASK_LINEAGE_ORIGINS:
+        return admission
+    classification = _text(envelope.metadata.get(TASK_CLASSIFICATION_KEY))
+    if not classification:
+        return ProofAdmission(
+            False, envelope, "recorded before the shared task classification; revalidation required", REJECTED)
+    if classification != TASK_TERMINAL_SUCCESS:
+        return ProofAdmission(False, envelope, f"Mythic task classified {classification}, not terminal success",
+                              REJECTED)
+    return admission
+
+
 def proof_from_evidence(evidence: Any) -> ProofEnvelope | None:
     if not isinstance(evidence, dict):
         return None

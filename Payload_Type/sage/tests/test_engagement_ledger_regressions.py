@@ -34,6 +34,7 @@ from tests.esl_fixtures import (
     OPERATION_ID,
     OPERATION_NAME,
     channel34_ledger,
+    observe_task,
     write_legacy_ledger,
 )
 
@@ -108,12 +109,12 @@ def _record(tools, technique: str, target: str, task_id: str) -> None:
     tools._last_issued_callback_id = "3"
     tools._last_issued_task_terminal_status = "completed"
     tools._last_issued_command = "shell"
+    observe_task(tools, task_id, "3")
     tools._pending_engagement_hop = (technique, target, "2026-11-04T18:00:00+00:00")
     tools._record_engagement_success(
         "whoami\r\nnt authority\\system\r\n",
         task_id=task_id,
         callback_id="3",
-        terminal_status="completed",
         command="shell",
     )
 
@@ -235,7 +236,8 @@ def test_a_rejected_raw_candidate_keeps_its_reason_through_state_and_reconciliat
     assert "system:kingslanding" not in _runtime_effects(writer)
 
 
-def test_a_rejected_gpo_setup_is_not_promoted_through_state_reconciliation_or_reload(monkeypatch):
+def test_a_rejected_gpo_setup_is_not_promoted_through_state_reconciliation_or_reload(monkeypatch,
+                                                                                      mythic_task_records):
     """A SharpGPOAbuse task whose observation is not terminal-success (fault-injected) leaves a retained, rejected
     candidate carrying its capability transaction. A later admitted SYSTEM-execution proof in that transaction must
     not promote the setup row: after end-of-turn reconciliation, ``/state reconcile`` and a fresh session's reload it
@@ -246,10 +248,11 @@ def test_a_rejected_gpo_setup_is_not_promoted_through_state_reconciliation_or_re
     writer = _session(3)
     token = mythic_tools._task_visibility_context.set({"transaction_id": transaction})
     try:
+        mythic_task_records[77] = {"completed": False, "status": "submitted"}  # Mythic: not yet handed to the agent
+        observe_task(writer, "77", "3")
         writer._pending_engagement_hop = ("gpo-abuse", "kingslanding", "2026-11-04T18:00:00+00:00")
         writer._record_engagement_success(
-            "whoami\r\nnt authority\\system\r\n", task_id="77", callback_id="3", terminal_status="submitted",
-            command="execute_assembly",
+            "whoami\r\nnt authority\\system\r\n", task_id="77", callback_id="3", command="execute_assembly",
         )
     finally:
         mythic_tools._task_visibility_context.reset(token)

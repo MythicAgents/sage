@@ -213,7 +213,9 @@ def test_ensure_engagement_key_binds_the_sessions_own_operation(monkeypatch):
     assert mt._eng_key() == f"Operation_Chimera_1_{FIXED_UUID}"
     mt._pending_engagement_hop = ("dcsync", "sevenkingdoms.local", "2026-06-08T00:00:00Z")
     mt._record_engagement_success("  Hash NTLM: 2b576acbe6bcfda7294d6bd18041b8fe")
-    assert [row["technique"] for row in mt._ledger_snapshot().display_hops()] == ["dcsync"]
+    # The krbtgt key lands on the account secret's typed row in the session's own operation ledger.
+    assert [(row["technique"], row["target"]) for row in mt._ledger_snapshot().display_hops()] == [
+        ("account-secret", "krbtgt@sevenkingdoms.local")]
 
 
 def test_unbound_session_is_explicitly_unavailable_not_default(monkeypatch):

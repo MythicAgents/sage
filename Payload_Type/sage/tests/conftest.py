@@ -120,3 +120,31 @@ def _isolate_engagement_ledger(tmp_path, monkeypatch):
 
     monkeypatch.setattr(chat_session, "_CHANNEL_MARKER_DB_PATH", str(tmp_path / "sage.db"))
     yield
+
+
+@pytest.fixture(autouse=True)
+def mythic_task_records(monkeypatch):
+    """Stub Mythic's task-record transport for the live writers' shared task classifier.
+
+    Every ledger writer classifies a task from this record, never from the output class. Without an entry a task
+    reads as Mythic reports an ordinary finished task: agent processed, responses present,
+    final status ``success``. Set ``mythic_task_records[<display id>]`` to a task row (GraphQL field names) to
+    serve a specific record, or to None for an unreadable one.
+    """
+    from ai.langgraph import mythic_tools
+    from tests.esl_fixtures import AGENT_PROCESSED
+
+    records: dict = {}
+
+    async def fetch(client, task_display_id):
+        key = int(task_display_id)
+        if key in records:
+            row = records[key]
+            return dict(row, display_id=row.get("display_id", key)) if isinstance(row, dict) else row
+        return {"display_id": key, "completed": True, "status": "success", "responses": [{"id": 1}],
+                **AGENT_PROCESSED}
+
+    # Some modules import ``mythic_tools`` flat (ai/langgraph on sys.path), a second module object.
+    for module in {mythic_tools, sys.modules.get("mythic_tools")} - {None}:
+        monkeypatch.setattr(module, "_fetch_task_record", fetch)
+    return records

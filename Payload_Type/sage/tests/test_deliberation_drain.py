@@ -7,7 +7,7 @@ no productive Mythic work. These pin the two guards:
   2. a hop the gate keeps blocking is STOPped after 3 tries (reset when a task actually passes the gate)
 Run: cd Payload_Type/sage && python3 -m pytest tests/test_deliberation_drain.py -q
 """
-from tests.esl_fixtures import seed_ledger  # noqa: E402
+from tests.esl_fixtures import AGENT_PROCESSED, seed_ledger  # noqa: E402
 import asyncio
 import json
 import sys
@@ -169,6 +169,7 @@ def test_runtime_corroboration_admits_only_task_linked_credential_rows():
                 "display_id": 450,
                 "status": "completed",
                 "completed": True,
+                **AGENT_PROCESSED,
                 "command_name": "dcsync",
                 "callback": {"display_id": 13},
             },

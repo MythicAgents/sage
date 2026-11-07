@@ -68,13 +68,15 @@ def _transaction(transaction_id: str = TRANSACTION):
 
 
 def _record(tools: MythicTools, output: str = DCSYNC_OK, *, task_id="45", callback_id="3",
-            terminal_status: str = "completed", command: str = "dcsync") -> None:
-    """The raw issue-task writer for one verified dcsync result, with the lineage the issue path passes."""
+            command: str = "dcsync") -> None:
+    """The raw issue-task writer for one verified dcsync result, with the lineage the issue path passes.
+
+    The issue path reads the settled task's Mythic record first (served by the ``mythic_task_records`` stub)."""
+    if task_id is not None:
+        asyncio.run(tools._observe_task_record(task_id, callback_id))
     tools._pending_engagement_hop = ("dcsync", DOMAIN, _now())
     with _transaction():
-        tools._record_engagement_success(
-            output, task_id=task_id, callback_id=callback_id, terminal_status=terminal_status, command=command,
-        )
+        tools._record_engagement_success(output, task_id=task_id, callback_id=callback_id, command=command)
 
 
 def _stored(tools: MythicTools) -> list[dict]:
@@ -128,23 +130,28 @@ def test_a_fully_lineaged_raw_result_is_achieved_on_its_admitted_envelope(sessio
     assert row["evidence"]["proof_admission_reason"] == "admitted runtime proof"
     proof = row["proof_envelope"]
     assert (proof["task_id"], proof["callback_id"], proof["terminal_status"], proof["command"]) == (
-        "45", "3", "completed", "dcsync")
+        "45", "3", "success", "dcsync")
     assert (row["evidence"]["mythic_task_id"], row["evidence"]["callback_id"]) == ("45", "3")
     assert EFFECT in _achieved(tools)
     assert _runtime_state(tools).satisfies_predicate(EFFECT)
 
 
 @pytest.mark.parametrize(
-    ("lineage", "reason"),
+    ("lineage", "reason", "status"),
     [
-        ({"task_id": None}, "missing Mythic task lineage"),
-        ({"callback_id": None}, "missing callback lineage"),
-        ({"terminal_status": "submitted"}, "task is not terminal-success"),
+        ({"task_id": None}, "missing Mythic task lineage", "unknown"),
+        ({"callback_id": None}, "missing callback lineage", "success"),
+        ({"record": {"completed": False, "status": "submitted"}}, "task is not terminal-success",
+         "not_agent_processed"),
     ],
     ids=["missing-task", "missing-callback", "nonterminal-task"],
 )
-def test_each_rejected_raw_candidate_is_kept_pending_with_its_gate_reason(session, lineage, reason):
+def test_each_rejected_raw_candidate_is_kept_pending_with_its_gate_reason(session, mythic_task_records, lineage,
+                                                                           reason, status):
     tools = session()
+    lineage = dict(lineage)
+    if "record" in lineage:
+        mythic_task_records[45] = lineage.pop("record")
     _record(tools, **lineage)
 
     [row] = _stored(tools)
@@ -156,7 +163,8 @@ def test_each_rejected_raw_candidate_is_kept_pending_with_its_gate_reason(sessio
     candidate = proof_boundary.ProofEnvelope.from_dict(row["proof_envelope"])
     assert candidate.task_id == ("" if lineage.get("task_id", "45") is None else "45")
     assert candidate.callback_id == ("" if lineage.get("callback_id", "3") is None else "3")
-    assert candidate.terminal_status == lineage.get("terminal_status", "completed")
+    # The status is the shared classifier's verdict on Mythic's record: success, or a non-admissible class name.
+    assert candidate.terminal_status == status
     # A rejected candidate satisfies no effect or precondition, in the writer's session or a fresh reader's.
     assert EFFECT not in _achieved(tools)
     assert not _runtime_state(tools).satisfies_predicate(EFFECT)
@@ -331,9 +339,10 @@ def test_an_issued_dcsync_task_records_its_own_lineage_through_the_raw_writer(se
 
     assert issued == [("dcsync", 3)]
     [row] = _stored(tools)
-    assert row["technique"] == "dcsync" and row["status"] == "achieved"
+    # The krbtgt key is the account secret's typed row; the raw writer's own technique stays on its observation.
+    assert (row["technique"], row["target"], row["status"]) == ("account-secret", f"krbtgt@{DOMAIN}", "achieved")
     assert row["evidence"]["proof_persistence_state"] == proof_boundary.ADMITTED
     proof = row["proof_envelope"]
     assert (proof["task_id"], proof["callback_id"], proof["terminal_status"], proof["command"]) == (
-        "4501", "3", "completed", "dcsync")
+        "4501", "3", "success", "dcsync")
     assert EFFECT in _achieved(tools)

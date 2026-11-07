@@ -259,7 +259,7 @@ def test_a_locked_store_reports_unrecorded_and_never_authorizes_or_fabricates(mo
         tools._last_issued_command = "shell"
         tools._pending_engagement_hop = ("gpo-abuse", "b", NOW)
         tools._record_engagement_success("whoami\r\nnt authority\\system\r\n", task_id="77", callback_id="3",
-                                         terminal_status="completed", command="shell")
+                                         command="shell")
         assert "could not be recorded" in tools._ledger_last_write_error
     finally:
         blocker.rollback()

@@ -326,4 +326,6 @@ def test_turn_end_reconciliation_records_operator_history_without_a_sage_task(mo
     assert getattr(client, "_last_issued_task_display_id", None) is None  # this session issued nothing
     text = asyncio.run(model._engagement_state_turn_summary_text())
     assert "krbtgt-hash:lab.local" in text and "26" in text
-    assert [row["technique"] for row in client._ledger_snapshot().display_hops()] == ["dcsync"]
+    # The krbtgt key is the account secret's typed row; reconciliation is its observation.
+    assert [(row["technique"], row["target"]) for row in client._ledger_snapshot().display_hops()] == [
+        ("account-secret", "krbtgt@lab.local")]

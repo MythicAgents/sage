@@ -24,6 +24,8 @@ def _task_proof(**overrides):
         "verifier_input": {"probe": {"krbtgt_hash_present": True}},
         "verifier_result": {"verdict": "achieved"},
         "captured_at": NOW,
+        # Every live writer commits the shared task classifier's verdict on the task's Mythic record.
+        "metadata": {pb.TASK_CLASSIFICATION_KEY: pb.TASK_TERMINAL_SUCCESS},
     }
     values.update(overrides)
     return pb.make_runtime_task_envelope(**values)
@@ -278,3 +280,20 @@ def test_cross_transaction_callback_and_tampered_result_reject_at_boundary():
         expected_task_id="450",
         expected_verifier_result_sha256=envelope.verifier_result_sha256,
     ).admitted is False
+
+
+# --- typed-effect observations also need the shared task classification ------------------------------------------
+
+def test_a_typed_observation_needs_a_terminal_success_classification():
+    admitted = pb.admit_task_observation(_task_proof(), current_engagement_id=ENGAGEMENT)
+    assert admitted.admitted is True
+
+    legacy = pb.admit_task_observation(_task_proof(metadata={}), current_engagement_id=ENGAGEMENT)
+    assert (legacy.admitted, legacy.reason) == (False, "recorded before the shared task classification; revalidation required")
+    # The same envelope passes the plain runtime checks: the classification is what holds it back.
+    assert pb.admit_runtime_envelope(_task_proof(metadata={}), current_engagement_id=ENGAGEMENT).admitted is True
+
+    for verdict in ("postprocessing_error_with_output", "agent_error_or_failed", "unknown", "not_agent_processed"):
+        rejected = pb.admit_task_observation(
+            _task_proof(metadata={pb.TASK_CLASSIFICATION_KEY: verdict}), current_engagement_id=ENGAGEMENT)
+        assert (rejected.admitted, rejected.reason) == (False, f"Mythic task classified {verdict}, not terminal success")

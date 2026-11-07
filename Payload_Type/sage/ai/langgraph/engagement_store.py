@@ -28,8 +28,10 @@ from typing import Any, Callable, Iterable, Iterator, Mapping
 
 try:  # package import (runtime) or flat import (tests that put ai/langgraph on sys.path)
     from . import engagement_ledger as _ledger
+    from . import task_evidence as _task_evidence
 except ImportError:  # pragma: no cover - import-path fallback
     import engagement_ledger as _ledger  # type: ignore
+    import task_evidence as _task_evidence  # type: ignore
 
 # Version 2: hop rows carry only achieved or pending. Store initialization migrates version-1 operations.
 SCHEMA_VERSION = 2
@@ -679,6 +681,7 @@ class EngagementStore:
                 kind, row_id = outcome[0], outcome[1]
                 if kind == "applied" and len(outcome) > 2:
                     result.row_revisions.add((outcome[2], outcome[3]))
+                    result.changed_identities.add(outcome[2])  # a typed effect may resolve to its owning row
                 if kind == "unchanged":
                     result.unchanged.append(row_id)
                     continue
@@ -1097,6 +1100,12 @@ def _apply_one(
     identity = mutation.identity or _identity_for(kind, payload)
     if not identity or identity in {":", "|"}:
         raise LedgerWriteFailed("ledger mutation has no row identity")
+    if kind == "hop" and _task_evidence.is_canonical_payload(payload):
+        # A typed-effect row: resolve the row that owns the effect, then merge this writer's contributions onto
+        # its stored head inside the transaction, so a concurrent writer's observation, an admitted proof, earlier
+        # rejected evidence and the row's number and corrections all survive.
+        identity, current = _typed_owner(connection, int(op["id"]), identity, str(payload["canonical_effect"]))
+        payload = _payload_without_metadata(_task_evidence.merge_rows(current, payload, binding.engagement_key))
     if kind == "hop" and _norm(payload.get("status")) not in _ROW_STATUSES:
         # The ledger records progress only; a failed or blocked attempt belongs to the request attempt memory.
         raise LedgerWriteFailed(f"hop status {payload.get('status')!r} is not a ledger row status")
@@ -1141,9 +1150,9 @@ def _apply_one(
     mutation_id = mutation.mutation_id or (
         mutation_id_for(binding.engagement_key, kind, identity, payload) + f":{int(head['revision'])}"
     )
-    if kind == "hop" and _is_admitted_achieved(current, binding.engagement_key) and not _is_admitted_achieved(
-        payload, binding.engagement_key
-    ):
+    if kind == "hop" and not _task_evidence.is_canonical_payload(payload) and _is_admitted_achieved(
+        current, binding.engagement_key
+    ) and not _is_admitted_achieved(payload, binding.engagement_key):
         if connection.execute(
             "SELECT 1 FROM esl_events WHERE operation_id=? AND mutation_id=?", (op["id"], mutation_id)
         ).fetchone():
@@ -1169,6 +1178,33 @@ def _apply_one(
         _lapse_attempt_record_retraction(connection, op["id"], row_id, int(head["retraction_event_id"]),
                                          new_revision, revision, stamp)
     return ("applied", row_id, identity, new_revision)
+
+
+def _typed_owner(connection: sqlite3.Connection, operation_id: int, proposed: str, typed: str) -> tuple[str, Any]:
+    """(identity, stored payload) of the row that owns a typed effect, or (proposed, None) for a new row.
+
+    The proposed row when it exists; else the row already carrying the typed effect; else the lowest-numbered earlier
+    row whose primary effect it is, retracted or not, so operator corrections on that effect stay in force.
+    """
+    row = connection.execute(
+        "SELECT identity, payload FROM esl_rows WHERE operation_id=? AND kind='hop' AND identity=?",
+        (operation_id, proposed),
+    ).fetchone()
+    if row is not None:
+        return proposed, json.loads(row["payload"])
+    legacy = None
+    for row in connection.execute(
+        "SELECT identity, payload FROM esl_rows WHERE operation_id=? AND kind='hop' ORDER BY number", (operation_id,)
+    ):
+        try:
+            payload = json.loads(row["payload"])
+        except ValueError:
+            continue
+        if payload.get("canonical_effect") == typed:
+            return str(row["identity"]), payload
+        if legacy is None and _task_evidence.payload_typed_identity(payload) == typed:
+            legacy = (str(row["identity"]), payload)
+    return legacy if legacy is not None else (proposed, None)
 
 
 def _lapse_attempt_record_retraction(
@@ -1201,6 +1237,10 @@ def _payload_without_metadata(payload: Mapping[str, Any]) -> dict:
     if not out.get("pending_reason"):
         # Only pending rows carry a reason; an empty one is not part of the stored row.
         out.pop("pending_reason", None)
+    if not out.get("canonical_effect") and not out.get("contributions"):
+        # Only rows keyed by a typed effect carry contributions.
+        out.pop("canonical_effect", None)
+        out.pop("contributions", None)
     return out
 
 
@@ -1964,9 +2004,16 @@ def hop_mutations(before: Iterable[Any], after: Iterable[Any]) -> list[RowMutati
         payload = _payload_without_metadata(data)
         if old is not None and _payload_without_metadata(old) == payload:
             continue
+        mutation_id = ""
+        if _task_evidence.is_canonical_payload(payload):
+            # Stable per (task, typed effect, writer, observation): replaying the same observation is idempotent,
+            # whatever else changed on the row meanwhile.
+            added = _task_evidence.observation_keys(payload) - _task_evidence.observation_keys(old)
+            if added:
+                mutation_id = _task_evidence.contribution_mutation_id("", identity, added)
         produced.append(RowMutation(
             kind="hop", identity=identity, payload=payload,
-            expected_revision=int((old or {}).get("revision") or 0),
+            expected_revision=int((old or {}).get("revision") or 0), mutation_id=mutation_id,
         ))
     return produced
 

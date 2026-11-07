@@ -17,6 +17,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from tests.esl_fixtures import observe_task
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph"))
 import credential_artifacts as ca  # noqa: E402
@@ -174,13 +175,19 @@ def _arm_runtime_lineage(mt, task_id="450", callback_id="13", command="test-comm
 
 
 def _record_success(mt, output):
+    observe_task(mt, mt._last_issued_task_display_id, mt._last_issued_callback_id)
     mt._record_engagement_success(
         output,
         task_id=mt._last_issued_task_display_id,
         callback_id=mt._last_issued_callback_id,
-        terminal_status=mt._last_issued_task_terminal_status,
         command=mt._last_issued_command,
     )
+
+
+def _writer_techniques(hop) -> dict:
+    """Each writer's own technique on a typed row's contributions."""
+    return {writer: (slots.get("admitted") or slots.get("rejected") or {}).get("technique")
+            for contribution in hop.contributions for writer, slots in contribution["writers"].items()}
 
 
 def _last(mt):
@@ -197,7 +204,9 @@ def test_record_dcsync_user_with_key_achieved(mt):
     mt._pending_engagement_hop = ("dcsync-user", USER, TS)
     _record_success(mt, MIMIKATZ_OK)
     hop = _last(mt)
-    assert hop.technique == "dcsync-user" and hop.status == "achieved"
+    # The account's secret is one typed row; the raw writer's technique is kept on its observation.
+    assert (hop.technique, hop.target, hop.status) == ("account-secret", USER, "achieved")
+    assert _writer_techniques(hop) == {"raw": "dcsync-user"}
     assert hop.evidence.get("verify_verdict") == "achieved"
     assert hop.evidence.get("verified_on_record") is True
     assert mt._pending_engagement_hop is None          # cleared in finally
@@ -209,7 +218,7 @@ def test_stage_b_dcsync_key_records_verified_credential_without_gate_flag(mt):
     _record_success(mt, MIMIKATZ_OK)
 
     hop = _last(mt)
-    assert hop.technique == "dcsync-user"
+    assert hop.technique == "account-secret" and _writer_techniques(hop) == {"raw": "dcsync-user"}
     assert hop.status == "achieved"
     assert hop.effect == f"creds:{USER}"
     assert hop.evidence.get("verify_verdict") == "achieved"
@@ -327,7 +336,7 @@ def test_verified_achieved_not_downgraded_same_run(mt):
     # Transient 8439 re-probe in the same instance must keep the verified achieved.
     mt._pending_engagement_hop = ("dcsync-user", USER, "2026-06-08T01:00:00+00:00")
     _record_success(mt, DCSYNC_8439)
-    hops = [h for h in mt._engagement_hops if h.technique == "dcsync-user" and h.target == USER]
+    hops = [h for h in mt._engagement_hops if h.canonical_effect == f"account-secret:{USER}"]
     assert len(hops) == 1 and hops[0].status == "achieved"
 
 
@@ -341,10 +350,10 @@ def test_verified_achieved_sticky_across_reload(tmp_path, monkeypatch):
     # Fresh instance loads the durable ledger; the no-key re-probe must keep the achieved hop.
     b = mythic_tools.MythicTools(agent_task_id="run2")
     _arm_runtime_lineage(b, task_id="451")
-    assert any(h.technique == "dcsync-user" and h.status == "achieved" for h in b._engagement_hops)
+    assert any(h.canonical_effect == f"account-secret:{USER}" and h.status == "achieved" for h in b._engagement_hops)
     b._pending_engagement_hop = ("dcsync-user", USER, "2026-06-08T02:00:00+00:00")
     _record_success(b, DCSYNC_8439)
-    hops = [h for h in b._engagement_hops if h.technique == "dcsync-user" and h.target == USER]
+    hops = [h for h in b._engagement_hops if h.canonical_effect == f"account-secret:{USER}"]
     assert len(hops) == 1 and hops[0].status == "achieved"
 
 

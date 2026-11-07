@@ -15,7 +15,7 @@ every value is synthetic. Identifiers are generic (`lab.local`, `ca01`).
 """
 
 from __future__ import annotations
-from tests.esl_fixtures import seed_ledger  # noqa: E402
+from tests.esl_fixtures import AGENT_PROCESSED, seed_ledger  # noqa: E402
 
 import asyncio
 import base64
@@ -656,7 +656,7 @@ def test_a_krbtgt_row_an_agent_reported_from_a_completed_task_is_proof(monkeypat
     seed_ledger(mt, hops=[])
     store["rows"].append({"id": 701, "account": "krbtgt", "realm": "lab.local", "type": "key",
                           "credential_text": KRBTGT_KEY, "comment": "reported by the agent",
-                          "task": {"display_id": 24, "status": "completed", "completed": True,
+                          "task": {"display_id": 24, "status": "completed", "completed": True, **AGENT_PROCESSED,
                                    "command_name": "dcsync", "callback": {"display_id": 13}}})
 
     [call] = _ground_forge(mt).tool_calls

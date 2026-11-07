@@ -168,6 +168,31 @@ _procedure_issued_tasks_context: contextvars.ContextVar[list | None] = contextva
 )
 
 
+_TASK_RECORD_QUERY = (
+    "query SageTaskRecord($id: Int!) { task(where: {display_id: {_eq: $id}}) { display_id operation_id completed "
+    "status status_timestamp_processing status_timestamp_processed callback { display_id } "
+    "responses(limit: 1) { id } } }"
+)
+# Mythic may still be running a completion function when the output wait returns; wait briefly for its verdict.
+_TASK_RECORD_SETTLE_ATTEMPTS = 4
+_TASK_RECORD_SETTLE_SECONDS = 0.5
+
+
+async def _fetch_task_record(client, task_display_id: int) -> dict | None:
+    """Mythic's task row for one display ID (the fields the shared classifier reads), or None.
+
+    Control-plane read only. A missing, duplicated or unreadable row yields None, which classifies as unknown.
+    """
+    result = await asyncio.wait_for(
+        mythic.execute_custom_query(client, _TASK_RECORD_QUERY, variables={"id": int(task_display_id)}),
+        timeout=5.0,
+    )
+    rows = result.get("task") if isinstance(result, dict) else None
+    if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+        return None
+    return rows[0]
+
+
 def _mythic_task_terminal_success(task_completed: Any, task_status: Any) -> bool:
     return task_completed is True and str(task_status or "").strip().casefold() in {
         "completed", "success",
@@ -7260,6 +7285,7 @@ class MythicTools:
                         )
                         raise
                     result_text = _task_output_text(result)
+                    await self._observe_task_record(tdid, callback_display_id)
                     result_class = command_builder.classify_result(command, result_text, parameters=parameters)
                     if (
                         executable_binding is not None
@@ -7506,7 +7532,6 @@ class MythicTools:
                     results_str,
                     task_id=self._last_issued_task_display_id,
                     callback_id=callback_display_id,
-                    terminal_status=self._last_issued_task_terminal_status,
                     command=command,
                 )
                 if getattr(self, "_ledger_last_write_error", ""):
@@ -7898,17 +7923,28 @@ class MythicTools:
     _CRED_CACHE_TTL_SECONDS = 60
 
     @staticmethod
+    def _credential_task_classification(task: dict | None) -> str:
+        try:
+            from . import task_evidence
+        except ImportError:  # pragma: no cover
+            import task_evidence
+        return task_evidence.classify_task(task_evidence.task_record_from_row(task if isinstance(task, dict) else None))
+
+    @staticmethod
     def _credential_task_terminal_success_status(task: dict | None) -> str:
-        """Return an admissible terminal-success label for a credential's source task, else empty."""
-        task = task if isinstance(task, dict) else {}
-        status = str(task.get("status") or "").strip().casefold()
-        if any(marker in status for marker in ("error", "fail", "cancel")):
+        """Return an admissible terminal-success label for a credential's source task, else empty.
+
+        The shared task classifier decides, from the task's Mythic record, as for every other ledger writer.
+        """
+        try:
+            from . import task_evidence
+        except ImportError:  # pragma: no cover
+            import task_evidence
+        record = task_evidence.task_record_from_row(task if isinstance(task, dict) else None)
+        classification = task_evidence.classify_task(record)
+        if classification != task_evidence.TERMINAL_SUCCESS:
             return ""
-        if status in {"completed", "complete", "success", "succeeded"}:
-            return status
-        if task.get("completed") is True:
-            return "completed"
-        return ""
+        return task_evidence.envelope_terminal_status(classification, record)
 
     def _credential_store_proof_envelope(self, credential: dict, now: str) -> dict:
         """Build proof for a Mythic credential row only when its source task lineage is complete."""
@@ -7932,7 +7968,10 @@ class MythicTools:
                 "task_id": task_id,
             },
             verifier_result={"observed": True, "source": "mythic_credential_store"},
-            metadata={"credential_type": str(credential.get("type") or "")},
+            metadata={
+                "credential_type": str(credential.get("type") or ""),
+                "task_classification": self._credential_task_classification(task),
+            },
         )
 
     async def _fetch_credentials_cached(self, now: str, force: bool = False) -> list:
@@ -7964,12 +8003,12 @@ class MythicTools:
                 query = ("query SageReadCredentials($op: Int) { credential(where: {deleted: {_eq: false}, "
                          "operation_id: {_eq: $op}}, order_by: {id: desc}, limit: 200) "
                          "{ id account realm type credential_text comment timestamp "
-                         "task { display_id status completed command_name original_params callback { display_id } } } }")
+                         "task { display_id status completed status_timestamp_processing status_timestamp_processed command_name original_params callback { display_id } } } }")
                 variables = {"op": op_id}
             else:
                 query = ("query SageReadCredentials { credential(where: {deleted: {_eq: false}}, "
                          "order_by: {id: desc}, limit: 200) { id account realm type credential_text comment timestamp "
-                         "task { display_id status completed command_name original_params callback { display_id } } } }")
+                         "task { display_id status completed status_timestamp_processing status_timestamp_processed command_name original_params callback { display_id } } } }")
                 variables = None
             resp = await mythic.execute_custom_query(self.client, query, variables=variables)
             creds = (resp or {}).get("credential") or []
@@ -9333,15 +9372,78 @@ class MythicTools:
             "stopped_after": "evaluation_authorization",
         }
 
+    @staticmethod
+    def _typed_effect_action(action) -> bool:
+        """Whether a capability's primary effect has a typed ledger row (task_evidence.canonical_effect)."""
+        try:
+            from . import task_evidence
+        except ImportError:  # pragma: no cover
+            import task_evidence
+        effects = list(getattr(action, "effects", []) or [])
+        return bool(effects) and task_evidence.canonical_effect(effects[0]) is not None
+
+    async def _observe_task_record(self, task_display_id, callback_display_id) -> None:
+        """Read Mythic's record of one settled task for the shared classifier; every ledger writer reads it back.
+
+        Waits briefly while Mythic still reports a running completion function. A failed read stores nothing, so
+        the task classifies as unknown and no writer can credit it as terminal success.
+        """
+        try:
+            from . import task_evidence
+        except ImportError:  # pragma: no cover
+            import task_evidence
+        task_id = self._exact_task_display_id(task_display_id)
+        if self.client is None or task_id is None:
+            return
+        record = None
+        for attempt in range(_TASK_RECORD_SETTLE_ATTEMPTS):
+            try:
+                row = await _fetch_task_record(self.client, task_id)
+            except Exception as exc:
+                logger.debug(f"task record read failed for task {task_id}: {exc}")
+                return
+            record = task_evidence.task_record_from_row(row)
+            if record is None or not task_evidence.is_settling(record):
+                break
+            if attempt + 1 < _TASK_RECORD_SETTLE_ATTEMPTS:
+                await asyncio.sleep(_TASK_RECORD_SETTLE_SECONDS)
+        if record is None or record.task_id != str(task_id):
+            return
+        if callback_display_id is not None and record.callback_id and record.callback_id != str(callback_display_id):
+            return  # a record for another callback's task is not this task's record
+        records = getattr(self, "_task_records", None)
+        if records is None:
+            records = self._task_records = {}
+        records[record.task_id] = record
+
+    def _task_classification(self, task_id) -> tuple[str, Any]:
+        """(class, record) for a task this session observed; ``unknown`` when it has no record."""
+        try:
+            from . import task_evidence
+        except ImportError:  # pragma: no cover
+            import task_evidence
+        record = (getattr(self, "_task_records", None) or {}).get(str(task_id).strip()) if task_id is not None else None
+        return task_evidence.classify_task(record), record
+
+    def _classified_terminal_status(self, task_id) -> tuple[str, str, Any]:
+        """(class, envelope terminal status, record): the only terminal status a ledger writer may put in proof."""
+        try:
+            from . import task_evidence
+        except ImportError:  # pragma: no cover
+            import task_evidence
+        classification, record = self._task_classification(task_id)
+        return classification, task_evidence.envelope_terminal_status(classification, record), record
+
     def _record_engagement_success(
         self,
         results_str,
         *,
         task_id=None,
         callback_id=None,
-        terminal_status: str = "",
         command: str = "",
     ) -> None:
+        """Record the armed raw hop's verified result. The task's terminal status comes only from its Mythic record
+        (the shared classifier), never from the caller or the output class."""
         pending = self._pending_engagement_hop
         try:
             if pending is None:
@@ -9552,6 +9654,8 @@ class MythicTools:
                 runtime_scope=True,
             )
             transaction_id = self._current_transaction_id() or f"issue-task:{task_id}"
+            # One terminal-success rule for every writer: Mythic's own task record, never the output class.
+            task_class, terminal_status, task_record = self._classified_terminal_status(task_id)
             verifier_input = {
                 "technique": technique,
                 "target": target_key,
@@ -9582,6 +9686,8 @@ class MythicTools:
                 "command": command,
                 "verifier_input_sha256": proof_reference.get("verifier_input_sha256"),
                 "verifier_result_sha256": proof_reference.get("verifier_result_sha256"),
+                "task_classification": task_class,
+                "mythic_task_status": (task_record.status[:80] if task_record is not None else ""),
                 **extra,
             }
             if status in {"failed", "blocked"}:
@@ -9607,7 +9713,7 @@ class MythicTools:
                 transaction_id=transaction_id,
                 verifier_input=verifier_input,
                 verifier_result=verifier_result,
-                metadata={"technique": technique, "target": target_key},
+                metadata={"technique": technique, "target": target_key, "task_classification": task_class},
                 # A rejected candidate reaches the ledger so the row keeps the admission reason; the ledger still
                 # requires admissible proof before it records the effect achieved, and the GPO setup reconciler
                 # never uses a rejected candidate's transaction to join the row to a later proof.
@@ -10454,6 +10560,14 @@ class MythicTools:
             evidence.setdefault("command", proof_reference.get("command"))
             evidence.setdefault("verifier_input_sha256", proof_reference.get("verifier_input_sha256"))
             evidence.setdefault("verifier_result_sha256", proof_reference.get("verifier_result_sha256"))
+            # The same terminal-success rule as every other writer: Mythic's task record, not the output class the
+            # capability executor saw.
+            task_class, classified_status, task_record = self._classified_terminal_status(
+                proof_reference.get("task_id") or evidence.get("mythic_task_id")
+            )
+            evidence["terminal_task_status"] = classified_status
+            evidence["task_classification"] = task_class
+            evidence["mythic_task_status"] = task_record.status[:80] if task_record is not None else ""
             proof_envelope_transaction_id = proof_transaction_id or transaction_id
             artifact_id = str(
                 evidence.get("pfx_artifact_id")
@@ -10473,27 +10587,30 @@ class MythicTools:
                     artifact_sha256=artifact_sha256,
                     callback_id=proof_reference.get("callback_id"),
                     task_id=proof_reference.get("task_id"),
-                    terminal_status=self._capability_text(proof_reference.get("terminal_status")),
+                    terminal_status=classified_status,
                     command=self._capability_text(proof_reference.get("command")),
                     transaction_id=proof_envelope_transaction_id,
                     verifier_input=proof_reference.get("verifier_input"),
                     verifier_result=proof_reference.get("verifier_result"),
                     authorization=proof_reference.get("authorization") if isinstance(proof_reference.get("authorization"), dict) else {},
-                    metadata={"capability_target": getattr(action, "target", "")},
+                    metadata={"capability_target": getattr(action, "target", ""), "task_classification": task_class},
                 )
             else:
                 proof_envelope = self._runtime_task_proof_envelope(
                     f"capability:{action_name}",
                     now,
+                    # On a typed-effect row a rejected candidate is the writer's observation of its task: keep it,
+                    # with its lineage and reason, so it lands on that task's contribution.
+                    retain_rejected=self._typed_effect_action(action),
                     callback_id=proof_reference.get("callback_id"),
                     task_id=proof_reference.get("task_id"),
-                    terminal_status=self._capability_text(proof_reference.get("terminal_status")),
+                    terminal_status=classified_status,
                     command=self._capability_text(proof_reference.get("command")),
                     transaction_id=proof_envelope_transaction_id,
                     verifier_input=proof_reference.get("verifier_input"),
                     verifier_result=proof_reference.get("verifier_result"),
                     authorization=proof_reference.get("authorization") if isinstance(proof_reference.get("authorization"), dict) else {},
-                    metadata={"capability_target": getattr(action, "target", "")},
+                    metadata={"capability_target": getattr(action, "target", ""), "task_classification": task_class},
                 )
             updated, verification = capabilities.record_capability_result(
                 state,
@@ -18888,12 +19005,22 @@ class MythicTools:
         verified-failed re-probe can overwrite it — the stickiness rule is 'verified-with-key beats no-key',
         never blind last-writer-wins.
         """
+        try:
+            from . import engagement_state
+        except ImportError:  # pragma: no cover
+            import engagement_state
         tech = str(technique).casefold()
         tgt = str(target_key).casefold()
-        for h in self._engagement_hops:
-            if str(getattr(h, "technique", "")).casefold() != tech:
+        hops = list(self._engagement_hops)
+        typed = engagement_state.row_identity(technique, target_key)
+        owner = engagement_state.typed_row(hops, typed) if typed != f"{tech}:{tgt}" else None
+        for h in hops:
+            if owner is not None:
+                if h is not owner:
+                    continue  # an account secret's typed row owns this technique's result
+            elif str(getattr(h, "technique", "")).casefold() != tech:
                 continue
-            if str(getattr(h, "target", "")).casefold() != tgt:
+            elif str(getattr(h, "target", "")).casefold() != tgt:
                 continue
             if str(getattr(h, "status", "")).casefold() != "achieved":
                 continue
@@ -19233,7 +19360,7 @@ class MythicTools:
                 proof_envelope=proof if isinstance(proof, dict) else None,
                 require_admissible_proof=True, engagement_id=self._eng_key(),
             )
-            identity = engagement_store.hop_identity(verified.technique, verified.target)
+            identity = engagement_state.typed_row_identity(state, verified.technique, verified.target)
             mutation_ids[identity] = state_reconcile._reconcile_mutation_id(
                 self._eng_key(), task["display_id"], identity, verified.evidence)
             produced.setdefault(key, []).append(identity)
@@ -19267,7 +19394,10 @@ class MythicTools:
         mutations = [
             engagement_store.RowMutation(
                 kind=item.kind, identity=item.identity, payload=item.payload,
-                expected_revision=item.expected_revision, mutation_id=mutation_ids.get(item.identity, ""),
+                expected_revision=item.expected_revision,
+                # A typed row's mutation can carry several tasks' observations: its own ID covers every one of
+                # them, where a per-task reconcile ID would let one already-stored task hide another's.
+                mutation_id=item.mutation_id or mutation_ids.get(item.identity, ""),
             )
             for item in engagement_store.hop_mutations(initial, state.hops)
         ]
@@ -19277,7 +19407,11 @@ class MythicTools:
             return [f"Reconciled {len(evaluate)} completed task(s) from the operation's history: "
                     f"{len(written)} row(s) recorded; cursor at task {update.task_cursor}"
                     + (f", {held} running task(s) held." if held > 0 else "."), *notes]
-        rows = {row.identity: row for row in self._ledger_snapshot().hop_rows()}
+        rows = {}
+        for row in self._ledger_snapshot().hop_rows():
+            rows[row.identity] = row
+            if row.payload.get("canonical_effect"):
+                rows.setdefault(str(row.payload["canonical_effect"]), row)
         before = {engagement_store.hop_identity(hop.technique, hop.target) for hop in initial}
         lines = []
         for item in cited:
@@ -19631,11 +19765,12 @@ class MythicTools:
         else:
             technique, target = "credential-material", f"{_credential_material_kind(credential)}:{principal}"
             effect = f"cred-material:{target}"
-        identity = engagement_store.hop_identity(technique, target)
-        current = next((hop for hop in state.hops
-                        if engagement_store.hop_identity(hop.technique, hop.target) == identity), None)
+        identity = engagement_state.row_identity(technique, target, effect)
+        typed = identity != engagement_store.hop_identity(technique, target)
+        current = engagement_state.typed_row(state.hops, identity) if typed else next(
+            (hop for hop in state.hops if engagement_store.hop_identity(hop.technique, hop.target) == identity), None)
         held = current is not None and current.status == "achieved"
-        if not held and effect in state.achieved_effects():
+        if not typed and not held and effect in state.achieved_effects():
             return state, "", effect, "already recorded"  # another verified row already holds this effect
         proof = self._credential_store_proof_envelope(credential, now)
         if not proof:
@@ -19656,7 +19791,7 @@ class MythicTools:
             state, technique, target, effect, "achieved", evidence, now, proof_envelope=proof,
             require_admissible_proof=True, engagement_id=self._eng_key(),
         )
-        return state, identity, effect, ""
+        return state, engagement_state.typed_row_identity(state, technique, target, effect), effect, ""
 
     async def _record_step_ledger(self, references: dict, step_task_ids) -> dict[str, Any]:
         """Record the capability gains a supervised step boundary can prove; returns what was recorded and left

@@ -45,6 +45,10 @@ class Hop:
     row_id: int = 0
     revision: int = 0
     corrections: dict = field(default_factory=dict)
+    # A row keyed by a typed effect (task_evidence.canonical_effect) instead of its writer's technique/target. Its
+    # status and effects derive from ``contributions``: one per Mythic task, each holding every writer's observation.
+    canonical_effect: str = ""
+    contributions: list = field(default_factory=list)
 
 
 @dataclass
@@ -1300,6 +1304,13 @@ def record_effect_result(
     else:
         normalized_reason = ""
     source = _text(evidence_dict.get("source")) if isinstance(evidence_dict, dict) else ""
+    canonical = _task_evidence().canonical_effect(normalized_effect) if require_admissible_proof else None
+    if canonical is not None:
+        return _record_canonical_observation(
+            state, canonical, technique, target, normalized_effect, normalized_status, evidence_dict, now,
+            normalized_preconditions, normalized_effects, proof_dict, admission, source, engagement_id,
+            normalized_reason,
+        )
     hop = Hop(
         id=_hop_id(technique, target),
         technique=technique,
@@ -1340,6 +1351,119 @@ def record_effect_result(
         ),
         corrected_hops=list(getattr(state, "corrected_hops", []) or []),
         request_attempts=tuple(getattr(state, "request_attempts", ()) or ()),
+    )
+
+
+def _task_evidence():
+    try:
+        from . import task_evidence
+    except ImportError:  # pragma: no cover
+        import task_evidence  # type: ignore
+    return task_evidence
+
+
+def typed_row(hops: Any, identity: str) -> "Hop | None":
+    """The row that owns a typed effect: the row keyed by it, else the row already carrying it, else the
+    lowest-numbered earlier row whose effect it is (adopted, keeping its number, corrections and history)."""
+    te = _task_evidence()
+    rows = [hop for hop in hops or [] if isinstance(hop, Hop)]
+    for hop in rows:
+        if f"{_normalize_key(hop.technique)}:{_normalize_key(hop.target)}" == identity:
+            return hop
+    owners = [hop for hop in rows if te.payload_typed_identity(
+        {"canonical_effect": hop.canonical_effect, "effect": hop.effect}) == identity]
+    if not owners:
+        return None
+    typed = [hop for hop in owners if hop.canonical_effect]
+    return min(typed or owners, key=lambda hop: (int(hop.number or 0) or 10**9))
+
+
+def typed_row_identity(state: "EngagementState", technique: str, target: str, effect: str = "") -> str:
+    """The identity of the row a runtime writer's result landed on in ``state``."""
+    canonical = _task_evidence().canonical_effect(effect or _technique_effect(technique, target))
+    if canonical is None:
+        return f"{_text(technique).strip().casefold()}:{_text(target).strip().casefold()}"
+    hop = typed_row(getattr(state, "hops", []), canonical.identity)
+    return f"{_normalize_key(hop.technique)}:{_normalize_key(hop.target)}" if hop is not None else canonical.identity
+
+
+def row_identity(technique: str, target: str, effect: str = "") -> str:
+    """The ledger row a runtime writer's result lands on: the typed effect's row, else ``technique:target``."""
+    canonical = _task_evidence().canonical_effect(effect or _technique_effect(technique, target))
+    if canonical is not None:
+        return canonical.identity
+    return f"{_text(technique).strip().casefold()}:{_text(target).strip().casefold()}"
+
+
+def _record_canonical_observation(
+    state: EngagementState,
+    canonical: Any,
+    technique: str,
+    target: str,
+    effect: str,
+    status: str,
+    evidence: dict,
+    now: str,
+    preconditions: list[str],
+    satisfied_effects: list[str],
+    proof: dict,
+    admission: Any,
+    source: str,
+    engagement_id: str,
+    pending_reason: str = "",
+) -> EngagementState:
+    """Add one writer's observation to the contribution (task, typed effect) on the typed effect's row.
+
+    The row keeps every writer's observation of every task; its status derives from what the proof boundary admits.
+    The store repeats this merge against the stored head inside its transaction, so a concurrent writer's
+    observation is never discarded.
+    """
+    import dataclasses
+    te = _task_evidence()
+    observation = te.build_observation(
+        technique=technique, target=target, effect=effect, satisfied_effects=satisfied_effects,
+        preconditions=preconditions, evidence=evidence, proof_envelope=proof,
+        admitted=bool(admission is not None and admission.admitted and status == "achieved"),
+        admission_reason=getattr(admission, "reason", "") or "proof admission failed closed",
+        source=source or "record_effect_result", timestamp=now, pending_reason=pending_reason,
+    )
+    incoming = te.contribution_row(canonical, te.writer_kind(technique, evidence), observation)
+    existing = typed_row(state.hops, canonical.identity)
+    current = dataclasses.asdict(existing) if existing is not None else None
+    merged = te.merge_rows(current, incoming, engagement_id)
+    hop = Hop(
+        id=_text(merged.get("id")) or canonical.identity,
+        technique=_text(merged.get("technique")) or canonical.technique,
+        target=_text(merged.get("target")) or canonical.target,
+        effect=_normalize_predicate(merged.get("effect")),
+        status=_normalize_key(merged.get("status")),
+        evidence=dict(merged.get("evidence") or {}),
+        preconditions=[_normalize_predicate(item) for item in merged.get("preconditions") or []],
+        satisfied_effects=[_normalize_predicate(item) for item in merged.get("satisfied_effects") or []],
+        source=_text(merged.get("source")) or "record_effect_result",
+        timestamp=_text(merged.get("timestamp")) or now,
+        proof_envelope=dict(merged.get("proof_envelope") or {}),
+        pending_reason=_normalize_key(merged.get("pending_reason")),
+        canonical_effect=canonical.identity,
+        contributions=list(merged.get("contributions") or []),
+    )
+    hops: list[Hop] = []
+    replaced = False
+    for item in state.hops:
+        if item is existing:
+            hops.append(_with_row_metadata(hop, existing))
+            replaced = True
+        else:
+            hops.append(item)
+    if not replaced:
+        hops.append(hop)
+    return dataclasses.replace(
+        state,
+        footholds=list(state.footholds),
+        hops=hops,
+        graph_facts=list(state.graph_facts),
+        probed_effect_prefixes=set(getattr(state, "probed_effect_prefixes", set()) or set()),
+        corrected_hops=list(getattr(state, "corrected_hops", []) or []),
     )
 
 
@@ -1719,6 +1843,8 @@ def _replace_hop_id(hop: Hop, hop_id: str) -> Hop:
         row_id=int(getattr(hop, "row_id", 0) or 0),
         revision=int(getattr(hop, "revision", 0) or 0),
         corrections=dict(getattr(hop, "corrections", {}) or {}),
+        canonical_effect=_text(getattr(hop, "canonical_effect", "")),
+        contributions=list(getattr(hop, "contributions", []) or []),
     )
 
 
@@ -2023,6 +2149,8 @@ def hops_from_dicts(items: Any) -> list["Hop"]:
                 row_id=_int_field(d.get("row_id")),
                 revision=_int_field(d.get("revision")),
                 corrections=dict(d["corrections"]) if isinstance(d.get("corrections"), dict) else {},
+                canonical_effect=_text(d.get("canonical_effect")),
+                contributions=list(d["contributions"]) if isinstance(d.get("contributions"), list) else [],
             ))
         except Exception:
             continue

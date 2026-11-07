@@ -23,6 +23,7 @@ from ai.langgraph import engagement_state, proof_boundary
 from ai.langgraph import mythic_tools as mythic_tools_module
 from ai.langgraph.mythic_tools import MythicTools
 from ai.langgraph.request_contract import build_request_contract
+from tests.esl_fixtures import observe_task
 
 ENGAGEMENT = "eng-gpo-setup-guard"
 GPO = "kingslanding"
@@ -156,13 +157,18 @@ def _control(engagement_id: str, *, runtime_scope: bool = True) -> engagement_st
 # --- the raw writer's retained rejected candidate through the store -----------------------------------------------
 
 def _raw_setup(tools: MythicTools, output: str, *, task_id=SETUP_TASK, callback_id=CALLBACK,
-               terminal_status="completed") -> None:
-    """The raw issue-task writer for one SharpGPOAbuse task, inside the capability's transaction."""
+               record: dict | None = None, records: dict | None = None) -> None:
+    """The raw issue-task writer for one SharpGPOAbuse task, inside the capability's transaction.
+
+    ``record`` is served as Mythic's record of the task through ``records`` (the ``mythic_task_records`` stub) for
+    the shared classifier; by default Mythic reports the task finished."""
+    if record is not None and records is not None:
+        records[int(task_id)] = record
+    observe_task(tools, task_id, callback_id)
     tools._pending_engagement_hop = ("gpo-abuse", GPO, _now())
     with _transaction():
         tools._record_engagement_success(
-            output, task_id=task_id, callback_id=callback_id, terminal_status=terminal_status,
-            command="execute_assembly",
+            output, task_id=task_id, callback_id=callback_id, command="execute_assembly",
         )
 
 
@@ -182,7 +188,7 @@ def _stored_state(tools: MythicTools) -> engagement_state.EngagementState:
 
 
 _FAULTS = {
-    "nonterminal-task": ({"terminal_status": "submitted"}, "task is not terminal-success"),
+    "nonterminal-task": ({"record": {"completed": False, "status": "submitted"}}, "task is not terminal-success"),
     "missing-task": ({"task_id": None}, "missing Mythic task lineage"),
     "missing-callback": ({"callback_id": None}, "missing callback lineage"),
 }
@@ -192,9 +198,11 @@ _OUTPUTS = {"setup-output": (SETUP_OUTPUT, "awaiting_effect"), "system-output": 
 @pytest.mark.parametrize("order", ["setup-first", "execution-first"])
 @pytest.mark.parametrize("output", list(_OUTPUTS))
 @pytest.mark.parametrize("fault", list(_FAULTS))
-def test_a_retained_rejected_setup_candidate_never_joins_a_valid_execution(session, fault, output, order):
+def test_a_retained_rejected_setup_candidate_never_joins_a_valid_execution(session, mythic_task_records, fault,
+                                                                           output, order):
     tools = session()
     lineage, reason = _FAULTS[fault]
+    lineage = dict(lineage, records=mythic_task_records)
     text, pending_reason = _OUTPUTS[output]
     if order == "execution-first":
         _commit_execution(tools)

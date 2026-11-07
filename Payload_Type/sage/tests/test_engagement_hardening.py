@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from tests.esl_fixtures import observe_task
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph"))
 import engagement_state as es  # noqa: E402
@@ -27,11 +28,11 @@ def _arm_runtime_lineage(mt, task_id="450", callback_id="50", command="test-comm
 
 
 def _record_success(mt, output):
+    observe_task(mt, mt._last_issued_task_display_id, mt._last_issued_callback_id)
     mt._record_engagement_success(
         output,
         task_id=mt._last_issued_task_display_id,
         callback_id=mt._last_issued_callback_id,
-        terminal_status=mt._last_issued_task_terminal_status,
         command=mt._last_issued_command,
     )
 

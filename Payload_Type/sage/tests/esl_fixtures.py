@@ -26,6 +26,14 @@ MARKER_UUID = "cd2a0da1-0000-4000-8000-000000000034"
 ENGAGEMENT_KEY = f"Operation_Chimera_{OPERATION_ID}_{MARKER_UUID}"
 
 
+# Mythic's once-set stage timestamps of a task an agent fetched and answered. The shared task classifier needs them
+# to call a finished task terminal success (task_evidence.classify_task).
+AGENT_PROCESSED = {
+    "status_timestamp_processing": "2026-11-07T00:00:01Z",
+    "status_timestamp_processed": "2026-11-07T00:00:02Z",
+}
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -289,3 +297,17 @@ def stub_mythic_operation(monkeypatch, *, operation_id: int = 1) -> dict:
     monkeypatch.setattr(sr, "_fetch_task_output_text", output)
     monkeypatch.setattr(mythic_tools_module.MythicTools, "_step_callback_rows", callback_rows)
     return records
+
+
+def observe_task(tools, task_id, callback_id=None) -> None:
+    """The issue path's read of a settled task's Mythic record, served by the ``mythic_task_records`` stub.
+
+    Every live ledger writer classifies a task from that record; a test that calls a writer directly reads it first,
+    as ``issue_task_and_waitfor_task_output`` does."""
+    import asyncio
+
+    if task_id is None:
+        return
+    if getattr(tools, "client", None) is None:
+        tools.client = object()
+    asyncio.run(tools._observe_task_record(task_id, callback_id))

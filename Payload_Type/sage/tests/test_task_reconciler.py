@@ -22,6 +22,8 @@ def _task(user="krbtgt"):
         "original_params": json.dumps({"Domain": DOM, "User": user, "DC": "kingslanding.sevenkingdoms.local"}),
         "status": "completed",
         "completed": True,
+        "status_timestamp_processing": "2026-06-11T21:59:00Z",
+        "status_timestamp_processed": "2026-06-11T21:59:30Z",
         "operator": {"username": "mythic_admin"},
         "callback": {"display_id": 13, "host": "CASTELBLACK", "user": "samwell.tarly"},
     }
@@ -40,6 +42,8 @@ def _assembly_wrapped_dcsync_task(user="krbtgt", command_name="invoke-assembly")
         }),
         "status": "completed",
         "completed": True,
+        "status_timestamp_processing": "2026-06-11T21:59:00Z",
+        "status_timestamp_processed": "2026-06-11T21:59:30Z",
         "operator": {"username": "mythic_admin"},
         "callback": {"display_id": 13, "host": "CASTELBLACK", "user": "samwell.tarly"},
     }
@@ -64,6 +68,8 @@ def _domain_admin_task():
         "original_params": 'net group "Domain Admins" /domain',
         "status": "completed",
         "completed": True,
+        "status_timestamp_processing": "2026-06-11T21:59:00Z",
+        "status_timestamp_processed": "2026-06-11T21:59:30Z",
         "operator": {"username": "mythic_admin"},
         "callback": {
             "display_id": 3,
@@ -221,6 +227,8 @@ def test_reconcile_execute_pe_wrapper_classifies_from_observed_commandline():
         "original_params": json.dumps({"pe_name": "mimikatz.exe", "arguments": ""}),
         "status": "success",
         "completed": True,
+        "status_timestamp_processing": "2026-06-11T21:59:00Z",
+        "status_timestamp_processed": "2026-06-11T21:59:30Z",
         "operator": {"username": "mythic_admin"},
         "callback": {"display_id": 13, "host": "CASTELBLACK", "user": "samwell.tarly"},
     }

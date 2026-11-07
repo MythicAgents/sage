@@ -30,7 +30,9 @@ from ai.langgraph import state_reconcile as sr
 from ai.langgraph.mythic_tools import MythicTools
 from ai.langgraph.request_contract import build_request_contract
 from ai.langgraph.turn_authority import authority_from_request_contract
-from tests.esl_fixtures import channel34_ledger, ingest_proof, seed_ledger, stub_mythic_operation, write_legacy_ledger
+from tests.esl_fixtures import (
+    AGENT_PROCESSED, channel34_ledger, ingest_proof, seed_ledger, stub_mythic_operation, write_legacy_ledger,
+)
 
 ENGAGEMENT = "eng-phase4"
 DOMAIN = "sevenkingdoms.local"
@@ -107,6 +109,7 @@ def _dcsync_task(display_id: int, callback: int) -> dict:
         "original_params": json.dumps({"Domain": DOMAIN, "User": "krbtgt", "DC": f"kingslanding.{DOMAIN}"}),
         "status": "completed",
         "completed": True,
+        **AGENT_PROCESSED,
         "operator": {"username": "operator_by_hand"},
         "callback": {"display_id": callback, "host": "CASTELBLACK", "user": "samwell.tarly"},
         "callback_display_id": callback,
@@ -169,6 +172,7 @@ def _task(display_id: int, command: str = "ps", *, callback: int = 13, status: s
           at: str = "2026-11-05T10:00:00", operation_id: int = 1, params: str = "") -> dict:
     return {"display_id": display_id, "id": display_id, "operation_id": operation_id, "command_name": command,
             "original_params": params, "status": status, "completed": status not in _RUNNING,
+            **(AGENT_PROCESSED if status not in _RUNNING else {}),
             "timestamp": at, "status_timestamp_preprocessing": at, "operator": {"username": "operator_by_hand"},
             "callback": {"display_id": callback, "host": "CASTELBLACK", "user": "samwell.tarly"}}
 
@@ -236,6 +240,8 @@ def _store_credential(credential_id: int, task: dict | None, *, account: str = "
     linked = None if task is None else {
         "display_id": task["display_id"], "operation_id": task.get("operation_id", 1), "status": task["status"],
         "completed": task["completed"], "command_name": task["command_name"], "original_params": task["original_params"],
+        "status_timestamp_processing": task.get("status_timestamp_processing"),
+        "status_timestamp_processed": task.get("status_timestamp_processed"),
         "callback": {"display_id": task["callback"]["display_id"]}}
     return {"id": credential_id, "operation_id": operation_id, "account": account, "realm": DOMAIN.upper(),
             "type": "hash", "credential_text": text, "comment": "", "task": linked}
@@ -505,7 +511,7 @@ def test_the_auto_journal_write_carries_the_attempt_memory_into_the_recovered_ru
 # --- credential material is not a working credential ---------------------------------------------------------------
 
 def _credential_task(display_id: int, command: str, params: dict) -> dict:
-    return {"display_id": display_id, "status": "success", "completed": True, "command_name": command,
+    return {"display_id": display_id, "status": "success", "completed": True, **AGENT_PROCESSED, "command_name": command,
             "original_params": json.dumps(params), "callback": {"display_id": 3}}
 
 
@@ -586,8 +592,7 @@ def test_a_pending_row_satisfies_no_precondition(operation):
 def test_a_raw_task_that_does_not_prove_its_effect_is_a_request_attempt(operation):
     tools = operation("channel-a", channel=3, request=1)
     tools._pending_engagement_hop = ("dcsync", DOMAIN, _now())
-    tools._record_engagement_success("ERROR_DS_DRA_ACCESS_DENIED", task_id=55, callback_id="3",
-                                     terminal_status="completed", command="dcsync")
+    tools._record_engagement_success("ERROR_DS_DRA_ACCESS_DENIED", task_id=55, callback_id="3", command="dcsync")
     assert tools._ledger_snapshot().hop_rows() == []
     [attempt] = tools._request_attempt_view()
     assert (attempt.effect, attempt.terminal, attempt.task_id) == (f"krbtgt-hash:{DOMAIN}", True, "55")
@@ -961,7 +966,8 @@ def _live_task(display_id: int = 53, *, callback: int = 2, created: Any = T53_CR
                operation_id: int = 1) -> dict:
     row = {"id": 1000 + display_id, "display_id": display_id, "operation_id": operation_id, "command_name": "spawn",
            "original_params": "", "display_params": "", "status": status, "completed": status not in _RUNNING,
-           "timestamp": updated, "status_timestamp_submitted": submitted, "status_timestamp_processed": processed,
+           "timestamp": updated, "status_timestamp_submitted": submitted, "status_timestamp_processing": submitted,
+           "status_timestamp_processed": processed,
            "operator": {"username": "operator_by_hand"},
            "callback": {"display_id": callback, "host": f"HOST-{callback}", "user": f"FIXTURE\\user-{callback}",
                         "domain": "FIXTURE"}}

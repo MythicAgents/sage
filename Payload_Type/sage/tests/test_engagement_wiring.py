@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from tests.esl_fixtures import AGENT_PROCESSED, observe_task
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph"))
@@ -96,11 +97,11 @@ def _arm_runtime_lineage(mt, task_id="4242", callback_id="50", command="test-com
 
 
 def _record_success(mt, output):
+    observe_task(mt, mt._last_issued_task_display_id, mt._last_issued_callback_id)
     mt._record_engagement_success(
         output,
         task_id=mt._last_issued_task_display_id,
         callback_id=mt._last_issued_callback_id,
-        terminal_status=mt._last_issued_task_terminal_status,
         command=mt._last_issued_command,
     )
 
@@ -252,7 +253,7 @@ def _seeded_reconcile(mt: MythicTools):
 # A credential-store row is proof only with a completed source task (an agent reported it). Rows typed into
 # Mythic carry no task and are never a forge's key.
 _AGENT_REPORTED_TASK = {"display_id": 77, "status": "completed", "completed": True, "command_name": "dcsync",
-                        "callback": {"display_id": 2}}
+                        **AGENT_PROCESSED, "callback": {"display_id": 2}}
 
 
 def _proof_hop(effect, task_id, callback_id="", technique="capability:seed", target=None, transaction_id=None):
@@ -1596,6 +1597,7 @@ def test_record_capability_result_bridge_records_and_persists():
         effects=["ds-replication-rights:lab.local"],
     )
 
+    observe_task(mt, 31337, "50")  # the issue path's read of Mythic's record for the capability's task
     verification = mt.record_capability_result(
             action,
             {"ds_replication_rights": True},
@@ -3164,7 +3166,8 @@ def test_execute_capability_gpo_proof_reconciles_the_pending_setup_hop_shown_in_
     assert "`achieved`" in rows[0]
 
 
-def test_execute_capability_gpo_proof_does_not_promote_a_setup_task_whose_candidate_was_rejected(monkeypatch):
+def test_execute_capability_gpo_proof_does_not_promote_a_setup_task_whose_candidate_was_rejected(monkeypatch,
+                                                                                                 mythic_task_records):
     """The assembled path of the test above, with one fault injected: the SharpGPOAbuse task's (task 7) observed
     terminal status is not terminal-success. The raw writer keeps that rejected candidate for its reason, and the
     candidate carries the capability's transaction. The same transaction's admitted `net group` proof (task 9) must
@@ -3230,18 +3233,9 @@ def test_execute_capability_gpo_proof_does_not_promote_a_setup_task_whose_candid
     task_ids = iter([7, 8, 9])
     calls = {}
 
-    # Fault injection at the raw writer's input only: the setup task's observation is not terminal-success.
-    # The writer, envelope builder, ledger admission, reconciler and effect computation are the production code.
-    real_record = mt._record_engagement_success
-
-    def record_with_nonterminal_setup(results_str, *, task_id=None, callback_id=None, terminal_status="",
-                                      command=""):
-        if str(task_id) == "7":
-            terminal_status = "submitted"
-        return real_record(results_str, task_id=task_id, callback_id=callback_id, terminal_status=terminal_status,
-                           command=command)
-
-    mt._record_engagement_success = record_with_nonterminal_setup
+    # Fault injection at Mythic's transport only: Mythic's record of the setup task says it was never handed to the
+    # agent. The classifier, writer, envelope builder, ledger admission, reconciler and effects are production code.
+    mythic_task_records[7] = {"completed": False, "status": "submitted"}
 
     with patch.object(access_reconciler, "reconcile_access", _seeded_reconcile(mt)), \
         _split_issue(lambda: next(outputs), calls, display_id=lambda: next(task_ids)):
@@ -3275,7 +3269,8 @@ def test_execute_capability_gpo_proof_does_not_promote_a_setup_task_whose_candid
     assert setup_hop.evidence["proof_persistence_state"] == proof_boundary.REJECTED
     assert "reconciled_from_hop" not in setup_hop.evidence
     candidate = proof_boundary.ProofEnvelope.from_dict(setup_hop.proof_envelope)
-    assert (candidate.task_id, candidate.terminal_status) == ("7", "submitted")
+    # The status is the shared classifier's verdict on Mythic's record of the task.
+    assert (candidate.task_id, candidate.terminal_status) == ("7", "not_agent_processed")
     # The precondition of the counterexample: the rejected candidate does share the proof's transaction.
     assert candidate.transaction_id and candidate.transaction_id == execution.proof_envelope["transaction_id"]
 
