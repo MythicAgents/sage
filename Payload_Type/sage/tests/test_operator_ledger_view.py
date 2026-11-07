@@ -113,10 +113,10 @@ def test_selector_that_is_not_an_existing_hop_number_matches_nothing(_restore_na
     assert len(mt._engagement_hops) == 2
 
 
-def test_state_set_is_disabled_and_changes_nothing(_restore_namespace):
+def test_state_set_cannot_set_a_status_and_changes_nothing(_restore_namespace):
     mt = _session()
     seed_ledger(mt, hops=_pending("one.local"))
-    assert "disabled" in _state(mt, "set 1 failed")
+    assert "Only `achieved` can be set" in _state(mt, "set 1 failed")
     assert mt._engagement_hops[0].status == "pending"
 
 

@@ -251,12 +251,59 @@ _STATE_USAGE = (
     "- `/state` — show the engagement ledger\n"
     "- `/state reconcile [<id>[,<id>…]] [apply]` — record verified effects from the operation's task history, or "
     "from the cited task IDs and `cred:<id>` entries (credential import is dry-run unless `apply`)\n"
+    "- `/state set <#|id> achieved task=<id> type=<type> account=<account>@<realm> line=<n> after=<text>` — promote a "
+    "pending account-secret row to credential material by citing where the secret is in a task's output\n"
     "- `/state remove <#|id[,…]> [--reason <text>]` — retract rows (kept, numbered, undoable)\n"
     "- `/state restore <#|id[,…]> [--reason <text>]` — undo retractions\n"
     "- `/state invalidate <#|id[,…]> [--reason <text>]` — mark rows as no longer holding\n"
     "- `/state objective <text>`\n"
     "- `/state wipe` — retract every row"
 )
+
+
+_SET_USAGE = (
+    "`/state set` promotes one pending account-secret row to **credential material** by citing where the secret is "
+    "in a Mythic task's output; it never takes the secret itself. Usage: `/state set <#|id> achieved task=<task "
+    "display id> type=<plaintext|cookie|ntlm|rc4|aes128|aes256> account=<account>@<realm> line=<output line> "
+    "after=<the text just before the value on that line>`. Only a task whose completion function failed after the "
+    "agent answered can be promoted, and a working credential still needs its own verified proof. Otherwise hop "
+    "status comes only from verified evidence: use `/state reconcile <id>` to record what a Mythic task (or "
+    "`cred:<id>`) proved, `/state remove` to retract a row, or `/state invalidate` to mark it no longer holding."
+)
+_PROMOTION_FIELDS = ("task", "type", "account", "line")
+
+
+def _parse_promotion(rest: str):
+    """Parse `<#|id> achieved task=… type=… account=…@… line=… after=<text>` into (selector, task, citation), or
+    return the refusal. Nothing the operator typed is echoed, so a mistyped secret never reaches the reply."""
+    try:
+        from ai.langgraph import credential_review
+    except ImportError:  # pragma: no cover
+        from ..ai.langgraph import credential_review  # type: ignore
+
+    def refused(reason: str):
+        return None, f"⚠️ {reason}.\n\n{_SET_USAGE}"
+
+    head, sep, after = (rest or "").partition(" after=")
+    tokens = head.split()
+    if len(tokens) < 2 or tokens[1].casefold() != "achieved":
+        return refused("Only `achieved` can be set, on one row, with a citation")
+    fields: dict[str, str] = {}
+    for token in tokens[2:]:
+        key, eq, value = token.partition("=")
+        key = key.casefold()
+        if not eq or key not in _PROMOTION_FIELDS or key in fields:
+            return refused("Only one each of `task=`, `type=`, `account=`, `line=` and a final `after=` are accepted")
+        fields[key] = value
+    if set(fields) != set(_PROMOTION_FIELDS) or not sep or not after.strip():
+        return refused("The citation needs `task=`, `type=`, `account=`, `line=` and `after=`")
+    account, at, realm = fields["account"].rpartition("@")
+    if not fields["task"].isdigit() or not fields["line"].isdigit() or int(fields["line"]) < 1 or not (
+            at and account and realm):
+        return refused("`task=` and `line=` are numbers and `account=` is `<account>@<realm>`")
+    citation = credential_review.Citation(fields["type"].casefold(), account, realm, int(fields["line"]),
+                                          after.strip())
+    return (tokens[0], int(fields["task"]), citation), ""
 
 
 def _split_reason(rest: str) -> tuple[str, str]:
@@ -341,9 +388,17 @@ async def _handle_state(model: Any, request: ChatRequest, arg: str = "") -> str:
                 notice += f" ({unchanged} matched row(s) already had that state.)"
             return _render_ledger_markdown(tools, request, model, notice=notice)
         if sub == "set":
-            return ("`/state set` is disabled: hop status comes only from verified evidence. Use "
-                    "`/state reconcile <id>` to record what a Mythic task (or `cred:<id>`) proved, "
-                    "`/state remove` to retract a row, or `/state invalidate` to mark it no longer holding.")
+            parsed, refusal = _parse_promotion(rest)
+            if parsed is None:
+                return refusal
+            if getattr(tools, "client", None) is None:
+                return ("`/state set` needs an active Mythic session — send one message on this channel first, then "
+                        "retry the promotion.")
+            selector, task_display_id, citation = parsed
+            notice = await tools._operator_promote_material(
+                selector, citation, task_display_id=task_display_id, actor=actor, command_text=rest,
+            )
+            return _render_ledger_markdown(tools, request, model, notice=notice)
         if sub == "reconcile":
             if getattr(tools, "client", None) is None:
                 return ("`/state reconcile` needs an active Mythic session — send one message on this channel "

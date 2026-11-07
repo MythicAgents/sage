@@ -7760,6 +7760,13 @@ class Model:
         }
         self._active_agent_label = aliases.get(normalized, normalized)
 
+    def _credential_reviewer(self):
+        """The narrow credential reviewer: this session's base chat model, unbound to tools, called isolated from the
+        graph and with tracing suppressed (credential_review_llm). Only the credential review's fallback uses it."""
+        from .credential_review_llm import CredentialReviewer
+
+        return CredentialReviewer(self.llm, model_id=f"{self.provider}:{self.model}") if self.llm else None
+
     def _get_base_chat_model(self) -> BaseChatModel | None:
         """Initialize and return the BaseChatModel based on provider and model."""
         ensure_logger_initialized()
@@ -9550,6 +9557,7 @@ class Model:
         )
         self.mythic_client.set_mechanic_repair_resolver(self._resolve_capability_mechanic)
         self.mythic_client.set_collection_runner(self._run_collection_capability)
+        self.mythic_client.set_credential_reviewer(self._credential_reviewer())
         self.mythic_client.set_capability_command_observer(self._emit_capability_command_card)
         self.mythic_client.set_execution_observer(self._emit_execution_event)
         self.mythic_client.set_turn_authority(self._turn_authority)

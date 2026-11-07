@@ -5593,15 +5593,16 @@ def test_handle_state_remove_records_a_retraction_and_keeps_the_row(monkeypatch)
     assert [hop.target for hop in tools._engagement_hops] == ["b"]
 
 
-def test_handle_state_set_is_disabled(monkeypatch):
-    """/state set no longer edits statuses: status comes only from verified evidence."""
+def test_handle_state_set_edits_no_status_without_a_cited_review(monkeypatch):
+    """/state set never edits a status directly: it only promotes cited credential material (see the phase 2
+    operator-review tests); anything else is refused with the usage."""
     from sage_chat import slash
 
     tools, seed_ledger = _state_session(monkeypatch, "op")
     seed_ledger(tools, hops=[{"technique": "t", "target": "a", "effect": "e1", "status": "achieved"}])
     for arg in ("set 1 pending", "set 1 achieved"):
         text = _run(slash._handle_state(_state_model(tools), build_chat_request("x", operation_id=0), arg))
-        assert "disabled" in text
+        assert "never takes the secret itself" in text and "`/state reconcile <id>`" in text
     assert tools._engagement_hops[0].status == "achieved"
 
 

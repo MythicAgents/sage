@@ -2171,6 +2171,9 @@ class MythicTools:
         self._mechanic_repair_cache: dict[tuple, dict | None] = {}
         # Runs graph collection (a Sage-owned transaction held by the model) for execute_capability.
         self._collection_runner = None
+        # The narrow credential reviewer (credential_review_llm.CredentialReviewer), called only when no deterministic
+        # locator reads a completion-function-error task's output. None in a session without a model.
+        self._credential_reviewer = None
         # Credential-store cache: the store is read both by read_credentials (which the agent hit 24× in one
         # solve) and by the gate's durable-hop corroboration probe. Cache the raw rows for a short TTL so
         # neither path re-queries Mythic repeatedly.
@@ -2226,6 +2229,10 @@ class MythicTools:
     def set_collection_runner(self, runner) -> None:
         """Install the async runner that performs `collect-graph` for execute_capability."""
         self._collection_runner = runner if callable(runner) else None
+
+    def set_credential_reviewer(self, reviewer) -> None:
+        """Install the narrow credential reviewer used by the credential review's fallback step."""
+        self._credential_reviewer = reviewer if callable(getattr(reviewer, "locate", None)) else None
 
     def set_capability_command_observer(self, observer) -> None:
         """Install a fail-soft presentation observer for callback tasks issued inside a capability."""
@@ -9434,52 +9441,283 @@ class MythicTools:
         classification, record = self._task_classification(task_id)
         return classification, task_evidence.envelope_terminal_status(classification, record), record
 
-    def _record_credential_review(
-        self, state, *, effect: str, task_id, callback_id, command: str, transaction_id: str, task_class: str,
-        output, now: str,
-    ):
-        """Add the credential review's observation to a completion-function-error task's account-secret row.
+    def _credential_review_target(self, state, *, effect: str, task_id, task_class: str, output):
+        """(canonical effect, stored reviews of the task's contribution) for a reviewable task, else None.
 
-        Runs only for a task Mythic classified ``postprocessing_error_with_output`` and an account-secret effect. A
-        review already stored for this task, effect, output and rule is reused, never regraded. A valid review
-        proves credential material only; a rejected one keeps its record and reason on the task's contribution; no
-        decisive review leaves the row as it was. No candidate value or output text is stored.
+        Reviewable: a task Mythic classified ``postprocessing_error_with_output`` with output, for an account-secret
+        effect.
         """
         try:
-            from . import credential_review, engagement_state, task_evidence
+            from . import engagement_state, task_evidence
         except ImportError:  # pragma: no cover
-            import credential_review
             import engagement_state
             import task_evidence
         canonical = task_evidence.canonical_effect(effect)
         if (canonical is None or task_class != task_evidence.POSTPROCESSING_ERROR_WITH_OUTPUT
                 or task_id is None or not str(output or "").strip()):
-            return state
+            return None
         owner = engagement_state.typed_row(getattr(state, "hops", []), canonical.identity)
         stored: dict = {}
         for contribution in (getattr(owner, "contributions", None) or []) if owner is not None else []:
             if isinstance(contribution, dict) and str(contribution.get("task_id")) == str(task_id):
                 stored = dict(contribution.get("reviews") or {})
+        return canonical, stored
+
+    def _record_review_outcome(
+        self, state, outcome, canonical, *, task_id, callback_id, command: str, transaction_id: str, now: str,
+        source: str = "credential_review",
+    ):
+        """Record a decisive review as an observation on the task's contribution. A valid review is admitted (or not)
+        by the proof boundary's review-backed material form; a rejected one keeps its record and reason."""
+        try:
+            from . import credential_review, engagement_state
+        except ImportError:  # pragma: no cover
+            import credential_review
+            import engagement_state
+        built = credential_review.review_observation(
+            outcome, subject=canonical.subject, engagement_id=self._eng_key(), task_id=str(task_id),
+            callback_id=callback_id, command=command, transaction_id=transaction_id, captured_at=now, source=source,
+        )
+        if built is None:
+            return state
+        material, evidence, envelope = built
+        return engagement_state.record_effect_result(
+            state, "credential-review", canonical.subject, material, "achieved", evidence, now,
+            satisfied_effects=[material], proof_envelope=envelope, require_admissible_proof=True,
+            engagement_id=self._eng_key(),
+        )
+
+    def _review_credential_task(
+        self, state, *, effect: str, task_id, callback_id, command: str, transaction_id: str, task_class: str,
+        output, now: str,
+    ):
+        """(state, deterministic outcome or None, review target or None). The deterministic review only."""
+        try:
+            from . import credential_review
+        except ImportError:  # pragma: no cover
+            import credential_review
+        target = self._credential_review_target(state, effect=effect, task_id=task_id, task_class=task_class,
+                                                output=output)
+        if target is None:
+            return state, None, None
+        canonical, stored = target
         try:
             outcome = credential_review.review_for_task(
                 output, task_id=str(task_id), canonical_effect=canonical.identity, account=canonical.account,
                 realm=canonical.realm, stored=stored,
             )
-            built = credential_review.review_observation(
-                outcome, subject=canonical.subject, engagement_id=self._eng_key(), task_id=str(task_id),
-                callback_id=callback_id, command=command, transaction_id=transaction_id, captured_at=now,
+            updated = self._record_review_outcome(
+                state, outcome, canonical, task_id=task_id, callback_id=callback_id, command=command,
+                transaction_id=transaction_id, now=now,
             )
-            if built is None:
-                return state
-            material, evidence, envelope = built
-            return engagement_state.record_effect_result(
-                state, "credential-review", canonical.subject, material, "achieved", evidence, now,
-                satisfied_effects=[material], proof_envelope=envelope, require_admissible_proof=True,
-                engagement_id=self._eng_key(),
-            )
+            return updated, outcome, target
         except Exception as exc:  # the review fails closed: the row stays as the writers left it
             logger.warning(f"credential review failed closed for task {task_id}: {type(exc).__name__}")
+            return state, None, None
+
+    def _record_credential_review(
+        self, state, *, effect: str, task_id, callback_id, command: str, transaction_id: str, task_class: str,
+        output, now: str,
+    ):
+        """Add the deterministic credential review's observation to a completion-function-error task's row.
+
+        Runs only for a task Mythic classified ``postprocessing_error_with_output`` and an account-secret effect. A
+        review already stored for this task, effect, output and rule is reused, never regraded. A valid review
+        proves credential material only; a rejected one keeps its record and reason on the task's contribution; no
+        decisive review leaves the row as it was. No candidate value or output text is stored. The raw writer uses
+        this synchronous step; task-history reconciliation adds the model fallback
+        (``_record_credential_review_with_fallback``).
+        """
+        return self._review_credential_task(
+            state, effect=effect, task_id=task_id, callback_id=callback_id, command=command,
+            transaction_id=transaction_id, task_class=task_class, output=output, now=now,
+        )[0]
+
+    async def _record_credential_review_with_fallback(
+        self, state, *, effect: str, task_id, callback_id, command: str, transaction_id: str, task_class: str,
+        output, now: str, notes: list,
+    ):
+        """The deterministic review, then the narrow model reviewer only when no deterministic locator applied.
+
+        The model's citation is reviewed like any other (credential_review.review_llm_response) and its decision is
+        stored once; a reload reuses it without a second call. When no decision can be made (no reviewer in this
+        session, an output that never names the account, a missing tracing boundary, a provider error or timeout)
+        nothing is stored, the row stays pending and ``notes`` gets one line saying why, without any value.
+        """
+        try:
+            from . import credential_review
+        except ImportError:  # pragma: no cover
+            import credential_review
+        state, outcome, target = self._review_credential_task(
+            state, effect=effect, task_id=task_id, callback_id=callback_id, command=command,
+            transaction_id=transaction_id, task_class=task_class, output=output, now=now,
+        )
+        if target is None or outcome is None or outcome.verdict != credential_review.NOT_APPLICABLE:
             return state
+        canonical, stored = target
+        try:
+            decided, reason = await self._llm_credential_review(canonical, task_id, output, stored)
+            if decided is None:
+                notes.append(f"- {task_id}: credential review left pending: {reason}.")
+                return state
+            return self._record_review_outcome(
+                state, decided, canonical, task_id=task_id, callback_id=callback_id, command=command,
+                transaction_id=transaction_id, now=now,
+            )
+        except Exception as exc:  # fails closed, reported by type only
+            logger.warning(f"credential review fallback failed closed for task {task_id}: {type(exc).__name__}")
+            notes.append(f"- {task_id}: credential review left pending ({type(exc).__name__}).")
+            return state
+
+    async def _llm_credential_review(self, canonical, task_id, output, stored):
+        """(decisive model review or None, why none). Reuses a stored model review; never stores the response."""
+        try:
+            from . import credential_review, credential_review_llm
+        except ImportError:  # pragma: no cover
+            import credential_review
+            import credential_review_llm
+        existing = credential_review.stored_review(
+            stored, task_id=str(task_id), canonical_effect=canonical.identity, output=output,
+            reviewer_kind=credential_review.REVIEWER_LLM,
+        )
+        if existing is not None:
+            return existing, ""
+        reviewer = self._credential_reviewer
+        if reviewer is None:
+            return None, "no model reviewer is available in this session"
+        excerpt = credential_review.llm_excerpt(credential_review.review_text(output), canonical.account)
+        if excerpt is None:
+            return None, f"the output never names {canonical.account}"
+        text, shown = excerpt
+        try:
+            response = await reviewer.locate(credential_review.llm_messages(text, canonical.account, canonical.realm))
+        except credential_review_llm.ReviewerUnavailable as exc:
+            return None, str(exc)
+        except Exception as exc:  # includes a timeout; the provider's message may echo the prompt
+            logger.warning(f"credential review call failed for task {task_id}: {type(exc).__name__}")
+            return None, f"the review call failed ({type(exc).__name__})"
+        return credential_review.review_llm_response(
+            output, response, task_id=str(task_id), canonical_effect=canonical.identity, account=canonical.account,
+            realm=canonical.realm, model=str(getattr(reviewer, "model_id", "") or ""), shown_lines=shown,
+        ), ""
+
+    async def _operator_promote_material(self, selector: str, citation, *, task_display_id: int, actor,
+                                         command_text: str) -> str:
+        """`/state set <row> achieved …`: promote one pending account-secret row to credential material from the
+        operator's citation of where the secret is in a Mythic task's output.
+
+        The cited task must be in this operation, be the row's effect, and be a completion-function error with
+        output; its callback must match the row's. The citation goes through the same span, type, binding and
+        admission checks as the model reviewer's. The operator review is recorded under the request's actor (only
+        channel and request identity is available; no name is invented). Anything else returns why and writes
+        nothing. Material only: a working credential still needs its own verified proof.
+        """
+        try:
+            from . import credential_review, engagement_state, engagement_store, state_reconcile, task_evidence
+        except ImportError:  # pragma: no cover
+            import credential_review
+            import engagement_state
+            import engagement_store
+            import state_reconcile
+            import task_evidence
+
+        def refused(reason: str) -> str:
+            return f"⚠️ Row not promoted: {reason}."
+
+        await self._ensure_engagement_key()
+        binding = self._require_ledger_binding()
+        store = self._ledger_store()
+        snapshot = self._ledger_snapshot()
+        rows = engagement_store.select_rows(snapshot, [selector])
+        if len(rows) != 1:
+            return refused(f"the selector matches {len(rows)} rows; cite exactly one row")
+        row = rows[0]
+        identity = str(row.payload.get("canonical_effect") or task_evidence.payload_typed_identity(row.payload) or "")
+        if not identity.startswith(f"{task_evidence.ACCOUNT_SECRET}:"):
+            return refused(f"row #{row.number} is not an account-secret row")
+        if row.retraction:
+            return refused(f"row #{row.number} is retracted")
+        if str(row.payload.get("status") or "") == "achieved":
+            return refused(f"row #{row.number} is already achieved")
+        cited = task_evidence.canonical_effect(f"creds:{citation.account}@{citation.realm}")
+        if cited is None or cited.identity != identity:
+            return refused(f"the cited account is not row #{row.number}'s account")
+
+        operation_id = await self._ledger_operation_id()
+        task, reason = await state_reconcile.fetch_cited_task(self.client, operation_id, int(task_display_id))
+        if not reason and not state_reconcile.is_terminal(task):
+            reason = "task not terminal"
+        if reason:
+            return refused(f"task {task_display_id}: {reason}")
+        now = datetime.now(timezone.utc).isoformat()
+        verified = await state_reconcile.verify_task(
+            self.client, task, now, engagement_id=self._eng_key(),
+            foothold_by_callback=state_reconcile.footholds_from_tasks([task], now), apply=False,
+        )
+        if verified is None:
+            return refused(f"task {task_display_id} proves no account secret")
+        effect = engagement_state._technique_effect(verified.technique, verified.target)
+        task_canonical = task_evidence.canonical_effect(effect)
+        if task_canonical is None or task_canonical.identity != identity:
+            return refused(f"task {task_display_id}'s effect is not row #{row.number}'s effect")
+        task_class = str(verified.evidence.get("task_classification") or "")
+        if task_class != task_evidence.POSTPROCESSING_ERROR_WITH_OUTPUT or not verified.review_output:
+            return refused(f"task {task_display_id} is {task_class or 'unclassified'}; only a completion-function "
+                           "error with output can be promoted")
+        callback = str(verified.evidence.get("callback_id") or "")
+        for contribution in row.payload.get("contributions") or []:
+            if (isinstance(contribution, dict) and str(contribution.get("task_id")) == str(task_display_id)
+                    and contribution.get("callback_id") and str(contribution.get("callback_id")) != callback):
+                return refused(f"task {task_display_id}'s callback does not match the row's record of it")
+
+        reviewer_id = (f"operator:{getattr(actor, 'actor_id', '') or 'identity-unavailable'};"
+                       f"channel:{getattr(actor, 'channel_id', '')}")
+        outcome = credential_review.review_citation(
+            verified.review_output, citation, task_id=str(task_display_id), canonical_effect=identity,
+            account=task_canonical.account, realm=task_canonical.realm,
+            reviewer_kind=credential_review.REVIEWER_OPERATOR, reviewer_id=reviewer_id, forbidden_text=command_text,
+        )
+        if outcome.verdict != credential_review.VALID:
+            return refused(str(outcome.record.get("reason") or "the citation is not valid"))
+
+        initial = list(self._ledger_view(snapshot).hops)
+        state = engagement_state.EngagementState(
+            objective=self._engagement_objective(), hops=list(initial), engagement_id=self._eng_key(),
+            runtime_scope=True,
+        )
+        proof = verified.evidence.get("proof_envelope")
+        state = engagement_state.record_hop_result(
+            state, verified.technique, verified.target, "achieved", verified.evidence, now,
+            proof_envelope=proof if isinstance(proof, dict) else None,
+            require_admissible_proof=True, engagement_id=self._eng_key(),
+        )
+        state = self._record_review_outcome(
+            state, outcome, task_canonical, task_id=task_display_id, callback_id=callback,
+            command=str(verified.evidence.get("command") or ""), transaction_id=f"operator-review:{task_display_id}",
+            now=now, source="operator_review",
+        )
+        material = f"cred-material:{outcome.material_kind}:{task_canonical.subject}"
+        promoted = engagement_state.typed_row(state.hops, identity)
+        if promoted is None or promoted.status != "achieved" or material not in promoted.satisfied_effects:
+            return refused("the proof boundary did not admit the operator's review")
+        review_key = str(outcome.record.get("review_id") or "")
+        mutations = [
+            engagement_store.RowMutation(
+                kind=item.kind, identity=item.identity, payload=item.payload,
+                expected_revision=item.expected_revision,
+                mutation_id=item.mutation_id or f"operator-review:{review_key}:{item.identity}",
+            )
+            for item in engagement_store.hop_mutations(initial, state.hops)
+        ]
+        result = store.apply(binding, mutations, actor=actor)
+        own = getattr(self, "_ledger_own_rows", None)
+        if own is None:
+            own = self._ledger_own_rows = set()
+        own.update(result.row_revisions)
+        kind = str((outcome.record.get("candidate") or {}).get("type") or "")
+        return (f"✅ Promoted row #{row.number} to credential material ({kind}) for {task_canonical.subject} from "
+                f"task {task_display_id}, on the operator's citation. A working credential still needs its own "
+                "verified proof.")
 
     def _record_engagement_success(
         self,
@@ -19416,13 +19654,13 @@ class MythicTools:
                 require_admissible_proof=True, engagement_id=self._eng_key(),
             )
             if verified.review_output:
-                state = self._record_credential_review(
+                state = await self._record_credential_review_with_fallback(
                     state, effect=engagement_state._technique_effect(verified.technique, verified.target),
                     task_id=task["display_id"], callback_id=verified.evidence.get("callback_id"),
                     command=str(verified.evidence.get("command") or ""),
                     transaction_id=str(verified.evidence.get("transaction_id") or f"operator-task:{task['display_id']}"),
                     task_class=str(verified.evidence.get("task_classification") or ""),
-                    output=verified.review_output, now=now,
+                    output=verified.review_output, now=now, notes=notes,
                 )
             identity = engagement_state.typed_row_identity(state, verified.technique, verified.target)
             mutation_ids[identity] = state_reconcile._reconcile_mutation_id(

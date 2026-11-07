@@ -43,34 +43,10 @@ def reconcile_task(
     but importing them into the durable ledger creates model-visible drag; failed effects should still be
     inspected from Mythic task history when debugging.
     """
-    if not isinstance(task, dict):
+    classified = _classify(task, output)
+    if classified is None:
         return None
-    if not _is_terminal(task):
-        return None
-
-    command = _text(task.get("command_name") or task.get("command"))
-    params = task.get("original_params")
-    if params in (None, ""):
-        params = task.get("display_params") or task.get("parameters") or ""
-    callback = task.get("callback") if isinstance(task.get("callback"), dict) else {}
-    classified = intent_classifier.classify_tool_call(command, params, callback_host=callback.get("host"))
-    if not classified:
-        # Wrapper commands such as execute_pe/execute_assembly often hide the real command line in task
-        # output ("New command line via PEB", "mimikatz(commandline)", etc.). Treat that as observation,
-        # not as proof: the verifier below still requires concrete post-action artifacts before import.
-        classified = intent_classifier.classify_tool_call(
-            command,
-            f"{_text(params)}\n{_text(output)}",
-            callback_host=callback.get("host"),
-        )
-    if not classified:
-        return None
-    technique, target = classified
-    target = _text(target).casefold()
-    if not target and technique == "domain-admin-membership-check":
-        target = _domain_admin_membership_target(callback)
-    if not technique or not target:
-        return None
+    technique, target, command, callback = classified
 
     probe = _probe_for_technique(technique, output, callback=callback)
     if probe is None:
@@ -226,6 +202,68 @@ def _credential_material_for_record(technique: str, target: str, output: Any) ->
     if not account or not realm:
         return []
     return credential_artifacts.extract_credential_material(output, account=account, realm=realm)
+
+
+def _classify(task: Any, output: Any) -> tuple[str, str, str, dict] | None:
+    """(technique, target, command, callback) for a completed task whose intent is a modeled technique, else None."""
+    if not isinstance(task, dict) or not _is_terminal(task):
+        return None
+    command = _text(task.get("command_name") or task.get("command"))
+    params = task.get("original_params")
+    if params in (None, ""):
+        params = task.get("display_params") or task.get("parameters") or ""
+    callback = task.get("callback") if isinstance(task.get("callback"), dict) else {}
+    classified = intent_classifier.classify_tool_call(command, params, callback_host=callback.get("host"))
+    if not classified:
+        # Wrapper commands such as execute_pe/execute_assembly often hide the real command line in task
+        # output ("New command line via PEB", "mimikatz(commandline)", etc.). Treat that as observation,
+        # not as proof: the verifier below still requires concrete post-action artifacts before import.
+        classified = intent_classifier.classify_tool_call(
+            command,
+            f"{_text(params)}\n{_text(output)}",
+            callback_host=callback.get("host"),
+        )
+    if not classified:
+        return None
+    technique, target = classified
+    target = _text(target).casefold()
+    if not target and technique == "domain-admin-membership-check":
+        target = _domain_admin_membership_target(callback)
+    if not technique or not target:
+        return None
+    return technique, target, command, callback
+
+
+def review_candidate(task: dict[str, Any], output: Any) -> tuple[str, str, dict] | None:
+    """(technique, target, lineage evidence) for a credential task the verifier above did not credit, whose output
+    the credential review may still read: Mythic classified it a completion-function error with output.
+
+    The hash verifier is one tool's locator; it must not decide whether a completion-error task is reviewed. This
+    carries no proof and no output text: only the task's lineage and classification, so the review can attach its own
+    observation to the task's contribution.
+    """
+    classified = _classify(task, output)
+    if classified is None:
+        return None
+    technique, target, command, callback = classified
+    if technique not in credential_artifacts.CREDENTIAL_TECHNIQUES or not _text(output).strip():
+        return None
+    if task_evidence.canonical_effect(engagement_state._technique_effect(technique, target)) is None:
+        return None  # a host-scoped dump (lsass) is no account's secret: nothing the review could prove
+    record = task_evidence.task_record_from_row(task, has_output=True)
+    task_class = task_evidence.classify_task(record)
+    if task_class != task_evidence.POSTPROCESSING_ERROR_WITH_OUTPUT:
+        return None
+    task_id = task.get("display_id") if task.get("display_id") is not None else task.get("id")
+    return technique, target, {
+        "source": "task_history_reconcile",
+        "provenance": "operator_task",
+        "mythic_task_id": task_id,
+        "callback_id": callback.get("display_id") or callback.get("id") or task.get("callback_display_id"),
+        "command": command,
+        "task_classification": task_class,
+        "transaction_id": f"operator-task:{task_id}",
+    }
 
 
 def _is_terminal(task: dict[str, Any]) -> bool:

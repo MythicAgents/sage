@@ -422,11 +422,16 @@ async def verify_task(client, task: dict, now: str, *, engagement_id: str, footh
         return None
     display_id = task.get("display_id")
     output = await _fetch_task_output_text(client, int(display_id))
-    record = _task_reconciler.reconcile_task(
-        _task_with_foothold_context(task, foothold_by_callback), output, now, engagement_id=str(engagement_id or ""),
-    )
+    context = _task_with_foothold_context(task, foothold_by_callback)
+    record = _task_reconciler.reconcile_task(context, output, now, engagement_id=str(engagement_id or ""))
     if record is None:
-        return None
+        candidate = _task_reconciler.review_candidate(context, output)
+        if candidate is None:
+            return None
+        # No verifier credited the task: its observation carries lineage and no proof, so the row stays pending
+        # unless the credential review proves material.
+        technique, target, evidence = candidate
+        return VerifiedTask(technique, target, evidence, (), review_output=str(output or ""))
     evidence = dict(record.evidence)
     refs, notes = await _import_reconciled_credentials(client, record.credential_material, display_id, apply=apply)
     if refs:
