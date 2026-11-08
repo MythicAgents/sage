@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
+import re
 from typing import Any, Mapping
 
 try:
@@ -201,3 +202,688 @@ def join_expired(observed_at: Any, now: Any, window_seconds: int | None = None) 
         return False
     window = CREDENTIAL_JOIN_WINDOW_SECONDS if window_seconds is None else window_seconds
     return (end - start).total_seconds() > window
+
+
+# --- Directory ACL reads ---------------------------------------------------------------------------------------
+#
+# A directory change (a granted right) is proven by a later read of the exact object, never by the write's own
+# success message. Two read formats are supported: StandIn ``--object <filter> --access`` text, which names the
+# object by its full distinguished name on its ``Path : LDAP://`` line and each trustee by ``NETBIOS\name``; and a
+# structured JSON read carrying the object's DN/SID/GUID and raw ACE records. A JSON Boolean claiming the effect is
+# not a read. Anything else is "not proven" with a reason, never a substring match.
+
+ACL_VERIFIER = "effect_observations:acl"
+
+# Extended-right GUIDs by schema display name (StandIn prints the name; a JSON read carries the GUID).
+DS_REPLICATION_GET_CHANGES = "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2"
+DS_REPLICATION_GET_CHANGES_ALL = "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2"
+DS_REPLICATION_GET_CHANGES_FILTERED = "89e95b76-444d-4c62-991a-0facbeda640c"
+EXTENDED_RIGHTS = {
+    "ds-replication-get-changes": DS_REPLICATION_GET_CHANGES,
+    "ds-replication-get-changes-all": DS_REPLICATION_GET_CHANGES_ALL,
+    "ds-replication-get-changes-in-filtered-set": DS_REPLICATION_GET_CHANGES_FILTERED,
+}
+# What ``ds-replication-rights:{domain}`` needs: both rights, as the existing verifier already required.
+REPLICATION_RIGHTS = (DS_REPLICATION_GET_CHANGES, DS_REPLICATION_GET_CHANGES_ALL)
+
+# Trustees every principal belongs to: their deny ACEs defeat any principal's right.
+_BROAD_TRUSTEES = frozenset({
+    "s-1-1-0", "s-1-5-11", "everyone", "authenticated users", "nt authority\\authenticated users",
+})
+_ADS_CONTROL_ACCESS = 0x100
+_GENERIC_ALL = 0x10000000
+_FULL_CONTROL = 0xF01FF
+_GUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+_SID_RE = re.compile(r"^s-1-\d+(?:-\d+)+$")
+_STANDIN_PATH_RE = re.compile(r"(?im)^\s*Path\s*:\s*LDAP://(?:[^/\r\n]+/)?(?P<dn>[^\r\n]+?)\s*$")
+_STANDIN_IDENTITY_RE = re.compile(r"(?im)^\s*\[\+\]\s*Identity\s*-->\s*(?P<trustee>[^\r\n]+?)\s*$")
+_STANDIN_FIELD_RE = re.compile(r"(?im)^\s*\|_\s*(?P<key>Type|Permission|Object)\s*:\s*(?P<value>[^\r\n]*?)\s*$")
+
+
+def normalize_dn(value: Any) -> str:
+    """A distinguished name compared case-insensitively, without whitespace around separators."""
+    text = _text(value)
+    if text.casefold().startswith("distinguishedname="):
+        text = text[len("distinguishedname="):]
+    parts = []
+    for rdn in text.split(","):
+        key, sep, val = rdn.partition("=")
+        if not sep:
+            return ""
+        parts.append(f"{key.strip().casefold()}={val.strip().casefold()}")
+    return ",".join(parts)
+
+
+def _right_guid(value: Any) -> str:
+    """'' for an ACE that applies to every extended right/property, the GUID for a named one, else None-like '?'."""
+    text = _text(value).casefold().strip("{}")
+    if text in ("", "all", "any", "00000000-0000-0000-0000-000000000000"):
+        return ""
+    if _GUID_RE.match(text):
+        return text
+    return EXTENDED_RIGHTS.get(text, "?" + text)
+
+
+@dataclass(frozen=True)
+class Ace:
+    trustee: str = ""
+    trustee_sid: str = ""
+    allow: bool = True
+    control_access: bool = False
+    full_control: bool = False
+    object_type: str = ""
+    inherit_only: bool = False
+    class_scoped: bool = False
+    # A format that prints no inheritance flags (StandIn) cannot show that a broad ACE is inherit-only, so only an ACE
+    # naming the exact right is credited from it.
+    exact_right_only: bool = False
+
+    def grants(self, right: str) -> bool:
+        """Allow side, strict: an ACE that might apply only to descendants or to another class proves nothing."""
+        if self.inherit_only or self.class_scoped:
+            return False
+        if self.exact_right_only:
+            return self.control_access and self.object_type == right
+        return (self.full_control or self.control_access) and self.object_type in ("", right)
+
+    def may_deny(self, right: str) -> bool:
+        """Deny side, conservative: a deny applies to the object unless it is explicitly inherit-only."""
+        if self.inherit_only:
+            return False
+        return (self.full_control or self.control_access) and self.object_type in ("", right)
+
+
+@dataclass(frozen=True)
+class AclRead:
+    """One directory read of one object: its DACL and, from a JSON read, its RBCD descriptor, members and gPLink."""
+
+    source_format: str = ""
+    object_dn: str = ""
+    object_sid: str = ""
+    object_guid: str = ""
+    aces: tuple[Ace, ...] = ()
+    complete: bool = False
+    reason: str = ""
+    has_dacl: bool = False
+    rbcd: tuple[Ace, ...] = ()
+    rbcd_complete: bool = False
+    members: tuple[str, ...] = ()
+    members_complete: bool = False
+    gplink: str | None = None
+
+
+@dataclass(frozen=True)
+class AclVerdict:
+    achieved: bool
+    reason: str
+    granted: tuple[str, ...] = ()
+    denied: tuple[str, ...] = ()
+    values: Mapping[str, Any] = field(default_factory=dict)
+
+
+def _permission_flags(value: Any) -> tuple[bool, bool]:
+    """(control access, full control) for StandIn's comma-separated ``ActiveDirectoryRights`` or a JSON mask/list."""
+    if isinstance(value, bool):
+        return False, False
+    if isinstance(value, int):
+        return bool(value & _ADS_CONTROL_ACCESS), bool(value & _GENERIC_ALL) or (value & _FULL_CONTROL) == _FULL_CONTROL
+    names = value if isinstance(value, (list, tuple)) else _text(value).split(",")
+    rights = {_text(name).strip().casefold() for name in names}
+    return "extendedright" in rights, "genericall" in rights
+
+
+def _json_document(text: str) -> Any:
+    stripped = text.strip()
+    for candidate in (stripped, stripped[stripped.find("{"): stripped.rfind("}") + 1] if "{" in stripped else ""):
+        if not candidate:
+            continue
+        try:
+            return json.loads(candidate)
+        except ValueError:
+            continue
+    return None
+
+
+def _parse_json_acl(document: Mapping[str, Any]) -> AclRead:
+    body = document.get("directory_read") if isinstance(document.get("directory_read"), Mapping) else document
+    obj = body.get("object") if isinstance(body.get("object"), Mapping) else {}
+    dacl = body.get("dacl") if isinstance(body.get("dacl"), Mapping) else None
+    rbcd = body.get("rbcd") if isinstance(body.get("rbcd"), Mapping) else None
+    member = body.get("member") if isinstance(body.get("member"), Mapping) else None
+    gplink = body.get("gplink") if isinstance(body.get("gplink"), str) else None
+    has_dacl = dacl is not None and isinstance(dacl.get("aces"), list)
+    has_rbcd = rbcd is not None and isinstance(rbcd.get("aces"), list)
+    has_member = member is not None and isinstance(member.get("sids"), list)
+    if not (has_dacl or has_rbcd or has_member or gplink is not None):
+        return AclRead("json", reason="the JSON read carries no DACL ACE records or other directory property")
+    parsed: dict[str, tuple[Ace, ...]] = {}
+    for label, container in (("dacl", dacl if has_dacl else None), ("rbcd", rbcd if has_rbcd else None)):
+        if container is None:
+            continue
+        aces, reason = _json_aces(container["aces"])
+        if reason:
+            return AclRead("json", reason=reason)
+        parsed[label] = aces
+    return AclRead(
+        "json", object_dn=normalize_dn(obj.get("dn")), object_sid=_text(obj.get("sid")).casefold(),
+        object_guid=_text(obj.get("guid")).casefold().strip("{}"), aces=parsed.get("dacl", ()),
+        complete=has_dacl and dacl.get("complete") is True, has_dacl=has_dacl,
+        rbcd=parsed.get("rbcd", ()), rbcd_complete=has_rbcd and rbcd.get("complete") is True,
+        members=tuple(_text(sid).casefold() for sid in member["sids"]) if has_member else (),
+        members_complete=has_member and member.get("complete") is True, gplink=gplink,
+    )
+
+
+def _json_aces(records: list) -> tuple[tuple[Ace, ...], str]:
+    aces = []
+    for raw in records:
+        if not isinstance(raw, Mapping):
+            return (), "an ACE record is not structured"
+        kind = _text(raw.get("type")).casefold()
+        if kind not in ("allow", "deny"):
+            return (), "an ACE record has no allow/deny type"
+        if not isinstance(raw.get("inherit_only", False), bool):
+            return (), "an ACE record's inherit_only is not a Boolean"
+        control, full = _permission_flags(raw.get("rights"))
+        aces.append(Ace(
+            trustee=_text(raw.get("trustee")).casefold(),
+            trustee_sid=_text(raw.get("trustee_sid")).casefold(),
+            allow=kind == "allow", control_access=control, full_control=full,
+            object_type=_right_guid(raw.get("object_type")),
+            inherit_only=raw.get("inherit_only") is True,
+            class_scoped=bool(_text(raw.get("inherited_object_type"))),
+        ))
+    return tuple(aces), ""
+
+
+def _parse_standin_acl(text: str) -> AclRead:
+    if re.search(r"(?im)^\s*\[\+\]\s*Set object access rules", text):
+        return AclRead("standin", reason="a StandIn write, not a read of the object")
+    failure = re.search(r"(?im)^\s*\[!\]\s*(?P<message>[^\r\n]*)", text)
+    if failure:
+        return AclRead("standin", reason=f"the read reported a failure: {_bounded(failure.group('message'))}")
+    paths = list(_STANDIN_PATH_RE.finditer(text))
+    if not paths:
+        return AclRead("standin", reason="the read does not name its object (no Path : LDAP:// line)")
+    if len(paths) > 1:
+        return AclRead("standin", reason="the read names more than one object")
+    path = paths[0]
+    identities = list(_STANDIN_IDENTITY_RE.finditer(text))
+    aces = []
+    for index, match in enumerate(identities):
+        end = identities[index + 1].start() if index + 1 < len(identities) else len(text)
+        block = {m.group("key").casefold(): m.group("value") for m in _STANDIN_FIELD_RE.finditer(text, match.end(), end)}
+        kind = _text(block.get("type")).casefold()
+        if kind not in ("allow", "deny"):
+            return AclRead("standin", reason="an access rule has no Allow/Deny type")
+        control, full = _permission_flags(block.get("permission"))
+        trustee = _text(match.group("trustee")).casefold()
+        aces.append(Ace(
+            trustee="" if _SID_RE.match(trustee) else trustee, trustee_sid=trustee if _SID_RE.match(trustee) else "",
+            allow=kind == "allow", control_access=control, full_control=full,
+            object_type=_right_guid(block.get("object")), exact_right_only=True,
+        ))
+    # StandIn lists every access rule of the object, or every rule of the --ntaccount trustee: complete for the
+    # trustee it names. A deny reaching the trustee only through a group it belongs to is not resolvable here.
+    return AclRead("standin", object_dn=normalize_dn(path.group("dn")), aces=tuple(aces), complete=True, has_dacl=True)
+
+
+def parse_acl_read(output: Any) -> AclRead:
+    """The object identity and ACE records of a directory ACL read, or an ``AclRead`` whose ``reason`` says why the
+    output is not a usable read."""
+    text = _text(output)
+    if not text:
+        return AclRead(reason="no read output")
+    document = _json_document(text) if text.lstrip().startswith("{") or "\"dacl\"" in text else None
+    if isinstance(document, Mapping):
+        return _parse_json_acl(document)
+    return _parse_standin_acl(text)
+
+
+def verify_acl_rights(
+    read: AclRead, *, object_dn: str, principal: str = "", principal_sid: str = "", rights: tuple[str, ...],
+    object_sid: str = "", object_guid: str = "",
+) -> AclVerdict:
+    """Whether ``read`` proves the exact principal holds every one of ``rights`` on the exact object.
+
+    The object binds by its full DN (whose DC components fix the domain) and, when both sides carry them, by SID and
+    GUID. The principal binds by SID, or by the exact ``NETBIOS\\name`` string the caller already bound to the domain
+    (the principal the same transaction granted). A right holds when an applicable allow ACE for that principal grants
+    it and no applicable deny ACE for the principal or a group every principal belongs to takes it away. A partial
+    DACL, a different trustee or object, or a read failure is not proof.
+    """
+    values: dict[str, Any] = {
+        "source_format": read.source_format, "object_dn": read.object_dn, "complete": read.complete,
+        "expected_object_dn": normalize_dn(object_dn), "trustee": _text(principal).casefold(),
+        "trustee_sid": _text(principal_sid).casefold(), "rights": list(rights),
+    }
+    if read.reason:
+        return AclVerdict(False, read.reason, values=values)
+    expected_dn = normalize_dn(object_dn)
+    if not expected_dn or read.object_dn != expected_dn:
+        return AclVerdict(False, "the read is of a different object", values=values)
+    for expected, observed, label in ((object_sid, read.object_sid, "SID"), (object_guid, read.object_guid, "GUID")):
+        if _text(expected) and observed and _text(expected).casefold().strip("{}") != observed:
+            return AclVerdict(False, f"the read's object {label} differs", values=values)
+    if not read.has_dacl:
+        return AclVerdict(False, "the read carries no DACL ACE records", values=values)
+    if not read.complete:
+        return AclVerdict(False, "the read does not declare a complete DACL", values=values)
+    want_name, want_sid = _text(principal).casefold(), _text(principal_sid).casefold()
+    if not want_name and not want_sid:
+        return AclVerdict(False, "no bound principal to verify", values=values)
+
+    def is_principal(ace: Ace) -> bool:
+        return bool((want_sid and ace.trustee_sid == want_sid) or (want_name and ace.trustee == want_name))
+
+    def is_broad(ace: Ace) -> bool:
+        return ace.trustee in _BROAD_TRUSTEES or ace.trustee_sid in _BROAD_TRUSTEES
+
+    granted = tuple(r for r in rights if any(a.allow and is_principal(a) and a.grants(r) for a in read.aces))
+    denied = tuple(r for r in rights if any(
+        not a.allow and (is_principal(a) or is_broad(a)) and a.may_deny(r) for a in read.aces))
+    values.update({"granted": list(granted), "denied": list(denied)})
+    if denied:
+        return AclVerdict(False, "a deny ACE takes the right away", granted, denied, values)
+    missing = [r for r in rights if r not in granted]
+    if missing:
+        return AclVerdict(False, "no allow ACE for the principal grants " + ", ".join(missing), granted, denied, values)
+    return AclVerdict(True, "", granted, denied, values)
+
+
+# --- Enrolled certificates ---------------------------------------------------------------------------------------
+#
+# An enrollment task's output may carry the CA-issued certificate itself (a PFX). It proves certificate material
+# only when code opens it with the task's own certificate password (held in memory, never stored) and binds the
+# public fingerprint, the requested UPN in the subject alternative name, the issuing CA and the template, and the
+# private key matches the certificate's public key. The result is material, not a working credential. Only public
+# values leave this function.
+
+CERTIFICATE_VERIFIER = "effect_observations:certificate"
+_UPN_OID = "1.3.6.1.4.1.311.20.2.3"
+_TEMPLATE_NAME_OID = "1.3.6.1.4.1.311.20.2"      # v1 template: the template's name
+_TEMPLATE_INFO_OID = "1.3.6.1.4.1.311.21.7"      # v2 template: the template's OID and version
+
+
+@dataclass(frozen=True)
+class CertificateBinding:
+    bound: bool
+    reason: str
+    values: Mapping[str, Any] = field(default_factory=dict)
+
+
+def _der_value(data: bytes, expected_tags: tuple[int, ...]) -> tuple[int, bytes] | None:
+    """(tag, content) of the single DER TLV at the start of ``data`` when its tag is expected, else None."""
+    if len(data) < 2 or data[0] not in expected_tags:
+        return None
+    length, offset = data[1], 2
+    if length & 0x80:
+        count = length & 0x7F
+        if count == 0 or count > 4 or len(data) < 2 + count:
+            return None
+        length, offset = int.from_bytes(data[2:2 + count], "big"), 2 + count
+    if len(data) < offset + length:
+        return None
+    return data[0], data[offset:offset + length]
+
+
+def _der_string(data: bytes) -> str:
+    if data[:1] == b"\xa0":  # an [0] EXPLICIT wrapper around the string
+        inner = _der_value(data, (0xA0,))
+        data = inner[1] if inner else b""
+    parsed = _der_value(data, (0x0C, 0x13, 0x16, 0x1E))
+    if parsed is None:
+        return ""
+    tag, content = parsed
+    try:
+        return content.decode("utf-16-be") if tag == 0x1E else content.decode("utf-8")
+    except UnicodeDecodeError:
+        return ""
+
+
+def _der_oid(content: bytes) -> str:
+    if not content:
+        return ""
+    arcs = [content[0] // 40, content[0] % 40]
+    value = 0
+    for byte in content[1:]:
+        value = (value << 7) | (byte & 0x7F)
+        if not byte & 0x80:
+            arcs.append(value)
+            value = 0
+    return ".".join(str(arc) for arc in arcs)
+
+
+def _template_identity(certificate: Any) -> tuple[str, str]:
+    """(template name, template OID) from the certificate's template extensions; '' where absent."""
+    name, oid = "", ""
+    for extension in certificate.extensions:
+        dotted = extension.oid.dotted_string
+        raw = getattr(extension.value, "value", b"")
+        if dotted == _TEMPLATE_NAME_OID and isinstance(raw, bytes):
+            name = _der_string(raw)
+        elif dotted == _TEMPLATE_INFO_OID and getattr(extension.value, "template_id", None) is not None:
+            oid = extension.value.template_id.dotted_string  # parsed by cryptography (MSCertificateTemplate)
+        elif dotted == _TEMPLATE_INFO_OID and isinstance(raw, bytes):
+            sequence = _der_value(raw, (0x30,))
+            identifier = _der_value(sequence[1], (0x06,)) if sequence else None
+            oid = _der_oid(identifier[1]) if identifier else ""
+    return name, oid
+
+
+def verify_enrolled_certificate(
+    pfx: bytes, password: str, *, account: str, domain: str, ca_name: str, template: str, observed_at: Any = "",
+) -> CertificateBinding:
+    """Whether ``pfx`` is CA-issued certificate material for ``account@domain`` from ``ca_name`` under ``template``.
+
+    ``ca_name`` may be the enrollment config ``host\\CA-Name``; the issuer's common name must equal the CA name. A v1
+    template binds by name; a v2 certificate carries only its template's OID, which is recorded as the template
+    binding (mapping it to the requested name needs a directory read). A PFX that does not open with the task's
+    password, carries no key, has a key that does not match, names another UPN or CA, or is outside its validity at
+    ``observed_at`` is not proof.
+    """
+    values: dict[str, Any] = {"pfx_sha256": hashlib.sha256(pfx or b"").hexdigest() if pfx else ""}
+    if not pfx:
+        return CertificateBinding(False, "no certificate artifact", values)
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.serialization import pkcs12
+        from cryptography.x509.oid import ExtensionOID, NameOID
+    except ImportError:  # pragma: no cover - the dependency is declared
+        return CertificateBinding(False, "the certificate parser is unavailable", values)
+    try:
+        key, certificate, _chain = pkcs12.load_key_and_certificates(pfx, _text(password).encode() or None)
+    except Exception:  # noqa: BLE001 - any parse failure is "not proven", with no detail that could echo input
+        return CertificateBinding(False, "the PFX does not open with the task's certificate password", values)
+    if key is None:
+        return CertificateBinding(False, "the PFX carries no private key", values)
+    if certificate is None:
+        return CertificateBinding(False, "the PFX carries no certificate", values)
+    try:
+        return _bind_certificate(key, certificate, values, x509, hashes, serialization, ExtensionOID, NameOID,
+                                 account=account, domain=domain, ca_name=ca_name, template=template,
+                                 observed_at=observed_at)
+    except Exception:  # noqa: BLE001 - a malformed extension is "not proven", with no detail that could echo input
+        return CertificateBinding(False, "the certificate's extensions could not be parsed", values)
+
+
+def _bind_certificate(key, certificate, values, x509, hashes, serialization, ExtensionOID, NameOID, *,
+                      account, domain, ca_name, template, observed_at) -> CertificateBinding:
+    spki = serialization.PublicFormat.SubjectPublicKeyInfo
+    public = certificate.public_key().public_bytes(serialization.Encoding.DER, spki)
+    upns: list[str] = []
+    try:
+        san = certificate.extensions.get_extension_for_oid(ExtensionOID.SUBJECT_ALTERNATIVE_NAME).value
+        for other in san.get_values_for_type(x509.OtherName):
+            if other.type_id.dotted_string == _UPN_OID:
+                upns.append(_der_string(other.value).casefold())
+    except x509.ExtensionNotFound:
+        pass
+    issuer_cn = [attr.value for attr in certificate.issuer.get_attributes_for_oid(NameOID.COMMON_NAME)]
+    template_name, template_oid = _template_identity(certificate)
+    values.update({
+        "fingerprint_sha256": certificate.fingerprint(hashes.SHA256()).hex(),
+        "subject": certificate.subject.rfc4514_string()[:MAX_REASON_CHARS],
+        "upns": upns,
+        "issuer_cn": _text(issuer_cn[0]) if issuer_cn else "",
+        "template_name": template_name,
+        "template_oid": template_oid,
+        "requested_template": _text(template),
+        "not_before": certificate.not_valid_before_utc.isoformat(),
+        "not_after": certificate.not_valid_after_utc.isoformat(),
+        "key_matches": key.public_key().public_bytes(serialization.Encoding.DER, spki) == public,
+    })
+    if not values["key_matches"]:
+        return CertificateBinding(False, "the PFX private key does not match the certificate", values)
+    expected_upn = f"{_text(account).casefold()}@{_text(domain).casefold()}"
+    if not _text(account) or not _text(domain) or expected_upn not in upns:
+        return CertificateBinding(False, "the certificate names a different UPN", values)
+    expected_ca = _text(ca_name).rsplit("\\", 1)[-1].casefold()
+    if not expected_ca or values["issuer_cn"].casefold() != expected_ca:
+        return CertificateBinding(False, "the certificate was issued by a different CA", values)
+    if template_name:
+        if template_name.casefold() != _text(template).casefold():
+            return CertificateBinding(False, "the certificate was issued under a different template", values)
+    elif not template_oid:
+        return CertificateBinding(False, "the certificate carries no template identity", values)
+    moment = _parse_time(observed_at)
+    if moment is not None and not (certificate.not_valid_before_utc <= moment <= certificate.not_valid_after_utc):
+        return CertificateBinding(False, "the certificate is outside its validity period", values)
+    return CertificateBinding(True, "", values)
+
+
+# --- RBCD, group membership and GPO links (structured JSON reads) ------------------------------------------------
+
+_GPLINK_RE = re.compile(r"\[LDAP://cn=\{?(?P<guid>[0-9a-f-]{36})\}?,[^;\]]*;(?P<options>\d+)\]", re.IGNORECASE)
+
+
+def _first_rdn_value(dn: str) -> str:
+    first = normalize_dn(dn).split(",", 1)[0]
+    return first.partition("=")[2]
+
+
+def verify_rbcd(read: AclRead, *, computer: str, trustee_sid: str) -> AclVerdict:
+    """Whether ``read`` shows ``trustee_sid`` allowed in ``computer``'s msDS-AllowedToActOnBehalfOfOtherIdentity.
+
+    The computer binds by its object's first RDN (``CN=<host>``); the trustee only by SID. Computer creation alone,
+    another computer or trustee, a deny, or an incomplete descriptor is not proof. This is configuration, not a usable
+    service ticket."""
+    host = _text(computer).casefold().rstrip("$").split(".", 1)[0]
+    sid = _text(trustee_sid).casefold()
+    values = {"object_dn": read.object_dn, "computer": host, "trustee_sid": sid, "source_format": read.source_format}
+    if read.reason:
+        return AclVerdict(False, read.reason, values=values)
+    if not host or _first_rdn_value(read.object_dn) != host:
+        return AclVerdict(False, "the read is of a different object", values=values)
+    if not read.rbcd_complete:
+        return AclVerdict(False, "the read does not declare a complete RBCD descriptor", values=values)
+    if not sid:
+        return AclVerdict(False, "no trustee SID to verify", values=values)
+    if any(not a.allow and a.trustee_sid == sid and not a.inherit_only for a in read.rbcd):
+        return AclVerdict(False, "a deny ACE names the trustee", values=values)
+    if any(a.allow and a.trustee_sid == sid and (a.full_control or a.control_access) for a in read.rbcd):
+        return AclVerdict(True, "", ("rbcd",), (), values)
+    return AclVerdict(False, "the RBCD descriptor does not allow the trustee", values=values)
+
+
+def verify_group_member(read: AclRead, *, group_dn: str, principal_sid: str, group_sid: str = "") -> AclVerdict:
+    """Whether ``read`` shows ``principal_sid`` as a direct member of the exact group (complete member list)."""
+    sid = _text(principal_sid).casefold()
+    values = {"object_dn": read.object_dn, "principal_sid": sid, "source_format": read.source_format}
+    if read.reason:
+        return AclVerdict(False, read.reason, values=values)
+    if not normalize_dn(group_dn) or read.object_dn != normalize_dn(group_dn):
+        return AclVerdict(False, "the read is of a different object", values=values)
+    if _text(group_sid) and read.object_sid and _text(group_sid).casefold() != read.object_sid:
+        return AclVerdict(False, "the read's object SID differs", values=values)
+    if not read.members_complete:
+        return AclVerdict(False, "the read does not declare a complete member list", values=values)
+    if not sid or sid not in read.members:
+        return AclVerdict(False, "the principal is not a direct member", values=values)
+    return AclVerdict(True, "", ("member",), (), values)
+
+
+def verify_gpo_link(read: AclRead, *, container_dn: str, gpo_guid: str) -> AclVerdict:
+    """Whether ``read`` shows the exact GPO linked and enabled on the exact container. A disabled link (option bit 1),
+    another container or GPO, or a read without the gPLink value is not proof; a link is not SYSTEM execution."""
+    guid = _text(gpo_guid).casefold().strip("{}")
+    values = {"object_dn": read.object_dn, "gpo_guid": guid, "source_format": read.source_format}
+    if read.reason:
+        return AclVerdict(False, read.reason, values=values)
+    if not normalize_dn(container_dn) or read.object_dn != normalize_dn(container_dn):
+        return AclVerdict(False, "the read is of a different object", values=values)
+    if read.gplink is None:
+        return AclVerdict(False, "the read carries no gPLink value", values=values)
+    links = {m.group("guid").casefold(): int(m.group("options")) for m in _GPLINK_RE.finditer(read.gplink)}
+    if guid not in links:
+        return AclVerdict(False, "the GPO is not linked to the container", values=values)
+    if links[guid] & 1:
+        return AclVerdict(False, "the GPO link is disabled", values=values)
+    return AclVerdict(True, "", ("gplink",), (), values)
+
+
+# --- Directory changes: a write is a candidate; a later read of the exact object proves it ---------------------
+#
+# A successful mutation task records an awaiting ``directory_change`` join naming the object, the principal and the
+# property it changed (from its own parameters or returned identity, never from proximity). Each terminal read task
+# indexes a ``directory_read`` observation of the object it read. A later pass resolves the join with the first read
+# that comes after the mutation and verifies. The proving task is the reading task.
+
+DIRECTORY_CHANGE_JOIN = "directory_change"
+DIRECTORY_READ = "directory_read"
+DIRECTORY_JOIN_WINDOW_SECONDS = 86400
+PROPERTY_REPLICATION = "replication-rights"
+PROPERTY_RBCD = "rbcd"
+PROPERTY_MEMBER = "member"
+PROPERTY_GPLINK = "gplink"
+DIRECTORY_PROPERTIES = (PROPERTY_REPLICATION, PROPERTY_RBCD, PROPERTY_MEMBER, PROPERTY_GPLINK)
+
+
+def _ace_record(ace: Ace) -> dict[str, Any]:
+    return {key: getattr(ace, key) for key in Ace.__dataclass_fields__}
+
+
+def read_values(read: AclRead) -> dict[str, Any]:
+    """The read's normalized, secret-free values for its observation."""
+    return {
+        "source_format": read.source_format, "object_dn": read.object_dn, "object_sid": read.object_sid,
+        "object_guid": read.object_guid, "complete": read.complete, "has_dacl": read.has_dacl,
+        "aces": [_ace_record(ace) for ace in read.aces], "rbcd": [_ace_record(ace) for ace in read.rbcd],
+        "rbcd_complete": read.rbcd_complete, "members": list(read.members), "members_complete": read.members_complete,
+        "gplink": read.gplink,
+    }
+
+
+def read_from_values(values: Mapping[str, Any]) -> AclRead:
+    def aces(key: str) -> tuple[Ace, ...]:
+        out = []
+        for raw in values.get(key) or []:
+            if isinstance(raw, Mapping):
+                out.append(Ace(**{k: raw[k] for k in Ace.__dataclass_fields__ if k in raw}))
+        return tuple(out)
+
+    return AclRead(
+        source_format=_text(values.get("source_format")), object_dn=_text(values.get("object_dn")),
+        object_sid=_text(values.get("object_sid")), object_guid=_text(values.get("object_guid")), aces=aces("aces"),
+        complete=values.get("complete") is True, has_dacl=values.get("has_dacl") is True, rbcd=aces("rbcd"),
+        rbcd_complete=values.get("rbcd_complete") is True, members=tuple(values.get("members") or ()),
+        members_complete=values.get("members_complete") is True,
+        gplink=values.get("gplink") if isinstance(values.get("gplink"), str) else None,
+    )
+
+
+def directory_read_observation(task: Mapping[str, Any] | None, output: Any, terminal_status: str,
+                               observed_at: str) -> Observation | None:
+    """A ``directory_read`` observation for a terminal-success task whose output is a supported read, else None."""
+    values = normalize_task(task)
+    if not values or values.get("task_classification") != task_evidence.TERMINAL_SUCCESS:
+        return None
+    read = parse_acl_read(output)
+    if read.reason or not read.object_dn:
+        return None
+    values.update(read_values(read))
+    values["terminal_status"] = _text(terminal_status)
+    task_id = str(values["task_id"])
+    return Observation(
+        kind=DIRECTORY_READ, source_kind="task", source_id=task_id, subject=read.object_dn, observed_at=_text(observed_at),
+        values=values, task_id=task_id, callback_id=str(values["callback_id"]),
+        agent_callback_id=str(values["agent_callback_id"]), supporting=(f"task:{task_id}",), verifier_id=ACL_VERIFIER,
+    )
+
+
+def directory_change_join(task: Mapping[str, Any] | None, *, prop: str, technique: str, target: str, obj: str,
+                          principal: str = "", principal_sid: str = "", observed_at: str = "") -> Observation | None:
+    """An awaiting join for a terminal-success mutation task naming ``obj`` and its principal, else None."""
+    values = normalize_task(task)
+    if prop not in DIRECTORY_PROPERTIES or not values:
+        return None
+    if values.get("task_classification") != task_evidence.TERMINAL_SUCCESS:
+        return None
+    obj_key = normalize_dn(obj) if "=" in _text(obj) else _text(obj).casefold()
+    if not obj_key or not (_text(principal) or _text(principal_sid)):
+        return None
+    values.update({
+        "property": prop, "technique": _text(technique).casefold(), "target": _text(target).casefold(),
+        "object": obj_key, "principal": _text(principal).casefold(), "principal_sid": _text(principal_sid).casefold(),
+    })
+    task_id = str(values["task_id"])
+    subject = f"{prop}:{obj_key}|{values['principal'] or values['principal_sid']}"
+    return Observation(
+        kind=DIRECTORY_CHANGE_JOIN, source_kind="task", source_id=task_id, subject=subject,
+        observed_at=_text(observed_at), values=values, task_id=task_id, callback_id=str(values["callback_id"]),
+        agent_callback_id=str(values["agent_callback_id"]), supporting=(f"task:{task_id}",), verifier_id=ACL_VERIFIER,
+        reason="awaiting a later read of the changed object", join_state=JOIN_AWAITING,
+    )
+
+
+def bound_principal(principal: str, netbios_map: Mapping[str, str] | None) -> str:
+    """``principal`` when it is a SID or a ``NETBIOS\\name`` whose prefix the engagement NetBIOS map names; else ''."""
+    text = _text(principal).casefold()
+    if _SID_RE.match(text):
+        return text
+    prefix, sep, name = text.partition("\\")
+    mapped = {_text(key).casefold() for key in (netbios_map or {})}
+    return text if sep and name and prefix in mapped else ""
+
+
+def _task_number(value: Any) -> int:
+    try:
+        return int(_text(value))
+    except ValueError:
+        return -1
+
+
+def resolve_directory_change(join: Mapping[str, Any], reads: list[Mapping[str, Any]],
+                             netbios_map: Mapping[str, str] | None) -> tuple[Mapping[str, Any] | None, str]:
+    """(the first later read that proves the join's change, '') or (None, why not yet).
+
+    ``join``/``reads`` are stored observation rows (``payload.values``). Only a read of a later task counts. A
+    replication-rights join needs its principal bound by SID or by a mapped NetBIOS prefix."""
+    values = (join.get("payload") or {}).get("values") or {}
+    prop, mutation_task = values.get("property"), _task_number(values.get("task_id"))
+    reason = "no later read of the changed object yet"
+    principal = ""
+    if prop == PROPERTY_REPLICATION:
+        principal = bound_principal(values.get("principal"), netbios_map)
+        if not principal:
+            return None, "the granted principal is not bound (no SID, and its NetBIOS prefix is not mapped)"
+    for read in sorted(reads, key=lambda row: _task_number(((row.get("payload") or {}).get("values") or {}).get("task_id"))):
+        read_values_ = (read.get("payload") or {}).get("values") or {}
+        if _task_number(read_values_.get("task_id")) <= mutation_task:
+            continue
+        observed = read_from_values(read_values_)
+        if prop == PROPERTY_REPLICATION:
+            sid = principal if _SID_RE.match(principal) else ""
+            verdict = verify_acl_rights(observed, object_dn=values.get("object"), principal="" if sid else principal,
+                                        principal_sid=sid, rights=REPLICATION_RIGHTS)
+        elif prop == PROPERTY_RBCD:
+            verdict = verify_rbcd(observed, computer=values.get("object"), trustee_sid=values.get("principal_sid"))
+        elif prop == PROPERTY_MEMBER:
+            verdict = verify_group_member(observed, group_dn=values.get("object"), principal_sid=values.get("principal_sid"))
+        elif prop == PROPERTY_GPLINK:
+            verdict = verify_gpo_link(observed, container_dn=values.get("object"), gpo_guid=values.get("principal"))
+        else:
+            return None, "unsupported directory property"
+        if verdict.achieved:
+            return read, ""
+        reason = verdict.reason
+    return None, reason
+
+
+def dn_domain(dn: str) -> str:
+    """The DNS domain a distinguished name's DC components name ('' without any)."""
+    parts = [rdn.partition("=")[2] for rdn in normalize_dn(dn).split(",") if rdn.startswith("dc=")]
+    return ".".join(parts)
+
+
+def domain_head_dn(domain: str) -> str:
+    """The distinguished name of a domain's naming-context head (``DC=...``), '' for an empty domain."""
+    return ",".join(f"dc={part}" for part in _text(domain).casefold().split(".") if part)
+
+
+def is_domain_head_dn(dn: str) -> bool:
+    """Whether a DN is a domain naming-context head: every RDN is ``DC=`` (no OU or CN prefix). Replication rights
+    live on this object; the same grant against an OU or leaf does not confer domain DCSync."""
+    normalized = normalize_dn(dn)
+    return bool(normalized) and all(rdn.startswith("dc=") for rdn in normalized.split(","))

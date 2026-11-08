@@ -11,9 +11,12 @@ from dataclasses import dataclass, field
 from typing import Any
 
 try:
-    from . import credential_artifacts, engagement_state, intent_classifier, proof_boundary, task_evidence
+    from . import (
+        credential_artifacts, effect_observations, engagement_state, intent_classifier, proof_boundary, task_evidence,
+    )
 except ImportError:
     import credential_artifacts
+    import effect_observations
     import engagement_state
     import intent_classifier
     import proof_boundary
@@ -112,15 +115,92 @@ def reconcile_task(
 
 
 def _probe_for_technique(technique: str, output: Any, *, callback: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """The structured probe a modeled technique's own task output supplies, or None when that output cannot prove it.
+
+    A directory write (the DCSync-rights grant, RBCD) proves nothing by its own success message: it becomes a
+    ``directory_change`` candidate (:func:`directory_observations`) that a later read of the object must prove.
+    Graph collection is proven only by the completed BloodHound ingest of its artifact, which records it itself.
+    """
     if technique in credential_artifacts.CREDENTIAL_TECHNIQUES:
         return dict(credential_artifacts.extract_credential_probe(output))
-    if technique in credential_artifacts.GRANT_TECHNIQUES:
-        return dict(credential_artifacts.extract_grant_probe(output))
     if technique in credential_artifacts.TICKET_TECHNIQUES:
         return dict(credential_artifacts.extract_ticket_probe(output))
     if technique == "domain-admin-membership-check":
         return _extract_domain_admin_membership_probe(output, callback=callback)
+    if technique == "gpo-abuse":
+        return _gpo_system_exec_probe(output)
     return None
+
+
+def _gpo_system_exec_probe(output: Any) -> dict[str, Any]:
+    """The raw writer's GPO rule: only observed SYSTEM execution achieves; a GPO modification alone stays partial."""
+    try:
+        from . import capabilities
+    except ImportError:  # pragma: no cover
+        import capabilities  # type: ignore
+    probe = capabilities.extract_gpo_system_exec_probe(output)
+    # verify_effect's achieved_any for gpo-abuse is these two execution signals, exactly as the capability verifier
+    # (verify_gpo_controlled_system_exec) achieves: a GPO modification or scheduled-task artifact stays partial.
+    return {
+        "system_command_succeeded": bool(probe.get("system_command_succeeded")),
+        "system_callback_observed": bool(probe.get("system_callback_observed")),
+        "gpo_modified": bool(probe.get("gpo_modified")),
+        "scheduled_task_present": bool(probe.get("scheduled_task_present")),
+    }
+
+
+_GRANT_IDENTITY_RE = None
+
+
+def _granted_principal(output: Any, params: Any) -> str:
+    """The principal a StandIn grant names: its returned identity ("... to object for NETBIOS\\name"), else the
+    ``--grant``/``--ntaccount`` parameter."""
+    import re
+
+    global _GRANT_IDENTITY_RE
+    if _GRANT_IDENTITY_RE is None:
+        _GRANT_IDENTITY_RE = re.compile(r"(?im)\bfor\s+(?P<principal>[^\s\\]+\\[^\s]+)\s*$")
+    match = _GRANT_IDENTITY_RE.search(_text(output))
+    if match:
+        return match.group("principal")
+    return intent_classifier.flag_value(params, "grant") or intent_classifier.flag_value(params, "ntaccount")
+
+
+def directory_observations(task: dict[str, Any], output: Any, now: str) -> list:
+    """Directory observations a terminal task supplies: an awaiting ``directory_change`` join for a successful
+    directory write, and a ``directory_read`` observation when its output is a supported read of one object."""
+    out = []
+    record = task_evidence.task_record_from_row(task, has_output=bool(_text(output).strip()))
+    terminal_status = task_evidence.envelope_terminal_status(task_evidence.classify_task(record), record)
+    read = effect_observations.directory_read_observation(task, output, terminal_status, now)
+    if read is not None:
+        out.append(read)
+    classified = _classify(task, output)
+    if classified is None:
+        return out
+    technique, target, _command, _callback = classified
+    params = task.get("original_params") or task.get("display_params") or task.get("parameters") or ""
+    if technique in credential_artifacts.GRANT_TECHNIQUES:
+        granted_object = intent_classifier.flag_value(params, "object")
+        # Replication rights are an extended right on the domain naming-context head. A grant whose object is an OU
+        # or a leaf is not a domain-DCSync grant, so it opens no ds-replication-rights join.
+        if credential_artifacts.grant_write_reported(output) and effect_observations.is_domain_head_dn(granted_object):
+            join = effect_observations.directory_change_join(
+                task, prop=effect_observations.PROPERTY_REPLICATION, technique=technique, target=target,
+                obj=granted_object, principal=_granted_principal(output, params), observed_at=now,
+            )
+            if join is not None:
+                out.append(join)
+    elif technique == "rbcd-standin":
+        text = _text(output)
+        if text.strip() and "[!]" not in text and "access is denied" not in text.casefold():
+            join = effect_observations.directory_change_join(
+                task, prop=effect_observations.PROPERTY_RBCD, technique=technique, target=target, obj=target,
+                principal_sid=intent_classifier.flag_value(params, "sid"), observed_at=now,
+            )
+            if join is not None:
+                out.append(join)
+    return out
 
 
 def _extract_domain_admin_membership_probe(output: Any, *, callback: dict[str, Any] | None = None) -> dict[str, Any]:

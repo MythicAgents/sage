@@ -9776,13 +9776,16 @@ class MythicTools:
                 # advisor, the achieved-dedup SKIP would then SKIP re-attempting a grant that never
                 # landed. Gate the record on a real grant-application artifact via the existing
                 # verify_effect seam.
-                probe = credential_artifacts.extract_grant_probe(results_str)
-                verdict = engagement_state.verify_effect(technique, target_key, probe)
-                status = "achieved" if verdict == "achieved" else "failed"
+                # A grant that reports success is a candidate, not proof: the row stays pending until a later read
+                # of the domain object shows the principal's rights (operation reconciliation resolves it).
+                reported = credential_artifacts.grant_write_reported(results_str)
+                verdict = "partial" if reported else "failed"
+                status = "pending" if reported else "failed"
                 extra = {
                     "verified_on_record": True,
-                    "verify_verdict": verdict,
-                    "artifact_present": bool(probe.get("ds_replication_rights")),
+                    "verify_verdict": "partial" if reported else "failed",
+                    "verify_reason": "grant reported; awaiting a later read of the object" if reported else "",
+                    "artifact_present": False,
                 }
                 if status != "achieved":
                     # Stickiness: a later no-marker re-probe must NOT downgrade a prior VERIFIED achieved grant
@@ -9918,6 +9921,20 @@ class MythicTools:
                             "verify_reason": "GPO modified but execution proof unavailable",
                             "artifact_present": False,
                         }
+            elif technique == "rbcd-standin":
+                # An RBCD write is a candidate: only a later read of the computer's descriptor proves it.
+                if _record_output_is_failure(results_str):
+                    logger.warning(
+                        f"🔒 [verify-on-record] {technique} {target_key}: RBCD write failed or empty — NOT recording."
+                    )
+                    return
+                status = "pending"
+                extra = {
+                    "verified_on_record": True,
+                    "verify_verdict": "partial",
+                    "verify_reason": "RBCD write reported; awaiting a later read of the computer's descriptor",
+                    "artifact_present": False,
+                }
             elif _record_output_is_failure(results_str):
                 # Legacy / no-probe technique: with NO artifact to verify, record `achieved` ONLY
                 # when the task produced clean output. Empty output or a Mythic/agent error (task
@@ -11403,10 +11420,6 @@ class MythicTools:
                     domain,
                     proof_marker,
                 ))
-                probe["callback_id"] = self._capability_text(callback_display_id)
-                verification = capabilities.verify_capability(capability, probe)
-                if verification.verdict != "achieved":
-                    return
                 action = capabilities.CapabilityAction(
                     name=self._capability_text(action_data.get("name") or capability),
                     target=self._capability_text(action_data.get("target") or context.get("target")),
@@ -11417,6 +11430,18 @@ class MythicTools:
                     reason=self._capability_text(action_data.get("reason")),
                     source_facts=self._capability_list(action_data.get("source_facts")),
                 )
+                # The registered step's own parameters (rebuilt in memory) open and bind the PFX. A password the
+                # safe runtime context withheld cannot be rebuilt, and then the PFX stays unbound.
+                probe = capabilities.bind_enrolled_certificate_probe(
+                    probe,
+                    output,
+                    capabilities.enrollment_binding_parameters(action, runtime),
+                    datetime.now(timezone.utc).isoformat(),
+                )
+                probe["callback_id"] = self._capability_text(callback_display_id)
+                verification = capabilities.verify_capability(capability, probe)
+                if verification.verdict != "achieved":
+                    return
                 self.record_capability_result(
                     action,
                     probe,
@@ -14761,10 +14786,11 @@ class MythicTools:
                 or not self._capability_executor_is_final_probe(command_obj)
             ):
                 return None, None
-            probe = dict(capabilities_mod.extract_directory_rights_probe(
-                output,
-                acl_entries=[output],
-                domain=self._capability_domain(action, inputs),
+            # The read must name the effect's domain head and the exact principal this transaction granted, not
+            # merely list replication rights someone holds.
+            binding = capabilities_mod.grant_read_binding(action, inputs)
+            probe = dict(capabilities_mod.extract_bound_directory_rights_probe(
+                output, target_dn=binding["target_dn"], principal=binding["principal"],
             ))
             probe["callback_id"] = self._capability_text(callback_id)
             verification = capabilities_mod.verify_capability(capability, probe)
@@ -14859,6 +14885,13 @@ class MythicTools:
                 domain,
                 proof_marker,
             ))
+            # The step's own parameters (in memory only) open and bind the PFX the task returned.
+            probe = capabilities_mod.bind_enrolled_certificate_probe(
+                probe,
+                output,
+                capabilities_mod.enrollment_binding_parameters(action, inputs),
+                datetime.now(timezone.utc).isoformat(),
+            )
             probe["callback_id"] = self._capability_text(callback_id)
             verification = capabilities_mod.verify_capability(capability, probe)
             return probe, verification
@@ -19575,6 +19608,110 @@ class MythicTools:
         except Exception:
             return None
 
+    def _directory_change_hops(self, state, binding, store, stored_joins, observed, now, *, cited: bool,
+                               observations: list, transitions: list, produced: dict, mutation_ids: dict,
+                               reasons: dict):
+        """Index this pass's directory reads and writes, and record each directory change a later read proves.
+
+        A write is never its own proof: its awaiting join resolves only with a read of the same object, by a later
+        task, that the source verifier accepts. The achieved row's proving task is that read. Mutates the passed
+        ``observations``/``transitions``/``produced``/``mutation_ids``/``reasons`` and returns the state.
+        """
+        try:
+            from . import access_reconciler, effect_observations as eo, engagement_state, engagement_store
+            from . import proof_boundary, state_reconcile
+        except ImportError:
+            import access_reconciler
+            import effect_observations as eo
+            import engagement_state
+            import engagement_store
+            import proof_boundary
+            import state_reconcile
+
+        def as_row(item):
+            return {"observation_id": item.observation_id, "observed_at": item.observed_at, "task_id": item.task_id,
+                    "subject": item.subject, "payload": item.payload()}
+
+        new_reads = [(key, item) for key, item in observed if item.kind == eo.DIRECTORY_READ]
+        new_joins = [(key, item) for key, item in observed if item.kind == eo.DIRECTORY_CHANGE_JOIN]
+        states = store.observation_states(binding, [item.observation_id for _key, item in observed])
+        for _key, item in new_reads:
+            observations.append(engagement_store.ObservationRecord(**item.record()))
+        pending = [(None, join) for join in stored_joins]
+        stored_ids = {join["observation_id"] for join in stored_joins}
+        for key, item in new_joins:
+            if states.get(item.observation_id) in (eo.JOIN_RESOLVED, eo.JOIN_EXPIRED):
+                reasons.setdefault(key, "no proven gain; its directory change was already settled or no later read "
+                                        "came within the window (cite the reading task)")
+                continue
+            if item.observation_id not in states:
+                observations.append(engagement_store.ObservationRecord(**item.record()))
+            if item.observation_id not in stored_ids:
+                pending.append((key, as_row(item)))
+        if not pending:
+            return state
+        dn_subjects = {(j["payload"]["values"] or {}).get("object") for _k, j in pending}
+        stored_reads = store.observations(binding, kind=eo.DIRECTORY_READ, subjects={s for s in dn_subjects if "=" in s})
+        if any("=" not in subject for subject in dn_subjects):  # a host-named RBCD write: match reads by first RDN
+            stored_reads += store.observations(binding, kind=eo.DIRECTORY_READ, limit=500)
+        reads = {row["observation_id"]: row for row in stored_reads}
+        reads.update({item.observation_id: as_row(item) for _key, item in new_reads})
+        read_keys = {item.observation_id: key for key, item in new_reads}
+        netbios = access_reconciler._engagement_netbios_map()
+        for key, join in pending:
+            values = join["payload"]["values"]
+            read, reason = eo.resolve_directory_change(join, list(reads.values()), netbios)
+            if read is None:
+                if key is not None:
+                    reasons.setdefault(key, f"no proven gain yet; the write is a candidate: {reason}")
+                elif not cited and eo.join_expired(join["observed_at"], now, eo.DIRECTORY_JOIN_WINDOW_SECONDS):
+                    transitions.append(engagement_store.JoinTransition(
+                        join["observation_id"], eo.JOIN_EXPIRED,
+                        reason="no later read proved the change within the window; cite the reading task"))
+                continue
+            technique, target = values.get("technique"), values.get("target")
+            if values.get("property") == eo.PROPERTY_REPLICATION and eo.normalize_dn(values.get("object")) != eo.domain_head_dn(target):
+                continue  # the write's object is not the domain naming-context head its effect names
+            read_values = read["payload"]["values"]
+            read_task = str(read_values.get("task_id"))
+            transaction_id = f"directory-change:{values.get('task_id')}"
+            envelope = proof_boundary.make_runtime_task_envelope(
+                engagement_id=self._eng_key(), callback_id=read_values.get("callback_id"), task_id=read_task,
+                terminal_status=str(read_values.get("terminal_status") or ""),
+                command=str(read_values.get("command_name") or ""), verifier_id=eo.ACL_VERIFIER, captured_at=now,
+                transaction_id=transaction_id,
+                verifier_input={"join": join["observation_id"], "join_values_sha256": join["payload"].get("values_sha256"),
+                                "read": read["observation_id"],
+                                "read_values_sha256": read["payload"].get("values_sha256")},
+                verifier_result={"verdict": "achieved", "technique": technique, "target": target,
+                                 "property": values.get("property")},
+                metadata={"reconciled": True, "mutation_task_id": values.get("task_id"),
+                          "task_classification": read_values.get("task_classification")},
+            )
+            evidence = {
+                "source": "task_history_reconcile", "provenance": "operator_task", "mythic_task_id": read_task,
+                "callback_id": read_values.get("callback_id"), "command": read_values.get("command_name"),
+                "verify_verdict": "achieved", "verified_on_record": True, "artifact_present": True,
+                "reconciled_at": now, "task_classification": read_values.get("task_classification"),
+                "transaction_id": transaction_id, "terminal_task_status": read_values.get("terminal_status"),
+                "mutation_task_id": values.get("task_id"), "directory_property": values.get("property"),
+                "proof_envelope": envelope.to_dict(),
+            }
+            state = engagement_state.record_hop_result(
+                state, technique, target, "achieved", evidence, now, proof_envelope=evidence["proof_envelope"],
+                require_admissible_proof=True, engagement_id=self._eng_key(),
+            )
+            identity = engagement_state.typed_row_identity(state, technique, target)
+            mutation_ids.setdefault(identity, state_reconcile._reconcile_mutation_id(
+                self._eng_key(), read_task, identity, {"directory_join": join["observation_id"]}))
+            transitions.append(engagement_store.JoinTransition(
+                join["observation_id"], eo.JOIN_RESOLVED, reason="a later read proved the change",
+                resolved_by=f"task:{read_task}"))
+            for owner in (read_keys.get(read["observation_id"]), key):
+                if owner is not None:
+                    produced.setdefault(owner, []).append(identity)
+        return state
+
     async def _reconcile_operation(self, cited=(), *, apply: bool = False) -> list[str]:
         """One reconciliation pass over the operation's task history, or the cited tasks and credentials.
 
@@ -19600,6 +19737,9 @@ class MythicTools:
         # Terminal credential tasks whose credential-store entry had not appeared when the cursor passed them.
         joins = store.awaiting_joins(binding, effect_observations.CREDENTIAL_ENTRY_JOIN,
                                      limit=effect_observations.JOIN_LIMIT)
+        # Directory writes awaiting a later read of the object they changed.
+        directory_joins = store.awaiting_joins(binding, effect_observations.DIRECTORY_CHANGE_JOIN,
+                                               limit=effect_observations.JOIN_LIMIT)
         operation_id = await self._ledger_operation_id()
         now = datetime.now(timezone.utc).isoformat()
         initial = list(self._ledger_view().hops)
@@ -19664,10 +19804,12 @@ class MythicTools:
         mutation_ids: dict[str, str] = {}
         notes: list[str] = []
         credited: set[str] = set()
+        directory_observed: list[tuple[str, Any]] = []
         for key, task in evaluate:
-            verified = await state_reconcile.verify_task(
+            verified, task_observations = await state_reconcile.verify_and_observe_task(
                 self.client, task, now, engagement_id=self._eng_key(), foothold_by_callback=foothold_map, apply=apply,
             )
+            directory_observed.extend((key, item) for item in task_observations)
             if verified is None:
                 continue
             notes.extend(verified.notes)
@@ -19711,6 +19853,11 @@ class MythicTools:
                 continue
             observations.append(engagement_store.ObservationRecord(**join.record()))
             reasons.setdefault(key, "no proven gain yet; awaiting its Mythic credential-store entry")
+        state = self._directory_change_hops(
+            state, binding, store, directory_joins, directory_observed, now, cited=bool(cited),
+            observations=observations, transitions=transitions, produced=produced, mutation_ids=mutation_ids,
+            reasons=reasons,
+        )
         for key, row in credentials:
             state, identity, _effect, reason = self._credential_hop(
                 state, row, now, source="operation_reconcile", require_admitted=True)
@@ -19752,13 +19899,20 @@ class MythicTools:
                                                     joins=transitions)
         if not cited:
             held = len(set(position.held_tasks) | set(update.held_added)) - len(update.held_resolved)
-            awaiting = len(({join["observation_id"] for join in joins} - {item.observation_id for item in transitions})
-                           | {record.observation_id for record in observations})
+            closed = {item.observation_id for item in transitions}
+            awaiting = len(({join["observation_id"] for join in joins} - closed)
+                           | {record.observation_id for record in observations
+                              if record.kind == effect_observations.CREDENTIAL_ENTRY_JOIN})
+            awaiting_reads = len(({join["observation_id"] for join in directory_joins} - closed)
+                                 | {record.observation_id for record in observations
+                                    if record.kind == effect_observations.DIRECTORY_CHANGE_JOIN
+                                    and record.observation_id not in closed})
             return [f"Reconciled {len(evaluate)} completed task(s) from the operation's history: "
                     f"{len(written)} row(s) recorded; cursor at task {update.task_cursor}"
                     + (f", {held} running task(s) held" if held > 0 else "")
-                    + (f", {awaiting} task(s) awaiting a credential-store entry" if awaiting > 0 else "") + ".",
-                    *notes]
+                    + (f", {awaiting} task(s) awaiting a credential-store entry" if awaiting > 0 else "")
+                    + (f", {awaiting_reads} directory change(s) awaiting a later read" if awaiting_reads > 0 else "")
+                    + ".", *notes]
         rows = {}
         for row in self._ledger_snapshot().hop_rows():
             rows[row.identity] = row

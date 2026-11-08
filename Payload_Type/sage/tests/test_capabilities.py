@@ -9,6 +9,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph")
 import capabilities  # noqa: E402
 import engagement_state as es  # noqa: E402
 import request_attempts  # noqa: E402
+import pytest  # noqa: E402
+from datetime import timedelta  # noqa: E402
+
+from tests.certificate_fixtures import ISSUED_AT, enrollment_output, issue_pfx  # noqa: E402
 
 NOW = "2026-06-10T12:00:00Z"
 TTL = 600
@@ -4025,7 +4029,8 @@ def test_build_adcs_esc_certificate_enroll_requires_ca_template_and_uses_cert_au
     _assert_payload_agnostic_plan(plan)
 
 
-def test_adcs_enrolled_certificate_probe_requires_certificate_and_private_key_material():
+def test_adcs_enrolled_certificate_marker_only_output_is_not_material():
+    """Markers and a well-formed blob were enough before; an unopened PFX now stays partial."""
     pfx = base64.b64encode(b"0" + b"B" * 512).decode("ascii")
     output = "\n".join([
         "SAGE_CERT_ENROLL_PROOF_administrator_lab_local_13",
@@ -4035,20 +4040,134 @@ def test_adcs_enrolled_certificate_probe_requires_certificate_and_private_key_ma
         "CERT_PFX_PATH=C:\\Windows\\Temp\\sage_forged_cert_administrator_lab_local_13.pfx",
         f"PFX_BASE64={pfx}",
     ])
-
     probe = capabilities.extract_adcs_enrolled_certificate_probe(
-        output,
-        "administrator",
-        "lab.local",
-        "SAGE_CERT_ENROLL_PROOF_administrator_lab_local_13",
+        output, "administrator", "lab.local", "SAGE_CERT_ENROLL_PROOF_administrator_lab_local_13",
+    )
+    probe["callback_id"] = "13"
+    assert capabilities.verify_capability("adcs-esc-certificate-enroll", probe).verdict != "achieved"
+
+    probe = capabilities.bind_enrolled_certificate_probe(probe, output, _ENROLL_PARAMETERS, ISSUED_AT.isoformat())
+    verdict = capabilities.verify_capability("adcs-esc-certificate-enroll", probe)
+    assert verdict.verdict == "partial"
+    assert "does not open" in verdict.reason
+    assert probe["enrolled_certificate_material_present"] is False
+
+
+_ENROLL_PARAMETERS = {
+    "domain": "lab.local", "account": "administrator", "ca_name": r"ca01.lab.local\LAB-CA",
+    "template": "VulnerableUser", "certificate_password": "step-secret",
+}
+
+
+def test_adcs_enrolled_certificate_bound_pfx_is_material_without_secret_in_probe():
+    pfx = issue_pfx("step-secret")
+    output = enrollment_output(pfx)
+    probe = capabilities.extract_adcs_enrolled_certificate_probe(
+        output, "administrator", "lab.local", "SAGE_CERT_ENROLL_PROOF_administrator_lab_local_13",
+    )
+    probe = capabilities.bind_enrolled_certificate_probe(probe, output, _ENROLL_PARAMETERS, ISSUED_AT.isoformat())
+    probe["callback_id"] = "13"
+    verdict = capabilities.verify_capability("adcs-esc-certificate-enroll", probe)
+
+    assert verdict.verdict == "achieved", verdict.reason
+    assert probe["certificate_upns"] == ["administrator@lab.local"]
+    assert probe["certificate_issuer_cn"] == "LAB-CA"
+    assert probe["certificate_template_name"] == "VulnerableUser"
+    assert len(probe["certificate_fingerprint_sha256"]) == 64
+    rendered = json.dumps(probe, default=str)
+    assert "step-secret" not in rendered
+    assert base64.b64encode(pfx).decode()[:40] not in rendered
+
+
+@pytest.mark.parametrize(
+    "pfx_kwargs, parameters, output_kwargs, reason",
+    [
+        ({"upn": "eddard@lab.local"}, {}, {}, "different UPN"),
+        ({"upn": "administrator@other.local"}, {}, {}, "different UPN"),
+        ({"ca_cn": "OTHER-CA"}, {}, {}, "different CA"),
+        ({"template": "User"}, {}, {}, "different template"),
+        ({"template": ""}, {}, {}, "no template identity"),
+        ({"include_key": False}, {}, {}, "no private key"),
+        ({}, {"certificate_password": "another"}, {}, "does not open"),
+        ({"issued_at": ISSUED_AT - timedelta(days=400)}, {}, {}, "outside its validity"),
+        ({}, {}, {"status": "FAILED"}, "did not report an issued certificate"),
+        ({}, {}, {"sha256": "0" * 64}, "reported SHA-256"),
+    ],
+)
+def test_adcs_enrolled_certificate_negative_bindings(pfx_kwargs, parameters, output_kwargs, reason):
+    pfx = issue_pfx("step-secret", **pfx_kwargs)
+    output = enrollment_output(pfx, **output_kwargs)
+    probe = capabilities.extract_adcs_enrolled_certificate_probe(output, "administrator", "lab.local", "")
+    probe = capabilities.bind_enrolled_certificate_probe(
+        probe, output, {**_ENROLL_PARAMETERS, **parameters}, ISSUED_AT.isoformat(),
     )
     probe["callback_id"] = "13"
     verdict = capabilities.verify_capability("adcs-esc-certificate-enroll", probe)
 
-    assert verdict.verdict == "achieved"
-    assert probe["enrolled_certificate_material_present"] is True
-    assert probe["enrolled_certificate_private_key_present"] is True
-    assert "PFX_BASE64" not in probe
+    assert verdict.verdict != "achieved"
+    assert reason in probe["certificate_binding_reason"]
+
+
+def test_adcs_enrolled_certificate_key_that_does_not_match_is_not_material(monkeypatch):
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.serialization import pkcs12
+
+    pfx = issue_pfx("step-secret")
+    _key, certificate, chain = pkcs12.load_key_and_certificates(pfx, b"step-secret")
+    other = ec.generate_private_key(ec.SECP256R1())
+    monkeypatch.setattr(pkcs12, "load_key_and_certificates", lambda *_args, **_kw: (other, certificate, chain))
+    probe = capabilities.bind_enrolled_certificate_probe({}, enrollment_output(pfx), _ENROLL_PARAMETERS, ISSUED_AT.isoformat())
+
+    assert probe["certificate_binding_verified"] is False
+    assert "does not match the certificate" in probe["certificate_binding_reason"]
+
+
+def test_adcs_enrolled_certificate_v2_template_binds_by_oid():
+    pfx = issue_pfx("step-secret", template_oid="1.3.6.1.4.1.311.21.8.1234.5678.9")
+    output = enrollment_output(pfx)
+    probe = capabilities.bind_enrolled_certificate_probe({}, output, _ENROLL_PARAMETERS, ISSUED_AT.isoformat())
+
+    assert probe["certificate_binding_verified"] is True
+    assert probe["certificate_template_oid"] == "1.3.6.1.4.1.311.21.8.1234.5678.9"
+    assert probe["certificate_template_name"] == ""
+
+
+def test_adcs_enrolled_certificate_real_policy_denial_is_not_material():
+    # Captured Certify output from a retained range run (Mythic archive 2026-10-30): a policy-module denial.
+    output = (
+        "[!] CA Response             : The submission failed: Denied by Policy Module\n"
+        "[!] Last status             : The permissions on the certificate template do not allow the current user "
+        "to enroll for this type of certificate. (Exception from HRESULT: 0x80094012)\n"
+        "[*] Request ID              : 3\n"
+    )
+    probe = capabilities.extract_adcs_enrolled_certificate_probe(output, "administrator", "lab.local", "")
+    probe = capabilities.bind_enrolled_certificate_probe(probe, output, _ENROLL_PARAMETERS, ISSUED_AT.isoformat())
+    probe["callback_id"] = "13"
+
+    verdict = capabilities.verify_capability("adcs-esc-certificate-enroll", probe)
+    assert verdict.verdict == "blocked"  # the denial reason survives; it is not reported as unbound material
+    assert "denied" in verdict.reason
+    assert probe["certificate_binding_verified"] is False
+
+
+def test_adcs_enrolled_certificate_legacy_windows_pfx_encryption_binds():
+    # .NET X509Certificate2.Export(Pfx) writes legacy PKCS#12 encryption (3DES/RC2 with SHA-1 MAC).
+    pfx = issue_pfx("step-secret", legacy=True)
+    probe = capabilities.bind_enrolled_certificate_probe({}, enrollment_output(pfx), _ENROLL_PARAMETERS, ISSUED_AT.isoformat())
+    assert probe["certificate_binding_verified"] is True, probe["certificate_binding_reason"]
+
+
+def test_adcs_enrolled_certificate_malformed_extension_is_not_proven(monkeypatch):
+    import effect_observations
+
+    def broken(*_args, **_kwargs):
+        raise ValueError("malformed SAN")
+
+    monkeypatch.setattr(effect_observations, "_bind_certificate", broken)
+    probe = capabilities.bind_enrolled_certificate_probe(
+        {}, enrollment_output(issue_pfx("step-secret")), _ENROLL_PARAMETERS, ISSUED_AT.isoformat())
+    assert probe["certificate_binding_verified"] is False
+    assert "could not be parsed" in probe["certificate_binding_reason"]
 
 
 def test_enrolled_certificate_unlocks_certificate_auth_without_ca_key_material():

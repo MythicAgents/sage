@@ -431,20 +431,35 @@ async def verify_task(client, task: dict, now: str, *, engagement_id: str, footh
 
     Credential material the output carries is imported into the Mythic credential store only with ``apply``.
     """
+    verified, _observations = await verify_and_observe_task(
+        client, task, now, engagement_id=engagement_id, foothold_by_callback=foothold_by_callback, apply=apply)
+    return verified
+
+
+async def verify_and_observe_task(client, task: dict, now: str, *, engagement_id: str, foothold_by_callback: dict,
+                                  apply: bool = False) -> tuple[VerifiedTask | None, list]:
+    """:func:`verify_task` plus the directory observations the same output supplies (a directory write's awaiting
+    join, a directory read), from one read of the task's output."""
     if _task_reconciler is None:
-        return None
+        return None, []
     display_id = task.get("display_id")
     output = await _fetch_task_output_text(client, int(display_id))
     context = _task_with_foothold_context(task, foothold_by_callback)
+    observations = list(_task_reconciler.directory_observations(context, output, now))
+    return await _verified_from_output(context, output, now, engagement_id=engagement_id, display_id=display_id,
+                                 client=client, apply=apply, observations=observations)
+
+
+async def _verified_from_output(context, output, now, *, engagement_id, display_id, client, apply, observations):
     record = _task_reconciler.reconcile_task(context, output, now, engagement_id=str(engagement_id or ""))
     if record is None:
         candidate = _task_reconciler.review_candidate(context, output)
         if candidate is None:
-            return None
+            return None, observations
         # No verifier credited the task: its observation carries lineage and no proof, so the row stays pending
         # unless the credential review proves material.
         technique, target, evidence = candidate
-        return VerifiedTask(technique, target, evidence, (), review_output=str(output or ""))
+        return VerifiedTask(technique, target, evidence, (), review_output=str(output or "")), observations
     evidence = dict(record.evidence)
     refs, notes = await _import_reconciled_credentials(client, record.credential_material, display_id, apply=apply)
     if refs:
@@ -452,7 +467,7 @@ async def verify_task(client, task: dict, now: str, *, engagement_id: str, footh
         evidence["credential_store_refs"] = refs
     reviewable = evidence.get("task_classification") == "postprocessing_error_with_output"
     return VerifiedTask(record.technique, record.target, evidence, tuple(notes),
-                        review_output=str(output or "") if reviewable else "")
+                        review_output=str(output or "") if reviewable else ""), observations
 
 
 def footholds_from_tasks(tasks, now: str) -> dict[str, object]:

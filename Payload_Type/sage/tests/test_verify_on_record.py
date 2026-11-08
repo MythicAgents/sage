@@ -439,13 +439,14 @@ def test_verify_grant_denied_failed():
     assert es.verify_effect("dcsync-rights-grant", GRANT_DOM, ca.extract_grant_probe(GRANT_DENIED)) == "failed"
 
 
-def test_record_grant_success_achieved(mt):
+def test_record_grant_success_is_a_pending_candidate(mt):
+    # A grant's own success message is a candidate: only a later read of the object proves the rights.
     mt._pending_engagement_hop = ("dcsync-rights-grant", GRANT_DOM, TS)
     _record_success(mt, GRANT_OK)
     hop = _last(mt)
-    assert hop.technique == "dcsync-rights-grant" and hop.status == "achieved"
-    assert hop.evidence.get("verify_verdict") == "achieved"
-    assert hop.evidence.get("artifact_present") is True
+    assert hop.technique == "dcsync-rights-grant" and hop.status == "pending"
+    assert hop.evidence.get("verify_verdict") == "partial"
+    assert hop.evidence.get("artifact_present") is False
 
 
 def test_record_grant_denied_failed_not_achieved(mt):
@@ -463,15 +464,27 @@ def test_record_grant_empty_failed(mt):
     assert _last_attempt(mt).verdict == "failed"
 
 
-def test_verified_achieved_grant_not_downgraded(mt):
+def test_rbcd_write_is_a_pending_candidate_and_a_failed_write_records_nothing(mt):
+    mt._pending_engagement_hop = ("rbcd-standin", "castelblack", TS)
+    _record_success(mt, "[+] SID added to msDS-AllowedToActOnBehalfOfOtherIdentity")
+    hop = _last(mt)
+    assert (hop.technique, hop.status) == ("rbcd-standin", "pending")
+    assert hop.evidence.get("artifact_present") is False
+
+    mt._pending_engagement_hop = ("rbcd-standin", "winterfell", TS)
+    _record_success(mt, "")
+    assert not [h for h in mt._engagement_hops if h.target == "winterfell"]
+
+
+def test_pending_grant_candidate_is_not_promoted_or_removed_by_a_denied_retry(mt):
     mt._pending_engagement_hop = ("dcsync-rights-grant", GRANT_DOM, TS)
     _record_success(mt, GRANT_OK)
-    assert _last(mt).status == "achieved"
-    # A later denied/empty re-probe in the same instance must keep the verified achieved grant.
+    assert _last(mt).status == "pending"
+    # A later denied re-probe is a request attempt; it neither achieves nor drops the candidate row.
     mt._pending_engagement_hop = ("dcsync-rights-grant", GRANT_DOM, "2026-06-08T01:00:00+00:00")
     _record_success(mt, GRANT_DENIED)
     hops = [h for h in mt._engagement_hops if h.technique == "dcsync-rights-grant" and h.target == GRANT_DOM]
-    assert len(hops) == 1 and hops[0].status == "achieved"
+    assert len(hops) == 1 and hops[0].status == "pending"
 
 
 # ---------------------------------------------------------------------------

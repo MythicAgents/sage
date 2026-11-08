@@ -162,6 +162,11 @@ def _tokens(text: str) -> list[str]:
     return expanded
 
 
+def flag_value(params: Any, flag: str) -> str:
+    """The value of ``flag`` (``--flag value``, ``/flag:value``, or a JSON key) in a task's parameters, '' if absent."""
+    return _flag_value(_parse_params(params), flag)
+
+
 def _flag_value(parsed: dict[str, Any], flag: str) -> str:
     flag_cf = flag.casefold().lstrip("-/")
 

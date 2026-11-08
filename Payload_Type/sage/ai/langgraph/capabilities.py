@@ -1265,13 +1265,16 @@ def verify_adcs_esc_certificate_enroll(probe_result: dict[str, Any]) -> Capabili
             "enroll_marker_seen",
         ),
     )
-    if material_present and private_key_present and enrollment_completed and callback_id and account and domain:
+    # Markers and a well-formed blob are not material: the PFX must have been opened and bound by code
+    # (bind_enrolled_certificate_probe) to the account's UPN, the issuing CA, the template and a matching key.
+    bound = probe_result.get("certificate_binding_verified") is True
+    if bound and material_present and private_key_present and enrollment_completed and callback_id and account and domain:
         return CapabilityVerification(
             "achieved",
             "ADCS enrollment produced account certificate material",
             _selected_probe(probe_result),
         )
-    if material_present and private_key_present:
+    if material_present and private_key_present and not probe_result.get("certificate_binding_reason"):
         return CapabilityVerification(
             "partial",
             "account certificate material is present, but callback/account/domain/enrollment proof is incomplete",
@@ -1293,6 +1296,12 @@ def verify_adcs_esc_certificate_enroll(probe_result: dict[str, Any]) -> Capabili
     )
     if blocker:
         return CapabilityVerification("blocked", blocker.replace("_", " "), _selected_probe(probe_result))
+    if probe_result.get("certificate_binding_reason") and not bound:
+        return CapabilityVerification(
+            "partial",
+            "certificate material is not bound: " + _text(probe_result.get("certificate_binding_reason")),
+            _selected_probe(probe_result),
+        )
 
     if _any_true(probe_result, ("certificate_request_submitted", "template_found", "ca_reachable")):
         return CapabilityVerification(
@@ -2590,6 +2599,152 @@ def extract_adcs_enrolled_certificate_probe(
         "access_denied": _has_any(low, ("access denied", "access is denied", "0x00000005")),
         "logon_failure": _has_any(low, ("logon failure", "unknown user name or bad password", "1326")),
     }
+
+
+def capability_step_parameters(action: CapabilityAction, inputs: dict[str, Any] | None, operation: str) -> dict[str, Any]:
+    """The parameters of ``operation``'s step in the plan this action and these inputs build; {} without one.
+
+    The plan is deterministic, so this is what the transaction's step used, including any artifact secret. Callers
+    keep the result in memory and never log or persist it.
+    """
+    plan = build_capability_execution_plan(action, inputs if isinstance(inputs, dict) else {})
+    for step in list(getattr(plan, "steps", []) or []):
+        if _normalize(getattr(step, "operation", "")) == _normalize(operation):
+            parameters = getattr(step, "parameters", {})
+            return dict(parameters) if isinstance(parameters, dict) else {}
+    return {}
+
+
+def _effect_subject(action: CapabilityAction, prefix: str) -> str:
+    """The subject of the action's ``prefix:<subject>`` effect, '' without one."""
+    for effect in list(getattr(action, "effects", []) or []):
+        name, sep, subject = _normalize(effect).partition(":")
+        if sep and name == prefix and subject:
+            return subject
+    return ""
+
+
+def grant_read_binding(action: CapabilityAction, inputs: dict[str, Any] | None) -> dict[str, str]:
+    """What the grant capability's final ACL read must show to prove its effect.
+
+    The object is the domain head of the domain the recorded effect names (``ds-replication-rights:<domain>``), never
+    a DN taken from runtime inputs: replication rights on another domain or on an OU do not give that domain's DCSync.
+    The principal is the one this transaction's read step names, which the transaction granted.
+    """
+    domain = _effect_subject(action, "ds-replication-rights")
+    step = capability_step_parameters(action, inputs, "ldap-acl-read")
+    return {"target_dn": _domain_dn(domain) if domain else "", "principal": _text(step.get("principal"))}
+
+
+def enrollment_binding_parameters(action: CapabilityAction, inputs: dict[str, Any] | None) -> dict[str, Any]:
+    """The enrollment step's own parameters (CA, template, certificate password) with the account and domain the
+    recorded effect names (``adcs-enrolled-certificate:<account>@<domain>``), so a certificate for another account
+    cannot prove this row. In memory only."""
+    step = capability_step_parameters(action, inputs, "adcs-esc-certificate-enroll")
+    account, _, domain = _effect_subject(action, "adcs-enrolled-certificate").partition("@")
+    step["account"], step["domain"] = account, domain
+    return step
+
+
+def _effect_observations():
+    try:
+        from . import effect_observations
+    except ImportError:  # pragma: no cover - flat import for tests that put ai/langgraph on sys.path
+        import effect_observations  # type: ignore
+    return effect_observations
+
+
+def extract_bound_directory_rights_probe(output: Any = None, *, target_dn: str = "", principal: str = "") -> dict[str, Any]:
+    """The grant capability's final ACL read, verified against the exact object and principal its transaction
+    granted.
+
+    ``ds_replication_rights`` holds only when the read names ``target_dn`` and an allow ACE for ``principal`` grants
+    both replication rights with no deny taking either away. Another trustee's replication ACEs (every domain object
+    carries them for its domain controllers), a partial or failed read, or the write's own success message are not
+    proof. The principal string is the one this transaction built and granted, so it is already bound to the domain.
+    """
+    observations = _effect_observations()
+    read = observations.parse_acl_read(_task_output_text(output))
+    verdict = observations.verify_acl_rights(
+        read,
+        object_dn=target_dn,
+        principal=principal,
+        rights=observations.REPLICATION_RIGHTS + (observations.DS_REPLICATION_GET_CHANGES_FILTERED,),
+    )
+    granted = set(verdict.granted)
+    replication = all(right in granted for right in observations.REPLICATION_RIGHTS) and not verdict.denied
+    low = _task_output_text(output).casefold()
+    return {
+        "ds_replication_rights": replication,
+        "ace_present": bool(granted) and not verdict.denied,
+        "get_changes": observations.DS_REPLICATION_GET_CHANGES in granted,
+        "get_changes_all": observations.DS_REPLICATION_GET_CHANGES_ALL in granted,
+        "get_changes_in_filtered_set": observations.DS_REPLICATION_GET_CHANGES_FILTERED in granted,
+        "access_denied": _has_any(low, ("access is denied", "access denied", "0x00000005")),
+        "acl_verifier": observations.ACL_VERIFIER,
+        "acl_binding_reason": "" if replication else (verdict.reason or "replication rights are not both granted"),
+        "acl_object_dn": verdict.values.get("object_dn", ""),
+        "acl_trustee": verdict.values.get("trustee", ""),
+    }
+
+
+def bind_enrolled_certificate_probe(
+    probe: dict[str, Any], output: Any, parameters: dict[str, Any], observed_at: Any = "",
+) -> dict[str, Any]:
+    """``probe`` with the enrollment's certificate bindings from the PFX in the task's own output.
+
+    ``parameters`` are the enrollment step's own (domain, account, CA, template, certificate password). The PFX must
+    open with that password and bind fingerprint, UPN, issuing CA and template, with a matching private key. Only
+    public bindings enter the probe; markers and a well-formed blob alone no longer establish material.
+    """
+    out = dict(probe)
+    text = _task_output_text(output)
+    status = (_first_output_field(text, "CERT_ENROLL_STATUS") or "").casefold()
+    blob = re.sub(r"\s+", "", _first_output_field(text, "PFX_BASE64"))
+    reason = ""
+    binding = None
+    if status != "ok":
+        reason = "the enrollment did not report an issued certificate"
+    elif not blob:
+        reason = "the enrollment output carries no PFX"
+    else:
+        try:
+            pfx = base64.b64decode(blob, validate=True)
+        except Exception:
+            pfx = b""
+        claimed = _first_output_field(text, "PFX_SHA256").casefold()
+        if not pfx:
+            reason = "the PFX is not valid base64"
+        elif claimed and claimed != hashlib.sha256(pfx).hexdigest():
+            reason = "the PFX does not match its reported SHA-256"
+        else:
+            binding = _effect_observations().verify_enrolled_certificate(
+                pfx,
+                _text(parameters.get("certificate_password")),
+                account=_text(parameters.get("account")),
+                domain=_text(parameters.get("domain")),
+                ca_name=_text(parameters.get("ca_name")),
+                template=_text(parameters.get("template")),
+                observed_at=observed_at,
+            )
+            reason = binding.reason
+    bound = bool(binding is not None and binding.bound)
+    values = dict(binding.values) if binding is not None else {}
+    out.update({
+        "certificate_binding_verified": bound,
+        "certificate_binding_reason": reason,
+        "certificate_verifier": _effect_observations().CERTIFICATE_VERIFIER,
+        "certificate_fingerprint_sha256": values.get("fingerprint_sha256", ""),
+        "certificate_upns": list(values.get("upns") or []),
+        "certificate_issuer_cn": values.get("issuer_cn", ""),
+        "certificate_template_name": values.get("template_name", ""),
+        "certificate_template_oid": values.get("template_oid", ""),
+        "certificate_not_after": values.get("not_after", ""),
+        "enrolled_certificate_material_present": bound,
+        "enrolled_certificate_private_key_present": bound,
+        "certificate_enrollment_completed": bound,
+    })
+    return out
 
 
 def extract_adcs_certificate_auth_probe(

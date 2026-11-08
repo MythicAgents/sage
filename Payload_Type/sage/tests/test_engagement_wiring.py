@@ -13,6 +13,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+
+from tests.certificate_fixtures import enrollment_output, issue_pfx  # noqa: E402
 from tests.esl_fixtures import AGENT_PROCESSED, observe_task
 
 
@@ -5575,24 +5577,19 @@ def test_execute_capability_apollo_adcs_ca_export_uses_token_backed_wmiexecute_r
     ]
 
 
-def test_execute_capability_adcs_esc_enroll_records_certificate_effect():
+def _adcs_enroll_run(output_for_password, extra_inputs=None):
     mt = _make_tools()
     seed_ledger(mt, hops=[
         _proof_hop("adcs-ca-key-export-blocked:ca01@lab.local", 7401, callback_id="13"),
     ])
     mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
     mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
-    pfx = base64.b64encode(b"0" + b"B" * 512).decode("ascii")
-    output = "\n".join([
-        "SAGE_CERT_ENROLL_PROOF_administrator_lab_local_13",
-        "CERT_ENROLL_STATUS=OK",
-        "CERT_ENROLL_TEMPLATE=VulnerableUser",
-        r"CERT_ENROLL_CA=ca01.lab.local\LAB-CA",
-        r"CERT_PFX_PATH=C:\Windows\Temp\sage_forged_cert_administrator_lab_local_13.pfx",
-        f"PFX_BASE64={pfx}",
-    ])
+    inputs = {"ca_name": r"ca01.lab.local\LAB-CA", "template": "VulnerableUser", "timeout": 5, **(extra_inputs or {})}
+    # The step's own default password, rebuilt in memory exactly as the executor does.
+    action = capabilities._adcs_esc_certificate_enroll_action("lab.local", "ca01", "administrator", "13")
+    password = capabilities.capability_step_parameters(action, inputs, "adcs-esc-certificate-enroll")["certificate_password"]
+    output = output_for_password(password)
     calls = {"issue": 0}
-
     with _split_issue(output, calls, display_id=7402):
         result = json.loads(asyncio.run(mt.execute_capability(
             {
@@ -5602,12 +5599,14 @@ def test_execute_capability_adcs_esc_enroll_records_certificate_effect():
                 "ca_host": "ca01",
                 "callback_id": "13",
             },
-            {
-                "ca_name": r"ca01.lab.local\LAB-CA",
-                "template": "VulnerableUser",
-                "timeout": 5,
-            },
+            inputs,
         )))
+    return mt, result, calls, password, output
+
+
+def test_execute_capability_adcs_esc_enroll_records_certificate_effect():
+    mt, result, calls, password, output = _adcs_enroll_run(
+        lambda password: enrollment_output(issue_pfx(password, issued_at=datetime.now(timezone.utc))))
 
     assert result["ok"] is True, result
     assert result["verdict"] == "achieved"
@@ -5616,6 +5615,64 @@ def test_execute_capability_adcs_esc_enroll_records_certificate_effect():
         "adcs-enrolled-certificate:administrator@lab.local",
     ]
     assert result["issued"][0]["verify_verdict"] == "achieved"
+    hop = next(h for h in mt._ledger_view().hops if h.effect == "adcs-enrolled-certificate:administrator@lab.local")
+    assert hop.status == "achieved"
+    import sqlite3
+
+    with sqlite3.connect(mt._ledger_store().path) as connection:
+        stored = json.dumps([list(row) for table in ("esl_rows", "esl_events") for row in
+                             connection.execute(f"SELECT * FROM {table}").fetchall()], default=str)
+    persisted = stored + json.dumps([vars(h) for h in mt._ledger_view().hops], default=str) + json.dumps(result, default=str)
+    assert "adcs-enrolled-certificate:administrator@lab.local" in stored
+    blob = output.split("PFX_BASE64=", 1)[1]
+    assert password not in persisted
+    assert blob[:40] not in persisted
+
+
+def test_execute_capability_adcs_esc_enroll_row_names_the_certificate_subject():
+    # Inputs that pick another account build that account's action: the row and the certificate name the same UPN.
+    mt, result, _calls, _password, _output = _adcs_enroll_run(
+        lambda password: enrollment_output(issue_pfx(
+            password, upn="eddard.stark@lab.local", issued_at=datetime.now(timezone.utc))),
+        extra_inputs={"account": "eddard.stark"},
+    )
+    achieved = {h.effect for h in mt._ledger_view().hops if h.status == "achieved"}
+
+    assert result["recorded_effects"] == ["adcs-enrolled-certificate:eddard.stark@lab.local"]
+    assert "adcs-enrolled-certificate:administrator@lab.local" not in achieved
+
+
+def test_adcs_enroll_verify_binds_the_effect_subject_not_input_account():
+    # An action recording administrator's row, with inputs steering the step to eddard: eddard's certificate is not
+    # administrator's material.
+    mt = _make_tools()
+    action = capabilities._adcs_esc_certificate_enroll_action("lab.local", "ca01", "administrator", "13")
+    inputs = {"ca_name": r"ca01.lab.local\LAB-CA", "template": "VulnerableUser", "account": "eddard.stark"}
+    password = capabilities.capability_step_parameters(action, inputs, "adcs-esc-certificate-enroll")["certificate_password"]
+    output = enrollment_output(issue_pfx(password, upn="eddard.stark@lab.local", issued_at=datetime.now(timezone.utc)))
+    command = {"command": "powerpick", "operation": "adcs-esc-certificate-enroll",
+               "expected_probe": "extract_adcs_enrolled_certificate_probe", "produces": [], "consumes": [], "purpose": "enroll"}
+    probe, verification = mt._capability_executor_verify_output(action, inputs, 13, output, command, capabilities)
+
+    assert verification.verdict != "achieved"
+    assert "different UPN" in probe["certificate_binding_reason"]
+
+
+def test_execute_capability_adcs_esc_enroll_marker_only_output_records_nothing():
+    marker_only = base64.b64encode(b"0" + b"B" * 512).decode("ascii")
+    mt, result, calls, _password, _output = _adcs_enroll_run(lambda _password: "\n".join([
+        "SAGE_CERT_ENROLL_PROOF_administrator_lab_local_13",
+        "CERT_ENROLL_STATUS=OK",
+        "CERT_ENROLL_TEMPLATE=VulnerableUser",
+        r"CERT_ENROLL_CA=ca01.lab.local\LAB-CA",
+        f"PFX_BASE64={marker_only}",
+    ]))
+
+    assert result["verdict"] != "achieved"
+    assert calls["issue"] >= 1
+    assert "adcs-enrolled-certificate:administrator@lab.local" not in {
+        h.effect for h in mt._ledger_view().hops if h.status == "achieved"
+    }
 
 
 def test_execute_capability_adcs_ca_export_returns_key_not_exportable_blocker(monkeypatch):
@@ -6281,7 +6338,7 @@ def test_grant_directory_rights_executor_verifies_only_final_acl_read_probe():
 
     setup_probe, setup_verification = mt._capability_executor_verify_output(
         action,
-        {},
+        {"principal": "user1"},
         9,
         "[+] Set object access rules\n    |_ Success, added dcsync privileges to object for RANGE\\user1",
         setup_cmd,
@@ -6291,7 +6348,7 @@ def test_grant_directory_rights_executor_verifies_only_final_acl_read_probe():
     assert setup_verification is None
     assert mt._capability_executor_is_final_probe(setup_cmd) is False
 
-    acl_output = """
+    acl_output = _STANDIN_RANGE_HEADER + """
 [+] Identity --> RANGE\\user1
     |_ Type       : Allow
     |_ Permission : ExtendedRight
@@ -6304,7 +6361,7 @@ def test_grant_directory_rights_executor_verifies_only_final_acl_read_probe():
 """
     probe, verification = mt._capability_executor_verify_output(
         action,
-        {},
+        {"principal": "user1"},
         9,
         acl_output,
         acl_cmd,
@@ -6317,6 +6374,126 @@ def test_grant_directory_rights_executor_verifies_only_final_acl_read_probe():
     assert probe["ds_replication_rights"] is True
     assert probe["callback_id"] == "9"
     assert verification.verdict == "achieved"
+
+
+# StandIn's read header, as the retained range captures print it (Mythic archive 2026-11-02 and 2026-11-04).
+_STANDIN_RANGE_HEADER = """
+[?] Using DC : dc01.range.local
+[?] Object   : DC=range
+    Path     : LDAP://DC=range,DC=local
+
+[+] Object properties
+    |_ Owner : BUILTIN\\Administrators
+    |_ Group : BUILTIN\\Administrators
+"""
+
+
+def _standin_rule(trustee, kind="Allow", permission="ExtendedRight", obj=""):
+    lines = [f"[+] Identity --> {trustee}", f"    |_ Type       : {kind}", f"    |_ Permission : {permission}"]
+    if obj:
+        lines.append(f"    |_ Object     : {obj}")
+    return "\n".join(lines) + "\n"
+
+
+_BOTH = ("DS-Replication-Get-Changes", "DS-Replication-Get-Changes-All")
+
+
+@pytest.mark.parametrize(
+    "output, reason",
+    [
+        # Every domain object carries replication ACEs for its domain controllers: another trustee's rights.
+        (_STANDIN_RANGE_HEADER + "".join(_standin_rule("RANGE\\Domain Controllers", obj=o) for o in _BOTH),
+         "no allow ACE for the principal"),
+        (_STANDIN_RANGE_HEADER.replace("DC=range,DC=local", "DC=other,DC=local")
+         + "".join(_standin_rule("RANGE\\user1", obj=o) for o in _BOTH), "different object"),
+        (_STANDIN_RANGE_HEADER + _standin_rule("RANGE\\user1", obj=_BOTH[0]), "no allow ACE for the principal grants"),
+        (_STANDIN_RANGE_HEADER + "".join(_standin_rule("RANGE\\user1", obj=o) for o in _BOTH)
+         + _standin_rule("Everyone", kind="Deny", obj=_BOTH[1]), "deny ACE"),
+        (_STANDIN_RANGE_HEADER + "".join(_standin_rule("RANGE\\user1", permission="ReadProperty", obj=o) for o in _BOTH),
+         "no allow ACE for the principal grants"),
+        ("".join(_standin_rule("RANGE\\user1", obj=o) for o in _BOTH), "does not name its object"),
+        ("[+] Set object access rules\n    |_ Success, added dcsync privileges to object for RANGE\\user1",
+         "a StandIn write"),
+        # The captured StandIn grant failure from the range (Mythic archive 2026-11-04), shown as if it were a read.
+        (_STANDIN_RANGE_HEADER + "\n[+] Set object access rules\n[!] Failed to set object access properties..\n"
+         "    |_ Access is denied.\n", "a StandIn write"),
+        ('{"object": {"dn": "DC=range,DC=local"}, "ds_replication_rights": true}', "no DACL ACE records"),
+    ],
+)
+def test_grant_directory_rights_final_read_rejects_unbound_acl(output, reason):
+    mt = _make_tools()
+    action = capabilities.CapabilityAction(
+        name="grant-directory-rights",
+        target="domain=range.local;source=gpo-system-exec:srv02-policy",
+        preconditions=["system-exec:gpo:srv02-policy@range.local"],
+        effects=["ds-replication-rights:range.local"],
+        intent={"capability": "grant-directory-rights", "domain": "range.local"},
+    )
+    acl_cmd = {
+        "command": "execute_assembly", "operation": "ldap-acl-read", "expected_probe": "extract_directory_rights_probe",
+        "produces": [], "consumes": ["event:group_policy_refresh"],
+        "purpose": "read target domain ACL for DS-Replication ACE verification",
+    }
+    probe, verification = mt._capability_executor_verify_output(
+        action, {"principal": "user1"}, 9, output, acl_cmd, capabilities,
+    )
+
+    assert probe["ds_replication_rights"] is False
+    assert verification.verdict != "achieved"
+    assert reason in probe["acl_binding_reason"]
+
+
+@pytest.mark.parametrize("effect_domain, target_dn, read_dn, principal", [
+    # a parent-domain read cannot prove the child domain's rights, even when the inputs name the parent
+    ("child.range.local", "DC=range,DC=local", "DC=range,DC=local", "CHILD\\user1"),
+    # replication rights on an OU are not the domain head's
+    ("range.local", "OU=Staff,DC=range,DC=local", "OU=Staff,DC=range,DC=local", "RANGE\\user1"),
+])
+def test_grant_directory_rights_final_read_binds_the_effect_domain_not_input_dn(effect_domain, target_dn, read_dn, principal):
+    mt = _make_tools()
+    action = capabilities.CapabilityAction(
+        name="grant-directory-rights", target=f"domain={effect_domain}", preconditions=[],
+        effects=[f"ds-replication-rights:{effect_domain}"],
+        intent={"capability": "grant-directory-rights", "domain": effect_domain},
+    )
+    acl_cmd = {"command": "execute_assembly", "operation": "ldap-acl-read",
+               "expected_probe": "extract_directory_rights_probe", "produces": [], "consumes": [], "purpose": "read"}
+    header = _STANDIN_RANGE_HEADER.replace("LDAP://DC=range,DC=local", f"LDAP://{read_dn}")
+    output = header + "".join(_standin_rule(principal, obj=o) for o in _BOTH)
+    probe, verification = mt._capability_executor_verify_output(
+        action, {"principal": "user1", "target_dn": target_dn}, 9, output, acl_cmd, capabilities,
+    )
+
+    assert verification.verdict != "achieved"
+    assert "different object" in probe["acl_binding_reason"]
+
+
+def test_grant_directory_rights_final_read_accepts_structured_json_by_exact_trustee():
+    mt = _make_tools()
+    action = capabilities.CapabilityAction(
+        name="grant-directory-rights", target="domain=range.local", preconditions=[],
+        effects=["ds-replication-rights:range.local"],
+        intent={"capability": "grant-directory-rights", "domain": "range.local"},
+    )
+    acl_cmd = {"command": "execute_assembly", "operation": "ldap-acl-read",
+               "expected_probe": "extract_directory_rights_probe", "produces": [], "consumes": [], "purpose": "read"}
+    document = {"object": {"dn": "DC=range,DC=local", "sid": "S-1-5-21-1-2-3"}, "dacl": {"complete": True, "aces": [
+        {"trustee": "RANGE\\user1", "trustee_sid": "S-1-5-21-1-2-3-1104", "type": "allow", "rights": 0x100,
+         "object_type": "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2"},
+        {"trustee": "RANGE\\user1", "trustee_sid": "S-1-5-21-1-2-3-1104", "type": "allow", "rights": 0x100,
+         "object_type": "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2"},
+    ]}}
+    probe, verification = mt._capability_executor_verify_output(
+        action, {"principal": "user1"}, 9, json.dumps(document), acl_cmd, capabilities,
+    )
+    assert verification.verdict == "achieved"
+
+    document["dacl"]["complete"] = False
+    probe, verification = mt._capability_executor_verify_output(
+        action, {"principal": "user1"}, 9, json.dumps(document), acl_cmd, capabilities,
+    )
+    assert verification.verdict != "achieved"
+    assert "complete DACL" in probe["acl_binding_reason"]
 
 
 def test_cross_domain_current_tgt_import_grants_rights_and_precheck_honors_it(monkeypatch):

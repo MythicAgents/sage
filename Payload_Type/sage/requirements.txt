@@ -49,3 +49,6 @@ python-dotenv==1.2.2
 # same defect class as the two entries above, so it is declared rather than borrowed. The module
 # degrades to a null span if the import fails, but a shipped image should not rely on that path.
 opentelemetry-api==1.45.1
+# Direct runtime import (`ai/langgraph/effect_observations.py` opens an enrollment task's PFX to bind its
+# certificate). It arrives transitively today; declared for the same reason as the entries above.
+cryptography==50.0.2

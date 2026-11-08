@@ -797,6 +797,7 @@ class EngagementStore:
 
     def observations(
         self, binding: OperationBinding, *, kind: str = "", join_state: str = "", limit: int | None = None,
+        subjects: Iterable[str] | None = None,
     ) -> list[dict]:
         """Indexed source observations of the operation, oldest first (read-only)."""
         with self._transaction(write=False) as connection:
@@ -813,6 +814,12 @@ class EngagementStore:
             if join_state:
                 clauses.append("join_state=?")
                 params.append(join_state)
+            if subjects is not None:
+                wanted = sorted({str(item) for item in subjects if item})
+                if not wanted:
+                    return []
+                clauses.append(f"subject IN ({','.join('?' for _ in wanted)})")
+                params.extend(wanted)
             query = f"SELECT * FROM esl_observations WHERE {' AND '.join(clauses)} ORDER BY id"
             if limit is not None:
                 query += " LIMIT ?"

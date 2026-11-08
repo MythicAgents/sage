@@ -328,6 +328,16 @@ def extract_grant_probe(output) -> dict:
     }
 
 
+def grant_write_reported(output) -> bool:
+    """Whether a rights-grant write reported success with no failure signature (StandIn prints ``|_ Success, ...``
+    under ``Set object access rules``). A reported write is only a candidate: a later read of the object proves it."""
+    text = output if isinstance(output, str) else ("" if output is None else str(output))
+    low = text.lower()
+    if not low.strip() or any(tok in low for tok in _GRANT_FAILURE_TOKENS):
+        return False
+    return any(tok in low for tok in _GRANT_SUCCESS_TOKENS) or re.search(r"\|_\s*success\b", low) is not None
+
+
 # Ticket techniques must never use the legacy "no known failure string means achieved" path. Forging or
 # injecting a ticket is only setup. The durable effect (da:<domain>) is achieved only when the ticket is
 # proven usable by a post-action access check or group-membership proof.
