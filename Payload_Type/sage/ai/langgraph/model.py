@@ -64,6 +64,7 @@ from .turn_authority import (
 from .request_events import RequestEventLedger, stable_event_id
 from .decision_record import seal_request_decision_record
 from .operator_error import operator_error_text
+from . import engagement_ledger
 from . import worker_outcome as _worker_outcome
 from . import handoff_brief as _handoff_brief
 from . import step_bounds as _step_bounds
@@ -2465,70 +2466,126 @@ def _runtime_request_attempts(mythic_client) -> tuple:
     return tuple(view() or ()) if callable(view) else ()
 
 
-# Imperative directive paired with the observed-state block. A bare status LIST is informational; the
-# operator can still favor an overlay checklist that lists an already-achieved hop. This makes the
-# instruction explicit ("ACHIEVED = DONE, do NOT re-issue"). Shared by the per-turn middleware injection
-# and the continue-loop nudge so both speak with one voice.
-_ENGAGEMENT_STATE_DIRECTIVE = (
-    "The ENGAGEMENT STATE above is authoritative. Any hop whose effect is listed as ACHIEVED is "
-    "DONE — do NOT re-issue it (the gate will only SKIP it, wasting steps). If a hop is achieved "
-    "but its expected follow-on did not occur (e.g. no new callback returned), that is a SEPARATE "
-    "blocker — report it and move on; do NOT re-run the achieved primitive. Advance to the next "
-    "viable hop from the observed state, or call respond_to_user with the blocker if no traversable "
-    "hop remains."
-)
+# Synthetic messages that carried a ledger snapshot into model history before Phase 5. They are filtered from the
+# ephemeral provider input (never rewritten in history), so an old checkpointed copy cannot pose as the current view.
+_HISTORICAL_LEDGER_VIEW_NUDGES = frozenset({"operator_ledger_view"})
+_LEGACY_ENGAGEMENT_STATE_HEADER = "=== ENGAGEMENT STATE"
+_AUTONOMOUS_CONTINUE_MARKER = "[autonomous-continue]"
 
 
-class _EngagementStateMiddleware(AgentMiddleware):
-    """Inject a FRESH observed engagement-state block into the operator's per-turn model context on
-    EVERY model call (flag-gated, autonomous-only, fail-open).
+def _is_generated_ledger_view(message: Any) -> bool:
+    kwargs = getattr(message, "additional_kwargs", None) or {}
+    return isinstance(message, HumanMessage) and (
+        engagement_ledger.MODEL_VIEW_TAG in kwargs
+        or kwargs.get("_synthetic_nudge") in _HISTORICAL_LEDGER_VIEW_NUDGES
+    )
 
-    This is the per-turn fix for the mis-wired continue-loop-only injection: the 156x re-proposal of
-    already-achieved hops happens INSIDE a single react run (many model calls, each ending in a tool
-    call), so the `=== ENGAGEMENT STATE` block must be visible at each model call — not only when the
-    operator ends a turn plainly (the rare path the continue-loop nudge covered). Injection is via
-    `request.override(messages=...)`, which is EPHEMERAL for this call only — it is NOT a graph-state
-    update, so the block never accumulates (otherwise 156 calls would append 156 state messages).
+
+def _without_historical_ledger_views(messages: list) -> list:
+    """Provider input minus recognized Sage-generated ledger snapshots: earlier fresh views, pre-Phase-5 operator
+    views, and the snapshot prefix of a pre-Phase-5 autonomous-continue nudge (its control text is kept). Ordinary
+    user and model discussion of earlier rows is untouched."""
+    kept = []
+    for message in messages:
+        if _is_generated_ledger_view(message):
+            continue
+        kwargs = getattr(message, "additional_kwargs", None) or {}
+        content = getattr(message, "content", None)
+        if (
+            isinstance(message, HumanMessage)
+            and kwargs.get("_synthetic_nudge") == "autonomous_operator_continue"
+            and isinstance(content, str)
+            and content.startswith(_LEGACY_ENGAGEMENT_STATE_HEADER)
+            and _AUTONOMOUS_CONTINUE_MARKER in content
+        ):
+            message = message.model_copy(update={"content": content[content.index(_AUTONOMOUS_CONTINUE_MARKER):]})
+        kept.append(message)
+    return kept
+
+
+# Graph roles that receive the fresh ledger view and the two ledger tools. Watcher and the other workers do not.
+_LEDGER_VIEW_ROLES = frozenset({"Supervisor", "Mythic_Operator"})
+# Sage-authored assistant messages that frame the delegated instruction right after them.
+_INSTRUCTION_CONTEXT_KWARGS = frozenset({"_assisted_assignment_context", "_step_scope_context"})
+
+
+def _request_tool_names(request: Any) -> set[str]:
+    return {name for name in (_offered_tool_name(item) for item in getattr(request, "tools", None) or []) if name}
+
+
+def _with_ledger_view(messages: list, view: HumanMessage) -> list:
+    """Place the view at the tail without becoming the final turn when the input ends on an operator/user message
+    or an assistant message: it goes immediately before that message, so the operator's request (or the provider
+    continuation the turn-authority middleware adds after an assistant message) stays last. After a tool result it
+    is appended; a tool call and its result are never separated. A trailing provider continuation (which the
+    turn-authority middleware strips and re-adds after an assistant message) is looked past."""
+    end = len(messages)
+    while end and isinstance(messages[end - 1], HumanMessage) and (
+        (messages[end - 1].additional_kwargs or {}).get("_synthetic_nudge") == "provider_requires_user_turn"
+        and not (messages[end - 1].additional_kwargs or {}).get("_operator_input")
+    ):
+        end -= 1
+    index = end
+    if index and isinstance(messages[index - 1], AIMessage):
+        # Before the trailing run of plain assistant messages (a specialist return: header, answer, step outcome).
+        while index and isinstance(messages[index - 1], AIMessage) and not messages[index - 1].tool_calls:
+            index -= 1
+    else:
+        # Before the final user-role run and the Sage context attached to it (assignment, step scope, consult), so
+        # those blocks stay adjacent to the instruction they frame.
+        while index and (isinstance(messages[index - 1], HumanMessage) or (
+            isinstance(messages[index - 1], AIMessage) and not messages[index - 1].tool_calls
+            and _INSTRUCTION_CONTEXT_KWARGS & set(messages[index - 1].additional_kwargs or {})
+        )):
+            index -= 1
+    return [*messages[:index], view, *messages[index:]]
+
+
+class _EngagementLedgerViewMiddleware(AgentMiddleware):
+    """Add exactly one FRESH engagement-ledger view to every Supervisor / Mythic_Operator model request.
+
+    Installed innermost (after context editing and summarization), in every mode, so the block reaches the provider
+    untrimmed. The view is built from one snapshot read immediately before the request is assembled; a concurrent
+    commit after that read belongs to the next call. Injection is ``request.override`` only: the block never enters
+    graph state or a checkpoint. A rendering failure yields a bounded UNAVAILABLE block, never an empty ledger. The
+    downstream handler is called exactly once and its exception propagates: no retry without the view.
     """
-    def __init__(self, model: "Model"):
+
+    def __init__(self, model: "Model", *, agent_name: str):
         super().__init__()
         self._model = model
-        self._last_rendered = None  # for change-only logging (proof-of-injection without log spam)
+        self._agent_name = agent_name
+        self._last_revision: Any = object()  # change-only logging
 
     def _augment(self, request):
         try:
-            rendered = self._model._render_engagement_state_for_injection()
-            if not rendered:
-                return request
-            # Proof-of-injection log, deduped to fire only when the observed state CHANGES (a hop newly
-            # achieved, or the first injection). This is the reliable observation surface: the injected
-            # block rides at the TAIL of a ~300KB+ prompt, past Phoenix's 128KB span-attr truncation, so
-            # it would not show in spans or Mythic task output. A handful of greppable lines instead.
-            if rendered != self._last_rendered:
-                self._last_rendered = rendered
-                _first = rendered.splitlines()[0] if rendered else ""
-                logger.info(f"🧭 [engagement-state] injected into operator per-turn context | {_first}")
-            return request.override(messages=list(request.messages) + [HumanMessage(content=rendered)])
-        except Exception:
-            return request  # fail-open: never break a model call over the state block
+            block, revision = self._model._engagement_ledger_view_for_call(self._agent_name, request)
+        except Exception as exc:  # the view never breaks a call; it says it is unavailable instead
+            try:
+                block = engagement_ledger.render_model_view_unavailable(
+                    f"the ledger view could not be rendered ({type(exc).__name__})")
+            except Exception:
+                block = "[Sage engagement ledger — UNAVAILABLE for this model call] Not an empty ledger."
+            revision = None
+        if revision != self._last_revision:
+            self._last_revision = revision
+            logger.info(f"🧭 [engagement-ledger] fresh view for {self._agent_name} | revision {revision}")
+        view = HumanMessage(
+            content=block,
+            additional_kwargs={
+                engagement_ledger.MODEL_VIEW_TAG: {"role": self._agent_name, "revision": revision},
+                "_synthetic_nudge": "engagement_ledger_view",
+                "_hide_from_stream": True,
+            },
+        )
+        return request.override(messages=_with_ledger_view(_without_historical_ledger_views(list(request.messages)),
+                                                           view))
 
     def wrap_model_call(self, request, handler):
-        augmented = self._augment(request)
-        if augmented is request:
-            return handler(request)
-        try:
-            return handler(augmented)
-        except Exception:
-            return handler(request)  # fail-open: a bad injection must never abort the turn
+        return handler(self._augment(request))
 
     async def awrap_model_call(self, request, handler):
-        augmented = self._augment(request)
-        if augmented is request:
-            return await handler(request)
-        try:
-            return await handler(augmented)
-        except Exception:
-            return await handler(request)  # fail-open: a bad injection must never abort the turn
+        return await handler(self._augment(request))
 
 
 class _MessageSanitizerMiddleware(AgentMiddleware):
@@ -10002,24 +10059,9 @@ class Model:
                         "Supervisor will route and the solve continues. Use `summarize_and_handback` ONLY at the recursion "
                         "limit (it pauses for the operator). Do not stop silently."
                     )
-                    # Engagement-state-aware nudge (fail-open): prepend a FRESH rendered snapshot of the
-                    # observed engagement state plus a "don't re-propose achieved hops" directive.
+                    # Control text only: the fresh engagement-ledger view rides on every model call
+                    # (_EngagementLedgerViewMiddleware), so the nudge carries no snapshot of its own.
                     _nudge_text = _base_nudge_text
-                    try:
-                        _rendered_state = None
-                        try:
-                            _state = await self._build_current_engagement_state()
-                            if _state is not None:
-                                try:
-                                    from . import engagement_state as _es
-                                except ImportError:
-                                    import engagement_state as _es
-                                _rendered_state = _es.render_engagement_state(_state)
-                        except Exception:
-                            _rendered_state = None  # fail-open to the plain base nudge
-                        _nudge_text = self._autonomous_nudge_content(_base_nudge_text, _rendered_state)
-                    except Exception:
-                        _nudge_text = _base_nudge_text  # fail-open: never break the continue-loop
                     _nudge = HumanMessage(
                         content=_nudge_text,
                         additional_kwargs={
@@ -10949,47 +10991,86 @@ class Model:
         except Exception:
             return None
 
-    def _render_engagement_state_for_injection(self) -> str | None:
-        """Cheap, synchronous, in-memory render of the observed engagement state for PER-TURN injection
-        by `_EngagementStateMiddleware`. Returns None — and the middleware injects nothing — when this is not
-        an autonomous solve, there is no mythic_client, or there is no observed state yet. NO network: reads the
-        in-memory incremental hop ledger plus cached footholds. Never raises (caller also guards).
-        """
+    def _ledger_view_lane(self) -> str:
+        """Which guidance the model view carries: conversation, supervised (incl. Autonomous Solve) or autonomous."""
         try:
-            if not self._autonomous_execution_enabled_for_turn():
-                return None
-            mythic_client = getattr(self, "mythic_client", None)
-            if mythic_client is None:
-                return None
-            hops, graph_facts, corrected_hops = _ledger_lists(mythic_client)
-            footholds = list(getattr(mythic_client, "_engagement_footholds", []) or [])
-            if not hops and not footholds and not corrected_hops:
-                return None
-            try:
-                from . import engagement_state as _es
-            except ImportError:
-                import engagement_state as _es
-            try:
-                objective = mythic_client._engagement_objective()
-            except Exception:
-                objective = "sage-engagement"
-            engagement_id, runtime_scope = _runtime_engagement_scope(mythic_client)
-            # Graph facts from the same snapshot so durable-hop corroboration markers can be computed.
-            state = _es.EngagementState(
-                objective=objective, footholds=footholds, hops=hops, graph_facts=graph_facts,
-                engagement_id=engagement_id, runtime_scope=runtime_scope,
-                current_account_contexts=_runtime_current_account_contexts(mythic_client),
-                request_attempts=_runtime_request_attempts(mythic_client),
-                corrected_hops=corrected_hops,
-            )
-            rendered = _es.render_engagement_state(state)
-            if not rendered:
-                return None
-            # Pair the observed-state block with the imperative directive so the per-turn injection is
-            # an instruction ("ACHIEVED = DONE"), not just a status list the operator can talk past.
-            return f"{rendered}\n\n{_ENGAGEMENT_STATE_DIRECTIVE}"
+            from .request_contract import RequestContract, RequestLane
+            contract = getattr(self, "_request_contract", None)
+            if isinstance(contract, RequestContract):
+                return {RequestLane.CONVERSATIONAL: "conversation",
+                        RequestLane.AUTONOMOUS_OBJECTIVE: "autonomous"}.get(contract.lane, "supervised")
         except Exception:
-            return None
+            pass
+        mode = str(getattr(self, "mode", "") or "")
+        return "autonomous" if mode == "auto" else "conversation" if mode == "conversation" else "supervised"
+
+    def _ledger_view_request_objective(self) -> str:
+        """The current autonomous request's objective, only when this request actually pursues one (never written)."""
+        try:
+            # The seed is (re)set from the prompt by _seed_autonomous_objective for exactly these requests.
+            if not self._autonomous_execution_enabled_for_turn():
+                return ""
+            seed = getattr(getattr(self, "mythic_client", None), "_autonomous_objective_seed", "")
+            return engagement_ledger.human_objective(seed if isinstance(seed, str) else "")
+        except Exception:
+            return ""
+
+    def _model_tool_admissible(self, tool_name: str, args: Any = None) -> bool:
+        """Whether a model call to ``tool_name`` would pass the current request contract / turn authority (the
+        after-model authority filter's precedence). Used so the ledger view never advertises a denied tool."""
+        try:
+            if self._request_contract_block_reason(tool_name, args or {}):
+                return False
+            if getattr(self, "_request_contract", None) is not None:
+                return True
+            authority = getattr(self, "_turn_authority", None)
+            if isinstance(authority, TurnAuthority) and authority.enforces_objective_tool_allowlist:
+                allowed, _reason = authority.allows_model_tool(
+                    tool_name, args or {}, progress=self._objective_contract_progress())
+                return bool(allowed)
+            return True
+        except Exception:
+            return False
+
+    def _engagement_ledger_view(self, *, reader_tool: bool, submit_tool: bool, lane: str) -> tuple[str, int | None]:
+        """(block, snapshot revision) from ONE fresh snapshot of the bound operation ledger, or an UNAVAILABLE block.
+
+        Reads the store only: no reconciliation, objective write, Mythic call or model call.
+        """
+        from .engagement_store import LedgerSnapshot
+
+        guidance = engagement_ledger.model_view_guidance(lane, submit_tool=submit_tool)
+        client = getattr(self, "mythic_client", None)
+        snapshot_fn = getattr(client, "_ledger_snapshot", None)
+        view_fn = getattr(client, "_ledger_model_view", None)
+        if client is None or not callable(snapshot_fn) or not callable(view_fn):
+            return engagement_ledger.render_model_view_unavailable(
+                "no operation ledger is bound to this session", guidance=guidance), None
+        try:
+            snapshot = snapshot_fn()
+        except Exception as exc:
+            return engagement_ledger.render_model_view_unavailable(exc, guidance=guidance), None
+        if not isinstance(snapshot, LedgerSnapshot):
+            return engagement_ledger.render_model_view_unavailable(
+                "this session's client exposes no operation snapshot", guidance=guidance), None
+        block = view_fn(
+            snapshot,
+            stored_objective=snapshot.objective_setting()[0],
+            request_objective=self._ledger_view_request_objective(),
+            reader_tool=reader_tool,
+            guidance=guidance,
+        )
+        return block, snapshot.revision
+
+    def _engagement_ledger_view_for_call(self, agent_name: str, request: Any) -> tuple[str, int | None]:
+        """The view for one graph-role model request: the reader is advertised only when it is among this call's
+        tools AND the current authority admits it."""
+        names = _request_tool_names(request)
+        reader = (engagement_ledger.READER_TOOL in names
+                  and self._model_tool_admissible(engagement_ledger.READER_TOOL))
+        submit = (engagement_ledger.SUBMIT_TOOL in names
+                  and self._model_tool_admissible(engagement_ledger.SUBMIT_TOOL))
+        return self._engagement_ledger_view(reader_tool=reader, submit_tool=submit, lane=self._ledger_view_lane())
 
     def _current_engagement_state_snapshot(self, *, require_autonomous: bool = True):
         """Cheap in-memory EngagementState snapshot for terminal objective checks.
@@ -12044,6 +12125,15 @@ class Model:
         steer = str(getattr(self, "_controller_hitl_operator_steer", "") or "").strip()
         if steer and self._controller_hitl_enabled():
             request = {**request, "operator_steering": steer}
+        # Descriptive context only, from one snapshot read now: the candidate schema, normalized executable state and
+        # deterministic frontier stay authoritative. The controller has no tool loop, so no tool is advertised.
+        try:
+            ledger_view, _revision = self._engagement_ledger_view(reader_tool=False, submit_tool=False,
+                                                                  lane="autonomous")
+        except Exception as exc:
+            ledger_view = engagement_ledger.render_model_view_unavailable(
+                f"the ledger view could not be rendered ({type(exc).__name__})")
+        request = {**request, "engagement_ledger": ledger_view}
         answer = await self.llm.ainvoke([
             SystemMessage(content=instruction),
             HumanMessage(content=json.dumps(request, sort_keys=True)),
@@ -14191,22 +14281,9 @@ class Model:
             and contract.stop_condition.kind == StopConditionKind.OBJECTIVE_PROVED
         )
 
-    def _autonomous_nudge_content(self, base_nudge_text: str, rendered_state: str | None) -> str:
-        """Compose the autonomous-continue nudge, optionally prefixed with observed state.
-
-        When ``rendered_state`` is falsy (gate off, or building/rendering failed) the base nudge is
-        returned UNCHANGED — byte-for-byte. Otherwise the rendered engagement-state block and the
-        "don't re-issue achieved hops" directive are PREPENDED so the Operator advances from the
-        observed state instead of re-proposing already-achieved hops.
-        """
-        if not rendered_state:
-            return base_nudge_text
-        return f"{rendered_state}\n\n{_ENGAGEMENT_STATE_DIRECTIVE}\n\n{base_nudge_text}"
-
     def _context_middleware(
             self,
             agent_name: str = "",
-            inject_engagement_state: bool = False,
             bounded_execute_stop: bool = False,
             mcp_no_progress_stop: bool = False,
             recon_reread_stop: bool = False,
@@ -14325,11 +14402,11 @@ class Model:
         if mode != "auto" and agent_name and agent_name != "Supervisor":
             # Built for every assisted worker; it acts only while the request lane is supervised.
             mw.append(_SupervisedStepBoundMiddleware(self, agent_name, frozenset(hitl_tools)))
-        # Per-turn engagement-state injection (Mythic_Operator only, autonomous + gate-on, fail-open).
-        # Appended LAST so it is the INNERMOST wrapper: the rendered block is added AFTER all the
-        # context-editing/summarization middleware run, so it is never trimmed before reaching the model.
-        if inject_engagement_state:
-            mw.append(_EngagementStateMiddleware(self))
+        # Fresh engagement-ledger view (Supervisor and Mythic_Operator, every mode). Appended after every
+        # context-editing/summarization middleware, so it is the innermost content change: one current block reaches
+        # the provider untrimmed, and older generated views are filtered from that call's input.
+        if agent_name in _LEDGER_VIEW_ROLES:
+            mw.append(_EngagementLedgerViewMiddleware(self, agent_name=agent_name))
         # Always inject the immutable turn contract ephemerally. This keeps hidden state fresh across
         # graph rebuilds and prevents delegated prose from silently widening authority.
         mw.append(_TurnAuthorityInjectionMiddleware(self, agent_name=agent_name))
@@ -14403,7 +14480,6 @@ class Model:
             name=name,
             middleware=self._context_middleware(
                 agent_name=name,
-                inject_engagement_state=True,
                 bounded_execute_stop=True,
                 recon_reread_stop=True,
             ),
@@ -15672,15 +15748,6 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             notes = engagement_ledger.correction_notes(hops, limit=_TURN_END_STATE_HOP_LIMIT)
             if notes:
                 lines.extend(notes)
-        # The operator sees this table with the closing message; queue the same rows for the model's next
-        # request on this channel so "hop N" resolves against what the operator saw.
-        engagement_ledger.record_operator_view(
-            getattr(self, "channel_id", None),
-            engagement_ledger.operator_view_text(
-                {"objective": objective, "hops": hops}, "the end-of-turn engagement-state table",
-                limit=_TURN_END_STATE_HOP_LIMIT,
-            ),
-        )
         return "\n".join(lines)
 
     async def _surface_hitl_interrupt(self, event: dict) -> bool:
@@ -16009,25 +16076,6 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         # Note: We don't load from checkpoint here because self.state already contains
         # the full conversation history from the graph's checkpointing mechanism
         #self._cleanup_dangling_tool_calls()
-
-        # A ledger view the operator was shown since the last request (`/state` or the turn-end table) enters
-        # the conversation once, just before the operator's message, so "hop N" resolves against those rows.
-        try:
-            from . import engagement_ledger as _ledger_views
-        except ImportError:
-            import engagement_ledger as _ledger_views
-        operator_view = _ledger_views.take_operator_view(getattr(self, "channel_id", None))
-        if operator_view:
-            view_msg = HumanMessage(
-                content=operator_view,
-                additional_kwargs={
-                    "_request_id": request_contract.request_id,
-                    "_synthetic_nudge": "operator_ledger_view",
-                    "_hide_from_stream": True,
-                },
-            )
-            _tag_msg(view_msg, self._next_seq())
-            self.state["supervisor_messages"].append(view_msg)
 
         # An objective-shaped request consults the attack graph before the Supervisor routes, so graph
         # coverage and path existence are known facts rather than a specialist the Supervisor must remember.

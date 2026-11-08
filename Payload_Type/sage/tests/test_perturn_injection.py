@@ -1,158 +1,77 @@
-"""Per-turn engagement-state injection tests (Bug 1 fix).
+"""Per-call engagement-ledger injection is ephemeral.
 
-Verify the per-turn fix for the mis-wired continue-loop-only injection:
-
-- Model._render_engagement_state_for_injection() is a cheap, synchronous, in-memory render that
-  returns None unless autonomous + observed state are present, and otherwise emits the observed
-  `=== ENGAGEMENT STATE` block.
-- _EngagementStateMiddleware._augment appends the rendered block as a HumanMessage via
-  request.override (EPHEMERAL — the original request is untouched, so it never accumulates).
-- awrap_model_call passes the augmented request to the handler.
-
-Mirrors test_autonomous_state_nudge.py: Model.__new__ + stub client, asyncio.run for async.
+The autonomous-only observed-state injection (``_EngagementStateMiddleware`` and
+``Model._render_engagement_state_for_injection``) is retired. ``_EngagementLedgerViewMiddleware`` adds one fresh
+engagement-ledger view to every Supervisor and Mythic_Operator model call, through ``request.override`` only, so
+the block never accumulates in graph state. The assembled behaviour (actual model inputs across lanes, freshness,
+no accumulation) is covered in ``test_engagement_ledger_phase5_fresh_awareness.py``.
 """
 
-import asyncio
-import importlib
 import sys
 from pathlib import Path
 
-import pytest
 from langchain_core.messages import HumanMessage
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph"))
-import engagement_state  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-
-def _load_model_module():
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    try:
-        return importlib.import_module("ai.langgraph.model")
-    except Exception as e:  # pragma: no cover - environment guard
-        pytest.skip(f"model.py runtime unavailable: {e}")
-
-
-class _StubClient:
-    def __init__(self, hops=None, footholds=None):
-        self._engagement_hops = list(hops or [])
-        self._engagement_footholds = list(footholds or [])
-
-    def _engagement_objective(self):
-        return "sage-engagement:test"
-
-
-def _achieved_hop():
-    state = engagement_state.record_hop_result(
-        engagement_state.EngagementState(objective="t"),
-        "gpo-abuse",
-        "winterfell.north.sevenkingdoms.local",
-        "achieved",
-        {"source": "test", "scheduled_task_present": True},
-        "2026-06-07T00:00:00Z",
-    )
-    return state.hops
-
-
-# ---------------------------------------------------------------------------
-# 1. render helper gating
-# ---------------------------------------------------------------------------
-
-
-def test_render_none_when_not_autonomous(monkeypatch):
-    mod = _load_model_module()
-    m = mod.Model.__new__(mod.Model)
-    m._autonomous_solve = False
-    m.mythic_client = _StubClient(hops=_achieved_hop())
-    assert m._render_engagement_state_for_injection() is None
-
-
-def test_render_observed_state_without_planning_block(monkeypatch):
-    # Stage B: per-turn injection always renders observed state only. The STRIPS planning block is gone.
-    mod = _load_model_module()
-    m = mod.Model.__new__(mod.Model)
-    m._autonomous_solve = True
-    m.mythic_client = _StubClient(hops=_achieved_hop())
-    out = m._render_engagement_state_for_injection()
-    assert out is not None
-    assert "=== ENGAGEMENT STATE" in out
-    assert "gpo-abuse" in out             # observed hop is present
-    assert "NEXT GROUNDED" not in out     # STRIPS planning suppressed when gate off
-    assert "Phase:" not in out
-
-
-def test_render_none_when_no_observed_state(monkeypatch):
-    mod = _load_model_module()
-    m = mod.Model.__new__(mod.Model)
-    m._autonomous_solve = True
-    m.mythic_client = _StubClient(hops=[], footholds=[])
-    assert m._render_engagement_state_for_injection() is None
-
-
-def test_render_present_when_autonomous_and_observed_state_exists(monkeypatch):
-    mod = _load_model_module()
-    m = mod.Model.__new__(mod.Model)
-    m._autonomous_solve = True
-    m.mythic_client = _StubClient(hops=_achieved_hop())
-    out = m._render_engagement_state_for_injection()
-    assert out is not None
-    assert "=== ENGAGEMENT STATE" in out
-    assert "gpo-abuse" in out
-
-
-# ---------------------------------------------------------------------------
-# 2. middleware augmentation (ephemeral)
-# ---------------------------------------------------------------------------
+from ai.langgraph import engagement_ledger  # noqa: E402
+from ai.langgraph import model as model_module  # noqa: E402
 
 
 class _FakeRequest:
-    def __init__(self, messages):
+    def __init__(self, messages, tools=()):
         self.messages = list(messages)
+        self.tools = list(tools)
 
     def override(self, **kw):
-        return _FakeRequest(kw.get("messages", self.messages))
+        return _FakeRequest(kw.get("messages", self.messages), self.tools)
 
 
-class _StubModelForMw:
-    def __init__(self, rendered):
-        self._rendered = rendered
-
-    def _render_engagement_state_for_injection(self):
-        return self._rendered
+class _StubModel:
+    def _engagement_ledger_view_for_call(self, agent_name, request):
+        return f"[Sage engagement ledger — fresh view for this model call] role={agent_name}", 7
 
 
-def test_middleware_appends_block_ephemerally():
-    mod = _load_model_module()
-    mw = mod._EngagementStateMiddleware(
-        _StubModelForMw("=== ENGAGEMENT STATE ===\nAchieved hops:\n- gpo-abuse")
-    )
-    orig = [HumanMessage(content="hello")]
-    req = _FakeRequest(orig)
-    new_req = mw._augment(req)
-    # Original request is untouched — injection is per-call, not accumulated.
-    assert len(req.messages) == 1
-    # New request carries the block as the most-recent (most salient) message.
-    assert len(new_req.messages) == 2
-    assert "=== ENGAGEMENT STATE" in new_req.messages[-1].content
+def test_the_retired_autonomous_only_injection_is_gone():
+    assert not hasattr(model_module, "_EngagementStateMiddleware")
+    assert not hasattr(model_module.Model, "_render_engagement_state_for_injection")
+    assert not hasattr(model_module, "_ENGAGEMENT_STATE_DIRECTIVE")
 
 
-def test_middleware_noop_when_render_none():
-    mod = _load_model_module()
-    mw = mod._EngagementStateMiddleware(_StubModelForMw(None))
-    req = _FakeRequest([HumanMessage(content="hi")])
-    assert mw._augment(req) is req  # same object, unchanged
+def test_the_view_is_appended_ephemerally_and_tagged():
+    mw = model_module._EngagementLedgerViewMiddleware(_StubModel(), agent_name="Supervisor")
+    request = _FakeRequest([HumanMessage(content="hello")])
+    augmented = mw._augment(request)
+    assert len(request.messages) == 1  # the original request (graph state) is untouched
+    assert len(augmented.messages) == 2
+    view, last = augmented.messages
+    assert last.content == "hello"  # the operator's message stays the final turn
+    assert view.content.endswith("role=Supervisor")
+    assert view.additional_kwargs[engagement_ledger.MODEL_VIEW_TAG] == {"role": "Supervisor", "revision": 7}
 
 
-def test_awrap_model_call_passes_augmented_request():
-    mod = _load_model_module()
-    mw = mod._EngagementStateMiddleware(
-        _StubModelForMw("=== ENGAGEMENT STATE ===\n- x")
-    )
-    seen = {}
+def test_placement_keeps_the_final_turn_and_never_splits_a_tool_result():
+    from langchain_core.messages import AIMessage, ToolMessage
 
-    async def handler(request):
-        seen["messages"] = request.messages
-        return "RESP"
+    mw = model_module._EngagementLedgerViewMiddleware(_StubModel(), agent_name="Supervisor")
+    call = AIMessage(content="", tool_calls=[{"name": "t", "args": {}, "id": "c1", "type": "tool_call"}])
+    result = ToolMessage(content="r", tool_call_id="c1")
+    after_tool = mw._augment(_FakeRequest([HumanMessage(content="go"), call, result])).messages
+    assert after_tool[1:3] == [call, result] and engagement_ledger.MODEL_VIEW_TAG in after_tool[3].additional_kwargs
+    answer = AIMessage(content="worker answer")
+    continuation = HumanMessage(content="continue", additional_kwargs={"_synthetic_nudge": "provider_requires_user_turn"})
+    outcome = AIMessage(content="[step outcome] ...", name="Sage")
+    tail = mw._augment(_FakeRequest([HumanMessage(content="go"), answer, outcome, continuation])).messages
+    assert engagement_ledger.MODEL_VIEW_TAG in tail[1].additional_kwargs and tail[2:] == [answer, outcome, continuation]
+    scope = AIMessage(content="<step_scope>", name="Sage", additional_kwargs={"_step_scope_context": True})
+    delegated = HumanMessage(content="do the step")
+    framed = mw._augment(_FakeRequest([HumanMessage(content="go"), call, result, scope, delegated])).messages
+    assert framed[3:4][0].additional_kwargs.get(engagement_ledger.MODEL_VIEW_TAG) and framed[4:] == [scope, delegated]
 
-    res = asyncio.run(mw.awrap_model_call(_FakeRequest([HumanMessage(content="go")]), handler))
-    assert res == "RESP"
-    assert "=== ENGAGEMENT STATE" in seen["messages"][-1].content
+
+def test_an_earlier_generated_view_is_replaced_not_stacked():
+    mw = model_module._EngagementLedgerViewMiddleware(_StubModel(), agent_name="Mythic_Operator")
+    first = mw._augment(_FakeRequest([HumanMessage(content="go")]))
+    second = mw._augment(_FakeRequest(first.messages))
+    views = [m for m in second.messages if engagement_ledger.MODEL_VIEW_TAG in m.additional_kwargs]
+    assert len(views) == 1 and len(second.messages) == 2

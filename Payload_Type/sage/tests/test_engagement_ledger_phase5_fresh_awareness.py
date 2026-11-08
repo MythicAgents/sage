@@ -147,6 +147,25 @@ def _tool_call(name: str, args: dict, call_id: str) -> AIMessage:
     return AIMessage(content="", tool_calls=[{"name": name, "args": args, "id": call_id, "type": "tool_call"}])
 
 
+# --- 1. a new session sees the operator's rows on its first Supervisor call -------------------------------------------
+
+
+def test_first_supervisor_call_of_a_new_session_carries_the_operator_rows(monkeypatch):
+    tools = _seeded_tools(monkeypatch)
+    model, fake = _build_model(tools, [AIMessage(content="Row 2 is pending.")])
+    _run(model, "Why is hop 2 pending? Do not execute anything.")
+
+    assert fake.calls, "the Supervisor was never called"
+    first = _text(fake.calls[0])
+    for number in (1, 2, 3, 4, 5):
+        assert f"#{number} " in first, f"row #{number} missing from the first Supervisor call:\n{first}"
+    assert "pending (awaiting effect)" in first
+    assert "operator retracted" in first and "duplicate collection row" in first
+    assert "no longer holds" in first
+    assert "proof missing" in first
+    assert SECRET_SENTINEL not in first and OUTPUT_SENTINEL not in first
+
+
 # --- checkpoint 1: the shared projection ---------------------------------------------------------------------------
 
 from ai.langgraph import engagement_ledger as el  # noqa: E402
@@ -560,6 +579,333 @@ def test_long_submission_results_say_what_was_not_shown(session, monkeypatch):
     monkeypatch.setattr(mythic_tools.MythicTools, "_reconcile_operation", many)
     out = _submit(tools, ["18"])
     assert "…10 further result line(s) not shown" in out
+
+
+# --- checkpoint 2: the actual consumers ------------------------------------------------------------------------------
+
+from langchain_core.messages import SystemMessage  # noqa: E402
+
+from ai.langgraph import model as model_module  # noqa: E402
+
+_READ_BRIEF = {"allowed_capabilities": ["control_plane"], "expected_result": "Report what the records show."}
+
+
+def _handoff(agent: str = "Mythic_Operator", call_id: str = "call_handoff_1") -> AIMessage:
+    return AIMessage(content="", tool_calls=[{
+        "name": f"transfer_to_{agent}",
+        "args": {"handoff_title": "explain the ledger", "handoff_instruction": "Explain rows 1 and 2 only.",
+                 **_READ_BRIEF},
+        "id": call_id, "type": "tool_call",
+    }])
+
+
+def _views(messages) -> list:
+    return [m for m in messages if isinstance(m, HumanMessage)
+            and el.MODEL_VIEW_TAG in (getattr(m, "additional_kwargs", None) or {})]
+
+
+def _role_of(call) -> str:
+    """Which graph role a captured call belongs to, from its generated view (or 'other' when it has none)."""
+    views = _views(call)
+    return views[0].additional_kwargs[el.MODEL_VIEW_TAG]["role"] if views else "other"
+
+
+def _calls_for(fake, role: str) -> list:
+    return [call for call in fake.calls if _role_of(call) == role]
+
+
+@pytest.mark.parametrize("mode, autonomous_solve", [
+    ("conversation", False), ("supervised", False), ("supervised", True), ("auto", True),
+])
+@pytest.mark.parametrize("gate", ["on", "off"])
+def test_every_lane_gives_supervisor_and_operator_the_fresh_view(monkeypatch, mode, autonomous_solve, gate):
+    monkeypatch.setenv("SAGE_ENGAGEMENT_GATE", "1" if gate == "on" else "0")
+    tools = _seeded_tools(monkeypatch)
+    model, fake = _build_model(tools, [_handoff(), AIMessage(content="Rows explained."),
+                                       AIMessage(content="Done.")] + [AIMessage(content="Done.")] * 8)
+    _run(model, "Explain hops 1 and 2; do not execute anything.", mode=mode, autonomous_solve=autonomous_solve,
+         tolerate=mode == "auto")
+    revision = tools._ledger_snapshot().revision
+    supervisor, operator = _calls_for(fake, "Supervisor"), _calls_for(fake, "Mythic_Operator")
+    assert supervisor, f"no Supervisor call carried the view in {mode}"
+    assert operator, f"the Mythic_Operator call carried no view in {mode}: {[_role_of(c) for c in fake.calls]}"
+    for call in supervisor + operator:
+        [view] = _views(call)  # exactly one generated block per actual model input
+        assert view.additional_kwargs[el.MODEL_VIEW_TAG]["revision"] == revision
+        assert "#2 r" in view.content and "operator retracted" in view.content
+    guidance = _views(supervisor[0])[0].content
+    if mode == "conversation":
+        assert "This request is observational" in guidance
+    elif mode == "supervised":
+        assert "exact guarded action the operator approves" in guidance
+    else:
+        assert "current proof" in guidance and "through the existing gates" in guidance
+
+
+def test_a_second_client_change_between_calls_reaches_the_next_model_input(monkeypatch):
+    tools = _seeded_tools(monkeypatch)
+    other = mythic_tools.MythicTools(agent_task_id="phase5-other")
+    binding = other._require_ledger_binding()
+    store = other._ledger_store()
+    key = binding.engagement_key
+    changes = []
+
+    def mutate():
+        added = _hop("gpo-abuse", "late", "system:late", "achieved", task=150)
+        added["proof_envelope"] = task_proof(key, task_id="150")
+        store.retract(binding, ["2"], reason="second client retracts", actor=OPERATOR)
+        seed_ledger(other, hops=[added])
+        changes.append(other._ledger_snapshot().revision)
+
+    model, fake = _build_model(tools, [
+        _tool_call("read_engagement_state", {"numbers": [2]}, "call_read_1"),
+        _tool_call("read_engagement_state", {"numbers": [2, 6]}, "call_read_2"),
+        AIMessage(content="Row 2 is now retracted."),
+    ])
+    original = _CapturingModel._generate
+
+    def generate(self, messages, stop=None, run_manager=None, **kwargs):
+        result = original(self, messages, stop=stop, run_manager=run_manager, **kwargs)
+        if len(self.calls) == 1:
+            mutate()
+        elif len(self.calls) == 2:
+            store.restore(binding, ["2"], reason="restored", actor=OPERATOR)
+            changes.append(other._ledger_snapshot().revision)
+        return result
+
+    monkeypatch.setattr(_CapturingModel, "_generate", generate)
+    _run(model, "What holds for row 2? Do not execute anything.")
+    first, second, third = (_views(call)[0] for call in fake.calls[:3])
+    assert "#6 " not in first.content and "CORRECTED" not in first.content.split("- #2 ")[1].split("\n")[0]
+    assert second.additional_kwargs[el.MODEL_VIEW_TAG]["revision"] == changes[0]
+    row2 = second.content.split("- #2 ")[1].split("\n")[0]
+    assert "CORRECTED: operator retracted" in row2 and "second client retracts" in row2
+    assert "- #6 r1" in second.content
+    assert third.additional_kwargs[el.MODEL_VIEW_TAG]["revision"] == changes[1]
+    assert "CORRECTED" not in third.content.split("- #2 ")[1].split("\n")[0]
+
+
+def test_direct_worker_entry_and_graph_rebuild_keep_the_view(monkeypatch):
+    tools = _seeded_tools(monkeypatch)
+    model, fake = _build_model(tools, [AIMessage(content="Operator answer.")] * 12)
+    monkeypatch.setattr(model, "_graph_start_node_for_turn", lambda: "Mythic_Operator")
+    _run(model, "Explain row 1.", tolerate=True)
+    assert _role_of(fake.calls[0]) == "Mythic_Operator", [_role_of(c) for c in fake.calls]
+    seen = len(fake.calls)
+    model._rebuild_graph()
+    _run(model, "Explain row 1 again.", thread="phase5-thread-2", tolerate=True)
+    assert _role_of(fake.calls[seen]) == "Mythic_Operator"
+    assert all(len(_views(call)) == 1 for call in fake.calls)
+
+
+def test_a_resumed_checkpoint_cannot_carry_an_old_view_into_the_input(monkeypatch):
+    tools = _seeded_tools(monkeypatch)
+    model, fake = _build_model(tools, [AIMessage(content="first"), AIMessage(content="second")])
+    stale = HumanMessage(content="[Sage ledger view] | 1 | `gpo-abuse:starkwallpaper` | STALE-VIEW-SENTINEL achieved |",
+                         additional_kwargs={"_synthetic_nudge": "operator_ledger_view", "_hide_from_stream": True})
+    nudge = HumanMessage(content="=== ENGAGEMENT STATE (observed; trust this over the plan) ===\nOLD-NUDGE-SNAPSHOT\n\n"
+                                 "[autonomous-continue] You ended your turn.",
+                         additional_kwargs={"_synthetic_nudge": "autonomous_operator_continue"})
+    model.state["supervisor_messages"].extend([stale, nudge])
+    _run(model, "Which rows hold?")
+    first = fake.calls[0]
+    text = _text(first)
+    assert "STALE-VIEW-SENTINEL" not in text and "OLD-NUDGE-SNAPSHOT" not in text
+    assert "[autonomous-continue] You ended your turn." in text  # control text kept
+    assert len(_views(first)) == 1
+    # History itself is not rewritten, and no generated view was added to it.
+    assert stale in model.state["supervisor_messages"]
+    _run(model, "And now?", thread="phase5-thread")
+    for channel in ("supervisor_messages", "mythic_operator_messages", "messages"):
+        assert not _views(model.state.get(channel) or [])
+
+
+@pytest.mark.parametrize("mode, autonomous_solve", [("supervised", False), ("auto", True)])
+def test_many_calls_accumulate_no_ledger_snapshots_in_graph_history(monkeypatch, mode, autonomous_solve):
+    tools = _seeded_tools(monkeypatch)
+    reads = [] if mode == "auto" else [_tool_call("read_engagement_state", {}, f"call_read_{i}") for i in range(3)]
+    script = [_handoff()] + reads + [AIMessage(content="worker done")] * 10  # auto: plain stops draw nudges
+    model, fake = _build_model(tools, script)
+    result = _run(model, "Explain the ledger.", mode=mode, autonomous_solve=autonomous_solve, tolerate=True)
+    assert len(fake.calls) >= 4
+    assert all(len(_views(call)) == 1 for call in fake.calls)
+    assert not any("=== ENGAGEMENT STATE" in _text(call) for call in fake.calls)
+    if mode == "auto":
+        # Continuation nudges fired and carried control text only.
+        assert any("[autonomous-continue]" in _text(call) for call in fake.calls)
+    for channel, messages in result.items():
+        if isinstance(messages, list):
+            assert not _views(messages), f"a generated view entered {channel}"
+            assert not any("[Sage engagement ledger" in str(getattr(m, "content", "")) for m in messages
+                           if isinstance(m, HumanMessage)), channel
+
+
+def test_excluded_roles_and_watcher_receive_no_view(monkeypatch):
+    tools = _seeded_tools(monkeypatch)
+    model, fake = _build_model(tools, [_handoff("Generalist"), AIMessage(content="general answer"),
+                                       AIMessage(content="final")])
+    _run(model, "What is Kerberoasting?")
+    others = [call for call in fake.calls if _role_of(call) == "other"]
+    assert others, "the Generalist was never called"
+    assert all("[Sage engagement ledger" not in _text(call) for call in others)
+    for name in ("Generalist", "Mythic_Payload", "BloodHound", "MCP_Manager", "Sandbox"):
+        middleware = model._context_middleware(agent_name=name)
+        assert not any(isinstance(m, model_module._EngagementLedgerViewMiddleware) for m in middleware), name
+    for name in ("Supervisor", "Mythic_Operator"):
+        middleware = model._context_middleware(agent_name=name)
+        assert sum(isinstance(m, model_module._EngagementLedgerViewMiddleware) for m in middleware) == 1
+
+
+def test_watcher_graph_receives_no_view(monkeypatch):
+    from sage_chat import watcher_graph
+    source = Path(watcher_graph.__file__).read_text(encoding="utf-8")
+    assert "engagement_ledger" not in source and "_EngagementLedgerViewMiddleware" not in source
+    assert "read_engagement_state" not in source and "submit_engagement_evidence" not in source
+
+
+# --- the view middleware's call contract -----------------------------------------------------------------------------
+
+
+class _Req:
+    def __init__(self, messages, tools=()):
+        self.messages = list(messages)
+        self.tools = list(tools)
+
+    def override(self, **kw):
+        return _Req(kw.get("messages", self.messages), self.tools)
+
+
+def _view_mw(monkeypatch):
+    tools = _seeded_tools(monkeypatch)
+    model, _fake = _build_model(tools, [])
+    return model, model_module._EngagementLedgerViewMiddleware(model, agent_name="Supervisor")
+
+
+def test_a_provider_exception_propagates_after_exactly_one_call_with_the_view(monkeypatch):
+    model, mw = _view_mw(monkeypatch)
+    seen = []
+
+    def handler(request):
+        seen.append(request.messages)
+        raise RuntimeError("provider failed")
+
+    with pytest.raises(RuntimeError, match="provider failed"):
+        mw.wrap_model_call(_Req([HumanMessage(content="hi")]), handler)
+    assert len(seen) == 1 and len(_views(seen[0])) == 1
+
+    async def ahandler(request):
+        seen.append(request.messages)
+        raise RuntimeError("async provider failed")
+
+    with pytest.raises(RuntimeError, match="async provider failed"):
+        asyncio.run(mw.awrap_model_call(_Req([HumanMessage(content="hi")]), ahandler))
+    assert len(seen) == 2 and len(_views(seen[1])) == 1
+
+
+def test_a_render_failure_sends_an_unavailable_block_not_an_empty_ledger(monkeypatch):
+    model, mw = _view_mw(monkeypatch)
+    monkeypatch.setattr(type(model.mythic_client), "_ledger_snapshot",
+                        lambda self: (_ for _ in ()).throw(engagement_store.LedgerUnavailable("database is locked")))
+    seen = []
+    mw.wrap_model_call(_Req([HumanMessage(content="hi")]), lambda request: seen.append(request.messages))
+    [view] = _views(seen[0])
+    assert "UNAVAILABLE" in view.content and "database is locked" in view.content
+    assert "No rows are recorded" not in view.content
+
+    monkeypatch.setattr(model, "_engagement_ledger_view_for_call",
+                        lambda *a: (_ for _ in ()).throw(ValueError("renderer bug")))
+    seen.clear()
+    mw.wrap_model_call(_Req([HumanMessage(content="hi")]), lambda request: seen.append(request.messages))
+    assert "UNAVAILABLE" in _views(seen[0])[0].content
+
+
+def test_the_reader_is_advertised_only_when_offered_and_admitted(monkeypatch):
+    from ai.langgraph.objective_contract import ObjectiveContract
+    from ai.langgraph.turn_authority import TurnAuthority
+
+    model, mw = _view_mw(monkeypatch)
+    offered = [type("T", (), {"name": el.READER_TOOL})(), type("T", (), {"name": el.SUBMIT_TOOL})()]
+    tools = model.mythic_client
+    # Enough rows that some are omitted, so the footer would carry the pointer.
+    seed_ledger(tools, hops=[dict(_hop("gpo-abuse", f"bulk{i}", f"system:bulk{i}", "pending", task=500 + i))
+                             for i in range(30)])
+    model._request_contract = None
+    model._turn_authority = TurnAuthority(mode="observe")
+    seen = []
+    mw.wrap_model_call(_Req([HumanMessage(content="hi")], offered), lambda r: seen.append(r.messages))
+    assert "`read_engagement_state`" in _views(seen[-1])[0].content
+    assert "`submit_engagement_evidence`" in _views(seen[-1])[0].content
+    mw.wrap_model_call(_Req([HumanMessage(content="hi")], []), lambda r: seen.append(r.messages))
+    assert "read_engagement_state" not in _views(seen[-1])[0].content
+    assert "submit_engagement_evidence" not in _views(seen[-1])[0].content
+    # A restricted objective contract that excludes the reader: offered but not admitted, so not advertised.
+    restricted = ObjectiveContract(objective_text="collect the graph", required_outcomes=("graph_ingested",),
+                                   allowed_action_families=("issue_task_and_waitfor_task_output", "ingest_collection"),
+                                   stop_conditions=("graph_ingested",), evidence_requirements=("bloodhound_ingest",),
+                                   engine="supervisor_graph", approval_policy="turn_hitl", scope_kind="bounded_report")
+    model._turn_authority = TurnAuthority(mode="autonomous_objective", objective_contract=restricted)
+    assert model._turn_authority.enforces_objective_tool_allowlist
+    mw.wrap_model_call(_Req([HumanMessage(content="hi")], offered), lambda r: seen.append(r.messages))
+    assert "read_engagement_state" not in _views(seen[-1])[0].content
+
+
+# --- controller policy calls -------------------------------------------------------------------------------------------
+
+
+class _RecordingLLM:
+    def __init__(self):
+        self.calls = []
+
+    async def ainvoke(self, messages):
+        self.calls.append(messages)
+        return AIMessage(content='{"disposition": "stop"}')
+
+
+def test_controller_policy_input_carries_the_same_projection_without_a_tool_promise(monkeypatch):
+    import json as _json
+
+    tools = _bulk_tools(monkeypatch, 40)
+    model, _fake = _build_model(tools, [])
+    llm = _RecordingLLM()
+    model.llm = llm
+    contract = build_request_contract(request_id="chat:1:request:9", channel_id="1", operation_id="operation-1",
+                                      mode="auto", autonomous_solve=True)
+    model.install_request_contract(contract)
+    tools._autonomous_objective_seed = "Become domain admin in NORTH"
+    original = {"selection_contract": "hybrid-full-frontier-v2", "candidates": []}
+    asyncio.run(model._controller_llm_policy_decide(dict(original)))
+    [messages] = llm.calls
+    payload = _json.loads(messages[1].content)
+    view = payload["engagement_ledger"]
+    assert view == tools._ledger_model_view(
+        stored_objective="", request_objective="Become domain admin in NORTH", reader_tool=False,
+        guidance=el.model_view_guidance("autonomous", submit_tool=False))
+    assert f"snapshot revision {tools._ledger_snapshot().revision}" in view
+    assert "Omitted 16 row(s)" in view and "read_engagement_state" not in view
+    assert "submit_engagement_evidence" not in view
+    assert "Current autonomous request objective: `Become domain admin in NORTH`" in view
+    assert payload["candidates"] == [] and payload["selection_contract"] == "hybrid-full-frontier-v2"
+    assert tools._ledger_snapshot().objective_setting()[0] == ""  # rendering never adopts a goal
+
+    # Fresh per call: a change between two policy calls reaches the second input.
+    tools._ledger_store().retract(tools._require_ledger_binding(), ["40"], reason="between calls", actor=OPERATOR)
+    asyncio.run(model._controller_llm_policy_decide(dict(original)))
+    second = _json.loads(llm.calls[1][1].content)["engagement_ledger"]
+    assert "between calls" in second and second != view
+
+
+def test_rendering_and_reading_in_a_run_write_nothing_and_reconcile_nothing(monkeypatch):
+    tools = _seeded_tools(monkeypatch)
+    before = tools._ledger_snapshot()
+    monkeypatch.setattr(mythic_tools.MythicTools, "_reconcile_operation",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("reconciled")))
+    model, fake = _build_model(tools, [_tool_call("read_engagement_state", {}, "call_read"),
+                                       AIMessage(content="done")] + [AIMessage(content="done")] * 4)
+    _run(model, "Read the ledger.", tolerate=True)
+    after = tools._ledger_snapshot()
+    assert after.revision == before.revision and after.objective_setting() == before.objective_setting()
+    assert "Stored compatibility objective (an operation setting, not a channel goal): `compromise NORTH`" in \
+        _views(fake.calls[0])[0].content
 
 
 # --- registration: both tools survive front-matter filtering in both roles, in every mode -----------------------------

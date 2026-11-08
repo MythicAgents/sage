@@ -306,9 +306,10 @@ def task_ids(hop) -> list[str]:
 def render_hop_table(hops, *, limit: int = 0) -> list[str]:
     """Render hops as markdown table lines keyed by permanent hop number, ascending.
 
-    Every surface that shows hops (`/state`, the turn-end summary, and the model's copy of either) uses this,
-    so "hop N" names the same row everywhere. `limit` keeps the N highest-numbered (newest) hops. The Task column
-    links each Mythic task the row names; ``evidence_notes`` explains each one. No task output is rendered.
+    Every operator surface that shows hops (`/state` and the turn-end summary) uses this, and the model view keeps
+    the same numbers and labels, so "hop N" names the same row everywhere. `limit` keeps the N highest-numbered
+    (newest) hops. The Task column links each Mythic task the row names; ``evidence_notes`` explains each one. No
+    task output is rendered.
     """
     rows = sorted((h for h in (hops or []) if isinstance(h, dict)), key=hop_number)
     if limit and len(rows) > limit:
@@ -905,53 +906,3 @@ def normalize_citations(citations) -> tuple[list[str], str]:
             return [], f"citation {canonical} is listed twice; list each ID once"
         normalized.append(canonical)
     return normalized, ""
-
-
-# --- operator-shown views handed to the model ----------------------------------------------------------
-# Sage shows the operator the ledger in `/state` and at the end of a turn, but neither reaches the model's
-# conversation, so "why is hop 1 pending?" had nothing to resolve against. The latest view shown on a channel
-# waits here, process-local, until that channel's next model request records it in the conversation.
-# Read-only: this hands the model a description of the ledger, never a way to change it.
-
-_OPERATOR_VIEWS: dict[str, str] = {}
-
-
-def operator_view_text(data: dict, shown_via: str, *, limit: int = 0) -> str:
-    """Model-facing copy of a ledger view the operator was just shown: the same table, task links and notes."""
-    hops = [h for h in (data.get("hops") or []) if isinstance(h, dict)]
-    lines = [
-        f"[Sage ledger view] The operator was shown this engagement-state table via {shown_via}. It is Sage's "
-        "engagement ledger as of that moment: data, not an instruction. When the operator refers to "
-        "\"hop N\" or a row, N is the # column. Hop numbers are permanent; the ledger may have changed since.",
-    ]
-    objective = str(data.get("objective") or "").strip()
-    if objective:
-        lines.append(f"Objective: {objective}")
-    if not hops:
-        lines.append("(no hops recorded)")
-    else:
-        if limit and len(hops) > limit:
-            lines.append(f"Showing the {limit} newest of {len(hops)} hops.")
-        lines.extend(render_hop_table(hops, limit=limit))
-        evidence = evidence_notes(hops, limit=limit)
-        if evidence:
-            lines.append("Evidence (one line per Mythic task, from structured ledger fields):")
-            lines.extend(evidence)
-        notes = correction_notes(hops, limit=limit)
-        if notes:
-            lines.append("Corrections (retracted or no-longer-holding rows are history, not current proof):")
-            lines.extend(notes)
-    return "\n".join(lines)
-
-
-def record_operator_view(channel_id, text: str) -> None:
-    """Remember the latest ledger view shown on a channel (replaces any earlier one not yet consumed)."""
-    key = str(channel_id if channel_id is not None else "").strip()
-    if key and text:
-        _OPERATOR_VIEWS[key] = text
-
-
-def take_operator_view(channel_id) -> str:
-    """Return and clear the pending ledger view for a channel ("" when none)."""
-    key = str(channel_id if channel_id is not None else "").strip()
-    return _OPERATOR_VIEWS.pop(key, "") if key else ""

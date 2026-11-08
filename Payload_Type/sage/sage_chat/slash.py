@@ -479,8 +479,8 @@ async def _resolve_chat_ledger(model: Any, request: ChatRequest):
 def _render_ledger_markdown(tools: Any, request: ChatRequest, model: Any, notice: str = "") -> str:
     """Render the operation ledger (every row, corrections marked) from one fresh snapshot.
 
-    The same view (task links and structured notes, never task output) is queued for this channel's next model
-    request so the model can resolve the operator's "hop N" against the rows shown here.
+    The model needs no copy of this table: every Supervisor and Mythic_Operator call carries its own fresh view of
+    the same rows and permanent numbers.
     """
     try:
         from ai.langgraph import engagement_ledger
@@ -517,10 +517,6 @@ def _render_ledger_markdown(tools: Any, request: ChatRequest, model: Any, notice
         "\n**Edit:** `/state remove <#|id[,…]> [--reason …]` · `/state restore <#|id[,…]>` · "
         "`/state invalidate <#|id[,…]>` · `/state objective <text>` · `/state wipe`  "
         "_(# = the permanent hop number, or a hop id/effect/technique)_"
-    )
-    engagement_ledger.record_operator_view(
-        getattr(request, "ChannelID", None),
-        engagement_ledger.operator_view_text({"objective": objective, "hops": hops}, "`/state`"),
     )
     if model is not None:
         out.append(

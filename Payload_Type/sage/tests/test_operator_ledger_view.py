@@ -1,8 +1,8 @@
-"""The model sees the engagement-ledger views the operator is shown, with the same permanent hop numbers.
+"""Permanent hop numbers shared by every ledger view, and the operator-facing `/state` and turn-end tables.
 
-`/state` and the turn-end engagement-state table were operator-only, so "why is hop 1 pending?" had no
-referent in the model's conversation. Hops now carry permanent numbers shared by every view, and the latest
-view shown on a channel enters that channel's next model request once, as hidden ledger data.
+Hops carry permanent numbers shared by every view. The model no longer receives a copy of a table the operator was
+shown: every Supervisor and Mythic_Operator call carries its own fresh view of the same rows (see
+test_engagement_ledger_phase5_fresh_awareness.py), so these operator surfaces queue nothing for the model.
 """
 
 import asyncio
@@ -24,9 +24,6 @@ from tests.esl_fixtures import seed_ledger
 @pytest.fixture(autouse=True)
 def _isolated_ledger(monkeypatch, tmp_path):
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
-    el._OPERATOR_VIEWS.clear()
-    yield
-    el._OPERATOR_VIEWS.clear()
 
 
 # ── permanent hop numbers (allocated by the shared store) ───────────────────────────────
@@ -144,14 +141,12 @@ def test_table_limit_keeps_newest_numbers():
     assert len(lines) == 3 and lines[2].startswith("| 4 |")
 
 
-def test_pending_view_is_per_channel_and_consumed_once():
-    el.record_operator_view(5, "view for 5")
-    assert el.take_operator_view(6) == ""
-    assert el.take_operator_view("5") == "view for 5"
-    assert el.take_operator_view(5) == ""
+def test_operator_view_copy_plumbing_is_retired():
+    for name in ("record_operator_view", "take_operator_view", "operator_view_text", "_OPERATOR_VIEWS"):
+        assert not hasattr(el, name), name
 
 
-# ── /state and the turn-end table both hand their view to the model ─────────────────────
+# ── /state and the turn-end table: unchanged for the operator, no model copy ───────────
 
 
 def _seeded_view_session():
@@ -167,40 +162,26 @@ def _seeded_view_session():
     return mt
 
 
-def test_state_command_queues_the_shown_rows_for_the_model(_restore_namespace):
+def test_state_command_shows_the_rows_unchanged(_restore_namespace):
     mt = _seeded_view_session()
     shown = _state(mt, "")
-    assert "| 2 | `dcsync:corp.local` |" in shown
-    view = el.take_operator_view(5)
-    assert view.startswith("[Sage ledger view]") and "via `/state`" in view
     assert "| 2 | `dcsync:corp.local` | krbtgt-hash:corp.local | `pending (awaiting effect)` | [12](/new/task/12) |" \
-        in view
-    assert "TARGET-OUTPUT-PREVIEW" not in view
-    assert "compromise CORP" in view
+        in shown
+    assert "TARGET-OUTPUT-PREVIEW" not in shown
+    assert "compromise CORP" in shown
 
 
-def test_state_usage_error_does_not_queue_a_view(_restore_namespace):
-    mt = _seeded_view_session()
-    _state(mt, "remove")
-    assert el.take_operator_view(5) == ""
-
-
-def test_turn_end_table_queues_the_same_rows_and_unchanged_queues_nothing(_restore_namespace):
+def test_turn_end_table_shows_the_rows_and_unchanged_on_repeat(_restore_namespace):
     mt = _seeded_view_session()
     model = object.__new__(graph_model.Model)
     model.mythic_client = mt
     model.channel_id = 7
     shown = asyncio.run(model._engagement_state_turn_summary_text())
     assert "| 1 | `kerberoast:svc` |" in shown and "| 2 | `dcsync:corp.local` |" in shown
-    view = el.take_operator_view(7)
-    assert "end-of-turn engagement-state table" in view and "| 2 | `dcsync:corp.local` |" in view
-
     assert "unchanged" in asyncio.run(model._engagement_state_turn_summary_text())
-    assert el.take_operator_view(7) == ""
 
     # A retraction changes neither technique, target nor historical status, but it is a change.
     _state(mt, "remove 1")
-    el.take_operator_view(5)
     shown = asyncio.run(model._engagement_state_turn_summary_text())
     assert "unchanged" not in shown and "operator retracted" in shown
 
@@ -254,27 +235,9 @@ def _drive(m):
     ]
 
 
-def test_next_request_carries_the_view_once_before_the_operator_message():
-    el.record_operator_view(9, "[Sage ledger view] | 1 | `kerberoast:svc` |")
-    el.record_operator_view(10, "[Sage ledger view] other channel")
+def test_a_request_adds_no_ledger_copy_to_the_supervisor_history():
     m, streamed = _inventory_model(9)
-
-    humans = _drive(m)
-    assert [msg.content for msg in humans] == ["[Sage ledger view] | 1 | `kerberoast:svc` |", "list_callbacks"]
-    view_msg, user_msg = humans
-    assert graph_model._is_internal_human_message(view_msg)
-    assert not graph_model._is_internal_human_message(user_msg)
-    assert user_msg.additional_kwargs.get("_operator_input") is True
-    assert view_msg.additional_kwargs["_request_id"] == user_msg.additional_kwargs["_request_id"]
-    assert not any("Sage ledger view" in text for text in streamed)
-
-    # Consumed: a second request adds no second copy, and another channel's view is untouched.
-    humans = _drive(m)
-    assert sum("Sage ledger view" in str(msg.content) for msg in humans) == 1
-    assert el.take_operator_view(10) == "[Sage ledger view] other channel"
-
-
-def test_request_without_a_pending_view_adds_nothing():
-    m, _ = _inventory_model(11)
     humans = _drive(m)
     assert [msg.content for msg in humans] == ["list_callbacks"]
+    assert not any("ledger view" in str(msg.content) for msg in m.state["supervisor_messages"])
+    assert not any("ledger view" in text for text in streamed)

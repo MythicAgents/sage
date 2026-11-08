@@ -235,9 +235,12 @@ def test_every_view_shows_task_links_and_structured_notes_never_output(session, 
     [row] = _typed_rows(_reader())
 
     shown = _state_command(tools)
-    model_view = engagement_ledger.take_operator_view(5)
     turn_end = asyncio.run(model_module.Model._engagement_state_turn_summary_text(SimpleNamespace(mythic_client=tools)))
-    for text in (shown, model_view, turn_end):
+    # The model's own view names the same row and both tasks, from structured fields only.
+    model_view = tools._ledger_model_view()
+    assert f"- #{row.number} r" in model_view and f"tasks {TASK}, {TASK + 1}" in model_view
+    assert NTLM not in model_view and "Hash NTLM" not in model_view and "SAM Username" not in model_view
+    for text in (shown, turn_end):
         assert f"[{TASK}](/new/task/{TASK}), [{TASK + 1}](/new/task/{TASK + 1})" in text
         assert (f"- hop {row.number} · [task {TASK}](/new/task/{TASK}): proves `ntlm` material for "
                 f"`{ACCOUNT}@{REALM}` · Mythic: completion-function error with output · admitted: credential review · "

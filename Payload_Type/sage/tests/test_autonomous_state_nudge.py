@@ -5,8 +5,8 @@ These tests verify the additive, flag-gated, fail-open nudge injection in
 
 - ``Model._build_current_engagement_state`` builds the current EngagementState the
   same way the gate does, best-effort, returning ``None`` on any error (never raises).
-- ``Model._autonomous_nudge_content`` prepends the rendered state + directive when a
-  rendered block is supplied, and is a byte-for-byte no-op when it is not.
+- The autonomous-continue nudge no longer embeds a ledger snapshot: the fresh engagement-ledger view is added to
+  every model call by ``_EngagementLedgerViewMiddleware``.
 
 No live Mythic is required — the MythicTools instance is stubbed and the async
 reconciler is monkeypatched. Async helpers are driven with ``asyncio.run`` because
@@ -124,7 +124,6 @@ def _live_apollo_foothold(callback_id="6"):
     )
 
 
-_DIRECTIVE_MARKER = "do NOT re-issue"
 
 
 # ---------------------------------------------------------------------------
@@ -185,94 +184,14 @@ def test_build_state_fails_open_to_empty_footholds(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 2. Flag-ON: composed nudge contains the achieved hop + the directive
+# 2. The continue nudge carries control text only. The fresh engagement-ledger view rides on every model call
+#    instead (tests/test_engagement_ledger_phase5_fresh_awareness.py asserts the actual inputs).
 # ---------------------------------------------------------------------------
 
 
-def test_nudge_on_contains_achieved_hop_and_directive():
+def test_nudge_composition_helper_is_retired():
     Model = _load_model_class()
-    m = Model.__new__(Model)
-
-    state = engagement_state.EngagementState(
-        objective="test",
-        footholds=[],
-        hops=_achieved_gpo_abuse_hop(),
-    )
-    rendered = engagement_state.render_engagement_state(state)
-
-    base = "[autonomous-continue] base nudge text"
-    out = m._autonomous_nudge_content(base, rendered)
-
-    # The achieved gpo-abuse hop is rendered into the block.
-    assert "Achieved hops:" in out
-    assert "gpo-abuse" in out
-    # The directive is present.
-    assert _DIRECTIVE_MARKER in out
-    # The original base nudge is preserved at the end.
-    assert out.endswith(base)
-    # State + directive precede the base text.
-    assert out.index("gpo-abuse") < out.index(_DIRECTIVE_MARKER) < out.index(base)
-
-
-def test_build_then_render_then_compose_end_to_end(monkeypatch):
-    """Exercise the real path: build state -> render -> compose nudge."""
-    Model = _load_model_class()
-    m = Model.__new__(Model)
-    m.mythic_client = _StubMythicClient(hops=_achieved_gpo_abuse_hop())
-
-    async def _fake_reconcile(client, now):
-        return []
-
-    monkeypatch.setattr(access_reconciler, "reconcile_access", _fake_reconcile)
-
-    state = asyncio.run(m._build_current_engagement_state())
-    rendered = engagement_state.render_engagement_state(state)
-    base = "[autonomous-continue] base nudge text"
-    out = m._autonomous_nudge_content(base, rendered)
-
-    assert "gpo-abuse" in out
-    assert _DIRECTIVE_MARKER in out
-    assert out.endswith(base)
-
-
-# ---------------------------------------------------------------------------
-# 3. Flag-OFF semantics: rendered_state falsy -> base nudge byte-for-byte
-# ---------------------------------------------------------------------------
-
-
-def test_nudge_off_is_byte_for_byte_base():
-    Model = _load_model_class()
-    m = Model.__new__(Model)
-    base = (
-        "[autonomous-continue] You ended your turn without reaching the objective and without an explicit "
-        "handback. Do not stop silently."
-    )
-    out = m._autonomous_nudge_content(base, None)
-    assert out == base
-    # No state header and no directive leaked in.
-    assert "ENGAGEMENT STATE" not in out
-    assert _DIRECTIVE_MARKER not in out
-
-
-def test_nudge_empty_string_state_is_base():
-    Model = _load_model_class()
-    m = Model.__new__(Model)
-    base = "[autonomous-continue] base"
-    assert m._autonomous_nudge_content(base, "") == base
-
-
-# ---------------------------------------------------------------------------
-# 4. Fail-open: render failure / reconcile raise -> plain base, no exception
-# ---------------------------------------------------------------------------
-
-
-def test_nudge_falls_back_to_base_when_render_unavailable():
-    """A None rendered_state (simulating a render/build failure) -> plain base nudge."""
-    Model = _load_model_class()
-    m = Model.__new__(Model)
-    base = "[autonomous-continue] base nudge"
-    out = m._autonomous_nudge_content(base, None)
-    assert out == base
+    assert not hasattr(Model, "_autonomous_nudge_content")
 
 
 def test_build_state_does_not_raise_on_broken_client(monkeypatch):
