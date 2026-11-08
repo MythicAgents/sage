@@ -233,7 +233,7 @@ def stub_mythic_operation(monkeypatch, *, operation_id: int = 1) -> dict:
     from ai.langgraph import mythic_tools as mythic_tools_module
     from ai.langgraph import state_reconcile as sr
 
-    records: dict = {"tasks": [], "outputs": {}, "credentials": [], "callbacks": [], "fail": False,
+    records: dict = {"tasks": [], "outputs": {}, "credentials": [], "files": [], "callbacks": [], "fail": False,
                      "operation_id": operation_id, "queries": 0}
 
     def reachable():
@@ -273,6 +273,12 @@ def stub_mythic_operation(monkeypatch, *, operation_id: int = 1) -> dict:
         mine = [row for row in rows if in_operation(row)]
         return (mine[0], "") if mine else ({}, "not in this operation" if rows else "no such credential")
 
+    async def cited_file(client, op, file_id):
+        reachable()
+        rows = [row for row in records["files"] if row["id"] == int(file_id)]
+        mine = [row for row in rows if in_operation(row)]
+        return (mine[0], "") if mine else ({}, "not in this operation" if rows else "no such file")
+
     async def credit_tasks(client, op, since, until, callback_ids):
         reachable()
         return [{"display_id": task["display_id"], "status": task.get("status"), "completed": task.get("completed"),
@@ -293,6 +299,7 @@ def stub_mythic_operation(monkeypatch, *, operation_id: int = 1) -> dict:
     monkeypatch.setattr(sr, "fetch_cited_task", cited_task)
     monkeypatch.setattr(sr, "fetch_task_credentials", task_credentials)
     monkeypatch.setattr(sr, "fetch_cited_credential", cited_credential)
+    monkeypatch.setattr(sr, "fetch_cited_file", cited_file)
     monkeypatch.setattr(sr, "fetch_callback_credit_tasks", credit_tasks)
     monkeypatch.setattr(sr, "_fetch_task_output_text", output)
     monkeypatch.setattr(mythic_tools_module.MythicTools, "_step_callback_rows", callback_rows)

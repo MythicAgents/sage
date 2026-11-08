@@ -250,7 +250,7 @@ _STATE_USAGE = (
     "Unknown `/state` subcommand. Usage:\n"
     "- `/state` — show the engagement ledger\n"
     "- `/state reconcile [<id>[,<id>…]] [apply]` — record verified effects from the operation's task history, or "
-    "from the cited task IDs and `cred:<id>` entries (credential import is dry-run unless `apply`)\n"
+    "from the cited task IDs, `cred:<id>` and `file:<id>` entries (credential import is dry-run unless `apply`)\n"
     "- `/state set <#|id> achieved task=<id> type=<type> account=<account>@<realm> line=<n> after=<text>` — promote a "
     "pending account-secret row to credential material by citing where the secret is in a task's output\n"
     "- `/state remove <#|id[,…]> [--reason <text>]` — retract rows (kept, numbered, undoable)\n"
@@ -405,8 +405,9 @@ async def _handle_state(model: Any, request: ChatRequest, arg: str = "") -> str:
                         "first, then retry `/state reconcile [<id>[,<id>…]] [apply]`.")
             cited, apply, invalid = _reconcile_citations(rest)
             if invalid:
-                return (f"`/state reconcile` takes Mythic task display IDs or `cred:<credential id>`, separated by "
-                        f"commas, then an optional `apply`; not {', '.join(f'`{item}`' for item in invalid)}.")
+                return (f"`/state reconcile` takes Mythic task display IDs, `cred:<credential id>` or "
+                        f"`file:<file id>`, separated by commas, then an optional `apply`; not "
+                        f"{', '.join(f'`{item}`' for item in invalid)}.")
             notes = await tools._reconcile_operation(cited, apply=apply)
             return _render_ledger_markdown(tools, request, model, notice="\n".join(notes))
     except Exception as exc:
@@ -417,7 +418,11 @@ async def _handle_state(model: Any, request: ChatRequest, arg: str = "") -> str:
 
 
 def _reconcile_citations(text: str) -> tuple[list[str], bool, list[str]]:
-    """Parse `[<id>[,<id>…]] [apply]`: task display IDs and `cred:<id>`. Returns (cited, apply, invalid)."""
+    """Parse `[<id>[,<id>…]] [apply]`: task display IDs, `cred:<id>` and `file:<id>`. Returns (cited, apply, invalid).
+
+    A `cred:<id>` or `file:<id>` is operator-entered material: alone it is not proof of use, and the reply says so;
+    cited together with the proving task's ID it requests verification that the task's action used that exact
+    material."""
     cited: list[str] = []
     invalid: list[str] = []
     apply = False
@@ -427,8 +432,9 @@ def _reconcile_citations(text: str) -> tuple[list[str], bool, list[str]]:
             apply = True
         elif token.isdigit():
             cited.append(str(int(token)))
-        elif lowered.startswith("cred:") and lowered[len("cred:"):].isdigit():
-            cited.append(f"cred:{int(lowered[len('cred:'):])}")
+        elif lowered.startswith(("cred:", "file:")) and lowered.split(":", 1)[1].isdigit():
+            prefix, _, number = lowered.partition(":")
+            cited.append(f"{prefix}:{int(number)}")
         else:
             invalid.append(token)
     return list(dict.fromkeys(cited)), apply, invalid

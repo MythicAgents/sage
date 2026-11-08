@@ -25,9 +25,10 @@ import re
 from typing import Any, Mapping
 
 try:
-    from . import credential_artifacts, task_evidence
+    from . import credential_artifacts, intent_classifier, task_evidence
 except ImportError:  # pragma: no cover - flat import for tests that put ai/langgraph on sys.path
     import credential_artifacts  # type: ignore
+    import intent_classifier  # type: ignore
     import task_evidence  # type: ignore
 
 
@@ -887,3 +888,188 @@ def is_domain_head_dn(dn: str) -> bool:
     live on this object; the same grant against an OU or leaf does not confer domain DCSync."""
     normalized = normalize_dn(dn)
     return bool(normalized) and all(rdn.startswith("dc=") for rdn in normalized.split(","))
+
+
+# --- Cross-task session proof -----------------------------------------------------------------------------------
+#
+# A context-changing task (make_token, ticket import, revert) records a non-secret ``session_context`` observation:
+# the identity now active on that callback lifetime. It is NOT evidence that authentication worked — it is the
+# sequence anchor a later proof joins to. A ``session_use`` observation is a later terminal-success network action
+# whose own response established access to a named resource. A working session is admitted only when a use joins the
+# setup that controls it: the same callback lifetime, the latest context before the use, matching identity and logon
+# id, with no intervening or ambiguous context change. The write's success message, a bare ticket/bind marker, a
+# local whoami or an anonymous read never prove use.
+
+SESSION_CONTEXT = "session_context"
+SESSION_USE = "session_use"
+SESSION_VERIFIER = "effect_observations:session"
+# How long a pass keeps joining a setup to a later use before it stops polling. Citing the proving task still records
+# it; expiry only ends the automatic search, as for the directory joins.
+SESSION_JOIN_WINDOW_SECONDS = 86400
+# The modeled rows a proven session records. Kerberos reuses the account-context vocabulary; a non-Kerberos resource
+# access is scoped to the resource and never labelled Kerberos or inferred as domain administration.
+SESSION_KERBEROS_TECHNIQUE = "kerberos-account-context"
+SESSION_RESOURCE_TECHNIQUE = "authenticated-session"
+
+
+def _session_identity_from_params(params: Any) -> str:
+    """``account@domain`` a make_token's parameters name (``--username``/``--domain``, ``DOMAIN\\user`` or
+    ``user@domain``), casefolded, else ''."""
+    user = intent_classifier.flag_value(params, "username") or intent_classifier.flag_value(params, "user")
+    domain = intent_classifier.flag_value(params, "domain") or intent_classifier.flag_value(params, "realm")
+    user = _text(user)
+    domain = _text(domain)
+    if user and not domain and "\\" in user:
+        domain, _, user = user.partition("\\")
+    if user and not domain and "@" in user:
+        user, _, domain = user.partition("@")
+    return f"{user}@{domain}".casefold() if user and domain else ""
+
+
+def _session_lifetime(values: Mapping[str, Any]) -> str:
+    return _text(values.get("agent_callback_id")) or f"callback:{_text(values.get('callback_id'))}"
+
+
+def session_context_observation(task: Mapping[str, Any] | None, output: Any, terminal_status: str, observed_at: str,
+                                *, params: Any = "") -> Observation | None:
+    """A ``session_context`` observation for a terminal-success context-changing task, else None.
+
+    ``set`` (make_token / ticket import) carries the new identity and opens an awaiting join; ``cleared`` (revert /
+    purge) only records the sequence break. A set whose account cannot be bound (no identity in output or parameters)
+    is ambiguous and anchors nothing.
+    """
+    values = normalize_task(task)
+    if not values or values.get("task_classification") != task_evidence.TERMINAL_SUCCESS:
+        return None
+    change = credential_artifacts.session_setup_change(values.get("command_name"), output)
+    if change is None:
+        return None
+    identity = _session_identity_from_params(params) or _text(change.get("identity"))
+    if change["change_kind"] == "set" and not identity:
+        return None
+    lifetime = _session_lifetime(values)
+    values.update({
+        "change_kind": change["change_kind"], "identity": identity, "is_kerberos": bool(change["is_kerberos"]),
+        "logon_id": _text(change.get("logon_id")), "callback_lifetime": lifetime,
+        "terminal_status": _text(terminal_status),
+    })
+    task_id = str(values["task_id"])
+    subject = f"{lifetime}|{task_id}|{identity or change['change_kind']}"
+    join_state = JOIN_AWAITING if change["change_kind"] == "set" else NO_JOIN
+    reason = ("awaiting a later network action that proves this context reaches a resource"
+              if join_state == JOIN_AWAITING else "")
+    return Observation(
+        kind=SESSION_CONTEXT, source_kind="task", source_id=task_id, subject=subject, observed_at=_text(observed_at),
+        values=values, task_id=task_id, callback_id=str(values["callback_id"]),
+        agent_callback_id=str(values["agent_callback_id"]), supporting=(f"task:{task_id}",),
+        verifier_id=SESSION_VERIFIER, reason=reason, join_state=join_state,
+    )
+
+
+def session_use_observation(task: Mapping[str, Any] | None, output: Any, terminal_status: str,
+                            observed_at: str) -> Observation | None:
+    """A ``session_use`` observation for a terminal-success task whose response established authenticated access to a
+    named resource, else None. A structured directory read of an exact object also counts, unless anonymous."""
+    values = normalize_task(task)
+    if not values or values.get("task_classification") != task_evidence.TERMINAL_SUCCESS:
+        return None
+    probe = dict(credential_artifacts.extract_session_use_probe(output))
+    read = parse_acl_read(output)
+    if not read.reason and read.object_dn and read.complete and not probe["anonymous"]:
+        probe["ldap_access_proven"] = True
+        if not probe["resource"]:
+            probe["resource"] = read.object_dn
+    if not (probe["service_access_proven"] or probe["ticket_valid"] or probe["ldap_access_proven"]):
+        return None
+    lifetime = _session_lifetime(values)
+    values.update({"callback_lifetime": lifetime, "terminal_status": _text(terminal_status),
+                   "logon_id": credential_artifacts.session_logon_id(output), **probe})
+    task_id = str(values["task_id"])
+    subject = f"{lifetime}|{task_id}|{probe.get('resource') or 'resource'}"
+    return Observation(
+        kind=SESSION_USE, source_kind="task", source_id=task_id, subject=subject, observed_at=_text(observed_at),
+        values=values, task_id=task_id, callback_id=str(values["callback_id"]),
+        agent_callback_id=str(values["agent_callback_id"]), supporting=(f"task:{task_id}",),
+        verifier_id=SESSION_VERIFIER,
+    )
+
+
+def _values(row: Mapping[str, Any]) -> dict[str, Any]:
+    return (row.get("payload") or {}).get("values") or {}
+
+
+def resolve_session_use(join: Mapping[str, Any], contexts: list[Mapping[str, Any]],
+                        uses: list[Mapping[str, Any]]) -> tuple[Mapping[str, Any] | None, str]:
+    """(the first later use that proves this setup's context, '') or (None, why not yet).
+
+    A use proves a setup only when the setup is the controlling context for that use: the latest ``set`` on the same
+    callback lifetime before the use, with no intervening context change. Identity and logon id, where the use names
+    them, must match; an anonymous read is never use."""
+    jv = _values(join)
+    lifetime = jv.get("callback_lifetime")
+    setup_task = _task_number(jv.get("task_id"))
+    identity = _text(jv.get("identity"))
+    logon = _text(jv.get("logon_id"))
+    sequence = sorted(
+        ((_task_number(_values(ctx).get("task_id")), _values(ctx)) for ctx in contexts
+         if _values(ctx).get("callback_lifetime") == lifetime),
+        key=lambda item: item[0])
+    reason = "no later network action proved this context reaches a resource"
+    for use in sorted(uses, key=lambda row: _task_number(_values(row).get("task_id"))):
+        uv = _values(use)
+        if uv.get("callback_lifetime") != lifetime:
+            continue
+        use_task = _task_number(uv.get("task_id"))
+        if use_task <= setup_task:
+            continue
+        controlling = None
+        for number, cv in sequence:
+            if number < use_task:
+                controlling = (number, cv)
+            else:
+                break
+        if controlling is None or controlling[0] != setup_task or controlling[1].get("change_kind") != "set":
+            # a later or ambiguous context change controls this use, not this setup
+            continue
+        use_identity = _text(uv.get("client_identity"))
+        if use_identity and identity and use_identity != identity:
+            reason = "the later action proved a different account's access, not this session's"
+            continue
+        use_logon = _text(uv.get("logon_id"))
+        if logon and use_logon and use_logon != logon:
+            reason = "the later action ran under a different logon id (a different session)"
+            continue
+        if not (uv.get("service_access_proven") or uv.get("ticket_valid") or uv.get("ldap_access_proven")):
+            continue
+        return use, ""
+    return None, reason
+
+
+def session_superseded(join: Mapping[str, Any], contexts: list[Mapping[str, Any]]) -> bool:
+    """Whether a later context change on the same callback lifetime has replaced this setup (a new ``set`` with a
+    different identity, or a ``cleared``), so its session scope no longer holds even before any use proved it."""
+    jv = _values(join)
+    lifetime, setup_task = jv.get("callback_lifetime"), _task_number(jv.get("task_id"))
+    identity = _text(jv.get("identity"))
+    for ctx in contexts:
+        cv = _values(ctx)
+        if cv.get("callback_lifetime") != lifetime:
+            continue
+        number = _task_number(cv.get("task_id"))
+        if number <= setup_task:
+            continue
+        if cv.get("change_kind") == "cleared" or _text(cv.get("identity")) != identity:
+            return True
+    return False
+
+
+def session_row(use: Mapping[str, Any], setup: Mapping[str, Any]) -> tuple[str, str, str]:
+    """(technique, target, resource) for the working-session row a resolved use records. Kerberos reuses the
+    account-context vocabulary; a non-Kerberos access is scoped to its resource."""
+    sv, uv = setup, use
+    identity = _text(sv.get("identity"))
+    resource = _text(uv.get("resource"))
+    if sv.get("is_kerberos"):
+        return SESSION_KERBEROS_TECHNIQUE, identity, resource
+    target = f"{identity}@{resource}" if identity and resource else (identity or resource)
+    return SESSION_RESOURCE_TECHNIQUE, target.casefold(), resource

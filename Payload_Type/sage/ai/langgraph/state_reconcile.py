@@ -136,6 +136,22 @@ async def fetch_cited_credential(client, operation_id, credential_id: int) -> tu
     return {}, ("not in this operation" if rows else "no such credential")
 
 
+_FILE_FIELDS = ("id agent_file_id filename_utf8 operation_id md5 sha1 comment "
+                "task { display_id operation_id command_name }")
+
+
+async def fetch_cited_file(client, operation_id, file_id: int) -> tuple[dict, str]:
+    """The cited Mythic file artifact in this operation, or ({}, reason). Its bytes are never read here: the artifact
+    is matched to a proving task by its identity (``agent_file_id``/digest/reference), not by its content."""
+    query = ("query SageCitedFile($id: Int!) { filemeta(where: {id: {_eq: $id}, deleted: {_eq: false}}) "
+             f"{{ {_FILE_FIELDS} }} }}")
+    rows = _rows(await mythic.execute_custom_query(client, query, variables={"id": int(file_id)}), "filemeta")
+    matching = [row for row in rows if operation_id is None or row.get("operation_id") == operation_id]
+    if matching:
+        return matching[0], ""
+    return {}, ("not in this operation" if rows else "no such file")
+
+
 async def fetch_callback_credit_tasks(client, operation_id, since: str, until: str, callback_ids) -> list[dict]:
     """Operation tasks that may be credited with a callback gain: tasks created in the attribution window, and the
     latest tasks on the gained callbacks. Any issuer.
@@ -446,6 +462,7 @@ async def verify_and_observe_task(client, task: dict, now: str, *, engagement_id
     output = await _fetch_task_output_text(client, int(display_id))
     context = _task_with_foothold_context(task, foothold_by_callback)
     observations = list(_task_reconciler.directory_observations(context, output, now))
+    observations += list(_task_reconciler.session_observations(context, output, now))
     return await _verified_from_output(context, output, now, engagement_id=engagement_id, display_id=display_id,
                                  client=client, apply=apply, observations=observations)
 

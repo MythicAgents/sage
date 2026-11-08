@@ -544,3 +544,110 @@ def extract_ticket_probe(output, expected_domain=None, expected_netbios=None, ex
         "ptt_attempted": bool(ticket_forged and "/ptt" in low),
         "ticket_error": bool(failed),
     }
+
+
+# --- Cross-task session proof (checkpoint 3) ---------------------------------------------------------------------
+#
+# A working session is two independent records joined: a context-changing task established an identity, and a later
+# network action proved that identity reaches a named resource. Neither half is proof on its own. The setup markers
+# recognize the context change (make_token / ticket import / revert); the use probe recognizes a later action whose
+# ACTUAL response establishes access. A make_token success, a bare ticket-present/bind-success marker, a local
+# whoami or an anonymous read is never use.
+
+_MAKE_TOKEN_MARKERS = (
+    "successfully set primary identity",
+    "successfully impersonated",
+    "successfully made token",
+    "new claims",
+)
+_TICKET_IMPORT_MARKERS = (
+    "ticket successfully imported",
+    "successfully imported ticket",
+    "ticket successfully submitted",
+    "successfully submitted ticket",
+    "applied ticket to current logon session",
+)
+_REVERT_MARKERS = ("reverted to self", "token has been reverted", "rev2self succeeded")
+# The Rubeus/klist "Client: user @ DOMAIN" line and the DOMAIN\user form that make_token echoes.
+_CLIENT_AT_RE = re.compile(r"(?im)client(?:\s*name)?\s*[:=]\s*([^\s@\\/]+)\s*@\s*([^\s,;]+)")
+_CLIENT_BACKSLASH_RE = re.compile(r"(?im)(?:impersonated|identity|user)[^\n]*?\b([a-z0-9_.\-]+)\\([^\s,;]+)")
+_LOGON_ID_RE = re.compile(r"(?im)(?:logon\s*id|luid)\s*[:=]\s*(0x[0-9a-f]+(?:\s*,\s*0x[0-9a-f]+)?|\d+)")
+# An anonymous / null-session read is not authenticated use, whatever object it returns.
+_ANONYMOUS_MARKERS = ("anonymous logon", "null session", "anonymous bind", "logged on anonymously")
+# An explicit authenticated LDAP/service response marker beside the returned object.
+_LDAP_ACCESS_MARKERS = ("ldap_success", "bound as", "search completed", "ldap bind succeeded")
+
+
+def principal_from_text(text: Any) -> str:
+    """``account@domain`` for an identity a session action's output names (a Kerberos ``Client:`` line or a
+    ``DOMAIN\\user`` echo), casefolded, else ''. The domain is normalized to its label-or-FQDN as printed."""
+    raw = _probe_text(text)
+    match = _CLIENT_AT_RE.search(raw)
+    if match:
+        return f"{match.group(1)}@{match.group(2)}".casefold()
+    match = _CLIENT_BACKSLASH_RE.search(raw)
+    if match:
+        return f"{match.group(2)}@{match.group(1)}".casefold()
+    return ""
+
+
+def session_logon_id(text: Any) -> str:
+    """The LUID/logon identifier a session action's output exposes, normalized, else ''."""
+    match = _LOGON_ID_RE.search(_probe_text(text))
+    return re.sub(r"\s+", "", match.group(1)).casefold() if match else ""
+
+
+def session_setup_change(command: Any, output: Any) -> dict | None:
+    """Classify a terminal-success task as a context change, or None.
+
+    Returns ``{"change_kind": "set"|"cleared", "is_kerberos": bool, "identity": str, "logon_id": str}``. A revert or
+    purge only *closes* the prior sequence (``cleared``, no identity). A make_token / ticket import that reports
+    success *sets* a new identity to be proven; the identity it names in output is returned when present (the caller
+    fills it from the task parameters otherwise).
+    """
+    cmd = (command if isinstance(command, str) else str(command or "")).casefold()
+    low = _probe_text(output).casefold()
+    if not low.strip():
+        return None
+    if ("rev2self" in cmd or ("klist" in cmd and "purge" in low)
+            or any(marker in low for marker in _REVERT_MARKERS)):
+        if any(bad in low for bad in ("fail", "error", "denied")):
+            return None
+        return {"change_kind": "cleared", "is_kerberos": False, "identity": "", "logon_id": ""}
+    is_ticket = any(marker in low for marker in _TICKET_IMPORT_MARKERS)
+    is_token = "make_token" in cmd and any(marker in low for marker in _MAKE_TOKEN_MARKERS)
+    if not (is_ticket or is_token):
+        return None
+    return {"change_kind": "set", "is_kerberos": bool(is_ticket),
+            "identity": principal_from_text(output), "logon_id": session_logon_id(output)}
+
+
+def extract_session_use_probe(output: Any) -> dict:
+    """Structured proof that a later network action reached a named resource, from its actual response.
+
+    ``service_access_proven`` is a genuine remote directory listing (reusing the ticket verifier's rule);
+    ``ticket_valid`` is an explicit AP-REQ/authentication success; ``ldap_access_proven`` is an authenticated LDAP
+    response marker. ``anonymous`` records a null-session read (never use). ``client_identity``/``resource`` name the
+    identity and resource the response establishes. A make_token/bind-success/whoami/ticket-present line sets none of
+    the proof booleans.
+    """
+    text = _probe_text(output)
+    low = text.casefold()
+    anonymous = any(marker in low for marker in _ANONYMOUS_MARKERS)
+    service_access = _service_access_proven(text) and not any(
+        token in low for token in ("access is denied", "access denied", "logon failure"))
+    ticket_valid = any(marker in low for marker in (
+        "ap-req succeeded", "authentication succeeded", "kerberos ticket is valid", "validated ticket"))
+    ldap_access = any(marker in low for marker in _LDAP_ACCESS_MARKERS)
+    resource = ""
+    share = _ADMIN_SHARE_RE.search(text)
+    if share:
+        resource = share.group(1).casefold()
+    return {
+        "service_access_proven": bool(service_access and not anonymous),
+        "ticket_valid": bool(ticket_valid and not anonymous),
+        "ldap_access_proven": bool(ldap_access and not anonymous),
+        "anonymous": bool(anonymous),
+        "client_identity": principal_from_text(output),
+        "resource": resource,
+    }

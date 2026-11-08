@@ -203,6 +203,23 @@ def directory_observations(task: dict[str, Any], output: Any, now: str) -> list:
     return out
 
 
+def session_observations(task: dict[str, Any], output: Any, now: str) -> list:
+    """Session observations a terminal task supplies: a ``session_context`` for a context-changing task
+    (make_token / ticket import / revert), and a ``session_use`` when its output is a later authenticated network
+    action. Neither is proof on its own; the reconciler joins a setup to a later use that it controls."""
+    out = []
+    record = task_evidence.task_record_from_row(task, has_output=bool(_text(output).strip()))
+    terminal_status = task_evidence.envelope_terminal_status(task_evidence.classify_task(record), record)
+    params = task.get("original_params") or task.get("display_params") or task.get("parameters") or ""
+    context = effect_observations.session_context_observation(task, output, terminal_status, now, params=params)
+    if context is not None:
+        out.append(context)
+    use = effect_observations.session_use_observation(task, output, terminal_status, now)
+    if use is not None:
+        out.append(use)
+    return out
+
+
 def _extract_domain_admin_membership_probe(output: Any, *, callback: dict[str, Any] | None = None) -> dict[str, Any]:
     text = _text(output)
     low = text.casefold()

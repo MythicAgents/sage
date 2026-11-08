@@ -278,7 +278,8 @@ def test_cited_ids_reply_one_line_each_with_the_row_or_the_reason(operation, myt
         "- 31: not added, task not terminal.",
         "- 32: not added, not in this operation.",
         "- 99: not added, no such task.",
-        "- cred:42: not added, no producing task (a later action must prove it; not supported yet).",
+        "- cred:42: not added, no proof of use; cite the proving task whose action used this entry (the entry "
+        "alone is not proof).",
     ]
     assert asyncio.run(tools._reconcile_operation(["17", "cred:41"]))[:2] == [
         "- 17: already recorded (row #1).", "- cred:41: already recorded (row #2)."]
@@ -851,7 +852,7 @@ def test_state_reconcile_cites_tasks_and_credentials_through_the_chat_command(op
     model = SimpleNamespace(mythic_client=tools, mode="supervised", provider="t", model="t", state={})
     request = build_chat_request("x", channel_id=3, operation_id=0)
     reply = asyncio.run(slash._handle_state(model, request, "reconcile 17, cred:42"))
-    assert "- 17: added row #1." in reply and "- cred:42: not added, no producing task" in reply
+    assert "- 17: added row #1." in reply and "- cred:42: not added, no proof of use; cite the proving task" in reply
     assert "`/state reconcile <id>`" in asyncio.run(slash._handle_state(model, request, "set 1 achieved"))
 
 

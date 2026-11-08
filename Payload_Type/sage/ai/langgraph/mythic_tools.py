@@ -19712,6 +19712,222 @@ class MythicTools:
                     produced.setdefault(owner, []).append(identity)
         return state
 
+    def _session_use_hops(self, state, binding, store, stored_joins, observed, now, *, cited: bool,
+                          observations: list, transitions: list, produced: dict, mutation_ids: dict,
+                          reasons: dict):
+        """Index this pass's session context changes and uses, and record each working session a later use proves.
+
+        A context-changing task is the sequence anchor, not proof: its awaiting join resolves only when a later
+        terminal-success network action, controlled by that setup (the latest context before it, same lifetime, no
+        intervening change), establishes access. The achieved row's proving task is that use. Mutates the passed
+        ``observations``/``transitions``/``produced``/``mutation_ids``/``reasons`` and returns the state."""
+        try:
+            from . import effect_observations as eo, engagement_state, engagement_store, proof_boundary, state_reconcile
+            from . import capabilities
+        except ImportError:
+            import effect_observations as eo
+            import engagement_state
+            import engagement_store
+            import proof_boundary
+            import state_reconcile
+            import capabilities
+
+        def as_row(item):
+            return {"observation_id": item.observation_id, "observed_at": item.observed_at, "task_id": item.task_id,
+                    "subject": item.subject, "payload": item.payload()}
+
+        new_contexts = [(key, item) for key, item in observed if item.kind == eo.SESSION_CONTEXT]
+        new_uses = [(key, item) for key, item in observed if item.kind == eo.SESSION_USE]
+        every = [item for _key, item in new_contexts + new_uses]
+        states = store.observation_states(binding, [item.observation_id for item in every])
+        for _key, item in new_uses:
+            observations.append(engagement_store.ObservationRecord(**item.record()))
+        pending = [(None, join) for join in stored_joins]
+        stored_ids = {join["observation_id"] for join in stored_joins}
+        for key, item in new_contexts:
+            if states.get(item.observation_id) in (eo.JOIN_RESOLVED, eo.JOIN_EXPIRED):
+                reasons.setdefault(key, "no proven gain; this context was already settled or no later use proved it")
+                continue
+            if item.observation_id not in states:
+                observations.append(engagement_store.ObservationRecord(**item.record()))
+            if item.join_state == eo.JOIN_AWAITING and item.observation_id not in stored_ids:
+                pending.append((key, as_row(item)))
+        setup_pending = [(key, join) for key, join in pending if eo._values(join).get("change_kind") == "set"]
+        if not setup_pending:
+            return state
+        contexts = list(store.observations(binding, kind=eo.SESSION_CONTEXT))
+        contexts += [as_row(item) for _key, item in new_contexts]
+        uses = list(store.observations(binding, kind=eo.SESSION_USE))
+        uses += [as_row(item) for _key, item in new_uses]
+        use_keys = {item.observation_id: key for key, item in new_uses}
+        for key, join in setup_pending:
+            setup_values = eo._values(join)
+            use, reason = eo.resolve_session_use(join, contexts, uses)
+            if use is None:
+                if eo.session_superseded(join, contexts):
+                    transitions.append(engagement_store.JoinTransition(
+                        join["observation_id"], eo.JOIN_EXPIRED,
+                        reason="a later context change replaced this session before any use proved it"))
+                elif key is not None:
+                    reasons.setdefault(key, f"no proven gain yet; the context is a candidate: {reason}")
+                elif not cited and eo.join_expired(join["observed_at"], now, eo.SESSION_JOIN_WINDOW_SECONDS):
+                    transitions.append(engagement_store.JoinTransition(
+                        join["observation_id"], eo.JOIN_EXPIRED,
+                        reason="no later use proved this context within the window; cite the proving task"))
+                continue
+            use_values = eo._values(use)
+            technique, target, resource = eo.session_row(use_values, setup_values)
+            if setup_values.get("is_kerberos"):
+                account, _, domain = eo._text(setup_values.get("identity")).partition("@")
+                probe = {
+                    "callback_id": use_values.get("callback_id"), "account": account, "domain": domain,
+                    "account_ticket_present": True, "ticket_client_matches_account": True,
+                    "logon_context_proven": True, "account_context_proven": True,
+                    "service_access_proven": bool(use_values.get("service_access_proven")),
+                    "ticket_valid": bool(use_values.get("ticket_valid")),
+                    "ldap_access_proven": bool(use_values.get("ldap_access_proven")),
+                }
+                if capabilities.verify_account_kerberos_context(probe).verdict != "achieved":
+                    if key is not None:
+                        reasons.setdefault(key, "no proven gain yet; the account context is not fully proven")
+                    continue
+            use_task = str(use_values.get("task_id"))
+            transaction_id = f"session-use:{setup_values.get('task_id')}"
+            envelope = proof_boundary.make_runtime_task_envelope(
+                engagement_id=self._eng_key(), callback_id=use_values.get("callback_id"), task_id=use_task,
+                terminal_status=str(use_values.get("terminal_status") or ""),
+                command=str(use_values.get("command_name") or ""), verifier_id=eo.SESSION_VERIFIER, captured_at=now,
+                transaction_id=transaction_id,
+                verifier_input={"setup": join["observation_id"], "setup_values_sha256": join["payload"].get("values_sha256"),
+                                "use": use["observation_id"], "use_values_sha256": use["payload"].get("values_sha256")},
+                verifier_result={"verdict": "achieved", "technique": technique, "target": target, "resource": resource},
+                metadata={"reconciled": True, "setup_task_id": setup_values.get("task_id"),
+                          "task_classification": use_values.get("task_classification")},
+            )
+            evidence = {
+                "source": "task_history_reconcile", "provenance": "operator_task", "mythic_task_id": use_task,
+                "callback_id": use_values.get("callback_id"), "command": use_values.get("command_name"),
+                "verify_verdict": "achieved", "verified_on_record": True, "artifact_present": True,
+                "reconciled_at": now, "task_classification": use_values.get("task_classification"),
+                "transaction_id": transaction_id, "terminal_task_status": use_values.get("terminal_status"),
+                "setup_task_id": setup_values.get("task_id"), "session_resource": resource,
+                "proof_envelope": envelope.to_dict(),
+            }
+            state = engagement_state.record_hop_result(
+                state, technique, target, "achieved", evidence, now, proof_envelope=evidence["proof_envelope"],
+                require_admissible_proof=True, engagement_id=self._eng_key(),
+            )
+            identity = engagement_state.typed_row_identity(state, technique, target)
+            mutation_ids.setdefault(identity, state_reconcile._reconcile_mutation_id(
+                self._eng_key(), use_task, identity, {"session_setup": join["observation_id"]}))
+            transitions.append(engagement_store.JoinTransition(
+                join["observation_id"], eo.JOIN_RESOLVED, reason="a later use proved the session",
+                resolved_by=f"task:{use_task}"))
+            for owner in (use_keys.get(use["observation_id"]), key):
+                if owner is not None:
+                    produced.setdefault(owner, []).append(identity)
+        return state
+
+    @staticmethod
+    def _material_binds(material: dict, params_text: str) -> str:
+        """How a proving task's parameters bind an operator-entered credential or file artifact: a trusted
+        ``@cred:``/``@file:`` reference, a matching artifact digest/id, or the exact secret found in the task's own
+        input — compared in memory only, never logged or stored. '' when nothing but the account name matches, which
+        is never a binding (a different password or ticket for that account must not validate the citation)."""
+        text = params_text or ""
+        low = text.casefold()
+        identifier = material.get("id")
+        if material.get("kind") == "credential":
+            if identifier is not None and f"@cred:{identifier}" in low:
+                return "reference"
+            secret = str(material.get("cred_text") or "")
+            return "material" if secret and secret in text else ""
+        if identifier is not None and f"@file:{identifier}" in low:
+            return "reference"
+        for token in (material.get("agent_file_id"), material.get("md5"), material.get("sha1")):
+            token = str(token or "")
+            if token and token.casefold() in low:
+                return "material"
+        return ""
+
+    def _cited_material_hops(self, state, materials, evaluate, observed, now, *, produced: dict,
+                             mutation_ids: dict, reasons: dict):
+        """Record the proven access an operator-entered credential or file artifact enabled, when a co-cited proving
+        task's own action used that exact material and reached a resource.
+
+        The citation is never proof on its own: the row's lineage is the proving task, and the material is retained
+        only as the non-task source id. A material cited without a proving task that used it, or whose binding or use
+        is missing, gets the exact missing/ambiguous link instead of a gain."""
+        try:
+            from . import effect_observations as eo, engagement_state, proof_boundary, state_reconcile
+        except ImportError:
+            import effect_observations as eo
+            import engagement_state
+            import proof_boundary
+            import state_reconcile
+
+        uses_by_task = {okey: obs for okey, obs in observed if obs.kind == eo.SESSION_USE}
+        contexts_by_task = {okey: obs for okey, obs in observed if obs.kind == eo.SESSION_CONTEXT}
+        for key, material in materials:
+            bound = None
+            for tkey, task in evaluate:
+                params = task.get("original_params") or task.get("display_params") or task.get("parameters") or ""
+                binding_kind = self._material_binds(material, str(params))
+                if binding_kind and tkey in uses_by_task:
+                    bound = (tkey, task, uses_by_task[tkey], binding_kind)
+                    break
+            if bound is None:
+                reasons.setdefault(key, "no proven gain; cite the proving task whose own action used this entry and "
+                                        "reached a resource (the entry alone is not proof of use)")
+                continue
+            tkey, task, use, binding_kind = bound
+            use_values = use.payload()["values"]
+            if material.get("kind") == "credential":
+                account, realm = eo._text(material.get("account")), eo._text(material.get("realm"))
+                identity = f"{account}@{realm}".casefold() if account and realm else ""
+                is_kerberos = False
+            else:
+                identity = eo._text(use_values.get("client_identity"))
+                context = contexts_by_task.get(tkey)
+                if not identity and context is not None:
+                    identity = eo._text(context.payload()["values"].get("identity"))
+                is_kerberos = bool(use_values.get("ticket_valid"))
+            if not identity:
+                reasons.setdefault(key, "no proven gain; the proving task's action does not name the identity this "
+                                        "artifact grants")
+                continue
+            technique, target, resource = eo.session_row(use_values, {"identity": identity, "is_kerberos": is_kerberos})
+            use_task = str(use_values.get("task_id"))
+            transaction_id = f"cited-material:{key}"
+            envelope = proof_boundary.make_runtime_task_envelope(
+                engagement_id=self._eng_key(), callback_id=use_values.get("callback_id"), task_id=use_task,
+                terminal_status=str(use_values.get("terminal_status") or ""),
+                command=str(use_values.get("command_name") or ""), verifier_id=eo.SESSION_VERIFIER, captured_at=now,
+                transaction_id=transaction_id,
+                verifier_input={"cited_source": key, "binding": binding_kind, "use": use.observation_id,
+                                "use_values_sha256": use.payload().get("values_sha256")},
+                verifier_result={"verdict": "achieved", "technique": technique, "target": target, "resource": resource},
+                metadata={"reconciled": True, "cited_source": key, "binding": binding_kind,
+                          "task_classification": use_values.get("task_classification")},
+            )
+            evidence = {
+                "source": "task_history_reconcile", "provenance": "operator_task", "mythic_task_id": use_task,
+                "callback_id": use_values.get("callback_id"), "command": use_values.get("command_name"),
+                "verify_verdict": "achieved", "verified_on_record": True, "artifact_present": True, "reconciled_at": now,
+                "task_classification": use_values.get("task_classification"), "transaction_id": transaction_id,
+                "terminal_task_status": use_values.get("terminal_status"), "cited_source": key,
+                "session_resource": resource, "proof_envelope": envelope.to_dict(),
+            }
+            state = engagement_state.record_hop_result(
+                state, technique, target, "achieved", evidence, now, proof_envelope=evidence["proof_envelope"],
+                require_admissible_proof=True, engagement_id=self._eng_key(),
+            )
+            row_identity = engagement_state.typed_row_identity(state, technique, target)
+            mutation_ids.setdefault(row_identity, state_reconcile._reconcile_mutation_id(
+                self._eng_key(), use_task, row_identity, {"cited_source": key}))
+            produced.setdefault(key, []).append(row_identity)
+        return state
+
     async def _reconcile_operation(self, cited=(), *, apply: bool = False) -> list[str]:
         """One reconciliation pass over the operation's task history, or the cited tasks and credentials.
 
@@ -19740,6 +19956,9 @@ class MythicTools:
         # Directory writes awaiting a later read of the object they changed.
         directory_joins = store.awaiting_joins(binding, effect_observations.DIRECTORY_CHANGE_JOIN,
                                                limit=effect_observations.JOIN_LIMIT)
+        # Context changes awaiting a later network action that proves the session reaches a resource.
+        session_joins = store.awaiting_joins(binding, effect_observations.SESSION_CONTEXT,
+                                             limit=effect_observations.JOIN_LIMIT)
         operation_id = await self._ledger_operation_id()
         now = datetime.now(timezone.utc).isoformat()
         initial = list(self._ledger_view().hops)
@@ -19751,6 +19970,7 @@ class MythicTools:
         produced: dict[str, list[str]] = {}
         evaluate: list[tuple[str, dict]] = []
         credentials: list[tuple[str, dict]] = []
+        files: list[tuple[str, dict]] = []
         update = None
         if cited:
             for item in cited:
@@ -19761,6 +19981,14 @@ class MythicTools:
                         reasons[item] = reason
                     else:
                         credentials.append((item, row))
+                    continue
+                if item.startswith("file:"):
+                    row, reason = await state_reconcile.fetch_cited_file(
+                        self.client, operation_id, int(item[len("file:"):]))
+                    if reason:
+                        reasons[item] = reason
+                    else:
+                        files.append((item, row))
                     continue
                 task, reason = await state_reconcile.fetch_cited_task(self.client, operation_id, int(item))
                 if not reason and not state_reconcile.is_terminal(task):
@@ -19858,6 +20086,11 @@ class MythicTools:
             observations=observations, transitions=transitions, produced=produced, mutation_ids=mutation_ids,
             reasons=reasons,
         )
+        state = self._session_use_hops(
+            state, binding, store, session_joins, directory_observed, now, cited=bool(cited),
+            observations=observations, transitions=transitions, produced=produced, mutation_ids=mutation_ids,
+            reasons=reasons,
+        )
         for key, row in credentials:
             state, identity, _effect, reason = self._credential_hop(
                 state, row, now, source="operation_reconcile", require_admitted=True)
@@ -19869,6 +20102,23 @@ class MythicTools:
                     {"credential_id": row.get("id")}))
             elif reason and key not in produced:
                 reasons.setdefault(key, reason)
+        # Operator-entered material cited for a session proof: a credential with no producing task, or a file
+        # artifact. Its access is admitted only through a co-cited proving task that used it (above records the
+        # task-produced credential acquisition case).
+        materials = [
+            (key, {"kind": "credential", "id": row.get("id"), "account": row.get("account"),
+                   "realm": row.get("realm"), "cred_text": row.get("credential_text")})
+            for key, row in credentials
+            if key.startswith("cred:") and (row.get("task") or {}).get("display_id") is None
+        ] + [
+            (key, {"kind": "file", "id": row.get("id"), "agent_file_id": row.get("agent_file_id"),
+                   "md5": row.get("md5"), "sha1": row.get("sha1"), "filename": row.get("filename_utf8")})
+            for key, row in files
+        ]
+        if materials:
+            state = self._cited_material_hops(
+                state, materials, evaluate, directory_observed, now, produced=produced, mutation_ids=mutation_ids,
+                reasons=reasons)
         only = {int(key) for key, _task in evaluate} if cited else None
         state, _recorded, _unattributed, baseline, by_task = await self._callback_gain_hops(
             state, now, position.callback_baseline, source="operation_reconcile", require_admitted=True,
@@ -19907,11 +20157,17 @@ class MythicTools:
                                  | {record.observation_id for record in observations
                                     if record.kind == effect_observations.DIRECTORY_CHANGE_JOIN
                                     and record.observation_id not in closed})
+            awaiting_sessions = len(({join["observation_id"] for join in session_joins} - closed)
+                                    | {record.observation_id for record in observations
+                                       if record.kind == effect_observations.SESSION_CONTEXT
+                                       and record.join_state == effect_observations.JOIN_AWAITING
+                                       and record.observation_id not in closed})
             return [f"Reconciled {len(evaluate)} completed task(s) from the operation's history: "
                     f"{len(written)} row(s) recorded; cursor at task {update.task_cursor}"
                     + (f", {held} running task(s) held" if held > 0 else "")
                     + (f", {awaiting} task(s) awaiting a credential-store entry" if awaiting > 0 else "")
                     + (f", {awaiting_reads} directory change(s) awaiting a later read" if awaiting_reads > 0 else "")
+                    + (f", {awaiting_sessions} context change(s) awaiting a later use" if awaiting_sessions > 0 else "")
                     + ".", *notes]
         rows = {}
         for row in self._ledger_snapshot().hop_rows():
@@ -20260,7 +20516,8 @@ class MythicTools:
             import engagement_store
         task = credential.get("task") if isinstance(credential.get("task"), dict) else {}
         if task.get("display_id") is None:
-            return state, "", "", "no producing task (a later action must prove it; not supported yet)"
+            return state, "", "", ("no proof of use; cite the proving task whose action used this entry (the entry "
+                                   "alone is not proof)")
         if (credential.get("operation_id") is not None and task.get("operation_id") is not None
                 and credential.get("operation_id") != task.get("operation_id")):
             return state, "", "", "the producing task is not in this operation"
