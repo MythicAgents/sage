@@ -37,6 +37,11 @@ try:
 except Exception:  # pragma: no cover
     _access_reconciler = None
 
+try:
+    from ai.langgraph import task_evidence as _task_evidence
+except ImportError:  # pragma: no cover - import-path fallback
+    from . import task_evidence as _task_evidence  # type: ignore
+
 
 PASS_LIMIT = 50
 HELD_LIMIT = 50
@@ -173,9 +178,17 @@ class CursorStep:
 
 
 def is_terminal(task: dict) -> bool:
-    """A task that finished, or one the operator cleared from the queue (it will never run)."""
-    if str(task.get("status") or "").strip().casefold() == "cleared":
+    """A task that finished, or one the operator cleared from the queue (it will never run).
+
+    A task Mythic is still finishing (``completed`` with a settling status such as its completion function running)
+    is not terminal under the shared task classification: its final status and any credentials the completion
+    function stores are still to come, so the pass holds it and reads it again instead of evaluating it now.
+    """
+    status = str(task.get("status") or "").strip().casefold()
+    if status == "cleared":
         return True
+    if status in _task_evidence.MYTHIC_SETTLING_STATES:
+        return False
     return bool(_task_reconciler and _task_reconciler._is_terminal(task))
 
 

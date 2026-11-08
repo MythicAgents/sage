@@ -136,6 +136,9 @@ class ApplyResult:
     row_revisions: set = field(default_factory=set)
     # Identities whose head this batch changed (a kept observation leaves the head as it was).
     changed_identities: set = field(default_factory=set)
+    # Source observations newly indexed, and awaiting joins this batch closed.
+    indexed: list = field(default_factory=list)
+    joins_closed: list = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -166,6 +169,36 @@ class ReconciliationUpdate:
     held_resolved: tuple[int, ...] = ()
     callback_baseline_initial: Mapping[str, str] | None = None
     callback_baseline_entries: Mapping[str, str] | None = None
+
+
+@dataclass(frozen=True)
+class ObservationRecord:
+    """One normalized observation to index (``effect_observations.Observation.record()``). Inserting an
+    ``observation_id`` the operation already holds changes nothing, so replaying a pass converges."""
+
+    observation_id: str
+    kind: str
+    source_kind: str
+    source_id: str
+    observed_at: str
+    payload: Mapping[str, Any]
+    subject: str = ""
+    task_id: str = ""
+    callback_id: str = ""
+    agent_callback_id: str = ""
+    join_state: str = "none"
+    join_reason: str = ""
+
+
+@dataclass(frozen=True)
+class JoinTransition:
+    """Close an awaiting join: ``resolved`` when its later record arrived, ``expired`` when the pass stops looking.
+    Only an awaiting join moves; a closed one never reopens."""
+
+    observation_id: str
+    state: str
+    reason: str = ""
+    resolved_by: str = ""
 
 
 @dataclass
@@ -333,6 +366,29 @@ _SCHEMA = (
         callback_baseline TEXT,
         updated_at TEXT NOT NULL
     )""",
+    # Normalized, secret-free source observations and the joins awaiting a later record (effect_observations).
+    # Evidence indexing beside the ledger, not progress: no row status is read from here.
+    """CREATE TABLE IF NOT EXISTS esl_observations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        operation_id INTEGER NOT NULL REFERENCES esl_operations(id),
+        observation_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        source_kind TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        subject TEXT NOT NULL DEFAULT '',
+        task_id TEXT NOT NULL DEFAULT '',
+        callback_id TEXT NOT NULL DEFAULT '',
+        agent_callback_id TEXT NOT NULL DEFAULT '',
+        observed_at TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        join_state TEXT NOT NULL CHECK (join_state IN ('none', 'awaiting', 'resolved', 'expired')),
+        join_reason TEXT NOT NULL DEFAULT '',
+        resolved_by TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (operation_id, observation_id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS esl_observations_join ON esl_observations(operation_id, kind, join_state, id)",
     "CREATE INDEX IF NOT EXISTS esl_events_row ON esl_events(row_id, id)",
     """CREATE TRIGGER IF NOT EXISTS esl_events_append_only_update BEFORE UPDATE ON esl_events
         BEGIN SELECT RAISE(ABORT, 'esl_events is append-only'); END""",
@@ -346,7 +402,7 @@ _SCHEMA = (
 )
 ESL_TABLES = ("esl_operations", "esl_rows", "esl_events", "esl_imports", "esl_legacy_settings")
 # Tables a store from before them may lack. They are copied when present and never required to read.
-OPTIONAL_ESL_TABLES = ("esl_reconciliation",)
+OPTIONAL_ESL_TABLES = ("esl_reconciliation", "esl_observations")
 
 
 def _connect(path: str | Path, *, write: bool = True) -> sqlite3.Connection:
@@ -655,6 +711,8 @@ class EngagementStore:
         complete_graph_refresh: bool = False,
         graph_refresh_time: str = "",
         reconciliation: ReconciliationUpdate | None = None,
+        observations: Iterable[ObservationRecord] = (),
+        joins: Iterable[JoinTransition] = (),
     ) -> ApplyResult:
         """Apply a bounded batch of produced rows. Unrelated heads are untouched.
 
@@ -663,7 +721,9 @@ class EngagementStore:
         observation is kept in the row's history and never replaces it. Retractions and markers are row flags
         that no update clears. ``complete_graph_refresh`` marks a full graph reconcile, which defines the current
         graph-fact generation (facts it did not observe stay stored but are no longer current).
-        ``reconciliation`` moves the task-history cursor and callback baseline in the same transaction.
+        ``reconciliation`` moves the task-history cursor and callback baseline in the same transaction, and
+        ``observations`` / ``joins`` index source observations and close awaiting joins in it too, so a failed write
+        leaves the cursor, the rows and the joins as they were.
         """
         batch = list(mutations)
         if len(batch) > MAX_BATCH:
@@ -704,7 +764,66 @@ class EngagementStore:
                 result.revision = int(op["revision"])
             if reconciliation is not None:
                 _write_reconciliation(connection, int(op["id"]), reconciliation, stamp)
+            for record in observations:
+                if _index_observation(connection, int(op["id"]), record, stamp):
+                    result.indexed.append(record.observation_id)
+            for transition in joins:
+                if _close_join(connection, int(op["id"]), transition, stamp):
+                    result.joins_closed.append(transition.observation_id)
         return result
+
+    def awaiting_joins(self, binding: OperationBinding, kind: str, *, limit: int = 50) -> list[dict]:
+        """The operation's awaiting joins of ``kind``, oldest first, at most ``limit``. A store from before the
+        observation table has none."""
+        return [row for row in self.observations(binding, kind=kind, join_state="awaiting", limit=limit)]
+
+    def observation_states(self, binding: OperationBinding, observation_ids: Iterable[str]) -> dict[str, str]:
+        """{observation ID: join state} for the IDs the operation already holds (read-only)."""
+        wanted = sorted({str(item) for item in observation_ids or () if item})
+        if not wanted:
+            return {}
+        with self._transaction(write=False) as connection:
+            _operation_row(connection, binding)
+            present = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='esl_observations'"
+            ).fetchone()
+            if not present:
+                return {}
+            rows = connection.execute(
+                "SELECT observation_id, join_state FROM esl_observations WHERE operation_id=? AND observation_id IN "
+                f"({','.join('?' * len(wanted))})", [binding.store_operation_id, *wanted],
+            ).fetchall()
+        return {str(row["observation_id"]): str(row["join_state"]) for row in rows}
+
+    def observations(
+        self, binding: OperationBinding, *, kind: str = "", join_state: str = "", limit: int | None = None,
+    ) -> list[dict]:
+        """Indexed source observations of the operation, oldest first (read-only)."""
+        with self._transaction(write=False) as connection:
+            _operation_row(connection, binding)
+            present = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='esl_observations'"
+            ).fetchone()
+            if not present:
+                return []
+            clauses, params = ["operation_id=?"], [binding.store_operation_id]
+            if kind:
+                clauses.append("kind=?")
+                params.append(kind)
+            if join_state:
+                clauses.append("join_state=?")
+                params.append(join_state)
+            query = f"SELECT * FROM esl_observations WHERE {' AND '.join(clauses)} ORDER BY id"
+            if limit is not None:
+                query += " LIMIT ?"
+                params.append(int(limit))
+            rows = connection.execute(query, params).fetchall()
+        out = []
+        for row in rows:
+            item = {key: row[key] for key in row.keys() if key != "payload"}
+            item["payload"] = json.loads(row["payload"])
+            out.append(item)
+        return out
 
     def reconciliation_state(self, binding: OperationBinding) -> ReconciliationState:
         """The operation's reconciliation cursor, held tasks and callback baseline. A store from before them reads
@@ -1164,6 +1283,41 @@ def _write_reconciliation(
         (operation_id, cursor, json.dumps(sorted(held)),
          json.dumps(baseline, sort_keys=True) if baseline is not None else None, stamp),
     )
+
+
+_JOIN_CLOSED_STATES = frozenset({"resolved", "expired"})
+_OBSERVATION_STATES = frozenset({"none", "awaiting"})
+
+
+def _index_observation(connection: sqlite3.Connection, operation_id: int, record: ObservationRecord, stamp: str) -> bool:
+    """Insert one observation unless the operation already holds its ID. Returns whether it was new."""
+    if not record.observation_id or not record.kind or not record.source_kind:
+        raise LedgerWriteFailed("observation record lacks an ID, kind or source")
+    if record.join_state not in _OBSERVATION_STATES:
+        raise LedgerWriteFailed(f"an observation is indexed as none or awaiting, not {record.join_state!r}")
+    cursor = connection.execute(
+        "INSERT INTO esl_observations (operation_id, observation_id, kind, source_kind, source_id, subject, task_id, "
+        "callback_id, agent_callback_id, observed_at, payload, join_state, join_reason, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(operation_id, observation_id) DO NOTHING",
+        (operation_id, record.observation_id, record.kind, record.source_kind, str(record.source_id),
+         str(record.subject or ""), str(record.task_id or ""), str(record.callback_id or ""),
+         str(record.agent_callback_id or ""), str(record.observed_at or stamp), _canonical(dict(record.payload)),
+         record.join_state, _bounded_reason(record.join_reason, ""), stamp, stamp),
+    )
+    return cursor.rowcount == 1
+
+
+def _close_join(connection: sqlite3.Connection, operation_id: int, transition: JoinTransition, stamp: str) -> bool:
+    """Move one awaiting join to resolved or expired. Returns whether it moved."""
+    if transition.state not in _JOIN_CLOSED_STATES:
+        raise LedgerWriteFailed(f"a join closes as resolved or expired, not {transition.state!r}")
+    cursor = connection.execute(
+        "UPDATE esl_observations SET join_state=?, join_reason=?, resolved_by=?, updated_at=? "
+        "WHERE operation_id=? AND observation_id=? AND join_state='awaiting'",
+        (transition.state, _bounded_reason(transition.reason, transition.state), str(transition.resolved_by or "")[:200],
+         stamp, operation_id, transition.observation_id),
+    )
+    return cursor.rowcount == 1
 
 
 def _rollback(connection: sqlite3.Connection) -> None:

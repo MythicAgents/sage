@@ -334,7 +334,8 @@ _CLASS_LABELS = {
 }
 _WRITER_LABELS = (
     ("raw", "raw"), ("capability", "capability"), ("reconcile", "task history"),
-    ("credential_store", "credential store"), ("review", "credential review"), ("operator", "operator review"),
+    ("credential_store", "credential store"), ("supervised_step", "supervised step"),
+    ("review", "credential review"), ("operator", "operator review"),
     ("legacy", "earlier record"),
 )
 

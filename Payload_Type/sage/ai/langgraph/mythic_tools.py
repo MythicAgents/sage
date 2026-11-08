@@ -19586,15 +19586,20 @@ class MythicTools:
         output is imported into the Mythic credential store only with ``apply``.
         """
         try:
-            from . import engagement_state, engagement_store, state_reconcile
+            from . import effect_observations, engagement_state, engagement_store, state_reconcile, task_reconciler
         except ImportError:
+            import effect_observations
             import engagement_state
             import engagement_store
             import state_reconcile
+            import task_reconciler
         await self._ensure_engagement_key()
         binding = self._require_ledger_binding()
         store = self._ledger_store()
         position = store.reconciliation_state(binding)
+        # Terminal credential tasks whose credential-store entry had not appeared when the cursor passed them.
+        joins = store.awaiting_joins(binding, effect_observations.CREDENTIAL_ENTRY_JOIN,
+                                     limit=effect_observations.JOIN_LIMIT)
         operation_id = await self._ledger_operation_id()
         now = datetime.now(timezone.utc).isoformat()
         initial = list(self._ledger_view().hops)
@@ -19631,14 +19636,34 @@ class MythicTools:
             evaluate = [(str(task["display_id"]), task) for task in step.evaluate]
             update = engagement_store.ReconciliationUpdate(
                 task_cursor=step.cursor, held_added=step.held_added, held_resolved=step.held_resolved)
-        if evaluate:
-            for row in await state_reconcile.fetch_task_credentials(
-                self.client, operation_id, [int(task["display_id"]) for _key, task in evaluate]
-            ):
+        credential_tasks = {int(task["display_id"]) for _key, task in evaluate}
+        if not cited:
+            # An uncited pass also looks again for the entries its awaiting joins expect; a citation reads only
+            # what it names.
+            credential_tasks |= {int(join["task_id"]) for join in joins if str(join["task_id"]).isdigit()}
+        if credential_tasks:
+            for row in await state_reconcile.fetch_task_credentials(self.client, operation_id, sorted(credential_tasks)):
                 credentials.append((str((row.get("task") or {}).get("display_id")), row))
+        entry_tasks: dict[str, list[str]] = {}
+        for _key, row in credentials:
+            task_id = str((row.get("task") or {}).get("display_id") or "")
+            if task_id:
+                entry_tasks.setdefault(task_id, []).append(f"cred:{row.get('id')}")
+        observations: list = []
+        transitions: list = []
+        for join in joins:
+            if str(join["task_id"]) in entry_tasks:
+                transitions.append(engagement_store.JoinTransition(
+                    join["observation_id"], effect_observations.JOIN_RESOLVED,
+                    reason="credential-store entry observed", resolved_by=",".join(entry_tasks[str(join["task_id"])])))
+            elif not cited and effect_observations.join_expired(join["observed_at"], now):
+                transitions.append(engagement_store.JoinTransition(
+                    join["observation_id"], effect_observations.JOIN_EXPIRED,
+                    reason="no credential-store entry within the window; cite it with cred:<id> once it exists"))
         foothold_map = state_reconcile.footholds_from_tasks([task for _key, task in evaluate], now)
         mutation_ids: dict[str, str] = {}
         notes: list[str] = []
+        credited: set[str] = set()
         for key, task in evaluate:
             verified = await state_reconcile.verify_task(
                 self.client, task, now, engagement_id=self._eng_key(), foothold_by_callback=foothold_map, apply=apply,
@@ -19647,6 +19672,8 @@ class MythicTools:
                 continue
             notes.extend(verified.notes)
             proof = verified.evidence.get("proof_envelope")
+            if isinstance(proof, dict) and proof:
+                credited.add(key)  # a task verifier proved the effect from the task itself
             state = engagement_state.record_hop_result(
                 state, verified.technique, verified.target, "achieved", verified.evidence, now,
                 proof_envelope=proof if isinstance(proof, dict) else None,
@@ -19665,6 +19692,25 @@ class MythicTools:
             mutation_ids[identity] = state_reconcile._reconcile_mutation_id(
                 self._eng_key(), task["display_id"], identity, verified.evidence)
             produced.setdefault(key, []).append(identity)
+        candidates: list = []
+        for key, task in evaluate:
+            # A terminal credential task that nothing proved yet and that has no credential-store entry: a later pass
+            # looks for the entry, without holding the cursor.
+            if key in credited or str(task["display_id"]) in entry_tasks:
+                continue
+            intent = task_reconciler.task_intent(task)
+            join = effect_observations.credential_join(task, *intent, now) if intent else None
+            if join is not None:
+                candidates.append((key, join))
+        stored_joins = store.observation_states(binding, [join.observation_id for _key, join in candidates])
+        for key, join in candidates:
+            if stored_joins.get(join.observation_id) == effect_observations.JOIN_EXPIRED:
+                # A closed join never reopens: say so instead of promising a later pass will look.
+                reasons.setdefault(key, "no proven gain; its credential-store entry did not appear within the window "
+                                        "(cite cred:<id> once it exists)")
+                continue
+            observations.append(engagement_store.ObservationRecord(**join.record()))
+            reasons.setdefault(key, "no proven gain yet; awaiting its Mythic credential-store entry")
         for key, row in credentials:
             state, identity, _effect, reason = self._credential_hop(
                 state, row, now, source="operation_reconcile", require_admitted=True)
@@ -19702,12 +19748,17 @@ class MythicTools:
             )
             for item in engagement_store.hop_mutations(initial, state.hops)
         ]
-        written = self._ledger_apply_reconciliation(binding, mutations, update)
+        written = self._ledger_apply_reconciliation(binding, mutations, update, observations=observations,
+                                                    joins=transitions)
         if not cited:
             held = len(set(position.held_tasks) | set(update.held_added)) - len(update.held_resolved)
+            awaiting = len(({join["observation_id"] for join in joins} - {item.observation_id for item in transitions})
+                           | {record.observation_id for record in observations})
             return [f"Reconciled {len(evaluate)} completed task(s) from the operation's history: "
                     f"{len(written)} row(s) recorded; cursor at task {update.task_cursor}"
-                    + (f", {held} running task(s) held." if held > 0 else "."), *notes]
+                    + (f", {held} running task(s) held" if held > 0 else "")
+                    + (f", {awaiting} task(s) awaiting a credential-store entry" if awaiting > 0 else "") + ".",
+                    *notes]
         rows = {}
         for row in self._ledger_snapshot().hop_rows():
             rows[row.identity] = row
@@ -19731,14 +19782,16 @@ class MythicTools:
                     lines.append(f"- {item}: {'updated' if identity in before else 'added'} row #{number}.")
         return [*lines, *notes]
 
-    def _ledger_apply_reconciliation(self, binding, mutations, update) -> set[str]:
-        """Apply reconciliation rows in bounded batches; the last batch carries the cursor. Returns the identities
-        that changed. A failed write is recorded and raised, so the cursor stays where it was."""
+    def _ledger_apply_reconciliation(self, binding, mutations, update, *, observations=(), joins=()) -> set[str]:
+        """Apply reconciliation rows in bounded batches; the last batch carries the cursor and the pass's source
+        observations and join closures. Returns the identities that changed. A failed write is recorded and raised,
+        so the cursor and the joins stay where they were."""
         try:
             from . import engagement_store
         except ImportError:
             import engagement_store
-        if not mutations and update is None:
+        observations, joins = list(observations or ()), list(joins or ())
+        if not mutations and update is None and not observations and not joins:
             return set()
         store = self._ledger_store()
         batches = [mutations[start:start + engagement_store.MAX_BATCH]
@@ -19746,7 +19799,9 @@ class MythicTools:
         written: set[str] = set()
         try:
             for index, batch in enumerate(batches):
-                result = store.apply(binding, batch, reconciliation=update if index == len(batches) - 1 else None)
+                last = index == len(batches) - 1
+                result = store.apply(binding, batch, reconciliation=update if last else None,
+                                     observations=observations if last else (), joins=joins if last else ())
                 own = getattr(self, "_ledger_own_rows", None)
                 if own is None:
                     own = self._ledger_own_rows = set()

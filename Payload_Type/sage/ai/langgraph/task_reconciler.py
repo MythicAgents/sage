@@ -233,6 +233,13 @@ def _classify(task: Any, output: Any) -> tuple[str, str, str, dict] | None:
     return technique, target, command, callback
 
 
+def task_intent(task: dict[str, Any]) -> tuple[str, str] | None:
+    """(technique, target) a terminal task's command and parameters name, else None. Parameters only: a wrapper
+    command whose real command line appears only in its output is not classified here."""
+    classified = _classify(task, "")
+    return (classified[0], classified[1]) if classified is not None else None
+
+
 def review_candidate(task: dict[str, Any], output: Any) -> tuple[str, str, dict] | None:
     """(technique, target, lineage evidence) for a credential task the verifier above did not credit, whose output
     the credential review may still read: Mythic classified it a completion-function error with output.

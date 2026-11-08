@@ -293,7 +293,7 @@ def material_effect(canonical: CanonicalEffect, kind: str) -> str:
 # --- contributions ----------------------------------------------------------------------------------------------
 
 _VOLATILE_PROOF_KEYS = frozenset({"captured_at", "persistence_state"})
-_WRITER_ORDER = ("capability", "raw", "reconcile", "credential_store", "review", "operator")
+_WRITER_ORDER = ("capability", "raw", "reconcile", "credential_store", "supervised_step", "review", "operator")
 _OBSERVATION_SLOTS = ("admitted", "rejected")
 # Task output that rows stored before Phase 2 group D carried in evidence.
 _OUTPUT_PREVIEW_KEYS = frozenset({"result_preview", "reconciled_setup_preview"})
@@ -312,7 +312,11 @@ def writer_kind(technique: str, evidence: Mapping[str, Any] | None) -> str:
         # Each credential-store entry is its own observation (one task can produce several, for example NTLM and
         # AES keys for one account).
         credential = _text(evidence.get("credential_id"))
-        return f"credential_store:{credential}" if credential else "credential_store"
+        slot = f"credential_store:{credential}" if credential else "credential_store"
+        # A supervised step's handback is its own writer. Its observation of the entry sits beside the
+        # credential-store observer's on the same contribution, whichever of them recorded the row first; sharing one
+        # slot would let the first writer's admitted observation silently absorb the other's.
+        return f"supervised_step:{slot}" if source == "supervised_step" else slot
     if source == "task_history_reconcile":
         return "reconcile"
     if source == "issue_task":
@@ -590,8 +594,11 @@ def derive_row(payload: Mapping[str, Any], engagement_id: str) -> dict[str, Any]
         if conflict:
             contribution["binding_conflict"] = conflict
         # Derived on every merge, for views: which writers' observations of this task the proof boundary admits now.
+        # Writers are visited in a fixed order: the stored row's JSON sorts its keys, so following dict order would
+        # make a replay look like a change.
         contribution["admitted_writers"] = []
-        for writer, slots in contribution.get("writers", {}).items():
+        for writer, slots in sorted(contribution.get("writers", {}).items(),
+                                    key=lambda item: (_writer_rank(item[0]), item[0])):
             observation = slots.get("admitted")
             if isinstance(observation, Mapping):
                 ok, reason = (False, conflict) if conflict else _admits(observation, contribution, engagement_id)
@@ -605,7 +612,7 @@ def derive_row(payload: Mapping[str, Any], engagement_id: str) -> dict[str, Any]
             observation = slots.get("rejected")
             if isinstance(observation, Mapping):
                 rejected.append((_text(observation.get("timestamp")), dict(observation)))
-    admitted.sort(key=lambda item: (-item[0], item[1], item[2]))
+    admitted.sort(key=lambda item: (-item[0], item[1], item[2], item[3]))
     for _rank, _task, _writer_order, _writer, observation in admitted:
         for effect in observation.get("satisfied_effects") or [observation.get("effect")]:
             other = canonical_effect(effect)
