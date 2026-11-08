@@ -274,6 +274,9 @@ SHIPPING_MYTHIC_REVERSE_DISPOSITIONS: dict[str, tuple[str, tuple[str, ...]]] = {
     "download_tool": ("DO_NOT_ADD_TREATMENT", ()),
     "ingest_collection": ("ADD_RAW", ("ingest_collection",)),
     "list_open_artifacts": ("DO_NOT_ADD_TREATMENT", ()),
+    # Sage harness ledger surface (engagement ledger reader and evidence submission); no raw-baseline treatment.
+    "read_engagement_state": ("DO_NOT_ADD_TREATMENT", ()),
+    "submit_engagement_evidence": ("DO_NOT_ADD_TREATMENT", ()),
     "get_payload_names": ("ALREADY_DIRECT", ("get_payload_types",)),
     "create_payload": ("ALREADY_DIRECT", ("create_payload",)),
     "get_all_payload_info": ("ADD_RAW", ("get_all_payload_info",)),

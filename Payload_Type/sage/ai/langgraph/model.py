@@ -14714,6 +14714,10 @@ class Model:
             # Read-only callback listing lets the Supervisor answer callback questions and name a step's callback
             # and targets in the delegation brief without first delegating a lookup.
             tools.extend(mythic_client.get_tools(["list_callbacks"]))
+        if mythic_client is not None:
+            # Engagement-ledger reader and evidence submission, offered in every mode (observational reads; code
+            # verifies any submitted evidence and decides admission).
+            tools.extend(mythic_client.get_tools(["read_engagement_state", "submit_engagement_evidence"]))
         tools = filter_tools_by_frontmatter("supervisor", tools)
 
         llm = self._get_base_chat_model()

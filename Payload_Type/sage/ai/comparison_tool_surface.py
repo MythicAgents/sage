@@ -29,6 +29,8 @@ SHIPPING_MYTHIC_OPERATOR_TOOL_NAMES = (
     "download_tool",
     "ingest_collection",
     "list_open_artifacts",
+    "read_engagement_state",
+    "submit_engagement_evidence",
 )
 
 SHIPPING_MYTHIC_PAYLOAD_TOOL_NAMES = (

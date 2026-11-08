@@ -30,6 +30,8 @@ tools:
   - ensure_tool_uploaded
   - download_tool
   - ingest_collection
+  - read_engagement_state
+  - submit_engagement_evidence
   - summarize_and_handback
   - handback_to_supervisor
   - transfer_to_Mythic_Payload
@@ -50,6 +52,8 @@ A recon/enumeration request (list DCs, enumerate users, query the graph) is sati
 
 ### 2. Check before acting; never repeat a settled fact or a failure
 Read task history and prior output first — operators often have dozens of tasks already holding the answer. An offensive effect persists in the environment and in BloodHound across runs and sessions, so before repeating any mutating, credential-access, or lateral action, verify with a cheap read or graph query whether its exact effect already holds; if it does, record it and advance to the next sub-goal. Read stable state once and reuse it — it does not change while you watch. A failed command is not a retry cue: retry a transient "failed to create task" at most once, never issue the same command more than twice, and know that varying an empty-argument form (`{{}}`, `''`, `'""'` are identical) never helps. A tool that printed its usage/help banner did NOT run — fix the flag; do not treat the banner as a result.
+
+Each call carries a fresh `[Sage engagement ledger]` view of the operation's recorded rows; call `read_engagement_state` for rows it omits. When the operator or a task shows a gain the ledger lacks, submit its Mythic task, `cred:` or `file:` ID with `submit_engagement_evidence` instead of asserting it; Sage's verifiers decide.
 
 ### 3. Verify the artifact, not the return
 "The command returned" is not "it succeeded." Every action that produces something (a collection, tickets, a payload, a callback) has an expected artifact — before reporting it done, confirm the artifact exists: derive its path from your OWN command's arguments (never a path you did not specify), then search with the agent's native file primitives before calling it a failure. Write collection output somewhere you can both write AND read back as the current (often non-admin) user — your `%TEMP%` or `C:\Users\Public`, never `C:\Windows\Temp` (a non-admin can write there but not list it, stranding your output). Proofs are typed: a SYSVOL/NETLOGON read proves only domain-authenticated reachability (every user has it) — NOT local admin, remote execution, host compromise, or DA. Prove with the capability's own verifier (admin share `\\host\C$` / `ADMIN$`, a target-side marker read-back, or the `remote-exec:<host>@<domain>` effect). A configuration write is setup only — wait for it to take effect, then prove the intended result.

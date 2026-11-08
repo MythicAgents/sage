@@ -61,13 +61,13 @@ def test_bidirectional_reverse_audit_is_exhaustive_and_implemented():
     disposition = bmt.raw_mythic_bidirectional_disposition()
     assert disposition == {
         "valid": True,
-        "shipping_count": 32,
-        "classified_count": 32,
+        "shipping_count": 34,
+        "classified_count": 34,
         "counts": {
             "ADD_RAW": 5,
             "ALREADY_COMPOSABLE": 4,
             "ALREADY_DIRECT": 13,
-            "DO_NOT_ADD_TREATMENT": 10,
+            "DO_NOT_ADD_TREATMENT": 12,
         },
         "failures": {},
     }
