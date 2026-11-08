@@ -19928,6 +19928,95 @@ class MythicTools:
             produced.setdefault(key, []).append(row_identity)
         return state
 
+    async def _derived_gain_hops(self, state, now, *, produced: dict, mutation_ids: dict):
+        """Persist a ``derived_rule`` row for each effect a code rule derives from premises that are admitted ledger
+        rows and whose live condition currently holds.
+
+        The derivation comes from ``effect_rules`` — the same evaluator the runtime gate uses — so the record and
+        the live calculation cannot diverge. A premise is resolved to its admitted row (id, revision, proof
+        commitment); a live foothold/context is a current-state condition, never a fabricated premise row. An effect
+        a real (non-derived) row already proves is not re-derived. Best-effort and fail-open: a missing live state
+        skips the pass, never raising."""
+        try:
+            from . import access_reconciler, effect_rules, engagement_state, proof_boundary, state_reconcile
+        except ImportError:
+            import access_reconciler
+            import effect_rules
+            import engagement_state
+            import proof_boundary
+            import state_reconcile
+        try:
+            footholds = list(getattr(self, "_engagement_footholds", []) or [])
+            if not footholds:
+                try:
+                    footholds = await access_reconciler.reconcile_access(self, now)
+                    self._engagement_footholds = list(footholds)
+                except Exception:
+                    footholds = []
+            view = self._ledger_view()
+            live = engagement_state.EngagementState(
+                objective=self._engagement_objective(), footholds=footholds, hops=list(view.hops),
+                graph_facts=list(view.graph_facts), engagement_id=self._eng_key(), runtime_scope=True,
+            )
+            predicates = engagement_state._filter_live_kerberos_context_predicates(
+                live.achieved_effects() | engagement_state.foothold_predicates(live))
+
+            def row_for(predicate: str):
+                target = engagement_state._normalize_predicate(predicate)
+                for hop in view.hops:
+                    if (str(getattr(hop, "status", "") or "").casefold() != "achieved"
+                            or engagement_state.row_corrected(hop) or engagement_state._is_derived_hop(hop)):
+                        continue  # cite a currently-valid, non-derived row as the premise, never a corrected one
+                    effects = {engagement_state._normalize_predicate(e) for e in getattr(hop, "satisfied_effects", []) or []}
+                    effects.add(engagement_state._normalize_predicate(getattr(hop, "effect", "")))
+                    if target in effects:
+                        return hop
+                for fact in getattr(view, "graph_facts", []) or []:
+                    if engagement_state._normalize_predicate(getattr(fact, "predicate", "")) == target:
+                        return fact
+                return None
+
+            for derivation in effect_rules.evaluate(predicates):
+                if derivation.output_effect in predicates:
+                    continue  # a real row already proves this effect; do not shadow it with a derivation
+                premise_rows = []
+                resolved = True
+                for premise in derivation.premises:
+                    row = row_for(premise)
+                    commitment = str((getattr(row, "proof_envelope", {}) or {}).get("verifier_result_sha256") or "")
+                    if row is None or not getattr(row, "row_id", 0) or len(commitment) != 64:
+                        resolved = False
+                        break
+                    premise_rows.append({"predicate": premise, "row_id": str(row.row_id),
+                                         "revision": str(getattr(row, "revision", 0)), "proof_commitment": commitment})
+                if not resolved:
+                    continue
+                envelope = proof_boundary.make_derived_rule_envelope(
+                    engagement_id=self._eng_key(), rule_id=derivation.rule_id, rule_version=derivation.rule_version,
+                    premises=derivation.premises, conditions=derivation.conditions, premise_rows=premise_rows,
+                    output_effect=derivation.output_effect, captured_at=now,
+                )
+                technique, target = "derived-rule", derivation.output_effect
+                evidence = {
+                    "source": "derived_rule", "provenance": "derivation", "verify_verdict": "achieved",
+                    "verified_on_record": True, "reconciled_at": now, "rule_id": derivation.rule_id,
+                    "rule_version": derivation.rule_version, "premises": list(derivation.premises),
+                    "conditions": list(derivation.conditions), "proof_envelope": envelope.to_dict(),
+                }
+                state = engagement_state.record_effect_result(
+                    state, technique, target, derivation.output_effect, "achieved", evidence, now,
+                    satisfied_effects=[derivation.output_effect], proof_envelope=evidence["proof_envelope"],
+                    require_admissible_proof=True, engagement_id=self._eng_key(),
+                )
+                identity = engagement_state.typed_row_identity(state, technique, target, derivation.output_effect)
+                mutation_ids.setdefault(identity, state_reconcile._reconcile_mutation_id(
+                    self._eng_key(), "", identity, {"derived_rule": derivation.rule_id,
+                                                    "output": derivation.output_effect}))
+                produced.setdefault(f"derived:{derivation.output_effect}", []).append(identity)
+        except Exception as exc:
+            logger.debug(f"derived-gain reconcile skipped: {exc}")
+        return state
+
     async def _reconcile_operation(self, cited=(), *, apply: bool = False) -> list[str]:
         """One reconciliation pass over the operation's task history, or the cited tasks and credentials.
 
@@ -20119,6 +20208,9 @@ class MythicTools:
             state = self._cited_material_hops(
                 state, materials, evaluate, directory_observed, now, produced=produced, mutation_ids=mutation_ids,
                 reasons=reasons)
+        # Persist derived-rule rows against the premises already committed to the ledger (a derivation lands the
+        # pass after its premise rows exist and its live condition holds).
+        state = await self._derived_gain_hops(state, now, produced=produced, mutation_ids=mutation_ids)
         only = {int(key) for key, _task in evaluate} if cited else None
         state, _recorded, _unattributed, baseline, by_task = await self._callback_gain_hops(
             state, now, position.callback_baseline, source="operation_reconcile", require_admitted=True,

@@ -101,12 +101,19 @@ class EngagementState:
     request_attempts: tuple = ()
 
     def achieved_effects(self) -> set[str]:
-        """Return normalized effects from achieved hops."""
+        """Return normalized effects from achieved hops.
+
+        A persisted derived-rule row is excluded: it is a durable ledger record of an inference, not an independent
+        premise. The runtime implication calculation below re-derives its effect from the current premises, so a
+        derived row can never keep crediting an effect after its premises stop holding.
+        """
         effects: set[str] = set()
         for hop in self.hops:
             if _text(getattr(hop, "status", "")).casefold() != "achieved":
                 continue
             if row_corrected(hop):
+                continue
+            if _is_derived_hop(hop):
                 continue
             if self.runtime_scope and not _hop_has_admissible_runtime_proof(hop, self.engagement_id):
                 continue
@@ -127,6 +134,22 @@ class EngagementState:
     def satisfies_predicate(self, predicate: str) -> bool:
         """Return whether a predicate is satisfied by the current state."""
         return _normalize_predicate(predicate) in self.satisfied_predicates()
+
+
+def _hop_proof_dict(hop: "Hop") -> dict:
+    proof = getattr(hop, "proof_envelope", {}) or {}
+    if not proof and isinstance(getattr(hop, "evidence", None), dict):
+        proof = getattr(hop, "evidence", {}).get("proof_envelope") or {}
+    return proof if isinstance(proof, dict) else {}
+
+
+def _is_derived_hop(hop: "Hop") -> bool:
+    """Whether a hop's proof is a derived-rule inference (a durable record of a derivation, not a premise)."""
+    try:
+        from . import proof_boundary
+    except ImportError:  # pragma: no cover
+        import proof_boundary
+    return str(_hop_proof_dict(hop).get("origin") or "") == proof_boundary.ORIGIN_DERIVED_RULE
 
 
 def _hop_has_admissible_runtime_proof(hop: "Hop", engagement_id: str) -> bool:
@@ -509,54 +532,15 @@ def _expand_implications(predicates: set[str]) -> set[str]:
        -> ds-replication-rights:{D}. The SharpGPOAbuse SYSTEM task grants/holds DS-Replication on the DC
        the GPO governs, so controlling the GPO chains forward to dcsync on that domain (the effect-chained
        hop the forward planner needs to name after the first graph-derived hop).
+
+    The rules themselves live in ``effect_rules``, the one evaluator shared with the ledger reconciler that
+    persists a ``derived_rule`` row, so the runtime calculation and the persisted derivation can never diverge.
     """
-    expanded = set(predicates)
-    gpo_domain: dict[str, str] = {}
-    live_context_domains = _live_kerberos_context_domains(predicates)
-    for domain in live_context_domains:
-        expanded.add(f"kerberos-context:{domain}")
-    # Domains where we hold a live, in-domain foothold (from foothold_predicates: authenticated:/live-foothold:).
-    # FQDN-ONLY: a bare NetBIOS label (e.g. "child", from authenticated:{identity_domain}) collides across
-    # unrelated forests (child.root.example.local vs child.other.example.local), so a same-label foothold in a
-    # DIFFERENT forest + a separately-held da: could wrongly grant replication rights and trigger a wrong-forest
-    # DCSync. Trust only dotted forest FQDNs (canonicalized via access_reconciler's NetBIOS->FQDN map), mirroring
-    # _in_domain_live_callback's forest-only matching. Degrades safely (no grant -> stall detector recovers).
-    live_foothold_domains = {
-        v for v in (
-            p.split(":", 1)[1].strip()
-            for p in predicates
-            if p.startswith(("authenticated:", "live-foothold:")) and ":" in p and not p.endswith(":*")
-        )
-        if "." in v
-    }
-    for predicate in predicates:
-        if predicate.startswith("gpo-domain:"):
-            gpo, _, domain = predicate[len("gpo-domain:"):].partition(":")
-            if gpo.strip() and domain.strip():
-                gpo_domain[gpo.strip()] = domain.strip()
-    for predicate in predicates:
-        for prefix in _DA_EFFECT_PREFIXES:
-            if predicate.startswith(prefix):
-                domain = predicate[len(prefix):].strip()
-                context_matches = {
-                    candidate
-                    for candidate in live_context_domains
-                    if _domains_equivalent(domain, candidate)
-                }
-                foothold_matches = {
-                    candidate
-                    for candidate in live_foothold_domains
-                    if _domains_equivalent(domain, candidate)
-                }
-                usable_domains = context_matches or foothold_matches
-                if domain and usable_domains:
-                    for usable_domain in usable_domains:
-                        expanded.add(f"ds-replication-rights:{usable_domain}")
-        if predicate.startswith("system:"):
-            domain = gpo_domain.get(predicate[len("system:"):].strip())
-            if domain:
-                expanded.add(f"ds-replication-rights:{domain}")
-    return expanded
+    try:
+        from . import effect_rules
+    except ImportError:  # pragma: no cover - flat import for tests on sys.path
+        import effect_rules  # type: ignore
+    return effect_rules.expand(predicates)
 
 
 def _live_kerberos_context_domains(predicates: set[str]) -> set[str]:

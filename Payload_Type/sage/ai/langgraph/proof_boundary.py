@@ -26,6 +26,9 @@ ORIGIN_MYTHIC_CREDENTIAL = "mythic_credential"
 ORIGIN_BLOODHOUND_INGEST = "bloodhound_ingest"
 # A callback context Mythic recorded (a new session, a rise in integrity), credited to the task that caused it.
 ORIGIN_MYTHIC_CALLBACK = "mythic_callback"
+# A logical derivation of one effect from admitted premises by a named code rule. It carries no Mythic task: its
+# admission recomputes the rule over the stated premises and rejects an unknown rule, a changed premise or a cycle.
+ORIGIN_DERIVED_RULE = "derived_rule"
 
 ALLOWED_RUNTIME_ORIGINS = frozenset({
     ORIGIN_MYTHIC_TASK,
@@ -33,6 +36,7 @@ ALLOWED_RUNTIME_ORIGINS = frozenset({
     ORIGIN_MYTHIC_CREDENTIAL,
     ORIGIN_BLOODHOUND_INGEST,
     ORIGIN_MYTHIC_CALLBACK,
+    ORIGIN_DERIVED_RULE,
 })
 
 DISALLOWED_RUNTIME_ORIGINS = frozenset({
@@ -325,8 +329,137 @@ def _valid_sha256(value: str) -> bool:
 
 
 def admit_runtime_envelope(envelope: ProofEnvelope | None, **expected: Any) -> ProofAdmission:
-    """Runtime admission: exact lineage and commitments, from a Mythic task Mythic reported as terminal success."""
+    """Runtime admission: exact lineage and commitments, from a Mythic task Mythic reported as terminal success.
+
+    A derived-rule envelope carries no Mythic task, so it takes the recompute-the-rule path instead of the task
+    lineage checks."""
+    if envelope is not None and envelope.metadata.get(PROOF_FORM_KEY) == DERIVED_RULE_PROOF:
+        return _admit_derived_rule(envelope, expected)
     return _admit_runtime_lineage(envelope, terminal_statuses=_TERMINAL_SUCCESS, **expected)
+
+
+def _derived_rule_verifier_input(rule_id: str, rule_version: str, premises: Any, conditions: Any,
+                                 premise_rows: Any) -> dict[str, Any]:
+    """What a derivation was computed over: the rule, its premises and live conditions, and the admitted premise
+    rows (id/revision/proof commitment) the reconciler resolved them to."""
+    return {
+        "rule_id": _text(rule_id),
+        "rule_version": _text(rule_version),
+        "premises": [_text(item) for item in (premises or [])],
+        "conditions": [_text(item) for item in (conditions or [])],
+        "premise_rows": [
+            {
+                "predicate": _text(row.get("predicate")),
+                "row_id": _text(row.get("row_id")),
+                "revision": _text(row.get("revision")),
+                "proof_commitment": _lower(row.get("proof_commitment")),
+            }
+            for row in (premise_rows or []) if isinstance(row, Mapping)
+        ],
+    }
+
+
+def _admit_derived_rule(envelope: ProofEnvelope, expected: Mapping[str, Any]) -> ProofAdmission:
+    """Admit a derivation by recomputing its named rule over its stated premises and conditions, never trusting the
+    serialized output. Rejects an unknown rule, a tampered commitment, a premise with no admitted row, a cycle
+    (the output among the premises), or a verifier identity that is not the rule's."""
+    if envelope.schema != PROOF_SCHEMA:
+        return ProofAdmission(False, envelope, "unsupported proof schema", REJECTED)
+    if envelope.scope != RUNTIME_SCOPE:
+        return ProofAdmission(False, envelope, "runtime achievement requires runtime scope", REJECTED)
+    if envelope.origin != ORIGIN_DERIVED_RULE:
+        return ProofAdmission(False, envelope, "derived-rule proof requires the derived-rule origin", REJECTED)
+    engagement_id = _text(expected.get("current_engagement_id"))
+    if not engagement_id or envelope.engagement_id != engagement_id:
+        return ProofAdmission(False, envelope, "proof engagement does not match current engagement", REJECTED)
+    if not envelope.captured_at:
+        return ProofAdmission(False, envelope, "missing capture time", REJECTED)
+    if not envelope.verifier_id or not envelope.verifier_version or not _valid_sha256(envelope.verifier_hash):
+        return ProofAdmission(False, envelope, "missing verifier lineage", REJECTED)
+    if not _valid_sha256(envelope.verifier_input_sha256) or not _valid_sha256(envelope.verifier_result_sha256):
+        return ProofAdmission(False, envelope, "missing canonical derivation commitments", REJECTED)
+
+    try:
+        from . import effect_rules
+    except ImportError:  # pragma: no cover
+        import effect_rules  # type: ignore
+    metadata = envelope.metadata
+    rule_id = _text(metadata.get("rule_id"))
+    rule_version = _text(metadata.get("rule_version"))
+    premises = tuple(_text(item) for item in (metadata.get("premises") or []))
+    conditions = tuple(_text(item) for item in (metadata.get("conditions") or []))
+    premise_rows = metadata.get("premise_rows") or []
+    output_effect = _text(metadata.get("output_effect"))
+
+    if not effect_rules.is_known_rule(rule_id, rule_version):
+        return ProofAdmission(False, envelope, f"unknown derivation rule {rule_id or 'missing'}@{rule_version or '?'}",
+                              REJECTED)
+    if envelope.verifier_id != f"effect_rules:{rule_id}" or envelope.verifier_version != rule_version:
+        return ProofAdmission(False, envelope, "derivation verifier does not match its rule", REJECTED)
+    input_commit = canonical_commitment_sha256(
+        _derived_rule_verifier_input(rule_id, rule_version, premises, conditions, premise_rows))
+    if envelope.verifier_input_sha256 != input_commit:
+        return ProofAdmission(False, envelope, "derivation input commitment mismatch", REJECTED)
+    if envelope.verifier_result_sha256 != canonical_commitment_sha256({"output_effect": output_effect}):
+        return ProofAdmission(False, envelope, "derivation result commitment mismatch", REJECTED)
+    recomputed = effect_rules.apply_rule(rule_id, premises, conditions)
+    if not recomputed or recomputed != output_effect:
+        return ProofAdmission(False, envelope, "rule does not recompute the stated output from its premises", REJECTED)
+    if output_effect in premises:
+        return ProofAdmission(False, envelope, "a derivation may not consume its own output (cycle)", REJECTED)
+    resolved = {_text(row.get("predicate")) for row in premise_rows if isinstance(row, Mapping)
+                and _text(row.get("row_id")) and _text(row.get("revision")) and _lower(row.get("proof_commitment"))}
+    if set(premises) - resolved:
+        return ProofAdmission(False, envelope, "a premise has no admitted row with a proof commitment", REJECTED)
+    return ProofAdmission(True, envelope, "admitted derived-rule gain", ADMITTED)
+
+
+def make_derived_rule_envelope(
+    *,
+    engagement_id: str,
+    rule_id: str,
+    rule_version: str,
+    premises: Any,
+    conditions: Any,
+    premise_rows: Any,
+    output_effect: str,
+    captured_at: str,
+) -> ProofEnvelope:
+    """A ``derived_rule`` proof envelope: no Mythic task, its verifier is the rule, and its metadata carries the
+    premises, live conditions, resolved premise rows and output effect the admission recomputes and commits to."""
+    premises = [_text(item) for item in (premises or [])]
+    conditions = [_text(item) for item in (conditions or [])]
+    rows = [
+        {
+            "predicate": _text(row.get("predicate")),
+            "row_id": _text(row.get("row_id")),
+            "revision": _text(row.get("revision")),
+            "proof_commitment": _lower(row.get("proof_commitment")),
+        }
+        for row in (premise_rows or []) if isinstance(row, Mapping)
+    ]
+    verifier_id = f"effect_rules:{_text(rule_id)}"
+    return ProofEnvelope(
+        scope=RUNTIME_SCOPE,
+        origin=ORIGIN_DERIVED_RULE,
+        engagement_id=engagement_id,
+        verifier_id=verifier_id,
+        verifier_version=_text(rule_version),
+        verifier_hash=stable_verifier_hash(verifier_id, rule_version),
+        verifier_input_sha256=canonical_commitment_sha256(
+            _derived_rule_verifier_input(rule_id, rule_version, premises, conditions, rows)),
+        verifier_result_sha256=canonical_commitment_sha256({"output_effect": _text(output_effect)}),
+        captured_at=captured_at,
+        metadata={
+            PROOF_FORM_KEY: DERIVED_RULE_PROOF,
+            "rule_id": _text(rule_id),
+            "rule_version": _text(rule_version),
+            "premises": premises,
+            "conditions": conditions,
+            "premise_rows": rows,
+            "output_effect": _text(output_effect),
+        },
+    )
 
 
 def _admit_runtime_lineage(
@@ -470,6 +603,9 @@ TASK_POSTPROCESSING_ERROR = "postprocessing_error_with_output"
 # function failed after the agent answered can carry, and it proves material only, never a working credential.
 PROOF_FORM_KEY = "proof_form"
 CREDENTIAL_REVIEW_MATERIAL = "credential_review_material"
+# A derived-rule proof: the output effect a named code rule recomputes from its admitted premises and live
+# conditions. It names the premise rows it consumed (id/revision/proof commitment) so a consumer can revalidate.
+DERIVED_RULE_PROOF = "derived_rule"
 _REVIEW_VERDICT_VALID = "valid"
 _MATERIAL_EFFECT_RE = re.compile(r"^cred-material:[a-z0-9][a-z0-9_-]*:([^:@\s\\]+@[a-z0-9][a-z0-9.-]*)$")
 
