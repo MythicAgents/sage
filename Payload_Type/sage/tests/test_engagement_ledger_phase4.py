@@ -1253,3 +1253,107 @@ def test_with_no_valid_creation_time_a_completed_task_on_callback_3_still_proves
     _turn_end(tools)
     assert live_mythic["errors"] == []
     _assert_callback_3_credited_to(tools, task_id=70, credited="none")
+
+
+# --- reconcile write boundaries as the `/state` help states them ---------------------------------------------------
+
+STATE_HELP_SAVES = "Verified ledger updates are saved immediately, including without `apply`."
+STATE_HELP_IMPORTS = ("`apply` only permits importing missing credential material into Mythic's credential store; "
+                      "without it, those imports are previewed.")
+
+
+def _mythic_credential_store(monkeypatch) -> list[dict]:
+    """Mythic's credential store behind the real import gate: reads list what was created, creates are recorded."""
+    created: list[dict] = []
+
+    async def resolve_operation(_client):
+        return (1, "Operation Chimera")
+
+    async def read_credentials(_client, _query, variables=None):
+        return {"credential": [dict(row) for row in created]}
+
+    async def create_credential(_client, credential, account="", realm="", comment="", credential_type=""):
+        created.append({"id": 900 + len(created), "account": account, "realm": realm, "type": credential_type,
+                        "credential_text": credential, "comment": comment})
+        return {"status": "success", "id": created[-1]["id"]}
+
+    monkeypatch.setattr(sr.operation_context, "resolve_operation", resolve_operation)
+    monkeypatch.setattr(sr.mythic, "execute_custom_query", read_credentials)
+    monkeypatch.setattr(sr.mythic, "create_credential", create_credential)
+    return created
+
+
+def _state_command(tools: MythicTools, arg: str) -> str:
+    from sage_chat import slash
+    from sage_chat.headless import build_chat_request
+
+    model = SimpleNamespace(mythic_client=tools, mode="conversation", provider="t", model="t", state={})
+    return asyncio.run(slash._handle_state(model, build_chat_request("x", channel_id=3, operation_id=0), arg))
+
+
+def _krbtgt_rows(reader: MythicTools) -> list[tuple]:
+    return [(hop.number, hop.status, str(hop.evidence.get("mythic_task_id")),
+             bool(hop.evidence.get("credential_material_imported")))
+            for hop in reader._ledger_view().hops if hop.effect == f"krbtgt-hash:{DOMAIN}"]
+
+
+def _history(tools: MythicTools) -> int:
+    return len(tools._ledger_store().export(tools._require_ledger_binding())["history"])
+
+
+@pytest.fixture
+def task_17_with_key_material(operation, mythic_records, monkeypatch):
+    tools = operation("channel-a", channel=3, request=1)
+    mythic_records["tasks"] = [_dcsync_task(17, callback=13) | {"operation_id": 1, "timestamp": ""}]
+    mythic_records["outputs"] = {17: _dcsync_output()}
+    return tools, _mythic_credential_store(monkeypatch)
+
+
+def test_reconcile_without_apply_saves_the_verified_row_and_only_previews_the_import(operation,
+                                                                                    task_17_with_key_material):
+    tools, created = task_17_with_key_material
+    help_text = _state_command(tools, "help")
+    assert STATE_HELP_SAVES in help_text and STATE_HELP_IMPORTS in help_text
+    assert "dry-run unless" not in help_text  # reconciliation as a whole is not presented as a dry run
+
+    reply = _state_command(tools, "reconcile 17")
+    assert "- 17: added row #1." in reply
+    assert "[dry-run] would add credential task 17: krbtgt@" in reply  # the preview the help promises
+    assert NTLM not in reply and AES256 not in reply
+    assert created == []  # no Mythic credential entry without apply
+    fresh = operation("channel-b", channel=4, request=1)  # a fresh reader of the shared store
+    assert _krbtgt_rows(fresh) == [(1, "achieved", "17", False)]  # saved without apply
+
+    events = _history(fresh)
+    replay = _state_command(tools, "reconcile 17")
+    assert "- 17: already recorded (row #1)." in replay
+    assert created == [] and _history(fresh) == events and _krbtgt_rows(fresh) == [(1, "achieved", "17", False)]
+    assert _position(tools).task_cursor == 0  # a citation never moves the cursor
+
+
+def test_reconcile_with_apply_imports_the_missing_material_once(operation, task_17_with_key_material):
+    tools, created = task_17_with_key_material
+    reply = _state_command(tools, "reconcile 17 apply")
+    assert "- 17: added row #1." in reply and "[dry-run]" not in reply
+    assert created and {row["account"] for row in created} == {"krbtgt"}
+    assert NTLM not in reply and AES256 not in reply
+    fresh = operation("channel-b", channel=4, request=1)
+    assert _krbtgt_rows(fresh) == [(1, "achieved", "17", True)]
+
+    count = len(created)
+    replay = _state_command(tools, "reconcile 17 apply")
+    assert "- 17: already recorded (row #1)." in replay and "credential store reused task 17" in replay
+    assert len(created) == count
+
+
+def test_the_no_import_probe_detects_apply_forwarded_as_true(task_17_with_key_material, monkeypatch):
+    """Negative control: if the gate received apply=True for a plain `/state reconcile`, the recorder would see it."""
+    tools, created = task_17_with_key_material
+    real = sr._import_reconciled_credentials
+
+    async def forced(client, materials, task_id, apply=False):
+        return await real(client, materials, task_id, apply=True)
+
+    monkeypatch.setattr(sr, "_import_reconciled_credentials", forced)
+    _state_command(tools, "reconcile 17")
+    assert created

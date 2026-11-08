@@ -250,13 +250,16 @@ _STATE_USAGE = (
     "Unknown `/state` subcommand. Usage:\n"
     "- `/state` — show the engagement ledger\n"
     "- `/state reconcile [<id>[,<id>…]] [apply]` — record verified effects from the operation's task history, or "
-    "from the cited task IDs, `cred:<id>` and `file:<id>` entries (credential import is dry-run unless `apply`)\n"
+    "from the cited task IDs, `cred:<id>` and `file:<id>` entries. Verified ledger updates are saved immediately, "
+    "including without `apply`. `apply` only permits importing missing credential material into Mythic's "
+    "credential store; without it, those imports are previewed.\n"
     "- `/state set <#|id> achieved task=<id> type=<type> account=<account>@<realm> line=<n> after=<text>` — promote a "
     "pending account-secret row to credential material by citing where the secret is in a task's output\n"
     "- `/state remove <#|id[,…]> [--reason <text>]` — retract rows (kept, numbered, undoable)\n"
     "- `/state restore <#|id[,…]> [--reason <text>]` — undo retractions\n"
     "- `/state invalidate <#|id[,…]> [--reason <text>]` — mark rows as no longer holding\n"
-    "- `/state objective <text>`\n"
+    "- `/state objective <text>` — set the operation's stored compatibility objective (an operation setting, not a "
+    "channel goal)\n"
     "- `/state wipe` — retract every row"
 )
 
@@ -361,12 +364,14 @@ async def _handle_state(model: Any, request: ChatRequest, arg: str = "") -> str:
             )
         if sub == "objective":
             if not rest:
-                return "Usage: `/state objective <text>` — set the engagement objective."
+                return ("Usage: `/state objective <text>` — set the operation's stored compatibility objective "
+                        "(an operation setting, not a channel goal).")
             store.update_objective(binding, rest, "operator")
             state = getattr(model, "state", None)
             if isinstance(state, dict):
                 state["_pending_objective_refinement"] = None
-            return _render_ledger_markdown(tools, request, model, notice="🎯 Objective updated.")
+            return _render_ledger_markdown(tools, request, model, notice=(
+                "🎯 Stored compatibility objective updated (operation setting, not a channel goal)."))
         if sub in {"remove", "restore", "invalidate"}:
             selector_text, reason = _split_reason(rest)
             selectors = [item.strip() for item in selector_text.split(",") if item.strip()]
@@ -499,7 +504,7 @@ def _render_ledger_markdown(tools: Any, request: ChatRequest, model: Any, notice
     objective = tools._human_engagement_objective(snapshot.objective_setting()[0])
     out.append(f"**Engagement state — `{snapshot.engagement_key}`**")
     if objective:
-        out.append(f"\n**Objective:** {objective}")
+        out.append(f"\n**Stored compatibility objective (operation setting, not a channel goal):** {objective}")
     out.append(f"\n**Hops:** {len(hops)}\n")
     if not hops:
         out.append("_(empty — no hops recorded yet)_")

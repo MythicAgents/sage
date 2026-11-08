@@ -5613,7 +5613,8 @@ def test_state_objective_writes_the_bound_operation_setting_and_clears_pending_r
     model = _state_model(tools, {"_pending_objective_refinement": {"objective_text": "stale"}})
     text = _run(slash._handle_state(model, build_chat_request("x", operation_id=0), "objective collect graph"))
 
-    assert "Objective updated" in text
+    assert "Stored compatibility objective updated (operation setting, not a channel goal)." in text
+    assert "**Stored compatibility objective (operation setting, not a channel goal):** collect graph" in text
     assert tools._ledger_snapshot().objective_setting() == ("collect graph", "operator")
     assert tools._ledger_snapshot().engagement_key == "Operation_Chimera_1_current"
     assert tools._engagement_hops == []  # the objective write touches no ledger rows

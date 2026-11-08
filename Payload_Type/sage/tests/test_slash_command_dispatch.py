@@ -157,3 +157,41 @@ def test_tools_rejects_unknown_subcommand(fresh_channel):
     chat = _NoModelChat()
     asyncio.run(chat.chat(_request("tools", "bogus")))
     assert "`/tools staged`" in chat.terminal_emissions[0]["content"]
+
+
+_COMPATIBILITY_LABEL = "Stored compatibility objective (operation setting, not a channel goal):"
+
+
+def test_new_channel_state_shows_its_operations_labelled_objective_without_model(monkeypatch, fresh_channel):
+    """A channel with no live session: `/state` reads the request operation's own snapshot, labels its compatibility
+    objective, hides a placeholder, and never builds a model (so no provider call). The retained-channel case after a
+    restart is in test_state_after_restart.py."""
+    sessions = {7: _bound_session(monkeypatch, "Operation_7_selected"),
+                8: _bound_session(monkeypatch, "Operation_8_other")}
+    sessions[7]._ledger_store().update_objective(sessions[7]._require_ledger_binding(), "collect graph", "operator")
+    sessions[8]._ledger_store().update_objective(sessions[8]._require_ledger_binding(), "sage-engagement:solve-8",
+                                                 "autonomous")
+    resolved = []
+
+    async def resolve(_model, request):
+        assert _model is None
+        resolved.append(request.OperationID)
+        return sessions[request.OperationID]
+
+    monkeypatch.setattr(slash, "_resolve_chat_ledger", resolve)
+    chat = _NoModelChat()
+    for operation_id in (7, 8):
+        asyncio.run(chat.chat(_request("state", "", operation_id=operation_id)))
+    asyncio.run(chat.chat(_request("state", "objective", operation_id=7)))
+    asyncio.run(chat.chat(_request("state", "help", operation_id=7)))
+
+    assert resolved == [7, 8, 7, 7]
+    assert [emission["complete_request"] for emission in chat.terminal_emissions] == [True] * 4
+    selected, other, usage, help_text = (emission["content"] for emission in chat.terminal_emissions)
+    assert f"**{_COMPATIBILITY_LABEL}** collect graph" in selected.splitlines()
+    assert "`Operation_7_selected`" in selected
+    assert _COMPATIBILITY_LABEL not in other and "solve-8" not in other and "collect graph" not in other
+    assert usage == ("Usage: `/state objective <text>` — set the operation's stored compatibility objective "
+                     "(an operation setting, not a channel goal).")
+    assert "Verified ledger updates are saved immediately, including without `apply`." in help_text
+    assert sessions[7]._ledger_snapshot().objective_setting() == ("collect graph", "operator")

@@ -41,19 +41,27 @@ def restarted_channel(monkeypatch):
     return request
 
 
+_RETAINED_OBJECTIVES = {
+    7: "objective for Operation_7_retained",
+    8: "objective for Operation_8_retained",
+    9: "sage-engagement:solve-9",  # an internal identifier, never shown as an objective
+}
+_COMPATIBILITY_LABEL = "Stored compatibility objective (operation setting, not a channel goal):"
+
+
 @pytest.mark.parametrize("argument", ["", "  \t"])
-@pytest.mark.parametrize("operation_id", [7, 8])
+@pytest.mark.parametrize("operation_id", sorted(_RETAINED_OBJECTIVES))
 def test_read_only_state_on_restarted_channel_uses_exact_operation_ledger(
     monkeypatch, restarted_channel, argument, operation_id,
 ):
     from ai.langgraph import mythic_tools
 
     sessions = {}
-    for op in (7, 8):
+    for op, objective in _RETAINED_OBJECTIVES.items():
         key = f"Operation_{op}_retained"
         monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", key)
         tools = mythic_tools.MythicTools(agent_task_id="state")
-        tools._ledger_store().update_objective(tools._require_ledger_binding(), f"objective for {key}", "operator")
+        tools._ledger_store().update_objective(tools._require_ledger_binding(), objective, "operator")
         sessions[op] = tools
 
     async def resolve(_model, request):
@@ -67,9 +75,13 @@ def test_read_only_state_on_restarted_channel_uses_exact_operation_ledger(
 
     assert len(chat.terminal_emissions) == 1
     text = chat.terminal_emissions[0]["content"]
-    assert f"Operation_{operation_id}_retained" in text
-    assert f"Operation_{15 - operation_id}_retained" not in text
-    assert f"objective for Operation_{operation_id}_retained" in text
+    assert f"`Operation_{operation_id}_retained`" in text
+    assert not any(f"Operation_{op}_retained" in text for op in _RETAINED_OBJECTIVES if op != operation_id)
+    objective_lines = [line for line in text.splitlines() if _COMPATIBILITY_LABEL in line]
+    if operation_id == 9:
+        assert objective_lines == [] and "solve-9" not in text
+    else:
+        assert objective_lines == [f"**{_COMPATIBILITY_LABEL}** {_RETAINED_OBJECTIVES[operation_id]}"]
     assert "prior scope and evidence are not restored" not in text
 
 

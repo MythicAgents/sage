@@ -15735,7 +15735,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         self._last_turn_state_signature = signature
         lines = ["📊 **Engagement state**"]
         if objective:
-            lines.append(f"Objective: {objective}")
+            lines.append(f"Stored compatibility objective (operation setting, not a channel goal): {objective}")
         if not hops:
             lines.append("_(empty — no hops recorded yet)_")
         else:
