@@ -872,6 +872,55 @@ def resolve_directory_change(join: Mapping[str, Any], reads: list[Mapping[str, A
     return None, reason
 
 
+def contradicts_directory_change(join: Mapping[str, Any], reads: list[Mapping[str, Any]],
+                                 netbios_map: Mapping[str, str] | None) -> tuple[Mapping[str, Any] | None, str]:
+    """(the first later COMPLETE read of the exact object showing the right absent, '') or (None, why not).
+
+    The inverse of :func:`resolve_directory_change`: a conclusive contradiction, used to retire a directory gain. A
+    read only contradicts when it is of the same object, by a later task, and COMPLETE for that property — an
+    incomplete read, a partial enumeration or a read of another object is not conclusive loss."""
+    values = (join.get("payload") or {}).get("values") or {}
+    prop, mutation_task = values.get("property"), _task_number(values.get("task_id"))
+    obj = _text(values.get("object"))
+    principal = ""
+    if prop == PROPERTY_REPLICATION:
+        principal = bound_principal(values.get("principal"), netbios_map)
+        if not principal:
+            return None, "the granted principal is not bound"
+    for read in sorted(reads, key=lambda row: _task_number(((row.get("payload") or {}).get("values") or {}).get("task_id"))):
+        rv = (read.get("payload") or {}).get("values") or {}
+        if _task_number(rv.get("task_id")) <= mutation_task:
+            continue
+        observed = read_from_values(rv)
+        same_object = (normalize_dn(observed.object_dn) == normalize_dn(obj) if "=" in obj
+                       else _first_rdn_value(observed.object_dn).casefold() == obj.casefold())
+        if not same_object:
+            continue
+        if prop == PROPERTY_REPLICATION:
+            if not observed.complete:
+                continue
+            sid = principal if _SID_RE.match(principal) else ""
+            verdict = verify_acl_rights(observed, object_dn=obj, principal="" if sid else principal,
+                                        principal_sid=sid, rights=REPLICATION_RIGHTS)
+        elif prop == PROPERTY_RBCD:
+            if not observed.rbcd_complete:
+                continue
+            verdict = verify_rbcd(observed, computer=obj, trustee_sid=values.get("principal_sid"))
+        elif prop == PROPERTY_MEMBER:
+            if not observed.members_complete:
+                continue
+            verdict = verify_group_member(observed, group_dn=obj, principal_sid=values.get("principal_sid"))
+        elif prop == PROPERTY_GPLINK:
+            if observed.gplink is None:
+                continue
+            verdict = verify_gpo_link(observed, container_dn=obj, gpo_guid=values.get("principal"))
+        else:
+            continue
+        if not verdict.achieved:
+            return read, ""
+    return None, "no complete later read of the object contradicts the change"
+
+
 def dn_domain(dn: str) -> str:
     """The DNS domain a distinguished name's DC components name ('' without any)."""
     parts = [rdn.partition("=")[2] for rdn in normalize_dn(dn).split(",") if rdn.startswith("dc=")]

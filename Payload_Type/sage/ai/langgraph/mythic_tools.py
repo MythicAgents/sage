@@ -20017,6 +20017,99 @@ class MythicTools:
             logger.debug(f"derived-gain reconcile skipped: {exc}")
         return state
 
+    async def _loss_marker_hops(self, now) -> int:
+        """Append an automatic "no longer holds" marker to each achieved row whose supported claim no longer has an
+        eligible support set, preserving its achieved history and original proof.
+
+        Three conclusive losses are detected from the ledger's own later observations: a derived row whose rule no
+        longer derives it from current premises; a directory gain a later COMPLETE read of the exact object
+        contradicts; and a session gain a later verified context change on its callback replaced. Timeouts, partial
+        enumerations, sleeping callbacks and generic denials are not conclusive and mark nothing. The store makes the
+        marker idempotent, lets a newer achievement re-establish it, and never lets it displace an operator
+        correction. Best-effort and fail-open."""
+        try:
+            from . import access_reconciler, effect_observations as eo, effect_rules, engagement_state, engagement_store
+        except ImportError:
+            import access_reconciler
+            import effect_observations as eo
+            import effect_rules
+            import engagement_state
+            import engagement_store
+        marked = 0
+        try:
+            binding = self._require_ledger_binding()
+            store = self._ledger_store()
+            view = self._ledger_view()
+            footholds = list(getattr(self, "_engagement_footholds", []) or [])
+            if not footholds:
+                try:
+                    footholds = await access_reconciler.reconcile_access(self, now)
+                    self._engagement_footholds = list(footholds)
+                except Exception:
+                    footholds = []
+            live = engagement_state.EngagementState(
+                objective=self._engagement_objective(), footholds=footholds, hops=list(view.hops),
+                graph_facts=list(view.graph_facts), engagement_id=self._eng_key(), runtime_scope=True)
+            predicates = engagement_state._filter_live_kerberos_context_predicates(
+                live.achieved_effects() | engagement_state.foothold_predicates(live))
+            derivable = {d.output_effect for d in effect_rules.evaluate(predicates)}
+            reads = list(store.observations(binding, kind=eo.DIRECTORY_READ, limit=500))
+            change_joins = list(store.observations(binding, kind=eo.DIRECTORY_CHANGE_JOIN))
+            session_contexts = list(store.observations(binding, kind=eo.SESSION_CONTEXT))
+            netbios = access_reconciler._engagement_netbios_map()
+
+            def lose(hop, reason, evidence):
+                nonlocal marked
+                identity = engagement_store.hop_identity(getattr(hop, "technique", ""), getattr(hop, "target", ""))
+                corrections = getattr(hop, "corrections", {}) or {}
+                if (corrections.get("no_longer_holds") or {}).get("effective"):
+                    return  # already marked and not re-established; the store would no-op, but skip the write
+                store.mark_no_longer_holds(binding, [identity], reason=reason, evidence=dict(evidence))
+                marked += 1
+
+            for hop in view.hops:
+                if str(getattr(hop, "status", "") or "").casefold() != "achieved" or engagement_state.row_corrected(hop):
+                    continue
+                effect = str(getattr(hop, "effect", "") or "")
+                evidence = getattr(hop, "evidence", {}) or {}
+                proof = engagement_state._hop_proof_dict(hop)
+
+                if engagement_state._is_derived_hop(hop):
+                    if effect not in derivable:
+                        lose(hop, "the premises no longer support this derivation",
+                             {"source": "derived_rule_revalidation", "effect": effect, "observed_at": now})
+                    continue
+
+                directory_property = str(evidence.get("directory_property") or "")
+                mutation_task = str(evidence.get("mutation_task_id") or "")
+                if directory_property and mutation_task:
+                    join = next((j for j in change_joins
+                                 if str((eo._values(j)).get("property")) == directory_property
+                                 and str((eo._values(j)).get("task_id")) == mutation_task), None)
+                    if join is not None:
+                        read, _why = eo.contradicts_directory_change(join, reads, netbios)
+                        if read is not None:
+                            lose(hop, "a later complete read of the object shows the right is gone",
+                                 {"source": "directory_contradiction", "effect": effect,
+                                  "read_observation_id": read.get("observation_id"),
+                                  "read_task_id": (eo._values(read)).get("task_id"), "observed_at": now})
+                        continue
+
+                if effect.startswith(("kerberos-account-context:", "authenticated-session:")):
+                    # Retire a session gain only when its OWN setup context was superseded: reuse the setup's
+                    # identity (account@domain, from the session_context observation) rather than the effect target,
+                    # which for a resource session also carries the resource. A same-account re-set never supersedes.
+                    setup_task = str(evidence.get("setup_task_id") or "")
+                    setup = next((c for c in session_contexts
+                                  if str((eo._values(c)).get("task_id")) == setup_task), None)
+                    if setup is not None and eo.session_superseded(setup, session_contexts):
+                        lose(hop, "a later context change on this callback replaced the session",
+                             {"source": "session_context_replacement", "effect": effect,
+                              "setup_task_id": setup_task, "observed_at": now})
+        except Exception as exc:
+            logger.debug(f"loss-marker reconcile skipped: {exc}")
+        return marked
+
     async def _reconcile_operation(self, cited=(), *, apply: bool = False) -> list[str]:
         """One reconciliation pass over the operation's task history, or the cited tasks and credentials.
 
@@ -20239,6 +20332,9 @@ class MythicTools:
         ]
         written = self._ledger_apply_reconciliation(binding, mutations, update, observations=observations,
                                                     joins=transitions)
+        # Retire gains the pass's own later observations conclusively contradict (dead premises, contradicting reads,
+        # replaced contexts), reading the state this pass just committed.
+        await self._loss_marker_hops(now)
         if not cited:
             held = len(set(position.held_tasks) | set(update.held_added)) - len(update.held_resolved)
             closed = {item.observation_id for item in transitions}
