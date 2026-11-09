@@ -5,22 +5,33 @@ weight = 70
 +++
 
 An LLM does not remember your engagement between turns. Sage keeps that memory outside the model, in a durable
-**engagement ledger**: a running record of what has actually been achieved, so a multi-day assessment survives
-context resets, restarts, and even a change of model. You read and edit it in chat with `/state`.
+**Engagement State Ledger** (the engagement ledger): a running record of the capabilities and credential material
+the operation has gained, so a multi-day assessment survives context resets, restarts, and even a change of model.
+You read and correct it in chat with `/state`.
 
 ## What it is
 
-One JSON file per Mythic operation — a table of hops toward the objective, each with a status. Each hop keeps a
-permanent number (the `#` column): removing a hop leaves a gap rather than renumbering the rest. When `/state` or
-the end-of-turn table shows you the ledger, Sage also sees that table on your next message, so you can ask about
-"hop 4" directly.
+One ledger per Mythic operation, shared live by every chat channel of that operation — a table of gains, each
+`achieved` or `pending`. A `pending` row is waiting for its effect or its proof and never satisfies a capability's
+precondition. Each row keeps a permanent number (the `#` column), assigned once and never reused; retracted and
+"no longer holds" rows stay in place, marked, so the numbers have no gaps. The Supervisor and Mythic_Operator get a
+fresh view of the ledger, with the same numbers, on every model call in every mode, so you can ask about "hop 4"
+directly, even in a new chat.
+
+When a conversation or supervised turn ends, and on `/state reconcile`, Sage reconciles the operation's Mythic
+tasks from every callback and every issuer. The ledger records verified gains, not every task: a task whose effect no verifier confirms leaves no achieved row,
+even when the task itself succeeded, and failed attempts stay in Mythic's task history.
 
 ## Why it is proof-gated
 
-A hop flips to *achieved* only when a verifier confirms the effect from real evidence. Each achieved hop carries
-a **proof envelope** recording the Mythic callback, task, and transaction ids, the terminal task status, and the
-verifier's input and result hashes (sha256). A row without a valid envelope is quarantined as `legacy_unverified`
-and can never count as proof — the model cannot write itself a success it did not earn.
+A row counts as *achieved* only when it traces back to real evidence: a verifier's check of Mythic task output or
+files, Mythic's credential store, Mythic's callback records, or BloodHound data collected through a payload, or a
+rule in Sage's code that derives it from rows that already have that proof. Each achieved row carries a **proof
+envelope** recording what it rests on (the Mythic callback, task, transaction, credential, file or BloodHound
+ingest it came from, or the rule and premise rows behind a derived row) and the verifier's input and result hashes
+(sha256). An achieved write without an admissible envelope is stored as `pending` (`proof_missing`) and never
+counts as proof. The model can read the ledger and submit Mythic evidence IDs for verification, but it never writes
+rows itself, so it cannot write itself a success it did not earn.
 
 ## Where it lives
 

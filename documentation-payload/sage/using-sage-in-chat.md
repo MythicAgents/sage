@@ -39,10 +39,12 @@ up front rather than failing mid-run.
 | `/watcher apply` | From the exact active locked `Sage Watcher` channel, claim or advance the immutable operation profile and rehydrate any requesting-user secret after restart |
 | `/watcher scan` · `/watcher pause` · `/watcher resume` | From the exact owner only, request an immediate read-only poll, pause the scheduler, or resume it |
 | `/watcher interval <seconds>` · `/watcher interval default` | From the exact owner only, persist cadence for the applied profile; accepted range is 5–86,400 integer seconds |
-| `/state` | Show the [engagement ledger](/agents/sage/engagement-ledger/) — the hop table of proven effects shared by every channel of this operation |
-| `/state objective <text>` | Set the engagement objective |
-| `/state reconcile [<id>[,<id>…]] [apply]` | Record verified effects from the operation's completed Mythic tasks, from any issuer, or from the cited task IDs and `cred:<id>` entries; credential import is dry-run unless `apply` is given |
-| `/state remove <#>[,…] [--reason <text>]` · `/state restore <#>[,…]` · `/state invalidate <#>[,…]` | Retract a row, undo a retraction, or mark a row "no longer holds", by hop number (the `#` column) or hop id. Rows are kept and numbered; you cannot hand-promote a row to `achieved` |
+| `/state` | Show the [engagement ledger](/agents/sage/engagement-ledger/) — the table of achieved and pending gains shared by every channel of this operation |
+| `/state help` | Show `/state` usage without reading the ledger |
+| `/state objective <text>` | Set the operation's stored compatibility objective (an operation setting, not a channel goal) |
+| `/state reconcile [<id>[,<id>…]] [apply]` | Record verified effects from the operation's completed Mythic tasks, from any issuer, or from the cited task IDs, `cred:<id>` and `file:<id>` entries. Verified updates are saved immediately; importing missing credential material into Mythic's credential store is previewed unless `apply` is given |
+| `/state set <#\|id> achieved task=<id> type=<type> account=<account>@<realm> line=<n> after=<text>` | Promote a pending account-secret row to credential material by citing where the secret sits in a task's output; Sage never takes the secret itself |
+| `/state remove <#>[,…] [--reason <text>]` · `/state restore <#>[,…]` · `/state invalidate <#>[,…]` | Retract a row, undo a retraction, or mark a row "no longer holds", by hop number (the `#` column) or hop id. Rows are kept and numbered; no command marks a row `achieved` without verified evidence |
 | `/state wipe` | Retract every row and every current graph fact; nothing is deleted or renumbered |
 | `/mode [conversation\|supervised\|auto]` | Show or switch the channel's mode |
 | `/list` | List active Sage chat sessions |

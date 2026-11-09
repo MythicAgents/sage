@@ -162,29 +162,35 @@ streaming emitter and terminal lifecycle.
 ## The engagement ledger
 
 An LLM does not remember your engagement between turns. Sage keeps that memory outside the model, in a durable
-**engagement ledger**: a running record of what has actually been achieved, so a multi-day assessment survives
-context resets, restarts, and even a change of model.
+**Engagement State Ledger** (the engagement ledger): a running record of the capabilities and credential material
+the operation has gained, so a multi-day assessment survives context resets, restarts, and even a change of model.
 
 <p align="center">
   <img src="docs/assets/engagement-ledger.png" alt="The /state engagement ledger" width="820">
-  <br><em><code>/state</code> renders the hop ledger: each proven effect with its status, task, and evidence.</em>
+  <br><em><code>/state</code> renders the ledger: each row's effect, status, task, and callback.</em>
 </p>
 
 - **What it is.** One ledger per Mythic operation, shared live by every chat channel of that operation — a table
-  of hops toward the objective, each with a status. You read and correct it in chat with
-  [`/state`](#slash-commands). Each hop keeps a permanent number (the `#` column), assigned once and never
+  of gains, each `achieved` or `pending`. A `pending` row is waiting for its effect or its proof and never
+  satisfies a capability's precondition. You read and correct the ledger in chat with
+  [`/state`](#slash-commands). Each row keeps a permanent number (the `#` column), assigned once and never
   reused. A correction never deletes a row: `/state remove` records a retraction (who, when, why) that you can undo
   with `/state restore`, and `/state invalidate` marks a row "no longer holds". The row keeps its number and shows
-  the correction, and no session relies on it again. When `/state` or the end-of-turn table shows you the ledger,
-  Sage also sees that table on your next message, so you can ask about "hop 4" directly. The ledger records
-  capability-verified effects, not every task: a task whose effect Sage cannot verify leaves no achieved hop, even
-  when the task itself succeeded.
+  the correction, and no session relies on it again. The Supervisor and Mythic_Operator get a fresh view of the
+  ledger, with the same numbers, on every model call in every mode, so you can ask about "hop 4" directly, even in
+  a new chat. When a conversation or supervised turn ends, and on `/state reconcile`, Sage reconciles the
+  operation's Mythic tasks from every callback and every issuer. The ledger records verified gains, not every task: a task whose effect no verifier confirms leaves no
+  achieved row, even when the task itself succeeded, and failed attempts stay in Mythic's task history.
 
-- **Why it is proof-gated.** A hop flips to *achieved* only when a verifier confirms the effect from real
-  evidence. Each achieved hop carries a **proof envelope** recording the Mythic callback, task, and transaction
-  ids, the terminal task status, and the verifier's input and result hashes (sha256). A row without a valid
-  envelope is quarantined as `legacy_unverified` and can never count as proof — the model cannot write itself a
-  success it did not earn.
+- **Why it is proof-gated.** A row counts as *achieved* only when it traces back to real evidence: a verifier's
+  check of Mythic task output or files, Mythic's credential store, Mythic's callback records, or BloodHound data
+  collected through a payload, or a rule in Sage's code that derives it from rows that already have that proof.
+  Each achieved row carries a **proof envelope** recording what it rests on (the Mythic callback, task,
+  transaction, credential, file or BloodHound ingest it came from, or the rule and premise rows behind a derived
+  row) and the verifier's input and result hashes (sha256). An achieved write without an admissible envelope is
+  stored as `pending` (`proof_missing`) and never counts as proof. The model can read the ledger and submit Mythic
+  evidence IDs for verification, but it never writes rows itself, so it cannot write itself a success it did not
+  earn.
 
 - **Where it lives.** In Sage's application database, `sage.db` (`SAGE_DATABASE_PATH` overrides it), keyed by
   the Mythic operation and the reset marker Sage stores in that operation. Every change is a short transaction
@@ -434,10 +440,12 @@ the token has no read scope for.
 
 | Command | What it does |
 |---|---|
-| `/state` | Show the [engagement ledger](#the-engagement-ledger) — the durable hop table of proven effects shared by chats in the current Mythic operation engagement |
-| `/state objective <text>` | Set the engagement objective |
-| `/state reconcile [<id>[,<id>…]] [apply]` | Record verified effects from the operation's completed Mythic tasks, from any issuer, or from the cited task IDs and `cred:<id>` entries; credential import is **dry-run unless `apply`** is given, because task output is attacker-influenceable |
-| `/state remove <#>[,…] [--reason <text>]` · `/state restore <#>[,…]` · `/state invalidate <#>[,…]` | Retract a row, undo a retraction, or mark a row "no longer holds", by hop number (the `#` column) or hop id. Rows are kept and numbered; you cannot hand-promote a row to `achieved` — that needs a real proof envelope |
+| `/state` | Show the [engagement ledger](#the-engagement-ledger) — the durable table of achieved and pending gains shared by every chat in the current Mythic operation |
+| `/state help` | Show `/state` usage without reading the ledger |
+| `/state objective <text>` | Set the operation's stored compatibility objective (an operation setting, not a channel goal) |
+| `/state reconcile [<id>[,<id>…]] [apply]` | Record verified effects from the operation's completed Mythic tasks, from any issuer, or from the cited task IDs, `cred:<id>` and `file:<id>` entries. Verified updates are saved immediately; `apply` only permits importing missing credential material into Mythic's credential store, which is **previewed unless `apply`** is given, because task output is attacker-influenceable |
+| `/state set <#\|id> achieved task=<id> type=<type> account=<account>@<realm> line=<n> after=<text>` | Promote a pending account-secret row to credential material by citing where the secret sits in a task's output; Sage never takes the secret itself, and only a task whose completion function failed after the agent answered qualifies |
+| `/state remove <#>[,…] [--reason <text>]` · `/state restore <#>[,…]` · `/state invalidate <#>[,…]` | Retract a row, undo a retraction, or mark a row "no longer holds", by hop number (the `#` column) or hop id. Rows are kept and numbered; no command marks a row `achieved` without verified evidence |
 | `/state wipe` | Retract every row and every current graph fact; nothing is deleted or renumbered |
 | `/mode [conversation\|supervised\|auto]` | Show or switch the channel's mode |
 | `/list` | List active Sage chat sessions |
@@ -452,7 +460,7 @@ the token has no read scope for.
 `/state` is available in conversation, supervised and auto modes. Its ledger is shared across
 chats in the same operation engagement and persists once written. A new engagement can show an
 empty ledger: viewing operation details or callbacks does not record an achieved effect, and
-reading `/state` alone does not create a ledger file.
+reading `/state` does not add rows.
 
 `/report` defaults to the identity report; `/report identity` remains supported.
 It is available in conversation and supervised chat, including a fresh chat
