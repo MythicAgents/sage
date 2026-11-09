@@ -7,32 +7,71 @@ between minor releases.
 
 ## [Unreleased]
 
+### Added
+
+- Every Supervisor and Mythic_Operator model call, in every mode, carries a fresh, bounded view of the
+  Engagement State Ledger, read from the store just before the call and never kept in chat history or a
+  checkpoint. A new chat starts from what the operation has already proven, and a `/state` correction shows on
+  the next call.
+- Two model tools work with the Engagement State Ledger. `read_engagement_state` reads rows by number or page,
+  and `submit_engagement_evidence` sends up to 20 Mythic task, `cred:<id>` or `file:<id>` citations to the same
+  verifiers `/state reconcile` uses. The model never writes, retracts or restores rows itself.
+- Rows in the model's ledger view name each source's kind (`cred:<id>` for a credential-store record, `file:<id>`,
+  or `unknown:<value>` for a legacy citation), so a credential ID is not read as a row number.
+- When a conversation or supervised turn ends, Sage reconciles the operation's completed Mythic tasks from every
+  callback and every issuer, one bounded batch per turn, so work an operator ran by hand is recorded once a
+  verifier proves it. `/state reconcile` runs the same pass on demand, and `/state reconcile` also accepts
+  `file:<id>` citations.
+- A rule written in code can record an achieved row derived from rows that already have proof: a domain-wide
+  Kerberos context from a callback-scoped one on a live callback, and replication rights from proven Domain
+  Admin or Enterprise Admin with a matching context or foothold, or from SYSTEM on a governed GPO linked to the
+  domain. The derived row names its rule and premise rows, and a model's inference never counts.
+- `/state help` shows the `/state` usage without reading the ledger or calling a model.
+
 ### Changed
 
-- The engagement ledger is now one shared store per Mythic operation in `sage.db`. Every chat channel of an
-  operation reads it fresh and writes only the rows it changes, so two sessions no longer erase each other's
-  rows, and a `/state` correction reaches running sessions on their next read. Hop numbers are assigned once
-  and never change or get reused: a ledger numbered 23–29 stays 23–29 and the next hop is 30.
+- The engagement ledger is now named the Engagement State Ledger and is one shared store per Mythic operation
+  in `sage.db`. Every chat channel of an operation reads it fresh and writes only the rows it changes, so two
+  sessions no longer erase each other's rows, and a `/state` correction reaches running sessions on their next
+  read. Hop numbers are assigned once and never change or get reused: a ledger numbered 23–29 stays 23–29 and
+  the next hop is 30.
+- Rows are now `achieved` or `pending`. `failed`, `blocked` and `legacy_unverified` are no longer row statuses;
+  attempts stay in Mythic's task history. A `pending` row, waiting for its effect or its proof, never satisfies a
+  capability's precondition, and an achieved write without an admissible proof envelope is stored as `pending`
+  (`proof_missing`).
+- Hashes and tickets found in task output or Mythic's credential store are recorded as credential material. A
+  material row proves possession, not a working credential, and does not satisfy a capability that needs one.
 - `/state remove` now records a retraction (who, when and why) instead of deleting the row; `/state restore`
   undoes it and `/state invalidate` marks a row "no longer holds". Corrected rows stay listed with their numbers
   and are shown as `achieved — operator retracted` or `achieved — no longer holds`; no gate, capability input
   or completion check relies on them. `/state wipe` retracts every row and every current graph fact without
-  deleting or renumbering anything. `/state set` is disabled.
-- A once-proven achievement stays historical: a contradicting observation adds a "no longer holds" marker with
-  its evidence instead of rewriting the row to failed.
+  deleting or renumbering anything.
+- `/state set` no longer sets status text. It promotes one pending account-secret row to credential material
+  when you cite where the secret sits in a Mythic task's output, only for a task whose completion function
+  failed after the agent answered, and it never takes the secret itself.
+- `/state reconcile` saves verified rows immediately, with or without `apply`. `apply` now only permits
+  importing missing credential material into Mythic's credential store; without it, those imports are
+  previewed, because task output is attacker-influenceable.
+- `/state` and the end-of-turn table label the stored objective "Stored compatibility objective (operation
+  setting, not a channel goal)", and `/state objective` describes it the same way.
+- A once-proven achievement stays historical: a later observation adds a "no longer holds" marker with its
+  evidence instead of rewriting the row to failed. Sage adds the marker automatically when a later complete
+  read of the same directory object contradicts a directory change, when a working session on the same callback
+  lifetime changes identity, or when a derived row's premise no longer holds.
 - Evaluator observations are stored on the evaluation side (`SAGE_EVAL_OBSERVATIONS_DIR`), never in Sage's
-  ledger or model context.
+  Engagement State Ledger or model context.
 
 ### Upgrade
 
 - Stop Sage and import existing `.sage_engagement/state_*.json` ledgers with
-  `skills/sage-goad-reset/scripts/engagement_ledger_migrate.py import --sage-stopped`. Sage reports the ledger
-  as unavailable until every legacy file is imported or explicitly excluded. Source files are never modified.
+  `skills/sage-goad-reset/scripts/engagement_ledger_migrate.py import --sage-stopped`. Sage reports the
+  Engagement State Ledger as unavailable until every legacy file is imported or explicitly excluded. Source
+  files are never modified.
 
 ## [0.3.0] - 2026-11-03
 
 Sage 0.3.0 bounds and scopes each supervised step, reads every step's results from Mythic rather than from the
-specialist's summary, and records proven progress in the engagement ledger.
+specialist's summary, and records proven progress in the Engagement State Ledger.
 
 ### Added
 
@@ -63,9 +102,10 @@ specialist's summary, and records proven progress in the engagement ledger.
   lands after the specialist looked is delivered without another delegation. At most 16 tasks per step are read;
   any beyond that are still listed.
 
-- Supervised steps now record what they proved in the engagement ledger, which tracks progress rather than every
-  task. A new callback, whether on a new host or as a new user, records a session on that host. A callback at high
-  or SYSTEM integrity, or one whose integrity rises after a step's task on it, records admin or SYSTEM on that host.
+- Supervised steps now record what they proved in the Engagement State Ledger, which tracks progress rather than
+  every task. A new callback, whether on a new host or as a new user, records a session on that host. A callback
+  at high or SYSTEM integrity, or one whose integrity rises after a step's task on it, records admin or SYSTEM on
+  that host.
   A credential whose source task belongs to the step is recorded by account and realm, never with its secret.
   A callback gain is credited to the Sage task issued before the callback first checked in, within 10 minutes
   (`SAGE_STEP_LEDGER_ATTRIBUTION_SECONDS`), so a payload that checks in after its step ended is still credited.
@@ -173,9 +213,9 @@ specialist's summary, and records proven progress in the engagement ledger.
 - The graph-collection summary names the tasks the collection issued and the graph effect it recorded. It used to
   say "none issued" and "no effects" after a collection that had run and been ingested.
 
-- The engagement ledger marks a GPO-abuse setup hop achieved once the same GPO transaction proves SYSTEM execution
-  through that GPO. Previously `/state` kept the setup hop pending beside the proven execution and Domain Admin
-  hops.
+- The Engagement State Ledger marks a GPO-abuse setup hop achieved once the same GPO transaction proves SYSTEM
+  execution through that GPO. Previously `/state` kept the setup hop pending beside the proven execution and
+  Domain Admin hops.
 
 - A supervised step may now target a host or GPO that Sage knows from its own attack-graph facts. The scope check on
   a step's brief admitted only targets named in the operator's request, in callback listings, footholds or ledger
@@ -266,13 +306,12 @@ specialist's summary, and records proven progress in the engagement ledger.
 - A forged-ticket request for one domain that also named a different `source_domain` was treated as a
   request for the source domain, so it reported "already achieved" from the source domain's existing proof.
   The named domain is now the ticket's target and the source domain supplies the ticket.
-- Sage can answer questions about the engagement-state tables you see. `/state` and the end-of-turn table
+- Sage can answer questions about the Engagement State Ledger rows you see. `/state` and the end-of-turn table
   were shown only to the operator, so a question such as "why is hop 1 pending?" had nothing to refer to.
-  The table you were last shown now reaches Sage with your next message, without the evidence previews.
-  Hops also keep permanent numbers: `/state remove` leaves a gap instead of renumbering later rows, so
-  `/state set 4 …` and "hop 4" mean the same hop in every view. The end-of-turn table now uses the same
-  columns and numbers as `/state`, and the `/state` count is labelled "Hops", since it includes pending
-  and failed rows.
+  The Supervisor and Mythic_Operator now see the ledger, with the same permanent numbers, on every model call,
+  so "hop 4" means the same row in `/state`, the end-of-turn table and the model's view. The end-of-turn table
+  now uses the same columns and numbers as `/state`, and the `/state` count is labelled "Hops", since it
+  includes pending rows.
 - The container no longer runs Sage as root. It runs as the owner of the installed service directory, so the
   databases and state Sage writes there belong to that user, and a later `mythic-cli install` no longer fails
   on root-owned files and leaves Sage uninstalled. The first start hands back root-owned files left by earlier
