@@ -150,7 +150,7 @@ The supported current reporting paths are:
 
 | Producer | Reproduction path |
 |---|---|
-| Independent proof records and explicit scoring inputs | `scorecard`; never an ambient engagement ledger or trajectory DB |
+| Independent proof records and explicit scoring inputs | `scorecard`; never an ambient Engagement State Ledger or trajectory DB |
 | Retained scored runs | `scorecard` children → `noise_floor` or `gate_experiment` |
 | Bare/harness result records | `comparison`, with retained result identities |
 | Native Trust Walker observations | `trust_walker_pair` → `trust_walker_batch` or the existing `trust_walker_improvement` report |

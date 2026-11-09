@@ -160,5 +160,5 @@ by design: GOAD is a benchmark, not a source of hardcoded strategy.
 | `adcs-esc-certificate-enroll` | A graph-proven ADCS escalation path → enroll a certificate |
 | `adcs-certificate-auth` | Verified certificate material → authenticate to obtain domain control |
 
-Every capability has a structured verifier, and effects are recorded to the engagement ledger **only on proof** —
-never on the model's assertion that an action succeeded.
+Every capability has a structured verifier, and effects are recorded to the Engagement State Ledger
+**only on proof** — never on the model's assertion that an action succeeded.

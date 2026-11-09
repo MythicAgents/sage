@@ -10,7 +10,7 @@ channels from the CLI, as a multi-turn engagement in one channel. This is the as
 counterpart to `sage-live-runner`'s auto one-shot runner: that skill can create a supervised channel
 and post its first prompt, but has no verb to post a *subsequent* prompt into an existing channel and
 no conversation-mode creator. A real supervised or conversation engagement is multi-turn in one
-channel so the engagement ledger accumulates across turns.
+channel so the Engagement State Ledger accumulates across turns.
 
 This wrapper reuses `skills/sage-live-runner/scripts/native_chat.py`'s own Mythic primitives
 (channel creation, `CreateSageMessage`, request snapshot, latest-request query) — it adds no new
@@ -77,7 +77,7 @@ List every active Sage AI channel with its mode and latest request status:
   never bypasses HITL.
 - **No auto / autonomous mode.** `create` only builds conversation or supervised channels
   (`autonomous_solve` stays false). Autonomous solves belong to `native_chat.py run --autonomous`.
-- **One engagement per channel.** Keep a multi-turn session in one channel so its engagement ledger
+- **One engagement per channel.** Keep a multi-turn session in one channel so its Engagement State Ledger
   accumulates; `inspect` between turns to read what the last turn proved before sending the next.
 - **Live tasking is still gated** by the same turn-authority, scope, and approval machinery the
   kernel enforces; a scoped driver token (`SAGE_DRIVER_APITOKEN` + `SAGE_BACKING_APITOKEN_ID`) is

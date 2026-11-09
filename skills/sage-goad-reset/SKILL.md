@@ -160,7 +160,7 @@ exits non-zero if either is still up. An absent `sage` tmux session is an alread
    destination is preflighted before anything moves, and a failed export or carry-forward leaves the archived
    database in place.
 
-### Engagement ledger migration and export
+### Engagement State Ledger migration and export
 
 Releases before the shared ESL kept one `.sage_engagement/state_*.json` file per operation. Sage refuses to use a
 ledger while such a file in its legacy state directory is not imported, and names this command. Stop Sage first:

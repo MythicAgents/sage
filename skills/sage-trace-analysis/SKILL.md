@@ -5,8 +5,8 @@ description: Repo-local Sage trace, Phoenix, Mythic task-output, and run-log ana
 
 # Sage Trace Analysis
 
-Treat `sage.db`, `.phoenix/phoenix.db`, run logs, and engagement ledgers as sensitive read-only data unless the
-operator explicitly says otherwise. Do not delete, compact, or mutate retained historical DBs.
+Treat `sage.db`, `.phoenix/phoenix.db`, run logs, and Engagement State Ledger data as sensitive read-only data
+unless the operator explicitly says otherwise. Do not delete, compact, or mutate retained historical DBs.
 
 Export the request first with `sage-live-runner`, then run the parameterized read-only audit:
 
