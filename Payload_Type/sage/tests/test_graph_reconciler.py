@@ -833,3 +833,142 @@ def test_probe_path_to_objective_probes_only_principals_present_in_the_graph():
     path_query = next(q for q in tool.calls if "shortestPath" in q)
     assert "samwell.tarly@north.sevenkingdoms.local" in path_query
     assert "samwell.tarly@sevenkingdoms.local" not in path_query
+
+
+def _reported_foothold(callback_id, reported, identity, *, forest=None, alive=True):
+    return engagement_state.Foothold(
+        callback_id=callback_id, agent="apollo", host="WS01", forest=forest or reported, identity=identity,
+        integrity="medium", alive=alive, source="test", timestamp=NOW, reported_domain=reported,
+    )
+
+
+def test_reported_domain_accounts_skip_shared_machine_dead_and_fqdn_reports():
+    state = engagement_state.EngagementState(objective="x", footholds=[
+        _reported_foothold("1", "corphq", "alice"),
+        _reported_foothold("2", "corphq", "CORPHQ\\Bob"),
+        _reported_foothold("3", "corphq", "Administrator"),
+        _reported_foothold("4", "corphq", "WS01$"),
+        _reported_foothold("5", "corphq", "carol", alive=False),
+        _reported_foothold("6", "corp.example.com", "dave"),
+        _reported_foothold("7", "nt authority", "system"),
+    ])
+    assert graph_reconciler.reported_domain_accounts_from_state(state) == [
+        ("corphq", "alice", "ws01"), ("corphq", "bob", "ws01"),
+    ]
+
+
+class _NetbiosTool:
+    """BloodHound with alice and WS01 in corp.example.com (NetBIOS CORPHQ, not its first label); alice controls a GPO."""
+
+    def __init__(self, alice_domains=("CORP.EXAMPLE.COM",), host_domains=("CORP.EXAMPLE.COM",)):
+        self.alice_domains = alice_domains
+        self.host_domains = host_domains
+        self.queries = []
+
+    async def ainvoke(self, args):
+        query = args.get("query", "")
+        self.queries.append(query)
+        if "u.samaccountname" in query and "'alice'" in query:
+            return _literals_response(*[domain.lower() for domain in self.alice_domains])
+        if "c.samaccountname" in query and "'ws01$'" in query:
+            return _literals_response(*[domain.lower() for domain in self.host_domains])
+        if "(t:GPO)" in query and "'alice@corp.example.com'" in query:
+            return _literals_response("HQPOLICY@CORP.EXAMPLE.COM|CN={1},CN=POLICIES|\\\\X|OBJ-1")
+        return _literals_response()
+
+
+def test_bloodhound_teaches_a_netbios_name_from_the_callback_account_and_matches_under_it():
+    state = engagement_state.EngagementState(objective="x", footholds=[_reported_foothold("1", "corphq", "alice")])
+    principals = graph_reconciler.controlled_principals_from_state(state)
+    assert principals == ["alice@corphq"]
+    tool = _NetbiosTool()
+
+    facts = asyncio.run(graph_reconciler.reconcile_graph_position(
+        _FakeMCPManager(tool), principals, "x", NOW, 120,
+        netbios_accounts=graph_reconciler.reported_domain_accounts_from_state(state),
+    ))
+
+    predicates = [fact.predicate for fact in facts]
+    assert "domain-netbios:corphq:corp.example.com" in predicates
+    assert "generic-write:gpo:hqpolicy" in predicates  # the edge query matched alice under the learned FQDN
+    assert engagement_state.learned_netbios_map(
+        engagement_state.EngagementState(objective="x", footholds=[], graph_facts=facts)
+    ) == {"corphq": "corp.example.com"}
+
+
+@pytest.mark.parametrize("alice_domains, host_domains", [
+    (("CORP.EXAMPLE.COM", "LAB.EXAMPLE.COM"), ("CORP.EXAMPLE.COM",)),  # the account name is in two domains
+    (("CORP.EXAMPLE.COM",), ()),  # the callback's host is not in the graph
+    (("CORP.EXAMPLE.COM",), ("LAB.EXAMPLE.COM",)),  # logged on to a computer in another domain
+])
+def test_bloodhound_learns_nothing_without_one_domain_for_account_and_host(alice_domains, host_domains):
+    state = engagement_state.EngagementState(objective="x", footholds=[_reported_foothold("1", "corphq", "alice")])
+    tool = _NetbiosTool(alice_domains=alice_domains, host_domains=host_domains)
+
+    facts = asyncio.run(graph_reconciler.reconcile_graph_position(
+        _FakeMCPManager(tool), graph_reconciler.controlled_principals_from_state(state), "x", NOW, 120,
+        netbios_accounts=graph_reconciler.reported_domain_accounts_from_state(state),
+    ))
+
+    assert not [fact for fact in facts if fact.predicate.startswith("domain-netbios:")]
+
+
+class _NorthOnlyBH:
+    """BloodHound holding only north.sevenkingdoms.local: north has its own sql_svc and samwell.tarly, CASTELBLACK, and
+    a GPO north\\sql_svc controls; essos.local (BRAAVOS, essos\\sql_svc) is not collected yet."""
+
+    async def ainvoke(self, args):
+        query = args.get("query", "")
+        if "u.samaccountname" in query and ("'sql_svc'" in query or "'samwell.tarly'" in query):
+            return _literals_response("north.sevenkingdoms.local")
+        if "c.samaccountname" in query and "'castelblack$'" in query:
+            return _literals_response("north.sevenkingdoms.local")
+        if "(t:GPO)" in query and "'sql_svc@north.sevenkingdoms.local'" in query:
+            return _literals_response("NORTHPOLICY@NORTH.SEVENKINGDOMS.LOCAL|CN={1},CN=POLICIES|\\\\X|OBJ-1")
+        return _literals_response()
+
+
+def _north_only_refresh(footholds):
+    state = engagement_state.EngagementState(objective="x", footholds=footholds)
+    facts = asyncio.run(graph_reconciler.reconcile_graph_position(
+        _FakeMCPManager(_NorthOnlyBH()), graph_reconciler.controlled_principals_from_state(state), "x", NOW, 120,
+        netbios_accounts=graph_reconciler.reported_domain_accounts_from_state(state),
+    ))
+    learned = engagement_state.learned_netbios_map(
+        engagement_state.EngagementState(objective="x", footholds=[], graph_facts=facts))
+    return [fact.predicate for fact in facts], learned
+
+
+def _host_foothold(callback_id, host, reported, identity):
+    return engagement_state.Foothold(
+        callback_id=callback_id, agent="apollo", host=host, forest=reported, identity=identity, integrity="medium",
+        alive=True, source="test", timestamp=NOW, reported_domain=reported,
+    )
+
+
+def test_a_same_named_account_in_another_collected_domain_teaches_nothing():
+    """essos\\sql_svc on BRAAVOS while only north (which has its own sql_svc) is collected."""
+    predicates, learned = _north_only_refresh([_host_foothold("20", "BRAAVOS", "essos", "sql_svc")])
+    assert learned == {}
+    assert not [p for p in predicates if p.startswith("domain-netbios:")]
+    assert "generic-write:gpo:northpolicy" not in predicates  # north\\sql_svc's edge is not ours
+
+
+def test_a_same_named_account_does_not_unlearn_or_misattribute_beside_a_corroborated_callback():
+    predicates, learned = _north_only_refresh([
+        _host_foothold("10", "CASTELBLACK", "north", "samwell.tarly"),
+        _host_foothold("20", "BRAAVOS", "essos", "sql_svc"),
+    ])
+    assert learned == {"north": "north.sevenkingdoms.local"}
+    assert "generic-write:gpo:northpolicy" not in predicates
+
+
+def test_bloodhound_drops_an_fqdn_claimed_by_two_netbios_names():
+    class _Everything:
+        async def ainvoke(self, args):
+            return _literals_response("corp.example.com") if "samaccountname" in args.get("query", "") else (
+                _literals_response())
+
+    learned = asyncio.run(graph_reconciler._learn_netbios_domains(
+        _Everything(), [("corphq", "alice", "ws01"), ("corp", "bob", "ws02")]))
+    assert learned == {}

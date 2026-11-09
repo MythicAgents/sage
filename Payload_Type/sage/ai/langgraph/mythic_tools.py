@@ -7718,8 +7718,9 @@ class MythicTools:
                     technique, target_key = rebind
 
         # Domain Admin group membership checks are domain-scoped read-probes, but the command commonly
-        # carries only `/domain`. Bind them from the issuing callback's forest so a successful read records
-        # `da:<domain>` instead of an empty-target no-op.
+        # carries only `/domain`. Bind them from the issuing callback's forest so the request has a target; the
+        # forest is the FQDN once the engagement has learned it. On record, the domain the output itself names
+        # replaces this binding (see `_record_engagement_success`).
         if not target_key and technique == "domain-admin-membership-check":
             cb_forest = next(
                 (f.forest for f in footholds if str(getattr(f, "callback_id", "")) == str(callback_display_id)),
@@ -7798,7 +7799,7 @@ class MythicTools:
         )
         reason = f"missing precondition(s): ds-replication-rights:{dom}" if rights_missing else ""
         if self._should_block_premature_dcsync(
-            technique, reason, bool(view.graph_facts),
+            technique, reason, engagement_state.has_graph_edges(view.graph_facts),
             self._dcsync_precheck_blocks.get((technique, dom), 0), self._DCSYNC_PRECHECK_MAX_BLOCKS,
         ):
             self._dcsync_precheck_blocks[(technique, dom)] = \
@@ -8300,7 +8301,19 @@ class MythicTools:
                 self._GRAPH_FACTS_TTL_SECONDS,
                 credential_domains=credential_domains,
                 proof_envelope=proof_envelope,
+                netbios_accounts=(graph_reconciler.reported_domain_accounts_from_state(state)
+                                  if access_reconciler.netbios_learning_enabled() else []),
             ) or [])
+            # A NetBIOS-name fact is not an edge: a refresh that resolved only names must not stand in for a
+            # complete edge read, so those are added on their own below and remove nothing.
+            name_facts = [
+                fact for fact in reconciled_facts
+                if str(getattr(fact, "predicate", "")).startswith(engagement_state.DOMAIN_NETBIOS_FACT_PREFIX)
+            ]
+            if len(name_facts) == len(reconciled_facts):
+                if name_facts:
+                    self._ledger_commit_facts(name_facts, complete=False, refreshed_at=now)
+                reconciled_facts = []
             facts = list(reconciled_facts)
             if reconciled_facts:
                 # A completed ingest already read this snapshot. Empty results also represent read
@@ -9636,8 +9649,10 @@ class MythicTools:
         nothing. Material only: a working credential still needs its own verified proof.
         """
         try:
-            from . import credential_review, engagement_state, engagement_store, state_reconcile, task_evidence
+            from . import access_reconciler, credential_review, engagement_state, engagement_store, state_reconcile
+            from . import task_evidence
         except ImportError:  # pragma: no cover
+            import access_reconciler
             import credential_review
             import engagement_state
             import engagement_store
@@ -9675,7 +9690,8 @@ class MythicTools:
         now = datetime.now(timezone.utc).isoformat()
         verified = await state_reconcile.verify_task(
             self.client, task, now, engagement_id=self._eng_key(),
-            foothold_by_callback=state_reconcile.footholds_from_tasks([task], now), apply=False,
+            foothold_by_callback=state_reconcile.footholds_from_tasks(
+                [task], now, state=access_reconciler.ledger_state(self)), apply=False,
         )
         if verified is None:
             return refused(f"task {task_display_id} proves no account secret")
@@ -9862,10 +9878,22 @@ class MythicTools:
                         f"(verdict={verdict}) — a request attempt, not achieved."
                     )
             elif technique == "domain-admin-membership-check":
-                # No output-echo domain correlation here: a `net group "Domain Admins" /domain` is implicitly
-                # scoped to the foothold's own domain and does not echo the domain name to correlate against.
+                # `net group "Domain Admins" /domain` queries the issuing computer's domain and names it before the
+                # result: "The request will be processed at a domain controller for domain <fqdn>." That FQDN is
+                # the domain whose group was listed, so the proof binds to it rather than to the callback's
+                # forest, which may still be the NetBIOS name the agent reported. Without the line (another tool,
+                # localized Windows, or a command run on a domain controller) the target stays the forest.
+                # Domain Admins is a global group, so a proven member's account belongs to that domain: the
+                # callback's reported NetBIOS name is recorded beside it, and the engagement learns the pair.
+                # The membership match is by account name, so a built-in name every domain has (Administrator)
+                # proves neither; for those the binding stays as it was.
                 # The deny-only filter, entry-shape check, and benign-string removal still apply via the probe.
                 probe = self._extract_domain_admin_membership_probe(results_str)
+                dc_domain = engagement_state.domain_controller_domain(results_str)
+                if any(engagement_state.shared_account_name(c) for c in probe.get("principal_candidates") or []):
+                    dc_domain = ""
+                if dc_domain:
+                    target_key = dc_domain
                 verdict = engagement_state.verify_effect(technique, target_key, probe)
                 status = "achieved" if verdict == "achieved" else "failed"
                 extra = {
@@ -9874,6 +9902,11 @@ class MythicTools:
                     "artifact_present": bool(probe.get("domain_admin")),
                     "principal_candidates": list(probe.get("principal_candidates") or []),
                 }
+                if dc_domain:
+                    extra[engagement_state.DC_DOMAIN_EVIDENCE_KEY] = dc_domain
+                    reported = self._callback_reported_netbios_domain(callback_id)
+                    if reported:
+                        extra[engagement_state.CALLBACK_NETBIOS_EVIDENCE_KEY] = reported
                 if status != "achieved":
                     logger.info(
                         f"🔒 [verify-on-record] {technique} {target_key}: Domain Admin membership not proven "
@@ -10794,6 +10827,14 @@ class MythicTools:
             "principal_candidates": candidates,
             "access_denied": denied,
         }
+
+    def _callback_reported_netbios_domain(self, callback_id) -> str:
+        """The NetBIOS domain name this callback's agent reported, else '' (unknown callback, or it reported an FQDN)."""
+        for foothold in list(getattr(self, "_engagement_footholds", []) or []):
+            if str(getattr(foothold, "callback_id", "")) == str(callback_id if callback_id is not None else ""):
+                reported = str(getattr(foothold, "reported_domain", "") or "").strip().casefold()
+                return reported if reported and "." not in reported else ""
+        return ""
 
     def _last_callback_identity_candidates(self) -> list[str]:
         callback_id = str(getattr(self, "_last_issued_callback_id", "") or "")
@@ -19828,7 +19869,7 @@ class MythicTools:
         reads = {row["observation_id"]: row for row in stored_reads}
         reads.update({item.observation_id: as_row(item) for _key, item in new_reads})
         read_keys = {item.observation_id: key for key, item in new_reads}
-        netbios = access_reconciler._engagement_netbios_map()
+        netbios = access_reconciler._engagement_netbios_map(state)
         for key, join in pending:
             values = join["payload"]["values"]
             read, reason = eo.resolve_directory_change(join, list(reads.values()), netbios)
@@ -20227,7 +20268,7 @@ class MythicTools:
             reads = list(store.observations(binding, kind=eo.DIRECTORY_READ, limit=500))
             change_joins = list(store.observations(binding, kind=eo.DIRECTORY_CHANGE_JOIN))
             session_contexts = list(store.observations(binding, kind=eo.SESSION_CONTEXT))
-            netbios = access_reconciler._engagement_netbios_map()
+            netbios = access_reconciler._engagement_netbios_map(live)
 
             def lose(hop, reason, evidence):
                 nonlocal marked
@@ -20292,8 +20333,10 @@ class MythicTools:
         output is imported into the Mythic credential store only with ``apply``.
         """
         try:
-            from . import effect_observations, engagement_state, engagement_store, state_reconcile, task_reconciler
+            from . import access_reconciler, effect_observations, engagement_state, engagement_store, state_reconcile
+            from . import task_reconciler
         except ImportError:
+            import access_reconciler
             import effect_observations
             import engagement_state
             import engagement_store
@@ -20381,7 +20424,8 @@ class MythicTools:
                 transitions.append(engagement_store.JoinTransition(
                     join["observation_id"], effect_observations.JOIN_EXPIRED,
                     reason="no credential-store entry within the window; cite it with cred:<id> once it exists"))
-        foothold_map = state_reconcile.footholds_from_tasks([task for _key, task in evaluate], now)
+        foothold_map = state_reconcile.footholds_from_tasks(
+            [task for _key, task in evaluate], now, state=access_reconciler.ledger_state(self))
         mutation_ids: dict[str, str] = {}
         notes: list[str] = []
         credited: set[str] = set()

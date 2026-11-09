@@ -78,6 +78,13 @@ def reconcile_task(
         "task_classification": task_class,
         "mythic_task_status": (record.status[: task_evidence.MAX_STATUS_CHARS] if record is not None else ""),
     }
+    if technique == "domain-admin-membership-check":
+        dc_domain = _domain_admin_output_domain(callback, output)
+        reported = _text(callback.get("domain")).casefold()
+        if dc_domain:
+            evidence[engagement_state.DC_DOMAIN_EVIDENCE_KEY] = dc_domain
+            if reported and "." not in reported and "\\" not in reported:
+                evidence[engagement_state.CALLBACK_NETBIOS_EVIDENCE_KEY] = reported
     if engagement_id:
         transaction_id = _text(transaction_id) or f"operator-task:{task_id}"
         evidence["transaction_id"] = transaction_id
@@ -252,6 +259,14 @@ def _extract_domain_admin_membership_probe(output: Any, *, callback: dict[str, A
     }
 
 
+def _domain_admin_output_domain(callback: dict[str, Any], output: Any) -> str:
+    """The domain a `net ... /domain` output names, unless the callback account is a built-in name every domain has:
+    the membership match is by account name, so for those it proves nothing about the domain."""
+    if engagement_state.shared_account_name(callback.get("user") or callback.get("identity")):
+        return ""
+    return engagement_state.domain_controller_domain(output)
+
+
 def _domain_admin_membership_target(callback: dict[str, Any]) -> str:
     for key in ("forest", "domain", "realm"):
         value = _text(callback.get(key)).casefold()
@@ -323,8 +338,10 @@ def _classify(task: Any, output: Any) -> tuple[str, str, str, dict] | None:
         return None
     technique, target = classified
     target = _text(target).casefold()
-    if not target and technique == "domain-admin-membership-check":
-        target = _domain_admin_membership_target(callback)
+    if technique == "domain-admin-membership-check":
+        # The domain the output names (its domain controller's) is the domain whose group was listed, as on the live
+        # record path; otherwise the callback row's FQDN.
+        target = _domain_admin_output_domain(callback, output) or target or _domain_admin_membership_target(callback)
     if not technique or not target:
         return None
     return technique, target, command, callback

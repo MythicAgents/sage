@@ -1,6 +1,8 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph"))
 import engagement_state  # noqa: E402
@@ -896,3 +898,53 @@ def test_render_omits_path_probe_section_when_no_probe_facts():
     rendered = engagement_state.render_engagement_state(state)
     assert "BloodHound attack-path probe:" not in rendered
     assert "(no observed state yet)" in rendered
+
+
+@pytest.mark.parametrize("scope", ["", "north.sevenkingdoms.local"])
+def test_collection_recorded_under_the_reported_name_still_covers_after_the_fqdn_is_learned(scope):
+    """Learning a NetBIOS name's FQDN changes the foothold's collection key; it must not re-offer the collection."""
+    recorded_key = "north|baseline" + (f"|scope:{scope}" if scope else "")
+    collected = engagement_state.Hop(
+        id="hop-graph", technique="collect-graph", target=recorded_key, effect=f"graph-built:{recorded_key}",
+        status="achieved", evidence={"graph_verified": True, "covered_domains": ["north.sevenkingdoms.local"]},
+        preconditions=[], satisfied_effects=[f"graph-built:{recorded_key}"], source="test", timestamp="",
+    )
+    learned = engagement_state.Foothold(
+        callback_id="2", agent="apollo", host="CASTELBLACK", forest="north.sevenkingdoms.local",
+        identity="samwell.tarly", integrity="medium", alive=True, source="test", timestamp="",
+        reported_domain="north",
+    )
+    state = engagement_state.EngagementState(objective="", footholds=[learned], hops=[collected])
+
+    assert engagement_state.graph_collection_covers_scope(state, learned, scope) is True
+    # Without the reported name there is no way to tell that collection was this foothold's.
+    unknown = engagement_state.Foothold(**{**learned.__dict__, "reported_domain": ""})
+    assert engagement_state.graph_collection_covers_scope(state, unknown, scope) is False
+    # A different reported name is a different foothold scope.
+    other = engagement_state.Foothold(**{**learned.__dict__, "reported_domain": "south"})
+    assert engagement_state.graph_collection_covers_scope(state, other, scope) is False
+
+
+@pytest.mark.parametrize("netbios, fqdn", [("north", "north.sevenkingdoms.local"), ("corphq", "corp.example.com")])
+def test_a_baseline_collection_under_the_reported_name_does_not_hide_the_admin_recollection(netbios, fqdn):
+    """After Domain Admin is proven the authority epoch changes, so the baseline collection no longer covers it."""
+    baseline = engagement_state.Hop(
+        id="hop-graph", technique="collect-graph", target=f"{netbios}|baseline", effect=f"graph-built:{netbios}|baseline",
+        status="achieved", evidence={"graph_verified": True, "covered_domains": [fqdn]}, preconditions=[],
+        satisfied_effects=[f"graph-built:{netbios}|baseline"], source="test", timestamp="",
+    )
+    admin = engagement_state.Hop(
+        id="hop-da", technique="domain-admin-membership-check", target=fqdn, effect=f"da:{fqdn}", status="achieved",
+        evidence={"dc_domain": fqdn, "callback_netbios_domain": netbios}, preconditions=[],
+        satisfied_effects=[f"da:{fqdn}"], source="test", timestamp="",
+    )
+    learned = engagement_state.Foothold(
+        callback_id="2", agent="apollo", host="WS01", forest=fqdn, identity="alice", integrity="medium", alive=True,
+        source="test", timestamp="", reported_domain=netbios,
+    )
+    before = engagement_state.EngagementState(objective="", footholds=[learned], hops=[baseline])
+    after = engagement_state.EngagementState(objective="", footholds=[learned], hops=[baseline, admin])
+
+    assert engagement_state.graph_collection_covers_scope(before, learned) is True
+    assert engagement_state.graph_collection_covers_scope(after, learned) is False
+    assert engagement_state.current_access_collection_missing(after) is True

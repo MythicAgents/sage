@@ -142,6 +142,68 @@ def controlled_principals_from_state(state: EngagementState) -> list[str]:
     return sorted(principal for principal in principals if principal)
 
 
+def reported_domain_accounts_from_state(state: EngagementState) -> list[tuple[str, str, str]]:
+    """``(netbios, account, host)`` for each live foothold whose agent reported a NetBIOS domain, for
+    :func:`reconcile_graph_position` to look up in BloodHound and learn that name's FQDN.
+
+    Uses the reported name, not the forest, so the lookup keeps confirming the pair after the forest becomes the FQDN.
+    Machine and shared built-in accounts, and footholds without a host, are skipped. Pure; never raises.
+    """
+    triples: set[tuple[str, str, str]] = set()
+    try:
+        for foothold in getattr(state, "footholds", []) or []:
+            if not getattr(foothold, "alive", False):
+                continue
+            netbios = engagement_state._netbios_domain_name(getattr(foothold, "reported_domain", ""))
+            identity = _text(getattr(foothold, "identity", ""))
+            account = identity.split("\\", 1)[1] if "\\" in identity else identity.split("@", 1)[0]
+            account = account.strip().casefold()
+            host = _text(getattr(foothold, "host", "")).split(".", 1)[0].strip().casefold()
+            if netbios and account and host and not engagement_state.shared_account_name(account):
+                triples.add((netbios, account, host))
+    except Exception:
+        return []
+    return sorted(triples)
+
+
+async def _single_domain(tool: Any, query: str) -> str:
+    domains = {name.casefold() for name in await _run_scalar_names(tool, query)}
+    return engagement_state._fqdn_name(next(iter(domains))) if len(domains) == 1 else ""
+
+
+async def _learn_netbios_domains(tool: Any, accounts: list[tuple[str, str, str]]) -> dict[str, str]:
+    """NetBIOS->FQDN pairs BloodHound shows for the callbacks' own account and host.
+
+    BloodHound's domain nodes carry no NetBIOS name, so the callback is the link: its account's user node and its
+    host's computer node must each sit in exactly one domain, and the same one. A name unique among the domains
+    collected so far does not prove the callback's domain on its own (that domain may not be collected yet), and a
+    user logged on to a computer in another domain proves nothing. An FQDN claimed by two NetBIOS names is dropped.
+    """
+    learned: dict[str, set[str]] = {}
+    for netbios, account, host in accounts:
+        safe_account = account.replace("\\", "").replace("'", "")
+        safe_host = host.replace("\\", "").replace("'", "")
+        if not safe_account or not safe_host:
+            continue
+        user_domain = await _single_domain(
+            tool, f"MATCH (u:User) WHERE toLower(u.samaccountname) = '{safe_account}' RETURN DISTINCT toLower(u.domain) AS name")
+        if not user_domain:
+            continue
+        host_domain = await _single_domain(
+            tool, f"MATCH (c:Computer) WHERE toLower(c.samaccountname) = '{safe_host}$' RETURN DISTINCT toLower(c.domain) AS name")
+        if host_domain == user_domain:
+            learned.setdefault(netbios, set()).add(user_domain)
+    claimed: dict[str, set[str]] = {}
+    for netbios, fqdns in learned.items():
+        for fqdn in fqdns:
+            claimed.setdefault(fqdn, set()).add(netbios)
+    return {
+        netbios: next(iter(fqdns))
+        for netbios, fqdns in learned.items()
+        if len(fqdns) == 1 and len(claimed[next(iter(fqdns))]) == 1
+    }
+
+
 def prune_stale_graph_facts(state: EngagementState, now: str) -> EngagementState:
     """Return a new state with stale graph facts removed."""
     current = access_reconciler._parse_iso_datetime(now)
@@ -177,9 +239,14 @@ async def reconcile_graph_position(
     ttl_seconds: int,
     credential_domains: list[str] | None = None,
     proof_envelope: dict[str, Any] | None = None,
+    netbios_accounts: list[tuple[str, str, str]] | None = None,
 ) -> list[GraphFact]:
     """Project modeled BloodHound edges for controlled principals into engagement
     predicates via the BloodHound MCP ``cypher_query`` tool.
+
+    ``netbios_accounts`` (from :func:`reported_domain_accounts_from_state`) also yields a
+    ``domain-netbios:<netbios>:<fqdn>`` fact for each NetBIOS name BloodHound resolves, and controlled principals named
+    ``account@<netbios>`` are matched under that FQDN.
 
     The real BloodHound CE cypher API (1) requires ``info_type="run"``, (2) does NOT support query
     parameters, and (3) returns scalar RETURNs under ``data.literals`` (a flat ``{value,key}`` list), NOT
@@ -195,8 +262,15 @@ async def reconcile_graph_position(
             return []
         principals = _normalized_unique(controlled_principals)
         domains = _normalized_unique(credential_domains or [])
-        if not principals and not domains:
+        accounts = list(netbios_accounts or [])
+        if not principals and not domains and not accounts:
             return []
+        learned = await _learn_netbios_domains(tool, accounts) if accounts else {}
+        principals = _normalized_unique([
+            f"{account}@{learned[domain]}" if domain in learned else principal
+            for principal in principals
+            for account, _, domain in [principal.partition("@")]
+        ])
         principals = await _resolve_principal_aliases(tool, principals)
         inlist = _principal_in_list(principals) if principals else "[]"
         facts: list[GraphFact] = []
@@ -205,6 +279,11 @@ async def reconcile_graph_position(
 
         def _runtime_fact(predicate: str) -> GraphFact:
             return _graph_fact(predicate, now, ttl_seconds, proof_envelope=proof)
+
+        for netbios, fqdn in sorted(learned.items()):
+            predicate = f"{engagement_state.DOMAIN_NETBIOS_FACT_PREFIX}{netbios}:{fqdn}"
+            seen.add(predicate)
+            facts.append(_runtime_fact(predicate))
 
         async def _collect(target_label: str, predicate_prefix: str, key_fn) -> None:
             if not principals:

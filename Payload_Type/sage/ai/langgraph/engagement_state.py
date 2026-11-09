@@ -21,6 +21,9 @@ class Foothold:
     alive: bool
     source: str
     timestamp: str
+    # The domain as the agent reported it (often a NetBIOS name such as ``north``), kept when ``forest`` holds the
+    # FQDN learned for it. Collection keys recorded before that FQDN was learned used this form.
+    reported_domain: str = ""
 
 
 @dataclass
@@ -299,6 +302,133 @@ def collection_target_key(
         return ""
 
 
+# A graph fact pairing a NetBIOS domain name with its FQDN: ``domain-netbios:<netbios>:<fqdn>``.
+DOMAIN_NETBIOS_FACT_PREFIX = "domain-netbios:"
+# Hop evidence keys: the domain a `net ... /domain` task's own output names (the domain controller it used), and the
+# NetBIOS name the issuing callback reported.
+DC_DOMAIN_EVIDENCE_KEY = "dc_domain"
+CALLBACK_NETBIOS_EVIDENCE_KEY = "callback_netbios_domain"
+# Accounts present in every domain under the same name. A name match on one of these says nothing about which domain
+# the callback's account is in, so it never teaches a NetBIOS name.
+SHARED_ACCOUNT_NAMES = frozenset({
+    "administrator", "guest", "krbtgt", "defaultaccount", "wdagutilityaccount", "system", "local service",
+    "network service",
+})
+
+
+def shared_account_name(identity: Any) -> bool:
+    """Whether ``identity`` (``account``, ``DOMAIN\\account`` or ``account@domain``) is a machine account or one of
+    the built-in names every domain has."""
+    text = _text(identity)
+    account = (text.split("\\", 1)[1] if "\\" in text else text.split("@", 1)[0]).strip().casefold()
+    return bool(account) and (account.endswith("$") or account in SHARED_ACCOUNT_NAMES)
+
+
+def has_graph_edges(graph_facts: Any) -> bool:
+    """Whether any of ``graph_facts`` is a graph edge rather than a learned NetBIOS name."""
+    return any(
+        not _text(getattr(fact, "predicate", "")).casefold().startswith(DOMAIN_NETBIOS_FACT_PREFIX)
+        for fact in graph_facts or []
+    )
+
+# `net ... /domain` prints this line before its result. English Windows only; localized output simply yields nothing.
+# No end-of-line anchor: tool results can carry the output JSON-escaped, with a literal `\r\n` after the period.
+_DC_DOMAIN_LINE_RE = re.compile(
+    r"processed at a domain controller for domain\s+([a-z0-9-]+(?:\.[a-z0-9-]+)+)(?![a-z0-9-])",
+    re.IGNORECASE,
+)
+
+
+def domain_controller_domain(output: Any) -> str:
+    """The FQDN a `net ... /domain` output says it was processed at, casefolded, else ''.
+
+    The line names the domain whose controller answered, which is the issuing computer's domain. A single-label name
+    is not an FQDN and yields ''. Two different domains in one output are ambiguous and yield ''.
+    """
+    found = {match.group(1).casefold() for match in _DC_DOMAIN_LINE_RE.finditer(_text(output))}
+    return found.pop() if len(found) == 1 else ""
+
+
+def _netbios_domain_name(value: Any) -> str:
+    name = _text(value).casefold()
+    return name if name and "." not in name and "\\" not in name and " " not in name else ""
+
+
+def _fqdn_name(value: Any) -> str:
+    name = _text(value).casefold().rstrip(".")
+    return name if "." in name and "\\" not in name and " " not in name else ""
+
+
+def learned_netbios_map(state: Any) -> dict[str, str]:
+    """NetBIOS->FQDN pairs this engagement's own evidence proves, casefolded.
+
+    Two witnesses, each pairing one callback's reported NetBIOS domain with an FQDN:
+
+    - an admitted hop recorded from a `net ... /domain` task, whose output named the domain controller's domain;
+    - an admitted BloodHound fact (``domain-netbios:<netbios>:<fqdn>``) from the callback account's user node.
+
+    No name is inferred from its spelling: a NetBIOS name need not be the first DNS label. A NetBIOS name with two
+    different FQDNs, or an FQDN claimed by two NetBIOS names, is ambiguous and dropped, so it stays unmapped. Pure;
+    never raises.
+    """
+    pairs: set[tuple[str, str]] = set()
+    try:
+        for hop in getattr(state, "hops", []) or []:
+            if not _is_admitted_achieved_hop(state, hop):
+                continue
+            evidence = getattr(hop, "evidence", {}) or {}
+            if not isinstance(evidence, dict):
+                continue
+            netbios = _netbios_domain_name(evidence.get(CALLBACK_NETBIOS_EVIDENCE_KEY))
+            fqdn = _fqdn_name(evidence.get(DC_DOMAIN_EVIDENCE_KEY))
+            if netbios and fqdn:
+                pairs.add((netbios, fqdn))
+        for fact in getattr(state, "graph_facts", []) or []:
+            predicate = _text(getattr(fact, "predicate", "")).casefold()
+            if not predicate.startswith(DOMAIN_NETBIOS_FACT_PREFIX):
+                continue
+            if not _is_admitted_graph_fact(state, fact):
+                continue
+            netbios, _, fqdn = predicate[len(DOMAIN_NETBIOS_FACT_PREFIX):].partition(":")
+            netbios, fqdn = _netbios_domain_name(netbios), _fqdn_name(fqdn)
+            if netbios and fqdn:
+                pairs.add((netbios, fqdn))
+    except Exception:
+        return {}
+    by_netbios: dict[str, set[str]] = {}
+    by_fqdn: dict[str, set[str]] = {}
+    for netbios, fqdn in pairs:
+        by_netbios.setdefault(netbios, set()).add(fqdn)
+        by_fqdn.setdefault(fqdn, set()).add(netbios)
+    return {
+        netbios: next(iter(fqdns))
+        for netbios, fqdns in by_netbios.items()
+        if len(fqdns) == 1 and len(by_fqdn[next(iter(fqdns))]) == 1
+    }
+
+
+def _reported_domain_collection_target_key(
+    state: "EngagementState",
+    foothold: "Foothold",
+    scope_domain: str = "",
+) -> str:
+    """The collection key this foothold had before its reported domain was resolved to an FQDN, else ''.
+
+    A collection recorded while the forest was still the reported NetBIOS name keeps covering the foothold after the
+    FQDN is learned, so learning a name never re-offers a collection by itself.
+    """
+    reported = _normalize_key(getattr(foothold, "reported_domain", ""))
+    forest = _normalize_key(getattr(foothold, "forest", ""))
+    if not reported or not forest or reported == forest:
+        return ""
+    # Same authority epoch and scope as the current key; only the forest part is spelled the old way. Recomputing the
+    # epoch under the NetBIOS name would miss authority recorded under the FQDN and hide a valid recollection.
+    head, separator, rest = collection_target_key(state, foothold, scope_domain).partition("|")
+    if not separator or head != _normalize_predicate(forest):
+        return ""
+    return _normalize_predicate(f"{reported}|{rest}")
+
+
 def graph_collection_covers_scope(
     state: "EngagementState",
     foothold: "Foothold",
@@ -309,7 +439,11 @@ def graph_collection_covers_scope(
         target_key = collection_target_key(state, foothold, scope_domain)
         if not target_key:
             return False
-        graph_effect = _normalize_predicate(f"graph-built:{target_key}")
+        graph_effects = {
+            _normalize_predicate(f"graph-built:{key}")
+            for key in (target_key, _reported_domain_collection_target_key(state, foothold, scope_domain))
+            if key
+        }
         expected_domain = _normalize_key(scope_domain) or _normalize_key(getattr(foothold, "forest", ""))
         matched_verified_hop = False
         for hop in getattr(state, "hops", []) or []:
@@ -320,7 +454,7 @@ def graph_collection_covers_scope(
                 for effect in getattr(hop, "satisfied_effects", []) or []
             }
             effects.add(_normalize_predicate(getattr(hop, "effect", "")))
-            if graph_effect not in effects:
+            if not graph_effects & effects:
                 continue
             evidence = getattr(hop, "evidence", {}) or {}
             if not isinstance(evidence, dict) or evidence.get("graph_verified") is not True:
@@ -1025,7 +1159,7 @@ def engagement_phase(state: "EngagementState") -> str:
                 "RECON — a trusted domain is visible but not collected; run one targeted BloodHound collection "
                 f"for {trusted_missing[0]}, then analyze"
             )
-        if not getattr(state, "graph_facts", None):
+        if not has_graph_edges(getattr(state, "graph_facts", None)):
             return "RECON — collect the graph ONCE, then analyze (do NOT re-collect)"
         return "BLOCKED — no modeled hop available; route to BloodHound for graph coverage/path analysis or await an access change"
     except Exception:

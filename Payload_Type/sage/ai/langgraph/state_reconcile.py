@@ -487,11 +487,12 @@ async def _verified_from_output(context, output, now, *, engagement_id, display_
                         review_output=str(output or "") if reviewable else ""), observations
 
 
-def footholds_from_tasks(tasks, now: str) -> dict[str, object]:
+def footholds_from_tasks(tasks, now: str, *, state=None) -> dict[str, object]:
     """Callback context for each task from the task's own Mythic callback row, keyed by callback display ID.
 
-    The forest comes from the callback's domain or user through the engagement's NetBIOS map, exactly as live
-    footholds derive it, so a task on a callback that has since died is evaluated the same way. No Mythic read.
+    The forest comes from the callback's domain or user through the engagement's NetBIOS map (learned from ``state``,
+    the engagement's ledger rows), exactly as live footholds derive it, so a task on a callback that has since died is
+    evaluated the same way. No Mythic read.
     """
     if _access_reconciler is None:
         return {}
@@ -501,6 +502,6 @@ def footholds_from_tasks(tasks, now: str) -> dict[str, object]:
         if isinstance(callback, dict) and callback.get("display_id") is not None:
             rows.setdefault(str(callback["display_id"]), callback)
     footholds = _access_reconciler.project_access(
-        list(rows.values()), now, {}, netbios_to_fqdn=_access_reconciler._engagement_netbios_map(),
+        list(rows.values()), now, {}, netbios_to_fqdn=_access_reconciler._engagement_netbios_map(state),
     )
     return {str(foothold.callback_id): foothold for foothold in footholds if str(foothold.callback_id)}

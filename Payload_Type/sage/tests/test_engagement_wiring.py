@@ -1556,6 +1556,160 @@ The command completed successfully.
     assert hop.evidence["mythic_task_id"] == "282"
 
 
+def _net_group_domain_admins_output(dc_domain: str) -> str:
+    """`net group "Domain Admins" /domain` as Windows prints it, with arya listed as a member."""
+    header = f"The request will be processed at a domain controller for domain {dc_domain}.\r\n\r\n" if dc_domain else ""
+    return (
+        f"{header}Group name     Domain Admins\r\n"
+        "Comment        Designated administrators of the domain\r\n\r\n"
+        "Members\r\n\r\n"
+        "-------------------------------------------------------------------------------\r\n"
+        "Administrator            arya                     eddard.stark\r\n"
+        "The command completed successfully.\r\n"
+    )
+
+
+@pytest.mark.parametrize("netbios, fqdn", [
+    ("north", "north.sevenkingdoms.local"),
+    ("corphq", "corp.example.com"),  # a NetBIOS name need not be the first DNS label
+])
+def test_domain_admin_check_binds_proof_to_the_domain_its_output_names(monkeypatch, netbios, fqdn):
+    monkeypatch.delenv("SAGE_ENGAGEMENT_NETBIOS_MAP", raising=False)
+    mt = _make_tools()
+    # The agent reported the NetBIOS name; nothing has mapped it yet, so the request was bound to it.
+    mt._engagement_footholds = [
+        engagement_state.Foothold(
+            callback_id="50", agent="apollo", host="CASTELBLACK", forest=netbios, identity="arya",
+            integrity="medium", alive=True, source="test", timestamp="2026-06-06T12:00:00Z", reported_domain=netbios,
+        )
+    ]
+    mt._last_issued_callback_id = 50
+    mt._last_issued_task_display_id = 8
+    mt._pending_engagement_hop = ("domain-admin-membership-check", netbios, "2026-06-11T01:10:05Z")
+
+    _record_success(mt, _net_group_domain_admins_output(fqdn))
+
+    hop = mt._engagement_hops[0]
+    assert hop.status == "achieved"
+    assert hop.effect == f"da:{fqdn}"
+    assert hop.evidence["dc_domain"] == fqdn
+    assert hop.evidence["callback_netbios_domain"] == netbios
+
+    # The recorded proof teaches the engagement the name, and the callback's forest becomes the FQDN.
+    async def callbacks():
+        return json.dumps([{"display_id": 50, "agent": "apollo", "host": "CASTELBLACK",
+                            "domain": netbios.upper(), "user": "arya", "integrity_level": 2}])
+
+    async def alive(_client, _display_id):
+        return {"alive": True}
+
+    monkeypatch.setattr(mt, "get_all_active_callbacks", callbacks)
+    monkeypatch.setattr(access_reconciler, "assess_callback_liveness", alive)
+    footholds = asyncio.run(access_reconciler.reconcile_access(mt, "2026-06-11T01:11:00Z"))
+    assert [(f.forest, f.reported_domain) for f in footholds] == [(fqdn, netbios)]
+
+    # Explicitly off: the reported name passes through unchanged.
+    monkeypatch.setenv("SAGE_ENGAGEMENT_NETBIOS_MAP", "off")
+    footholds = asyncio.run(access_reconciler.reconcile_access(mt, "2026-06-11T01:12:00Z"))
+    assert [f.forest for f in footholds] == [netbios]
+
+
+def test_domain_admin_check_without_a_domain_line_keeps_the_callback_forest(monkeypatch):
+    monkeypatch.delenv("SAGE_ENGAGEMENT_NETBIOS_MAP", raising=False)
+    mt = _make_tools()
+    mt._engagement_footholds = [
+        engagement_state.Foothold(
+            callback_id="50", agent="apollo", host="WINTERFELL", forest="north", identity="arya",
+            integrity="high", alive=True, source="test", timestamp="2026-06-06T12:00:00Z", reported_domain="north",
+        )
+    ]
+    mt._last_issued_callback_id = 50
+    mt._last_issued_task_display_id = 9
+    mt._pending_engagement_hop = ("domain-admin-membership-check", "north", "2026-06-11T01:10:05Z")
+
+    _record_success(mt, _net_group_domain_admins_output(""))
+
+    hop = mt._engagement_hops[0]
+    assert hop.effect == "da:north"
+    assert "dc_domain" not in hop.evidence and "callback_netbios_domain" not in hop.evidence
+    assert access_reconciler._engagement_netbios_map(access_reconciler.ledger_state(mt)) == {}
+
+
+def test_domain_admin_check_by_a_shared_builtin_name_teaches_no_domain(monkeypatch):
+    """SEVENKINGDOMS\\Administrator on a north member server: north's list names north's own Administrator."""
+    monkeypatch.delenv("SAGE_ENGAGEMENT_NETBIOS_MAP", raising=False)
+    mt = _make_tools()
+    mt._engagement_footholds = [
+        engagement_state.Foothold(
+            callback_id="50", agent="apollo", host="CASTELBLACK", forest="sevenkingdoms", identity="Administrator",
+            integrity="high", alive=True, source="test", timestamp="2026-06-06T12:00:00Z",
+            reported_domain="sevenkingdoms",
+        )
+    ]
+    mt._last_issued_callback_id = 50
+    mt._last_issued_task_display_id = 8
+    mt._pending_engagement_hop = ("domain-admin-membership-check", "sevenkingdoms", "2026-06-11T01:10:05Z")
+
+    _record_success(mt, _net_group_domain_admins_output("north.sevenkingdoms.local"))
+
+    hop = mt._engagement_hops[0]
+    assert hop.effect == "da:sevenkingdoms"  # the binding stays as it was; the name match proves no domain
+    assert "dc_domain" not in hop.evidence and "callback_netbios_domain" not in hop.evidence
+    assert access_reconciler._engagement_netbios_map(access_reconciler.ledger_state(mt)) == {}
+
+
+@pytest.mark.parametrize("setting", ["", "off"])
+def test_graph_refresh_learns_a_netbios_name_from_bloodhound_unless_switched_off(monkeypatch, setting):
+    from ai.mcp import MCPManager
+
+    if setting:
+        monkeypatch.setenv("SAGE_ENGAGEMENT_NETBIOS_MAP", setting)
+    else:
+        monkeypatch.delenv("SAGE_ENGAGEMENT_NETBIOS_MAP", raising=False)
+    mt = _make_tools()
+    mt._engagement_footholds = [
+        engagement_state.Foothold(
+            callback_id="2", agent="apollo", host="WS01", forest="corphq", identity="alice", integrity="medium",
+            alive=True, source="test", timestamp="2026-06-06T12:00:00Z", reported_domain="corphq",
+        )
+    ]
+
+    class _Cypher:
+        name = "cypher_query"
+
+        async def ainvoke(self, args):
+            query = args.get("query", "")
+            hit = ("u.samaccountname" in query and "'alice'" in query) or (
+                "c.samaccountname" in query and "'ws01$'" in query)
+            literals = [{"value": "corp.example.com", "key": "name"}] if hit else []
+            return json.dumps({"info_type": "run", "success": True,
+                               "data": {"nodes": {}, "edges": [], "literals": literals}})
+
+    monkeypatch.setattr(MCPManager, "get_connected_servers", lambda: ["BloodHound"])
+    monkeypatch.setattr(MCPManager, "is_bloodhound_server", lambda _server: True)
+    monkeypatch.setattr(MCPManager, "get_tools_by_server", lambda _server: [_Cypher()])
+    proof = proof_boundary.make_runtime_bloodhound_envelope(
+        engagement_id=mt._eng_key(), callback_id="2", task_id="99", terminal_status="completed",
+        command="execute_assembly", ingest_job_id="job-1", ingest_status="complete", source_artifact_id="file-1",
+        source_artifact_sha256="a" * 64, verifier_id="bloodhound_ingest:completed", transaction_id="fixture:99",
+        verifier_input={"ingest_job_id": "job-1", "task_id": "99"}, verifier_result={"ingest_status": "complete"},
+        captured_at="2026-06-11T01:00:00Z",
+    ).to_dict()
+
+    asyncio.run(mt._refresh_graph_facts_if_stale(
+        "2026-06-11T01:10:00Z", force=True, proof_envelope=proof, covered_domains=["corp.example.com"]))
+
+    facts = list(mt._ledger_view().graph_facts)
+    learned = access_reconciler._engagement_netbios_map(access_reconciler.ledger_state(mt))
+    if setting:
+        assert facts == [] and learned == {}
+    else:
+        # Name-only results are stored as a partial update and are not graph edges.
+        assert [f.predicate for f in facts] == ["domain-netbios:corphq:corp.example.com"]
+        assert learned == {"corphq": "corp.example.com"}
+        assert engagement_state.has_graph_edges(facts) is False
+
+
 def test_extract_domain_admin_membership_probe_accepts_net_user_global_group_membership():
     mt = _make_tools()
     mt._engagement_footholds = [

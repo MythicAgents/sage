@@ -156,6 +156,27 @@ def test_reconcile_manual_domain_admin_membership_records_callback_principal_da(
     assert state.achieved_effects() == {"da:north.sevenkingdoms.local"}
 
 
+def test_reconcile_domain_admin_membership_binds_the_domain_its_output_names():
+    """An Apollo callback row carries only the NetBIOS domain; the output's domain-controller line names the FQDN."""
+    task = _domain_admin_task()
+    task["callback"] = {"display_id": 3, "host": "WS01", "user": "alice", "domain": "CORPHQ"}
+    output = ("The request will be processed at a domain controller for domain corp.example.com.\r\n"
+              + _domain_admin_output(member="alice"))
+
+    record = task_reconciler.reconcile_task(task, output, TS)
+
+    assert record is not None
+    assert record.target == "corp.example.com"
+    assert (record.evidence["dc_domain"], record.evidence["callback_netbios_domain"]) == ("corp.example.com", "corphq")
+    # Without the line, a NetBIOS-only callback row still names no FQDN, so nothing is recorded.
+    assert task_reconciler.reconcile_task(task, _domain_admin_output(member="alice"), TS) is None
+    # A built-in name every domain has proves no domain by a name match: no FQDN binding, nothing learned.
+    task["callback"]["user"] = "Administrator"
+    shared = ("The request will be processed at a domain controller for domain corp.example.com.\r\n"
+              + _domain_admin_output(member="Administrator"))
+    assert task_reconciler.reconcile_task(task, shared, TS) is None
+
+
 def test_reconcile_domain_admin_membership_requires_callback_principal():
     assert task_reconciler.reconcile_task(
         _domain_admin_task(),

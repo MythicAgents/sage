@@ -18,30 +18,52 @@ except ImportError:
 Foothold = engagement_state.Foothold
 
 _NETBIOS_MAP_ENV = "SAGE_ENGAGEMENT_NETBIOS_MAP"
+_NETBIOS_MAP_OFF = {"off", "0", "false", "no", "none"}
 
-
-def _engagement_netbios_map() -> dict[str, str]:
-    """NetBIOS->FQDN overrides sourced from engagement config, not hardcoded.
-
-    Read from the ``SAGE_ENGAGEMENT_NETBIOS_MAP`` env var (a JSON object), keeping forest
-    resolution environment-agnostic: each engagement supplies its own NetBIOS->FQDN map
-    instead of a fixed lab topology. Example::
-
-        SAGE_ENGAGEMENT_NETBIOS_MAP='{"CORP": "corp.example.com", "EU": "eu.corp.example.com"}'
-
-    Fail-soft: an unset, empty, or malformed value yields ``{}``, in which case a NetBIOS
-    domain hint passes through casefolded (no fabricated FQDN).
-    """
-    raw = os.environ.get(_NETBIOS_MAP_ENV, "").strip()
-    if not raw:
-        return {}
+def _pinned_netbios_map(raw: str) -> dict[str, str]:
     try:
         parsed = json.loads(raw)
     except (TypeError, ValueError):
         return {}
     if not isinstance(parsed, dict):
         return {}
-    return {str(key): str(value) for key, value in parsed.items()}
+    return {_text(key).casefold(): _text(value).casefold() for key, value in parsed.items() if _text(key) and _text(value)}
+
+
+def netbios_learning_enabled() -> bool:
+    """False when ``SAGE_ENGAGEMENT_NETBIOS_MAP`` switches learning off (see ``_engagement_netbios_map``)."""
+    return os.environ.get(_NETBIOS_MAP_ENV, "").strip().casefold() not in _NETBIOS_MAP_OFF
+
+
+def _engagement_netbios_map(state: Any = None) -> dict[str, str]:
+    """NetBIOS->FQDN map for this engagement, learned from its evidence by default (``learned_netbios_map``).
+
+    Nothing needs configuring. ``SAGE_ENGAGEMENT_NETBIOS_MAP`` exists only to override that:
+
+    - ``off`` (or ``0``/``false``/``no``/``none``) stops learning, so reported NetBIOS names pass through unchanged;
+    - a JSON object pins names, winning over learned pairs, e.g.
+      ``SAGE_ENGAGEMENT_NETBIOS_MAP='{"CORP": "corp.example.com"}'``. Evaluation fixtures use this.
+
+    A malformed value pins nothing and learning continues. Never raises.
+    """
+    raw = os.environ.get(_NETBIOS_MAP_ENV, "").strip()
+    if raw.casefold() in _NETBIOS_MAP_OFF:
+        return {}
+    learned = engagement_state.learned_netbios_map(state) if state is not None else {}
+    return {**learned, **(_pinned_netbios_map(raw) if raw else {})}
+
+
+def ledger_state(mythic_tools: Any) -> Any:
+    """The engagement's ledger rows as an admission-scoped EngagementState, or None when no ledger is bound."""
+    try:
+        view = mythic_tools._ledger_view()
+        return engagement_state.EngagementState(
+            objective="", footholds=[], hops=list(view.hops), graph_facts=list(view.graph_facts),
+            engagement_id=mythic_tools._eng_key(), runtime_scope=True,
+        )
+    except Exception:
+        return None
+
 
 _SOURCE = "mythic:get_all_active_callbacks"
 _INTEGRITY_LEVELS = {
@@ -78,6 +100,7 @@ def project_access(
                 alive=bool(safe_liveness.get(display_id, False)),
                 source=_SOURCE,
                 timestamp=now,
+                reported_domain=_text(domain).casefold(),
             )
         )
     return footholds
@@ -124,7 +147,7 @@ async def reconcile_access(mythic_tools: Any, now: str) -> list[Foothold]:
             liveness[display_id] = bool(result.get("alive")) if isinstance(result, dict) else False
         except Exception:
             liveness[display_id] = False
-    return project_access(raw_callbacks, now, liveness, netbios_to_fqdn=_engagement_netbios_map())
+    return project_access(raw_callbacks, now, liveness, netbios_to_fqdn=_engagement_netbios_map(ledger_state(mythic_tools)))
 
 
 def _text(value: Any) -> str:
