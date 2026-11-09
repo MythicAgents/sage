@@ -185,7 +185,7 @@ def test_new_channel_state_shows_its_operations_labelled_objective_without_model
     asyncio.run(chat.chat(_request("state", "objective", operation_id=7)))
     asyncio.run(chat.chat(_request("state", "help", operation_id=7)))
 
-    assert resolved == [7, 8, 7, 7]
+    assert resolved == [7, 8, 7]  # valid help answers before resolving any ledger
     assert [emission["complete_request"] for emission in chat.terminal_emissions] == [True] * 4
     selected, other, usage, help_text = (emission["content"] for emission in chat.terminal_emissions)
     assert f"**{_COMPATIBILITY_LABEL}** collect graph" in selected.splitlines()
@@ -193,5 +193,104 @@ def test_new_channel_state_shows_its_operations_labelled_objective_without_model
     assert _COMPATIBILITY_LABEL not in other and "solve-8" not in other and "collect graph" not in other
     assert usage == ("Usage: `/state objective <text>` — set the operation's stored compatibility objective "
                      "(an operation setting, not a channel goal).")
+    assert help_text.startswith("Usage:\n") and "Unknown" not in help_text
     assert "Verified ledger updates are saved immediately, including without `apply`." in help_text
     assert sessions[7]._ledger_snapshot().objective_setting() == ("collect graph", "operator")
+
+
+# --- `/state help` is neutral usage; unknown subcommands keep their error prefix ---------------------------------------
+
+_UNKNOWN_STATE = "Unknown `/state` subcommand. Usage:\n"
+_PHASE6_USAGE_TEXT = (
+    "- `/state` — show the engagement ledger\n",
+    "from the cited task IDs, `cred:<id>` and `file:<id>` entries. Verified ledger updates are saved immediately, "
+    "including without `apply`. `apply` only permits importing missing credential material into Mythic's "
+    "credential store; without it, those imports are previewed.\n",
+    "- `/state objective <text>` — set the operation's stored compatibility objective (an operation setting, not a "
+    "channel goal)\n",
+    "- `/state wipe` — retract every row",
+)
+
+
+def _assert_neutral_state_usage(text):
+    assert text.startswith("Usage:\n") and "Unknown" not in text, text
+    assert "- `/state help` — " in text
+    for phrase in _PHASE6_USAGE_TEXT:
+        assert phrase in text, phrase
+
+
+def _ledger_must_not_resolve(monkeypatch):
+    async def resolve(_model, _request):
+        raise AssertionError("valid /state help resolved the engagement ledger")
+
+    monkeypatch.setattr(slash, "_resolve_chat_ledger", resolve)
+
+
+@pytest.mark.parametrize("argument", ["help", "HELP", "  Help\t", " hElP "])
+def test_state_help_on_a_fresh_channel_is_neutral_usage_without_ledger_or_model(monkeypatch, fresh_channel, argument):
+    _ledger_must_not_resolve(monkeypatch)
+    chat = _NoModelChat()
+    asyncio.run(chat.chat(_request("state", argument)))
+
+    [emission] = chat.terminal_emissions
+    assert emission["complete_request"] is True and "content" in emission, emission  # not an error emission
+    _assert_neutral_state_usage(emission["content"])
+
+
+@pytest.mark.parametrize("mode", ["conversation", "supervised"])
+def test_state_help_on_an_active_channel_is_neutral_usage_without_ledger_or_model(monkeypatch, mode):
+    request = _request("state", " Help ")
+    active = SimpleNamespace(mode=mode, operation_id=request.OperationID, apitoken_id=request.APITokenID)
+
+    async def active_session(_request):
+        return active
+
+    async def seen_channel(_request):
+        return False
+
+    monkeypatch.setattr(service, "get_channel_session", active_session)
+    monkeypatch.setattr(service, "claim_channel_marker", seen_channel)
+    _ledger_must_not_resolve(monkeypatch)
+    chat = _NoModelChat()
+    asyncio.run(chat.chat(request))
+
+    [emission] = chat.terminal_emissions
+    assert emission["complete_request"] is True and "content" in emission, emission  # not an error emission
+    _assert_neutral_state_usage(emission["content"])
+
+
+@pytest.mark.parametrize("argument", ["unknown-source-check", "help extra", "helpme", "?", "--help"])
+def test_unknown_state_subcommands_keep_the_error_prefix(monkeypatch, fresh_channel, argument):
+    tools = _bound_session(monkeypatch, "Operation_7_selected")
+
+    async def resolve(_model, _request):
+        return tools
+
+    monkeypatch.setattr(slash, "_resolve_chat_ledger", resolve)
+    chat = _NoModelChat()
+    asyncio.run(chat.chat(_request("state", argument)))
+
+    [emission] = chat.terminal_emissions
+    text = emission["content"]
+    assert emission["complete_request"] is True
+    assert text.startswith(_UNKNOWN_STATE) and text.count("Unknown") == 1, text
+    _assert_neutral_state_usage(text[len("Unknown `/state` subcommand. "):])
+
+
+@pytest.mark.parametrize("argument", ["", "show", " SHOW "])
+def test_bare_state_and_show_still_render_the_ledger(monkeypatch, fresh_channel, argument):
+    from tests.esl_fixtures import seed_ledger
+
+    tools = _bound_session(monkeypatch, "Operation_7_selected")
+    seed_ledger(tools, hops=[{"technique": "t", "target": "a", "effect": "e", "status": "pending"}])
+
+    async def resolve(_model, _request):
+        return tools
+
+    monkeypatch.setattr(slash, "_resolve_chat_ledger", resolve)
+    chat = _NoModelChat()
+    asyncio.run(chat.chat(_request("state", argument)))
+
+    [emission] = chat.terminal_emissions
+    text = emission["content"]
+    assert "`Operation_7_selected`" in text and "Usage:" not in text and "Unknown" not in text

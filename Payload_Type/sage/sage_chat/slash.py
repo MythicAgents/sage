@@ -247,8 +247,9 @@ async def _handle_report(chat: Any, request: ChatRequest, model: Any, arg: str) 
 
 
 _STATE_USAGE = (
-    "Unknown `/state` subcommand. Usage:\n"
+    "Usage:\n"
     "- `/state` — show the engagement ledger\n"
+    "- `/state help` — show this usage\n"
     "- `/state reconcile [<id>[,<id>…]] [apply]` — record verified effects from the operation's task history, or "
     "from the cited task IDs, `cred:<id>` and `file:<id>` entries. Verified ledger updates are saved immediately, "
     "including without `apply`. `apply` only permits importing missing credential material into Mythic's "
@@ -262,6 +263,7 @@ _STATE_USAGE = (
     "channel goal)\n"
     "- `/state wipe` — retract every row"
 )
+_STATE_UNKNOWN = "Unknown `/state` subcommand. "
 
 
 _SET_USAGE = (
@@ -334,18 +336,20 @@ def _state_actor(request: ChatRequest):
 async def _handle_state(model: Any, request: ChatRequest, arg: str = "") -> str:
     """Show or correct the operation's shared Engagement State Ledger.
 
-    Usage: `/state` (show) · `/state reconcile [<id>[,<id>…]] [apply]` · `/state remove <#|id[,…]> [--reason …]` ·
-    `/state restore <#|id[,…]>` · `/state invalidate <#|id[,…]>` · `/state objective <text>` · `/state wipe`.
-    Corrections are recorded events in sage.db: rows, numbers and history are kept, and running sessions see
-    them on their next ledger read.
+    Usage: `/state` (show) · `/state help` · `/state reconcile [<id>[,<id>…]] [apply]` ·
+    `/state remove <#|id[,…]> [--reason …]` · `/state restore <#|id[,…]>` · `/state invalidate <#|id[,…]>` ·
+    `/state objective <text>` · `/state wipe`. Corrections are recorded events in sage.db: rows, numbers and history
+    are kept, and running sessions see them on their next ledger read.
     """
+    parts = (arg or "").strip().split(maxsplit=1)
+    sub = parts[0].lower() if parts else ""
+    rest = parts[1].strip() if len(parts) > 1 else ""
+    if sub == "help" and not rest:
+        return _STATE_USAGE  # neutral usage: no ledger, Mythic client, model or write
     tools = await _resolve_chat_ledger(model, request)
     if tools is None:
         return ("Couldn't resolve this channel's engagement ledger from Mythic (no operation context yet). "
                 "Send one message to start a session, then try `/state` again.")
-    parts = (arg or "").strip().split(maxsplit=1)
-    sub = parts[0].lower() if parts else ""
-    rest = parts[1].strip() if len(parts) > 1 else ""
     store = tools._ledger_store()
     try:
         binding = tools._require_ledger_binding()
@@ -418,7 +422,7 @@ async def _handle_state(model: Any, request: ChatRequest, arg: str = "") -> str:
     except Exception as exc:
         return f"⚠️ The engagement ledger change was not recorded: {exc}"
     if sub and sub != "show":
-        return _STATE_USAGE
+        return _STATE_UNKNOWN + _STATE_USAGE
     return _render_ledger_markdown(tools, request, model)
 
 

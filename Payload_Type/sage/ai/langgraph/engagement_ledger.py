@@ -567,6 +567,27 @@ def _correction(corrections) -> dict:
     return {"kind": kind, "at": str(event.get("recorded_at") or ""), "reason": str(event.get("reason") or "")}
 
 
+_SOURCE_KIND_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*:")
+
+
+def _typed_sources(evidence: dict) -> list[str]:
+    """A row's source references, each naming its kind, in recorded order: the cited source as recorded when it
+    already carries a kind prefix (``unknown:<value>`` for a legacy value without one), then the credential-store
+    record ID as ``cred:<id>``. Absent and blank values are omitted. Presentation only; stored evidence is unchanged."""
+    out: list[str] = []
+    cited = evidence.get("cited_source")
+    cited = str(cited).strip() if cited is not None else ""
+    if cited:
+        out.append(cited if _SOURCE_KIND_RE.match(cited) else f"unknown:{cited}")
+    credential = evidence.get("credential_id")
+    credential = str(credential).strip() if credential is not None else ""
+    if credential[:5].casefold() == "cred:":
+        credential = credential[5:].strip()
+    if credential:
+        out.append(f"cred:{credential}")
+    return out
+
+
 def _premise_row_ids(hop: dict) -> list[str]:
     evidence = hop.get("evidence") if isinstance(hop.get("evidence"), dict) else {}
     proof = hop.get("proof_envelope") if isinstance(hop.get("proof_envelope"), dict) and hop.get("proof_envelope") \
@@ -579,9 +600,9 @@ def model_rows(snapshot, *, ttl_hours: float = 0, now: str = "") -> list[dict]:
     """Every hop row of one snapshot, projected for model context, in ascending permanent number.
 
     Each row carries only its number and revision, label/target/effect, recorded status and pending reason, its
-    effective correction (kind, recorded time, bounded reason), current eligibility, existing source IDs and any
-    derived-rule premise row numbers. Eligibility comes from the snapshot's own runtime projection: the same proof
-    quarantine, correction and TTL rules every runtime consumer applies.
+    effective correction (kind, recorded time, bounded reason), current eligibility, existing source IDs (each typed,
+    such as ``cred:<id>``) and any derived-rule premise row numbers. Eligibility comes from the snapshot's own runtime
+    projection: the same proof quarantine, correction and TTL rules every runtime consumer applies.
     """
     display = snapshot.display_hops()
     eligible, ineligible = snapshot.runtime_hop_dicts(ttl_hours=ttl_hours, now=now)
@@ -633,7 +654,7 @@ def model_rows(snapshot, *, ttl_hours: float = 0, now: str = "") -> list[dict]:
             "material_only": material_only,
             "tasks": task_ids(hop)[:6],
             "callback": str(evidence.get("callback_id") or evidence.get("callback_display_id") or ""),
-            "sources": [str(v) for v in (evidence.get("cited_source"), evidence.get("credential_id")) if v not in (None, "")],
+            "sources": _typed_sources(evidence),
             "rule": str(evidence.get("rule_id") or "") if derived else "",
             "premises": premises,
         })
