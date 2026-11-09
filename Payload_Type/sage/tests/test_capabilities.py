@@ -1252,6 +1252,106 @@ def test_same_domain_da_graph_replication_fact_allows_dcsync_after_context_refre
     assert len(dcsync) == 1
     assert "kerberos-context:lab.local@callback:13" in dcsync[0].preconditions
     assert "ensure-kerberos-context" not in [action.name for action in actions]
+    assert capabilities.dcsync_context_hold(state, "lab.local", "13") == (False, [])
+
+
+def test_short_name_admin_gates_fqdn_dcsync_context():
+    """A NetBIOS-keyed DA proof still gates DCSync of its FQDN when the key cannot be canonicalized at plan time.
+
+    Two known FQDNs share the `north` label, so `da:north` stays short-keyed. The gate must match it to the
+    requested FQDN by domain equivalence and authorize the refresh with `da:north` exactly as recorded.
+    """
+    state = es.EngagementState(
+        objective="domain admin",
+        footholds=[_foothold("north.example.local", callback_id="2", identity="NORTH\\operator")],
+        hops=[_hop("da:north"), _hop("ds-replication-rights:north.example.local")],
+        graph_facts=[_fact("ds-replication-rights:north.other.local")],
+    )
+
+    actions = capabilities.actions_from_state(state)
+    refresh = [
+        action for action in actions
+        if action.name == "ensure-kerberos-context" and action.target == "domain=north.example.local;callback=2"
+    ]
+
+    assert not [
+        action for action in actions
+        if action.name == "dcsync-krbtgt" and action.target == "domain=north.example.local;account=krbtgt"
+    ]
+    assert len(refresh) == 1
+    assert refresh[0].preconditions == ["da:north", "live-callback:2"]
+    assert refresh[0].effects == ["kerberos-context:north.example.local@callback:2"]
+    held, context_actions = capabilities.dcsync_context_hold(state, "north.example.local", "2")
+    assert held is True
+    assert [action.target for action in context_actions] == ["domain=north.example.local;callback=2"]
+
+
+def test_ambiguous_admin_domain_match_still_demands_context_refresh():
+    """Two inequivalent admin proofs that both match a short replication domain fail safe toward the refresh."""
+    state = es.EngagementState(
+        objective="domain admin",
+        footholds=[_foothold("north.a.local", callback_id="2", identity="NORTH\\operator")],
+        hops=[_hop("da:north.a.local"), _hop("da:north.b.local")],
+        graph_facts=[_fact("ds-replication-rights:north")],
+    )
+
+    actions = capabilities.actions_from_state(state)
+    refresh = [
+        action for action in actions
+        if action.name == "ensure-kerberos-context" and action.target == "domain=north;callback=2"
+    ]
+
+    assert not [
+        action for action in actions
+        if action.name == "dcsync-krbtgt" and action.target == "domain=north;account=krbtgt"
+    ]
+    assert len(refresh) == 1
+    assert refresh[0].preconditions[0] in {"da:north.a.local", "da:north.b.local"}
+
+
+def test_short_form_krbtgt_fact_feeds_fqdn_context_fallback():
+    """With no same-domain callback, a short-form `krbtgt-hash:` source still yields the context action."""
+    state = es.EngagementState(
+        objective="domain admin",
+        footholds=[_foothold("other.local", callback_id="13")],
+        hops=[_hop("krbtgt-hash:north"), _hop("da:north.example.local")],
+    )
+
+    actions = capabilities.actions_from_state(state)
+    contexts = [
+        action for action in actions
+        if action.name == "ensure-kerberos-context"
+        and action.effects == ["kerberos-context:north.example.local@callback:13"]
+    ]
+
+    assert len(contexts) == 1
+    assert contexts[0].intent["source_domain"] == "north"
+    assert "dcsync-krbtgt" not in [action.name for action in actions]
+
+
+@pytest.mark.parametrize("admin_effect", ["", "da:north.other.local", "da:south"])
+def test_graph_only_replication_right_without_equivalent_admin_stays_immediately_usable(admin_effect):
+    """No admin proof equivalent to the replication domain: DCSync runs now, with no context refresh."""
+    state = es.EngagementState(
+        objective="domain admin",
+        footholds=[_foothold("north.example.local", callback_id="2")],
+        hops=[_hop(admin_effect)] if admin_effect else [],
+        graph_facts=[_fact("ds-replication-rights:north.example.local")],
+    )
+
+    actions = capabilities.actions_from_state(state)
+    dcsync = [
+        action for action in actions
+        if action.name == "dcsync-krbtgt" and action.target == "domain=north.example.local;account=krbtgt"
+    ]
+
+    assert len(dcsync) == 1
+    assert not [item for item in dcsync[0].preconditions if item.startswith("kerberos-context:")]
+    assert not [
+        action for action in actions
+        if action.name == "ensure-kerberos-context" and action.target.startswith("domain=north.example.local;")
+    ]
+    assert capabilities.dcsync_context_hold(state, "north.example.local", "2") == (False, [])
 
 
 def test_same_domain_da_with_krbtgt_still_prefers_current_context_refresh():

@@ -6962,9 +6962,20 @@ def _admin_dcsync_context_gate(
     the active callback's Kerberos PAC is refreshed. Same-domain admin authority therefore still needs a proven
     callback-scoped context even when a graph fact now also names replication rights. Direct graph-only
     replication rights without a matching admin effect remain immediately usable.
+
+    Admin authority matches the requested domain by exact key first, then by ``_domains_equivalent`` so a
+    NetBIOS-keyed proof (``da:north``) still gates its FQDN (``north.example.local``). The matched proof
+    predicate, in its recorded form, authorizes the refresh. When more than one inequivalent admin key matches,
+    the gate fails safe and still demands the refresh: an unneeded refresh is benign, a skipped one is not.
     """
-    if domain not in admin_effects:
-        return "", [], False
+    authorization_effect = admin_effects.get(domain, "")
+    if not authorization_effect:
+        equivalent = sorted(
+            admin_effects[key] for key in admin_effects if _domains_equivalent(domain, key)
+        )
+        if not equivalent:
+            return "", [], False
+        authorization_effect = equivalent[0]
     context_callback = _current_kerberos_context_callback(domain, state, live_callback_ids)
     if context_callback:
         return context_callback, [], True
@@ -6973,7 +6984,7 @@ def _admin_dcsync_context_gate(
         return "", _refresh_kerberos_context_actions(
             domain,
             same_domain_callbacks,
-            authorization_effect=admin_effects.get(domain, f"da:{domain}"),
+            authorization_effect=authorization_effect,
             preferred_callback_id=preferred_callback_id,
             terminal_failed=terminal_failed,
         ), True
@@ -6984,6 +6995,42 @@ def _admin_dcsync_context_gate(
         preferred_callback_id=preferred_callback_id,
         terminal_failed=terminal_failed,
     ), True
+
+
+def dcsync_context_hold(state: Any, domain: str, callback_id: str) -> tuple[bool, list[CapabilityAction]]:
+    """Whether a DCSync of ``domain`` on ``callback_id`` must wait for a proven callback Kerberos context.
+
+    The executor's counterpart of the frontier's admin-DCSync gate, for a DCSync proposed directly rather than
+    taken from ``actions_from_state``. It derives the gate's inputs from the same state the frontier reads and
+    returns ``(True, context_actions)`` when admin authority backs the replication right but this callback has
+    no proven context for the domain; ``(False, [])`` when DCSync may run here now.
+    """
+    domain = _normalize(domain)
+    callback_id = _normalize_callback_id(callback_id)
+    if not domain or not callback_id:
+        return False, []
+    facts = _graph_fact_predicates(state)
+    achieved = _achieved_effects(state)
+    explicit_replication_domains = set(_replication_right_domains(achieved | facts))
+    known_domains = {
+        *_live_foothold_domains(state),
+        *explicit_replication_domains,
+        *(gpo_domain for _, gpo_domain in _controlled_gpos_with_domain(facts)),
+        *(gpo_domain for _, gpo_domain in _system_exec_gpos(achieved)),
+    }
+    context_callback, context_actions, context_required = _admin_dcsync_context_gate(
+        domain,
+        state,
+        achieved,
+        {callback_id},
+        explicit_replication_domains,
+        _admin_domain_effects(achieved, known_domains),
+        preferred_callback_id=callback_id,
+        terminal_failed=_terminal_failed_effects(state),
+    )
+    if not context_required or context_callback == callback_id:
+        return False, []
+    return True, context_actions
 
 
 def _ensure_kerberos_context_actions(
@@ -7000,7 +7047,9 @@ def _ensure_kerberos_context_actions(
     source_domains = {
         domain
         for domain in _krbtgt_hash_domains(achieved)
-        if domain == target_domain or _parent_domain(domain) == target_domain
+        if domain == target_domain
+        or _parent_domain(domain) == target_domain
+        or _domains_equivalent(domain, target_domain)
     }
     if not source_domains:
         return []

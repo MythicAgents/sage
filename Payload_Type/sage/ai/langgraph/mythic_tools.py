@@ -12187,6 +12187,26 @@ class MythicTools:
                     "recorded_effects": [],
                 }, action_obj, input_values, callback_id)
 
+            dcsync_context_failure = self._capability_dcsync_context_precondition_failure(
+                action_obj,
+                input_values,
+                callback_id,
+                capabilities,
+            )
+            if dcsync_context_failure:
+                return self._capability_executor_failure_json({
+                    "ok": False,
+                    "verdict": "failed",
+                    "capability": self._capability_text(getattr(action_obj, "name", "")),
+                    "reason": dcsync_context_failure["reason"],
+                    "missing": dcsync_context_failure["missing"],
+                    "suggested_capability": dcsync_context_failure["suggested_capability"],
+                    "context_actions": dcsync_context_failure["context_actions"],
+                    "action": asdict(action_obj) if is_dataclass(action_obj) else {},
+                    "issued": [],
+                    "recorded_effects": [],
+                }, action_obj, input_values, callback_id)
+
             injected_blocker = self._capability_executor_injected_blocker(
                 action_obj,
                 input_values,
@@ -16534,6 +16554,53 @@ class MythicTools:
                 "host-scoped capability preconditions are missing for "
                 f"{host}@{domain}; local-admin or remote-exec on another host does not satisfy this target"
             ),
+        }
+
+    def _capability_dcsync_context_precondition_failure(
+        self,
+        action,
+        inputs: dict,
+        callback_id: str | int | None,
+        capabilities_mod,
+    ) -> dict:
+        """Hold an admin-backed DCSync until its callback has a proven Kerberos context.
+
+        The frontier offers admin-backed DCSync only after `ensure-kerberos-context` proves a fresh ticket on the
+        callback, because a ticket issued before the admin grant carries no replication rights. A DCSync proposed
+        straight to the executor must meet the same gate, or it replicates on that stale ticket and fails.
+        """
+        capability = self._capability_text(getattr(action, "name", "")).casefold()
+        if capability not in {"dcsync-krbtgt", "dcsync-account"}:
+            return {}
+        domain = self._capability_domain(action, inputs)
+        callback = self._capability_text(callback_id)
+        if not domain or not callback:
+            return {}
+        try:
+            from . import engagement_state
+        except ImportError:  # pragma: no cover
+            import engagement_state
+        view = self._ledger_view()
+        state = engagement_state.EngagementState(
+            objective=self._engagement_objective(),
+            footholds=list(getattr(self, "_engagement_footholds", []) or []),
+            hops=list(view.hops),
+            graph_facts=list(view.graph_facts),
+            engagement_id=self._eng_key(),
+            runtime_scope=True,
+        )
+        held, context_actions = capabilities_mod.dcsync_context_hold(state, domain, callback)
+        if not held:
+            return {}
+        return {
+            "missing": [f"kerberos-context:{domain}@callback:{callback}"],
+            "reason": (
+                f"admin authority backs DCSync of {domain}, but callback {callback} has no proven Kerberos "
+                "context for that domain, and a ticket issued before the admin grant carries no replication "
+                "rights; run ensure-kerberos-context on this callback first"
+            ),
+            "suggested_capability": "ensure-kerberos-context",
+            "context_actions": [asdict(item) for item in context_actions],
         }
 
     def _capability_artifact_scoped_precondition_failure(

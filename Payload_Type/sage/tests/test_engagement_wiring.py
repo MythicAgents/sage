@@ -4609,6 +4609,66 @@ def test_execute_capability_rejects_wrong_host_ca_export_scope(monkeypatch):
     assert "another host" in result["reason"]
 
 
+_FQDN_DCSYNC = {"capability": "dcsync-krbtgt", "domain": "north.example.local", "callback_id": "2"}
+_FQDN_DCSYNC_OK = (
+    "[DC] 'north.example.local' will be the domain\n** SAM ACCOUNT **\nSAM Username         : krbtgt\n"
+    f"Credentials:\n  Hash NTLM: {'d' * 32}\n* Primary:Kerberos-Newer-Keys *\n  aes256_hmac       (4096) : {'e' * 64}\n"
+)
+
+
+def _short_name_admin_dcsync_tools(monkeypatch, tmp_path, *extra_hops):
+    """A worker-proposed FQDN DCSync after a NetBIOS-keyed DA proof, before any callback context refresh."""
+    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path / "engagement"))
+    mt = _make_tools()
+    mt._fetch_command_schema = lambda command, callback_display_id, **kw: asyncio.sleep(0, result=[])
+    mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
+    mt._resolve_payload_type = lambda callback_id: asyncio.sleep(0, result="apollo")
+    mt._resolve_domain_controller_host = lambda domain: asyncio.sleep(0, result="dc01.north.example.local")
+    mt._engagement_footholds = [engagement_state.Foothold(
+        callback_id="2", agent="apollo", host="WS01", forest="north.example.local", identity="NORTH\\operator",
+        integrity="medium", alive=True, source="test", timestamp="2026-06-12T12:00:00Z",
+    )]
+    seed_ledger(mt, hops=[
+        _proof_hop("da:north", 8, callback_id="2"),
+        _proof_hop("ds-replication-rights:north.example.local", 8, callback_id="2", technique="derived-rule"),
+        *extra_hops,
+    ])
+    return mt
+
+
+def test_execute_capability_holds_admin_backed_dcsync_until_callback_context_is_proven(monkeypatch, tmp_path):
+    mt = _short_name_admin_dcsync_tools(monkeypatch, tmp_path)
+    calls: dict = {}
+
+    with _split_issue(lambda: _FQDN_DCSYNC_OK, calls, display_id=9):
+        result = json.loads(asyncio.run(mt.execute_capability(dict(_FQDN_DCSYNC), {"timeout": 5})))
+
+    assert calls.get("issued", []) == []  # held before any Mythic task exists
+    assert result["ok"] is False
+    assert result["issued"] == []
+    assert result["missing"] == ["kerberos-context:north.example.local@callback:2"]
+    assert result["suggested_capability"] == "ensure-kerberos-context"
+    assert [
+        (action["name"], action["target"], action["preconditions"]) for action in result["context_actions"]
+    ] == [("ensure-kerberos-context", "domain=north.example.local;callback=2", ["da:north", "live-callback:2"])]
+    assert "recorded_failed_effects" not in result
+
+
+def test_execute_capability_runs_admin_backed_dcsync_on_callback_with_proven_context(monkeypatch, tmp_path):
+    mt = _short_name_admin_dcsync_tools(
+        monkeypatch, tmp_path,
+        _proof_hop("kerberos-context:north.example.local@callback:2", 15, callback_id="2"),
+    )
+    calls: dict = {}
+
+    with _split_issue(lambda: _FQDN_DCSYNC_OK, calls, display_id=16):
+        result = json.loads(asyncio.run(mt.execute_capability(dict(_FQDN_DCSYNC), {"timeout": 5})))
+
+    assert [issue["command_name"] for issue in calls["issued"]] == ["dcsync"]
+    assert result["ok"] is True, result
+    assert "krbtgt-hash:north.example.local" in result["recorded_effects"]
+
+
 def test_build_capability_commands_adcs_ca_export_uses_wmiexecute_after_remote_exec(monkeypatch):
     mt = _make_tools()
     seed_ledger(mt, hops=[
