@@ -46,7 +46,7 @@ services, and Sage-local attack artifacts are not admissible proof of an objecti
 
 - [How Sage works](#how-sage-works)
 - [Product contracts and authority modes](#product-contracts-and-authority-modes)
-- [The engagement ledger](#the-engagement-ledger)
+- [The Engagement State Ledger](#the-engagement-state-ledger)
 - [Repository layout](#repository-layout)
 - [Requirements](#requirements)
 - [Install and run Sage](#install-and-run-sage)
@@ -88,7 +88,7 @@ the same authority or acceptance standard.
 When authority permits action, Sage runs an observe/model/select/execute/verify loop. It **observes** state from
 Mythic and BloodHound, **models** the actions available to it as typed capabilities, **selects** one, **executes**
 it as a Mythic task, **verifies** the effect from real proof, then **repairs or re-plans** — appending every proven
-effect to [the engagement ledger](#the-engagement-ledger).
+effect to [the Engagement State Ledger](#the-engagement-state-ledger).
 
 ```mermaid
 flowchart LR
@@ -98,7 +98,7 @@ flowchart LR
     E --> V[Verify from real proof]
     V --> R[Repair / re-plan]
     R --> O
-    V --> L[(Engagement ledger)]
+    V --> L[(Engagement State Ledger)]
 ```
 
 In an autonomous solve, a deterministic controller (`autonomous_controller.py`) honors the model's intent to act
@@ -159,14 +159,14 @@ streaming emitter and terminal lifecycle.
 | `Payload_Type/sage/prompts/` | Externalized agent prompts |
 | `Payload_Type/sage/ttps/` | Tradecraft references and pinned tool metadata |
 
-## The engagement ledger
+## The Engagement State Ledger
 
 An LLM does not remember your engagement between turns. Sage keeps that memory outside the model, in a durable
-**Engagement State Ledger** (the engagement ledger): a running record of the capabilities and credential material
-the operation has gained, so a multi-day assessment survives context resets, restarts, and even a change of model.
+**Engagement State Ledger**: a running record of the capabilities and credential material the operation has
+gained, so a multi-day assessment survives context resets, restarts, and even a change of model.
 
 <p align="center">
-  <img src="docs/assets/engagement-ledger.png" alt="The /state engagement ledger" width="820">
+  <img src="docs/assets/engagement-ledger.png" alt="The Engagement State Ledger shown by /state" width="820">
   <br><em><code>/state</code> renders the ledger: each row's effect, status, task, and callback.</em>
 </p>
 
@@ -395,7 +395,7 @@ Set `mode` when you create the channel, or switch it live with `/mode`:
 
 <p align="center">
   <img src="docs/assets/sage-ledger-solve.gif" alt="Sage in experimental auto mode on the GOAD lab" width="900">
-  <br><em>Experimental auto mode in a GOAD lab: the engagement ledger fills in as each hop is verified, through to
+  <br><em>Experimental auto mode in a GOAD lab: the Engagement State Ledger fills in as each hop is verified, through to
   domain compromise. Auto mode is a research and evaluation capability, validated only on GOAD.</em>
 </p>
 
@@ -440,7 +440,7 @@ the token has no read scope for.
 
 | Command | What it does |
 |---|---|
-| `/state` | Show the [engagement ledger](#the-engagement-ledger) — the durable table of achieved and pending gains shared by every chat in the current Mythic operation |
+| `/state` | Show the [Engagement State Ledger](#the-engagement-state-ledger) — the durable table of achieved and pending gains shared by every chat in the current Mythic operation |
 | `/state help` | Show `/state` usage without reading the ledger |
 | `/state objective <text>` | Set the operation's stored compatibility objective (an operation setting, not a channel goal) |
 | `/state reconcile [<id>[,<id>…]] [apply]` | Record verified effects from the operation's completed Mythic tasks, from any issuer, or from the cited task IDs, `cred:<id>` and `file:<id>` entries. Verified updates are saved immediately; `apply` only permits importing missing credential material into Mythic's credential store, which is **previewed unless `apply`** is given, because task output is attacker-influenceable |
@@ -995,7 +995,7 @@ are:
   verify callback identity and clocks.
 - `sage-live-runner`: prepare, run, monitor, and inspect native Mythic chat requests.
 - `sage-focused-capability-tests`: narrow capability diagnostics plus explicit offline test tiers.
-- `sage-trace-analysis`: inspect Phoenix, Mythic output, and engagement ledgers.
+- `sage-trace-analysis`: inspect Phoenix, Mythic output, and Engagement State Ledger exports.
 - `sage-trajectory-learning`: export and replay redacted transition data.
 
 Range-specific operators, prompts, credentials, and generated evidence remain development inputs. They are not

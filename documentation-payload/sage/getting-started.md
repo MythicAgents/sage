@@ -75,4 +75,4 @@ Sage renders markdown, and each tool it runs appears as an updating, collapsible
 
 - [Using Sage in Chat](/agents/sage/using-sage-in-chat/) — modes, approvals, and slash commands
 - [Connecting BloodHound](/agents/sage/bloodhound/) — required for graph-driven work
-- [The Engagement Ledger](/agents/sage/engagement-ledger/) — how Sage tracks proven progress
+- [The Engagement State Ledger](/agents/sage/engagement-ledger/) — how Sage tracks proven progress

@@ -31,7 +31,7 @@ Sage requires **Mythic v4.0.0 or later**. Native chat containers do not exist be
 - 32 Mythic tools plus a 15-step generic, range-agnostic capability chain
 - BloodHound attack-graph analysis through a pre-wired MCP server
 - Connects to arbitrary third-party MCP servers
-- A durable, proof-gated **engagement ledger** that survives restarts and model changes
+- A durable, proof-gated **Engagement State Ledger** that survives restarts and model changes
 - A locked `Sage Watcher` profile with a stateless non-tasking console, background findings, native Mythic
   notifications, and durable deduplication
 - Embedded [Arize Phoenix](https://github.com/Arize-ai/phoenix) tracing for full run observability

@@ -29,7 +29,7 @@ See [Tools Reference](/agents/sage/tools-reference/) for what each Mythic tool d
 
 In an **autonomous** solve there is one more piece that is *not* an LLM. A deterministic controller honors the
 model's intent to act, but owns which capability actually runs and how it is built — the mechanics stay below the
-model, and an effect only reaches the [engagement ledger](/agents/sage/engagement-ledger/) after a verifier
+model, and an effect only reaches the [Engagement State Ledger](/agents/sage/engagement-ledger/) after a verifier
 confirms it. This is what keeps an autonomous run grounded in proof rather than in the model's narration.
 
 {{% notice tip %}}

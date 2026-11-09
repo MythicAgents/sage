@@ -1,13 +1,13 @@
 +++
-title = "The Engagement Ledger"
+title = "The Engagement State Ledger"
 chapter = false
 weight = 70
 +++
 
 An LLM does not remember your engagement between turns. Sage keeps that memory outside the model, in a durable
-**Engagement State Ledger** (the engagement ledger): a running record of the capabilities and credential material
-the operation has gained, so a multi-day assessment survives context resets, restarts, and even a change of model.
-You read and correct it in chat with `/state`.
+**Engagement State Ledger**: a running record of the capabilities and credential material the operation has
+gained, so a multi-day assessment survives context resets, restarts, and even a change of model. You read and
+correct it in chat with `/state`.
 
 ## What it is
 

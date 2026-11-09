@@ -39,7 +39,7 @@ up front rather than failing mid-run.
 | `/watcher apply` | From the exact active locked `Sage Watcher` channel, claim or advance the immutable operation profile and rehydrate any requesting-user secret after restart |
 | `/watcher scan` · `/watcher pause` · `/watcher resume` | From the exact owner only, request an immediate read-only poll, pause the scheduler, or resume it |
 | `/watcher interval <seconds>` · `/watcher interval default` | From the exact owner only, persist cadence for the applied profile; accepted range is 5–86,400 integer seconds |
-| `/state` | Show the [engagement ledger](/agents/sage/engagement-ledger/) — the table of achieved and pending gains shared by every channel of this operation |
+| `/state` | Show the [Engagement State Ledger](/agents/sage/engagement-ledger/) — the table of achieved and pending gains shared by every channel of this operation |
 | `/state help` | Show `/state` usage without reading the ledger |
 | `/state objective <text>` | Set the operation's stored compatibility objective (an operation setting, not a channel goal) |
 | `/state reconcile [<id>[,<id>…]] [apply]` | Record verified effects from the operation's completed Mythic tasks, from any issuer, or from the cited task IDs, `cred:<id>` and `file:<id>` entries. Verified updates are saved immediately; importing missing credential material into Mythic's credential store is previewed unless `apply` is given |

@@ -25,7 +25,7 @@ risk of unintended impact on a live network. Weigh production use very carefully
 - Objective proof comes from Mythic task output or artifacts, Mythic credential-store state, or BloodHound facts
   derived from payload-collected artifacts. Sage-local attack artifacts are not admissible proof.
 - No capability effect or objective completion may be recorded from Sage-host target I/O or Sage-local artifact
-  generation. See [The Engagement Ledger](/agents/sage/engagement-ledger/) for how proof is enforced.
+  generation. See [The Engagement State Ledger](/agents/sage/engagement-ledger/) for how proof is enforced.
 
 ## Scope and termination controls
 
