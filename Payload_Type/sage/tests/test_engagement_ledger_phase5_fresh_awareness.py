@@ -97,8 +97,11 @@ def _seeded_tools(monkeypatch) -> mythic_tools.MythicTools:
     return tools
 
 
-def _build_model(tools, script) -> tuple[Model, _CapturingModel]:
-    async def emit(_text):
+def _build_model(tools, script, *, emitted: list | None = None) -> tuple[Model, _CapturingModel]:
+    """``emitted`` records what the native-chat response emitter received (the operator's view)."""
+    async def emit(text):
+        if emitted is not None:
+            emitted.append(text)
         return True
 
     async def build():
@@ -119,9 +122,10 @@ def _build_model(tools, script) -> tuple[Model, _CapturingModel]:
 
 
 def _run(model: Model, prompt: str, *, mode: str = "supervised", autonomous_solve: bool = False,
-         thread: str = "phase5-thread", tolerate: bool = False) -> dict:
+         thread: str = "phase5-thread", tolerate: bool = False, stream: bool = False) -> dict:
     """Drive one request through the real graph. ``tolerate`` keeps going past the end of a short script or the
-    recursion limit (the probes assert on the inputs the model actually received) and returns checkpointed state."""
+    recursion limit (the probes assert on the inputs the model actually received) and returns checkpointed state.
+    ``stream`` drives native chat's event path, so the final report reaches the response emitter."""
     async def go():
         model.mode = mode
         model._rebuild_graph()
@@ -137,6 +141,10 @@ def _run(model: Model, prompt: str, *, mode: str = "supervised", autonomous_solv
         config = model._graph_run_config(thread)
         config["recursion_limit"] = 30
         try:
+            if stream:
+                async for event in model.graph.astream(model.state, config):
+                    await model._process_stream_event(event)
+                return (await model.graph.aget_state(config)).values
             return await model.graph.ainvoke(model.state, config)
         except Exception:
             if not tolerate:
@@ -1104,3 +1112,304 @@ def test_submission_result_keeps_a_cited_material_source_typed(session, citation
     assert f"already recorded (row #{number})" in again and _typed_sources(again)[number] == [cited[0]]
     assert applied == [False, False] and sdk_guard.writes == [] and sdk_guard.issued == []
     assert SECRET not in out + again
+
+
+# --- worker-owned observation: a real supervised delegation and a real conversation submission -----------------------
+#
+# Two consumers the shared projection serves had no assembled observation: a Mythic_Operator model call reached by a
+# real supervised delegation, and a submission result reaching the next model input. These tests drive both through
+# the real graph, agents, handoff validator, view middleware, tools and reconciler; only the chat model is scripted.
+# They qualify the assembled path, not model judgment: whether a live model chooses this delegation is a live question.
+
+from langchain_core.messages import ToolMessage  # noqa: E402
+
+from ai.langgraph import effect_observations  # noqa: E402
+from ai.langgraph.prompt_loader import load_prompt  # noqa: E402
+from tests.test_engagement_ledger_phase4 import TGS_HASH, _callback_row  # noqa: E402
+
+REQUEST_ID = "chat:1:request:1"
+_JOIN_KINDS = (effect_observations.CREDENTIAL_ENTRY_JOIN, effect_observations.DIRECTORY_CHANGE_JOIN,
+               effect_observations.SESSION_CONTEXT)
+
+
+def _prompt_role(call) -> str:
+    """A captured call's role from its leading system prompt, independent of the generated view it should carry."""
+    first = call[0] if call else None
+    if isinstance(first, SystemMessage):
+        for role, prompt in (("Supervisor", load_prompt("supervisor")),
+                             ("Mythic_Operator", load_prompt("mythic_operator", commands_text=""))):
+            if str(first.content).startswith(prompt[:80]):
+                return role
+    return "other"
+
+
+def _record_agent_tools(monkeypatch) -> dict:
+    """Pass-through spy on the real agent builder: records each role's offered tool names, then builds the real agent."""
+    offered: dict = {}
+    original = model_module.create_agent
+
+    def spy(*args, **kwargs):
+        offered[kwargs.get("name")] = [getattr(tool, "name", "") for tool in kwargs.get("tools") or []]
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(model_module, "create_agent", spy)
+    return offered
+
+
+def _ledger_state(tools) -> tuple:
+    """What a run must leave unchanged: rows, revision, next number, settings, events, cursor and awaiting joins."""
+    binding = tools._require_ledger_binding()
+    store = tools._ledger_store()
+    snapshot = tools._ledger_snapshot()
+    return (snapshot.revision, snapshot.next_hop_number, snapshot.display_hops(), dict(snapshot.settings),
+            store.history(binding), store.reconciliation_state(binding),
+            [store.awaiting_joins(binding, kind) for kind in _JOIN_KINDS])
+
+
+def _tool_results(call, name: str) -> list:
+    return [m for m in call if isinstance(m, ToolMessage) and m.name == name]
+
+
+def _final_reports(result) -> list:
+    return [m.content for m in result["messages"]
+            if isinstance(m, AIMessage) and m.additional_kwargs.get("_is_final_report")]
+
+
+def _row_line(text: str, number: int) -> str:
+    [line] = [line for line in text.splitlines() if line.startswith(f"- #{number} ")]
+    return line
+
+
+def _seed_two_rows(tools) -> None:
+    """Rows #1 and #2, so the credential-material row is #3: its row number differs from its task, callback and
+    credential IDs."""
+    key = tools._require_ledger_binding().engagement_key
+    proven = _hop("gpo-abuse", "starkwallpaper", "system:starkwallpaper", "achieved", task=102,
+                  extra={"credential_id": 2})
+    proven["proof_envelope"] = task_proof(key, task_id="102")
+    pending = _hop("domain-admin-membership-check", "north", "da:north", "pending", task=103,
+                   extra={"cited_source": "file:7"})
+    seed_ledger(tools, hops=[proven, pending])
+
+
+def _retained_operation(session, monkeypatch) -> mythic_tools.MythicTools:
+    """The retained shape, produced by the real reconciler: after rows #1 and #2, one operation pass records task 20's
+    credential-store record 10 (callback 2) as material row #3 and sets the cursor and callback baseline, as earlier
+    passes had before the live run. Mythic is the stub transport; the store, verifiers and reconciler are real."""
+    records = stub_mythic_operation(monkeypatch)
+    harvest = _store_task(20, "execute_assembly", callback=2, params=KERBEROAST)
+    records["tasks"], records["credentials"] = [harvest], [_store_credential(10, harvest)]
+    records["callbacks"] = [_callback_row(2, "CASTELBLACK", "NORTH\\samwell.tarly", 2, "2026-11-05T09:00:00")]
+    tools = session()
+    _seed_two_rows(tools)
+    asyncio.run(tools._reconcile_operation())
+    position = tools._ledger_store().reconciliation_state(tools._require_ledger_binding())
+    assert position.task_cursor == 20 and position.callback_baseline is not None
+    assert _typed_sources(_block(tools))[3] == ["cred:10"]
+    return tools
+
+
+_AUDIT_PROMPT = "Have the operator agent check this session's open artifacts and ledger rows 1 and 3; change nothing."
+_WORKER_REPORT = ("Session inventory: list_open_artifacts returned [] for this session only; it says nothing about the "
+                  "operation's history and nothing was cleaned. Ledger row #3 is credential material only "
+                  "(credential record 10 from task 20 on callback 2), not a proven working credential.")
+_AUDIT_FINAL = "Audit complete: this session has no open artifacts; ledger row #3 is credential material only."
+
+
+def _audit_handoff() -> AIMessage:
+    return AIMessage(content="", tool_calls=[{
+        "name": "transfer_to_Mythic_Operator",
+        "args": {"handoff_title": "audit session inventory and rows 1 and 3",
+                 "handoff_instruction": "Call list_open_artifacts once, then read_engagement_state for rows 1 and 3. "
+                                        "Report the session inventory separately from the rows.",
+                 "allowed_capabilities": ["control_plane"],
+                 "expected_result": "The session's open-artifact inventory and rows 1 and 3, reported separately."},
+        "id": "call_handoff_audit", "type": "tool_call",
+    }])
+
+
+def _run_audit(session, monkeypatch, emitted: list) -> tuple:
+    """The supervised audit through the normal Supervisor entry: a control-plane delegation, the worker's artifact
+    list and ledger read, its handback, and the Supervisor's final report."""
+    tools = _retained_operation(session, monkeypatch)
+    before = _ledger_state(tools)
+    offered = _record_agent_tools(monkeypatch)
+    model, fake = _build_model(tools, [
+        _audit_handoff(),
+        _tool_call("list_open_artifacts", {}, "call_artifacts"),
+        _tool_call(el.READER_TOOL, {"numbers": [1, 3]}, "call_read_rows"),
+        AIMessage(content=_WORKER_REPORT),
+        _tool_call("respond_to_user", {"final_response": _AUDIT_FINAL, "outcome": "completed"}, "call_final"),
+    ], emitted=emitted)
+    result = _run(model, _AUDIT_PROMPT, mode="supervised", stream=True)
+    return tools, model, fake, result, before, offered
+
+
+def _assert_worker_executed(fake) -> list:
+    """The worker observation: actual Mythic_Operator model calls, with its artifact-list result and its ledger read
+    each reaching a LATER worker input. A Supervisor-only answer, however correct, does not satisfy it."""
+    worker = [call for call in fake.calls if _prompt_role(call) == "Mythic_Operator"]
+    assert worker, "no Mythic_Operator model call was made"
+    for name in ("list_open_artifacts", el.READER_TOOL):
+        later = [index for index, call in enumerate(worker) if _tool_results(call, name)]
+        assert later and later[0] > 0, f"no later Mythic_Operator input carried the {name} result"
+    [artifacts] = _tool_results(worker[-1], "list_open_artifacts")
+    assert artifacts.content == "[]"  # the real executor's result for a session that created no artifact
+    [read] = _tool_results(worker[-1], el.READER_TOOL)
+    assert "Sage engagement ledger — read_engagement_state" in read.content
+    return worker
+
+
+def _assert_one_fresh_view_per_call(calls, role: str, revision: int) -> None:
+    assert calls, f"no {role} call"
+    for call in calls:
+        views = _views(call)
+        assert len(views) == 1, f"a {role} call carried {len(views)} generated views"
+        [view] = views
+        assert view.additional_kwargs[el.MODEL_VIEW_TAG] == {"role": role, "revision": revision}
+        rows = [line for line in view.content.splitlines() if re.match(r"^- #\d+ ", line)]
+        assert 0 < len(rows) <= el.MODEL_VIEW_MAX_ROWS and len(view.content) <= el.MODEL_VIEW_MAX_CHARS
+        assert all(len(line) <= el.MODEL_ROW_MAX_CHARS for line in rows)
+        assert _typed_sources(view.content)[3] == ["cred:10"]  # never the bare source number
+
+
+def test_supervised_audit_reaches_the_worker_owned_artifact_tool_and_typed_rows(session, sdk_guard, monkeypatch):
+    emitted: list = []
+    tools, model, fake, result, before, offered = _run_audit(session, monkeypatch, emitted)
+
+    # Ownership, on the agents actually built: the artifact list is the worker's alone; both ledger tools are offered
+    # to both roles.
+    assert "list_open_artifacts" in offered["Mythic_Operator"]
+    assert "list_open_artifacts" not in offered["Supervisor"]
+    for role in ("Supervisor", "Mythic_Operator"):
+        assert {el.READER_TOOL, el.SUBMIT_TOOL} <= set(offered[role]), role
+
+    # The real validator accepted the control-plane brief, and the worker actually ran.
+    [brief] = model._ensure_request_event_ledger(REQUEST_ID).actual_events(kind="brief")
+    assert (brief.phase, brief.content) == ("accepted", "Mythic_Operator")
+    worker = _assert_worker_executed(fake)
+    supervisor = [call for call in fake.calls if _prompt_role(call) == "Supervisor"]
+    assert [_prompt_role(call) for call in fake.calls] == ["Supervisor"] + ["Mythic_Operator"] * 3 + ["Supervisor"]
+
+    # The worker's next input after its read holds the real typed rows; row #3 stays material, with distinct kinds.
+    [read] = _tool_results(worker[2], el.READER_TOOL)
+    assert _typed_sources(read.content) == {1: ["cred:2"], 3: ["cred:10"]}
+    row3 = _row_line(read.content, 3)
+    assert "material only, not a proven working credential" in row3
+    assert "tasks 20" in row3 and "callback 2" in row3
+
+    # Every Supervisor and worker call carried exactly one fresh, bounded view of the current revision.
+    revision = tools._ledger_snapshot().revision
+    _assert_one_fresh_view_per_call(supervisor, "Supervisor", revision)
+    _assert_one_fresh_view_per_call(worker, "Mythic_Operator", revision)
+
+    # The handback reached the Supervisor, whose respond_to_user report reached native chat once.
+    assert any(isinstance(m, AIMessage) and m.content == _WORKER_REPORT for m in supervisor[1])
+    assert _final_reports(result) == [_AUDIT_FINAL]
+    assert sum(_AUDIT_FINAL in text for text in emitted) == 1
+
+    seen = "\n".join(_text(call) for call in fake.calls) + "\n".join(emitted)
+    assert TGS_HASH not in seen and SECRET_SENTINEL not in seen and OUTPUT_SENTINEL not in seen
+    assert _ledger_state(tools) == before
+    assert sdk_guard.writes == [] and sdk_guard.issued == []
+
+
+def test_a_supervisor_only_answer_is_not_a_worker_observation(session, sdk_guard, monkeypatch):
+    """Negative control: the Supervisor's own correct read must not count as worker execution."""
+    tools = _retained_operation(session, monkeypatch)
+    emitted: list = []
+    model, fake = _build_model(tools, [
+        _tool_call(el.READER_TOOL, {"numbers": [1, 3]}, "call_read_rows"),
+        _tool_call("respond_to_user", {"final_response": _AUDIT_FINAL, "outcome": "completed"}, "call_final"),
+    ], emitted=emitted)
+    result = _run(model, _AUDIT_PROMPT, mode="supervised", stream=True)
+
+    [read] = _tool_results(fake.calls[1], el.READER_TOOL)
+    assert _typed_sources(read.content) == {1: ["cred:2"], 3: ["cred:10"]}  # the answer itself is correct
+    assert _final_reports(result) == [_AUDIT_FINAL] and sum(_AUDIT_FINAL in text for text in emitted) == 1
+
+    assert [_prompt_role(call) for call in fake.calls] == ["Supervisor", "Supervisor"]
+    assert not any(_tool_results(call, "list_open_artifacts") for call in fake.calls)
+    assert not model._ensure_request_event_ledger(REQUEST_ID).actual_events(kind="brief")
+    # The worker's channel was seeded with its system prompt when the graph was built, so a non-empty channel is no
+    # evidence that it ran.
+    assert any(isinstance(m, SystemMessage) for m in model.state["mythic_operator_messages"])
+    with pytest.raises(AssertionError, match="no Mythic_Operator model call"):
+        _assert_worker_executed(fake)
+
+
+def test_the_worker_view_assertion_fails_without_the_worker_view(session, sdk_guard, monkeypatch):
+    """Sensitivity control: with the worker's view removed in this test only, the positive view check rejects it."""
+    original = model_module._EngagementLedgerViewMiddleware._augment
+
+    def without_worker_view(self, request):
+        return request if self._agent_name == "Mythic_Operator" else original(self, request)
+
+    monkeypatch.setattr(model_module._EngagementLedgerViewMiddleware, "_augment", without_worker_view)
+    tools, _model, fake, _result, _before, _offered = _run_audit(session, monkeypatch, [])
+    worker = _assert_worker_executed(fake)  # the worker still ran
+    revision = tools._ledger_snapshot().revision
+    _assert_one_fresh_view_per_call([c for c in fake.calls if _prompt_role(c) == "Supervisor"], "Supervisor", revision)
+    with pytest.raises(AssertionError, match="carried 0 generated views"):
+        _assert_one_fresh_view_per_call(worker, "Mythic_Operator", revision)
+
+
+_SUBMIT_PROMPT = "Submit task 20 as evidence and tell me which ledger row it maps to and what it proves."
+_SUBMIT_FINAL = "Row #3 is already recorded: credential material only (credential record 10, task 20, callback 2)."
+
+
+def _assert_submission_observed(next_input) -> None:
+    """The submission observation: the real result line, its resulting row and the fresh view, in one model input."""
+    results = _tool_results(next_input, el.SUBMIT_TOOL)
+    assert len(results) == 1, f"the next model input carried {len(results)} submission results"
+    text = str(results[0].content)
+    assert "- 20: already recorded (row #3)." in text, text
+    assert any(line.startswith("- #3 ") for line in text.splitlines()), f"no resulting row #3 in:\n{text}"
+    row3 = _row_line(text, 3)
+    assert "material only, not a proven working credential" in row3
+    assert "tasks 20" in row3 and "callback 2" in row3
+    assert _typed_sources(text) == {3: ["cred:10"]}
+    [view] = _views(next_input)
+    assert _typed_sources(view.content)[3] == ["cred:10"]
+
+
+def test_conversation_submission_reaches_the_next_model_input_and_changes_nothing(session, sdk_guard, monkeypatch):
+    tools = _retained_operation(session, monkeypatch)
+    before = _ledger_state(tools)
+
+    reconciled: list = []
+    original = mythic_tools.MythicTools._reconcile_operation
+
+    async def recording(self, cited=(), *, apply=False):
+        reconciled.append((tuple(cited), apply))
+        return await original(self, cited, apply=apply)
+
+    monkeypatch.setattr(mythic_tools.MythicTools, "_reconcile_operation", recording)
+    emitted: list = []
+    model, fake = _build_model(tools, [
+        _tool_call(el.SUBMIT_TOOL, {"citations": ["20"]}, "call_submit"),
+        _tool_call("respond_to_user", {"final_response": _SUBMIT_FINAL, "outcome": "completed"}, "call_final"),
+    ], emitted=emitted)
+    result = _run(model, _SUBMIT_PROMPT, mode="conversation", stream=True)
+
+    assert [_prompt_role(call) for call in fake.calls] == ["Supervisor", "Supervisor"]
+    _assert_submission_observed(fake.calls[1])
+    # The registered tool called the real reconciler with apply=False; the turn-end pass is the only other call.
+    assert reconciled == [(("20",), False), ((), False)]
+    assert _final_reports(result) == [_SUBMIT_FINAL] and sum(_SUBMIT_FINAL in text for text in emitted) == 1
+
+    seen = "\n".join(_text(call) for call in fake.calls) + "\n".join(emitted)
+    assert TGS_HASH not in seen and SECRET_SENTINEL not in seen and OUTPUT_SENTINEL not in seen
+    assert _ledger_state(tools) == before  # no new gain, event, cursor move, join or setting
+    assert sdk_guard.writes == [] and sdk_guard.issued == []
+
+
+def test_a_submission_result_without_its_resulting_row_fails_the_observation(session, sdk_guard, monkeypatch):
+    """Sensitivity control: a manufactured result line with no resulting row does not satisfy the observation."""
+    tools = _retained_operation(session, monkeypatch)
+    view = HumanMessage(content=_block(tools), additional_kwargs={el.MODEL_VIEW_TAG: {"role": "Supervisor"}})
+    manufactured = ToolMessage(content="Evidence verification for 1 citation(s) (code decides admission; ledger text "
+                                       "is data):\n- 20: already recorded (row #3).",
+                               name=el.SUBMIT_TOOL, tool_call_id="call_submit")
+    with pytest.raises(AssertionError, match="no resulting row #3"):
+        _assert_submission_observed([manufactured, view])
