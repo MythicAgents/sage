@@ -669,6 +669,40 @@ def _admit_credential_review(envelope: ProofEnvelope, claimed_effects: Any, expe
     return ProofAdmission(True, envelope, "admitted review-backed credential material", ADMITTED)
 
 
+def review_backed_account_material(hop: Any, account: str, realm: str = "", *,
+                                   engagement_id: str) -> dict[str, str] | None:
+    """The proof of an achieved, valid review-backed material row for ``account@realm``; None for any other row.
+
+    Re-admits the row's own proof envelope (``admit_task_observation``), so only the completion-function-error form
+    with a valid review, Mythic task lineage and exactly this account's material effect qualifies. Returns the effect,
+    realm, producing task, callback and review id. A pending or rejected review, another proof class (including a
+    credential-store row without task lineage), another account or another realm returns None. This is input
+    provenance only: it never asserts a working credential.
+    """
+    if _lower(getattr(hop, "status", "")) != "achieved":
+        return None
+    raw = getattr(hop, "proof_envelope", None)
+    envelope = ProofEnvelope.from_dict(raw if isinstance(raw, Mapping) else None)
+    if envelope is None or envelope.metadata.get(PROOF_FORM_KEY) != CREDENTIAL_REVIEW_MATERIAL:
+        return None
+    effect = _lower(envelope.metadata.get("claimed_effect"))
+    match = _MATERIAL_EFFECT_RE.fullmatch(effect)
+    if match is None:
+        return None
+    subject_account, _, subject_realm = match.group(1).rpartition("@")
+    if subject_account != _lower(account) or (realm and subject_realm != _lower(realm)):
+        return None
+    effects = {_lower(item) for item in [getattr(hop, "effect", ""), *(getattr(hop, "satisfied_effects", None) or [])]}
+    if effect not in effects:
+        return None
+    if not admit_task_observation(envelope, claimed_effects=[effect], current_engagement_id=engagement_id).admitted:
+        return None
+    if not envelope.task_id or not envelope.callback_id:
+        return None
+    return {"effect": effect, "realm": subject_realm, "task_id": envelope.task_id,
+            "callback_id": envelope.callback_id, "review_id": _lower(envelope.metadata.get("review_id"))}
+
+
 def row_headline_claims(envelope: ProofEnvelope | None, satisfied_effects: Any) -> list[str]:
     """The effects a typed row's headline proof must itself cover, for a reader that re-admits only the headline.
 

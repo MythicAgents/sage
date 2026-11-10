@@ -153,11 +153,47 @@ rdp_retry() {
 }
 rdp_retry &
 RDP_PID=$!
-cleanup(){ kill "$RDP_PID" 2>/dev/null || true; }
+
+# Local cleanup runs on every exit. Killing the retry subshell alone leaves the opener (and its xfreerdp3) running,
+# so: freeze the retry loop (no new opener can start), collect its children, end the loop, and ask each opener to
+# exit (it closes its own RDP client on SIGTERM). Survivors past the grace period are killed and the cleanup is
+# reported as failed. The launch result is kept: a failed launch stays failed, and a successful launch whose
+# local cleanup failed exits non-zero and says both.
+cleanup() {
+  local rc=$? status=ok pids="" pid alive deadline
+  trap - EXIT
+  if [ -n "${RDP_PID:-}" ] && kill -0 "$RDP_PID" 2>/dev/null; then
+    kill -STOP "$RDP_PID" 2>/dev/null || true
+    pids="$(pgrep -P "$RDP_PID" 2>/dev/null | tr '\n' ' ' || true)"
+    kill -KILL "$RDP_PID" 2>/dev/null || true
+    wait "$RDP_PID" 2>/dev/null || true
+    for pid in $pids; do kill -TERM "$pid" 2>/dev/null || true; done
+    deadline=$(( $(date +%s) + ${SAGE_RDP_CLEANUP_SECONDS:-15} ))
+    while :; do
+      alive=""
+      for pid in $pids; do kill -0 "$pid" 2>/dev/null && alive="$alive $pid"; done
+      [ -z "$alive" ] && break
+      if [ "$(date +%s)" -ge "$deadline" ]; then
+        for pid in $alive; do kill -KILL "$pid" 2>/dev/null || true; done
+        status="failed (opener did not exit on SIGTERM:$alive; killed, its RDP client may remain)"
+        break
+      fi
+      sleep 0.1
+    done
+  fi
+  echo "launch_apollo_foothold: local RDP client cleanup: $status" >&2
+  if [ "$status" != ok ] && [ "$rc" -eq 0 ]; then
+    echo "launch_apollo_foothold: the launch succeeded, but its local cleanup failed" >&2
+    rc=2
+  fi
+  exit "$rc"
+}
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
 
 # 3) Start the pre-staged Apollo and wait for the callback (launch-existing polls for the session,
-#    starts SageApolloBootstrap, waits for check-in, then tsdiscon's the RDP).
+#    starts SageApolloBootstrap, waits for check-in, then tsdiscon's the RDP on every exit path).
 "$REPO/.venv/bin/python" "$HERE/deploy_payload_via_ludus.py" launch-existing \
   --target-ip "$TARGET_IP" --run-as-user "$RUN_AS" \
   --wait-interactive-session-seconds 600 "$@"

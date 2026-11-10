@@ -185,5 +185,13 @@ def render_consult(consult: AttackGraphConsult) -> str:
     if consult.no_path:
         lines.append(f"No path found from controlled principals to: {_names(consult.no_path)}")
     lines.append(_OUTCOME_GUIDANCE[consult.outcome])
+    if consult.outcome == ConsultOutcome.ABSENT:
+        scope = (f"scoped to {consult.objective_domains[0]}" if len(consult.objective_domains) == 1
+                 else "scoped to the callback user's domain")
+        lines.append(
+            f"Available first procedure: the catalog capability `collect-graph` on the observed callback, {scope}. "
+            "In a supervised request Sage presents it as the first delegated step, for the operator to approve or "
+            "reject."
+        )
     lines.append("</knowledge_source_consult>")
     return "\n".join(lines)

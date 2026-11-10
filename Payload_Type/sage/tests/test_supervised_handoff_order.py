@@ -42,13 +42,14 @@ def _return_state() -> tuple[dict, list]:
                        name="Mythic_Payload",
                        additional_kwargs={"_is_completion_header": True,
                                           "_request_id": REQUEST, "_seq": 8})
+    # Returned messages carry their return's sequence, as the wrapper tags them.
     build = AIMessage(content=".", name="Mythic_Payload", tool_calls=[
         {"name": "create_payload", "args": {}, "id": "build-1", "type": "tool_call"},
-    ])
+    ], additional_kwargs={"_seq": 8})
     result = ToolMessage(content='{"agent_file_id":"uuid"}', tool_call_id="build-1",
-                         name="create_payload")
+                         name="create_payload", additional_kwargs={"_seq": 8})
     summary = AIMessage(content="Apollo payload exists; file id UUID.",
-                        name="Mythic_Payload")
+                        name="Mythic_Payload", additional_kwargs={"_seq": 8})
     evidence = AIMessage(
         content="<untrusted_mythic_task_observations>\n{}\n</untrusted_mythic_task_observations>",
         name="Mythic_Payload",
@@ -60,7 +61,10 @@ def _return_state() -> tuple[dict, list]:
     return state, [opening, header, build, result, summary, evidence]
 
 
-def test_assembled_operator_input_prioritizes_same_request_completed_return():
+def test_a_resumed_delegation_gets_sage_evidence_but_not_the_earlier_return_transcript():
+    """A new supervised delegation starts with its own transcript: the earlier same-request return stays in the
+    channel (and its summary in the Supervisor's evidence) but reaches this worker only as Sage's source-only
+    observation and the delegating agent's assignment, never as replayed worker messages."""
     state, parts = _return_state()
     tool = _create_handoff_tool(agent_name="Mythic_Operator")
     command = tool.func(SimpleNamespace(state=state, tool_call_id="resume-operator"),
@@ -92,19 +96,12 @@ def test_assembled_operator_input_prioritizes_same_request_completed_return():
     assert len(assignments) == 1
     assert "Model-authored wording must not replace authority." in assignments[0].content
     without_assignment = [m for m in provider_input if m not in assignments]
-    assert without_assignment[:-1] == [parts[0], delegated] + parts[1:]
-    assert isinstance(provider_input[-1], HumanMessage)
-    assert provider_input[-1].additional_kwargs["_synthetic_nudge"] == (
-        "provider_requires_user_turn"
-    )
-    assert provider_input[-1].content == (
-        "Internal conversation continuation. The operator's request and authorization are unchanged."
-    )
-    assert provider_input[3].tool_calls[0]["id"] == provider_input[4].tool_call_id
-    human_contents = [message.content for message in provider_input
-                      if isinstance(message, HumanMessage)
-                      and not message.additional_kwargs.get("_synthetic_nudge")]
-    assert human_contents == [EXACT, EXACT]
+    # The exact operator input ends the call, so no continuation turn is added after it.
+    assert without_assignment == [parts[5], delegated]
+    assert not any(m in provider_input for m in parts[:5])
+    assert parts[1] in state["mythic_operator_messages"] and parts[4] in state["mythic_operator_messages"]
+    human_contents = [message.content for message in provider_input if isinstance(message, HumanMessage)]
+    assert human_contents == [EXACT]
     assert state["mythic_operator_messages"][-1] is delegated  # persisted order is unchanged
 
 

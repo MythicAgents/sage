@@ -312,25 +312,11 @@ def test_same_channel_worker_sees_prior_command_schema_after_second_handoff(monk
     assert any(isinstance(message, HumanMessage)
                and "Use the prior probe_command schema." in str(message.content)
                for message in second_worker_input)
-    assert sum(isinstance(message, ToolMessage) and message.name ==
-               "get_all_command_args_for_payloadtype" and message.content == schema
-               for message in second_worker_input) == 1
+    # A later supervised delegation starts with a fresh transcript: the schema read earlier reaches it as Sage's
+    # reference data (one Mythic read in total), not as a replayed tool result.
+    reference = [message for message in second_worker_input
+                 if message.additional_kwargs.get("_carried_context") == "command_reference"]
+    assert len(reference) == 1 and schema in reference[0].content
+    assert not any(isinstance(message, ToolMessage) and message.name == "get_all_command_args_for_payloadtype"
+                   for message in second_worker_input)
     assert all(schema_marker not in str(message.content) for message in fresh_worker_input)
-
-    # The scripted model records create_agent input, but the normal digest threshold is not
-    # forced during these turns. Apply the actual editor separately to the assembled input.
-    digested = copy.deepcopy(second_worker_input)
-    digested.extend([
-        AIMessage(content="", tool_calls=[{"name": "newer_read", "args": {},
-            "id": "newer-read", "type": "tool_call"}]),
-        ToolMessage(content="newer observation", name="newer_read", tool_call_id="newer-read"),
-    ])
-    editor = _DigestToolUsesEdit(trigger=1, keep=1, clear_tool_inputs=False,
-                                 placeholder="[elided]")
-    editor.apply(digested, count_tokens=lambda messages: sum(
-        len(str(message.content)) for message in messages))
-    assert all(schema_marker not in str(message.content) for message in digested)
-    assert any(isinstance(message, ToolMessage) and message.name ==
-               "get_all_command_args_for_payloadtype" and
-               message.response_metadata.get("context_editing", {}).get("cleared")
-               for message in digested)

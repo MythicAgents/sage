@@ -644,12 +644,18 @@ def actions_from_state(state: Any) -> list[CapabilityAction]:
         for callback_id in sorted(live_callback_ids):
             actions.append(_adcs_certificate_auth_from_enrolled_certificate_action(target_domain, account, callback_id))
 
-    for domain in _krbtgt_hash_domains(achieved | facts):
+    # The forge's key input: a working `krbtgt-hash:<domain>`, or else a valid review-backed krbtgt material row whose
+    # proof task the guarded forge binder re-reads for the key. Material never records `krbtgt-hash`; only the
+    # forge's own verifier records an effect.
+    krbtgt_inputs = {domain: f"krbtgt-hash:{domain}" for domain in _krbtgt_hash_domains(achieved | facts)}
+    for domain, material in _review_backed_krbtgt_material(state).items():
+        krbtgt_inputs.setdefault(domain, material)
+    for domain, key_input in sorted(krbtgt_inputs.items()):
         parent_domain = _parent_domain(domain)
         if parent_domain != domain and f"da:{parent_domain}" not in achieved:
-            actions.append(_forge_golden_ticket_action(domain, target_domain=parent_domain))
+            actions.append(_forge_golden_ticket_action(domain, target_domain=parent_domain, key_input=key_input))
         if f"da:{domain}" not in achieved:
-            actions.append(_forge_golden_ticket_action(domain))
+            actions.append(_forge_golden_ticket_action(domain, key_input=key_input))
 
     actions = _dedupe_actions(actions)
     actions.sort(key=lambda action: _capability_action_sort_key(action, preferred_callback_id))
@@ -6150,7 +6156,10 @@ def _adcs_certificate_auth_from_enrolled_certificate_action(
     )
 
 
-def _forge_golden_ticket_action(domain: str, target_domain: str = "") -> CapabilityAction:
+def _forge_golden_ticket_action(domain: str, target_domain: str = "", key_input: str = "") -> CapabilityAction:
+    """`key_input` is the predicate that holds the forge's key: `krbtgt-hash:<domain>` (the default) or a valid
+    review-backed `cred-material:<kind>:krbtgt@<domain>` row (`_review_backed_krbtgt_material`)."""
+    key_input = key_input or f"krbtgt-hash:{domain}"
     target_domain = _normalize(target_domain)
     effect_domain = target_domain or domain
     target = f"domain={domain}"
@@ -6171,7 +6180,7 @@ def _forge_golden_ticket_action(domain: str, target_domain: str = "") -> Capabil
     return CapabilityAction(
         name="forge-golden-ticket",
         target=target,
-        preconditions=[f"krbtgt-hash:{domain}"],
+        preconditions=[key_input],
         effects=[f"da:{effect_domain}"],
         intent={
             "capability": "forge-golden-ticket",
@@ -6194,7 +6203,7 @@ def _forge_golden_ticket_action(domain: str, target_domain: str = "") -> Capabil
             ],
         },
         reason=reason,
-        source_facts=[f"krbtgt-hash:{domain}"],
+        source_facts=[key_input],
     )
 
 
@@ -6315,6 +6324,25 @@ def _krbtgt_hash_domains(predicates: set[str]) -> list[str]:
         if predicate.startswith("krbtgt-hash:")
     }
     return sorted(domain for domain in domains if domain)
+
+
+def _review_backed_krbtgt_material(state: Any) -> dict[str, str]:
+    """Domain -> material effect for each achieved krbtgt material row whose review-backed proof re-admits (valid
+    review, Mythic task and callback lineage). Any other proof class contributes nothing."""
+    try:
+        from . import proof_boundary
+    except ImportError:
+        import proof_boundary
+    out: dict[str, str] = {}
+    for hop in list(getattr(state, "hops", None) or []):
+        try:
+            proof = proof_boundary.review_backed_account_material(
+                hop, "krbtgt", engagement_id=str(getattr(state, "engagement_id", "") or ""))
+        except Exception:
+            proof = None
+        if proof and proof["realm"]:
+            out.setdefault(_normalize(proof["realm"]), proof["effect"])
+    return out
 
 
 def _credential_material_accounts(predicates: set[str]) -> list[tuple[str, str]]:

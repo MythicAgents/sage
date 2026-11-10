@@ -1040,6 +1040,7 @@ def launch_existing_scheduled_task_interactive(
     expected_task_state: str | None = None,
     expected_remote_path: str | None = None,
     expected_remote_sha256: str | None = None,
+    session_sink: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     session_info = wait_for_active_interactive_session(
         session,
@@ -1047,6 +1048,9 @@ def launch_existing_scheduled_task_interactive(
         timeout_seconds=timeout_seconds,
         poll_interval=poll_interval,
     )
+    if session_sink is not None:
+        # The caller disconnects this session on every exit path, including a refused or failed launch below.
+        session_sink["session_id"] = str(session_info.get("session_id") or "")
     inspect_script = f"""
 $ErrorActionPreference = 'Stop'
 $taskName = {ps_quote(task_name)}
@@ -1696,58 +1700,80 @@ async def command_launch_existing(args: argparse.Namespace) -> None:
         args.winrm_operation_timeout_seconds,
         args.winrm_read_timeout_seconds,
     )
-    launch = launch_existing_scheduled_task_interactive(
-        session,
-        args.task_name,
-        args.run_as_user,
-        timeout_seconds=args.wait_interactive_session_seconds,
-        poll_interval=args.poll_interval,
-        expected_task_state=getattr(args, "expected_task_state", None),
-        expected_remote_path=getattr(args, "expected_remote_path", None),
-        expected_remote_sha256=getattr(args, "expected_remote_sha256", None),
-    )
-    callbacks_after, callback = await wait_for_callback_checkin_advance(
-        client,
-        before_checkins,
-        payload_type=args.payload_type,
-        host=args.callback_host,
-        user=args.callback_user,
-        seconds=args.wait_callbacks_seconds,
-        poll_interval=args.poll_interval,
-    )
+    # Everything from the session wait onward runs under one cleanup: once an interactive session exists for this
+    # launch it is disconnected on every exit (success, no matching callback, duplicate lanes, a refused launch or
+    # an exception after the task started). The callback outcome and the cleanup outcome are reported separately,
+    # and a cleanup never turns a failed launch into a success.
+    session_sink: dict[str, Any] = {}
+    launch: dict[str, Any] = {}
+    callback: dict[str, Any] | None = None
+    callbacks_after: list[dict[str, Any]] = list(callbacks_before)
     settled_lanes: list[dict[str, Any]] = []
-    if callback and args.callback_settle_seconds > 0:
-        callbacks_after, settled_lanes = await wait_for_settled_callback_lanes(
+    disconnect = None
+    cleanup_status = "not_started"
+    try:
+        launch = launch_existing_scheduled_task_interactive(
+            session,
+            args.task_name,
+            args.run_as_user,
+            timeout_seconds=args.wait_interactive_session_seconds,
+            poll_interval=args.poll_interval,
+            expected_task_state=getattr(args, "expected_task_state", None),
+            expected_remote_path=getattr(args, "expected_remote_path", None),
+            expected_remote_sha256=getattr(args, "expected_remote_sha256", None),
+            session_sink=session_sink,
+        )
+        callbacks_after, callback = await wait_for_callback_checkin_advance(
             client,
             before_checkins,
             payload_type=args.payload_type,
             host=args.callback_host,
             user=args.callback_user,
-            seconds=args.callback_settle_seconds,
+            seconds=args.wait_callbacks_seconds,
             poll_interval=args.poll_interval,
         )
-        if len(settled_lanes) == 1:
-            callback = settled_lanes[0]
-    disconnect = None
-    if callback and args.disconnect_interactive_session:
-        session_id = str((launch.get("interactive_session") or {}).get("session_id") or "")
-        disconnect = disconnect_interactive_session(session, session_id)
-    result = {
-        "target": {
-            "inventory_hostname": host.get("inventory_hostname"),
-            "ansible_host": host.get("ansible_host"),
-        },
-        "launch": launch,
-        "callback": callback_identity(callback) if callback else None,
-        "callback_settle": {
-            "seconds": args.callback_settle_seconds,
-            "require_unique": args.require_unique_callback,
-            "matching_advanced_active_callbacks": [callback_identity(row) for row in settled_lanes],
-        },
-        "interactive_session_disconnect": disconnect,
-        "callbacks_after": [callback_identity(row) for row in callbacks_after],
-    }
-    print(json.dumps(result, indent=2, sort_keys=True))
+        if callback and args.callback_settle_seconds > 0:
+            callbacks_after, settled_lanes = await wait_for_settled_callback_lanes(
+                client,
+                before_checkins,
+                payload_type=args.payload_type,
+                host=args.callback_host,
+                user=args.callback_user,
+                seconds=args.callback_settle_seconds,
+                poll_interval=args.poll_interval,
+            )
+            if len(settled_lanes) == 1:
+                callback = settled_lanes[0]
+    finally:
+        session_id = str(
+            (launch.get("interactive_session") or {}).get("session_id") or session_sink.get("session_id") or ""
+        )
+        if not args.disconnect_interactive_session:
+            cleanup_status = "disabled"
+        elif session_id:
+            try:
+                disconnect = disconnect_interactive_session(session, session_id)
+                cleanup_status = "disconnected"
+            except Exception as exc:  # reported beside the launch outcome, never instead of it
+                cleanup_status = f"failed: {type(exc).__name__}: {exc}"
+        result = {
+            "target": {
+                "inventory_hostname": host.get("inventory_hostname"),
+                "ansible_host": host.get("ansible_host"),
+            },
+            "launch": launch,
+            "callback": callback_identity(callback) if callback else None,
+            "callback_settle": {
+                "seconds": args.callback_settle_seconds,
+                "require_unique": args.require_unique_callback,
+                "matching_advanced_active_callbacks": [callback_identity(row) for row in settled_lanes],
+            },
+            "interactive_session_disconnect": disconnect,
+            "cleanup": {"interactive_session_id": session_id or None,
+                        "interactive_session_disconnect": cleanup_status},
+            "callbacks_after": [callback_identity(row) for row in callbacks_after],
+        }
+        print(json.dumps(result, indent=2, sort_keys=True))
     if not callback:
         raise DeployError(
             f"No {args.payload_type} callback check-in advanced on "
@@ -1757,6 +1783,11 @@ async def command_launch_existing(args: argparse.Namespace) -> None:
         raise DeployError(
             f"Expected exactly one settled active {args.payload_type} callback lane on "
             f"{args.callback_host} as {args.callback_user}, observed {len(settled_lanes)}."
+        )
+    if cleanup_status.startswith("failed"):
+        raise DeployError(
+            f"{args.payload_type} callback {callback.get('display_id')} checked in, but cleanup failed: "
+            f"interactive session {session_id} was not disconnected ({cleanup_status})."
         )
 
 

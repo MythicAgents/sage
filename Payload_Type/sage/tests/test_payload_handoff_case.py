@@ -348,16 +348,15 @@ def test_posthandoff_accounts_provider_without_reservation_headroom(monkeypatch,
     assert result["provider_accounting"]["usage_complete"]
     assert result["posthandoff_input_bytes"][0] > 0
     messages = result["provider_requests"][0]["request"]["messages"]
-    completion = next(index for index, message in enumerate(messages)
-                      if message.get("content") == "[Mythic_Payload completed task]")
-    # Exercise the real request producer metadata and complete middleware chain:
-    # the completed artifact follows both copies of the unchanged instruction.
-    assert [message["content"] for message in messages[:completion]
-            if message["role"] == "user"] == [case.PROMPT, case.PROMPT]
-    assert not any(message.get("content") == case.PROMPT for message in messages[completion:])
-    assert messages[-1] == {"role": "user", "content":
-        "Internal conversation continuation. The operator's request and authorization are unchanged."}
-    assert "Sage-generated provider continuation" in messages[0]["content"]
+    # Exercise the real request producer metadata and complete middleware chain. The resumed Operator delegation
+    # starts with a fresh transcript: the build reaches it as Sage's record of Mythic's create_payload answer (the
+    # ids the upload needs), the Payload return is not replayed, and the exact operator input ends the call.
+    handed = [message for message in messages if "<results_handed_to_you>" in str(message.get("content") or "")]
+    assert len(handed) == 1
+    assert case.FILE_UUID in handed[0]["content"] and case.PAYLOAD_UUID in handed[0]["content"]
+    assert not any(message.get("content") == "[Mythic_Payload completed task]" for message in messages)
+    assert [message["content"] for message in messages if message["role"] == "user"].count(case.PROMPT) == 1
+    assert messages[-1] == {"role": "user", "content": case.PROMPT}
     assert result["model_calls"][-1]["usage"][0]["total_tokens"] == 123
     offered = {tool["function"]["name"]: tool["function"]
                for tool in result["provider_requests"][0]["request"]["tools"]}

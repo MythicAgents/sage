@@ -1,6 +1,8 @@
 ---
 name: Golden Ticket
 category: kerberos
+# Sage runs this technique as a catalog procedure; guidance returns it with its guarded executor.
+sage_capability: forge-golden-ticket
 subcategories: [ticket-forgery, krbtgt, persistence, domain-persistence]
 tradecraft_tags: [golden-ticket, krbtgt, kerberos, persistence, domain-compromise, technique]
 mitre_attack:

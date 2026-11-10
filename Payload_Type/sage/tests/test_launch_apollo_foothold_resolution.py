@@ -7,6 +7,8 @@ from pathlib import Path
 import shutil
 import subprocess
 
+import pytest
+
 
 SCRIPT = (Path(__file__).resolve().parents[3] / "skills" /
           "sage-mythic-payload-deploy" / "scripts" / "launch_apollo_foothold.sh")
@@ -177,3 +179,75 @@ def test_interactive_launcher_rejects_unusable_mythic_env_before_helpers(tmp_pat
         assert "MYTHIC_ENV_PATH must name a readable regular file" in result.stderr
         assert "skill-fixture-secret" not in result.stdout + result.stderr
         assert not calls.exists()
+
+
+def _orphan_probe_launcher(tmp_path, launch_exit: int, opener_ignores_term: bool = False):
+    """Run the launcher with a long-lived stand-in RDP opener and a launch-existing that exits `launch_exit`.
+
+    Returns (completed process, opener pid). The opener records its pid and stays up until signalled, as the real
+    opener holds the RDP session open."""
+    repo = tmp_path / "sage"
+    launcher = repo / "skills/sage-mythic-payload-deploy/scripts/launch_apollo_foothold.sh"
+    launcher.parent.mkdir(parents=True)
+    shutil.copy2(SCRIPT, launcher)
+    pid_file = tmp_path / "opener.pid"
+    fake_python = repo / ".venv/bin/python"
+    fake_python.parent.mkdir(parents=True)
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        'case "$*" in *logoff-user*) exit 0;; esac\n'
+        # launch-existing starts once the RDP session (the opener) is up, as the real one polls for it.
+        'i=0; while [ ! -s "$PID_FILE" ] && [ $i -lt 100 ]; do sleep 0.05; i=$((i+1)); done\n'
+        f"exit {launch_exit}\n"
+    )
+    fake_python.chmod(0o755)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    opener = fake_bin / "python3"
+    term = "trap '' TERM\n" if opener_ignores_term else "trap 'exit 0' TERM\n"
+    opener.write_text("#!/bin/sh\n" + term + 'echo $$ > "$PID_FILE"\nwhile :; do sleep 0.05; done\n')
+    opener.chmod(0o755)
+    mythic_env = tmp_path / "mythic.env"
+    mythic_env.write_text("MYTHIC_ADMIN_PASSWORD=fixture-only-secret\n")
+    env = dict(os.environ)
+    env.update(
+        PATH=f"{fake_bin}:/usr/bin:/bin", SAGE_RDP_DISPLAY=":42", SAGE_RUN_AS_PASSWORD="fixture-only-password",
+        MYTHIC_ENV_PATH=str(mythic_env), PID_FILE=str(pid_file), SAGE_RDP_CLEANUP_SECONDS="1",
+    )
+    result = subprocess.run(["/bin/bash", str(launcher), "10.4.10.22", r"NORTH\samwell.tarly"],
+                            cwd=repo, env=env, capture_output=True, text=True, timeout=20, check=False)
+    return result, int(pid_file.read_text().strip())
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+@pytest.mark.parametrize("launch_exit", [0, 2])
+def test_the_rdp_opener_never_outlives_the_launcher(tmp_path, launch_exit):
+    """2026-11-09: launch-existing exited 2 and the EXIT trap killed only the retry subshell, leaving the opener and
+    its RDP client running. Every exit path must end the opener itself, and the launch result is kept."""
+    result, pid = _orphan_probe_launcher(tmp_path, launch_exit)
+    try:
+        assert not _alive(pid), "the RDP opener survived the launcher"
+        assert result.returncode == launch_exit, result.stderr
+        assert "local RDP client cleanup: ok" in result.stderr
+    finally:
+        if _alive(pid):
+            os.kill(pid, 9)
+
+
+def test_a_launch_success_with_a_failed_local_cleanup_exits_non_zero_and_says_so(tmp_path):
+    result, pid = _orphan_probe_launcher(tmp_path, 0, opener_ignores_term=True)
+    try:
+        assert result.returncode != 0
+        assert "local RDP client cleanup: failed" in result.stderr
+        assert "launch succeeded" in result.stderr
+        assert not _alive(pid)  # forced down, but reported as a failed cleanup
+    finally:
+        if _alive(pid):
+            os.kill(pid, 9)

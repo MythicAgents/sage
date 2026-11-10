@@ -914,3 +914,149 @@ def test_an_unknown_range_number_fails_before_any_range_request(monkeypatch, cap
 def test_a_range_number_never_reaches_the_api_unresolved(monkeypatch):
     with pytest.raises(deploy.DeployError, match="range number"):
         deploy.with_ludus_range_id("/api/v2/range/ansibleinventory", "4")
+
+
+# --- launch-existing: a new callback ID is the launch's callback, and cleanup runs on every exit ---------------
+
+def _apollo_row(display_id: int, checkin: str, *, active: bool = True, host: str = "CASTELBLACK") -> dict:
+    return {"display_id": display_id, "host": host, "user": "samwell.tarly", "active": active,
+            "last_checkin": checkin, "payload": {"payloadtype": {"name": "apollo"}}}
+
+
+def _launch_existing_args(**overrides) -> argparse.Namespace:
+    values = dict(
+        require_unique_callback=True, callback_settle_seconds=1, winrm_operation_timeout_seconds=45,
+        winrm_read_timeout_seconds=75, task_name="SageApolloBootstrap", run_as_user=r"NORTH\samwell.tarly",
+        wait_interactive_session_seconds=1, poll_interval=0.25, payload_type="apollo",
+        callback_host="CASTELBLACK", callback_user="samwell.tarly", wait_callbacks_seconds=1,
+        disconnect_interactive_session=True,
+    )
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+def _patch_launch_existing(monkeypatch, censuses: list[list[dict]], *, launch=None, disconnect=None):
+    """Drive command_launch_existing through the real selectors over a scripted Mythic callback census."""
+    disconnects: list[str] = []
+    reads = iter(censuses)
+    last: list[list[dict]] = [censuses[0]]
+
+    async def fake_get_callbacks(client):
+        last[0] = next(reads, last[0])
+        return last[0]
+
+    async def fake_login(args):
+        return object()
+
+    clock = {"now": 0.0}
+
+    def monotonic():  # each read advances the launcher's clock, so every wait ends after a few polls
+        clock["now"] += 0.5
+        return clock["now"]
+
+    def default_launch(session, task_name, run_as_user, **kwargs):
+        sink = kwargs.get("session_sink")
+        if isinstance(sink, dict):
+            sink["session_id"] = "4"
+        return {"interactive_session": {"session_id": "4"}}
+
+    def default_disconnect(session, session_id):
+        disconnects.append(session_id)
+        return {"Method": "tsdiscon", "SessionId": session_id}
+
+    monkeypatch.setattr(deploy, "mythic_login", fake_login)
+    monkeypatch.setattr(deploy, "get_callbacks", fake_get_callbacks)
+    monkeypatch.setattr(deploy, "select_ludus_host", lambda args: {})
+    monkeypatch.setattr(deploy, "winrm_session", lambda *args, **kwargs: object())
+    monkeypatch.setattr(deploy, "launch_existing_scheduled_task_interactive", launch or default_launch)
+    monkeypatch.setattr(deploy, "disconnect_interactive_session", disconnect or default_disconnect)
+    monkeypatch.setattr(deploy, "time", type("_Clock", (), {"monotonic": staticmethod(monotonic),
+                                                             "sleep": staticmethod(lambda seconds: None)}))
+    return disconnects
+
+
+def test_launch_existing_accepts_a_new_matching_callback_beside_the_stale_imported_one(monkeypatch, capsys):
+    """The staged Apollo checks in as a new callback ID while the imported one stays stale: that new ID is the
+    launch's callback (no selection change was needed; the 2026-11-09 failure was a host mismatch)."""
+    before = [_apollo_row(1, "import", active=False)]
+    after = [_apollo_row(1, "import", active=False), _apollo_row(2, "new-2")]
+    disconnects = _patch_launch_existing(monkeypatch, [before, after, after, after])
+
+    asyncio.run(deploy.command_launch_existing(_launch_existing_args()))
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["callback"]["display_id"] == 2
+    assert [row["display_id"] for row in output["callback_settle"]["matching_advanced_active_callbacks"]] == [2]
+    assert disconnects == ["4"]
+    assert output["cleanup"]["interactive_session_disconnect"] == "disconnected"
+
+
+def test_launch_existing_disconnects_the_session_when_no_callback_matches(monkeypatch, capsys):
+    """The 2026-11-09 branch: no row matched within the wait. The session it opened is still disconnected, and the
+    failure is reported as a launch failure, never masked by the cleanup."""
+    before = [_apollo_row(1, "import", active=False)]
+    after = [_apollo_row(1, "import", active=False), _apollo_row(2, "new-2")]
+    disconnects = _patch_launch_existing(monkeypatch, [before, after])
+
+    with pytest.raises(deploy.DeployError, match="No apollo callback check-in advanced"):
+        asyncio.run(deploy.command_launch_existing(_launch_existing_args(callback_host="http://100.108.59.85")))
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["callback"] is None
+    assert disconnects == ["4"]
+    assert output["cleanup"]["interactive_session_disconnect"] == "disconnected"
+
+
+def test_launch_existing_disconnects_the_session_after_an_exception_following_task_launch(monkeypatch, capsys):
+    before = [_apollo_row(1, "import", active=False)]
+    disconnects = _patch_launch_existing(monkeypatch, [before])
+
+    async def broken_wait(*args, **kwargs):
+        raise RuntimeError("transport dropped during the callback wait")
+
+    monkeypatch.setattr(deploy, "wait_for_callback_checkin_advance", broken_wait)
+    with pytest.raises(RuntimeError, match="transport dropped"):
+        asyncio.run(deploy.command_launch_existing(_launch_existing_args()))
+
+    assert disconnects == ["4"]
+    output = json.loads(capsys.readouterr().out)
+    assert output["callback"] is None and output["cleanup"]["interactive_session_disconnect"] == "disconnected"
+
+
+def test_launch_existing_disconnects_a_session_found_before_a_refused_launch(monkeypatch, capsys):
+    before = [_apollo_row(1, "import", active=False)]
+
+    def refused(session, task_name, run_as_user, **kwargs):
+        kwargs["session_sink"]["session_id"] = "4"
+        raise deploy.DeployError("Task SageApolloBootstrap executable hash does not match; refusing launch.")
+
+    disconnects = _patch_launch_existing(monkeypatch, [before], launch=refused)
+    with pytest.raises(deploy.DeployError, match="refusing launch"):
+        asyncio.run(deploy.command_launch_existing(_launch_existing_args()))
+    assert disconnects == ["4"]
+
+
+def test_launch_existing_reports_a_live_callback_and_a_failed_cleanup_separately(monkeypatch, capsys):
+    before = [_apollo_row(1, "import", active=False)]
+    after = [_apollo_row(1, "import", active=False), _apollo_row(2, "new-2")]
+
+    def failing_disconnect(session, session_id):
+        raise deploy.DeployError("tsdiscon failed for session 4 with exit code 1")
+
+    _patch_launch_existing(monkeypatch, [before, after, after, after], disconnect=failing_disconnect)
+    with pytest.raises(deploy.DeployError, match="callback 2 checked in.*cleanup failed"):
+        asyncio.run(deploy.command_launch_existing(_launch_existing_args()))
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["callback"]["display_id"] == 2
+    assert output["cleanup"]["interactive_session_disconnect"].startswith("failed")
+
+
+def test_launch_existing_still_reports_duplicate_lanes_after_disconnecting(monkeypatch, capsys):
+    before = [_apollo_row(1, "import", active=False)]
+    after = [_apollo_row(1, "import", active=False), _apollo_row(2, "new-2"), _apollo_row(3, "new-3")]
+    disconnects = _patch_launch_existing(monkeypatch, [before, after, after, after])
+
+    with pytest.raises(deploy.DeployError, match="Expected exactly one settled active apollo callback lane"):
+        asyncio.run(deploy.command_launch_existing(_launch_existing_args()))
+    assert disconnects == ["4"]

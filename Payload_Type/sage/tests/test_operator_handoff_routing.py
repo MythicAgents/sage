@@ -307,7 +307,8 @@ def test_real_agent_handoff_to_payload_waits_for_approval_before_supervisor(
         )
         model._rebuild_graph()
         model.state["mythic_operator_messages"].append(
-            AIMessage(content="Prior inert Operator observation marker.")
+            AIMessage(content="Prior inert Operator observation marker.",
+                      additional_kwargs={"_seq": 1})  # tagged, as persisted worker messages are
         )
         config = model._graph_run_config("operator-payload-real-agents")
         config["recursion_limit"] = 30
@@ -328,10 +329,20 @@ def test_real_agent_handoff_to_payload_waits_for_approval_before_supervisor(
     assert calls == ["Supervisor:initial", "Mythic_Operator:initial", "Mythic_Payload:propose",
                      "Mythic_Payload:complete",
                      "Supervisor:resume", "Mythic_Operator:resumed", "Supervisor:final"], calls
-    assert sum(payload_outcome in str(message.content)
-               for message in resumed_context) == 1
-    assert any("Prior inert Operator observation marker." in str(message.content)
-               for message in resumed_context)
+    # The resumed Operator delegation starts with a fresh transcript. The build it delegated reaches it as Sage's
+    # record of the Payload worker's tool result (Mythic's answer), not as the Payload worker's prose or the
+    # Operator's earlier messages.
+    handed = [message for message in resumed_context
+              if message.additional_kwargs.get("_carried_context") == "results_handed_to_you"]
+    [block] = handed
+    assert '"tool": "create_payload"' in block.content and '"producer": "Mythic_Payload"' in block.content
+    if decision == "approve":
+        assert '"status": "completed"' in block.content and "inert payload created" in block.content
+    else:
+        assert '"status": "denied_by_operator"' in block.content
+    assert not any(str(message.content) == payload_outcome for message in resumed_context)
+    assert not any("Prior inert Operator observation marker." in str(message.content)
+                   for message in resumed_context)
     assert any("Describe a payload." in str(message.content)
                for message in resumed_context)
 

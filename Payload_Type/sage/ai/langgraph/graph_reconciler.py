@@ -410,6 +410,18 @@ async def reconcile_graph_position(
             if predicate and predicate not in seen:
                 seen.add(predicate)
                 facts.append(_runtime_fact(predicate))
+        # Domain controllers in the collected (payload-ingested) graph, each with the domain BloodHound places it in.
+        # A host-specific brief may name a DC only once a read like this one has observed it; nothing is inferred
+        # from a domain name. Bounded: membership depth 2, at most 200 rows.
+        dc_query = (
+            "MATCH (c:Computer)-[:MemberOf*1..2]->(g:Group) WHERE coalesce(g.objectid, '') ENDS WITH '-516' "
+            "RETURN DISTINCT c.name + '|' + coalesce(c.domain, '') AS name LIMIT 200"
+        )
+        for raw_name in await _run_scalar_names(tool, dc_query):
+            predicate = _domain_controller_fact_from_scalar(raw_name)
+            if predicate and predicate not in seen:
+                seen.add(predicate)
+                facts.append(_runtime_fact(predicate))
         return facts
     except Exception:
         return []
@@ -587,6 +599,21 @@ def _gpo_scope_facts_from_scalar(value: Any) -> list[str]:
     if _text(raw_is_dc).casefold() in {"1", "true", "yes", "dc"}:
         facts.append(f"gpo-affects-dc:{gpo}:{host}:{domain}")
     return facts
+
+
+def _domain_controller_fact_from_scalar(value: Any) -> str:
+    """`domain-controller:<short host>:<domain>` from a `<computer name>|<domain>` row; "" unless both are present and
+    a qualified computer name lies in exactly that domain."""
+    text = _text(value)
+    if "|" not in text:
+        return ""
+    raw_computer, raw_domain, *_ = text.split("|")
+    host = _short_host(raw_computer)
+    domain = access_reconciler.normalize_forest(_text(raw_domain))
+    named = _domain_from_computer_name(raw_computer)
+    if not host or not domain or (named and named != domain):
+        return ""
+    return f"domain-controller:{host}:{domain}"
 
 
 def _trust_reachable_fact_from_scalar(value: Any) -> str:

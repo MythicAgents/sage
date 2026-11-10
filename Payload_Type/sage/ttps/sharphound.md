@@ -1,6 +1,8 @@
 ---
 name: SharpHound
 category: recon
+# Sage runs this technique as a catalog procedure; guidance returns it with its guarded executor.
+sage_capability: collect-graph
 recommends_mcp: bloodhound  # pairs with the BloodHound MCP for graph-reasoned attack-path analysis
 subcategories: [ad-enumeration, attack-path-mapping]
 tradecraft_tags: [bloodhound, acl, foreign-trust, kerberoast-discovery]

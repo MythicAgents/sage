@@ -2671,7 +2671,7 @@ def test_completed_ingest_reuses_positive_domain_snapshot_and_preserves_retry(
         expected.add("domain-collected:corp.local")
     assert {fact.predicate for fact in facts} == expected
     assert all(fact.proof_envelope == proof for fact in facts)
-    assert len(path.queries) == 8
+    assert len(path.queries) == 9  # the position reads, the trust read and the domain-controller read
     # One readiness read (job 0), one upload, one read of the uploaded job — which completes at once.
     assert [(call["info_type"], call.get("job_id")) for call in path.uploads] == [
         ("status", 0), ("upload_bytes", None), ("status", 41),
@@ -2693,7 +2693,7 @@ def test_unverified_ingest_still_refreshes_without_claiming_completed_coverage(
     assert result["covered_domains"] == []
     assert not path.tools._engagement_hops
     assert len(path.domains) == 1
-    assert len(path.queries) == 8
+    assert len(path.queries) == 9  # the position reads, the trust read and the domain-controller read
     assert len(path.uploads) == polls + 2  # readiness read + upload + job reads
     assert path.sleeps == [6] * (polls - 1)  # the first job read is immediate
     assert not any(fact.proof_envelope for fact in path.tools._engagement_graph_facts)
@@ -2703,7 +2703,7 @@ def test_standalone_graph_refresh_reads_current_domain_metadata(assembled_ingest
     path = assembled_ingest_graph_path
     asyncio.run(path.tools._refresh_graph_facts_if_stale("2026-09-17T00:01:00+00:00"))
     assert len(path.domains) == 1
-    assert len(path.queries) == 8
+    assert len(path.queries) == 9  # the position reads, the trust read and the domain-controller read
     assert path.uploads == []
     assert {fact.predicate for fact in path.tools._engagement_graph_facts} == {
         "generic-write:computer:workstation02", "domain-collected:corp.local",

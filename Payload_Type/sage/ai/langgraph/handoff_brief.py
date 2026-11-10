@@ -160,6 +160,8 @@ def _named_in(name: str, text: str) -> bool:
 # Graph facts that name a host and the GPO applying to it, as `graph_reconciler` writes them:
 # `<kind>:{gpo}:{short_host}:{domain}`.
 _GPO_HOST_FACTS = ("gpo-affects-computer", "gpo-affects-dc")
+# `domain-controller:{short_host}:{domain}`: a DC observed in the collected graph.
+_DC_FACT = "domain-controller"
 
 
 def _graph_fact_names(predicate: str) -> tuple[set[str], set[str]]:
@@ -173,6 +175,9 @@ def _graph_fact_names(predicate: str) -> tuple[set[str], set[str]]:
     if kind in _GPO_HOST_FACTS and len(parts) == 3 and all(parts) and "." in parts[2]:
         gpo, host, domain = parts
         return {host if "." in host else f"{host}.{domain}"}, {gpo}
+    if kind == _DC_FACT and len(parts) == 2 and all(parts) and "." not in parts[0] and "." in parts[1]:
+        # A domain controller the collected graph observed (`graph_reconciler`), named with its own domain.
+        return {f"{parts[0]}.{parts[1]}"}, set()
     if kind == "generic-write" and len(parts) == 2 and parts[0] == "gpo" and parts[1]:
         return set(), {parts[1]}
     return set(), set()
@@ -397,9 +402,20 @@ def validate_brief(brief: HandoffBrief, *, worker: str, require_scope: bool, sco
             )
     unrequested = [target for target in brief.targets if not scope.names_target(target)]
     if unrequested:
+        hosts_in_known_domains = [target for target in unrequested if _host_in_known_domain(_name(target), scope)]
+        guidance = ""
+        if hosts_in_known_domains:
+            # A domain being requested or known does not name the hosts in it. Say what grounds such a host, so the
+            # Supervisor runs that discovery instead of re-sending the same target.
+            guidance = (
+                f"; {', '.join(hosts_in_known_domains)} lies in a known domain but no observation names it: a host "
+                "becomes a target only after a read-only Mythic or BloodHound discovery observes it (a domain "
+                "controller, once that domain's graph is collected, is recorded as `domain-controller:<host>:"
+                "<domain>`); run that discovery first rather than re-sending this target"
+            )
         errors.append(
             f"targets: {', '.join(unrequested)} named neither in the operator's request nor in "
-            "engagement state; a step may act only on requested or observed targets"
+            f"engagement state; a step may act only on requested or observed targets{guidance}"
         )
     for reference in brief.inputs_by_reference:
         match = _REFERENCE_RE.match(reference)
@@ -408,6 +424,12 @@ def validate_brief(brief: HandoffBrief, *, worker: str, require_scope: bool, sco
         elif (scope.tasks if match.group(1) == "task" else scope.credentials).isdisjoint({match.group(2)}):
             errors.append(f"inputs_by_reference: `{reference}` does not resolve to a record Sage holds")
     return tuple(errors)
+
+
+def _host_in_known_domain(name: str, scope: KnownScope) -> bool:
+    label, _, domain = name.partition(".")
+    return bool(label and domain and "." in domain and (domain in scope.domains or _named_in(domain,
+                                                                                            scope.operator_input)))
 
 
 def render_scope(brief: Mapping[str, Any] | None) -> str:

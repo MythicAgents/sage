@@ -1,6 +1,8 @@
 ---
 name: SharpGPOAbuse
 category: acl-abuse
+# Sage runs this technique as a catalog procedure; guidance returns it with its guarded executor.
+sage_capability: gpo-controlled-system-exec
 subcategories: [gpo-abuse, code-execution, local-admin-add]
 tradecraft_tags: [gpo, group-policy, code-exec, privilege-escalation, acl-abuse]
 mitre_attack:

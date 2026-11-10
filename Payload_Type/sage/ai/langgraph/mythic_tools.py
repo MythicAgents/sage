@@ -10436,6 +10436,10 @@ class MythicTools:
             payload_type = await self._resolve_payload_type(callback_display_id)
             if payload_type and hasattr(self, "_cmd_schema_cache"):
                 self._cmd_schema_cache.pop((payload_type, command), None)
+            if payload_type:
+                # A schema Mythic just contradicted is no longer reference data for later supervised steps.
+                self.__dict__.setdefault("_command_reference_invalidations", set()).add(
+                    (str(payload_type).casefold(), str(command).casefold()))
         except Exception:
             return
 
@@ -12594,6 +12598,26 @@ class MythicTools:
                                 evidence=evidence,
                             )
                         after_effects = self._capability_achieved_effects()
+                        material_only = self._material_only_credential_outcome(
+                            action_obj, after_effects, issued_item.get("task_id"))
+                        if material_only:
+                            return json.dumps({
+                                "ok": True,
+                                "verdict": "partial",
+                                "material_only": True,
+                                "working_key_proved": False,
+                                "capability": self._capability_text(getattr(action_obj, "name", "")),
+                                "reason": material_only["reason"],
+                                "missing_effects": material_only["missing_effects"],
+                                "recovery": material_only["recovery"],
+                                "action": asdict(action_obj) if is_dataclass(action_obj) else {},
+                                "materialized": self._capability_executor_materialized_summary(materialized_payload),
+                                "issued": self._capability_executor_public_issued(all_issued),
+                                "recorded_effects": sorted(after_effects - before_effects),
+                                "achieved_effects": sorted(after_effects),
+                                "stopped_after": "material_only",
+                                "transaction": transaction,
+                            }, sort_keys=True)
                         return json.dumps({
                             "ok": True,
                             "verdict": "achieved",
@@ -17814,12 +17838,78 @@ class MythicTools:
         candidates.sort(key=lambda item: item[0])
         return candidates[0][1]
 
+    def _material_only_credential_outcome(self, action, achieved_effects, task_id) -> dict | None:
+        """When a credential capability's verified output was recorded only as credential material, the result that
+        says so; None otherwise.
+
+        A completion-function-error task proves `cred-material:<kind>:<account>@<realm>` through the credential
+        review, never the declared working credential (`krbtgt-hash:<realm>` / `creds:<account>@<realm>`). Reporting
+        that run as achieved let the Supervisor plan on a key no capability accepted. The result names the missing
+        effect, that no working key was proved, and the guarded recovery route."""
+        achieved = {self._canonical_capability_effect(item) for item in achieved_effects or ()}
+        missing: list[str] = []
+        material: list[str] = []
+        for declared in [self._capability_text(item) for item in getattr(action, "effects", []) or []]:
+            kind, _, subject = declared.partition(":")
+            if kind == "krbtgt-hash" and subject:
+                account, realm = "krbtgt", subject.casefold()
+            elif kind == "creds" and "@" in subject:
+                account, _, realm = subject.casefold().rpartition("@")
+            else:
+                continue
+            if self._canonical_capability_effect(declared) in achieved:
+                return None
+            held = sorted(effect for effect in achieved if effect.startswith("cred-material:")
+                          and effect.endswith(f":{account}@{realm}"))
+            if not held:
+                return None
+            missing.append(declared)
+            material.extend(held)
+        if not missing:
+            return None
+        task = self._capability_text(task_id) or "unknown"
+        if any(effect.startswith("krbtgt-hash:") for effect in missing):
+            recovery = (f"forge-golden-ticket is offered for this domain while the material row is valid; its guarded "
+                        f"input binder re-reads the krbtgt key from task {task}'s output, and only the forge's own "
+                        "verifier records an effect")
+        else:
+            recovery = ("no capability that needs a working credential accepts this material; a terminal-success "
+                        "task must prove the working credential")
+        reason = (f"Recorded credential material only ({', '.join(sorted(set(material)))}) from task {task}: its "
+                  f"Mythic record is not a terminal success, so {', '.join(missing)} is not proved and a working key "
+                  f"has not been proved. Recovery: {recovery}.")
+        return {"reason": reason, "missing_effects": missing, "recovery": recovery}
+
     async def _recover_krbtgt_credential_from_recorded_task(self, domain: str) -> dict:
+        """The krbtgt key re-read from the proof task of an achieved row for `domain`, or {}.
+
+        Two row classes qualify: an achieved `krbtgt-hash:<domain>`, and a valid review-backed
+        `cred-material:<kind>:krbtgt@<domain>` row (the completion-function-error DCSync), whose proof envelope
+        re-admits with its task, callback and valid review. The material row is an input source only: no
+        `krbtgt-hash` effect is recorded from it, and the forge's own verifier still decides the forge's effect.
+        A store row with no task lineage, a pending or failed review, another account or domain, or an output
+        with no parseable krbtgt key binds nothing."""
+        try:
+            from . import proof_boundary
+        except ImportError:
+            import proof_boundary
         domain_cf = self._capability_text(domain).casefold()
         task_ids: list[int] = []
-        for hop in reversed(list(getattr(self, "_engagement_hops", []) or [])):
+        try:
+            hops = list(self._ledger_view().hops)
+        except Exception:
+            hops = list(getattr(self, "_engagement_hops", []) or [])
+        for hop in reversed(hops):
             status = self._capability_text(getattr(hop, "status", "")).casefold()
             if status != "achieved":
+                continue
+            material = proof_boundary.review_backed_account_material(
+                hop, "krbtgt", domain_cf, engagement_id=self._eng_key())
+            if material:
+                try:
+                    task_ids.append(int(material["task_id"]))
+                except Exception:
+                    pass
                 continue
             effects = [self._capability_text(getattr(hop, "effect", ""))]
             effects.extend(self._capability_text(item) for item in (getattr(hop, "satisfied_effects", []) or []))
@@ -22918,6 +23008,16 @@ class MythicTools:
             execution = ("Could not resolve the callback's payload type. Use get_all_active_callbacks "
                          "then get_all_commands_for_payloadtype to map execution.")
 
+        procedure = self._catalog_procedure_for_technique(frontmatter)
+        if procedure:
+            # The catalog already owns this procedure: point at Sage's guarded executor, never at a hand-built command.
+            execution = (
+                f"Sage runs this technique as the catalog procedure `{procedure}` through `execute_capability`: one "
+                "guarded action that builds and verifies the commands itself (approved by the operator in supervised "
+                f"mode). Do not assemble the commands by hand. In a step that is not scoped to `{procedure}` (for "
+                f"example a control-plane step), hand back naming `{procedure}` so the Supervisor scopes a step to it."
+            )
+
         result = {
             "slug": slug,
             "reference_scope": {
@@ -22944,6 +23044,10 @@ class MythicTools:
             "full_reference_available": ttp_library._FULL_REFERENCE_HEADING in (body or ""),
             "next": "Use common_args + usage_examples first; call get_ttp_full_reference(slug) only for uncommon flags, output format, or version specifics.",
         }
+        if procedure:
+            result["sage_capability"] = {"name": procedure, "executor": "execute_capability"}
+            result["next"] = (f"Run `{procedure}` through `execute_capability` in a step scoped to it; the reference "
+                              "fields describe the technique, not a command to issue.")
         # Proactive capability recommendation: if this tradecraft pairs with an MCP that isn't
         # currently connected, surface a suggestion for the operator (they decide; never auto-connect).
         # Suppressed when the MCP is already connected, so it never nags.
@@ -22973,6 +23077,20 @@ class MythicTools:
         if cycle_warning:
             result["cycle_warning"] = cycle_warning
         return json.dumps(result, sort_keys=True)
+
+    @staticmethod
+    def _catalog_procedure_for_technique(frontmatter: Any) -> str:
+        """The catalog procedure a technique file declares (`sage_capability`), when the catalog has it; else ""."""
+        if not isinstance(frontmatter, dict):
+            return ""
+        name = str(frontmatter.get("sage_capability") or "").strip().casefold()
+        if not name:
+            return ""
+        try:
+            from . import capabilities as capabilities_mod
+        except ImportError:
+            import capabilities as capabilities_mod
+        return name if name in {doc.name for doc in capabilities_mod.capability_docs()} else ""
 
     def _record_and_check_guidance_cycle(self, goal: str) -> str | None:
         """Track recent get_ttp_guidance goals; return an escalating nudge when the agent re-queries
