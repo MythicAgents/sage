@@ -424,17 +424,44 @@ def _canned_consult(outcome):
 INGESTED = '{"ok": true, "status": "ingested"}'
 
 
+CORP_CALLBACKS = [{"id": 7, "host": "workstation", "agent": "apollo", "user": "operator"}]
+
+
+def _inventory_transport(rows, reads: list):
+    """Mythic's GraphQL endpoint as the real `list_callbacks` tool reads it: the slim active-callback query only.
+    `rows` are observed callbacks (id, host, user and, when known, agent), or an exception the transport raises."""
+    async def execute_custom_query(_client, query, *_args, **_kwargs):
+        if "slimcb" not in str(query):
+            raise RuntimeError("only the callback inventory query is served offline")
+        reads.append("list_callbacks")
+        if isinstance(rows, BaseException):
+            raise rows
+        return {"callback": [{
+            "display_id": row["id"], "host": row["host"], "user": row.get("user", "operator"), "integrity_level": 2,
+            "last_checkin": "2026-11-10T16:00:00Z", "c2profileparametersinstances": [],
+            "payload": {"payloadtype": {"name": row["agent"]}} if row.get("agent") else None,
+        } for row in rows]}
+    return execute_custom_query
+
+
 async def _graph_session(script: list, turns: list[tuple[str, Any]], *, mode: str = "supervised",
                          consult=None, outcome=knowledge_sources.ConsultOutcome.ABSENT,
                          autonomous_solve: bool = False, executor_result: str = INGESTED,
-                         callbacks: list[dict] | None = None, executor=None, runner: bool = True) -> list:
+                         callbacks: list[dict] | None = None, executor=None, runner: bool = True,
+                         inventory=None, preseed: bool = True, prior_reads: int = 0) -> list:
     """Native supervised requests in one channel and one Model; each turn is (operator input, card decision).
 
     A decision is "accept", "reject", "" (leave the card pending) or ("respond", text) for an operator steer.
     `callbacks` are the observed callback rows (id, host and, when known, agent); `executor(model, action)` replaces
-    the canned executor result with a real runner. Returns one record per turn: what its worker steps saw and
-    proposed, the executor runs and model calls at the moment its first card surfaced, and the consult Sage recorded
-    for it."""
+    the canned executor result with a real runner. The Supervisor's `list_callbacks` is the real tool, whose GraphQL
+    transport serves `inventory` (default: `callbacks`; an exception makes the read fail); `preseed=False` starts with
+    no listing cached; `prior_reads` advances the tool's real reread guard as earlier identical reads would. Returns one
+    record per turn: what its worker steps saw and proposed, the executor runs, model
+    calls and inventory reads at the moment its first card surfaced, and the consult Sage recorded for it."""
+    from unittest.mock import patch
+
+    from ai.langgraph import mythic_tools as package_mythic_tools
+
     ran: list[dict] = []
 
     @_tool
@@ -452,16 +479,28 @@ async def _graph_session(script: list, turns: list[tuple[str, Any]], *, mode: st
         channel_id=1, apitoken_id=0,
     )
     sink = MagicMock()
-    sink.get_tools.side_effect = lambda names: [execute_capability] if "execute_capability" in names else []
+    # The real read-only listing tool, sharing its snapshot cache with the sink as one client would.
+    lister = MythicTools(agent_task_id="closure-inventory")
+    lister.client = object()
+    sink.get_tools.side_effect = lambda names: [
+        *([execute_capability] if "execute_capability" in names else []),
+        *(lister.get_tools(["list_callbacks"]) if "list_callbacks" in names else [])]
+    sink._recon_snapshot_cache = lister._recon_snapshot_cache
+    rows = [dict(row) for row in callbacks] if callbacks is not None else [{"id": 5, "host": "WORKSTATION-5"}]
+    if preseed:
+        lister._recon_snapshot_cache[("list_callbacks", "all")] = [dict(row) for row in rows]
+    for _ in range(prior_reads):
+        lister._recon_reread_guard("list_callbacks", "all")
     if callbacks is None:
-        sink._recon_snapshot_cache = {("list_callbacks", "all"): [{"id": 5, "host": "WORKSTATION-5"}]}
         sink._engagement_footholds = [_NS(callback_id="5", host="WORKSTATION-5", forest="north.test",
                                           identity="NORTH\\operator")]
     else:
-        sink._recon_snapshot_cache = {("list_callbacks", "all"): [dict(row) for row in callbacks]}
         sink._engagement_footholds = [
             _NS(callback_id=str(row["id"]), host=row["host"], forest="north.test", identity="NORTH\\operator",
                 agent=row.get("agent", ""), alive=True) for row in callbacks]
+    reads: list[str] = []
+    transport = patch.object(package_mythic_tools.mythic, "execute_custom_query",
+                             _inventory_transport(rows if inventory is None else inventory, reads))
     if not runner:
         sink._collection_runner = None
     sink._engagement_hops = []
@@ -490,9 +529,25 @@ async def _graph_session(script: list, turns: list[tuple[str, Any]], *, mode: st
             proposed.append(message.tool_calls[0]["id"])
         return message
 
-    from unittest.mock import patch
+    # Sage's own Supervisor calls leave the Supervisor's channel with its handoff, so record each one the real
+    # producer returns (observed, not replaced).
+    routed: list[AIMessage] = []
+    route_results: list[dict] = []
+    route = model_module.Model._explicit_collection_route_message
+
+    def observed_route(self, offered, messages):
+        message = route(self, offered, messages)
+        if message is not None:
+            routed.append(message)
+            route_results.append({m.tool_call_id: m.content for m in messages if getattr(m, "type", "") == "tool"
+                                  and str(m.tool_call_id).startswith("sage_route_")})
+        return message
+
     spy = patch.object(model_module._SupervisedStepBoundMiddleware, "_bound_procedure_message", observed_proposal)
     spy.start()
+    route_spy = patch.object(model_module.Model, "_explicit_collection_route_message", observed_route)
+    route_spy.start()
+    transport.start()
     try:
         for index, (objective, decision) in enumerate(turns):
             request_id += 1
@@ -501,11 +556,11 @@ async def _graph_session(script: list, turns: list[tuple[str, Any]], *, mode: st
             if index == 0:
                 bind_channel_thread_id(request, model)
             cards_before, ran_before, calls_before = len(_cards(chat)), len(ran), len(fake.inputs)
-            proposed_before = len(proposed)
+            proposed_before, reads_before, routed_before = len(proposed), len(reads), len(routed)
             await chat.chat(request)
             new_cards = _cards(chat)[cards_before:]
-            at_card = _NS(ran=len(ran) - ran_before, model_calls=len(fake.inputs) - calls_before) \
-                if new_cards else None
+            at_card = _NS(ran=len(ran) - ran_before, model_calls=len(fake.inputs) - calls_before,
+                          inventory_reads=len(reads) - reads_before) if new_cards else None
             if decision and new_cards:
                 request_id += 1
                 resume = build_chat_request("", channel_id=1, operation_id=1, request_id=request_id,
@@ -529,6 +584,8 @@ async def _graph_session(script: list, turns: list[tuple[str, Any]], *, mode: st
             ledger = getattr(model, "_request_event_ledger", None)
             brief_events = [(event.phase, event.content) for event in ledger.actual_events(kind="brief")] \
                 if ledger is not None else []
+            tool_events = [(event.phase, dict(event.metadata).get("tool_name"), dict(event.metadata).get("tool_call_id"))
+                           for event in ledger.actual_events(kind="tool")] if ledger is not None else []
             records.append(_NS(
                 objective=objective,
                 briefs=[k["_handoff_brief"] for k in kwargs if k.get("_handoff_brief") is not None],
@@ -544,9 +601,18 @@ async def _graph_session(script: list, turns: list[tuple[str, Any]], *, mode: st
                 supervisor_tools=[str(m.content) for m in [*supervisor, *shared] if getattr(m, "type", "") == "tool"],
                 worker_tools=[str(m.content) for m in operator if getattr(m, "type", "") == "tool"],
                 brief_events=brief_events,
+                tool_events=tool_events,
+                inventory_reads=len(reads) - reads_before,
+                model_calls=len(fake.inputs) - calls_before,
+                # Supervisor calls Sage wrote itself, in order, and the routing results each one saw.
+                routed=[message.tool_calls[0]["name"] for message in routed[routed_before:]],
+                route_messages=list(routed[routed_before:]), route_results=list(route_results[routed_before:]),
+                shared_tool_call_ids=[m.tool_call_id for m in shared if getattr(m, "type", "") == "tool"],
             ))
         return records
     finally:
+        transport.stop()
+        route_spy.stop()
         spy.stop()
         await drop_channel_session(build_chat_request("", channel_id=1, operation_id=1))
 
@@ -989,9 +1055,9 @@ def _scope(brief: dict) -> dict:
     return {key: value for key, value in brief.items() if key != "expected_result"}
 
 
-def _assert_exact_proposal(run, *, callback: str = "5", model_calls: int = 1) -> None:
-    """The first admitted brief and its one card are the bound procedure; nothing ran and no worker model call
-    preceded the card (only the Supervisor's routing calls)."""
+def _assert_exact_proposal(run, *, callback: str = "5", model_calls: int = 0) -> None:
+    """The first admitted brief and its one card are the bound procedure and nothing ran. With no model call before
+    the card (the default), Sage routed the request itself: one real inventory read, then the exact handoff."""
     action = {**NORTH_COLLECT, "callback_id": callback}
     assert _scope(run.briefs[0]) == {**EXACT_SCOPE, "callback_display_id": callback}, run.briefs
     assert run.briefs[0]["expected_result"]
@@ -1001,30 +1067,264 @@ def _assert_exact_proposal(run, *, callback: str = "5", model_calls: int = 1) ->
     assert card["data"]["guarded_action_count"] == 1
     assert len(run.bound_ids) == 1 and run.bound_ids[0].startswith("sage_bound_")
     assert run.at_card.ran == 0 and run.at_card.model_calls == model_calls
+    if model_calls == 0:
+        assert run.routed == ["list_callbacks", "transfer_to_Mythic_Operator"], run.routed
+        assert run.titles[0] == "Collect BloodHound data"
 
 
-def test_the_recorded_raw_collection_brief_becomes_the_bound_collection_procedure_before_dispatch():
-    script = [_call("transfer_to_Mythic_Operator", RAW_RECIPE, 1),
-              AIMessage(content="A worker reading the raw recipe would stage SharpHound here."), *FINALS]
-    run = _explicit(script)
+# The Supervisor's direct answer: what the live request did with an achieved collection already in the ledger.
+ANSWERED = _call("respond_to_user", {"final_response": "north.test is already collected; nothing to do."}, 1)
+ROUTED = ["list_callbacks", "transfer_to_Mythic_Operator"]
+
+
+def test_an_explicit_request_reaches_the_bound_procedure_before_any_supervisor_inference():
+    run = _explicit([ANSWERED, *FINALS])
 
     assert run.consult_metadata == []  # a collection request is not objective-shaped
     _assert_exact_proposal(run)
+    assert run.at_card.inventory_reads == 1
+    assert run.ran == [] and run.other_delegations == [] and run.brief_events == [("accepted", "Mythic_Operator")]
+    # Sage's handoff is not presented as a replaced Supervisor step, nor does it claim a missing graph.
+    assert not any("Sage replaced" in text or "no collected graph" in text or "by hand" in text
+                   for text in run.supervisor_tools)
+
+
+def test_sages_routing_calls_are_paired_with_their_results_and_fabricate_no_card_or_provider_call():
+    run = _explicit([ANSWERED, *FINALS])
+
+    inventory, handoff = (message.tool_calls[0]["id"] for message in run.route_messages)
+    assert inventory.startswith("sage_route_chat_1_request_1") and handoff.startswith("sage_route_chat_1_request_1")
+    assert inventory != handoff
+    # The real listing answered Sage's inventory call before the handoff was written; the handoff's acknowledgement
+    # answers the handoff call.
+    assert [row["id"] for row in json.loads(run.route_results[1][inventory])] == [5]
+    assert handoff in run.shared_tool_call_ids
+    # Supervisor calls open no tool card; the one card event is the worker's pending guarded proposal.
+    assert [(phase, name) for phase, name, _ in run.tool_events] == [("started", "execute_capability")]
+    # Sage-generated, without provider usage, and no provider call before the card.
+    assert [m.additional_kwargs.get("_sage_generated") for m in run.route_messages] == [
+        "explicit_collection_inventory", "explicit_collection_handoff"]
+    assert not any(m.usage_metadata for m in run.route_messages)
+    assert run.at_card.model_calls == 0 and len(run.cards) == 1
+
+
+def test_the_inventory_comes_from_the_real_listing_tool_without_a_preseeded_cache():
+    # Footholds name the callback but not its payload type; only the listing observes `apollo`.
+    run = _explicit([ANSWERED, *FINALS], callbacks=[{"id": 5, "host": "WORKSTATION-5"}], inventory=APOLLO_5,
+                    preseed=False)
+    _assert_exact_proposal(run)
+    assert run.at_card.inventory_reads == 1
+
+
+def test_an_unchanged_listing_that_carries_its_last_snapshot_is_a_usable_inventory():
+    run = _explicit([ANSWERED, *FINALS], prior_reads=2)  # the read guard answers `unchanged` with the snapshot
+    _assert_exact_proposal(run)
+    assert run.at_card.inventory_reads == 0
+
+
+@pytest.mark.parametrize("inventory, preseed, prior_reads", [
+    pytest.param(RuntimeError("Mythic GraphQL unavailable"), True, 0, id="read-error-with-stale-cache"),
+    pytest.param(None, False, 2, id="unchanged-without-snapshot"),
+])
+def test_an_unusable_inventory_routes_nothing_and_is_not_read_again(inventory, preseed, prior_reads):
+    run = _explicit([ANSWERED, *FINALS], inventory=inventory, preseed=preseed, prior_reads=prior_reads)
+
+    assert run.routed == ["list_callbacks"] and run.inventory_reads <= 1
+    assert run.cards == [] and run.bound_ids == [] and run.ran == []
+    assert run.model_calls == 1  # the Supervisor routed the request; its direct answer ended it
+
+
+def test_a_rejected_routing_handoff_is_not_emitted_again_or_admitted(monkeypatch):
+    def refuse(brief, **kwargs):
+        return ("forced structural rejection",) if brief.allowed_capabilities == ("collect-graph",) else ()
+
+    monkeypatch.setattr(model_module._handoff_brief, "validate_brief", refuse)
+    run = _explicit([ANSWERED, *FINALS])
+
+    assert run.routed == ROUTED and run.brief_events == [("rejected", "forced structural rejection")]
+    assert run.cards == [] and run.bound_ids == [] and run.ran == [] and run.briefs == []
+    assert run.model_calls == 1
+
+
+def test_an_operator_named_callback_among_several_is_routed():
+    prompt = "Collect BloodHound data for north.test through callback 7; collection only."
+    run = _explicit([ANSWERED, *FINALS], prompt=prompt, callbacks=TWO_APOLLO)
+    _assert_exact_proposal(run, callback="7")
+
+
+def test_a_large_listing_compacted_to_a_table_is_still_a_usable_inventory():
+    """Cold review: a listing longer than the compaction trigger reaches the Supervisor's state as a table, which
+    is not JSON; it is still the successful read, and the binding reads every row from the tool's cache."""
+    many = [{"id": n, "host": f"WORKSTATION-{n}", "agent": "apollo", "user": "operator"} for n in range(1, 41)]
+    prompt = "Collect BloodHound data for north.test through callback 7; collection only."
+    run = _explicit([ANSWERED, *FINALS], prompt=prompt, callbacks=many)
+    _assert_exact_proposal(run, callback="7")
+
+
+def test_an_unobserved_operator_callback_is_not_routed():
+    prompt = "Collect BloodHound data for north.test through callback 9; collection only."
+    run = _explicit([ANSWERED, *FINALS], prompt=prompt)
+    assert run.routed == ["list_callbacks"] and run.cards == [] and run.ran == []
+
+
+def test_with_several_callbacks_the_current_foothold_is_not_guessed():
+    script = [_collect(["north.test"]), AIMessage(content="Collected."), *FINALS]
+    run = _explicit(script, callbacks=TWO_APOLLO)
+
+    assert run.routed == ["list_callbacks"]
+    # No forced proposal: the Supervisor's own step (its choice, not an operator selection) runs as written.
+    assert run.titles[0] == "collect graph" and run.supervisor_tools
+    assert not any("Sage replaced" in text for text in run.supervisor_tools)
+
+
+@pytest.mark.parametrize("callbacks, runner", [
+    pytest.param([{"id": 5, "host": "WORKSTATION-5", "agent": "nebula"}], True, id="unknown-payload"),
+    pytest.param([{"id": 5, "host": "WORKSTATION-5"}], True, id="payload-type-not-observed"),
+    pytest.param(APOLLO_5, False, id="no-collection-runner"),
+])
+def test_without_adapter_support_or_a_runner_no_collection_is_forced(callbacks, runner):
+    script = [_call("transfer_to_Mythic_Operator", TTP_STEP, 1), AIMessage(content="Read."), *FINALS]
+    run = _explicit(script, callbacks=callbacks, runner=runner)
+
+    assert run.routed == ["list_callbacks"]
+    assert run.titles[0] == TTP_STEP["handoff_title"] and run.briefs[0]["allowed_capabilities"] == ["control_plane"]
+    assert run.cards == [] and run.bound_ids == [] and run.ran == []
+
+
+def test_a_merlin_callback_gets_the_same_procedure_level_proposal():
+    run = _explicit([ANSWERED, *FINALS], callbacks=[{"id": 5, "host": "WORKSTATION-5", "agent": "merlin"}])
+    _assert_exact_proposal(run)
+
+
+def test_a_rejected_explicit_collection_runs_nothing_and_is_not_proposed_again():
+    script = [AIMessage(content="Denied."), _call("transfer_to_Mythic_Operator", TTP_STEP, 2),
+              AIMessage(content="Read."), *FINALS]
+    run = _explicit(script, "reject")
+
+    assert run.ran == [] and len(run.cards) == 1 and len(run.bound_ids) == 1 and run.routed == ROUTED
+    assert [b["allowed_capabilities"] for b in run.briefs][:2] == [["collect-graph"], ["control_plane"]]
+    assert run.titles[1] == TTP_STEP["handoff_title"]
+
+
+def test_a_failed_explicit_collection_is_not_retried_or_reported_complete():
+    script = [AIMessage(content="The collection failed."), _call("transfer_to_Mythic_Operator", TTP_STEP, 2),
+              AIMessage(content="Read."), *FINALS]
+    run = _explicit(script, "accept", executor_result='{"ok": false, "status": "failed", "error": "collector failed"}')
+
+    assert run.ran == [{"action": NORTH_COLLECT, "inputs": None}]
+    assert len(run.cards) == 1 and len(run.bound_ids) == 1 and run.routed == ROUTED
+    assert [b["allowed_capabilities"] for b in run.briefs][:2] == [["collect-graph"], ["control_plane"]]
+    assert not any('"ok": true' in text for text in run.worker_tools)
+
+
+def test_an_operator_steer_at_the_card_never_executes_the_old_bound_action():
+    script = [AIMessage(content="Redirected."), _call("transfer_to_Mythic_Operator", TTP_STEP, 2),
+              AIMessage(content="Read."), *FINALS]
+    run = _explicit(script, ("respond", "Stop; just list the callbacks instead."))
+
+    assert run.ran == [] and len(run.cards) == 1 and len(run.bound_ids) == 1 and run.routed == ROUTED
+    # The redirected request's later step passes as the Supervisor wrote it (the steer re-delivers the first step's
+    # brief to its worker, so that step's brief appears again before it).
+    assert run.titles[-1] == TTP_STEP["handoff_title"] and run.briefs[-1]["allowed_capabilities"] == ["control_plane"]
+    assert {b["allowed_capabilities"][0] for b in run.briefs} == {"collect-graph", "control_plane"}
+
+
+def test_each_explicit_request_gets_its_own_proposal_and_an_unrelated_request_inherits_none():
+    script = [
+        AIMessage(content="Denied."), AIMessage(content="Final answer."),        # request 1, rejected
+        AIMessage(content="Collected."), AIMessage(content="Final answer."),     # request 2, accepted
+        AIMessage(content="Collected."), AIMessage(content="Final answer."),     # request 3, accepted
+        _call("transfer_to_Mythic_Operator", TTP_STEP, 3), AIMessage(content="Read."),  # unrelated request
+        AIMessage(content="Final answer."), *FINALS,
+    ]
+    turns = [(COLLECT_PROMPT, "reject"), (COLLECT_PROMPT, "accept"), (COLLECT_PROMPT, "accept"), ("Yes, run it.", "")]
+    rejected, first, second, unrelated = asyncio.run(_graph_session(script, turns, callbacks=APOLLO_5))
+
+    for record in (rejected, first, second):
+        assert _scope(record.briefs[0]) == EXACT_SCOPE and len(record.bound_ids) == 1, record.briefs
+        assert record.cards[0]["data"]["arguments"] == {"action": NORTH_COLLECT}
+        assert record.routed == ROUTED and record.at_card.model_calls == 0
+    assert rejected.ran == []
+    assert first.ran == second.ran == [{"action": NORTH_COLLECT, "inputs": None}]
+    # The third read in one task epoch is the tool's `unchanged` answer with its snapshot, which still routes.
+    assert [r.at_card.inventory_reads for r in (rejected, first, second)] == [1, 1, 0]
+    assert unrelated.routed == [] and unrelated.titles[:1] == [TTP_STEP["handoff_title"]]
+    assert unrelated.cards == [] and unrelated.bound_ids == [] and unrelated.ran == []
+
+
+@pytest.mark.parametrize("prompt", [
+    "How do I collect BloodHound data for north.test?",
+    "Don't collect BloodHound data for north.test.",
+    '"Collect BloodHound data for north.test"',
+    "If the graph is empty, collect BloodHound data for north.test.",
+    "Collect BloodHound data for north.test and south.test",
+    "Collect BloodHound session data for north.test",
+    "Collect BloodHound data for north.test, then obtain administrative control of it",
+])
+def test_parser_near_matches_get_no_sage_routing(prompt):
+    script = [_call("transfer_to_Mythic_Operator", TTP_STEP, 1), AIMessage(content="Read."), *FINALS]
+    run = _explicit(script, prompt=prompt)
+    assert run.routed == [] and run.inventory_reads == 0
+
+
+@pytest.mark.parametrize("prompt", [
+    "collect bloodhound data for north.test",
+    "Recollect BloodHound graph data from north.test.",
+    "Please collect BloodHound data for north.test through callback 5",
+])
+def test_parser_positive_forms_are_routed(prompt):
+    _assert_exact_proposal(_explicit([ANSWERED, *FINALS], prompt=prompt))
+
+
+def test_supervisor_assignment_text_is_never_read_as_an_operator_collection_request():
+    assigned = {**TTP_STEP, "handoff_instruction": "Collect BloodHound data for north.test through callback 5."}
+    script = [_call("transfer_to_Mythic_Operator", assigned, 1), AIMessage(content="Read."), *FINALS]
+    run = _explicit(script, prompt="Summarize what we know about north.test so far.")
+    assert run.titles[0] == TTP_STEP["handoff_title"] and run.cards == [] and run.bound_ids == []
+    assert run.routed == []
+
+
+def test_an_objective_request_keeps_its_consult_proposal_and_no_direct_binding():
+    script = [_call("transfer_to_Mythic_Operator", TTP_STEP, 1), AIMessage(content="Read."), *FINALS]
+    run = _explicit(script, prompt=OBJECTIVE)
+    assert run.consult_metadata and run.consult_metadata[0]["outcome"] == "absent"
+    assert run.titles[0] == "Collect the attack graph"  # the objective plan's step, unchanged
+    assert run.routed == []
+
+
+def test_conversation_mode_binds_no_collection_and_executes_nothing():
+    script = [_call("transfer_to_Mythic_Operator", {"handoff_title": "Look up guidance"}, 1),
+              AIMessage(content="Here is what I found."), *FINALS]
+    run = _explicit(script, mode="conversation")
+    assert run.ran == [] and run.cards == [] and run.bound_ids == [] and run.routed == []
+    assert all(b.get("allowed_capabilities") != ["collect-graph"] for b in run.briefs)
+
+
+# --- supervised Autonomous Solve keeps the first-delegation hook: Sage does not route its opening turn -------------
+
+@pytest.fixture
+def supervisor_autonomy(monkeypatch):
+    monkeypatch.setenv("SAGE_CONTROLLER_HITL", "0")  # reach the Supervisor rather than the controller
+
+
+def test_supervised_autonomous_solve_on_the_supervisor_path_gets_the_same_bound_proposal(supervisor_autonomy):
+    script = [_call("transfer_to_Mythic_Operator", RAW_RECIPE, 1), AIMessage(content="Collected."), *FINALS]
+    run = _explicit(script, autonomous_solve=True)
+    assert run.routed == []
+    _assert_exact_proposal(run, model_calls=1)
     assert run.titles[0] != RAW_RECIPE["handoff_title"]
-    assert run.ran == [] and run.other_delegations == []
-    # The Supervisor is told what Sage did, without claiming a missing graph or advising a raw bypass.
     note = next(text for text in run.supervisor_tools if "collect-graph" in text)
     assert "requested" in note and "no collected graph" not in note and "by hand" not in note
 
 
-def test_the_supervisors_exact_collection_procedure_passes_once_unchanged():
+def test_the_supervisors_exact_collection_procedure_passes_the_hook_once_unchanged(supervisor_autonomy):
     own = {"handoff_title": "collect north", "allowed_capabilities": ["collect-graph"], "callback_display_id": 5,
            "targets": ["north.test"], "expected_result": "A collected graph of north.test."}
     script = [_call("transfer_to_Mythic_Operator", own, 1), AIMessage(content="Collected."), *FINALS]
-    run = _explicit(script, "accept")
+    run = _explicit(script, "accept", autonomous_solve=True)
 
     assert run.titles[0] == "collect north"
-    _assert_exact_proposal(run)
+    _assert_exact_proposal(run, model_calls=1)
     assert run.ran == [{"action": NORTH_COLLECT, "inputs": None}]
     assert [b["allowed_capabilities"] for b in run.briefs].count(["collect-graph"]) == 1
 
@@ -1043,133 +1343,24 @@ def test_the_supervisors_exact_collection_procedure_passes_once_unchanged():
     pytest.param(_collect(["north.test", "south.test"]), id="several-domains"),
     pytest.param(_collect(["north.test", "workstation-5"]), id="extra-host-target"),
 ])
-def test_a_replaceable_first_delegation_cannot_bypass_the_requested_procedure(first):
-    run = _explicit([first, AIMessage(content="Collection result read."), *FINALS])
+def test_a_replaceable_first_delegation_cannot_bypass_the_requested_procedure(supervisor_autonomy, first):
+    run = _explicit([first, AIMessage(content="Collection result read."), *FINALS], autonomous_solve=True)
 
     assert run.titles[0] == "Collect BloodHound data", run.titles  # Sage's step, not the Supervisor's
     assert run.other_delegations == []
-    _assert_exact_proposal(run)
+    _assert_exact_proposal(run, model_calls=1)
 
 
-def test_an_operator_named_callback_is_bound_and_a_conflicting_supervisor_callback_is_a_recoverable_error():
+def test_a_conflicting_supervisor_callback_is_a_recoverable_brief_error_at_the_hook(supervisor_autonomy):
     prompt = "Collect BloodHound data for north.test through callback 7; collection only."
     script = [_collect(["north.test"]),  # names callback 5, not the operator's 7
               _call("transfer_to_Mythic_Operator", TTP_STEP, 2), AIMessage(content="Collected."), *FINALS]
-    run = _explicit(script, prompt=prompt, callbacks=TWO_APOLLO)
+    run = _explicit(script, prompt=prompt, callbacks=TWO_APOLLO, autonomous_solve=True)
 
     (rejected, accepted) = run.brief_events
     assert rejected[0] == "rejected" and "callback_display_id: 5 is not callback 7" in rejected[1], run.brief_events
     assert accepted == ("accepted", "Mythic_Operator")
     _assert_exact_proposal(run, callback="7", model_calls=2)
-
-
-def test_with_several_callbacks_the_current_foothold_is_not_guessed():
-    script = [_collect(["north.test"]), AIMessage(content="Collected."), *FINALS]
-    run = _explicit(script, callbacks=TWO_APOLLO)
-
-    # No forced proposal: the Supervisor's own step (its choice, not an operator selection) runs as written.
-    assert run.titles[0] == "collect graph" and run.supervisor_tools
-    assert not any("Sage replaced" in text for text in run.supervisor_tools)
-
-
-@pytest.mark.parametrize("callbacks, runner", [
-    pytest.param([{"id": 5, "host": "WORKSTATION-5", "agent": "nebula"}], True, id="unknown-payload"),
-    pytest.param([{"id": 5, "host": "WORKSTATION-5"}], True, id="payload-type-not-observed"),
-    pytest.param(APOLLO_5, False, id="no-collection-runner"),
-])
-def test_without_adapter_support_or_a_runner_no_collection_is_forced(callbacks, runner):
-    script = [_call("transfer_to_Mythic_Operator", TTP_STEP, 1), AIMessage(content="Read."), *FINALS]
-    run = _explicit(script, callbacks=callbacks, runner=runner)
-
-    assert run.titles[0] == TTP_STEP["handoff_title"] and run.briefs[0]["allowed_capabilities"] == ["control_plane"]
-    assert run.cards == [] and run.bound_ids == [] and run.ran == []
-
-
-def test_a_merlin_callback_gets_the_same_procedure_level_proposal():
-    script = [_call("transfer_to_Mythic_Operator", RAW_RECIPE, 1), AIMessage(content="Collected."), *FINALS]
-    run = _explicit(script, callbacks=[{"id": 5, "host": "WORKSTATION-5", "agent": "merlin"}])
-    _assert_exact_proposal(run)
-
-
-def test_a_rejected_explicit_collection_runs_nothing_and_is_not_proposed_again():
-    script = [_call("transfer_to_Mythic_Operator", RAW_RECIPE, 1), AIMessage(content="Denied."),
-              _call("transfer_to_Mythic_Operator", TTP_STEP, 2), AIMessage(content="Read."), *FINALS]
-    run = _explicit(script, "reject")
-
-    assert run.ran == [] and len(run.cards) == 1 and len(run.bound_ids) == 1
-    assert [b["allowed_capabilities"] for b in run.briefs][:2] == [["collect-graph"], ["control_plane"]]
-    assert run.titles[1] == TTP_STEP["handoff_title"]
-
-
-def test_a_failed_explicit_collection_is_not_retried_or_reported_complete():
-    script = [_call("transfer_to_Mythic_Operator", RAW_RECIPE, 1), AIMessage(content="The collection failed."),
-              _call("transfer_to_Mythic_Operator", TTP_STEP, 2), AIMessage(content="Read."), *FINALS]
-    run = _explicit(script, "accept", executor_result='{"ok": false, "status": "failed", "error": "collector failed"}')
-
-    assert run.ran == [{"action": NORTH_COLLECT, "inputs": None}]
-    assert len(run.cards) == 1 and len(run.bound_ids) == 1
-    assert [b["allowed_capabilities"] for b in run.briefs][:2] == [["collect-graph"], ["control_plane"]]
-    assert not any('"ok": true' in text for text in run.worker_tools)
-
-
-def test_an_operator_steer_at_the_card_never_executes_the_old_bound_action():
-    script = [_call("transfer_to_Mythic_Operator", RAW_RECIPE, 1), AIMessage(content="Redirected."),
-              _call("transfer_to_Mythic_Operator", TTP_STEP, 2), AIMessage(content="Read."), *FINALS]
-    run = _explicit(script, ("respond", "Stop; just list the callbacks instead."))
-
-    assert run.ran == [] and len(run.cards) == 1 and len(run.bound_ids) == 1
-    # The redirected request's later step passes as the Supervisor wrote it (the steer re-delivers the first step's
-    # brief to its worker, so that step's brief appears again before it).
-    assert run.titles[-1] == TTP_STEP["handoff_title"] and run.briefs[-1]["allowed_capabilities"] == ["control_plane"]
-    assert {b["allowed_capabilities"][0] for b in run.briefs} == {"collect-graph", "control_plane"}
-
-
-def test_each_explicit_request_gets_its_own_proposal_and_an_unrelated_request_inherits_none():
-    script = [
-        _call("transfer_to_Mythic_Operator", RAW_RECIPE, 1), AIMessage(content="Denied."),
-        AIMessage(content="Final answer."),
-        _call("transfer_to_Mythic_Operator", RAW_RECIPE, 2), AIMessage(content="Denied."),
-        AIMessage(content="Final answer."),
-        _call("transfer_to_Mythic_Operator", TTP_STEP, 3), AIMessage(content="Read."),
-        AIMessage(content="Final answer."), *FINALS,
-    ]
-    turns = [(COLLECT_PROMPT, "reject"), (COLLECT_PROMPT, "reject"), ("Yes, run it.", "")]
-    first, second, unrelated = asyncio.run(_graph_session(script, turns, callbacks=APOLLO_5))
-
-    for record in (first, second):
-        assert _scope(record.briefs[0]) == EXACT_SCOPE and len(record.bound_ids) == 1 and record.ran == []
-        assert record.cards[0]["data"]["arguments"] == {"action": NORTH_COLLECT}
-    assert unrelated.titles[:1] == [TTP_STEP["handoff_title"]]
-    assert unrelated.cards == [] and unrelated.bound_ids == [] and unrelated.ran == []
-
-
-def test_supervisor_assignment_text_is_never_read_as_an_operator_collection_request():
-    assigned = {**TTP_STEP, "handoff_instruction": "Collect BloodHound data for north.test through callback 5."}
-    script = [_call("transfer_to_Mythic_Operator", assigned, 1), AIMessage(content="Read."), *FINALS]
-    run = _explicit(script, prompt="Summarize what we know about north.test so far.")
-    assert run.titles[0] == TTP_STEP["handoff_title"] and run.cards == [] and run.bound_ids == []
-
-
-def test_an_objective_request_keeps_its_consult_proposal_and_no_direct_binding():
-    script = [_call("transfer_to_Mythic_Operator", TTP_STEP, 1), AIMessage(content="Read."), *FINALS]
-    run = _explicit(script, prompt=OBJECTIVE)
-    assert run.consult_metadata and run.consult_metadata[0]["outcome"] == "absent"
-    assert run.titles[0] == "Collect the attack graph"  # the objective plan's step, unchanged
-
-
-def test_conversation_mode_binds_no_collection_and_executes_nothing():
-    script = [_call("transfer_to_Mythic_Operator", {"handoff_title": "Look up guidance"}, 1),
-              AIMessage(content="Here is what I found."), *FINALS]
-    run = _explicit(script, mode="conversation")
-    assert run.ran == [] and run.cards == [] and run.bound_ids == []
-    assert all(b.get("allowed_capabilities") != ["collect-graph"] for b in run.briefs)
-
-
-def test_supervised_autonomous_solve_on_the_supervisor_path_gets_the_same_bound_proposal(monkeypatch):
-    monkeypatch.setenv("SAGE_CONTROLLER_HITL", "0")
-    script = [_call("transfer_to_Mythic_Operator", RAW_RECIPE, 1), AIMessage(content="Collected."), *FINALS]
-    run = _explicit(script, autonomous_solve=True)
-    _assert_exact_proposal(run)
 
 
 # --- the approved procedure drives the real collection runner through each backend's adapter --------------------
@@ -1210,10 +1401,11 @@ def test_the_approved_procedure_runs_each_backends_real_commands_and_verifies_th
 
     install_bloodhound(monkeypatch, FakeIngestTool())  # the image's ingest-ready MCP, as the controller tests use
     calls: list = []
-    script = [_call("transfer_to_Mythic_Operator", RAW_RECIPE, 1), AIMessage(content="Collected."), *FINALS]
-    run = _explicit(script, "accept", callbacks=[{"id": 5, "host": "WORKSTATION-5", "agent": agent}],
+    run = _explicit([AIMessage(content="Collected."), *FINALS], "accept",
+                    callbacks=[{"id": 5, "host": "WORKSTATION-5", "agent": agent}],
                     executor=_backend_executor(agent, calls))
 
+    _assert_exact_proposal(run)
     assert run.ran == [{"action": NORTH_COLLECT, "inputs": None}]
     tasks = [call for call in calls if call[0] not in {"ingest_collection", "_latest_download"}]  # Mythic tasks
     commands = [call[0] for call in tasks]
@@ -1236,14 +1428,20 @@ from tests.test_private_collection_transaction import collection  # noqa: E402,F
 APPROVED_COLLECTION_STEPS = ["whoami", "ticket_cache_list", "execute_assembly", "ls", "download"]
 CORP_PROMPT = "Collect BloodHound data for corp.test through the current foothold; collection only."
 CORP_COLLECT = {"capability": "collect-graph", "callback_id": "7", "domain": "corp.test"}
-CORP_RAW = {**RAW_RECIPE, "callback_display_id": 7, "targets": ["corp.test", "workstation"],
-            "handoff_instruction": "Stage SharpHound on callback 7, run it against corp.test, download and ingest."}
 
 
-async def _real_collection_request(case, script: list, decision: str) -> _NS:
+async def _real_collection_request(case, script: list, decision: str, *, prompt: str = CORP_PROMPT,
+                                   preseed: bool = True, inventory=None) -> _NS:
     """One native supervised request whose Mythic client is the real `MythicTools` from the private-collection
     fixture: the card's approval, `execute_capability`, the collection transaction, the Apollo adapter, the command
-    resolver and ingest all run; Mythic's task API, file registry, download and BloodHound MCP are inert."""
+    resolver and ingest all run; Mythic's task API, file registry, download and BloodHound MCP are inert.
+
+    The Supervisor's `list_callbacks` is the client's real tool; its GraphQL transport serves `inventory` (default:
+    the fixture's callback 7). `preseed=False` starts with no callback inventory cached."""
+    from unittest.mock import patch
+
+    from ai.langgraph import mythic_tools as package_mythic_tools
+
     model = model_module.Model(
         provider="openai", model="gpt-4o-mini", system_prompt="offline collection acceptance",
         config={"configurable": {"api_key": "offline-only", "API_ENDPOINT": "http://127.0.0.1:9/v1"}},
@@ -1253,7 +1451,11 @@ async def _real_collection_request(case, script: list, decision: str) -> _NS:
     client = case.client
     client._private_collection_transaction = None
     client._recon_snapshot_cache = {("list_callbacks", "all"): [
-        {"id": 7, "host": "workstation", "agent": "apollo", "user": "operator", "status": "alive"}]}
+        {"id": 7, "host": "workstation", "agent": "apollo", "user": "operator", "status": "alive"}]} if preseed else {}
+    reads: list[str] = []
+    transport = patch.object(package_mythic_tools.mythic, "execute_custom_query",
+                             _inventory_transport(CORP_CALLBACKS if inventory is None else inventory, reads))
+    transport.start()
     client._engagement_footholds = list(case.state.footholds)
     client.set_collection_runner(model._run_collection_capability)
     model.mythic_client = client
@@ -1276,7 +1478,8 @@ async def _real_collection_request(case, script: list, decision: str) -> _NS:
         bind_channel_thread_id(first, model)
         await chat.chat(first)
         cards = _cards(chat)
-        at_card = _NS(tasks=len(case.tasks), registered=len(case.registered), model_calls=len(fake.inputs))
+        at_card = _NS(tasks=len(case.tasks), registered=len(case.registered), model_calls=len(fake.inputs),
+                      inventory_reads=len(reads))
         if cards and decision:
             second = build_chat_request("", channel_id=1, operation_id=1, request_id=2, config={"mode": "supervised"})
             second.InputResponse = _input_response(decision, cards[0])
@@ -1286,13 +1489,17 @@ async def _real_collection_request(case, script: list, decision: str) -> _NS:
         results = [json.loads(m.content) for m in operator
                    if getattr(m, "type", "") == "tool" and getattr(m, "name", "") == "execute_capability"
                    and str(m.content).startswith("{")]
-        return _NS(cards=_cards(chat), at_card=at_card, results=results)
+        return _NS(cards=_cards(chat), at_card=at_card, results=results, inventory_reads=len(reads),
+                   model_calls=len(fake.inputs), emissions=list(chat.emissions),
+                   supervisor=list(snapshot.values.get("supervisor_messages", [])))
     finally:
+        transport.stop()
         await drop_channel_session(build_chat_request("", channel_id=1, operation_id=1))
 
 
 def _acceptance_script() -> list:
-    return [_call("transfer_to_Mythic_Operator", CORP_RAW, 1), AIMessage(content="Collected corp.test."), *FINALS]
+    # What follows the card: the worker's report of the collection result, then the Supervisor's.
+    return [AIMessage(content="Collected corp.test."), *FINALS]
 
 
 def test_acceptance_the_explicit_request_runs_the_real_collection_and_verifies_the_requested_domain(
@@ -1303,7 +1510,8 @@ def test_acceptance_the_explicit_request_runs_the_real_collection_and_verifies_t
 
     (card,) = run.cards
     assert card["data"]["arguments"] == {"action": CORP_COLLECT}
-    assert (run.at_card.tasks, run.at_card.registered, run.at_card.model_calls) == (0, 0, 1)
+    assert (run.at_card.tasks, run.at_card.registered, run.at_card.model_calls) == (0, 0, 0)
+    assert run.at_card.inventory_reads == 1
     # The approved transaction issued the Apollo adapter's real collection commands on the approved callback.
     assert [task["command_name"] for task in case.tasks] == APPROVED_COLLECTION_STEPS
     assert {task["callback_display_id"] for task in case.tasks} == {7}
@@ -1324,9 +1532,11 @@ def test_acceptance_an_existing_graph_is_recollected_fresh_when_the_operator_app
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path / "engagement"))
     case = collection
     _covered(case, monkeypatch)
-    run = asyncio.run(_real_collection_request(case, _acceptance_script(), "accept"))
+    run = asyncio.run(_real_collection_request(case, _acceptance_script(), "accept", preseed=False))
 
     assert run.cards[0]["data"]["arguments"] == {"action": CORP_COLLECT}
+    # Routed by Sage from the real listing, with nothing issued before approval.
+    assert (run.at_card.model_calls, run.at_card.inventory_reads, run.at_card.tasks) == (0, 1, 0)
     assert "execute_assembly" in [task["command_name"] for task in case.tasks]
     assert case.client._private_collection_transaction._artifact_consumed is True
     (result,) = run.results
@@ -1340,6 +1550,35 @@ def test_acceptance_a_rejected_explicit_collection_issues_no_target_task(collect
 
     assert run.cards[0]["data"]["arguments"] == {"action": CORP_COLLECT}
     assert case.tasks == [] and case.registered == []
+    assert not [event for event in case.events if event[0] == "ingest"]
+
+
+# --- the live no-delegation failure: a warm graph, an achieved collection, and a Supervisor that answers directly --
+#
+# Live 2026-11-10: with north already collected and verified, the operator's explicit collection request reached the
+# Supervisor, which listed callbacks and then answered that the collection was complete. No handoff ran, so the
+# first-delegation hook never fired and no card appeared. Sage now reads the inventory and proposes the requested
+# procedure before the Supervisor is asked anything.
+
+from tests.test_collection_capability import _covered  # noqa: E402
+
+ALREADY_COLLECTED = _call("respond_to_user", {
+    "final_response": "BloodHound data for corp.test is already collected and verified; nothing further is needed."}, 1)
+
+
+def test_a_warm_graph_explicit_request_reaches_the_exact_card_before_any_supervisor_inference(
+        collection, monkeypatch, tmp_path):
+    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path / "engagement"))
+    case = collection
+    _covered(case, monkeypatch)
+    run = asyncio.run(_real_collection_request(case, [ALREADY_COLLECTED, *FINALS], "", preseed=False))
+
+    (card,) = run.cards
+    assert card["data"]["arguments"] == {"action": CORP_COLLECT}
+    assert card["data"]["guarded_action_count"] == 1
+    # The real inventory tool supplied the observation; the Supervisor's direct answer was never consumed.
+    assert (run.at_card.inventory_reads, run.at_card.model_calls) == (1, 0)
+    assert (run.at_card.tasks, run.at_card.registered) == (0, 0)
     assert not [event for event in case.events if event[0] == "ingest"]
 
 
@@ -1367,6 +1606,11 @@ def _nebula_client(monkeypatch, tmp_path):
         0, result={"task_completed": True, "task_status": "completed"})
     # A collection runner is installed, so the collection-request variant is refused for its payload type alone.
     mt.set_collection_runner(lambda **_kwargs: pytest.fail("no collector may run for an uncatalogued payload"))
+    # The Supervisor's real `list_callbacks` observes the same callback through Mythic's (inert) GraphQL endpoint.
+    from ai.langgraph import mythic_tools as package_mythic_tools
+    mt._inventory_reads = []
+    monkeypatch.setattr(package_mythic_tools.mythic, "execute_custom_query", _inventory_transport(
+        [{"id": 9, "host": "NODE-9", "agent": "nebula", "user": "operator"}], mt._inventory_reads))
     return mt
 
 
@@ -1425,6 +1669,8 @@ def test_an_uncatalogued_payload_keeps_its_generic_task_path_and_runs_the_inert_
     assert issued_at_card == 0
     assert [(i["command_name"], i["callback_display_id"]) for i in calls["issued"]] == [("ls", 9)]
     assert calls["issued"][0]["parameters"] == {"path": "C:\\Users\\Public"}
+    # The collection request read the inventory once and, finding no adapter for `nebula`, routed nothing.
+    assert len(mt._inventory_reads) == (1 if prompt.startswith("Collect") else 0)
 
 
 # --- the explicit binding at the hook: typed/operator agreement, redirect, lanes -----------------------------------
@@ -1511,6 +1757,71 @@ def test_an_objective_request_is_never_given_an_explicit_binding():
     assert model._graph_first_step is objective_plan
 
 
+# --- Sage's opening routing at the producer: bindings, tool availability, one emission -----------------------------
+
+ROUTE_TOOLS = {"list_callbacks", "transfer_to_Mythic_Operator"}
+
+
+def _route_model(*, contract_admits: bool = True, **binding):
+    """The hook model as an ordinary supervised native request. It has no native enforcement projection, so its real
+    contract refuses every tool; `contract_admits` stands in for an admitting contract (the native tests use the real
+    one)."""
+    model = _explicit_hook_model(**binding)
+    model.mode, model._native_chat_explicit_hitl, model._autonomous_solve = "supervised", True, False
+    if contract_admits:
+        model._request_contract_block_reason = lambda name, args=None: ""
+    return model
+
+
+def _listing(model) -> list:
+    from langchain_core.messages import ToolMessage
+
+    rows = [{"id": row["id"], "agent": row["agent"], "host": row["host"]} for row in TWO_APOLLO]
+    return [ToolMessage(content=json.dumps(rows), name="list_callbacks",
+                        tool_call_id=model._graph_first_step["route_inventory"])]
+
+
+def test_an_agreeing_typed_binding_is_routed_to_its_callback():
+    model = _route_model(operator_callback="7", typed="7")
+    assert model._explicit_collection_route_message(ROUTE_TOOLS, []).tool_calls[0]["name"] == "list_callbacks"
+    (call,) = model._explicit_collection_route_message(ROUTE_TOOLS, _listing(model)).tool_calls
+    assert call["name"] == "transfer_to_Mythic_Operator"
+    assert {key: call["args"][key] for key in ("callback_display_id", "targets", "allowed_capabilities")} == {
+        "callback_display_id": "7", "targets": ["north.test"], "allowed_capabilities": ["collect-graph"]}
+    assert model._explicit_collection_route_message(ROUTE_TOOLS, _listing(model)) is None  # emitted once
+
+
+def test_a_conflicting_typed_binding_is_not_routed_and_leaves_the_hook_pending():
+    model = _route_model(operator_callback="7", typed="5")
+    model._explicit_collection_route_message(ROUTE_TOOLS, [])
+    assert model._explicit_collection_route_message(ROUTE_TOOLS, _listing(model)) is None
+    assert model._graph_first_step["route_done"] is True and model._graph_first_step["done"] is False
+    assert model._explicit_collection_route_message(ROUTE_TOOLS, _listing(model)) is None  # no second inventory
+
+
+@pytest.mark.parametrize("offered", [set(), {"list_callbacks"}], ids=["no-listing-tool", "no-handoff-tool"])
+def test_a_tool_the_supervisor_is_not_offered_ends_the_route(offered):
+    model = _route_model()
+    first = model._explicit_collection_route_message(offered, [])
+    if "list_callbacks" in offered:
+        assert first is not None
+        assert model._explicit_collection_route_message(offered, _listing(model)) is None
+    else:
+        assert first is None
+    assert model._graph_first_step["route_done"] is True
+
+
+def test_a_request_contract_refusal_ends_the_route_without_a_call():
+    model = _route_model(contract_admits=False)
+    assert model._explicit_collection_route_message(ROUTE_TOOLS, []) is None
+    assert model._graph_first_step["route_done"] is True and "route_inventory" not in model._graph_first_step
+
+
+def test_a_redirected_request_is_not_routed():
+    model = _route_model(revisions=(0, 1))
+    assert model._explicit_collection_route_message(ROUTE_TOOLS, []) is None
+
+
 DA_LABEL_PROMPT = "Collect BloodHound data for north.da.test through callback 7; collection only."
 
 
@@ -1519,14 +1830,11 @@ def test_a_domain_label_that_reads_as_an_objective_does_not_take_the_explicit_bi
     objective, so the consult's plan was armed and the operator's callback binding was dropped. The explicit request
     does not depend on that consult."""
     assert knowledge_sources.classify_turn(DA_LABEL_PROMPT) == knowledge_sources.TURN_OBJECTIVE  # the overlap
-    script = [_collect(["north.da.test"]),  # the Supervisor's own collection, on callback 5
-              _call("transfer_to_Mythic_Operator", TTP_STEP, 2), AIMessage(content="Collected."), *FINALS]
-    run = _explicit(script, prompt=DA_LABEL_PROMPT, callbacks=TWO_APOLLO)
+    run = _explicit([ANSWERED, *FINALS], prompt=DA_LABEL_PROMPT, callbacks=TWO_APOLLO)
 
-    (rejected, accepted) = run.brief_events
-    assert rejected[0] == "rejected" and "callback_display_id: 5 is not callback 7" in rejected[1], run.brief_events
-    assert accepted == ("accepted", "Mythic_Operator")
+    # The operator's callback 7, among two, is routed; the consult's plan did not take the binding away.
+    assert run.routed == ROUTED and run.brief_events == [("accepted", "Mythic_Operator")]
     (card,) = run.cards
     assert card["data"]["arguments"] == {"action": {"capability": "collect-graph", "callback_id": "7",
                                                     "domain": "north.da.test"}}
-    assert run.titles[0] == "Collect BloodHound data" and run.at_card.ran == 0
+    assert run.titles[0] == "Collect BloodHound data" and run.at_card.ran == 0 and run.at_card.model_calls == 0

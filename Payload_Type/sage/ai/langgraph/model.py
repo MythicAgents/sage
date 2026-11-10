@@ -3174,6 +3174,46 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
             self._add_time(request, started, guarded=_tool_name_from_request(request) in self._guarded)
 
 
+class _ExplicitCollectionRouteMiddleware(AgentMiddleware):
+    """Route an explicit collection request's opening Supervisor turn without a provider decision.
+
+    For an ordinary supervised native-chat request whose whole opening input is a supported explicit collection
+    request, the Supervisor's first two model calls are Sage's own: `list_callbacks`, then the exact
+    `transfer_to_Mythic_Operator` collection step (`Model._explicit_collection_route_message`). They are ordinary tool
+    calls: turn authority, the handoff's brief check, the worker's bound-procedure middleware and native approval
+    apply to them exactly as to a model's. Every other model call passes through untouched.
+    """
+
+    def __init__(self, model: "Model"):
+        super().__init__()
+        self._model = model
+
+    async def _announce(self, message: AIMessage) -> None:
+        """Give Sage's call to the Supervisor's capture callback, as a model's response would be. It carries no usage,
+        and, like every Supervisor call, opens no tool card."""
+        capture = getattr(self._model, "_capture_callbacks", {}).get("Supervisor")
+        if capture is None:
+            return
+        try:
+            await capture.on_llm_end(LLMResult(generations=[[ChatGeneration(message=message)]]), run_id=uuid4())
+        except Exception as exc:
+            logger.warning(f"explicit-collection route call not captured: {type(exc).__name__}: {exc}")
+
+    def wrap_model_call(self, request, handler):
+        # Native chat runs the async path; the sync path keeps the Supervisor's own routing.
+        return handler(request)
+
+    async def awrap_model_call(self, request, handler):
+        message = self._model._explicit_collection_route_message(
+            {_offered_tool_name(tool) for tool in getattr(request, "tools", None) or []},
+            _agent_state_messages(getattr(request, "state", None)),
+        )
+        if message is None:
+            return await handler(request)
+        await self._announce(message)
+        return message
+
+
 def _remove_tool_calls(message: AIMessage, call_ids: set[str], note: str) -> None:
     """Drop the named tool calls from a generation message in place and say why, as the authority filter does."""
     message.tool_calls[:] = [call for call in message.tool_calls if str(call.get("id") or "") not in call_ids]
@@ -6909,29 +6949,60 @@ class Model:
         if revision != plan.get("revision"):
             plan["done"] = True  # the operator redirected the request; its opening input no longer binds a procedure
             return None
+        named = brief.callback_display_id if isinstance(brief, _handoff_brief.HandoffBrief) else ""
+        substitute, scope, _reason = self._explicit_collection_binding(plan, named=named)
+        if substitute is None:
+            return None
+        callback, domain = substitute.callback_display_id, substitute.targets[0]
+        expected = {"action": {"capability": "collect-graph", "callback_id": callback, "domain": domain}}
+        if (worker == "Mythic_Operator" and isinstance(brief, _handoff_brief.HandoffBrief)
+                and _step_bounds.bound_procedure_call(brief.as_metadata(), scope.hosts) == expected):
+            plan["admit"] = _admission_key(worker, brief)
+            return None
+        plan["admit"] = _admission_key("Mythic_Operator", substitute)
+        logger.info(f"🧭 [first-step] explicit collection requested: {worker} step {title!r} replaced by collect-graph "
+                    f"on callback {callback} for {domain}")
+        note = (f"The operator requested a BloodHound collection of {domain}, which Sage runs as its catalog procedure "
+                f"`collect-graph`, so Sage replaced this first delegation ({worker}: {title or 'untitled'}) with "
+                f"`collect-graph` on callback {callback} for {domain}, for the operator's approval.")
+        return ("Mythic_Operator", substitute, _EXPLICIT_COLLECTION_TITLE, _explicit_collection_assignment(substitute),
+                note)
+
+    def _explicit_collection_binding(
+        self, plan: dict[str, Any], *, named: str = "",
+    ) -> tuple["_handoff_brief.HandoffBrief | None", Any, str]:
+        """Sage's one binding of an explicit collection request to `collect-graph`: (the exact brief, the known scope,
+        "") when it resolves, else (None, scope or None, the reason).
+
+        The callback is the operator's or the typed request's binding (which must agree), else the only callback Sage
+        observed as active; a Supervisor's choice among several is not an operator selection. Its observed payload type
+        must have a collection adapter and Sage a collection runner, and Sage's binder must resolve the brief to exactly
+        that callback and the requested domain. `named` is a delegation's own callback: one that conflicts with the
+        binding is left to the brief check, which rejects it naming the binding. An unsupported payload, a missing
+        runner or a domain that names an observed host ends the plan; missing or ambiguous identities leave it pending."""
         try:
             scope = _handoff_brief.known_scope(
                 getattr(self, "mythic_client", None),
                 bound_callback=getattr(getattr(self, "_turn_authority", None), "bounded_callback_id", ""),
             )
-        except Exception:
-            return None
+        except Exception as exc:
+            return None, None, f"the known scope could not be read ({type(exc).__name__})"
         operator, typed = str(plan.get("callback_id") or ""), scope.bound_callback
         if operator and typed and operator != typed:
-            logger.info(f"🧭 [first-step] explicit collection not bound: the operator named callback {operator} but "
-                        f"the request is bound to callback {typed}")
-            return None
-        named = brief.callback_display_id if isinstance(brief, _handoff_brief.HandoffBrief) else ""
+            reason = f"the operator named callback {operator} but the request is bound to callback {typed}"
+            logger.info(f"🧭 [first-step] explicit collection not bound: {reason}")
+            return None, scope, reason
         bound = operator or typed
         if bound and named and named != bound:
-            return None  # the brief check rejects it, naming the binding
+            return None, scope, f"the delegation names callback {named}, not the bound callback {bound}"
         active = self._observed_active_callbacks()
         callback = bound or (next(iter(active)) if len(active) == 1 else "")
         if not callback:
-            return None
+            return None, scope, (f"{len(active)} active callbacks are observed and none is bound" if active
+                                 else "no active callback is observed")
         payload_type = self._observed_callback_payload_type(callback)
         if not payload_type:
-            return None
+            return None, scope, f"callback {callback} has no single observed payload type"
         try:
             from . import mythic_capability_adapter as _adapter
         except ImportError:  # pragma: no cover - flat import layout
@@ -6942,30 +7013,99 @@ class Model:
             reason = (f"payload type {payload_type!r} has no collection adapter" if callable(runner)
                       else "no collection runner is installed")
             logger.info(f"🧭 [first-step] explicit collection on callback {callback} not bound: {reason}")
-            return None
+            return None, scope, reason
         domain = str(plan.get("domain") or "")
-        expected = {"action": {"capability": "collect-graph", "callback_id": callback, "domain": domain}}
-        if (worker == "Mythic_Operator" and isinstance(brief, _handoff_brief.HandoffBrief)
-                and _step_bounds.bound_procedure_call(brief.as_metadata(), scope.hosts) == expected):
-            plan["admit"] = _admission_key(worker, brief)
-            return None
-        substitute = _handoff_brief.HandoffBrief(
+        brief = _handoff_brief.HandoffBrief(
             targets=(domain,), callback_display_id=callback, allowed_capabilities=("collect-graph",),
             expected_result=f"BloodHound holds a freshly collected, verified graph of {domain}.",
         )
-        if _step_bounds.bound_procedure_call(substitute.as_metadata(), scope.hosts) != expected:
+        expected = {"action": {"capability": "collect-graph", "callback_id": callback, "domain": domain}}
+        if _step_bounds.bound_procedure_call(brief.as_metadata(), scope.hosts) != expected:
             plan["done"] = True
-            logger.info(f"🧭 [first-step] explicit collection not bound: {domain} names a host Sage observed")
+            reason = f"{domain} names a host Sage observed"
+            logger.info(f"🧭 [first-step] explicit collection not bound: {reason}")
+            return None, scope, reason
+        return brief, scope, ""
+
+    def _explicit_collection_route_message(self, offered: set[str], messages: list[AnyMessage]) -> AIMessage | None:
+        """Sage's own Supervisor call for an explicit collection request's opening routing, or None to ask the model.
+
+        Two calls, each at most once for the request's opening input: the ordinary `list_callbacks` read, then, at the
+        next Supervisor model boundary and only when that exact call returned a usable inventory, the exact
+        `transfer_to_Mythic_Operator` collection step from `_explicit_collection_binding`. Both run through the normal
+        tool, authority and handoff paths; the handoff's brief check admits the step and consumes the plan. A tool not
+        offered or not allowed, an unusable inventory or an unresolved binding ends the attempt and the Supervisor's own
+        routing resumes, with the existing first-delegation hook. Ordinary supervised native chat with Autonomous Solve
+        off only."""
+        plan = self._pending_explicit_collection()
+        if plan is None or plan.get("route_done") or not self._explicit_collection_route_eligible():
             return None
-        plan["admit"] = _admission_key("Mythic_Operator", substitute)
-        logger.info(f"🧭 [first-step] explicit collection requested: {worker} step {title!r} replaced by collect-graph "
-                    f"on callback {callback} for {domain}")
-        note = (f"The operator requested a BloodHound collection of {domain}, which Sage runs as its catalog procedure "
-                f"`collect-graph`, so Sage replaced this first delegation ({worker}: {title or 'untitled'}) with "
-                f"`collect-graph` on callback {callback} for {domain}, for the operator's approval.")
-        assignment = (f"Collect BloodHound data for {domain} on callback {callback} with the catalog procedure "
-                      "`collect-graph`, then report what was collected and verified.")
-        return "Mythic_Operator", substitute, "Collect BloodHound data", assignment, note
+        request_id = str(getattr(self._request_contract, "request_id", "") or "")
+        inventory = str(plan.get("route_inventory") or "")
+        if not inventory:
+            reason = self._explicit_collection_route_tool_refusal("list_callbacks", {}, offered)
+            if reason:
+                return self._end_explicit_collection_route(plan, reason)
+            plan["route_inventory"] = _route_call_id(request_id, "inventory")
+            logger.info(f"🧭 [first-step] explicit collection for {plan.get('domain')}: Sage reads the callback "
+                        "inventory before the Supervisor routes")
+            return _route_message("list_callbacks", {}, plan["route_inventory"], "inventory")
+        result = next((message for message in messages if isinstance(message, ToolMessage)
+                       and str(getattr(message, "tool_call_id", "") or "") == inventory), None)
+        reason = _callback_inventory_refusal(result)
+        if reason:
+            return self._end_explicit_collection_route(plan, reason)
+        brief, _scope, reason = self._explicit_collection_binding(plan)
+        if brief is None:
+            return self._end_explicit_collection_route(plan, reason)
+        args = {
+            "handoff_title": _EXPLICIT_COLLECTION_TITLE,
+            "handoff_instruction": _explicit_collection_assignment(brief),
+            "callback_display_id": brief.callback_display_id,
+            "targets": list(brief.targets),
+            "allowed_capabilities": list(brief.allowed_capabilities),
+            "expected_result": brief.expected_result,
+        }
+        handoff = "transfer_to_Mythic_Operator"
+        reason = self._explicit_collection_route_tool_refusal(handoff, args, offered)
+        if reason:
+            return self._end_explicit_collection_route(plan, reason)
+        plan["route_done"] = True
+        plan["route_handoff"] = _route_call_id(request_id, "handoff")
+        logger.info(f"🧭 [first-step] explicit collection for {brief.targets[0]}: Sage proposes collect-graph on "
+                    f"callback {brief.callback_display_id} before the Supervisor routes")
+        return _route_message(handoff, args, plan["route_handoff"], "handoff")
+
+    def _explicit_collection_route_eligible(self) -> bool:
+        """An ordinary supervised native-chat request with Autonomous Solve off, still current and not stopping."""
+        try:
+            from .request_contract import RequestLane, StopConditionKind
+        except ImportError:  # pragma: no cover - flat import layout
+            from request_contract import RequestLane, StopConditionKind
+        contract = getattr(self, "_request_contract", None)
+        return bool(
+            getattr(self, "mode", "") == "supervised"
+            and getattr(self, "_native_chat_explicit_hitl", False)
+            and getattr(contract, "lane", None) == RequestLane.SUPERVISED_WORKFLOW
+            and not getattr(contract, "is_terminal_control", False)
+            and getattr(getattr(contract, "stop_condition", None), "kind", None) != StopConditionKind.OPERATOR_STOP
+            and not getattr(self, "_stop_requested", False)
+            and not self._autonomous_execution_enabled_for_turn()
+        )
+
+    def _explicit_collection_route_tool_refusal(self, name: str, args: dict[str, Any], offered: set[str]) -> str:
+        """Why the Supervisor may not make this call now: not offered to it, or refused by the request contract."""
+        if name not in offered:
+            return f"{name} is not offered to the Supervisor"
+        refused = self._request_contract_block_reason(name, args)
+        return f"{name} is refused by the request contract: {refused}" if refused else ""
+
+    @staticmethod
+    def _end_explicit_collection_route(plan: dict[str, Any], reason: str) -> None:
+        plan["route_done"] = True
+        logger.info(f"🧭 [first-step] explicit collection for {plan.get('domain')} not routed before the Supervisor: "
+                    f"{reason}; the Supervisor routes the request")
+        return None
 
     def _consume_admitted_first_step(self, worker: str, brief: "_handoff_brief.HandoffBrief") -> None:
         """Mark an explicit-collection plan consumed when the brief check admits the delegation it expects."""
@@ -15100,6 +15240,9 @@ class Model:
         if mode != "auto" and agent_name and agent_name != "Supervisor":
             # Built for every assisted worker; it acts only while the request lane is supervised.
             mw.append(_SupervisedStepBoundMiddleware(self, agent_name, frozenset(hitl_tools)))
+        if mode == "supervised" and agent_name == "Supervisor":
+            # Acts only on an explicit collection request's opening turn in ordinary supervised native chat.
+            mw.append(_ExplicitCollectionRouteMiddleware(self))
         # Fresh engagement-ledger view (Supervisor and Mythic_Operator, every mode). Appended after every
         # context-editing/summarization middleware, so it is the innermost content change: one current block reaches
         # the provider untrimmed, and older generated views are filtered from that call's input.
@@ -18153,6 +18296,54 @@ def _assisted_operator_input_entries(
 
 
 _EXPLICIT_COLLECTION_SOURCE = "explicit_collection"
+_EXPLICIT_COLLECTION_TITLE = "Collect BloodHound data"
+
+
+def _explicit_collection_assignment(brief: "_handoff_brief.HandoffBrief") -> str:
+    """The worker assignment for an explicit collection step; the exact operator input travels with it."""
+    return (f"Collect BloodHound data for {brief.targets[0]} on callback {brief.callback_display_id} with the catalog "
+            "procedure `collect-graph`, then report what was collected and verified.")
+
+
+def _route_call_id(request_id: str, kind: str) -> str:
+    """A request-scoped tool-call id for a Supervisor call Sage writes itself, in the provider-safe alphabet."""
+    return re.sub(r"[^A-Za-z0-9_-]", "_", f"sage_route_{request_id}_{kind}")
+
+
+def _route_message(name: str, args: dict[str, Any], call_id: str, kind: str) -> AIMessage:
+    """One ordinary Supervisor tool call that Sage, not a provider, produced."""
+    return AIMessage(
+        content="", name="Supervisor",
+        tool_calls=[{"name": name, "args": args, "id": call_id, "type": "tool_call"}],
+        additional_kwargs={"_sage_generated": f"explicit_collection_{kind}"},
+    )
+
+
+def _callback_inventory_refusal(message: Any) -> str:
+    """Why a `list_callbacks` result is not a usable callback observation; empty when it is.
+
+    A callback list is one, including a long list the tool-result compaction re-encoded as a table (only a list of
+    rows becomes one; the tool's cache keeps every row). So is the tool's `unchanged` response when it carries the
+    last successful listing. An error, a refusal, a missing result or anything unparseable is not, so no binding is
+    made from an older cache."""
+    if not isinstance(message, ToolMessage):
+        return "the callback inventory read returned no result"
+    if getattr(message, "status", "") == "error":
+        return "the callback inventory read failed"
+    text = _message_content_as_text(message.content)
+    if text.startswith(_TOON_SENTINEL):
+        return ""
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        return "the callback inventory result is unreadable"
+    if isinstance(payload, list):
+        return ""
+    if (isinstance(payload, dict) and payload.get("status") == "unchanged"
+            and isinstance(payload.get("callbacks"), list)):
+        return ""
+    status = payload.get("status") or payload.get("verdict") if isinstance(payload, dict) else ""
+    return f"the callback inventory read returned no callback listing ({status or 'unrecognized result'})"
 
 
 def _admission_key(worker: str, brief: Any) -> tuple[str, str]:

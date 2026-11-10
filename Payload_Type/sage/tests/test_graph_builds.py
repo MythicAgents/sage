@@ -171,6 +171,29 @@ def test_built_supervisor_offers_both_final_report_modes(mode, monkeypatch):
     assert not fields["outcome"].is_required()
 
 
+@pytest.mark.parametrize("mode, installed", [("conversation", False), ("supervised", True), ("auto", False)])
+def test_explicit_collection_routing_is_built_only_for_the_supervised_supervisor(mode, installed, monkeypatch):
+    original = model_module.create_agent
+    captured = {}
+
+    def capture_agent(*args, **kwargs):
+        captured[kwargs["name"]] = kwargs["middleware"]
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(model_module, "create_agent", capture_agent)
+
+    async def body():
+        instance = _hermetic_model(mode=mode)
+        instance._rebuild_graph()
+        return instance.graph
+
+    assert asyncio.run(body()) is not None
+    route = model_module._ExplicitCollectionRouteMiddleware
+    assert sum(isinstance(item, route) for item in captured["Supervisor"]) == (1 if installed else 0)
+    assert all(not isinstance(item, route)
+               for name, middleware in captured.items() if name != "Supervisor" for item in middleware)
+
+
 def test_the_hermetic_fixture_never_reaches_the_network():
     """The control: prove this file is testing Sage, not the operator's connectivity.
 
