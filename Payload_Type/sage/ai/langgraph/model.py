@@ -6666,6 +6666,12 @@ class Model:
             bound_callback=getattr(getattr(self, "_turn_authority", None), "bounded_callback_id", ""),
             operator_target_inputs=history,
         )
+        pending = self._pending_explicit_collection()
+        if pending is not None and pending.get("callback_id") and not scope.bound_callback:
+            # Until its procedure is admitted, the callback the operator named in an explicit collection request binds
+            # the request like a typed binding: a brief naming another one is rejected, naming the binding. Binding
+            # adds nothing to the observed callbacks.
+            scope = replace(scope, bound_callback=str(pending["callback_id"]))
         errors = _handoff_brief.validate_brief(
             brief, worker=worker, require_scope=lane == "supervised_workflow", scope=scope,
             worker_tools=_worker_guarded_tool_names(worker),
@@ -6720,6 +6726,7 @@ class Model:
                         "brief": json.dumps(brief.as_metadata(), sort_keys=True),
                     },
                 )
+            self._consume_admitted_first_step(worker, brief)
             return None
         rejections = _handoff_brief.rejection_count(ledger.actual_events(kind="brief"))
         return errors, rejections >= _handoff_brief.REJECTIONS_BEFORE_STOP
@@ -6745,6 +6752,8 @@ class Model:
         if (not isinstance(plan, dict) or plan.get("done") or lane != "supervised_workflow"
                 or plan.get("request_id") != str(getattr(contract, "request_id", "") or "")):
             return None
+        if plan.get("source") == _EXPLICIT_COLLECTION_SOURCE:
+            return self._explicit_collection_first_step(plan, worker, brief, title)
         partial = bool(plan.get("partial"))
         own_collection = (isinstance(brief, _handoff_brief.HandoffBrief)
                           and brief.allowed_capabilities == ("collect-graph",))
@@ -6794,6 +6803,178 @@ class Model:
         assignment = (f"Collect the attack graph{where} on callback {callback} with the catalog procedure "
                       "`collect-graph`, then report what was collected.")
         return "Mythic_Operator", substitute, "Collect the attack graph", assignment, note
+
+    def _arm_explicit_collection_first_step(self, prompt: Any, request_contract: Any) -> None:
+        """Bind a supervised request whose exact opening operator input is a supported explicit collection request
+        (`knowledge_sources.explicit_collection_request`) to Sage's `collect-graph` procedure for its first delegation.
+
+        Called once per new request, after the attack-graph consult; an approval resume never reaches it. The plan
+        holds only the request identity and revision, the parsed domain and optional callback, its source and one-shot
+        state. A parsed request is a collection request, not an objective, and its binding does not depend on the
+        consult: when a domain label alone made the objective classifier arm a consult plan too (a label such as `da`),
+        the explicit plan replaces it, and the replacement is logged. Requests the grammar does not match keep the
+        consult plan unchanged."""
+        try:
+            from . import knowledge_sources
+            from .request_contract import RequestLane
+        except ImportError:  # pragma: no cover - flat import layout
+            import knowledge_sources
+            from request_contract import RequestLane
+        if getattr(request_contract, "lane", None) != RequestLane.SUPERVISED_WORKFLOW:
+            return
+        parsed = knowledge_sources.explicit_collection_request(prompt)
+        if parsed is None:
+            return
+        if getattr(self, "_graph_first_step", None) is not None:
+            logger.warning(f"🧭 [first-step] explicit collection request for {parsed.domain} also read as an "
+                           "objective; its collection binding replaces the consult's first-step plan")
+        self._graph_first_step = {
+            "request_id": str(getattr(request_contract, "request_id", "") or ""),
+            "revision": 0,
+            "source": parsed.source,
+            "domain": parsed.domain,
+            "callback_id": parsed.callback_id,
+            "done": False,
+        }
+
+    def _pending_explicit_collection(self) -> dict[str, Any] | None:
+        """The current request's explicit-collection plan while its procedure is still unadmitted and the operator has
+        not redirected the request; None otherwise."""
+        plan = getattr(self, "_graph_first_step", None)
+        contract = getattr(self, "_request_contract", None)
+        if (not isinstance(plan, dict) or plan.get("source") != _EXPLICIT_COLLECTION_SOURCE or plan.get("done")
+                or plan.get("request_id") != str(getattr(contract, "request_id", "") or "")):
+            return None
+        return plan if self._current_operator_input_revision() == plan.get("revision") else None
+
+    def _current_operator_input_revision(self) -> int | None:
+        """The highest operator-input revision of the current assisted request; None when it cannot be read."""
+        try:
+            entries = _assisted_operator_input_entries(getattr(self, "state", None) or {})
+        except RuntimeError:
+            return None
+        return max((revision for revision, _ in entries), default=None) if entries else None
+
+    def _observed_callback_payload_type(self, callback: str) -> str:
+        """The payload type Sage observed for `callback` in its callback listing and reconciled footholds; empty when
+        unobserved or when those observations disagree. Never inferred from a filename, tool or prompt."""
+        client = getattr(self, "mythic_client", None)
+        seen: set[str] = set()
+        cache = getattr(client, "_recon_snapshot_cache", None)
+        rows = cache.get(("list_callbacks", "all")) if isinstance(cache, dict) else None
+        for row in rows if isinstance(rows, list) else ():
+            if isinstance(row, Mapping) and _handoff_brief._callback(row.get("id")) == callback:
+                seen.add(str(row.get("agent") or "").strip().casefold())
+        footholds = getattr(client, "_engagement_footholds", None)
+        for foothold in footholds if isinstance(footholds, list) else ():
+            if _handoff_brief._callback(getattr(foothold, "callback_id", "")) == callback:
+                seen.add(str(getattr(foothold, "agent", "") or "").strip().casefold())
+        seen.discard("")
+        return next(iter(seen)) if len(seen) == 1 else ""
+
+    def _observed_active_callbacks(self) -> set[str]:
+        """Callbacks Sage observed as active: Mythic's active-callback listing and live reconciled footholds."""
+        client = getattr(self, "mythic_client", None)
+        active: set[str] = set()
+        cache = getattr(client, "_recon_snapshot_cache", None)
+        rows = cache.get(("list_callbacks", "all")) if isinstance(cache, dict) else None
+        for row in rows if isinstance(rows, list) else ():
+            if isinstance(row, Mapping):
+                active.add(_handoff_brief._callback(row.get("id")))
+        footholds = getattr(client, "_engagement_footholds", None)
+        for foothold in footholds if isinstance(footholds, list) else ():
+            if getattr(foothold, "alive", False) is True:
+                active.add(_handoff_brief._callback(getattr(foothold, "callback_id", "")))
+        active.discard("")
+        return active
+
+    def _explicit_collection_first_step(
+        self, plan: dict[str, Any], worker: str, brief: Any, title: str,
+    ) -> tuple[str, "_handoff_brief.HandoffBrief", str, str, str] | None:
+        """Bind the operator's explicit collection request to `collect-graph` before the first admitted dispatch.
+
+        The callback is the operator's or the typed request's binding (which must agree), else the only callback Sage
+        observed as active; a Supervisor's choice among several is not an operator selection. Its observed payload type
+        must have a collection adapter and Sage a collection runner. The Supervisor's own step stands when Sage's
+        binder resolves it to exactly this procedure, callback and domain; any other first delegation (a raw recipe, a
+        read, another worker, a wrong, missing or extra target) is replaced by the exact procedure. A Supervisor
+        callback that conflicts with the binding is left to the brief check, which rejects it naming the binding.
+
+        Missing or ambiguous identities leave the plan pending and the delegation unchanged; an unsupported payload or
+        missing runner ends it. The plan is consumed only when the brief check admits the expected brief
+        (`_consume_admitted_first_step`), so rejection never rearms and an unadmitted proposal is not lost."""
+        revision = self._current_operator_input_revision()
+        if revision is None:
+            return None
+        if revision != plan.get("revision"):
+            plan["done"] = True  # the operator redirected the request; its opening input no longer binds a procedure
+            return None
+        try:
+            scope = _handoff_brief.known_scope(
+                getattr(self, "mythic_client", None),
+                bound_callback=getattr(getattr(self, "_turn_authority", None), "bounded_callback_id", ""),
+            )
+        except Exception:
+            return None
+        operator, typed = str(plan.get("callback_id") or ""), scope.bound_callback
+        if operator and typed and operator != typed:
+            logger.info(f"🧭 [first-step] explicit collection not bound: the operator named callback {operator} but "
+                        f"the request is bound to callback {typed}")
+            return None
+        named = brief.callback_display_id if isinstance(brief, _handoff_brief.HandoffBrief) else ""
+        bound = operator or typed
+        if bound and named and named != bound:
+            return None  # the brief check rejects it, naming the binding
+        active = self._observed_active_callbacks()
+        callback = bound or (next(iter(active)) if len(active) == 1 else "")
+        if not callback:
+            return None
+        payload_type = self._observed_callback_payload_type(callback)
+        if not payload_type:
+            return None
+        try:
+            from . import mythic_capability_adapter as _adapter
+        except ImportError:  # pragma: no cover - flat import layout
+            import mythic_capability_adapter as _adapter
+        runner = getattr(getattr(self, "mythic_client", None), "_collection_runner", None)
+        if _adapter.collection_adapter_for_payload_type(payload_type) is None or not callable(runner):
+            plan["done"] = True
+            reason = (f"payload type {payload_type!r} has no collection adapter" if callable(runner)
+                      else "no collection runner is installed")
+            logger.info(f"🧭 [first-step] explicit collection on callback {callback} not bound: {reason}")
+            return None
+        domain = str(plan.get("domain") or "")
+        expected = {"action": {"capability": "collect-graph", "callback_id": callback, "domain": domain}}
+        if (worker == "Mythic_Operator" and isinstance(brief, _handoff_brief.HandoffBrief)
+                and _step_bounds.bound_procedure_call(brief.as_metadata(), scope.hosts) == expected):
+            plan["admit"] = _admission_key(worker, brief)
+            return None
+        substitute = _handoff_brief.HandoffBrief(
+            targets=(domain,), callback_display_id=callback, allowed_capabilities=("collect-graph",),
+            expected_result=f"BloodHound holds a freshly collected, verified graph of {domain}.",
+        )
+        if _step_bounds.bound_procedure_call(substitute.as_metadata(), scope.hosts) != expected:
+            plan["done"] = True
+            logger.info(f"🧭 [first-step] explicit collection not bound: {domain} names a host Sage observed")
+            return None
+        plan["admit"] = _admission_key("Mythic_Operator", substitute)
+        logger.info(f"🧭 [first-step] explicit collection requested: {worker} step {title!r} replaced by collect-graph "
+                    f"on callback {callback} for {domain}")
+        note = (f"The operator requested a BloodHound collection of {domain}, which Sage runs as its catalog procedure "
+                f"`collect-graph`, so Sage replaced this first delegation ({worker}: {title or 'untitled'}) with "
+                f"`collect-graph` on callback {callback} for {domain}, for the operator's approval.")
+        assignment = (f"Collect BloodHound data for {domain} on callback {callback} with the catalog procedure "
+                      "`collect-graph`, then report what was collected and verified.")
+        return "Mythic_Operator", substitute, "Collect BloodHound data", assignment, note
+
+    def _consume_admitted_first_step(self, worker: str, brief: "_handoff_brief.HandoffBrief") -> None:
+        """Mark an explicit-collection plan consumed when the brief check admits the delegation it expects."""
+        plan = getattr(self, "_graph_first_step", None)
+        contract = getattr(self, "_request_contract", None)
+        if (isinstance(plan, dict) and plan.get("source") == _EXPLICIT_COLLECTION_SOURCE and not plan.get("done")
+                and plan.get("request_id") == str(getattr(contract, "request_id", "") or "")
+                and plan.get("admit") == _admission_key(worker, brief)):
+            plan["done"] = True
 
     def _note_answered_step(
         self, worker: str, outcome: dict[str, Any], messages: list[AnyMessage], answer: str,
@@ -16597,7 +16778,11 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
 
         # An objective-shaped request consults the attack graph before the Supervisor routes, so graph
         # coverage and path existence are known facts rather than a specialist the Supervisor must remember.
+        # Each new request computes its own first-step plan; an approval resume returns above and keeps its own.
+        self._graph_first_step = None
         consult_msg = await self._attack_graph_consult_message(prompt, request_contract)
+        # A supported explicit collection request is bound to Sage's procedure, independently of the consult.
+        self._arm_explicit_collection_first_step(prompt, request_contract)
         if consult_msg is not None:
             _tag_msg(consult_msg, self._next_seq())
             self.state["supervisor_messages"].append(consult_msg)
@@ -17965,6 +18150,15 @@ def _assisted_operator_input_entries(
     if not matches:
         raise RuntimeError("assisted handoff lacks one exact current operator input")
     return matches
+
+
+_EXPLICIT_COLLECTION_SOURCE = "explicit_collection"
+
+
+def _admission_key(worker: str, brief: Any) -> tuple[str, str]:
+    """Identity of one delegation as the brief check admits it: its worker and exact structural brief."""
+    metadata = brief.as_metadata() if isinstance(brief, _handoff_brief.HandoffBrief) else {}
+    return worker, json.dumps(metadata, sort_keys=True)
 
 
 def _current_assisted_operator_input(state: Mapping[str, Any]) -> str | None:

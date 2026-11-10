@@ -162,3 +162,23 @@ if __name__ == "__main__":
             traceback.print_exc()
     print(f"\n{len(tests) - failed}/{len(tests)} passed")
     sys.exit(1 if failed else 0)
+
+
+# Cairn #180: the worker's generic collection goal tied four references; the first alphabetically was presented.
+HISTORICAL_GOAL = "collect BloodHound domain data for north.sevenkingdoms.local"
+
+
+def test_match_goal_keeps_its_default_limit_and_can_rank_every_candidate():
+    assert len(ttp_library.match_goal(HISTORICAL_GOAL)) == 3
+    every = ttp_library.match_goal(HISTORICAL_GOAL, limit=None)
+    assert len(every) > 4 and every[:3] == ttp_library.match_goal(HISTORICAL_GOAL)
+
+
+def test_best_matches_are_every_reference_tied_at_the_top_score_in_slug_order():
+    tied = ttp_library.best_matches(ttp_library.match_goal(HISTORICAL_GOAL, limit=None))
+    assert [slug for slug, _ in tied] == ["roadtools", "rusthound", "sharphound", "sharphound-cross-forest"]
+    assert len({score for _, score in tied}) == 1
+    # Input order never decides the result.
+    assert ttp_library.best_matches(list(reversed(ttp_library.match_goal(HISTORICAL_GOAL, limit=None)))) == tied
+    assert ttp_library.best_matches(ttp_library.match_goal("Run SharpHound", limit=None)) == [("sharphound", 101)]
+    assert ttp_library.best_matches([]) == []

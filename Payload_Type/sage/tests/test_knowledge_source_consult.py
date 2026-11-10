@@ -347,3 +347,75 @@ def test_partial_supervised_consults_arm_one_missing_domain_and_other_outcomes_d
         assert _armed(ks.AttackGraphConsult(outcome, objective_domains=["essos.local"])) is None
     # A partial outcome with nothing missing has nothing to collect.
     assert _armed(ks.AttackGraphConsult(ConsultOutcome.CONSULTED_PARTIAL, collected_domains=["north.test"])) is None
+
+
+# --- an explicit supported collection request: a bounded, whole-string grammar ------------------------------------
+#
+# Cairn #180 (2026-11-10): "Collect BloodHound data for north.sevenkingdoms.local through the current foothold;
+# collection only." reached the worker as a raw staging recipe. The parser recognizes only this deliberately bounded
+# request language; anything else keeps ordinary routing.
+
+REPRODUCED_COLLECTION = ("Collect BloodHound data for north.sevenkingdoms.local through the current foothold; "
+                         "collection only.")
+
+
+@pytest.mark.parametrize("prompt, domain, callback", [
+    (REPRODUCED_COLLECTION, "north.sevenkingdoms.local", ""),
+    ("collect bloodhound data for corp.example.test", "corp.example.test", ""),
+    ("Recollect BloodHound graph data from corp.example.test.", "corp.example.test", ""),
+    ("re-collect BloodHound graph in CORP.Example.Test", "corp.example.test", ""),
+    ("Gather BloodHound collection for corp.example.test!", "corp.example.test", ""),
+    ("Collect BloodHound data for corp.example.test.", "corp.example.test", ""),
+    ("Please collect BloodHound data for corp.example.test through callback 7", "corp.example.test", "7"),
+    ("Can you run SharpHound against corp.example.test on callback 12?", "corp.example.test", "12"),
+    ("could you please rerun SharpHound for corp.example.test using callback 3, collection only",
+     "corp.example.test", "3"),
+    ("Can you please re-run SharpHound on corp.example.test through the current foothold.", "corp.example.test", ""),
+    ("Please execute SharpHound for corp.example.test", "corp.example.test", ""),
+    ("  Launch   SharpHound\tfor  corp.example.test  ", "corp.example.test", ""),
+])
+def test_explicit_collection_requests_parse_to_one_domain_and_an_optional_callback(prompt, domain, callback):
+    parsed = ks.explicit_collection_request(prompt)
+    assert parsed == ks.ExplicitCollectionRequest(domain=domain, callback_id=callback)
+    assert parsed.source == "explicit_collection"
+    # Never objective-shaped, so a direct request and an objective consult cannot both claim one request.
+    assert ks.classify_turn(prompt) == ks.TURN_OTHER
+
+
+@pytest.mark.parametrize("prompt", [
+    "",
+    "collect bloodhound data",
+    "How do I collect BloodHound data for corp.example.test?",
+    "Can you collect BloodHound data for corp.example.test, or should I?",
+    '"Collect BloodHound data for corp.example.test"',
+    "`Run SharpHound against corp.example.test`",
+    "Don't collect BloodHound data for corp.example.test.",
+    "Do not run SharpHound against corp.example.test",
+    "If the graph is empty, collect BloodHound data for corp.example.test.",
+    "Collect BloodHound data for corp.example.test if needed",
+    "Collect BloodHound data for corp.example.test and south.example.test",
+    "Collect BloodHound data for corp.example.test, south.example.test",
+    "Collect BloodHound data for corp.example.test, then obtain administrative control of it",
+    "Collect BloodHound data for corp.example.test and kerberoast",
+    "Obtain administrative control of corp.example.test",
+    "Collect AzureHound data for corp.example.test",
+    "Collect BloodHound data for the corp.example.test Azure tenant",
+    "Run RustHound against corp.example.test",
+    "Run SharpHound against corp.example.test with -c DCOnly",
+    "Run SharpHound against corp.example.test --CollectionMethods Session",
+    "Collect BloodHound session data for corp.example.test",
+    "Collect BloodHound data for corp.example.test and save it to C:\\Temp",
+    "Collect BloodHound data for corp.example.test using execute_assembly",
+    "Run SharpHound.exe with execute_assembly on callback 7",
+    "Collect BloodHound data for corp",
+    "Collect BloodHound data for corp..test",
+    "Collect BloodHound data for corp.example.test through callback 7 through callback 8",
+    "Collect BloodHound data for corp.example.test through the current foothold on callback 7",
+    "Collect BloodHound data for corp.example.test through callback 0",
+    "Collect BloodHound data for corp.example.test through callback 07",
+    "Collect BloodHound data for corp.example.test through callback seven",
+    # In the bounded grammar the qualifier follows a callback selector.
+    "Collect BloodHound data for corp.example.test; collection only",
+])
+def test_near_matches_and_qualified_requests_are_not_rewritten(prompt):
+    assert ks.explicit_collection_request(prompt) is None

@@ -142,6 +142,57 @@ async def consult_attack_graph(
     )
 
 
+EXPLICIT_COLLECTION = "explicit_collection"
+
+
+@dataclass(frozen=True)
+class ExplicitCollectionRequest:
+    """A complete operator request to collect one domain's directory graph, as the bounded grammar parsed it.
+
+    A proposal-selection hint only: it grants no authority, replaces no request contract, approval or target scope,
+    and names no payload command."""
+
+    domain: str
+    callback_id: str = ""
+    source: str = EXPLICIT_COLLECTION
+
+
+# The whole request, nothing else: an optional politeness prefix, one of two core forms naming one fully qualified
+# domain, an optional callback selector (followed optionally by "collection only"), and optional final punctuation.
+# Anything outside this language (a question about how, a quote, a negation, a condition, several domains, another
+# collector, flags, an output path, a collection method, a follow-on action) does not match and keeps ordinary
+# routing; qualifiers are never stripped to make the rest match.
+_EXPLICIT_COLLECTION_RE = re.compile(
+    r"(?:(?:please|can you|could you)(?: please)? )?"
+    r"(?:"
+    r"(?:collect|recollect|re-collect|gather) bloodhound (?:data|graph data|graph|collection) (?:for|from|in) "
+    r"(?P<domain_a>\S+?)"
+    r"|"
+    r"(?:run|rerun|re-run|execute|launch) sharphound (?:for|against|on) (?P<domain_b>\S+?)"
+    r")"
+    r"(?: (?:through the current foothold|(?:through|on|using) callback (?P<callback>[1-9][0-9]*))"
+    r"(?:[;,] collection only)?)?"
+    r"[.!?]?"
+)
+
+
+def explicit_collection_request(text: Any) -> ExplicitCollectionRequest | None:
+    """Parse the exact current operator input as a supported explicit collection request; None for anything else.
+
+    Matched case-insensitively against the whole input after whitespace normalization. The domain must be one fully
+    qualified name by Sage's objective-domain lexical rule; a short label is never completed with a guessed suffix.
+    """
+    normalized = " ".join(str(text or "").split()).casefold()
+    match = _EXPLICIT_COLLECTION_RE.fullmatch(normalized) if normalized else None
+    if match is None:
+        return None
+    domain = (match.group("domain_a") or match.group("domain_b") or "").rstrip(".")
+    if (not re.fullmatch(engagement_state._OBJECTIVE_DOMAIN_RE, domain)
+            or not all(domain.split(".")) or domain.endswith("-")):
+        return None
+    return ExplicitCollectionRequest(domain=domain, callback_id=match.group("callback") or "")
+
+
 def first_missing_domain(consult: AttackGraphConsult) -> str:
     """The objective domain a partial consult's first collection is scoped to: the first of its missing domains,
     normalized and sorted; empty when none is missing. One domain, not a queue of every missing one."""

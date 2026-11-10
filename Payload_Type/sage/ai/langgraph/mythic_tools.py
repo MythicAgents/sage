@@ -22985,8 +22985,8 @@ class MythicTools:
         get_ttp_full_reference(slug) only for an uncommon flag or exact output format.
         """
         logger.debug(f"🛠️ Calling get_ttp_guidance tool (goal={goal!r}, callback={callback_display_id})")
-        matches = ttp_library.match_goal(goal)
-        if not matches:
+        ranked = ttp_library.match_goal(goal, limit=None)
+        if not ranked:
             categories = ttp_library.list_categories()
             return json.dumps({
                 "status": "no_match",
@@ -22994,8 +22994,14 @@ class MythicTools:
                 "available_categories": sorted(categories.keys()),
                 "hint": "Call list_ttp_categories for the full catalog, or restate the goal using tradecraft terms.",
             }, sort_keys=True)
+        best = ttp_library.best_matches(ranked)
+        if len(best) > 1:
+            # Several references tie at the best score: the goal does not single one out, so none is presented as
+            # the technique (no recipe, agent mapping or catalog procedure). Not recorded as a guidance repetition.
+            return json.dumps(self._ambiguous_guidance(goal, best), sort_keys=True)
 
-        slug, _score = matches[0]
+        slug, _score = best[0]
+        matches = ranked[:3]
         frontmatter, body = ttp_library.load_ttp(slug)
         payload_type = await self._resolve_payload_type(callback_display_id)
         agent_frontmatter, _ = ttp_library.load_mythic_agent(payload_type)
@@ -23077,6 +23083,27 @@ class MythicTools:
         if cycle_warning:
             result["cycle_warning"] = cycle_warning
         return json.dumps(result, sort_keys=True)
+
+    _AMBIGUOUS_GUIDANCE_CANDIDATES = 8
+
+    @classmethod
+    def _ambiguous_guidance(cls, goal: str, tied: list[tuple[str, int]]) -> dict[str, Any]:
+        """The lookup result when references tie at the best score: candidate summaries, no selected technique."""
+        shown = tied[:cls._AMBIGUOUS_GUIDANCE_CANDIDATES]
+        candidates = []
+        for slug, score in shown:
+            frontmatter, _ = ttp_library.load_ttp(slug)
+            name = frontmatter.get("name", slug) if isinstance(frontmatter, dict) else slug
+            candidates.append({"slug": slug, "name": str(name), "score": score})
+        return {
+            "status": "ambiguous",
+            "goal": goal,
+            "candidates": candidates,
+            "candidate_count": len(tied),
+            "truncated": len(tied) > len(shown),
+            "hint": ("Several references match this goal equally well, so none is selected. Restate the goal "
+                     "naming the specific technique or tool you mean, then call get_ttp_guidance again."),
+        }
 
     @staticmethod
     def _catalog_procedure_for_technique(frontmatter: Any) -> str:

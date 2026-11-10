@@ -180,7 +180,7 @@ def _haystack(slug: str, frontmatter: dict[str, Any]) -> str:
 _NAME_MATCH_BONUS = 100
 
 
-def match_goal(goal: str, limit: int = 3) -> list[tuple[str, int]]:
+def match_goal(goal: str, limit: int | None = 3) -> list[tuple[str, int]]:
     """Rank TTPs by keyword overlap with the goal text. Returns [(slug, score), ...] desc.
 
     A TTP the goal *explicitly names* (its slug or name appears as a goal token, or its
@@ -189,6 +189,9 @@ def match_goal(goal: str, limit: int = 3) -> list[tuple[str, int]]:
     (e.g. RustHound's `sharphound-alternative` tag) tie or beat the named tool — and stable
     sort then favors whichever sorts first alphabetically. The bonus makes "run SharpHound"
     return the `sharphound` TTP, not `rusthound`.
+
+    ``limit=None`` returns every match, so a caller can see all references tied at the best score
+    before any display truncation (`best_matches`).
     """
     goal_lower = goal.lower()
     tokens = {t for t in re.split(r"\W+", goal_lower) if len(t) > 2}
@@ -210,7 +213,18 @@ def match_goal(goal: str, limit: int = 3) -> list[tuple[str, int]]:
             score += _NAME_MATCH_BONUS
         scored.append((slug, score))
     scored.sort(key=lambda pair: pair[1], reverse=True)
-    return scored[:limit]
+    return scored if limit is None else scored[:limit]
+
+
+def best_matches(ranked: list[tuple[str, int]]) -> list[tuple[str, int]]:
+    """Every match tied at the best score, in slug order; empty when nothing matched.
+
+    Several entries mean the goal does not single out one reference. Neither corpus iteration order nor the
+    order of ``ranked`` decides among them."""
+    if not ranked:
+        return []
+    top = max(score for _, score in ranked)
+    return sorted((pair for pair in ranked if pair[1] == top), key=lambda pair: pair[0])
 
 
 def load_mythic_agent(payload_type: str | None) -> tuple[dict[str, Any] | None, str | None]:
