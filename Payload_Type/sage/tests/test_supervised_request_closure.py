@@ -958,7 +958,7 @@ def test_without_one_unambiguous_callback_no_collection_is_invented():
 
 # --- an explicit supported collection request runs Sage's collection procedure, chosen before dispatch -------------
 #
-# Cairn #180 (2026-11-10, channel 3 request 2): the operator asked for a BloodHound collection; the Supervisor sent
+# A live supervised request (2026-11-10): the operator asked for a BloodHound collection; the Supervisor sent
 # the worker a raw staging recipe (issue/download/ingest tools), the worker followed it for five model calls and its
 # raw card was rejected. With the same input, channel 4 bound `collect-graph` and the existing procedure collected and
 # verified the domain. Identities here are synthetic; the brief's shape is the recorded one.

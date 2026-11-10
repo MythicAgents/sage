@@ -50,7 +50,7 @@ def test_guidance_distinguishes_reference_from_runtime_metadata(monkeypatch, con
 
 # --- a lookup whose best references tie is an honest ambiguity, not an arbitrary technique ----------------------
 #
-# Cairn #180 (Phoenix span 46): the worker's generic collection goal tied ROADtools, RustHound, cross-forest
+# A live worker's generic collection goal (2026-11-10) tied ROADtools, RustHound, cross-forest
 # SharpHound and SharpHound; alphabetical iteration presented ROADtools with a missing-agent-file fallback.
 
 HISTORICAL_GOAL = "collect BloodHound domain data for north.sevenkingdoms.local"

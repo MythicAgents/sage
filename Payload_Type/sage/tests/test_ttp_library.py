@@ -164,7 +164,7 @@ if __name__ == "__main__":
     sys.exit(1 if failed else 0)
 
 
-# Cairn #180: the worker's generic collection goal tied four references; the first alphabetically was presented.
+# A live worker's generic collection goal tied four references; the first alphabetically was presented.
 HISTORICAL_GOAL = "collect BloodHound domain data for north.sevenkingdoms.local"
 
 

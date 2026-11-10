@@ -351,9 +351,9 @@ def test_partial_supervised_consults_arm_one_missing_domain_and_other_outcomes_d
 
 # --- an explicit supported collection request: a bounded, whole-string grammar ------------------------------------
 #
-# Cairn #180 (2026-11-10): "Collect BloodHound data for north.sevenkingdoms.local through the current foothold;
-# collection only." reached the worker as a raw staging recipe. The parser recognizes only this deliberately bounded
-# request language; anything else keeps ordinary routing.
+# A live supervised request (2026-11-10), "Collect BloodHound data for north.sevenkingdoms.local through the
+# current foothold; collection only.", reached the worker as a raw staging recipe. The parser recognizes only this
+# deliberately bounded request language; anything else keeps ordinary routing.
 
 REPRODUCED_COLLECTION = ("Collect BloodHound data for north.sevenkingdoms.local through the current foothold; "
                          "collection only.")
