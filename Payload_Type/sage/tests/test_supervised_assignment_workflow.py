@@ -13,6 +13,9 @@ from langchain_core.tools import tool
 
 from tests import test_scripted_handoff as harness_module
 
+# These flows are not tests of the assignment check; its model call answers `consistent` (conftest).
+pytestmark = pytest.mark.usefixtures("consistent_assignment_checker")
+
 
 def call(name, args, call_id):
     return AIMessage(content="", tool_calls=[{

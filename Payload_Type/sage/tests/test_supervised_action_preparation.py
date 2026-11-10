@@ -25,6 +25,9 @@ from sage_chat import session
 from sage_chat.headless import build_chat_request
 from tests.test_supervised_objective_native import driver
 
+# These flows are not tests of the assignment check; its model call answers `consistent` (conftest).
+pytestmark = pytest.mark.usefixtures("consistent_assignment_checker")
+
 
 TOOL = "issue_task_and_waitfor_task_output"
 RAW = {"command": "dcsync", "callback_display_id": 2, "timeout": 60,

@@ -28,6 +28,9 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 import pytest
 
+# These flows are not tests of the assignment check; its model call answers `consistent` (conftest).
+pytestmark = pytest.mark.usefixtures("consistent_assignment_checker")
+
 _HARNESS_PATH = Path(__file__).resolve().with_name("test_scripted_handoff.py")
 _SPEC = importlib.util.spec_from_file_location("scripted_handoff_harness_target_history", _HARNESS_PATH)
 _harness = importlib.util.module_from_spec(_SPEC)

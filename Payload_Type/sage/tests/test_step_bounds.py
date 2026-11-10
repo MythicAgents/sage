@@ -320,6 +320,7 @@ def _script(brief: dict) -> list:
             _call(NEW_ACTION["name"], NEW_ACTION["args"], 3), AIMessage(content="Final answer.")]
 
 
+@pytest.mark.usefixtures("consistent_assignment_checker")  # a raw task, not a test of the check
 def test_one_executed_action_ends_the_step_before_a_second_card():
     clock = {"now": 0.0}
     effects, cards, outcomes = asyncio.run(_native(_script({**BRIEF, "allowed_tools": [ISSUE]}), "accept",
@@ -335,6 +336,7 @@ def test_one_executed_action_ends_the_step_before_a_second_card():
     assert outcome["waiting_seconds"] == 3600.0
 
 
+@pytest.mark.usefixtures("consistent_assignment_checker")  # a raw task, not a test of the check
 def test_an_operator_rejection_ends_the_step_without_another_proposal_card():
     effects, cards, outcomes = asyncio.run(_native(_script({**BRIEF, "allowed_tools": [ISSUE]}), "reject"))
 

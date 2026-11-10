@@ -1614,6 +1614,7 @@ def _nebula_client(monkeypatch, tmp_path):
     return mt
 
 
+@pytest.mark.usefixtures("consistent_assignment_checker")  # a raw task, not a test of the check
 @pytest.mark.parametrize("prompt", [
     "Collect BloodHound data for corp.test through the current foothold; collection only.",
     "List C:\\Users\\Public on callback 9.",
