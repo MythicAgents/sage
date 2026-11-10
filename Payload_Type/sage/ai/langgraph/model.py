@@ -6477,6 +6477,64 @@ class Model:
     def _assisted_operator_input_for_handoff(self) -> str | None:
         return _current_assisted_operator_input(self.state)
 
+    def _assisted_operator_target_inputs(self) -> tuple["_handoff_brief.OperatorTargetInput", ...]:
+        """The operator inputs this live native chat generation already received, as exact target-name evidence.
+
+        Reference memory for a brief's targets only: a name the operator typed in an earlier request (or an earlier
+        revision of this one) may be named again. It is not permission to run an old request and not proof a host
+        exists; the worker still receives the exact current input, and each guarded action keeps its own approval.
+
+        Read from this Model's own reducer-backed Supervisor history, never a worker view, summary or Mythic state, so
+        a new, replaced or restarted Model has none. Empty unless the current typed request is a native chat
+        conversation or supervised request of this Model's channel and operation. Eligible inputs carry the
+        transport's operator-input tag and this channel's request identity, with no synthetic, hidden or delegated
+        marker. A request with a malformed or conflicting revision, or no valid opening input, contributes nothing.
+        Oldest first, by retained message sequence.
+        """
+        contract = getattr(self, "_request_contract", None)
+        state = getattr(self, "state", None)
+        channel = str(getattr(self, "channel_id", "") or "").strip()
+        operation = str(getattr(self, "operation_id", "") or "").strip()
+        scope = getattr(contract, "scope", None)
+        lane = str(getattr(getattr(contract, "lane", None), "value", "") or "")
+        request_id = str(getattr(contract, "request_id", "") or "")
+        identity = re.compile(rf"chat:{re.escape(channel)}:request:[^:\s]+")
+        if (not channel or not operation or not isinstance(state, dict)
+                or lane not in {"conversational", "supervised_workflow"}
+                or not identity.fullmatch(request_id)
+                or str(getattr(scope, "channel_id", "") or "") != channel
+                or str(getattr(scope, "operation_id", "") or "") != operation
+                or state.get("_request_id") != request_id or state.get("_request_lane") != lane):
+            return ()
+        retained: dict[str, dict[int, tuple[str, str, int, int]]] = {}
+        malformed: set[str] = set()
+        for position, message in enumerate(state.get("supervisor_messages") or ()):
+            if not isinstance(message, HumanMessage):
+                continue
+            metadata = message.additional_kwargs or {}
+            source = metadata.get("_request_id")
+            if (metadata.get("_operator_input") is not True or not isinstance(source, str)
+                    or not identity.fullmatch(source)
+                    or any(metadata.get(marker) for marker in _NOT_OPERATOR_INPUT_MARKERS)):
+                continue
+            revision = metadata.get("_operator_input_revision", 0)
+            steer = metadata.get("_operator_steer")
+            seq = _get_seq(message)
+            if (type(revision) is not int or revision < 0 or (revision > 0 and steer is not True)
+                    or (revision == 0 and steer) or type(seq) is not int):
+                malformed.add(source)
+                continue
+            record = (_msg_id(message), _message_content_as_text(message.content), seq, position)
+            prior = retained.setdefault(source, {}).setdefault(revision, record)
+            if prior[:2] != record[:2]:
+                malformed.add(source)  # two different records claim one request revision
+        ordered = sorted(
+            (seq, position, _handoff_brief.OperatorTargetInput(request_id=source, revision=revision, text=text))
+            for source, revisions in retained.items() if source not in malformed and 0 in revisions
+            for revision, (_identity, text, seq, position) in revisions.items() if text.strip()
+        )
+        return tuple(item for _seq, _position, item in ordered)
+
     def _step_clock(self) -> float:
         return time.monotonic()
 
@@ -6600,27 +6658,35 @@ class Model:
             operator_input = _current_assisted_operator_input(state) or ""
         except RuntimeError:
             operator_input = ""
+        # Earlier operator inputs of this chat generation name targets only, and only while the current input is valid.
+        history = self._assisted_operator_target_inputs() if operator_input else ()
         scope = _handoff_brief.known_scope(
             getattr(self, "mythic_client", None),
             operator_input=operator_input,
             bound_callback=getattr(getattr(self, "_turn_authority", None), "bounded_callback_id", ""),
+            operator_target_inputs=history,
         )
         errors = _handoff_brief.validate_brief(
             brief, worker=worker, require_scope=lane == "supervised_workflow", scope=scope,
             worker_tools=_worker_guarded_tool_names(worker),
         )
         restatement = _handoff_brief.restatement(instruction, operator_input)
+        metadata = {
+            "worker": worker,
+            "restatement": restatement,
+            "brief": json.dumps(brief.as_metadata(), sort_keys=True),
+        }
+        # Which targets only an earlier operator input named, and which input: the request and revision, no text.
+        sources = _handoff_brief.operator_target_sources(brief, scope)
+        if sources:
+            metadata["operator_target_sources"] = json.dumps(sources, sort_keys=True)
         ledger = self._ensure_request_event_ledger(str(getattr(contract, "request_id", "") or ""))
         ledger.record(
             event_id=f"brief:{ledger.request_id}:{len(ledger.actual_events(kind='brief')) + 1}",
             kind="brief",
             phase="rejected" if errors else "accepted",
             content="; ".join(errors) if errors else worker,
-            metadata={
-                "worker": worker,
-                "restatement": restatement,
-                "brief": json.dumps(brief.as_metadata(), sort_keys=True),
-            },
+            metadata=metadata,
         )
         logger.info(
             f"🧾 [brief] {worker} {'rejected' if errors else 'accepted'} | "
@@ -17829,6 +17895,14 @@ def _create_recursion_summary_tool():
         )
 
     return request_continuation
+
+# A HumanMessage carrying any of these is Sage's own text (a nudge, hidden context, a delegation or carried
+# reference), never an operator input, even if it also carries the operator-input tag.
+_NOT_OPERATOR_INPUT_MARKERS = (
+    "_synthetic_nudge", "_hide_from_stream", "_delegated_to", "_handoff_request_id", "_assisted_assignment",
+    "_carried_context",
+)
+
 
 def _assisted_operator_input_entries(
     state: Mapping[str, Any],

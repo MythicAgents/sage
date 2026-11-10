@@ -1056,3 +1056,89 @@ def test_without_its_supporting_record_the_same_brief_reaches_no_worker(monkeypa
     assert [event.phase for event in events] == ["rejected"]
     assert "targets: WS01.CHILD.EXAMPLE.TEST named neither" in events[0].content
     _assert_no_mythic_tasking(harness)
+
+
+# --- earlier operator inputs: exact target names only --------------------------------------------------------------
+
+HISTORY_DOMAIN = "branch.example.test"
+HISTORY_HOST = "dc01.branch.example.test"
+
+
+def _said(*texts: str) -> tuple[hb.OperatorTargetInput, ...]:
+    return tuple(hb.OperatorTargetInput(f"chat:1:request:{number}", 0, text)
+                 for number, text in enumerate(texts, start=1))
+
+
+def _history_scope(*texts: str, current: str = "Yes, run it", **extra: Any) -> hb.KnownScope:
+    return hb.known_scope(_client(**extra), operator_input=current, operator_target_inputs=_said(*texts))
+
+
+@pytest.mark.parametrize("said, target, ok", [
+    (f"Collect {HISTORY_DOMAIN} later.", HISTORY_DOMAIN, True),
+    (f"Check {HISTORY_HOST} later.", HISTORY_HOST, True),
+    (f"Collect {HISTORY_DOMAIN.upper()}.", HISTORY_DOMAIN, True),
+    (f"Collect {HISTORY_DOMAIN}.", "example.test", False),                  # suffix of the mention
+    (f"Collect {HISTORY_DOMAIN}.", "eu.branch.example.test", False),        # a subdomain of the mention
+    (f"Collect {HISTORY_DOMAIN}.", "branch.example.tes", False),            # one character short
+    (f"Collect {HISTORY_DOMAIN}.", "branch.example.tests", False),          # one character long
+    (f"Collect {HISTORY_DOMAIN}.", "brunch.example.test", False),           # one character changed
+    (f"Collect {HISTORY_DOMAIN}.", "branch.other.test", False),             # changed domain
+    (f"Collect {HISTORY_DOMAIN}.", HISTORY_HOST, False),                    # a host in the named domain
+    (f"Collect {HISTORY_DOMAIN}.", "branch", False),                        # its bare first label
+    ("Collect Branch.", HISTORY_DOMAIN, False),                             # a bare label never means the FQDN
+    (f"Collect eu.{HISTORY_DOMAIN}.", HISTORY_DOMAIN, False),               # a parent of the mention
+], ids=["exact-domain", "exact-host", "case", "suffix", "subdomain", "short", "long", "changed-char",
+        "changed-domain", "host-in-domain", "first-label", "bare-label", "parent"])
+def test_an_earlier_input_names_only_the_exact_target(said, target, ok):
+    assert (_errors(_brief(targets=[target]), _history_scope(said)) == ()) is ok
+
+
+def test_a_short_host_and_its_domain_in_separate_inputs_name_no_full_host():
+    scope = _history_scope("Remember dc01.", f"The domain is {HISTORY_DOMAIN}.")
+    assert scope.names_target(HISTORY_DOMAIN) and not scope.names_target(HISTORY_HOST)
+    errors = _errors(_brief(targets=[HISTORY_HOST]), scope)
+    assert errors and "lies in a known domain but no observation names it" in errors[0]
+
+
+def test_history_does_not_complete_a_principal_with_a_domain():
+    # `daenerys` is an observed principal; `branch` appears only in an earlier input, as a bare word.
+    scope = _history_scope("Look at the branch domain.")
+    assert not scope.names_target("branch\\daenerys")
+    assert scope.names_target("essos.local\\daenerys")  # observed domain and principal, as before
+
+
+def test_history_adds_no_observed_names_tasks_callbacks_or_credentials():
+    said = f"Use callback 9, task 77 and cred:12 on {HISTORY_HOST} in {HISTORY_DOMAIN}."
+    with_history, without = _history_scope(said), _history_scope()
+    for field in ("callbacks", "hosts", "domains", "principals", "tasks", "credentials", "objects"):
+        assert getattr(with_history, field) == getattr(without, field), field
+    errors = _errors(_brief(targets=[HISTORY_HOST], callback_display_id=9, inputs_by_reference=["task:77"]),
+                     with_history)
+    assert any("callback 9 is not one Sage has observed" in error for error in errors)
+    assert any("`task:77` does not resolve" in error for error in errors)
+
+
+def test_the_newest_input_naming_a_target_is_its_source():
+    scope = hb.known_scope(_client(), operator_input="go", operator_target_inputs=(
+        hb.OperatorTargetInput("chat:1:request:1", 0, f"Collect {HISTORY_DOMAIN}."),
+        hb.OperatorTargetInput("chat:1:request:2", 0, "Unrelated."),
+        hb.OperatorTargetInput("chat:1:request:2", 1, f"Actually, {HISTORY_DOMAIN} first."),
+    ))
+    assert hb.operator_target_sources(_brief(targets=[HISTORY_DOMAIN]), scope) == [
+        {"target": HISTORY_DOMAIN, "request_id": "chat:1:request:2", "revision": 1}]
+
+
+def test_targets_named_now_or_observed_record_no_history_source():
+    scope = _history_scope(f"Collect {HISTORY_DOMAIN}.", "meereen.essos.local and essos.local",
+                           current=f"Collect {HISTORY_DOMAIN} now.")
+    brief = _brief(targets=[HISTORY_DOMAIN, "meereen.essos.local", "essos.local"])
+    assert _errors(brief, scope) == ()
+    assert hb.operator_target_sources(brief, scope) == []
+
+
+def test_without_history_the_scope_is_unchanged():
+    scope = _scope(PROMPT)
+    assert scope.operator_target_inputs == () and scope == _scope(PROMPT)
+    assert not scope.names_target(HISTORY_DOMAIN)
+    junk = hb.known_scope(_client(), operator_input=PROMPT, operator_target_inputs=[f"Collect {HISTORY_DOMAIN}."])
+    assert junk.operator_target_inputs == () and not junk.names_target(HISTORY_DOMAIN)

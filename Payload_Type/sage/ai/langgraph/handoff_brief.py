@@ -6,6 +6,10 @@ present, the callback and targets must be ones Sage already knows or the operato
 resolve within data Sage already holds. Wording is never judged, and the brief grants no authority: the worker
 still receives the exact operator input, and every guarded action still needs the operator's approval.
 
+The operator may have named a target in an earlier input of the same live chat generation ("collect essos.local",
+then "Yes, run it"). Those retained inputs are exact-name evidence for targets only: they never name a callback,
+task or credential, never become an observed host or domain, and never combine into a derived name.
+
 Pure and offline: the caller passes in what Sage holds; nothing here queries Mythic.
 """
 from __future__ import annotations
@@ -112,10 +116,21 @@ class HandoffBrief:
 
 
 @dataclass(frozen=True)
+class OperatorTargetInput:
+    """One operator input this chat generation already received: its request, revision and exact text."""
+
+    request_id: str
+    revision: int
+    text: str
+
+
+@dataclass(frozen=True)
 class KnownScope:
     """What Sage already holds for this request, normalized for comparison."""
 
     operator_input: str = ""
+    # Earlier authenticated operator inputs, oldest first; exact target names only (see the module docstring).
+    operator_target_inputs: tuple[OperatorTargetInput, ...] = ()
     bound_callback: str = ""
     callbacks: frozenset[str] = frozenset()
     hosts: frozenset[str] = frozenset()
@@ -126,6 +141,20 @@ class KnownScope:
     objects: frozenset[str] = frozenset()
 
     def names_target(self, target: str) -> bool:
+        return self.names_current(target) or self.operator_target_source(target) is not None
+
+    def operator_target_source(self, target: str) -> OperatorTargetInput | None:
+        """The newest retained operator input that names `target` exactly; None when none does.
+
+        Each input is matched on its own, so a short host in one input and its domain in another never form a full
+        host name, and a bare label never stands for the full name it abbreviates."""
+        name = _name(target)
+        if not name:
+            return None
+        return next((item for item in reversed(self.operator_target_inputs) if _named_in(name, item.text)), None)
+
+    def names_current(self, target: str) -> bool:
+        """Whether the current operator input or Sage's observed state names `target`; history is not consulted."""
         name = _name(target)
         if not name:
             return False
@@ -147,7 +176,7 @@ class KnownScope:
             if found:
                 user, domain = (right, left) if separator == "\\" else (left, right)
                 if (user in self.principals or user in self.objects) and (
-                        domain in self.domains or self.names_target(domain)):
+                        domain in self.domains or self.names_current(domain)):
                     return True
         return False
 
@@ -252,8 +281,12 @@ def _managed_secret_host(predicate: str) -> tuple[str, str] | None:
     return _host_identity(fields) if fields else None
 
 
-def known_scope(mythic_client: Any, *, operator_input: str = "", bound_callback: Any = "") -> KnownScope:
-    """Collect callbacks, names, tasks and credentials Sage already holds in memory. Never queries Mythic."""
+def known_scope(mythic_client: Any, *, operator_input: str = "", bound_callback: Any = "",
+                operator_target_inputs: Iterable[OperatorTargetInput] = ()) -> KnownScope:
+    """Collect callbacks, names, tasks and credentials Sage already holds in memory. Never queries Mythic.
+
+    `operator_target_inputs` are the earlier operator inputs the caller validated; they are carried for exact
+    target names and contribute nothing else (no callbacks, tasks, credentials, hosts or domains)."""
     callbacks: set[str] = set()
     hosts: set[str] = set()
     domains: set[str] = set()
@@ -347,6 +380,8 @@ def known_scope(mythic_client: Any, *, operator_input: str = "", bound_callback:
         callbacks.add(bound)
     return KnownScope(
         operator_input=str(operator_input or ""),
+        operator_target_inputs=tuple(item for item in operator_target_inputs or ()
+                                     if isinstance(item, OperatorTargetInput)),
         bound_callback=bound,
         callbacks=frozenset(callbacks - {""}),
         hosts=frozenset(hosts - {""}),
@@ -427,9 +462,26 @@ def validate_brief(brief: HandoffBrief, *, worker: str, require_scope: bool, sco
 
 
 def _host_in_known_domain(name: str, scope: KnownScope) -> bool:
+    """Guidance only, never admission: a domain the operator named (now or earlier) does not name its hosts."""
     label, _, domain = name.partition(".")
-    return bool(label and domain and "." in domain and (domain in scope.domains or _named_in(domain,
-                                                                                            scope.operator_input)))
+    return bool(label and domain and "." in domain and (
+        domain in scope.domains or _named_in(domain, scope.operator_input)
+        or scope.operator_target_source(domain) is not None))
+
+
+def operator_target_sources(brief: HandoffBrief, scope: KnownScope) -> list[dict[str, Any]]:
+    """For each brief target that only an earlier operator input names, that input's request and revision.
+
+    Targets the current input or observed state already names are omitted, so a pass caused by existing state is
+    distinguishable from one that needed the earlier mention. Carries no input text."""
+    sources = []
+    for target in brief.targets:
+        if scope.names_current(target):
+            continue
+        source = scope.operator_target_source(target)
+        if source is not None:
+            sources.append({"target": target, "request_id": source.request_id, "revision": source.revision})
+    return sources
 
 
 def render_scope(brief: Mapping[str, Any] | None) -> str:
