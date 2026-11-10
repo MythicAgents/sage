@@ -142,6 +142,13 @@ async def consult_attack_graph(
     )
 
 
+def first_missing_domain(consult: AttackGraphConsult) -> str:
+    """The objective domain a partial consult's first collection is scoped to: the first of its missing domains,
+    normalized and sorted; empty when none is missing. One domain, not a queue of every missing one."""
+    names = sorted({str(d).strip().strip("'\"").rstrip(".").casefold() for d in consult.missing_domains} - {""})
+    return names[0] if names else ""
+
+
 _OUTCOME_GUIDANCE = {
     ConsultOutcome.CONSULTED_OK: (
         "The graph covers the objective. Plan from it: have the BloodHound agent analyze the path from the "
@@ -192,6 +199,12 @@ def render_consult(consult: AttackGraphConsult) -> str:
             f"Available first procedure: the catalog capability `collect-graph` on the observed callback, {scope}. "
             "In a supervised request Sage presents it as the first delegated step, for the operator to approve or "
             "reject."
+        )
+    elif consult.outcome == ConsultOutcome.CONSULTED_PARTIAL and first_missing_domain(consult):
+        lines.append(
+            "Available first procedure: the catalog capability `collect-graph` on the observed callback, scoped to "
+            f"{first_missing_domain(consult)}, an objective domain the collected graph does not cover. In a "
+            "supervised request Sage presents it as the first delegated step, for the operator to approve or reject."
         )
     lines.append("</knowledge_source_consult>")
     return "\n".join(lines)

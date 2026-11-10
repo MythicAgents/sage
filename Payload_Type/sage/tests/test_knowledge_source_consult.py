@@ -280,3 +280,70 @@ def test_invoke_puts_the_consult_before_the_operator_message_in_the_supervisors_
     assert humans[-1].content == CHANNEL_3_PROMPT
     assert "Outcome: absent" in humans[-2].content
     assert not any("knowledge_source_consult" in str(text) for text in streamed)
+
+
+# ── partial coverage arms the first collection for one missing objective domain ──────────
+
+
+def test_a_partial_consult_names_collect_graph_for_its_first_missing_domain():
+    result, _ = _consult("take over west.test and take over south.test", collected=["north.test"])
+    assert result.outcome == ConsultOutcome.CONSULTED_PARTIAL
+    assert ks.first_missing_domain(result) == "south.test"
+    text = ks.render_consult(result)
+    assert "Not collected: south.test, west.test" in text
+    assert "`collect-graph` on the observed callback, scoped to south.test" in text
+    assert "by hand" in text
+
+
+def test_mixed_coverage_keeps_the_covered_path_result_beside_the_missing_domain_proposal():
+    result, probed = _consult("take over north.test and take over south.test", collected=["north.test"],
+                              predicates=["objective-path-found:north.test"])
+    assert probed == [["north.test"]] and result.path_found == ["north.test"]
+    assert result.missing_domains == ["south.test"]
+    text = ks.render_consult(result)
+    assert "Path exists from controlled principals to: north.test" in text
+    assert "scoped to south.test" in text
+
+
+@pytest.mark.parametrize("missing, expected", [
+    (["West.Test.", " south.test "], "south.test"),
+    ([], ""),
+    (["", "  "], ""),
+])
+def test_the_first_missing_domain_is_normalized_and_sorted(missing, expected):
+    consult = ks.AttackGraphConsult(ConsultOutcome.CONSULTED_PARTIAL, missing_domains=missing)
+    assert ks.first_missing_domain(consult) == expected
+
+
+def test_covering_and_unavailable_consults_name_no_first_collection():
+    covered, _ = _consult("take over north.test", collected=["north.test"])
+    assert "Available first procedure" not in ks.render_consult(covered)
+    assert "Available first procedure" not in ks.render_consult(ks.AttackGraphConsult(ConsultOutcome.UNAVAILABLE))
+
+
+def _armed(consult, *, mode="supervised", request_id="chat:3:request:1"):
+    from ai.langgraph.request_contract import build_request_contract
+
+    async def consult_fn(prompt):
+        return consult
+
+    m, _ = _supervised_model(consult_fn)
+    contract = build_request_contract(request_id=request_id, channel_id="3", operation_id="op", mode=mode,
+                                      autonomous_solve=False)
+    asyncio.run(m._attack_graph_consult_message(CHANNEL_3_PROMPT, contract))
+    return m._graph_first_step
+
+
+def test_partial_supervised_consults_arm_one_missing_domain_and_other_outcomes_do_not():
+    partial = ks.AttackGraphConsult(ConsultOutcome.CONSULTED_PARTIAL, objective_domains=["essos.local", "west.test"],
+                                    collected_domains=["north.test"], missing_domains=["west.test", "essos.local"])
+    assert _armed(partial) == {"request_id": "chat:3:request:1", "partial": True, "domains": ["essos.local"],
+                               "done": False}
+    absent = ks.AttackGraphConsult(ConsultOutcome.ABSENT, objective_domains=["essos.local"])
+    assert _armed(absent) == {"request_id": "chat:3:request:1", "partial": False, "domains": ["essos.local"],
+                              "done": False}
+    assert _armed(partial, mode="conversation") is None
+    for outcome in (ConsultOutcome.CONSULTED_OK, ConsultOutcome.UNAVAILABLE):
+        assert _armed(ks.AttackGraphConsult(outcome, objective_domains=["essos.local"])) is None
+    # A partial outcome with nothing missing has nothing to collect.
+    assert _armed(ks.AttackGraphConsult(ConsultOutcome.CONSULTED_PARTIAL, collected_domains=["north.test"])) is None

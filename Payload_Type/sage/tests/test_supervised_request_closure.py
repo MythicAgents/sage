@@ -395,6 +395,7 @@ from langchain_core.tools import tool as _tool  # noqa: E402
 from langgraph.checkpoint.memory import InMemorySaver  # noqa: E402
 
 from ai.langgraph import knowledge_sources, model as model_module  # noqa: E402
+from ai.langgraph.model import _get_seq  # noqa: E402
 from sage_chat.headless import build_chat_request  # noqa: E402
 from sage_chat.service import bind_channel_thread_id  # noqa: E402
 from sage_chat.session import drop_channel_session  # noqa: E402
@@ -407,23 +408,39 @@ TTP_STEP = {"handoff_title": "Check TTP guidance for SharpHound collection", "al
             "expected_result": "How to run SharpHound on this agent."}
 
 
-async def _graph_request(script: list, decision: str = "", *, mode: str = "supervised",
-                         outcome=knowledge_sources.ConsultOutcome.ABSENT, objective: str = OBJECTIVE):
-    """One native supervised request with an attack-graph consult of `outcome`; returns what each worker step saw."""
+def _canned_consult(outcome):
+    async def consult(prompt):
+        return knowledge_sources.AttackGraphConsult(outcome, objective_domains=["north.test"],
+                                                    collected_domains=["essos.test"] if outcome.value.startswith(
+                                                        "consulted") else [],
+                                                    missing_domains=["north.test"] if outcome.value ==
+                                                    "consulted_partial" else [])
+    return consult
+
+
+INGESTED = '{"ok": true, "status": "ingested"}'
+
+
+async def _graph_session(script: list, turns: list[tuple[str, str]], *, mode: str = "supervised",
+                         consult=None, outcome=knowledge_sources.ConsultOutcome.ABSENT,
+                         autonomous_solve: bool = False, executor_result: str = INGESTED) -> list:
+    """Native supervised requests in one channel and one Model; each turn is (operator input, card decision).
+
+    Returns one record per turn: what its worker steps saw and proposed, the executor runs and model calls at the
+    moment its first card surfaced, and the consult Sage recorded for it."""
     ran: list[dict] = []
-    worker_briefs: list[dict] = []
 
     @_tool
     async def execute_capability(action: dict | str, inputs: dict | str | None = None) -> str:
         """Run one catalog capability."""
         ran.append({"action": action, "inputs": inputs})
-        return '{"ok": true, "status": "ingested"}'
+        return executor_result
 
     model = model_module.Model(
         provider="openai", model="gpt-4o-mini", system_prompt="offline closure",
         config={"configurable": {"api_key": "offline-only", "API_ENDPOINT": "http://127.0.0.1:9/v1"}},
-        task_id=0, agent_task_id="closure", mode=mode, autonomous_solve=False, operation_id=1, channel_id=1,
-        apitoken_id=0,
+        task_id=0, agent_task_id="closure", mode=mode, autonomous_solve=autonomous_solve, operation_id=1,
+        channel_id=1, apitoken_id=0,
     )
     sink = MagicMock()
     sink.get_tools.side_effect = lambda names: [execute_capability] if "execute_capability" in names else []
@@ -432,15 +449,7 @@ async def _graph_request(script: list, decision: str = "", *, mode: str = "super
                                       identity="NORTH\\operator")]
     sink._engagement_hops = []
     sink._ledger_view = lambda: _NS(hops=[], graph_facts=[], corrected_hops=[], snapshot=None)
-
-    async def consult(prompt):
-        return knowledge_sources.AttackGraphConsult(outcome, objective_domains=["north.test"],
-                                                    collected_domains=["essos.test"] if outcome.value.startswith(
-                                                        "consulted") else [],
-                                                    missing_domains=["north.test"] if outcome.value ==
-                                                    "consulted_partial" else [])
-
-    sink._consult_attack_graph = consult
+    sink._consult_attack_graph = consult or _canned_consult(outcome)
     model.mythic_client = sink
     model._payload_names = []
     model.memory = InMemorySaver()
@@ -450,25 +459,79 @@ async def _graph_request(script: list, decision: str = "", *, mode: str = "super
     model.command_name = "chat"
     model._rebuild_graph()
     chat = _NativeDriverChat(model)
+    records: list = []
+    seen: set = set()
+    request_id = 0
+    # Sage's own proposals live in the worker's step, not the parent channels: record each one the real step-bound
+    # middleware makes (observed, not replaced).
+    proposed: list[str] = []
+    propose = model_module._SupervisedStepBoundMiddleware._bound_procedure_message
+
+    def observed_proposal(self, request):
+        message = propose(self, request)
+        if message is not None:
+            proposed.append(message.tool_calls[0]["id"])
+        return message
+
+    from unittest.mock import patch
+    spy = patch.object(model_module._SupervisedStepBoundMiddleware, "_bound_procedure_message", observed_proposal)
+    spy.start()
     try:
-        first = build_chat_request(objective, channel_id=1, operation_id=1, request_id=1, config={"mode": mode})
-        bind_channel_thread_id(first, model)
-        await chat.chat(first)
-        cards = _cards(chat)
-        if decision and cards:
-            second = build_chat_request("", channel_id=1, operation_id=1, request_id=2, config={"mode": mode})
-            second.InputResponse = _input_response(decision, cards[0])
-            await chat.chat(second)
-        snapshot = await model.graph.aget_state(model._graph_run_config(model._session_thread_id()))
-        for message in snapshot.values.get("mythic_operator_messages", []):
-            brief = getattr(message, "additional_kwargs", {}).get("_handoff_brief")
-            if brief is not None:
-                worker_briefs.append(brief)
-        consult_text = "\n".join(str(m.content) for m in snapshot.values.get("supervisor_messages", [])
-                                 if m.additional_kwargs.get("_synthetic_nudge") == "knowledge_source_consult")
-        return _NS(ran=ran, briefs=worker_briefs, cards=_cards(chat), consult=consult_text)
+        for index, (objective, decision) in enumerate(turns):
+            request_id += 1
+            request = build_chat_request(objective, channel_id=1, operation_id=1, request_id=request_id,
+                                         config={"mode": mode})
+            if index == 0:
+                bind_channel_thread_id(request, model)
+            cards_before, ran_before, calls_before = len(_cards(chat)), len(ran), len(fake.inputs)
+            proposed_before = len(proposed)
+            await chat.chat(request)
+            new_cards = _cards(chat)[cards_before:]
+            at_card = _NS(ran=len(ran) - ran_before, model_calls=len(fake.inputs) - calls_before) \
+                if new_cards else None
+            if decision and new_cards:
+                request_id += 1
+                resume = build_chat_request("", channel_id=1, operation_id=1, request_id=request_id,
+                                            config={"mode": mode})
+                resume.InputResponse = _input_response(decision, new_cards[0])
+                await chat.chat(resume)
+            snapshot = await model.graph.aget_state(model._graph_run_config(model._session_thread_id()))
+            values = snapshot.values
+            fresh = lambda channel: [m for m in values.get(channel, [])  # noqa: E731
+                                     if (channel, _get_seq(m), type(m).__name__) not in seen]
+            operator = fresh("mythic_operator_messages")
+            supervisor = fresh("supervisor_messages")
+            others = {channel: fresh(channel) for channel in ("generalist_messages", "bloodhound_messages")}
+            for channel, messages in (("mythic_operator_messages", operator), ("supervisor_messages", supervisor),
+                                      *others.items()):
+                seen.update((channel, _get_seq(m), type(m).__name__) for m in messages)
+            kwargs = [getattr(m, "additional_kwargs", {}) for m in operator]
+            records.append(_NS(
+                objective=objective,
+                briefs=[k["_handoff_brief"] for k in kwargs if k.get("_handoff_brief") is not None],
+                titles=[str(k.get("_handoff_title") or "") for k in kwargs if k.get("_handoff_brief") is not None],
+                bound_ids=list(proposed[proposed_before:]),
+                other_delegations=[m for messages in others.values() for m in messages
+                                   if getattr(m, "additional_kwargs", {}).get("_delegated_to")],
+                cards=new_cards, at_card=at_card, ran=list(ran[ran_before:]),
+                consult="\n".join(str(m.content) for m in supervisor
+                                  if m.additional_kwargs.get("_synthetic_nudge") == "knowledge_source_consult"),
+                consult_metadata=[m.additional_kwargs["_knowledge_source_consult"] for m in supervisor
+                                  if m.additional_kwargs.get("_knowledge_source_consult")],
+            ))
+        return records
     finally:
+        spy.stop()
         await drop_channel_session(build_chat_request("", channel_id=1, operation_id=1))
+
+
+async def _graph_request(script: list, decision: str = "", *, mode: str = "supervised",
+                         outcome=knowledge_sources.ConsultOutcome.ABSENT, objective: str = OBJECTIVE, consult=None,
+                         autonomous_solve: bool = False, executor_result: str = INGESTED):
+    """One native supervised request with an attack-graph consult of `outcome`; returns what each worker step saw."""
+    (record,) = await _graph_session(script, [(objective, decision)], mode=mode, consult=consult, outcome=outcome,
+                                     autonomous_solve=autonomous_solve, executor_result=executor_result)
+    return record
 
 
 def _supervisor_ttp_lookup_first() -> list:
@@ -499,12 +562,223 @@ def test_an_operator_rejected_collection_runs_nothing_and_leaves_manual_enumerat
     assert [b["allowed_capabilities"] for b in run.briefs][:2] == [["collect-graph"], ["control_plane"]], run.briefs
 
 
-@pytest.mark.parametrize("outcome", [knowledge_sources.ConsultOutcome.CONSULTED_PARTIAL,
-                                     knowledge_sources.ConsultOutcome.UNAVAILABLE])
-def test_partial_and_unavailable_graphs_keep_the_supervisors_own_first_step(outcome):
+@pytest.mark.parametrize("outcome", [knowledge_sources.ConsultOutcome.UNAVAILABLE,
+                                     knowledge_sources.ConsultOutcome.CONSULTED_OK])
+def test_unavailable_and_covering_graphs_keep_the_supervisors_own_first_step(outcome):
     run = asyncio.run(_graph_request(_supervisor_ttp_lookup_first(), outcome=outcome))
     assert run.briefs[0]["allowed_capabilities"] == ["control_plane"]
+    assert run.ran == [] and run.cards == []
+
+
+# --- a partial graph that misses the objective's domain proposes collecting that domain first --------------------
+
+PARTIAL_OBJECTIVE = "Obtain Domain Admin of south.test from the observed foothold."
+
+
+def _real_consult(domains: dict[str, bool]):
+    """Sage's own consult producer (`MythicTools._consult_attack_graph`) over a stubbed BloodHound whose
+    `domain_info` lists `domains` with their `collected` flag; MCP is stubbed only while the consult runs."""
+    from unittest.mock import patch
+
+    from ai import mcp as mcp_module
+    from tests.test_knowledge_source_consult import _Tool, _mythic_tools
+
+    rows = [{"name": name.upper(), "collected": collected} for name, collected in domains.items()]
+    tools = [_Tool("domain_info", lambda _args: json.dumps({"data": rows})),
+             _Tool("cypher_query", lambda _args: json.dumps({"data": {"literals": []}}))]
+    mt = _mythic_tools()
+    mt._engagement_footholds = [_NS(callback_id="5", host="WORKSTATION-5", forest="north.test",
+                                    identity="NORTH\\operator")]
+
+    async def consult(prompt):
+        manager = mcp_module.MCPManager
+        with patch.object(manager, "get_connected_servers", staticmethod(lambda: ["bloodhound"])), \
+                patch.object(manager, "is_bloodhound_server", staticmethod(lambda server: server == "bloodhound")), \
+                patch.object(manager, "get_tools_by_server", staticmethod(lambda server: tools)):
+            return await mt._consult_attack_graph(prompt)
+
+    consult.tools = tools
+    return consult
+
+
+NORTH_ONLY = {"north.test": True, "south.test": False}
+SOUTH_COLLECT = {"capability": "collect-graph", "callback_id": "5", "domain": "south.test"}
+
+
+def test_a_partial_graph_missing_the_objective_domain_proposes_collecting_it_first():
+    """With north collected and the requested domain only a trust stub, the Supervisor delegated other work and
+    never proposed collecting the requested domain. Sage now makes that collection the first delegated proposal."""
+    consult = _real_consult(NORTH_ONLY)
+    run = asyncio.run(_graph_request(_supervisor_ttp_lookup_first(), objective=PARTIAL_OBJECTIVE, consult=consult))
+
+    (metadata,) = run.consult_metadata
+    assert metadata["outcome"] == "consulted_partial"
+    assert metadata["collected_domains"] == ["north.test"] and metadata["missing_domains"] == ["south.test"]
+    assert not any("shortestPath" in str(call) for call in consult.tools[1].calls)  # nothing covered to probe
+    # The first accepted brief and its native card are the bound collection of the missing domain.
+    assert run.briefs[0] == {"targets": ["south.test"], "callback_display_id": "5",
+                             "allowed_capabilities": ["collect-graph"], "allowed_tools": [],
+                             "inputs_by_reference": [], "expected_result": run.briefs[0]["expected_result"]}
+    (card,) = run.cards
+    assert card["data"]["actions"] == [{"tool_name": "execute_capability", "display_name": "collect-graph",
+                                        "arguments": {"action": SOUTH_COLLECT}}]
+    assert card["data"]["guarded_action_count"] == 1
+    assert len(run.bound_ids) == 1 and run.bound_ids[0].startswith("sage_bound_")
+    # Pending: nothing ran, and only the Supervisor's one routing call preceded the card (no worker model call).
+    assert run.at_card.ran == 0 and run.at_card.model_calls == 1
     assert run.ran == []
+    assert "collect-graph" in run.consult and "south.test" in run.consult
+
+
+def test_an_accepted_missing_domain_collection_runs_once_with_the_carded_scope():
+    run = asyncio.run(_graph_request(_supervisor_ttp_lookup_first(), "accept", objective=PARTIAL_OBJECTIVE,
+                                     consult=_real_consult(NORTH_ONLY)))
+    assert run.cards[0]["data"]["arguments"] == {"action": SOUTH_COLLECT}
+    assert run.ran == [{"action": SOUTH_COLLECT, "inputs": None}]
+    # The native approval resume neither re-proposes nor re-cards the collection.
+    assert len(run.cards) == 1 and len(run.bound_ids) == 1
+    assert [b["allowed_capabilities"] for b in run.briefs].count(["collect-graph"]) == 1
+
+
+def test_with_mixed_coverage_only_the_first_missing_objective_domain_is_proposed():
+    objective = ("Obtain Domain Admin of west.test and domain admin of south.test and domain admin of north.test "
+                 "from the observed foothold.")
+    run = asyncio.run(_graph_request(_supervisor_ttp_lookup_first(), objective=objective,
+                                     consult=_real_consult({**NORTH_ONLY, "west.test": False})))
+
+    (metadata,) = run.consult_metadata
+    assert metadata["outcome"] == "consulted_partial"
+    assert metadata["objective_domains"] == ["north.test", "south.test", "west.test"]
+    assert metadata["collected_domains"] == ["north.test"]
+    assert metadata["missing_domains"] == ["south.test", "west.test"]  # the remaining scope stays for the Supervisor
+    assert run.briefs[0]["targets"] == ["south.test"] and run.briefs[0]["allowed_capabilities"] == ["collect-graph"]
+    (card,) = run.cards
+    assert card["data"]["arguments"] == {"action": SOUTH_COLLECT}  # one domain, never several or a default
+    assert run.ran == []
+
+
+def _collect(targets: list[str] | None = None, *, title: str = "collect graph", worker: str = "Mythic_Operator",
+             index: int = 1) -> AIMessage:
+    args = {"handoff_title": title, "allowed_capabilities": ["collect-graph"], "callback_display_id": 5,
+            "expected_result": "A collected graph."}
+    if targets is not None:
+        args["targets"] = targets
+    return _call(f"transfer_to_{worker}", args, index)
+
+
+@pytest.mark.parametrize("first", [
+    pytest.param(_collect(["north.test"]), id="already-collected-callback-domain"),
+    pytest.param(_collect(None), id="omitted-target"),
+    pytest.param(_collect(["workstation-5"]), id="callback-host-default"),
+    pytest.param(_collect(["south.test", "west.test"]), id="several-targets"),
+    pytest.param(_collect(["south.test"], worker="Mythic_Payload"), id="other-worker"),
+])
+def test_a_first_collection_of_the_wrong_scope_is_replaced_by_the_missing_domain_proposal(first):
+    script = [first, AIMessage(content="Collection result read."), AIMessage(content="Final answer."),
+              AIMessage(content="Final answer.")]
+    run = asyncio.run(_graph_request(script, objective=PARTIAL_OBJECTIVE, consult=_real_consult(NORTH_ONLY)))
+
+    assert run.titles[0] == "Collect the attack graph", run.titles  # Sage's step, not the Supervisor's
+    assert run.briefs[0]["targets"] == ["south.test"] and run.briefs[0]["callback_display_id"] == "5"
+    assert run.other_delegations == []
+    (card,) = run.cards
+    assert card["data"]["arguments"] == {"action": SOUTH_COLLECT}
+    assert run.at_card.ran == 0 and run.at_card.model_calls == 1
+
+
+def test_a_first_collection_already_scoped_to_the_missing_domain_passes_once_unchanged():
+    script = [_collect(["south.test"], title="collect south"), AIMessage(content="Collection result read."),
+              AIMessage(content="Final answer."), AIMessage(content="Final answer.")]
+    run = asyncio.run(_graph_request(script, "accept", objective=PARTIAL_OBJECTIVE, consult=_real_consult(NORTH_ONLY)))
+
+    assert run.titles[0] == "collect south"
+    assert [b["allowed_capabilities"] for b in run.briefs].count(["collect-graph"]) == 1
+    assert run.ran == [{"action": SOUTH_COLLECT, "inputs": None}]
+
+
+def test_a_rejected_missing_domain_collection_runs_nothing_and_later_steps_pass_unchanged():
+    script = [_call("transfer_to_Mythic_Operator", TTP_STEP, 1), AIMessage(content="Denied."),
+              _call("transfer_to_Mythic_Operator", TTP_STEP, 2), AIMessage(content="Enumerated by hand."),
+              AIMessage(content="Final answer."), AIMessage(content="Final answer.")]
+    run = asyncio.run(_graph_request(script, "reject", objective=PARTIAL_OBJECTIVE, consult=_real_consult(NORTH_ONLY)))
+
+    assert run.ran == []
+    assert [b["allowed_capabilities"] for b in run.briefs][:2] == [["collect-graph"], ["control_plane"]], run.briefs
+    assert run.titles[1] == TTP_STEP["handoff_title"]
+
+
+def test_a_failed_missing_domain_collection_does_not_force_a_second_proposal():
+    script = [_call("transfer_to_Mythic_Operator", TTP_STEP, 1), AIMessage(content="The collection failed."),
+              _call("transfer_to_Mythic_Operator", TTP_STEP, 2), AIMessage(content="Enumerated by hand."),
+              AIMessage(content="Final answer."), AIMessage(content="Final answer.")]
+    run = asyncio.run(_graph_request(script, "accept", objective=PARTIAL_OBJECTIVE, consult=_real_consult(NORTH_ONLY),
+                                     executor_result='{"ok": false, "status": "failed", "error": "collector failed"}'))
+
+    assert run.ran == [{"action": SOUTH_COLLECT, "inputs": None}]
+    assert [b["allowed_capabilities"] for b in run.briefs][:2] == [["collect-graph"], ["control_plane"]], run.briefs
+    assert len(run.cards) == 1
+
+
+def test_supervised_with_autonomous_solve_on_the_supervisor_path_proposes_the_missing_domain_for_approval(
+        monkeypatch):
+    # With the controller rolled back, Autonomous Solve requests run the Supervisor graph in the supervised lane.
+    monkeypatch.setenv("SAGE_CONTROLLER_HITL", "0")
+    run = asyncio.run(_graph_request(_supervisor_ttp_lookup_first(), objective=PARTIAL_OBJECTIVE,
+                                     consult=_real_consult(NORTH_ONLY), autonomous_solve=True))
+    (card,) = run.cards
+    assert card["data"]["arguments"] == {"action": SOUTH_COLLECT}
+    assert run.ran == [] and run.at_card.ran == 0
+
+
+def test_supervised_with_autonomous_solve_by_default_stays_controller_owned_and_executes_nothing_unapproved():
+    """By default the controller owns a supervised Autonomous Solve objective; the Supervisor hook does not reach it."""
+    run = asyncio.run(_graph_request(_supervisor_ttp_lookup_first(), objective=PARTIAL_OBJECTIVE,
+                                     consult=_real_consult(NORTH_ONLY), autonomous_solve=True))
+    assert run.briefs == [] and run.bound_ids == []
+    assert run.ran == []
+
+
+def test_conversation_mode_stays_observational_with_a_partial_graph():
+    script = [_call("transfer_to_Mythic_Operator", {"handoff_title": "Look up guidance"}, 1),
+              AIMessage(content="Here is what I found."), AIMessage(content="Final answer."),
+              AIMessage(content="Final answer.")]
+    run = asyncio.run(_graph_request(script, mode="conversation", objective=PARTIAL_OBJECTIVE,
+                                     consult=_real_consult(NORTH_ONLY)))
+    assert run.consult_metadata[0]["outcome"] == "consulted_partial"
+    assert run.ran == [] and run.cards == [] and run.bound_ids == []
+    assert all(b.get("allowed_capabilities") != ["collect-graph"] for b in run.briefs)
+
+
+def _step(title: str, index: int) -> AIMessage:
+    return _call("transfer_to_Mythic_Operator", {**TTP_STEP, "handoff_title": title}, index)
+
+
+def test_each_objective_request_in_a_channel_gets_its_own_first_proposal_and_no_stale_one():
+    """A later request in the same channel: one Model. Each new objective request whose domain is missing gets its own
+    proposal; a covered or non-objective request afterwards inherits none."""
+    domains = {**NORTH_ONLY, "west.test": False}
+    script = [
+        _step("First lookup", 1), AIMessage(content="Denied."), AIMessage(content="Final answer."),
+        _step("Second lookup", 2), AIMessage(content="Denied."), AIMessage(content="Final answer."),
+        _step("Covered lookup", 3), AIMessage(content="Read."), AIMessage(content="Final answer."),
+        _step("Guidance lookup", 4), AIMessage(content="Read."), AIMessage(content="Final answer."),
+        *[AIMessage(content="Final answer.")] * 4,
+    ]
+    turns = [(PARTIAL_OBJECTIVE, "reject"),
+             ("Obtain Domain Admin of west.test from the observed foothold.", "reject"),
+             ("Obtain Domain Admin of north.test from the observed foothold.", ""),
+             ("Check the TTP guidance for SharpHound collection.", "")]
+    first, second, covered, other = asyncio.run(_graph_session(script, turns, consult=_real_consult(domains)))
+
+    assert [c["data"]["arguments"]["action"]["domain"] for c in first.cards + second.cards] == [
+        "south.test", "west.test"]
+    assert first.briefs[0]["targets"] == ["south.test"] and second.briefs[0]["targets"] == ["west.test"]
+    assert first.ran == second.ran == []
+    assert covered.consult_metadata[0]["outcome"] == "consulted_ok"
+    assert other.consult_metadata == []
+    for record, title in ((covered, "Covered lookup"), (other, "Guidance lookup")):
+        assert record.titles[:1] == [title] and record.briefs[0]["allowed_capabilities"] == ["control_plane"]
+        assert record.cards == [] and record.ran == [] and record.bound_ids == []
 
 
 def test_conversation_mode_stays_observational_with_an_absent_graph():
@@ -624,3 +898,33 @@ def test_earlier_steps_are_one_line_facts_for_this_request_only():
     block = model_module._earlier_steps_context(messages, REQUEST)
     assert "precondition_unsatisfiable (no krbtgt key)" in block.content and "other request" not in block.content
     assert model_module._earlier_steps_context([], REQUEST) is None
+
+
+def _hook_model(callbacks: list[int], *, bound: str = ""):
+    from ai.langgraph.request_contract import build_request_contract
+
+    model = object.__new__(model_module.Model)
+    model._graph_first_step = {"request_id": "chat:1:request:1", "partial": True, "domains": ["south.test"],
+                               "done": False}
+    model._request_contract = build_request_contract(request_id="chat:1:request:1", channel_id="1", operation_id="1",
+                                                     mode="supervised", autonomous_solve=False)
+    model.mythic_client = _NS(_recon_snapshot_cache={("list_callbacks", "all"): [
+        {"id": callback, "host": f"HOST-{callback}"} for callback in callbacks]})
+    model._turn_authority = _NS(bounded_callback_id=bound)
+    return model
+
+
+def test_without_one_unambiguous_callback_no_collection_is_invented():
+    from ai.langgraph import handoff_brief
+
+    lookup = handoff_brief.HandoffBrief.from_args(allowed_capabilities=["control_plane"], expected_result="Read.")
+    model = _hook_model([5, 7])
+    assert model._graph_collection_first_step("Mythic_Operator", lookup, "", "lookup") is None
+    assert model._graph_first_step["done"] is False  # still owed to the first delegation that names a callback
+    named = handoff_brief.HandoffBrief.from_args(callback_display_id=7, allowed_capabilities=["control_plane"],
+                                                 expected_result="Read.")
+    worker, brief, *_ = model._graph_collection_first_step("Mythic_Operator", named, "", "lookup")
+    assert (worker, brief.callback_display_id, brief.targets) == ("Mythic_Operator", "7", ("south.test",))
+    assert _hook_model([5, 7], bound="5")._graph_collection_first_step(
+        "Mythic_Operator", lookup, "", "lookup")[1].callback_display_id == "5"
+    assert _hook_model([])._graph_collection_first_step("Mythic_Operator", lookup, "", "lookup") is None

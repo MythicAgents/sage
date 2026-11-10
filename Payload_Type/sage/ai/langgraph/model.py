@@ -6724,24 +6724,31 @@ class Model:
         rejections = _handoff_brief.rejection_count(ledger.actual_events(kind="brief"))
         return errors, rejections >= _handoff_brief.REJECTIONS_BEFORE_STOP
 
-    def _absent_graph_first_step(
+    def _graph_collection_first_step(
         self, worker: str, brief: Any, instruction: str, title: str,
     ) -> tuple[str, "_handoff_brief.HandoffBrief", str, str, str] | None:
         """Sage's `collect-graph` step in place of a supervised request's first delegation when its attack-graph
-        consult found no collected graph; None leaves the delegation as the Supervisor wrote it.
+        consult found no collected graph, or a graph missing an objective domain; None leaves the delegation as the
+        Supervisor wrote it.
 
-        Once per request: the Supervisor's own collect-graph step satisfies it, and after the proposal (approved,
-        rejected or failed) later delegations pass unchanged, so manual enumeration stays available. The callback is
-        the one the Supervisor's brief names, else the request's bound callback, else the only callback Sage has
-        observed; without one nothing is substituted. The collection is scoped to the objective's one domain (with
-        several or none, the collector's default domain applies)."""
+        Once per request: after the proposal (approved, rejected or failed) later delegations pass unchanged, so
+        manual enumeration stays available. The callback is the one the Supervisor's brief names, else the request's
+        bound callback, else the only callback Sage has observed; without one nothing is substituted. With no graph,
+        the Supervisor's own collect-graph step satisfies it, and the collection is scoped to the objective's one
+        domain (with several or none, the collector's default domain applies). With a partial graph the collection is
+        the first missing objective domain exactly: the Supervisor's own step satisfies it only when it is a
+        Mythic_Operator step that binds `collect-graph` on that callback to that domain; any other collection (a covered
+        domain, no or several targets, another worker) is replaced like any other first step."""
         plan = getattr(self, "_graph_first_step", None)
         contract = getattr(self, "_request_contract", None)
         lane = str(getattr(getattr(contract, "lane", None), "value", "") or "")
         if (not isinstance(plan, dict) or plan.get("done") or lane != "supervised_workflow"
                 or plan.get("request_id") != str(getattr(contract, "request_id", "") or "")):
             return None
-        if isinstance(brief, _handoff_brief.HandoffBrief) and brief.allowed_capabilities == ("collect-graph",):
+        partial = bool(plan.get("partial"))
+        own_collection = (isinstance(brief, _handoff_brief.HandoffBrief)
+                          and brief.allowed_capabilities == ("collect-graph",))
+        if own_collection and not partial:
             plan["done"] = True
             return None
         try:
@@ -6760,19 +6767,30 @@ class Model:
         domains = [str(domain) for domain in plan.get("domains") or [] if str(domain).strip()]
         targets = tuple(domains) if len(domains) == 1 else ()
         where = f" for {domains[0]}" if targets else ""
+        if partial and own_collection and worker == "Mythic_Operator" and targets:
+            # The Supervisor's own collection stands only when Sage's binder resolves it to exactly this proposal.
+            bound = _step_bounds.bound_procedure_call(brief.as_metadata(), scope.hosts)
+            if bound == {"action": {"capability": "collect-graph", "callback_id": callback, "domain": targets[0]}}:
+                plan["done"] = True
+                return None
         substitute = _handoff_brief.HandoffBrief(
             targets=targets, callback_display_id=callback, allowed_capabilities=("collect-graph",),
             expected_result=f"BloodHound holds a collected attack graph{where}.",
         )
         plan["done"] = True
+        partial_note = partial and bool(targets)
+        reason = (f"the objective domain {targets[0]} is missing from the collected graph" if partial_note
+                  else "no collected graph exists")
         try:
-            logger.info(f"🧭 [first-step] no collected graph: {worker} step {title!r} replaced by collect-graph on "
+            logger.info(f"🧭 [first-step] {reason}: {worker} step {title!r} replaced by collect-graph on "
                         f"callback {callback}{where}")
         except Exception:
             pass
-        note = (f"No collected graph exists, so Sage replaced this first delegation ({worker}: {title or 'untitled'}) "
-                f"with the catalog procedure `collect-graph` on callback {callback}{where}, for the operator's "
-                "approval. If the operator rejects it, enumerate by hand through Mythic tasks.")
+        note = (f"{reason[:1].upper()}{reason[1:]}"
+                f"{' while other graph data exists' if partial_note else ''}, so Sage replaced this first delegation "
+                f"({worker}: {title or 'untitled'}) with the catalog procedure `collect-graph` on callback "
+                f"{callback}{where}, for the operator's approval. If the operator rejects it, enumerate by hand "
+                "through Mythic tasks.")
         assignment = (f"Collect the attack graph{where} on callback {callback} with the catalog procedure "
                       "`collect-graph`, then report what was collected.")
         return "Mythic_Operator", substitute, "Collect the attack graph", assignment, note
@@ -8630,15 +8648,20 @@ class Model:
             logger.warning(f"Attack-graph consult failed open: {type(e).__name__}: {e}")
             consult = knowledge_sources.AttackGraphConsult(knowledge_sources.ConsultOutcome.UNAVAILABLE)
         text = knowledge_sources.render_consult(consult)
-        # With no collected graph, a supervised request's first delegation is Sage's bound collect-graph step
-        # (`_absent_graph_first_step`). Partial and unavailable outcomes keep their meaning; conversation observes.
-        self._graph_first_step = (
-            {"request_id": str(getattr(request_contract, "request_id", "") or ""),
-             "domains": list(consult.objective_domains), "done": False}
-            if consult.outcome == knowledge_sources.ConsultOutcome.ABSENT
-            and getattr(request_contract, "lane", None) == RequestLane.SUPERVISED_WORKFLOW
-            else None
-        )
+        # A supervised request whose consult found no collected graph, or a graph missing one of the objective's
+        # domains, starts with Sage's bound collect-graph step (`_graph_collection_first_step`). With a partial graph
+        # it is scoped to the first missing objective domain, never to a covered one. Covering and unavailable
+        # outcomes keep the Supervisor's own first step; conversation observes. Each request computes its own plan.
+        plan = None
+        if getattr(request_contract, "lane", None) == RequestLane.SUPERVISED_WORKFLOW:
+            request_id = str(getattr(request_contract, "request_id", "") or "")
+            missing = knowledge_sources.first_missing_domain(consult)
+            if consult.outcome == knowledge_sources.ConsultOutcome.ABSENT:
+                plan = {"request_id": request_id, "partial": False, "domains": list(consult.objective_domains),
+                        "done": False}
+            elif consult.outcome == knowledge_sources.ConsultOutcome.CONSULTED_PARTIAL and missing:
+                plan = {"request_id": request_id, "partial": True, "domains": [missing], "done": False}
+        self._graph_first_step = plan
         if not text:
             return None
         metadata = consult.as_metadata()
@@ -15200,7 +15223,7 @@ class Model:
             ),
             "brief_check": None if self.mode == "auto" else self._check_handoff_brief,
             "repeat_check": None if self.mode == "auto" else self._answered_step_repeat,
-            "first_step": None if self.mode == "auto" else self._absent_graph_first_step,
+            "first_step": None if self.mode == "auto" else self._graph_collection_first_step,
         }
         assign_to_generalist_agent = _create_handoff_tool(
             agent_name="Generalist",
@@ -18070,9 +18093,10 @@ def _create_handoff_tool(
             )
         except Exception:  # pragma: no cover
             pass
-        # A request whose attack-graph consult found no collected graph starts with Sage's bound `collect-graph` step:
-        # the first delegation, whatever the Supervisor chose, becomes that step. It is validated, recorded and
-        # carded below exactly like a Supervisor-authored step, and the operator may reject it.
+        # A request whose attack-graph consult found no collected graph, or a graph missing an objective domain,
+        # starts with Sage's bound `collect-graph` step: the first delegation, whatever the Supervisor chose, becomes
+        # that step. It is validated, recorded and carded below exactly like a Supervisor-authored step, and the
+        # operator may reject it.
         delegate_to = agent_name
         replaced_note = ""
         if first_step is not None:
