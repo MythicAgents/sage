@@ -29,7 +29,7 @@ services, and Sage-local attack artifacts are not admissible proof of an objecti
 <p align="center">
   <img src="docs/assets/supervised-approval-hero.png" alt="Sage supervised approval card in Mythic" width="900">
   <br><em>Supervised mode: Sage works the objective in a specialist agent and pauses each guarded action for your
-  decision — Accept, Reject, or Respond with guidance.</em>
+  decision — Accept, Reject, or Respond with guidance. Captured from a development build in October 2026.</em>
 </p>
 
 > **⚠️ Authorized use only, and still maturing.** Use Sage only for activity you are explicitly authorized to
@@ -37,10 +37,11 @@ services, and Sage-local attack artifacts are not admissible proof of an objecti
 > understood: an autonomous agent driving a C2 carries real risk of unintended impact on a live network. Weigh
 > production use very carefully, and prefer labs and authorized engagements until Sage has matured.
 
-> **Mythic target.** Native chat containers do not exist before Mythic v4. The 0.3.0 release qualification runs on
-> Mythic `v4.0.8`, and its GitHub release notes report the result. The last live qualification recorded in this
-> repository is 0.1.0-beta's, on tag `v4.0.0rc5` at commit `a9add7f1f62f5b2098d1f0eb0306c4b15b8cd916`. Other
-> Mythic v4 builds may work but have not been qualified. See [Limitations](#limitations).
+> **Mythic target.** Native chat containers do not exist before Mythic v4. The 0.3.0 release qualification runs one
+> supervised GOAD objective on Mythic `v4.0.8`, and its GitHub release notes report the result. The last live
+> qualification recorded in this repository is 0.1.0-beta's, on tag `v4.0.0rc5` at commit
+> `a9add7f1f62f5b2098d1f0eb0306c4b15b8cd916`. Other Mythic v4 builds may work but have not been qualified. See
+> [Limitations](#limitations).
 
 ## Contents
 
@@ -167,7 +168,8 @@ gained, so a multi-day assessment survives context resets, restarts, and even a 
 
 <p align="center">
   <img src="docs/assets/engagement-ledger.png" alt="The Engagement State Ledger shown by /state" width="820">
-  <br><em><code>/state</code> renders the ledger: each row's effect, status, task, and callback.</em>
+  <br><em><code>/state</code> renders the ledger: each row's effect, status, task, and callback. Captured from a
+  supervised run on a development build in November 2026.</em>
 </p>
 
 - **What it is.** One ledger per Mythic operation, shared live by every chat channel of that operation — a table
@@ -396,7 +398,8 @@ Set `mode` when you create the channel, or switch it live with `/mode`:
 <p align="center">
   <img src="docs/assets/sage-ledger-solve.gif" alt="Sage in experimental auto mode on the GOAD lab" width="900">
   <br><em>Experimental auto mode in a GOAD lab: the Engagement State Ledger fills in as each hop is verified, through to
-  domain compromise. Auto mode is a research and evaluation capability, validated only on GOAD.</em>
+  domain compromise. Recorded by August 2026 on a development build that predates 0.1.0-beta; auto mode was not run
+  live on 0.3.0. Auto mode is a research and evaluation capability, exercised only on GOAD.</em>
 </p>
 
 ### Supervised approvals
@@ -1082,17 +1085,23 @@ Sage 0.3 is deliberately narrow, and its live validation lags its code:
   Apollo `v0.1.0-rc1`, BloodHound CE 9.5.1, BloodHound MCP `92a37dd`, and `sonnet-4-6` through an
   OpenAI-compatible LiteLLM route. Releases from 0.2.0 on are validated by the offline suite, the
   repository-boundary guards, the repo-hygiene checks, and scripted tests of the assembled chat path; 0.2.0 had
-  no live-range run. The 0.3.0 release qualification runs one GOAD objective on a locally built image, and its
-  GitHub release notes report the image, Mythic version, model route and result. That result covers that one
-  configuration and objective. Individual fixes are spot-checked live on a GOAD lab during development; those
-  checks are not a release qualification.
+  no live-range run. The 0.3.0 release qualification runs once, in supervised mode, on a locally built image of
+  the release source: one objective request to obtain Domain Admin of one GOAD domain from an Apollo foothold
+  (plus at most one `proceed` if it ends without proof), within fixed time, token, cost and approval-card limits,
+  with no other operator input than accepting or rejecting cards. 0.3.0 is published only after that run passes,
+  and its GitHub release notes report the image, architecture, Mythic version, model route and result. That result
+  covers that one configuration and objective. The published image is checked for installation, not requalified.
+  Individual fixes are spot-checked live on a GOAD lab during development; those checks are not a release
+  qualification.
 - **Supervised mode.** Live evidence for objective-led supervised mode comes only from GOAD with an Apollo
   foothold and one model route. Sage proposes and you approve each guarded action, but the quality of its
-  proposals on another engagement is not established. When the Supervisor scopes a step to the wrong catalog
-  procedure, the request still ends rather than re-scoping; 0.3.0 recovers only when the specialist names
-  something that is not a catalog procedure.
-- **Auto mode** is experimental and has been exercised only against GOAD. That does not establish reliability or
-  generalization on another range or a production network.
+  proposals on another engagement is not established. The Supervisor does not yet plan bounded steps: it can hand
+  a specialist the whole objective, so a step runs until one of its limits or an error. When the Supervisor scopes
+  a step to the wrong catalog procedure, the request still ends rather than re-scoping; 0.3.0 recovers only when
+  the specialist names something that is not a catalog procedure.
+- **Auto mode** is experimental, was not run live on 0.3.0, and has been exercised only against GOAD on earlier
+  development builds. That does not establish reliability or generalization on another range or a production
+  network.
 - **Other configurations.** Other operating systems and architectures; other Mythic, Apollo, BloodHound CE, or
   BloodHound MCP revisions; other model providers, routes, and models; and payload types other than Apollo are not
   validated. Code paths that support them are not evidence that they work.
@@ -1104,8 +1113,13 @@ Sage 0.3 is deliberately narrow, and its live validation lags its code:
 - **Known issues.** See the [CHANGELOG](CHANGELOG.md) for each release's known issues. As of 0.3.0 these include
   SQLite locking on the bind-mounted service directory under macOS Docker Desktop and OrbStack (see
   [SQLite on macOS Docker Desktop / OrbStack](#sqlite-on-macos-docker-desktop--orbstack)), dependency
-  vulnerabilities that remain until `mythic-container` and `arize-phoenix` update their pins, and an approved
-  supervised action that can be issued twice if Sage stops before it records the action's result.
+  vulnerabilities that remain until `mythic-container` and `arize-phoenix` update their pins, an approved
+  supervised action that can be issued twice if Sage stops before it records the action's result, repeated
+  collection proposals and empty delegations that end in the no-progress stop, request endings reported as "not
+  terminal" or as errors when a task's completion function failed or a delegation was interrupted, chat display
+  ordering, a ledger that records only verifier-proven gains, and two forge defects (a parent-domain forge from a
+  child-domain source can skip the parent's replication grant, and a krbtgt reference beyond the top-ranked key is
+  refused).
 - **Erasure.** Operation-memory erasure removes Sage-derived state for one operation but deliberately leaves
   authoritative Mythic records unchanged. It does not erase separate LangGraph checkpoints, Phoenix traces,
   LiteLLM/provider retention, native Mythic messages, or Slack workspace records; each owner must apply its own
