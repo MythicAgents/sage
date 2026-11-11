@@ -98,104 +98,21 @@ def credential_references(rows: Any, *, task_ids: Iterable[int], added_ids: Iter
     return sorted(references, key=lambda item: item["credential_id"])
 
 
-GRAPH_MAX_RECORDS = 12
-GRAPH_EXCERPT_CHARS = 1500
-GRAPH_TOTAL_CHARS = 12_000
-_GRAPH_ARGUMENT_CHARS = 600
-_CALL_ID_LIMIT = 128
-
-
-def graph_citation(request_id: str, tool_call_id: str) -> str:
-    """The stable token a worker cites for one graph observation; resolved by exact lookup, never parsed."""
-    return f"graph:{request_id}:{tool_call_id}"
-
-
-def graph_citation_suffix(token: str) -> str:
-    """The line Sage appends to a BloodHound worker's own graph result so the worker can cite it."""
-    return f"\n\n[Sage source {token}]"
-
-
-def _without_citation_suffix(text: str) -> str:
-    """The tool's own output: a trailing Sage citation line is not part of the observation."""
-    marker = text.rfind("\n\n[Sage source graph:")
-    if marker >= 0 and text.endswith("]") and "\n" not in text[marker + 2:]:
-        return text[:marker]
-    return text
-
-
-def graph_observation_records(
-    messages: Iterable[Any], graph_tools: Iterable[str], *, request_id: str, generation: str = "",
-    is_error: Any = None, max_records: int = GRAPH_MAX_RECORDS, total_chars: int = GRAPH_TOTAL_CHARS,
-    excerpt_chars: int = GRAPH_EXCERPT_CHARS,
-) -> list[dict[str, Any]]:
-    """The graph queries a step made, each with its paired result, in call order. Pure.
-
-    A record is usable support only when one allowlisted call and one result share its call ID and tool name.
-    Ambiguous pairs stay visible without an excerpt or citation; a result with no allowlisted call, or a call with
-    no result, produces nothing. An error result (`ToolMessage.status` or the structured `is_error` detector) is an
-    observation of an error. The most recent records are selected first, within the record and excerpt budgets;
-    the digest always covers the full result.
-    """
+def graph_read_references(messages: Iterable[Any], graph_tools: Iterable[str]) -> list[dict[str, Any]]:
+    """The graph tool calls a step made that have a paired result."""
     allowed = frozenset(graph_tools)
-    messages = list(messages)
-    calls: dict[str, list[dict[str, Any]]] = {}
-    results: dict[str, list[Any]] = {}
+    calls: dict[str, dict[str, Any]] = {}
+    references = []
     for message in messages:
         for call in getattr(message, "tool_calls", None) or []:
-            call_id = call.get("id")
-            if call.get("name") in allowed and isinstance(call_id, str) and 0 < len(call_id) <= _CALL_ID_LIMIT:
-                calls.setdefault(call_id, []).append(call)
+            if call.get("name") in allowed and isinstance(call.get("id"), str):
+                calls[call["id"]] = call
         if getattr(message, "type", "") == "tool" and getattr(message, "tool_call_id", None) in calls:
-            results.setdefault(message.tool_call_id, []).append(message)
-    paired = [call_id for call_id in calls if call_id in results]
-    records: list[dict[str, Any]] = []
-    remaining = total_chars
-    for call_id in reversed(paired):
-        if len(records) >= max_records:
-            break
-        call, result = calls[call_id][0], results[call_id][0]
-        arguments = json.dumps(call.get("args") or {}, ensure_ascii=False, sort_keys=True, default=str)
-        content = result.content
-        text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False, default=str)
-        text = _without_citation_suffix(text)
-        pairing = ("duplicate_call" if len(calls[call_id]) > 1 else
-                   "duplicate_result" if len(results[call_id]) > 1 else
-                   "tool_name_mismatch" if getattr(result, "name", None) not in {None, call["name"]} else "paired")
-        error = getattr(result, "status", None) == "error" or bool(callable(is_error) and is_error(text))
-        record: dict[str, Any] = {
-            "request_id": request_id,
-            "source_tool": call["name"],
-            "source_tool_call_id": call_id,
-            "arguments": arguments[:_GRAPH_ARGUMENT_CHARS],
-            "arguments_sha256": hashlib.sha256(arguments.encode("utf-8")).hexdigest(),
-            "arguments_truncated": len(arguments) > _GRAPH_ARGUMENT_CHARS,
-            "result_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
-            "disposition": "error" if error else "success",
-            "pairing": pairing,
-            "usable": pairing == "paired",
-        }
-        if generation:
-            record["generation"] = generation
-        if pairing == "paired":
-            excerpt = text[:max(0, min(excerpt_chars, remaining))]
-            remaining -= len(excerpt)
-            record.update({"citation": graph_citation(request_id, call_id), "result_excerpt": excerpt,
-                           "result_truncated": len(excerpt) < len(text)})
-        record["truncated"] = bool(record.get("result_truncated") or record["arguments_truncated"]
-                                   or pairing != "paired")
-        records.append(record)
-    records.reverse()
-    return records
-
-
-def graph_read_references(messages: Iterable[Any], graph_tools: Iterable[str], *,
-                          is_error: Any = None) -> list[dict[str, Any]]:
-    """The graph tool calls a step made that have a paired result, from the shared graph record builder."""
-    return [{"tool": record["source_tool"], "tool_call_id": record["source_tool_call_id"][:_TEXT_LIMIT],
-             "args_sha256": record["arguments_sha256"], "result_sha256": record["result_sha256"],
-             "disposition": record["disposition"], "pairing": record["pairing"]}
-            for record in graph_observation_records(messages, graph_tools, request_id="-", is_error=is_error,
-                                                    max_records=10**6, total_chars=0)]
+            call = calls.pop(message.tool_call_id)
+            arguments = json.dumps(call.get("args") or {}, ensure_ascii=False, sort_keys=True, default=str)
+            references.append({"tool": call["name"], "tool_call_id": call["id"][:_TEXT_LIMIT],
+                               "args_sha256": hashlib.sha256(arguments.encode("utf-8")).hexdigest()})
+    return references
 
 
 async def _bounded(awaitable: Any) -> Any:
@@ -203,14 +120,13 @@ async def _bounded(awaitable: Any) -> Any:
 
 
 async def collect(client: Any, *, task_ids: Iterable[Any], credentials_added: Iterable[Any],
-                  messages: Iterable[Any], graph_tools: Iterable[str],
-                  graph_is_error: Any = None) -> tuple[dict[str, list], dict[int, list]]:
+                  messages: Iterable[Any], graph_tools: Iterable[str]) -> tuple[dict[str, list], dict[int, list]]:
     """Read the step's references from Mythic. Returns the references and the output rows read for each task.
 
     A failed read keeps the reference with `read: failed`; nothing here raises to the caller.
     """
     references = empty()
-    references["graph_reads"] = graph_read_references(messages, graph_tools, is_error=graph_is_error)
+    references["graph_reads"] = graph_read_references(messages, graph_tools)
     ids = sorted({i for i in (_exact_id(t) for t in task_ids) if i is not None})
     added = sorted({i for i in (_exact_id(c) for c in credentials_added) if i is not None})
     read_ids, unread_ids = ids[:MAX_TASK_REFERENCES], ids[MAX_TASK_REFERENCES:]
@@ -274,10 +190,7 @@ def render_lines(references: Mapping[str, Any] | None) -> list[str]:
         lines.append(f"- credential {credential['credential_id']}: `{principal or '-'}` "
                      f"({credential.get('type') or 'unknown type'}), {source}; secret not shown.")
     for read in references.get("graph_reads") or []:
-        state = {"error": ", returned an error"}.get(read.get("disposition"), "")
-        if read.get("pairing") not in {None, "paired"}:
-            state += f", ambiguous result pairing ({read['pairing']}); not usable support"
-        lines.append(f"- graph read `{read['tool']}` (call {read['tool_call_id']}){state}.")
+        lines.append(f"- graph read `{read['tool']}` (call {read['tool_call_id']}).")
     if not lines:
         return []
     return ["References read by Sage from Mythic (the worker's summary is its interpretation of these):", *lines]

@@ -23,9 +23,6 @@ from sage_chat.hitl import (
 from sage_chat.service import _build_request_contract
 from tests.test_supervised_objective_native import driver
 
-# These flows are not tests of the assignment check; its model call answers `consistent` (conftest).
-pytestmark = pytest.mark.usefixtures("consistent_assignment_checker")
-
 
 ACTION = {
     "name": "issue_task_and_waitfor_task_output",

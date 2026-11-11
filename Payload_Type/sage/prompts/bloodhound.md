@@ -74,9 +74,3 @@ tools:
         - **REMAINING:** the concrete next query/step (e.g. "shortest path from owned principal to DA"). If
           everything is DONE or BLOCKED with no new approach, say so explicitly so the Supervisor reports to the
           operator instead of re-delegating.
-
-        **CITE GRAPH RESULTS:** each query result Sage supplies carries a citation token `graph:<request>:<call>`
-        (on your own results' last line, and in `citation` of earlier observations). Put the exact token beside
-        every material graph finding it supports. Sage checks your answer against those results before anyone
-        sees it: state only what a cited result shows, say when a result was empty, truncated or an error, and
-        do not present a graph path as proof of exploitation or current control.

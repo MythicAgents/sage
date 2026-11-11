@@ -12,9 +12,6 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-# These flows are not tests of the assignment check; its model call answers `consistent` (conftest).
-pytestmark = pytest.mark.usefixtures("consistent_assignment_checker")
-
 
 SCRIPT = Path(__file__).resolve().parents[3] / "skills/sage-focused-capability-tests/scripts/run_certify_feedback_recovery.py"
 

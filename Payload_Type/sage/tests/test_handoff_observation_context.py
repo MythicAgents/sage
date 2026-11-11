@@ -107,15 +107,7 @@ def test_retained_task_outputs_reach_generalist_model_input_without_new_authorit
     assert all(generated_instruction not in str(m.content) for m in provider_messages
                if not m.additional_kwargs.get("_assisted_assignment_context"))
     assert worker_summary not in contents
-    # The earlier request's published answer reaches the fresh delegation only as Sage's preceding-answer data,
-    # never as replayed worker prose; the unpublished worker summary stays absent.
-    preceding = [m for m in provider_messages
-                 if m.additional_kwargs.get("_carried_context") == "untrusted_preceding_assistant_answer"]
-    assert len(preceding) == 1 and isinstance(preceding[0], AIMessage)
-    assert '"status": "available"' in preceding[0].content
-    assert "The worker reviewed stored task outputs." in preceding[0].content
-    assert all("The worker reviewed stored task outputs." not in str(m.content)
-               for m in provider_messages if m is not preceding[0])
+    assert "The worker reviewed stored task outputs." not in contents
     assert not any(isinstance(m, ToolMessage) and m.name == "get_all_task_output_by_task_id"
                    for m in provider_messages)
 

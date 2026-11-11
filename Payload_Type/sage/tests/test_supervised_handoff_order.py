@@ -95,11 +95,7 @@ def test_a_resumed_delegation_gets_sage_evidence_but_not_the_earlier_return_tran
                    if m.additional_kwargs.get("_assisted_assignment_context")]
     assert len(assignments) == 1
     assert "Model-authored wording must not replace authority." in assignments[0].content
-    preceding = [m for m in provider_input
-                 if m.additional_kwargs.get("_carried_context") == "untrusted_preceding_assistant_answer"]
-    # No answer was published before this request, so the preceding answer is explicitly unavailable.
-    assert len(preceding) == 1 and '"status": "unavailable"' in preceding[0].content
-    without_assignment = [m for m in provider_input if m not in assignments and m not in preceding]
+    without_assignment = [m for m in provider_input if m not in assignments]
     # The exact operator input ends the call, so no continuation turn is added after it.
     assert without_assignment == [parts[5], delegated]
     assert not any(m in provider_input for m in parts[:5])

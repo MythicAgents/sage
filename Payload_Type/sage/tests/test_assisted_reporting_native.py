@@ -15,9 +15,6 @@ import pytest
 
 from sage_chat.headless import build_chat_request
 
-# These flows are not tests of the assignment check; its model call answers `consistent` (conftest).
-pytestmark = pytest.mark.usefixtures("consistent_assignment_checker")
-
 
 ROOT = Path(__file__).resolve().parents[3]
 MATRIX = ROOT / "skills/sage-focused-capability-tests/scripts/run_operator_prompt_matrix.py"

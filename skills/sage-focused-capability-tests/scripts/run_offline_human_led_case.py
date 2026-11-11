@@ -137,37 +137,11 @@ def install_inert_supervised_preparation(sink, *, commands=("whoami", "shell", "
     sink._prepare_supervised_issue_action = preparer._prepare_supervised_issue_action
 
 
-def _offline_check_verdict(messages) -> AIMessage | None:
-    from ai.langgraph import assignment_check
-
-    instruction = getattr(messages[0], "content", None) if messages else None
-    if instruction == assignment_check.PROPOSAL_INSTRUCTION:
-        return AIMessage(content='{"verdict": "consistent", "reason": "offline case: not a test of the check"}')
-    if instruction != assignment_check.SUPPORT_INSTRUCTION:
-        return None
-    packet = json.loads(messages[1].content)
-    citations = []
-    for source in packet["sources"]:
-        excerpt = source["excerpt"].split("\n", 1)[1].strip() if "\n" in source["excerpt"] else ""
-        if packet["candidate_answer"].strip() and excerpt and not source["source_id"].startswith("graph:"):
-            citations = [{"claim": packet["candidate_answer"].strip()[:40], "source_id": source["source_id"],
-                          "quote": excerpt[:40]}]
-            break
-    return AIMessage(content=json.dumps({"verdict": "supported", "assignment": "satisfied" if citations else "partial",
-                                         "reason": "offline case: not a test of the check",
-                                         "citations": citations}))
-
-
 class ScriptedModel(GenericFakeChatModel):
     def bind_tools(self, tools, **kwargs):
         return self
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):
-        checked = _offline_check_verdict(messages)
-        if checked is not None:
-            # Sage's assignment/answer checks call the same configured model. This case is not a test of those
-            # checks, so they get a fixed passing verdict instead of consuming the scripted conversation.
-            return ChatResult(generations=[ChatGeneration(message=checked)])
         scripted = next(self.messages)
         if callable(scripted):
             scripted = scripted(messages)

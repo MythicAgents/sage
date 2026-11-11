@@ -13,9 +13,7 @@ import pytest
 
 # Passes alone and in serial order but fails in a parallel worker after other modules have run there: shared
 # process state leaks into it that is not yet traced. Run in the offline suite's serial pass until it is.
-pytestmark = [pytest.mark.serial,
-              # Not a test of the assignment/answer check; its model call answers per conftest.
-              pytest.mark.usefixtures("consistent_assignment_checker")]
+pytestmark = pytest.mark.serial
 
 SCRIPT = Path(__file__).resolve().parents[3] / "skills/sage-focused-capability-tests/scripts/run_principal_retrieval_case.py"
 
@@ -386,10 +384,8 @@ def test_component_graph_uses_real_bloodhound_tool_and_hands_back(tmp_path, monk
     assert any("ALICE@LAB is in the retained graph" in str(row["content"])
                for row in result["component_supervisor_messages"])
     assert result["component_supervised_projection"]["harness_replay"] is True
-    # A BloodHound worker's interim prose is held until its answer is checked; only the checked return is
-    # published, so the narration on its tool call no longer streams.
-    assert not any("I'll verify the graph principal." in str(row.get("content"))
-                   for row in result["component_emissions"])
+    assert any("I'll verify the graph principal." in str(row.get("content"))
+               for row in result["component_emissions"])
     assert not rpc_attempts
     assert wrapped.events and wrapped.events[0]["source"] == "mcp"
     assert wrapped.events[0]["result"]["nodes"][0]["name"] == "ALICE@LAB"

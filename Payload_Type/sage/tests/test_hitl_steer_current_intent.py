@@ -34,10 +34,6 @@ from sage_chat.session import (  # noqa: E402
     get_channel_session,
     put_channel_session,
 )
-import pytest
-
-# These flows are not tests of the assignment check; its model call answers `consistent` (conftest).
-pytestmark = pytest.mark.usefixtures("consistent_assignment_checker")
 
 
 REQUEST_ID = "chat:steer:request:1"

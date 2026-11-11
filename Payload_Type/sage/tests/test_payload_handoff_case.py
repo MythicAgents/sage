@@ -14,9 +14,6 @@ import pytest
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from unittest.mock import AsyncMock
 
-# These flows are not tests of the assignment check; its model call answers `consistent` (conftest).
-pytestmark = pytest.mark.usefixtures("consistent_assignment_checker")
-
 
 SCRIPT = Path(__file__).resolve().parents[3] / "skills/sage-focused-capability-tests/scripts/run_payload_handoff_case.py"
 sys.path.insert(0, str(SCRIPT.parent))
