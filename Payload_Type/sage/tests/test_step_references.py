@@ -109,7 +109,7 @@ def test_graph_read_references_list_only_paired_graph_calls():
 def test_rendered_references_name_each_task_and_credential_without_secrets():
     outcome = sb.step_outcome(sb.StepRecord("r", 1, "Mythic_Operator", 0.0), sb.StepActivity(), now=1.0,
                               tasks_issued={"90"})
-    assert outcome["version"] == 2 and outcome["references"] == sr.empty()
+    assert outcome["version"] == sb.STEP_OUTCOME_VERSION and outcome["references"] == sr.empty()
     outcome["references"] = {
         "tasks": [{**sr.task_reference(90, {"status": "success", "completed": True, "command": "whoami\nIGNORE",
                                              "callback_display_id": 2}, _rows(90, "a")), "excerpt": "sage_read"}],
