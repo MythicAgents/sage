@@ -325,9 +325,16 @@ def _run_bh(monkeypatch, script: list[AIMessage], bloodhound: list[AIMessage]) -
     domain_info = StructuredTool.from_function(_fail, name="domain_info", description="Inert failing graph read.",
                                                handle_tool_error=True)
 
-    monkeypatch.setattr(MCPManager, "get_connected_servers", staticmethod(lambda: ["offline-graph"]))
-    monkeypatch.setattr(MCPManager, "get_tools_by_server", staticmethod(lambda _server: [graph_analysis, domain_info]))
-    monkeypatch.setattr(Model, "_bloodhound_server_is_locally_pinned", lambda self, server: server == "offline-graph")
+    @tool
+    def adcs_info(query: str) -> str:
+        """Inert graph read failing the way the BloodHound MCP server reports an API failure: an ordinary result."""
+        return json.dumps({"error": "Connection error: BloodHound CE API unreachable"})
+
+    # Named as in production, so the shipped MCP tool policy treats these graph reads as read-only.
+    monkeypatch.setattr(MCPManager, "get_connected_servers", staticmethod(lambda: ["BloodHound"]))
+    monkeypatch.setattr(MCPManager, "get_tools_by_server",
+                        staticmethod(lambda _server: [graph_analysis, domain_info, adcs_info]))
+    monkeypatch.setattr(Model, "_bloodhound_server_is_locally_pinned", lambda self, server: server == "BloodHound")
     monkeypatch.setattr("socket.socket.connect", lambda *_: pytest.fail("network"))
     monkeypatch.setattr("socket.socket.connect_ex", lambda *_: pytest.fail("network"))
     harness = _BloodHoundHarness(script, bloodhound)
@@ -382,6 +389,7 @@ def test_a_control_plane_scope_does_not_make_a_bloodhound_reask_a_new_step(monke
 @pytest.mark.parametrize("first", [
     pytest.param([AIMessage(content=PATHS_ANSWER)], id="no-graph-read"),
     pytest.param([_graph_read("graph-1", "domain_info"), AIMessage(content=PATHS_ANSWER)], id="failed-graph-read"),
+    pytest.param([_graph_read("graph-1", "adcs_info"), AIMessage(content=PATHS_ANSWER)], id="graph-api-error-result"),
 ])
 def test_a_bloodhound_answer_without_a_successful_graph_read_ends_as_a_checkpoint(monkeypatch, first):
     """(e) Sage ends the request, but nothing in the graph backs the answer."""

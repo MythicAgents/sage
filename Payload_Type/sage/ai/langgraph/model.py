@@ -18978,7 +18978,19 @@ def _successful_graph_reads(messages: list[AnyMessage]) -> int:
     calls = {call.get("id") for message in messages if isinstance(message, AIMessage)
              for call in message.tool_calls or [] if call.get("name") in _BLOODHOUND_AGENT_TOOL_ALLOWLIST}
     return sum(1 for message in messages if isinstance(message, ToolMessage) and message.tool_call_id in calls
-               and getattr(message, "status", None) != "error")
+               and not _graph_read_failed(message))
+
+
+def _graph_read_failed(message: ToolMessage) -> bool:
+    """An error ToolMessage, or a result that is a top-level `{"error": ...}` object: the BloodHound MCP server
+    returns its API and connection failures as an ordinary result in that shape."""
+    if getattr(message, "status", None) == "error":
+        return True
+    try:
+        payload = json.loads(_message_content_as_text(message.content))
+    except (TypeError, ValueError):
+        return False
+    return isinstance(payload, dict) and "error" in payload
 
 
 def _answered_step_repeat_command(
