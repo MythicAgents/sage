@@ -39,7 +39,10 @@ def capture(monkeypatch):
     "The foothold is DC-2\\localuser and already controls every domain.",
     "Callback 7 reports LAB\\analyst on WORKSTATION-7; graph relationships remain unverified.",
 ])
-def test_source_identity_and_refined_assignment_reach_supervisor_after_three_returns(monkeypatch, first_answer):
+def test_source_identity_reaches_supervisor_and_a_bloodhound_reask_is_not_dispatched(monkeypatch, first_answer):
+    """The Supervisor compares BloodHound's answer with callback observations. A corrective re-ask sent right after
+    that answer is not dispatched: Sage decides the request does not ask BloodHound the same thing again, hands the
+    answer back, and the Supervisor answers the operator itself. Asking the correction is a new request."""
     seen = capture(monkeypatch)
     from ai.mcp import MCPManager
     from ai.langgraph.model import Model
@@ -72,7 +75,6 @@ def test_source_identity_and_refined_assignment_reach_supervisor_after_three_ret
         call("transfer_to_BloodHound", {"handoff_title": "Assess graph", "handoff_instruction": first}, "route-2"),
         AIMessage(content=first_answer),
         call("transfer_to_BloodHound", {"handoff_title": "Correct subject", "handoff_instruction": correction}, "route-3"),
-        AIMessage(content="Graph analysis is incomplete; the earlier subject was unsupported."),
         call("respond_to_user", {"final_response":
              "The graph assessment remains incomplete; the earlier subject is unsupported."}, "final-1"),
     ]
@@ -87,8 +89,8 @@ def test_source_identity_and_refined_assignment_reach_supervisor_after_three_ret
 
     harness._build = build_with_tools
     result = asyncio.run(harness.run(prompt, assisted=True))
-    assert len(seen) == 8  # Supervisor assesses the third specialist return
-    for index, instruction in ((4, first), (6, correction)):
+    assert len(seen) == 7  # the Supervisor reads the refused re-ask, then answers
+    for index, instruction in ((4, first),):
         messages = seen[index]
         assignment = [m for m in messages if m.additional_kwargs.get("_assisted_assignment_context")]
         assert len(assignment) == 1
@@ -104,11 +106,11 @@ def test_source_identity_and_refined_assignment_reach_supervisor_after_three_ret
     assert first_answer in supervisor_input and "WORKSTATION-7" in supervisor_input
     returned = [m for m in result["supervisor_messages"]
                 if m.additional_kwargs.get("_assisted_assignment_return")]
-    assert len(returned) == 3  # read, assessment, then corrective assessment
+    assert len(returned) == 2  # read, then assessment; the corrective re-ask never reached BloodHound
     for header, assignment, worker in zip(
         returned,
-        ("Read the available callback metadata.", first, correction),
-        ("Mythic_Operator", "BloodHound", "BloodHound"),
+        ("Read the available callback metadata.", first),
+        ("Mythic_Operator", "BloodHound"),
     ):
         assert "specialist returned; result not verified" in header.content
         assert "not operator input, approval, or source evidence" in header.content
@@ -117,9 +119,11 @@ def test_source_identity_and_refined_assignment_reach_supervisor_after_three_ret
                               "worker": worker, "assignment": assignment}
     assert returned[1] in seen[5]
     assert first_answer in str(seen[5][seen[5].index(returned[1]) + 1].content)
-    assert any(
+    assert not any(
         m.additional_kwargs.get("_assisted_assignment") == correction
         for m in result["bloodhound_messages"])
+    [refused] = [m for m in seen[6] if getattr(m, "tool_call_id", None) == "route-3"]
+    assert "not dispatched" in refused.content and first_answer in refused.content
     final = [m for m in result["messages"] if m.additional_kwargs.get("_is_final_report")][-1]
     assert final.content == "The graph assessment remains incomplete; the earlier subject is unsupported."
     assert first_answer not in final.content and "<untrusted_" not in final.content
@@ -213,7 +217,7 @@ def test_three_specialist_returns_can_reach_pending_native_approval(monkeypatch,
     script = [
         call("transfer_to_BloodHound", {"handoff_title": "Review graph", "handoff_instruction": "Review one relationship."}, "route-a"),
         AIMessage(content="One relationship needs corroboration."),
-        call("transfer_to_BloodHound", {"handoff_title": "Check scope", "handoff_instruction": "Check the scope."}, "route-b"),
+        call("transfer_to_Generalist", {"handoff_title": "Check scope", "handoff_instruction": "Check the scope."}, "route-b"),
         AIMessage(content="Scope remains uncertain."),
         call("transfer_to_BloodHound", {"handoff_title": "Check evidence", "handoff_instruction": "Check the evidence."}, "route-c"),
         AIMessage(content="Evidence is incomplete."),

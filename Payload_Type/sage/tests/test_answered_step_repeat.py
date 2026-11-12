@@ -5,6 +5,10 @@ it needed the operator to supply a tool, and an "already achieved" capability ve
 answer until the no-progress stop. Sage now refuses an unchanged repeat of the step that just answered: it hands the
 answer back once, and a second repeat ends the request with that answer.
 
+BloodHound analysis is one step whatever its title, instruction or scope: once BloodHound answered without effect,
+the next BloodHound question naming no guarded tool is refused the same way, and the request ends `completed` when a
+successful graph read backs the answer, `checkpoint` otherwise.
+
 The scripted checks prove the handoff boundary, not that a real model then calls respond_to_user.
 """
 
@@ -15,9 +19,11 @@ import importlib.util
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
-from langchain_core.messages import AIMessage
-from langchain_core.tools import tool
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.tools import StructuredTool, ToolException, tool
 import pytest
 
 _HARNESS_PATH = Path(__file__).resolve().with_name("test_scripted_handoff.py")
@@ -152,10 +158,10 @@ def test_answered_without_effect(fields, answered):
 
 
 def test_a_delegation_without_a_brief_is_never_compared():
-    # Specialist questions with no structural brief differ only in their prose.
-    assert model_module._answered_step_key("BloodHound", "Find a path", None) == ""
-    assert model_module._answered_step_key("BloodHound", "Find a path", {"targets": [], "expected_result": ""}) == ""
-    assert model_module._answered_step_key("BloodHound", "Find a path", {"expected_result": "a path"}) == ""
+    # Specialist questions with no structural brief differ only in their prose. BloodHound is the exception, below.
+    assert model_module._answered_step_key("Generalist", "Find a path", None) == ""
+    assert model_module._answered_step_key("Generalist", "Find a path", {"targets": [], "expected_result": ""}) == ""
+    assert model_module._answered_step_key("Generalist", "Find a path", {"expected_result": "a path"}) == ""
     brief = {"allowed_capabilities": ["control_plane"], "expected_result": "x"}
     assert model_module._answered_step_key("Mythic_Operator", "Read  TASK", brief) \
         == model_module._answered_step_key("Mythic_Operator", "read task", {**brief, "expected_result": "y"})
@@ -216,3 +222,219 @@ def test_an_already_achieved_verdict_is_not_delegated_again(monkeypatch):
     assert "task=41" in str(final.content)  # the existing proof is named
     assert final.additional_kwargs["_turn_outcome"] == "checkpoint"
     assert _stops(captured) == []
+
+
+# --- BloodHound: an answered analysis is not asked again --------------------------------------------------------
+#
+# Live supervised shape: BloodHound ran its graph queries and answered with the options, then the Supervisor sent
+# BloodHound five more analysis delegations, each with a new title, no brief and an instruction asking for "RAW
+# results only", until the neutral cap stopped the request. Sage now decides the request does not ask BloodHound
+# the same thing again: the first re-ask gets the answer back and the second ends the request with it.
+#
+# Everything is real except the models. BloodHound's turns and the other agents' turns come from separate scripts,
+# so a re-ask that is dispatched is answered as it was live instead of desynchronising one shared script. The
+# scripted Supervisor proves wiring only; whether a real Supervisor re-asks is the live check's question.
+
+PATHS_ANSWER = ("Four options to Domain Admin in partner.test: 1) GenericAll on DC-1 via GROUP-B; "
+                "2) ADCS ESC1 on template USER-ESC; 3) DCSync rights held by SVC-SYNC; 4) a cross-forest trust.")
+REASK_TITLES = (  # the live re-asks' titles, with the domain renamed
+    "BloodHound cross-forest path analysis",
+    "Query BloodHound for partner paths",
+    "BloodHound paths to partner.test DA",
+    "BloodHound path analysis to PARTNER.TEST",
+    "BloodHound path query to PARTNER.TEST",
+)
+CONTROL_PLANE = {"allowed_capabilities": ["control_plane"]}
+
+
+class _RoutedModel(_harness._ScriptedModel):
+    """BloodHound speaks from its own script; every other agent from the main one."""
+
+    bloodhound: Any = None
+    seen: Any = None  # what every non-BloodHound model call was given, in order
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        speaker = any(isinstance(m, SystemMessage) and "You are the **BloodHound Agent**" in str(m.content)
+                      for m in messages)
+        if not speaker:
+            self.seen.append(list(messages))
+        message = next(self.bloodhound if speaker else self.messages)
+        return ChatResult(generations=[ChatGeneration(message=message)])
+
+
+class _BloodHoundHarness(_harness._Harness):
+    def __init__(self, script: list[AIMessage], bloodhound: list[AIMessage]) -> None:
+        super().__init__(script)
+        self.bloodhound = bloodhound
+
+    def _build(self, script):
+        model = super()._build(script)
+        self.fake = _RoutedModel(messages=iter(script), bloodhound=iter(self.bloodhound), seen=[])
+        model._get_base_chat_model = lambda *a, **k: self.fake  # type: ignore[assignment]
+        return model
+
+
+def _bh_handoff(title: str, call_id: str, brief: dict | None = None, instruction: str = "") -> AIMessage:
+    args = {"handoff_title": title,
+            "handoff_instruction": instruction or "Query BloodHound for attack paths into partner.test. Perform the "
+                                                  "tool calls and return the RAW results only.",
+            **(brief or {})}
+    return AIMessage(content="", tool_calls=[{"name": "transfer_to_BloodHound", "args": args, "id": call_id,
+                                              "type": "tool_call"}])
+
+
+def _graph_read(call_id: str, name: str = "graph_analysis") -> AIMessage:
+    return AIMessage(content="", tool_calls=[{"name": name, "args": {"query": "shortest path to Domain Admins"},
+                                              "id": call_id, "type": "tool_call"}])
+
+
+def _respond(text: str) -> AIMessage:
+    return AIMessage(content="", tool_calls=[{"name": "respond_to_user", "args": {
+        "final_response": text, "outcome": "completed"}, "id": "final-1", "type": "tool_call"}])
+
+
+def _first_ask(brief: dict | None = None) -> AIMessage:
+    return _bh_handoff("Cross-forest path to partner.test DA", "h1", brief,
+                       "Query BloodHound for attack paths that lead to Domain Admin in partner.test and list our "
+                       "options.")
+
+
+def _reasks(brief: dict | None = None) -> list[AIMessage]:
+    return [_bh_handoff(title, f"h{index}", brief) for index, title in enumerate(REASK_TITLES, 2)]
+
+
+def _answers(first: list[AIMessage]) -> list[AIMessage]:
+    """BloodHound's first answer, then the same answer to every re-ask that reaches it."""
+    again = [message for index in range(len(REASK_TITLES))
+             for message in (_graph_read(f"graph-again-{index}"), AIMessage(content=PATHS_ANSWER))]
+    return [*first, *again]
+
+
+def _run_bh(monkeypatch, script: list[AIMessage], bloodhound: list[AIMessage]) -> tuple[dict, Any]:
+    from ai.langgraph.model import Model
+    from ai.mcp import MCPManager
+
+    @tool
+    def graph_analysis(query: str) -> str:
+        """Run an inert offline graph query."""
+        return "PATH: USER-A -[MemberOf]-> GROUP-B -[GenericAll]-> DC-1"
+
+    def _fail(query: str) -> str:
+        raise ToolException("graph query failed: database unavailable")
+
+    domain_info = StructuredTool.from_function(_fail, name="domain_info", description="Inert failing graph read.",
+                                               handle_tool_error=True)
+
+    monkeypatch.setattr(MCPManager, "get_connected_servers", staticmethod(lambda: ["offline-graph"]))
+    monkeypatch.setattr(MCPManager, "get_tools_by_server", staticmethod(lambda _server: [graph_analysis, domain_info]))
+    monkeypatch.setattr(Model, "_bloodhound_server_is_locally_pinned", lambda self, server: server == "offline-graph")
+    monkeypatch.setattr("socket.socket.connect", lambda *_: pytest.fail("network"))
+    monkeypatch.setattr("socket.socket.connect_ex", lambda *_: pytest.fail("network"))
+    harness = _BloodHoundHarness(script, bloodhound)
+    limit = _harness._RECURSION_LIMIT
+    _harness._RECURSION_LIMIT = 80
+    try:
+        result = asyncio.run(harness.run(
+            "Use BloodHound to find a path that would give us Domain Admin in partner.test and let me know what our "
+            "options are.", assisted=True))
+    finally:
+        _harness._RECURSION_LIMIT = limit
+    harness.model.supervisor_inputs = harness.fake.seen
+    return result, harness.model
+
+
+def _bh_dispatches(result: dict) -> int:
+    return sum(1 for m in result.get("bloodhound_messages", [])
+               if isinstance(m, HumanMessage) and m.additional_kwargs.get("_delegated_to") == "BloodHound")
+
+
+def _assert_ended_on_the_answer(result: dict, model: Any, outcome: str) -> None:
+    messages = result["supervisor_messages"]
+    assert _bh_dispatches(result) == 1  # no re-ask reached BloodHound
+    assert _steps(messages) == 1
+    # The first re-ask's handback lives in the Supervisor's own loop, which the second re-ask ends; the Supervisor
+    # model read it before sending that second re-ask.
+    [handback] = [m for m in model.supervisor_inputs[-1] if isinstance(m, ToolMessage) and m.tool_call_id == "h2"]
+    assert "not dispatched" in str(handback.content) and PATHS_ANSWER in str(handback.content)
+    final = _final(messages)
+    assert str(final.content) == PATHS_ANSWER
+    assert final.additional_kwargs["_is_final_report"] is True
+    assert final.additional_kwargs["_turn_outcome"] == outcome
+    assert _stops(messages) == []
+    assert getattr(model, "_stop_reason", "") != model_module.STOP_REASON_NO_PROGRESS
+
+
+def test_a_bloodhound_answer_backed_by_a_graph_read_ends_the_request_as_completed(monkeypatch):
+    """(a) The live shape: brief-less re-asks with new titles after an answer backed by a successful graph read."""
+    result, model = _run_bh(monkeypatch, [_first_ask(), *_reasks(), _respond("never reached")],
+                            _answers([_graph_read("graph-1"), AIMessage(content=PATHS_ANSWER)]))
+    _assert_ended_on_the_answer(result, model, "completed")
+
+
+def test_a_control_plane_scope_does_not_make_a_bloodhound_reask_a_new_step(monkeypatch):
+    """(b) The same re-asks, each scoped to the control plane."""
+    result, model = _run_bh(monkeypatch, [_first_ask(CONTROL_PLANE), *_reasks(CONTROL_PLANE),
+                                          _respond("never reached")],
+                            _answers([_graph_read("graph-1"), AIMessage(content=PATHS_ANSWER)]))
+    _assert_ended_on_the_answer(result, model, "completed")
+
+
+@pytest.mark.parametrize("first", [
+    pytest.param([AIMessage(content=PATHS_ANSWER)], id="no-graph-read"),
+    pytest.param([_graph_read("graph-1", "domain_info"), AIMessage(content=PATHS_ANSWER)], id="failed-graph-read"),
+])
+def test_a_bloodhound_answer_without_a_successful_graph_read_ends_as_a_checkpoint(monkeypatch, first):
+    """(e) Sage ends the request, but nothing in the graph backs the answer."""
+    result, model = _run_bh(monkeypatch, [_first_ask(), *_reasks(), _respond("never reached")], _answers(first))
+    _assert_ended_on_the_answer(result, model, "checkpoint")
+
+
+def test_a_bloodhound_step_naming_a_guarded_tool_is_dispatched(monkeypatch):
+    """(c) A BloodHound brief naming a guarded tool in allowed_tools is dispatched after an answer.
+
+    Today BloodHound declares no guarded tool, so its handoff carries no brief and every BloodHound step is
+    analysis. Declaring one gives its handoff the scoped signature (`_create_handoff_tool`), which is the only way a
+    brief can name a guarded tool; this declares `file_upload` so the exemption is exercised at the real handoff.
+    """
+    declared = model_module._worker_guarded_tool_names
+    monkeypatch.setattr(model_module, "_worker_guarded_tool_names",
+                        lambda name: ("file_upload",) if name == "BloodHound" else declared(name))
+    guarded = {"allowed_tools": ["file_upload"], "expected_result": "The collection is ingested."}
+    script = [_first_ask(), _bh_handoff("Ingest the collection", "h2", guarded), _respond("Options are above.")]
+    bloodhound = [_graph_read("graph-1"), AIMessage(content=PATHS_ANSWER), AIMessage(content="Nothing to ingest.")]
+    result, model = _run_bh(monkeypatch, script, bloodhound)
+    delegated = [m.additional_kwargs.get("_handoff_brief", {}).get("allowed_tools")
+                 for m in result["bloodhound_messages"]
+                 if isinstance(m, HumanMessage) and m.additional_kwargs.get("_delegated_to") == "BloodHound"]
+    assert delegated == [[], ["file_upload"]]  # both dispatched; the second carries the guarded tool
+    assert not [m for m in result["supervisor_messages"] if getattr(m, "name", "") == "transfer_to_BloodHound"
+                and "not dispatched" in str(m.content)]
+    assert str(_final(result["supervisor_messages"]).content) == "Options are above."
+
+
+def test_a_bloodhound_reask_after_another_worker_is_dispatched(monkeypatch):
+    """(d) BloodHound, then Mythic_Operator, then BloodHound: the record is only the step that just answered."""
+    script = [_first_ask(), _handoff(READ, "op-1"), AIMessage(content="Callback 5 is alive."),
+              _reasks()[0], _respond("Options are above.")]
+    bloodhound = [_graph_read("graph-1"), AIMessage(content=PATHS_ANSWER),
+                  _graph_read("graph-2"), AIMessage(content=PATHS_ANSWER)]
+    result, model = _run_bh(monkeypatch, script, bloodhound)
+    assert _bh_dispatches(result) == 2
+    assert _steps(result["supervisor_messages"]) == 3
+    assert str(_final(result["supervisor_messages"]).content) == "Options are above."
+    assert _stops(result["supervisor_messages"]) == []
+
+
+def test_bloodhound_analysis_steps_share_one_key():
+    key = model_module._answered_step_key
+    analysis = key("BloodHound", "Find a path", None)
+    assert analysis
+    assert key("BloodHound", "BloodHound path query to PARTNER.TEST", None) == analysis
+    assert key("BloodHound", "Find a path", {"allowed_capabilities": ["control_plane"], "expected_result": "x"}) \
+        == analysis
+    assert key("BloodHound", "Find a path", {"targets": ["partner.test"], "expected_result": "x"}) == analysis
+    # A step naming a guarded tool keeps the exact identity.
+    guarded = key("BloodHound", "Ingest", {"allowed_tools": ["file_upload"], "expected_result": "x"})
+    assert guarded and guarded != analysis
+    # Other workers are unchanged.
+    assert key("Mythic_Operator", "Find a path", None) == ""

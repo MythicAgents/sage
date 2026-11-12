@@ -7141,32 +7141,42 @@ class Model:
         delegated = max((message for message in messages if isinstance(message, HumanMessage)
                          and message.additional_kwargs.get("_delegated_to") == worker), key=_get_seq, default=None)
         kwargs = getattr(delegated, "additional_kwargs", {}) or {}
-        key = _answered_step_key(worker, str(kwargs.get("_handoff_title") or ""), kwargs.get("_handoff_brief"))
+        keys = {_answered_step_key(worker, str(kwargs.get("_handoff_title") or ""), kwargs.get("_handoff_brief"))}
+        # Once BloodHound has answered, asking it any analysis question again asks it the same thing.
+        ending = _TURN_OUTCOME_CHECKPOINT
+        if worker == "BloodHound":
+            keys.add(_BLOODHOUND_ANALYSIS_KEY)
+            if _successful_graph_reads(_current_delegation_messages(messages)):
+                ending = _TURN_OUTCOME_COMPLETED
+        keys.discard("")
         request_id = str(getattr(getattr(self, "_request_contract", None), "request_id", "") or "")
-        if key and request_id:
-            self._answered_step = {"request_id": request_id, "key": key, "answer": answer, "refusals": 0}
+        if keys and request_id:
+            self._answered_step = {"request_id": request_id, "keys": sorted(keys), "answer": answer,
+                                   "refusals": 0, "outcome": ending}
 
-    def _answered_step_repeat(self, worker: str, title: str, brief: Any) -> tuple[str, int] | None:
-        """The prior answer and the refusal count when a delegation re-sends the step that just answered; None
-        dispatches it.
+    def _answered_step_repeat(self, worker: str, title: str, brief: Any) -> tuple[str, int, str] | None:
+        """The prior answer, the refusal count and the outcome to end with when a delegation re-sends the step that
+        just answered; None dispatches it.
 
         Identity is the worker, the step's structural brief and its card title, compared exactly. A step that
         changed nothing returns the same answer when sent again, so live Supervisors re-sent an answered read, a
         worker's report that it needed the operator, and an "already achieved" capability verdict until the
-        no-progress stop. Any other delegation clears the record, so only a back-to-back repeat is refused.
+        no-progress stop. A BloodHound analysis step (one naming no guarded tool) is one step whatever its title or
+        instruction: live Supervisors re-asked a complete BloodHound answer under new titles until the neutral cap.
+        Any other delegation clears the record, so only a back-to-back repeat is refused.
         """
         answered = getattr(self, "_answered_step", None)
         request_id = str(getattr(getattr(self, "_request_contract", None), "request_id", "") or "")
         metadata = brief.as_metadata() if isinstance(brief, _handoff_brief.HandoffBrief) else None
         key = _answered_step_key(worker, title, metadata)
         if (not isinstance(answered, dict) or not key or answered.get("request_id") != request_id
-                or answered.get("key") != key):
+                or key not in answered.get("keys", ())):
             self._answered_step = None
             return None
         answered["refusals"] = int(answered.get("refusals", 0)) + 1
-        logger.info(f"🔒 [handoff] {worker} step re-sent unchanged after it answered; not dispatched "
+        logger.info(f"🔒 [handoff] {worker} step re-sent after it answered; not dispatched "
                     f"({answered['refusals']}/{_SUPERVISED_REPEAT_REFUSAL_CAP})")
-        return str(answered["answer"]), answered["refusals"]
+        return str(answered["answer"]), answered["refusals"], str(answered.get("outcome") or _TURN_OUTCOME_CHECKPOINT)
 
     def _pending_task_receipt_for_request(self) -> dict[str, Any] | None:
         """Return a trusted unfinished-task receipt for this supervised graph request."""
@@ -18463,7 +18473,7 @@ def _create_handoff_tool(
     subgoal_scheduler: Callable[..., dict[str, Any]] | None = None,
     assisted_operator_lookup: Callable[[], str | None] | None = None,
     brief_check: Callable[..., tuple[tuple[str, ...], bool] | None] | None = None,
-    repeat_check: Callable[[str, str, Any], tuple[str, int] | None] | None = None,
+    repeat_check: Callable[[str, str, Any], tuple[str, int, str] | None] | None = None,
     first_step: Callable[..., tuple[str, Any, str, str, str] | None] | None = None,
 ):
     """Create a handoff tool to transfer control to another agent.
@@ -18941,9 +18951,16 @@ def _answered_step_key(worker: str, title: str, brief: Any) -> str:
     """Identity of a supervised step for repeat detection; empty for a delegation with no structural brief,
     which is never compared (consecutive specialist questions without a brief differ only in prose).
 
+    BloodHound is the exception: a BloodHound step that names no guarded tool only reads the graph, so every such
+    step has one identity, whatever its title, instruction or scope. BloodHound declares no guarded tool today, so
+    its handoff carries no brief and every BloodHound step is analysis.
+
     The free-text ``expected_result`` is left out: a re-sent step keeps its worker, title and scope but rewords the
     result it expects each time, so including it let every rewording through as a new step.
     """
+    if worker == "BloodHound" and not (
+            isinstance(brief, Mapping) and set(brief.get("allowed_tools") or ()) & GUARDED_TOOLS):
+        return _BLOODHOUND_ANALYSIS_KEY
     if not isinstance(brief, Mapping):
         return ""
     scope = {key: value for key, value in brief.items() if key != "expected_result"}
@@ -18952,12 +18969,25 @@ def _answered_step_key(worker: str, title: str, brief: Any) -> str:
     return json.dumps([worker, " ".join(title.split()).casefold(), scope], sort_keys=True, default=str)
 
 
+# A BloodHound step that names no guarded tool only reads the graph, whatever its title, instruction or scope.
+_BLOODHOUND_ANALYSIS_KEY = json.dumps(["BloodHound", "analysis"])
+
+
+def _successful_graph_reads(messages: list[AnyMessage]) -> int:
+    """Graph tool calls in these messages whose paired result is not an error."""
+    calls = {call.get("id") for message in messages if isinstance(message, AIMessage)
+             for call in message.tool_calls or [] if call.get("name") in _BLOODHOUND_AGENT_TOOL_ALLOWLIST}
+    return sum(1 for message in messages if isinstance(message, ToolMessage) and message.tool_call_id in calls
+               and getattr(message, "status", None) != "error")
+
+
 def _answered_step_repeat_command(
     runtime: ToolRuntime,
     tool_name: str,
     agent_name: str,
     answer: str,
     refusals: int,
+    outcome: str = _TURN_OUTCOME_CHECKPOINT,
     *,
     channels: Iterable[str],
 ) -> Command:
@@ -18980,11 +19010,12 @@ def _answered_step_repeat_command(
         name=tool_name,
         tool_call_id=runtime.tool_call_id,
     )
-    # A checkpoint, not a completion: Sage ended the request, and the answer may itself be a blocker.
+    # A checkpoint unless the recorded step backs a completion (a BloodHound answer with a successful graph read):
+    # Sage ended the request, and any other answer may itself be a blocker.
     final_message = AIMessage(
         content=answer,
         name="Supervisor",
-        additional_kwargs={"_is_final_report": True, "_turn_outcome": _TURN_OUTCOME_CHECKPOINT},
+        additional_kwargs={"_is_final_report": True, "_turn_outcome": outcome},
     )
     _tag_msg(tool_message, max_seq + 1)
     _tag_msg(final_message, max_seq + 2)
