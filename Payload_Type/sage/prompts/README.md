@@ -81,6 +81,25 @@ new chat, and the agent can no longer use it (Sage filters its tool set against 
 are *always* available; they can't be listed here. The `tools:` list for `mcp_manager.md` governs
 only Sage's own built-in tools.
 
+## Step bounds
+
+A worker's `step_bounds:` frontmatter limits each supervised step it runs (one delegation from the
+Supervisor):
+
+```yaml
+step_bounds:
+  tool_calls: 20          # tool calls the step may run; routing calls do not count
+  active_seconds: 600     # the worker's own time; approval waits and guarded actions do not count
+  consecutive_errors: 3   # tool errors in a row
+```
+
+A missing field, or a missing block, uses the default shown. A valid `SAGE_STEP_MAX_TOOL_CALLS`,
+`SAGE_STEP_MAX_ACTIVE_SECONDS` or `SAGE_STEP_MAX_CONSECUTIVE_ERRORS` value overrides that field for every
+worker; an invalid one is ignored. Values must be positive, and the two counts whole numbers: Sage
+refuses to build its agents from a malformed block rather than guess. A step that reaches a bound
+gets one last model call with no tools, so it can report what it found, and then returns to the
+Supervisor.
+
 ## Troubleshooting
 
 - **My whole prompt shows literal `{something}` text.** You referenced a variable that isn't

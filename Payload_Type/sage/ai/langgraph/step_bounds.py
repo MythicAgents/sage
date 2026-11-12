@@ -5,20 +5,26 @@ guarded action, a tool-call bound, an active-time bound, or a run of tool errors
 operator's approval, and time inside a guarded action (which includes the Mythic task wait, capped separately),
 never counts toward the active-time bound: the bound limits the agent's own work, not the operator's decision time.
 
+Each worker's bounds come from its prompt front matter (`step_bounds:`), and a valid `SAGE_STEP_MAX_*` operator
+override wins over it; they are resolved once per step. A step that reaches a bound gets one final model call with
+no tools offered, so it can return what it found; Sage writes a notice instead when that call yields no text.
+
 The outcome is written by Sage from what happened in the step, never by the model. Pure: callers pass the step's
 messages, the clock readings and the guarded tool set.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+import math
 import os
 from typing import Any, Iterable, Mapping
 
 from . import step_references
 
 # 2: the outcome carries Sage-read references to the step's tasks, credentials and graph reads.
-STEP_OUTCOME_VERSION = 2
+# 3: it also carries the step's resolved bounds and their sources, blocked calls, and the final-answer status.
+STEP_OUTCOME_VERSION = 3
 QUEUED_PREFIX = "[Queued]"
 DENIED_PREFIX = "[DENIED by operator]"
 # Routing results that can appear in a worker's context; they are not work the step did.
@@ -43,14 +49,6 @@ class StepStatus(str, Enum):
 CONTINUABLE = frozenset(StepStatus) - {StepStatus.TASK_PENDING, StepStatus.SUBMISSION_UNKNOWN}
 
 
-def _positive(env: Mapping[str, str], name: str, default: float) -> float:
-    try:
-        value = float(env.get(name, ""))
-    except (TypeError, ValueError):
-        return default
-    return value if value > 0 else default
-
-
 @dataclass(frozen=True)
 class StepBounds:
     tool_calls: int = 20
@@ -59,14 +57,94 @@ class StepBounds:
     # One guarded action per step is a decision, not a tunable.
     guarded_actions: int = 1
 
-    @classmethod
-    def from_env(cls, env: Mapping[str, str] | None = None) -> "StepBounds":
-        env = os.environ if env is None else env
-        return cls(
-            tool_calls=int(_positive(env, "SAGE_STEP_MAX_TOOL_CALLS", cls.tool_calls)),
-            active_seconds=_positive(env, "SAGE_STEP_MAX_ACTIVE_SECONDS", cls.active_seconds),
-            consecutive_errors=int(_positive(env, "SAGE_STEP_MAX_CONSECUTIVE_ERRORS", cls.consecutive_errors)),
-        )
+    def as_dict(self) -> dict[str, int | float]:
+        return {name: getattr(self, name) for name in BOUND_ENV}
+
+
+# Each tunable bound and the operator override that wins over a worker's front matter.
+BOUND_ENV = {
+    "tool_calls": "SAGE_STEP_MAX_TOOL_CALLS",
+    "active_seconds": "SAGE_STEP_MAX_ACTIVE_SECONDS",
+    "consecutive_errors": "SAGE_STEP_MAX_CONSECUTIVE_ERRORS",
+}
+_COUNTS = frozenset({"tool_calls", "consecutive_errors"})
+# The most wall time a step's final, tool-free model call may take, within the request's own limits.
+WRAP_UP_SECONDS = 30.0
+
+
+class StepBoundsError(ValueError):
+    """A worker's front matter declares step bounds Sage cannot use."""
+
+
+def _bound_value(name: str, value: Any) -> int | float | None:
+    """`value` as a usable bound: positive and finite, and a whole number for a count; None otherwise."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        return None
+    if name in _COUNTS:
+        return int(number) if number.is_integer() else None
+    return number
+
+
+def front_matter_bounds(meta: Mapping[str, Any]) -> dict[str, int | float]:
+    """The bounds a worker's prompt front matter declares under `step_bounds`; {} when it declares none.
+
+    Raises StepBoundsError for a declaration Sage cannot use, so a malformed prompt fails the graph build instead
+    of running its worker with bounds nobody chose."""
+    if "step_bounds" not in meta:
+        return {}
+    declared = meta["step_bounds"]
+    if not isinstance(declared, Mapping):
+        raise StepBoundsError(f"step_bounds must be a mapping of {', '.join(BOUND_ENV)}, not {declared!r}")
+    unknown = sorted(str(name) for name in declared if name not in BOUND_ENV)
+    if unknown:
+        raise StepBoundsError(f"step_bounds names unknown bounds: {', '.join(unknown)}")
+    values: dict[str, int | float] = {}
+    for name, raw in declared.items():
+        value = _bound_value(name, raw)
+        if value is None:
+            kind = "whole number" if name in _COUNTS else "number"
+            raise StepBoundsError(f"step_bounds.{name} must be a positive finite {kind}, not {raw!r}")
+        values[name] = value
+    return values
+
+
+def _override(name: str, raw: str | None) -> int | float | None:
+    try:
+        return _bound_value(name, float(str(raw).strip())) if raw is not None and str(raw).strip() else None
+    except ValueError:
+        return None
+
+
+def resolve_bounds(front_matter: Mapping[str, int | float] | None = None,
+                   env: Mapping[str, str] | None = None) -> tuple[StepBounds, dict[str, str]]:
+    """One step's bounds and where each came from: a valid operator override, else the worker's front matter (as
+    parsed by `front_matter_bounds`), else the default. An invalid override sets nothing."""
+    env = os.environ if env is None else env
+    values: dict[str, int | float] = {}
+    sources: dict[str, str] = {}
+    for name, variable in BOUND_ENV.items():
+        override = _override(name, env.get(variable))
+        if override is not None:
+            values[name], sources[name] = override, "env"
+        elif front_matter and name in front_matter:
+            values[name], sources[name] = front_matter[name], "front_matter"
+        else:
+            values[name], sources[name] = getattr(StepBounds, name), "default"
+    return StepBounds(**values), sources
+
+
+class WrapUp(str, Enum):
+    """The step's final, tool-free model call after a bound. Unset when the step ended without reaching one."""
+    PENDING = "pending"      # admitted; the call has not returned
+    ANSWERED = "answered"    # the worker's text was returned
+    EMPTY = "empty"          # the call returned no text (or only tool calls): Sage's notice was returned
+    FAILED = "failed"        # the call raised: Sage's notice was returned
+    TIMEOUT = "timeout"      # the call outran its reserve: Sage's notice was returned
+    SKIPPED = "skipped"      # no time was left in the request: no call, Sage's notice was returned
+    NOT_RUN = "not_run"      # the step closed before the call ran (a stop, a halt or another guard)
 
 
 @dataclass
@@ -86,6 +164,12 @@ class StepRecord:
     detail: str = ""
     # Sage proposed the step's bound procedure itself (`bound_procedure_call`); it does so at most once per step.
     procedure_dispatched: bool = False
+    # Resolved once, when the step starts (`resolve_bounds`).
+    bounds: StepBounds = field(default_factory=StepBounds)
+    bound_sources: dict[str, str] = field(default_factory=dict)
+    # Calls a model response proposed beyond the step's free call slots; removed before any ran.
+    calls_blocked: int = 0
+    wrap_up: WrapUp | None = None
 
     def end(self, status: StepStatus, bound: str = "", detail: str = "") -> None:
         if self.status is None:
@@ -115,6 +199,11 @@ def _text(content: Any) -> str:
     return str(content or "")
 
 
+def is_work_call(name: str) -> bool:
+    """Whether a tool call is work the step's call bound counts, rather than routing."""
+    return not (name.startswith("transfer_to_") or name in CONTROL_TOOLS)
+
+
 def step_activity(messages: Iterable[Any], guarded: frozenset[str]) -> StepActivity:
     """Tool results of one step: how many ran, which guarded actions ran or were denied, the trailing error run."""
     tool_calls, streak, results = 0, 0, []
@@ -123,7 +212,7 @@ def step_activity(messages: Iterable[Any], guarded: frozenset[str]) -> StepActiv
             continue
         name = str(getattr(message, "name", "") or "")
         text = _text(getattr(message, "content", "")).lstrip()
-        if text.startswith(QUEUED_PREFIX) or name.startswith("transfer_to_") or name in CONTROL_TOOLS:
+        if text.startswith(QUEUED_PREFIX) or not is_work_call(name):
             continue  # a deferred proposal or a routing result, not work this step did
         tool_calls += 1
         if name in guarded:
@@ -141,6 +230,31 @@ def bound_reached(activity: StepActivity, record: StepRecord, bounds: StepBounds
     if record.active_seconds >= bounds.active_seconds:
         return "active_time", f"{record.active_seconds:.0f}s active (bound {bounds.active_seconds:.0f}s)"
     return None
+
+
+def budget_line(activity: StepActivity, record: StepRecord) -> str:
+    """The Sage-authored line a worker's model call receives about what is left of its step."""
+    bounds = record.bounds
+    if record.wrap_up is not None:
+        return (f"Step budget (Sage): this step reached its bound ({record.detail}). No tools are offered for this "
+                "final call: answer now from the evidence above, saying what you found and what remains undone.")
+    calls_left = max(0, bounds.tool_calls - activity.tool_calls)
+    seconds_left = max(0.0, bounds.active_seconds - record.active_seconds)
+    return (f"Step budget (Sage): {calls_left} of {bounds.tool_calls} tool calls left; {seconds_left:.0f}s of "
+            f"{bounds.active_seconds:.0f}s active time left; {activity.error_streak} of {bounds.consecutive_errors} "
+            "consecutive tool errors. Approval waits and guarded-action time do not count.")
+
+
+def wrap_up_notice(record: StepRecord, wrap_up: WrapUp) -> str:
+    """What the Supervisor receives when a bounded step's final call yields no answer."""
+    why = {
+        WrapUp.EMPTY: "its final call returned no text",
+        WrapUp.FAILED: "its final call failed",
+        WrapUp.TIMEOUT: f"its final call took longer than {WRAP_UP_SECONDS:.0f}s",
+        WrapUp.SKIPPED: "no time was left in the request for a final call",
+    }[wrap_up]
+    return (f"[Sage] {record.worker} reached its step bound ({record.detail}) and gave no final answer: {why}. "
+            "The tool results and the step outcome are what this step produced; nothing more ran.")
 
 
 def _brief_scope(brief: Any) -> tuple[list[str], list[str]]:
@@ -228,6 +342,7 @@ def step_outcome(record: StepRecord, activity: StepActivity, *, now: float, task
                  credentials_added: Iterable[int] = (), status: StepStatus | None = None) -> dict[str, Any]:
     final = status or record.status or StepStatus.ENDED
     wall = max(0.0, now - record.started)
+    wrap_up = WrapUp.NOT_RUN if record.wrap_up is WrapUp.PENDING else record.wrap_up
     return {
         "version": STEP_OUTCOME_VERSION,
         "worker": record.worker,
@@ -244,6 +359,11 @@ def step_outcome(record: StepRecord, activity: StepActivity, *, now: float, task
         "active_seconds": round(record.active_seconds, 1),
         "action_seconds": round(record.action_seconds, 1),
         "waiting_seconds": round(max(0.0, wall - record.active_seconds - record.action_seconds), 1),
+        "bounds": record.bounds.as_dict(),
+        "bound_sources": dict(record.bound_sources),
+        "calls_blocked": record.calls_blocked,
+        # The final, tool-free call after a bound; "" when the step reached none.
+        "wrap_up": wrap_up.value if wrap_up else "",
     }
 
 
@@ -270,6 +390,13 @@ def render_outcome(outcome: Mapping[str, Any]) -> str:
         f"Time: {outcome['active_seconds']:.0f}s active, {outcome['action_seconds']:.0f}s inside the guarded "
         f"action, {outcome['waiting_seconds']:.0f}s waiting (approval and other).",
     ]
+    if outcome.get("calls_blocked"):
+        lines.append(f"Tool calls not run because the step had no call slots left: {outcome['calls_blocked']}.")
+    if outcome.get("wrap_up"):
+        lines.append("Final answer after the bound: " + {
+            WrapUp.ANSWERED.value: "written by the worker without tools.",
+            WrapUp.NOT_RUN.value: "not run; the step was closed first.",
+        }.get(outcome["wrap_up"], f"none ({outcome['wrap_up']}); Sage returned a partial-result notice."))
     lines.extend(step_references.render_lines(outcome.get("references")))
     ledger = outcome.get("ledger") if isinstance(outcome.get("ledger"), Mapping) else {}
     if ledger.get("recorded"):

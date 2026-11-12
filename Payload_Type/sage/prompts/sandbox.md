@@ -7,6 +7,10 @@ variables: []
 tools:
   - sandbox_exec
   - summarize_and_handback
+step_bounds:   # per supervised step; a valid SAGE_STEP_MAX_* environment value overrides each
+  tool_calls: 20
+  active_seconds: 600
+  consecutive_errors: 3
 ---
 You are the **Sandbox Agent**. You run small, local-only shell or Python snippets inside Sage's isolated `sage-sandbox` container and return the result.
 

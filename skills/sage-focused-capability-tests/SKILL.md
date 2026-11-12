@@ -28,6 +28,17 @@ argument is still accepted and ignored. See `docs/development/TEST_TIERS.md`.
 ## Bundled Scripts
 
 - `build_capability_smoke.py`
+- `check_supervised_step_budget.py --output-dir <dir> [--run]` — three assembled supervised steps, each driven to
+  one step bound (tool calls, active time, consecutive errors) by an inert share probe with synthetic evidence; only
+  the worker's final call after the bound may reach a provider. Default is offline readiness: a local stand-in
+  answers behind the bounded transport and no socket may open (`readiness.json`, status `dry_run_ready`). `--run`
+  sends those three calls to the route in the `--config` file (default `Payload_Type/sage/.env.local`), refusing it
+  unless its model and endpoint hash match `--expected-model` and `--expected-endpoint-sha256` (defaults: the route
+  the script binds), with at most 3 requests, 150,000 total tokens, 1,024 output tokens per call, 180 s and no
+  retries.
+  It writes `set.json` (wire requests, outputs, usage, per-check verdict) and refuses a second set in the same
+  directory. It is paid provider activity: run it only with the operator's authorization. It proves the final
+  call's provider integration, not Mythic or range behaviour.
 - `check_bloodhound_ingest_contract.py --image <id> [--json out.json]` — checks a **built** Sage image's baked
   BloodHound MCP serves the ingest contract (byte upload plus exact-job `status`). It runs one throwaway container
   with `--network none`, the entrypoint bypassed, and only the checker mounted read-only; a loopback fake BloodHound

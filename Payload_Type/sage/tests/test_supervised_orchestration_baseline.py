@@ -98,6 +98,7 @@ def test_baseline_a_worker_step_returns_control_at_its_tool_call_bound(probe_cal
     script = [_handoff({"handoff_title": "Work the objective", "handoff_instruction": "Objective: " + PROMPT,
                         "allowed_capabilities": ["control_plane"], "expected_result": "Probe steps recorded."}),
               *(_probe_step(step) for step in range(bound)),
+              AIMessage(content="partial answer"),  # the one tool-free final answer the bound admits
               AIMessage(content="final")]
 
     result = _run(script, recursion_limit=250)

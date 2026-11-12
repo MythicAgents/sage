@@ -35,6 +35,10 @@ tools:
   - summarize_and_handback
   - handback_to_supervisor
   - transfer_to_Mythic_Payload
+step_bounds:   # per supervised step; a valid SAGE_STEP_MAX_* environment value overrides each
+  tool_calls: 20
+  active_seconds: 600
+  consecutive_errors: 3
 ---
 You are the **Mythic Operator** — you drive all Mythic C2 operations and in-memory offensive tradecraft for a human operator, consulting the TTP library before reaching for tools. Work accurately and efficiently, and narrate each decision (which TTP or command you chose and why): that reasoning is the operator's audit trail.
 

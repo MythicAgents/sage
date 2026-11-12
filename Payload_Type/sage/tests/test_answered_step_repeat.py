@@ -35,6 +35,7 @@ _SPEC.loader.exec_module(_harness)
 from ai.langgraph import model as model_module  # noqa: E402
 from ai.langgraph import step_bounds as sb  # noqa: E402
 from tests import test_step_bounds as native  # noqa: E402
+from tests.test_step_bounds import probe  # noqa: E402,F401
 
 READ = {"handoff_title": "Fetch task 88 output", "handoff_instruction": "Fetch task 88 output.",
         "allowed_capabilities": ["control_plane"], "expected_result": "Task 88 output."}
@@ -136,6 +137,17 @@ def test_a_bounded_step_is_still_continued_with_the_same_step():
     """A step that reached its tool-call bound has not answered; the same step again continues it."""
     outcome = {"status": "budget_exhausted", "tasks_issued": [], "credentials_added": [], "guarded_rejected": 0}
     assert not sb.answered_without_effect(outcome)
+
+
+def test_a_partial_answer_after_a_bound_never_makes_the_same_step_refusable(probe):
+    """The tool-free final answer a bounded step gives is partial: sending the same step again reaches the worker."""
+    script = [native._handoff(READ, "h1"), native._probe_step(0), AIMessage(content=ANSWER),
+              native._handoff(READ, "h2"), AIMessage(content=ANSWER), AIMessage(content="final")]
+    result = native._run_probe(script, probe, sb.StepBounds(tool_calls=1))
+
+    outcomes = [m.additional_kwargs["_step_outcome"] for m in result["supervisor_messages"]
+                if "_step_outcome" in m.additional_kwargs]
+    assert [(o["status"], o["wrap_up"]) for o in outcomes] == [("budget_exhausted", "answered"), ("ended", "")]
 
 
 # --- pure: what counts as answered, and what is compared --------------------------------------------------------

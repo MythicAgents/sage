@@ -15,6 +15,10 @@ tools:
   - get_ttp_full_reference
   - list_ttp_categories
   - summarize_and_handback
+step_bounds:   # per supervised step; a valid SAGE_STEP_MAX_* environment value overrides each
+  tool_calls: 20
+  active_seconds: 600
+  consecutive_errors: 3
 ---
         You are the **BloodHound Agent** — the single owner of the BloodHound attack-graph in Sage.
         BloodHound is central to Sage's purpose, and you own its entire lifecycle:

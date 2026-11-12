@@ -11,14 +11,18 @@ import asyncio
 import base64
 import json
 import importlib.util
+import os
 from pathlib import Path
+import threading
+import time
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
-from langchain_core.messages import AIMessage, ToolMessage
-from langchain_core.tools import tool
+from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
+from langchain_core.tools import ToolException, tool
 from langgraph.checkpoint.memory import InMemorySaver
+from pydantic import Field
 import pytest
 
 _HARNESS_PATH = Path(__file__).resolve().with_name("test_scripted_handoff.py")
@@ -53,12 +57,16 @@ def _record(**fields: Any) -> sb.StepRecord:
     return sb.StepRecord(request_id="r", delegation_seq=1, worker="Mythic_Operator", started=0.0, **fields)
 
 
-def test_bounds_default_to_the_baseline_and_read_positive_overrides():
-    assert sb.StepBounds.from_env({}) == sb.StepBounds(tool_calls=20, active_seconds=600.0, consecutive_errors=3)
-    assert sb.StepBounds.from_env({"SAGE_STEP_MAX_TOOL_CALLS": "12", "SAGE_STEP_MAX_ACTIVE_SECONDS": "90"}) \
-        == sb.StepBounds(tool_calls=12, active_seconds=90.0)
-    assert sb.StepBounds.from_env({"SAGE_STEP_MAX_TOOL_CALLS": "0"}).tool_calls == 20
-    assert sb.StepBounds.from_env({"SAGE_STEP_MAX_TOOL_CALLS": "many"}).tool_calls == 20
+def test_bounds_resolve_env_then_front_matter_then_default():
+    default = sb.StepBounds(tool_calls=20, active_seconds=600.0, consecutive_errors=3)
+    assert sb.resolve_bounds(None, {}) == (default, dict.fromkeys(sb.BOUND_ENV, "default"))
+    bounds, sources = sb.resolve_bounds({"tool_calls": 30, "active_seconds": 120.0},
+                                        {"SAGE_STEP_MAX_TOOL_CALLS": "12", "SAGE_STEP_MAX_CONSECUTIVE_ERRORS": "x"})
+    assert bounds == sb.StepBounds(tool_calls=12, active_seconds=120.0, consecutive_errors=3)
+    assert sources == {"tool_calls": "env", "active_seconds": "front_matter", "consecutive_errors": "default"}
+    for raw in ("0", "-3", "many", "12.5", "nan", "inf", ""):
+        assert sb.resolve_bounds(None, {"SAGE_STEP_MAX_TOOL_CALLS": raw})[0].tool_calls == 20, raw
+    assert sb.resolve_bounds(None, {"SAGE_STEP_MAX_ACTIVE_SECONDS": "90.5"})[0].active_seconds == 90.5
 
 
 def test_activity_counts_executions_not_queued_proposals_and_marks_denials():
@@ -131,14 +139,21 @@ READ_BRIEF = {"handoff_title": "Probe", "allowed_capabilities": ["control_plane"
 
 @pytest.fixture
 def probe(monkeypatch):
-    state = {"calls": [], "clock": 0.0, "advance": 0.0}
+    state = {"calls": [], "clock": 0.0, "advance": 0.0, "fail": False}
 
     @tool
     def baseline_probe_step(step: int) -> str:
         """Test-only probe. Records one worker step and returns immediately."""
         state["calls"].append(step)
-        state["clock"] += state["advance"]
+        if state.get("timed") is None or step in state["timed"]:
+            state["clock"] += state["advance"]
+        if state.get("after_call"):
+            state["after_call"]()
+        if state["fail"]:
+            raise ToolException(f"probe step {step} failed")
         return f"probe step {step} recorded"
+
+    baseline_probe_step.handle_tool_error = True
 
     original = model_module.filter_tools_by_frontmatter
 
@@ -160,23 +175,63 @@ def _probe_step(step: int) -> AIMessage:
         "name": "baseline_probe_step", "args": {"step": step}, "id": f"probe_{step}", "type": "tool_call"}])
 
 
-def _run_probe(script: list[AIMessage], probe: dict, bounds: sb.StepBounds) -> dict:
+class _MenuModel(_NativeScriptedModel):
+    """The native scripted model, also recording the tool menu each call was offered: `()` when no tools were bound,
+    which is what create_agent does with an empty menu."""
+
+    menus: list = Field(default_factory=list)
+    bound: tuple = ()
+
+    def bind_tools(self, tools, **kwargs):
+        return self.model_copy(update={"bound": tuple(
+            model_module._offered_tool_name(item) or getattr(item, "name", "") for item in tools)})
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        self.menus.append(self.bound)
+        return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+
+def _bounds_env(bounds: sb.StepBounds) -> dict[str, str]:
+    """The operator overrides that set `bounds`: one per field that differs from the default."""
+    default = sb.StepBounds()
+    return {name: str(getattr(bounds, field)) for field, name in sb.BOUND_ENV.items()
+            if getattr(bounds, field) != getattr(default, field)}
+
+
+async def _cancel_once(run, started: threading.Event):
+    task = asyncio.ensure_future(run)
+    while not started.is_set() and not task.done():
+        await asyncio.sleep(0.01)
+    task.cancel()
+    return await task
+
+
+def _run_probe(script: list[AIMessage], probe: dict, bounds: sb.StepBounds, *, env: dict | None = None,
+               recursion_limit: int = 200, cancel_when: threading.Event | None = None) -> dict:
+    """Run one scripted supervised request. Bounds reach the step through the operator's environment overrides,
+    the same path production reads; the clock is the probe's."""
     harness = _harness._Harness(script)
     original_build = harness._build
 
     def build(script):
         model = original_build(script)
-        model._step_bounds_config = bounds
         model._step_clock = lambda: probe["clock"]
+        probe["model"] = model
         return model
 
     harness._build = build
-    limit = _harness._RECURSION_LIMIT
-    _harness._RECURSION_LIMIT = 200
+    limit, scripted = _harness._RECURSION_LIMIT, _harness._ScriptedModel
+    _harness._RECURSION_LIMIT, _harness._ScriptedModel = recursion_limit, _MenuModel
+    overrides = {**_bounds_env(bounds), **(env or {})}
     try:
-        return asyncio.run(harness.run(PROMPT, assisted=True))
+        with patch.dict(os.environ, overrides):
+            for name in set(sb.BOUND_ENV.values()) - set(overrides):
+                os.environ.pop(name, None)
+            run = harness.run(PROMPT, assisted=True)
+            return asyncio.run(run if cancel_when is None else _cancel_once(run, cancel_when))
     finally:
-        _harness._RECURSION_LIMIT = limit
+        _harness._RECURSION_LIMIT, _harness._ScriptedModel = limit, scripted
+        probe["fake"] = probe["model"]._get_base_chat_model()
 
 
 def _outcomes(messages: list) -> list[dict]:
@@ -185,7 +240,8 @@ def _outcomes(messages: list) -> list[dict]:
 
 def test_active_time_ends_a_step_at_the_next_model_boundary(probe):
     probe["advance"] = 700.0  # each neutral read takes longer than the whole active-time bound
-    script = [_handoff(READ_BRIEF, "h1"), _probe_step(0), AIMessage(content="final")]
+    script = [_handoff(READ_BRIEF, "h1"), _probe_step(0), AIMessage(content="partial answer"),
+              AIMessage(content="final")]
     result = _run_probe(script, probe, sb.StepBounds())
 
     assert probe["calls"] == [0]
@@ -196,16 +252,19 @@ def test_active_time_ends_a_step_at_the_next_model_boundary(probe):
 
 def test_a_bounded_step_hands_control_back_and_the_next_step_starts_fresh(probe):
     bounds = sb.StepBounds(tool_calls=3)
-    script = [_handoff(READ_BRIEF, "h1"), *(_probe_step(i) for i in range(3)),
-              _handoff(READ_BRIEF, "h2"), *(_probe_step(i) for i in range(3, 6)),
+    script = [_handoff(READ_BRIEF, "h1"), *(_probe_step(i) for i in range(3)), AIMessage(content="first partial"),
+              _handoff(READ_BRIEF, "h2"), *(_probe_step(i) for i in range(3, 6)), AIMessage(content="second partial"),
               AIMessage(content="final")]
     result = _run_probe(script, probe, bounds)
 
     assert probe["calls"] == list(range(6))
     outcomes = _outcomes(result["supervisor_messages"])
-    assert [(o["status"], o["tool_calls"]) for o in outcomes] == [("budget_exhausted", 3)] * 2
+    assert [(o["status"], o["tool_calls"], o["wrap_up"]) for o in outcomes] == [("budget_exhausted", 3, "answered")] * 2
     assert not any(m.additional_kwargs.get("_is_final_report") and "Blocked" in str(m.content)
                    for m in result["supervisor_messages"])
+    # The second delegation's first call starts from the whole budget again.
+    lines = _budget_lines(probe)
+    assert lines[4] == lines[0] == _line(3, 3, 600, 0)
 
 
 def test_conversation_lane_steps_are_not_bounded(probe):
@@ -219,6 +278,318 @@ def test_conversation_lane_steps_are_not_bounded(probe):
         _harness.build_request_contract = real_build
     assert probe["calls"] == list(range(4))
     assert _outcomes(result["supervisor_messages"]) == []
+
+
+# --- assembled: per-worker budget, the budget line, call slots and the one tool-free final answer --------------
+
+WRAP = "Partial answer: probes 0-2 recorded; the rest of the objective is unexplored."
+
+
+def _line(left: int, limit: int, seconds_left: float, errors: int, *, error_limit: int = 3,
+          seconds: float = 600) -> str:
+    return (f"Step budget (Sage): {left} of {limit} tool calls left; {seconds_left:.0f}s of {seconds:.0f}s active "
+            f"time left; {errors} of {error_limit} consecutive tool errors. Approval waits and guarded-action time "
+            "do not count.")
+
+
+def _budget_lines(probe: dict) -> list[str]:
+    """The Sage budget line each worker model call received, in call order; '' for a call that had none."""
+    return _worker_budget_lines(probe["fake"].inputs)
+
+
+def _worker_budget_lines(inputs: list[list]) -> list[str]:
+    lines = []
+    for messages in inputs:
+        if not any(getattr(m, "additional_kwargs", {}).get("_delegated_to") == "Mythic_Operator" for m in messages):
+            continue  # a Supervisor call
+        system = "\n".join(model_module._message_content_as_text(m.content) for m in messages
+                           if isinstance(m, SystemMessage))
+        found = [line for line in system.splitlines() if line.startswith("Step budget (Sage):")]
+        lines.append(found[0] if len(found) == 1 else "" if not found else "<duplicated>")
+    return lines
+
+
+def _worker_menus(probe: dict) -> list[tuple]:
+    fake = probe["fake"]
+    return [menu for menu, messages in zip(fake.menus, fake.inputs)
+            if any(getattr(m, "additional_kwargs", {}).get("_delegated_to") == "Mythic_Operator" for m in messages)]
+
+
+def _forwarded(result: dict) -> list[str]:
+    """The worker answer the Supervisor received for each step: the message directly after its completion header."""
+    messages = result["supervisor_messages"]
+    return [str(messages[index + 1].content) for index, m in enumerate(messages[:-1])
+            if m.additional_kwargs.get("_is_completion_header")]
+
+
+def _probe_batch(steps: list[int]) -> AIMessage:
+    return AIMessage(content="", tool_calls=[{"name": "baseline_probe_step", "args": {"step": step},
+                                              "id": f"probe_{step}", "type": "tool_call"} for step in steps])
+
+
+def _wrap(text: str = WRAP, *, call: int | None = 99) -> AIMessage:
+    """An adversarial final answer: prose plus a tool call the wrap-up must never run."""
+    return AIMessage(content=text, tool_calls=[] if call is None else [
+        {"name": "baseline_probe_step", "args": {"step": call}, "id": f"probe_{call}", "type": "tool_call"}])
+
+
+@pytest.mark.parametrize("reason", ["tool_calls", "active_time", "consecutive_errors"])
+def test_each_bound_admits_one_tool_free_final_answer_that_reaches_the_supervisor_verbatim(probe, reason):
+    if reason == "active_time":
+        probe["advance"] = 700.0
+        work = [_probe_step(0)]
+    else:
+        probe["fail"] = reason == "consecutive_errors"
+        work = [_probe_step(i) for i in range(3)]
+    script = [_handoff(READ_BRIEF, "h1"), *work, _wrap(), AIMessage(content="final")]
+    result = _run_probe(script, probe, sb.StepBounds(tool_calls=3) if reason == "tool_calls" else sb.StepBounds())
+
+    assert probe["calls"] == list(range(len(work)))       # the wrap-up's own call never ran
+    assert not any(isinstance(m, ToolMessage) and m.tool_call_id == "probe_99"
+                   for m in result["mythic_operator_messages"])  # nor was it routed to the tool boundary
+    [outcome] = _outcomes(result["supervisor_messages"])
+    assert (outcome["status"], outcome["bound"], outcome["wrap_up"]) == ("budget_exhausted", reason, "answered")
+    assert _forwarded(result) == [WRAP]                   # exactly the worker's words, nothing appended
+    menus = _worker_menus(probe)
+    assert len(menus) == len(work) + 1                    # one final invocation, no retry
+    assert menus[-1] == () and all("baseline_probe_step" in menu for menu in menus[:-1])
+    assert _budget_lines(probe)[-1].startswith("Step budget (Sage): this step reached its bound")
+
+
+@pytest.mark.parametrize("final, status", [
+    (AIMessage(content="", tool_calls=[{"name": "baseline_probe_step", "args": {"step": 99}, "id": "p99",
+                                        "type": "tool_call"}]), "empty"),
+    (AIMessage(content=""), "empty"),
+    (lambda messages: (_ for _ in ()).throw(RuntimeError("provider unavailable")), "failed"),
+], ids=["tool-only", "empty", "failed"])
+def test_a_final_call_without_usable_text_returns_sages_partial_result_notice(probe, final, status):
+    script = [_handoff(READ_BRIEF, "h1"), *(_probe_step(i) for i in range(2)), final, AIMessage(content="final")]
+    # The script holds no spare reply: a further model attempt (a retry or a summary synthesis) would consume the
+    # Supervisor's and fail the run.
+    result = _run_probe(script, probe, sb.StepBounds(tool_calls=2))
+
+    assert probe["calls"] == [0, 1]
+    [outcome] = _outcomes(result["supervisor_messages"])
+    assert (outcome["status"], outcome["bound"], outcome["wrap_up"]) == ("budget_exhausted", "tool_calls", status)
+    [notice] = _forwarded(result)
+    assert notice.startswith("[Sage] Mythic_Operator reached its step bound (2 tool calls (bound 2))")
+    assert len(_worker_menus(probe)) == 3
+
+
+def test_a_final_call_that_overruns_its_reserve_returns_the_notice(probe, monkeypatch):
+    monkeypatch.setattr(sb, "WRAP_UP_SECONDS", 0.05)
+
+    def slow(messages):
+        time.sleep(0.5)
+        return AIMessage(content="too late")
+
+    script = [_handoff(READ_BRIEF, "h1"), _probe_step(0), slow, AIMessage(content="final")]
+    result = _run_probe(script, probe, sb.StepBounds(tool_calls=1))
+
+    [outcome] = _outcomes(result["supervisor_messages"])
+    assert outcome["wrap_up"] == "timeout"
+    assert "too late" not in "\n".join(_forwarded(result))
+
+
+def _wrap_up_states(probe: dict) -> list[str]:
+    return [record.wrap_up.value for record in probe["model"]._step_records.values() if record.wrap_up]
+
+
+def test_a_cancelled_final_call_is_not_turned_into_an_answer(probe):
+    """The operator's stop cancels the request task while the final call is in flight; the cancellation wins."""
+    started = threading.Event()
+
+    def in_flight(messages):
+        started.set()
+        time.sleep(0.5)
+        return AIMessage(content="never delivered")
+
+    script = [_handoff(READ_BRIEF, "h1"), _probe_step(0), in_flight, AIMessage(content="final")]
+    with pytest.raises((asyncio.CancelledError, model_module.NodeCancelledError)):
+        _run_probe(script, probe, sb.StepBounds(tool_calls=1), cancel_when=started)
+    assert _wrap_up_states(probe) == ["pending"]  # no notice or answer was made of the cancelled call
+
+
+def test_a_provider_filtered_final_call_keeps_the_provider_filter_outcome(probe):
+    filtered = AIMessage(content="", response_metadata={"finish_reason": "content_filter"})
+    script = [_handoff(READ_BRIEF, "h1"), _probe_step(0), filtered, AIMessage(content="final")]
+    with pytest.raises(model_module._ProviderFilteredResponse):  # the request's own provider-filter ending
+        _run_probe(script, probe, sb.StepBounds(tool_calls=1))
+    assert _wrap_up_states(probe) == ["pending"]
+
+
+def test_no_final_call_is_made_once_the_request_deadline_has_passed(probe):
+    def deadline_passes():
+        probe["model"]._eval_arm_deadline_epoch = time.time() - 1.0  # the request's deadline ends during the read
+
+    probe["after_call"] = deadline_passes
+    script = [_handoff(READ_BRIEF, "h1"), _probe_step(0), AIMessage(content="final")]
+    result = _run_probe(script, probe, sb.StepBounds(tool_calls=1))
+
+    [outcome] = _outcomes(result["supervisor_messages"])
+    assert outcome["wrap_up"] == "skipped"
+    assert len(_worker_menus(probe)) == 1  # no final call reached the model
+    assert _forwarded(result)[0].startswith("[Sage] Mythic_Operator reached its step bound")
+
+
+def test_the_request_step_limit_wins_over_the_final_call(probe):
+    script = [_handoff(READ_BRIEF, "h1"), _probe_step(0), _wrap(), AIMessage(content="final")]
+    harness_build = _harness._Harness._build
+
+    def build(self, script):
+        model = harness_build(self, script)
+        model._max_steps = 2  # the Supervisor's handoff and the worker's one read: no model step is left
+        return model
+
+    with patch.object(_harness._Harness, "_build", build):
+        try:
+            _run_probe(script, probe, sb.StepBounds(tool_calls=1))
+        except Exception:
+            pass  # how the request reports its own halt is not this test's subject
+    assert len(_worker_menus(probe)) == 1  # the final call never reached the model
+
+
+def test_an_oversized_batch_runs_only_the_free_call_slots(probe):
+    script = [_handoff(READ_BRIEF, "h1"), _probe_step(0), _probe_batch([1, 2, 3, 4]), _wrap(),
+              AIMessage(content="final")]
+    result = _run_probe(script, probe, sb.StepBounds(tool_calls=3))
+
+    assert sorted(probe["calls"]) == [0, 1, 2]  # the batch's kept calls run concurrently
+    [outcome] = _outcomes(result["supervisor_messages"])
+    assert (outcome["tool_calls"], outcome["calls_blocked"], outcome["wrap_up"]) == (3, 2, "answered")
+    channel = result["mythic_operator_messages"]
+    called = {c["id"] for m in channel if isinstance(m, AIMessage) for c in m.tool_calls}
+    answered = {m.tool_call_id for m in channel if isinstance(m, ToolMessage) and m.name == "baseline_probe_step"}
+    assert {"probe_3", "probe_4"}.isdisjoint(called) and called == answered  # every kept call has its result
+
+
+def test_each_worker_call_receives_its_exact_remaining_budget(probe):
+    # Sequential reads take 10s each; the parallel batch takes none, so its overlapping calls cannot blur the line.
+    probe["advance"], probe["timed"] = 10.0, {0, 3}
+    script = [_handoff(READ_BRIEF, "h1"), _probe_step(0), _probe_batch([1, 2]), _probe_step(3), _wrap(),
+              AIMessage(content="final")]
+    _run_probe(script, probe, sb.StepBounds(tool_calls=4))
+
+    lines = _budget_lines(probe)
+    assert lines[:3] == [_line(4, 4, 600, 0), _line(3, 4, 590, 0), _line(1, 4, 590, 0)]
+    assert lines[3] == ("Step budget (Sage): this step reached its bound (4 tool calls (bound 4)). No tools are "
+                        "offered for this final call: answer now from the evidence above, saying what you found "
+                        "and what remains undone.")
+
+
+def test_a_step_under_its_bounds_ends_on_its_own_answer_without_a_final_call(probe):
+    script = [_handoff(READ_BRIEF, "h1"), _probe_step(0), AIMessage(content="worker done"),
+              AIMessage(content="final")]
+    result = _run_probe(script, probe, sb.StepBounds())
+
+    [outcome] = _outcomes(result["supervisor_messages"])
+    assert (outcome["status"], outcome["wrap_up"], outcome["calls_blocked"]) == ("ended", "", 0)
+    assert _forwarded(result) == ["worker done"]
+    assert _budget_lines(probe) == [_line(20, 20, 600, 0), _line(19, 20, 600, 0)]
+
+
+def test_the_tool_boundary_denies_a_call_the_final_answer_filter_missed(probe, monkeypatch):
+    monkeypatch.setattr(model_module, "_strip_tool_calls", lambda message: None)  # the model-side removal fails
+    script = [_handoff(READ_BRIEF, "h1"), _probe_step(0), _wrap(), AIMessage(content="final")]
+    result = _run_probe(script, probe, sb.StepBounds(tool_calls=1))
+
+    assert probe["calls"] == [0]  # the wrap-up's call reached the tool boundary and was refused there
+    denied = [m for m in result["mythic_operator_messages"]
+              if isinstance(m, ToolMessage) and m.tool_call_id == "probe_99"]
+    assert len(denied) == 1 and json.loads(denied[0].content)["verdict"] == "blocked"
+
+
+def test_the_conversation_lane_gets_no_budget_line_slots_or_final_call(probe):
+    real_build = _harness.build_request_contract
+    _harness.build_request_contract = lambda **kw: real_build(**{**kw, "mode": "conversation"})
+    try:
+        script = [_handoff({"handoff_title": "Probe"}, "h1"), _probe_batch([0, 1, 2]),
+                  AIMessage(content="worker done"), AIMessage(content="final")]
+        _run_probe(script, probe, sb.StepBounds(tool_calls=2))
+    finally:
+        _harness.build_request_contract = real_build
+    assert sorted(probe["calls"]) == [0, 1, 2]
+    assert _budget_lines(probe) == ["", ""]
+
+
+def _with_front_matter(monkeypatch, worker_prompt: str, bounds: Any) -> None:
+    """One worker prompt's `step_bounds` replaced, merged over its shipped block when both are mappings."""
+    original = model_module.load_prompt_meta
+
+    def meta(name):
+        shipped = original(name)
+        if name != worker_prompt:
+            return shipped
+        if isinstance(bounds, dict) and isinstance(shipped.get("step_bounds"), dict):
+            return {**shipped, "step_bounds": {**shipped["step_bounds"], **bounds}}
+        return {**shipped, "step_bounds": bounds}
+
+    monkeypatch.setattr(model_module, "load_prompt_meta", meta)
+
+
+def test_a_front_matter_bound_applies_to_its_worker_and_no_other(probe, monkeypatch):
+    _with_front_matter(monkeypatch, "mythic_operator", {"tool_calls": 2})
+    script = [_handoff(READ_BRIEF, "h1"), *(_probe_step(i) for i in range(3)), _wrap(),
+              AIMessage(content="", tool_calls=[{"name": "transfer_to_Generalist", "id": "g1", "type": "tool_call",
+                                                 "args": {"handoff_title": "Explain the probe"}}]),
+              AIMessage(content="generalist answer"), AIMessage(content="final")]
+    result = _run_probe(script, probe, sb.StepBounds())
+
+    assert probe["calls"] == [0, 1]
+    operator, generalist = _outcomes(result["supervisor_messages"])
+    assert (operator["worker"], operator["bound"], operator["tool_calls"]) == ("Mythic_Operator", "tool_calls", 2)
+    assert operator["bounds"] == {"tool_calls": 2, "active_seconds": 600.0, "consecutive_errors": 3}
+    assert operator["bound_sources"] == dict.fromkeys(sb.BOUND_ENV, "front_matter")
+    assert generalist["worker"] == "Generalist"  # its own shipped front matter, untouched by the operator's
+    assert generalist["bounds"] == {"tool_calls": 20, "active_seconds": 600, "consecutive_errors": 3}
+    assert generalist["bound_sources"] == dict.fromkeys(sb.BOUND_ENV, "front_matter")
+
+
+@pytest.mark.parametrize("env, bound, source", [
+    ({"SAGE_STEP_MAX_TOOL_CALLS": "1"}, 1, "env"),              # a valid operator override wins
+    ({"SAGE_STEP_MAX_TOOL_CALLS": "1.5"}, 2, "front_matter"),   # not a count: ignored
+    ({"SAGE_STEP_MAX_TOOL_CALLS": "0"}, 2, "front_matter"),
+    ({"SAGE_STEP_MAX_TOOL_CALLS": "inf"}, 2, "front_matter"),
+    ({"SAGE_STEP_MAX_TOOL_CALLS": ""}, 2, "front_matter"),      # empty sets nothing
+])
+def test_an_operator_override_wins_only_when_valid(probe, monkeypatch, env, bound, source):
+    _with_front_matter(monkeypatch, "mythic_operator", {"tool_calls": 2})
+    script = [_handoff(READ_BRIEF, "h1"), *(_probe_step(i) for i in range(bound)), _wrap(),
+              AIMessage(content="final")]
+    result = _run_probe(script, probe, sb.StepBounds(), env=env)
+
+    [outcome] = _outcomes(result["supervisor_messages"])
+    assert (outcome["tool_calls"], outcome["bounds"]["tool_calls"]) == (bound, bound)
+    assert outcome["bound_sources"]["tool_calls"] == source
+
+
+@pytest.mark.parametrize("declared", [
+    {"tool_calls": 0}, {"tool_calls": 2.5}, {"tool_calls": True}, {"tool_calls": "20"},
+    {"active_seconds": float("inf")}, {"active_seconds": float("nan")}, {"active_seconds": -1},
+    {"consecutive_errors": None}, {"turns": 5}, [20], "20", None,
+])
+def test_malformed_front_matter_bounds_fail_the_build(monkeypatch, declared):
+    _with_front_matter(monkeypatch, "mythic_operator", declared)
+    model = SimpleNamespace(mode="supervised", _get_base_chat_model=lambda: None)
+    with pytest.raises(sb.StepBoundsError):
+        model_module.Model._context_middleware(model, agent_name="Mythic_Operator")
+
+
+@pytest.mark.parametrize("declared, expected", [
+    ({}, {}),
+    ({"tool_calls": 30}, {"tool_calls": 30}),
+    ({"tool_calls": 30.0, "active_seconds": 90.5, "consecutive_errors": 4},
+     {"tool_calls": 30, "active_seconds": 90.5, "consecutive_errors": 4}),
+])
+def test_well_formed_front_matter_bounds_parse(declared, expected):
+    assert sb.front_matter_bounds({"step_bounds": declared}) == expected
+    assert sb.front_matter_bounds({}) == {}
+
+
+def test_every_shipped_worker_declares_the_unchanged_default_bounds():
+    for worker, prompt in model_module._WORKER_PROMPTS.items():
+        declared = sb.front_matter_bounds(model_module.load_prompt_meta(prompt))
+        assert declared == {"tool_calls": 20, "active_seconds": 600, "consecutive_errors": 3}, worker
 
 
 @pytest.mark.parametrize("mode, bounded", [("auto", False), ("supervised", True), ("conversation", True)])
@@ -333,6 +704,30 @@ def test_one_executed_action_ends_the_step_before_a_second_card():
     # The hour awaiting approval and the guarded action's own wait do not count as active time.
     assert outcome["active_seconds"] == 0.0 and outcome["action_seconds"] == 500.0
     assert outcome["waiting_seconds"] == 3600.0
+
+
+def test_the_budget_line_after_an_approved_action_excludes_the_approval_wait_and_the_action():
+    clock = {"now": 0.0}
+    asyncio.run(_native(_script({**BRIEF, "allowed_tools": [ISSUE]}), "accept", clock=clock))
+
+    lines = _worker_budget_lines(_native.last.model._get_base_chat_model().inputs)
+    # Before the action, and after an hour's approval wait plus 500s inside the guarded action.
+    assert lines == [_line(20, 20, 600, 0), _line(19, 20, 600, 0)]
+
+
+def test_a_guarded_call_in_the_final_answer_never_reaches_an_approval_card():
+    """The step's one action ran and used its last call slot; the final call proposes another action anyway."""
+    handoff = {"handoff_title": "inspect token privileges", "handoff_instruction": ORIGINAL, **BRIEF,
+               "allowed_tools": [ISSUE]}
+    final = _call(NEW_ACTION["name"], NEW_ACTION["args"], 3).model_copy(update={"content": "getprivs ran."})
+    script = [_call("transfer_to_Mythic_Operator", handoff, 1), _call(OLD_ACTION["name"], OLD_ACTION["args"], 2),
+              final, AIMessage(content="Final answer.")]
+    with patch.dict(os.environ, {"SAGE_STEP_MAX_TOOL_CALLS": "1"}):
+        effects, cards, outcomes = asyncio.run(_native(script, "accept", clock={"now": 0.0}))
+
+    assert effects == ["getprivs"] and cards == ["getprivs"]  # no card for the final call's proposal
+    [outcome] = outcomes
+    assert (outcome["status"], outcome["bound"], outcome["wrap_up"]) == ("budget_exhausted", "tool_calls", "answered")
 
 
 def test_an_operator_rejection_ends_the_step_without_another_proposal_card():

@@ -2323,6 +2323,17 @@ class _TurnAuthorityInjectionMiddleware(AgentMiddleware):
         self._model = model
         self._agent_name = agent_name
 
+    def _budget_line(self, request: Any) -> str:
+        """What is left of a supervised worker step, from its own record; '' outside one."""
+        line = getattr(self._model, "_supervised_step_budget_line", None)
+        if not self._agent_name or not callable(line):
+            return ""
+        try:
+            return line(self._agent_name, getattr(request, "state", None))
+        except Exception as exc:  # pragma: no cover - the authority context must still reach the model
+            logger.warning(f"step budget line not built: {type(exc).__name__}: {exc}")
+            return ""
+
     def _augment(self, request):
         try:
             authority = getattr(self._model, "_turn_authority", TurnAuthority(mode="observe"))
@@ -2347,6 +2358,9 @@ class _TurnAuthorityInjectionMiddleware(AgentMiddleware):
             supervised_context = supervised_projection() if callable(supervised_projection) else ""
             if supervised_context:
                 context += "\n" + supervised_context
+            budget_line = self._budget_line(request)
+            if budget_line:
+                context += "\n" + budget_line
             if messages and isinstance(messages[-1], AIMessage):
                 # Bedrock rejects assistant prefill. Keep its required user turn, but identify
                 # this exact final message from trusted context rather than relying on its label.
@@ -2904,8 +2918,12 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
     calls. Model calls and read tools count as active time; guarded tool execution (which contains the Mythic task
     wait) and the approval pause do not. A guarded call is removed from the model's response, before any after-model
     hook or approval card, when the step already ran or was denied its one guarded action, or when the call is outside
-    the step's brief. Ending the step at a bound happens in the turn-authority `before_model`
-    (`Model._supervised_step_should_end`). Supervised lane only; other requests pass through untouched.
+    the step's brief. Work calls beyond the step's free call slots are removed the same way.
+
+    Reaching a bound is detected in the turn-authority `before_model` (`Model._supervised_step_should_end`), which
+    admits one final model call: this middleware offers it no tools, removes any tool call it returns, and returns
+    Sage's notice when it yields no text. The tool wrappers refuse any call that reaches them after the bound.
+    Supervised lane only; other requests pass through untouched.
     """
 
     def __init__(self, model: "Model", agent_name: str, guarded: frozenset[str]):
@@ -2914,6 +2932,10 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
         self._agent_name = agent_name
         self._guarded = guarded
         model._step_guarded_tools = {**getattr(model, "_step_guarded_tools", {}), agent_name: guarded}
+        # Read at graph build, so a malformed declaration fails the build instead of a step.
+        prompt = _WORKER_PROMPTS.get(agent_name)
+        declared = _step_bounds.front_matter_bounds(load_prompt_meta(prompt)) if prompt else {}
+        model._step_front_matter = {**getattr(model, "_step_front_matter", {}), agent_name: declared}
 
     def _record(self, request: Any) -> Any:
         return self._model._supervised_step_record(
@@ -2994,11 +3016,7 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
     def _limit_response(self, request: Any, response: Any) -> None:
         """Remove a guarded call this step may not make from the model's response, in place."""
         record = self._record(request)
-        result = getattr(response, "result", None)
-        if result is None:
-            result = getattr(getattr(response, "model_response", None), "result", None)
-        candidates = [response] if isinstance(response, AIMessage) else list(result or [])
-        message = next((item for item in reversed(candidates) if isinstance(item, AIMessage)), None)
+        message = _response_message(response)
         if record is None or message is None:
             return
         guarded = [call for call in message.tool_calls if str(call.get("name") or "") in self._guarded]
@@ -3134,6 +3152,95 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
         except Exception as exc:  # pragma: no cover - never break the model path on bookkeeping
             logger.debug(f"capability grounding/plannability check skipped (fail-open): {exc}")
 
+    def _bound_to_slots(self, request: Any, response: Any) -> None:
+        """Keep only as many work calls of a response as the step has call slots left, in order, so a parallel
+        batch never runs past the bound. Removed calls leave the message, so every kept call keeps its result."""
+        record = self._record(request)
+        message = _response_message(response)
+        if record is None or message is None:
+            return
+        work = [call for call in message.tool_calls if _step_bounds.is_work_call(str(call.get("name") or ""))]
+        state_messages = _agent_state_messages(getattr(request, "state", None))
+        used = _step_bounds.step_activity(_current_delegation_messages(state_messages), self._guarded).tool_calls
+        free = max(0, record.bounds.tool_calls - used)
+        if len(work) <= free:
+            return
+        dropped = work[free:]
+        record.calls_blocked += len(dropped)
+        _remove_tool_calls(message, {str(call.get("id") or "") for call in dropped},
+                           f"[step-boundary] {len(dropped)} tool call(s) not run: this step had {free} of its "
+                           f"{record.bounds.tool_calls} tool calls left.")
+
+    def _wrap_up_reserve(self) -> float:
+        """Seconds the final call may take: the fixed reserve, within the request's own deadline when it has one."""
+        deadline = getattr(self._model, "_eval_arm_deadline_epoch", None)
+        reserve = _step_bounds.WRAP_UP_SECONDS
+        return reserve if deadline is None else min(reserve, deadline - time.time())
+
+    def _wrap_up_notice(self, record: Any, status: "_step_bounds.WrapUp") -> AIMessage:
+        record.wrap_up = status
+        logger.info(f"⏹️ [{self._agent_name}] final call after the bound: {status.value}; Sage's notice returned")
+        return AIMessage(content=_step_bounds.wrap_up_notice(record, status), name=self._agent_name,
+                         additional_kwargs={"_step_wrap_up_notice": status.value})
+
+    def _finish_wrap_up(self, record: Any, response: Any) -> Any:
+        """The final call's text exactly as written, with every tool call removed; Sage's notice when no text is
+        left. A provider-filtered response passes through untouched for the outermost filter to end the request."""
+        message = _response_message(response)
+        if message is not None and _is_provider_filtered_message(message):
+            return response
+        if message is not None:
+            _strip_tool_calls(message)
+            if _message_content_as_text(message.content).strip():
+                record.wrap_up = _step_bounds.WrapUp.ANSWERED
+                return response
+        return self._wrap_up_notice(record, _step_bounds.WrapUp.EMPTY)
+
+    def _wrap_up_failed(self, record: Any, exc: Exception) -> AIMessage:
+        logger.warning(f"[{self._agent_name}] final call after the bound failed: {type(exc).__name__}: {exc}")
+        return self._wrap_up_notice(record, _step_bounds.WrapUp.FAILED)
+
+    def _wrap_up(self, request: Any, handler: Any, record: Any) -> Any:
+        if self._wrap_up_reserve() <= 0:
+            return self._wrap_up_notice(record, _step_bounds.WrapUp.SKIPPED)
+        try:
+            response = handler(request.override(tools=[]))
+        except _NODE_FAILURE_CONTROL_EXCEPTIONS:
+            raise
+        except Exception as exc:
+            return self._wrap_up_failed(record, exc)
+        return self._finish_wrap_up(record, response)
+
+    async def _awrap_up(self, request: Any, handler: Any, record: Any) -> Any:
+        reserve = self._wrap_up_reserve()
+        if reserve <= 0:
+            return self._wrap_up_notice(record, _step_bounds.WrapUp.SKIPPED)
+        try:
+            # Cancellation is a BaseException and is never turned into an answer.
+            response = await asyncio.wait_for(handler(request.override(tools=[])), timeout=reserve)
+        except _NODE_FAILURE_CONTROL_EXCEPTIONS:
+            raise
+        except TimeoutError:
+            return self._wrap_up_notice(record, _step_bounds.WrapUp.TIMEOUT)
+        except Exception as exc:
+            return self._wrap_up_failed(record, exc)
+        return self._finish_wrap_up(record, response)
+
+    def _pending_wrap_up(self, request: Any) -> Any:
+        record = self._record(request)
+        return record if record is not None and record.wrap_up is _step_bounds.WrapUp.PENDING else None
+
+    def _refused_after_bound(self, request: Any) -> ToolMessage | None:
+        """A tool call reaching execution after the step's bound is refused here, whatever let it through."""
+        record = self._record(request)
+        if record is None or record.wrap_up is None:
+            return None
+        payload = {"ok": False, "verdict": "blocked", "source": "step_bound",
+                   "reason": f"this step reached its bound ({record.detail}); no tool runs after it"}
+        return ToolMessage(content=json.dumps(payload, sort_keys=True),
+                           name=_tool_name_from_request(request) or "unknown_tool",
+                           tool_call_id=_tool_call_id_from_request(request))
+
     def _add_time(self, request: Any, started: float, *, guarded: bool) -> None:
         record = self._record(request)
         if record is None:
@@ -3146,6 +3253,12 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
 
     def wrap_model_call(self, request, handler):
         started = self._model._step_clock()
+        record = self._pending_wrap_up(request)
+        if record is not None:
+            try:
+                return self._wrap_up(request, handler, record)
+            finally:
+                self._add_time(request, started, guarded=False)
         # Sage proposes a bound procedure only on the async path, where it can open the call's tool card.
         request = self._offer_scoped_tools(request)
         try:
@@ -3153,10 +3266,17 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
         finally:
             self._add_time(request, started, guarded=False)
         self._limit_response(request, response)
+        self._bound_to_slots(request, response)
         return response
 
     async def awrap_model_call(self, request, handler):
         started = self._model._step_clock()
+        record = self._pending_wrap_up(request)
+        if record is not None:
+            try:
+                return await self._awrap_up(request, handler, record)
+            finally:
+                self._add_time(request, started, guarded=False)
         request = self._offer_scoped_tools(request)
         bound = self._bound_procedure_message(request)
         if bound is not None:
@@ -3171,9 +3291,13 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
             self._add_time(request, started, guarded=False)
         self._limit_response(request, response)
         await self._ground_and_limit_capability(request, response)
+        self._bound_to_slots(request, response)
         return response
 
     def wrap_tool_call(self, request, handler):
+        refused = self._refused_after_bound(request)
+        if refused is not None:
+            return refused
         started = self._model._step_clock()
         try:
             return handler(request)
@@ -3181,6 +3305,9 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
             self._add_time(request, started, guarded=_tool_name_from_request(request) in self._guarded)
 
     async def awrap_tool_call(self, request, handler):
+        refused = self._refused_after_bound(request)
+        if refused is not None:
+            return refused
         started = self._model._step_clock()
         try:
             return await handler(request)
@@ -3243,6 +3370,28 @@ def _remove_tool_calls(message: AIMessage, call_ids: set[str], note: str) -> Non
     message.invalid_tool_calls[:] = []
     message.additional_kwargs.pop("tool_calls", None)
     message.additional_kwargs.pop("function_call", None)
+
+
+def _strip_tool_calls(message: AIMessage) -> None:
+    """Drop every tool call from a generation message in place, leaving its text exactly as written."""
+    message.tool_calls[:] = []
+    if isinstance(message.content, list):
+        message.content[:] = [
+            block for block in message.content
+            if not (isinstance(block, dict) and str(block.get("type") or "").casefold() in {"tool_use", "tool_call"})
+        ]
+    message.invalid_tool_calls[:] = []
+    message.additional_kwargs.pop("tool_calls", None)
+    message.additional_kwargs.pop("function_call", None)
+
+
+def _response_message(response: Any) -> AIMessage | None:
+    """The generation message of a model-call response: a bare AIMessage, or the last one in its result."""
+    result = getattr(response, "result", None)
+    if result is None:
+        result = getattr(getattr(response, "model_response", None), "result", None)
+    candidates = [response] if isinstance(response, AIMessage) else list(result or [])
+    return next((item for item in reversed(candidates) if isinstance(item, AIMessage)), None)
 
 
 class _MCPManagerNoProgressStopMiddleware(AgentMiddleware):
@@ -6592,12 +6741,6 @@ class Model:
     def _step_clock(self) -> float:
         return time.monotonic()
 
-    def _supervised_step_bounds(self) -> "_step_bounds.StepBounds":
-        bounds = getattr(self, "_step_bounds_config", None)
-        if bounds is None:
-            bounds = self._step_bounds_config = _step_bounds.StepBounds.from_env()
-        return bounds
-
     def _issued_task_ids(self) -> frozenset[str]:
         issued = getattr(getattr(self, "mythic_client", None), "_task_source_request_ids", None)
         return frozenset(str(task_id) for task_id in issued) if isinstance(issued, dict) else frozenset()
@@ -6623,14 +6766,33 @@ class Model:
         if key not in records:
             for stale in [item for item in records if item[0] != request_id]:
                 records.pop(stale)
+            # Resolved once per step, from the worker's front matter (read at graph build) and the environment now.
+            bounds, sources = _step_bounds.resolve_bounds(getattr(self, "_step_front_matter", {}).get(worker))
             records[key] = _step_bounds.StepRecord(
                 request_id=request_id, delegation_seq=seq, worker=worker, started=self._step_clock(),
                 tasks_before=self._issued_task_ids(), credentials_before=self._added_credential_ids(),
+                bounds=bounds, bound_sources=sources,
             )
+            logger.info(f"📏 [{worker}] step bounds {bounds.as_dict()} from {sources}")
+            ignored = [variable for name, variable in _step_bounds.BOUND_ENV.items()
+                       if str(os.environ.get(variable) or "").strip() and sources[name] != "env"]
+            if ignored:
+                logger.warning(f"[{worker}] ignored invalid step-bound override(s): {', '.join(ignored)}")
         return records[key]
 
+    def _supervised_step_budget_line(self, worker: str, state: Any) -> str:
+        """The budget line for a worker's next model call in a supervised step; '' outside one."""
+        messages = _agent_state_messages(state)
+        record = self._supervised_step_record(worker, messages)
+        if record is None:
+            return ""
+        guarded = getattr(self, "_step_guarded_tools", {}).get(worker, frozenset(GUARDED_TOOLS))
+        return _step_bounds.budget_line(
+            _step_bounds.step_activity(_current_delegation_messages(messages), guarded), record)
+
     def _supervised_step_should_end(self, worker: str, state: Any) -> bool:
-        """Whether a worker's supervised step has ended or reached a bound, checked before its next model call."""
+        """Whether a worker's supervised step has ended, checked before its next model call. A step that has just
+        reached a bound ends `budget_exhausted` and is admitted one final, tool-free model call first."""
         messages = _agent_state_messages(state)
         record = self._supervised_step_record(worker, messages)
         if record is None:
@@ -6638,12 +6800,13 @@ class Model:
         if record.status is None:
             guarded = getattr(self, "_step_guarded_tools", {}).get(worker, frozenset(GUARDED_TOOLS))
             reached = _step_bounds.bound_reached(
-                _step_bounds.step_activity(_current_delegation_messages(messages), guarded), record,
-                self._supervised_step_bounds(),
+                _step_bounds.step_activity(_current_delegation_messages(messages), guarded), record, record.bounds,
             )
             if reached is not None:
                 record.end(_step_bounds.StepStatus.BUDGET_EXHAUSTED, *reached)
-        if record.status is None:
+                record.wrap_up = _step_bounds.WrapUp.PENDING
+                logger.info(f"⏹️ [{worker}] step reached its bound: {record.detail}; one final call without tools")
+        if record.status is None or record.wrap_up is _step_bounds.WrapUp.PENDING:
             return False
         logger.info(f"⏹️ [{worker}] step ended: {record.status.value} {record.detail}".rstrip())
         return True

@@ -7,6 +7,22 @@ between minor releases.
 
 ## [Unreleased]
 
+### Changed
+
+- Each supervised specialist now carries its own step limits in its prompt frontmatter (`step_bounds:` with
+  `tool_calls`, `active_seconds` and `consecutive_errors`); the shipped values are unchanged at 20, 600 and 3. A
+  valid `SAGE_STEP_MAX_*` value still overrides a limit for every specialist; an invalid one is now ignored rather
+  than rounded, and a malformed frontmatter block stops Sage from building its agents. A step's outcome records
+  the limits it ran under and where each came from.
+- A supervised specialist is told, on each model call, how many tool calls and how much active time its step has
+  left. A batch of parallel tool calls runs only as many calls as the step has left; the rest are removed before
+  anything runs and counted in the outcome.
+- A step that reaches a limit no longer stops mid-thought: the specialist gets one last model call with no tools
+  offered (at most 30 seconds) and its answer goes to the Supervisor unchanged. If that call returns no text,
+  fails or runs out of time, Sage sends a notice saying so instead, and nothing more runs in that step. The step
+  still ends as `budget_exhausted` with the limit it reached, and its partial answer never counts as a finished
+  answer when the Supervisor sends the same step again.
+
 ## [0.3.0] - 2026-11-11
 
 Sage 0.3.0 bounds and scopes each supervised step, reads every step's results from Mythic rather than from the

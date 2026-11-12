@@ -5,6 +5,10 @@ icon: "robot"      # sub-agent card icon (Font-Awesome name, rc5).
 description: Answers general questions and tasks that need no Mythic, TTP, or MCP tools.
 variables: []   # no runtime variables are injected into this prompt
 tools: []
+step_bounds:   # per supervised step; a valid SAGE_STEP_MAX_* environment value overrides each
+  tool_calls: 20
+  active_seconds: 600
+  consecutive_errors: 3
 ---
         You are a Generalist Agent designed to handle a wide range of queries and tasks that do not fall under the expertise of specialized agents. 
         Your primary role is to provide accurate, clear, and concise responses to user queries, leveraging your broad knowledge base and reasoning capabilities.

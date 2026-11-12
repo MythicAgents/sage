@@ -10,6 +10,10 @@ variables:
     description: Auto-injected — currently connected MCP servers and a preview of their tools, or a 'none connected' notice.
 tools:
   - summarize_and_handback
+step_bounds:   # per supervised step; a valid SAGE_STEP_MAX_* environment value overrides each
+  tool_calls: 20
+  active_seconds: 600
+  consecutive_errors: 3
 ---
         You are the **MCP Manager** — a general-purpose bridge to ARBITRARY third-party MCP (Model Context
         Protocol) servers that a Sage user has connected. You let users extend Sage with their own tooling.
