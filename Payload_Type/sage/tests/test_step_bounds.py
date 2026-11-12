@@ -376,6 +376,102 @@ def test_a_final_call_without_usable_text_returns_sages_partial_result_notice(pr
     assert len(_worker_menus(probe)) == 3
 
 
+# --- assembled: the final answer reaches the Supervisor exactly, or Sage says it could not ------------------------
+
+BOUND_REASONS = ["tool_calls", "active_time", "consecutive_errors"]
+BOUND_DETAIL = {"tool_calls": "3 tool calls (bound 3)", "active_time": "700s active (bound 600s)",
+                "consecutive_errors": "3 consecutive tool errors"}
+STRAY_TOOL_USE = {"type": "tool_use", "id": "probe_99", "name": "baseline_probe_step", "input": {"step": 99}}
+# Answers the supervised scope filter leaves exactly as written (outer whitespace is restored by the handback).
+INTACT_ANSWERS = {
+    "ordinary": WRAP,
+    "outer-whitespace": "\n  Probes 0-2 recorded; nothing else ran.  \n\n",
+    "inline-near-match": "Probes 0-2 recorded; the remaining probes and any next steps are for the operator to choose.",
+    "text-blocks": [{"type": "text", "text": "Probes 0-2 recorded."}, STRAY_TOOL_USE,
+                    {"type": "text", "text": "Probe 2 was the largest."}],
+}
+# Answers the filter would alter, each with a phrase that must not reach the Supervisor in any form.
+ALTERED_ANSWERS = {
+    "remaining": ("Probes 0-2 recorded.\n\n**REMAINING:**\n- Probe 3 onward is unexplored.", "Probe 3 onward"),
+    "next-steps": ("Probes 0-2 recorded.\n\nNext steps:\n1. Run probe 3.", "Run probe 3"),
+    "collapsed-whitespace": ("Probes 0-2 recorded.\n\n\n\nProbe 2 returned the largest result.", "largest result"),
+    "text-blocks": ([{"type": "text", "text": "Probes 0-2 recorded."}, STRAY_TOOL_USE,
+                     {"type": "text", "text": "Suggested next actions: run probe 3."}], "run probe 3"),
+}
+
+
+def _bound_work(probe: dict, reason: str) -> tuple[list[AIMessage], sb.StepBounds]:
+    """The worker reads that reach `reason`'s bound, and the bounds under which they reach it."""
+    if reason == "active_time":
+        probe["advance"] = 700.0
+        return [_probe_step(0)], sb.StepBounds()
+    probe["fail"] = reason == "consecutive_errors"
+    return [_probe_step(i) for i in range(3)], sb.StepBounds(tool_calls=3 if reason == "tool_calls" else 20)
+
+
+def _stray_final(content: str | list) -> AIMessage:
+    """A final answer that also asks for a tool the wrap-up must never run (in its content blocks too, if any)."""
+    return AIMessage(content=content, tool_calls=[
+        {"name": "baseline_probe_step", "args": {"step": 99}, "id": "probe_99", "type": "tool_call"}])
+
+
+def _assert_one_final_call_and_nothing_after(probe: dict, result: dict, work: list) -> None:
+    assert probe["calls"] == list(range(len(work)))       # the final answer's own call never ran
+    assert not any(isinstance(m, ToolMessage) and m.tool_call_id == "probe_99"
+                   for m in result["mythic_operator_messages"])
+    menus = _worker_menus(probe)
+    assert len(menus) == len(work) + 1 and menus[-1] == ()  # one tool-free final invocation, no retry
+
+
+@pytest.mark.parametrize("kind", sorted(INTACT_ANSWERS))
+@pytest.mark.parametrize("reason", BOUND_REASONS)
+def test_a_final_answer_the_scope_filter_leaves_intact_reaches_the_supervisor_exactly(probe, reason, kind):
+    content = INTACT_ANSWERS[kind]
+    work, bounds = _bound_work(probe, reason)
+    result = _run_probe([_handoff(READ_BRIEF, "h1"), *work, _stray_final(content), AIMessage(content="final")],
+                        probe, bounds)
+
+    [outcome] = _outcomes(result["supervisor_messages"])
+    assert (outcome["status"], outcome["bound"], outcome["detail"], outcome["wrap_up"]) == (
+        "budget_exhausted", reason, BOUND_DETAIL[reason], "answered")
+    assert _forwarded(result) == [model_module._message_content_as_text(content)]
+    _assert_one_final_call_and_nothing_after(probe, result, work)
+
+
+@pytest.mark.parametrize("kind", sorted(ALTERED_ANSWERS))
+@pytest.mark.parametrize("reason", BOUND_REASONS)
+def test_a_final_answer_the_scope_filter_would_alter_is_withheld_with_sages_notice(probe, reason, kind):
+    content, withheld = ALTERED_ANSWERS[kind]
+    work, bounds = _bound_work(probe, reason)
+    result = _run_probe([_handoff(READ_BRIEF, "h1"), *work, _stray_final(content), AIMessage(content="final")],
+                        probe, bounds)
+
+    [outcome] = _outcomes(result["supervisor_messages"])
+    assert (outcome["status"], outcome["bound"], outcome["detail"], outcome["wrap_up"]) == (
+        "budget_exhausted", reason, BOUND_DETAIL[reason], "failed")
+    assert "references" in outcome
+    [notice] = _forwarded(result)
+    assert notice.startswith(f"[Sage] Mythic_Operator reached its step bound ({BOUND_DETAIL[reason]})")
+    assert "supervised scope filtering" in notice and "final call failed" not in notice
+    # Sage withholds the whole answer: no part of it reaches the Supervisor around the filter.
+    assert not any(withheld in model_module._message_content_as_text(m.content)
+                   for m in result["supervisor_messages"])
+    [step_line] = [m for m in result["supervisor_messages"] if "_step_outcome" in m.additional_kwargs]
+    assert "Final answer after the bound: none (failed); Sage returned a partial-result notice." in step_line.content
+    _assert_one_final_call_and_nothing_after(probe, result, work)
+
+
+def test_an_answer_within_the_bounds_keeps_the_scope_filter_and_gets_no_final_call(probe):
+    script = [_handoff(READ_BRIEF, "h1"), _probe_step(0), AIMessage(content=ALTERED_ANSWERS["remaining"][0]),
+              AIMessage(content="final")]
+    result = _run_probe(script, probe, sb.StepBounds())
+
+    [outcome] = _outcomes(result["supervisor_messages"])
+    assert (outcome["status"], outcome["wrap_up"]) == ("ended", "")
+    assert _forwarded(result) == ["Probes 0-2 recorded."]  # the existing handback filter, unchanged
+    assert len(_worker_menus(probe)) == 2
+
+
 def test_a_final_call_that_overruns_its_reserve_returns_the_notice(probe, monkeypatch):
     monkeypatch.setattr(sb, "WRAP_UP_SECONDS", 0.05)
 
@@ -410,8 +506,9 @@ def test_a_cancelled_final_call_is_not_turned_into_an_answer(probe):
     assert _wrap_up_states(probe) == ["pending"]  # no notice or answer was made of the cancelled call
 
 
-def test_a_provider_filtered_final_call_keeps_the_provider_filter_outcome(probe):
-    filtered = AIMessage(content="", response_metadata={"finish_reason": "content_filter"})
+@pytest.mark.parametrize("content", ["", ALTERED_ANSWERS["remaining"][0]], ids=["empty", "scoped-text"])
+def test_a_provider_filtered_final_call_keeps_the_provider_filter_outcome(probe, content):
+    filtered = AIMessage(content=content, response_metadata={"finish_reason": "content_filter"})
     script = [_handoff(READ_BRIEF, "h1"), _probe_step(0), filtered, AIMessage(content="final")]
     with pytest.raises(model_module._ProviderFilteredResponse):  # the request's own provider-filter ending
         _run_probe(script, probe, sb.StepBounds(tool_calls=1))

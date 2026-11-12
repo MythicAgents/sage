@@ -52,3 +52,34 @@ def test_the_verdict_fails_when_the_final_call_is_offered_tools(tmp_path, monkey
 
     assert (code, record["status"]) == (1, "not_ready")
     assert not record["results"][0]["checks"]["empty_wire_menu"]
+
+
+# A synthetic final answer carrying a scope section the supervised handback filter removes.
+SCOPED_ANSWER = ("LAB-FS01 exposes a readable Finance share; its contents were not reviewed.\n\n"
+                 "**REMAINING:**\n- Review the Finance share contents.")
+
+
+def test_offline_readiness_withholds_a_scope_altered_answer_behind_sages_notice(tmp_path, monkeypatch):
+    monkeypatch.setattr(CHECK, "OFFLINE_ANSWER", SCOPED_ANSWER)
+    code, record = _readiness(tmp_path)
+
+    assert (code, record["status"], record["provider_requests"]) == (0, "dry_run_ready", 3)
+    for result in record["results"]:
+        assert all(result["checks"].values()), result["checks"]
+        assert result["provider_text"] == SCOPED_ANSWER  # the provider's own words stay in the provider evidence
+        assert [outcome["wrap_up"] for outcome in result["outcomes"]] == ["failed"]
+        [notice] = result["forwarded"]
+        assert notice.startswith(CHECK.NOTICE_PREFIX) and "supervised scope filtering" in notice
+        assert "Finance share" not in notice
+    assert record["usefulness"] == {"answered": 0, "fallback": 3}
+
+
+def test_the_verdict_fails_when_a_scope_altered_answer_is_forwarded_as_answered(tmp_path, monkeypatch):
+    # Without the delivery check the filter shortens the answer on its way to the Supervisor, still marked answered.
+    monkeypatch.setattr(CHECK, "OFFLINE_ANSWER", SCOPED_ANSWER)
+    monkeypatch.setattr(model_module, "_supervised_handback_intact", lambda text: True)
+    code, record = _readiness(tmp_path)
+
+    assert (code, record["status"]) == (1, "not_ready")
+    first = record["results"][0]
+    assert not first["checks"]["forwarded"] and first["observations"]["wrap_up"] == "answered"

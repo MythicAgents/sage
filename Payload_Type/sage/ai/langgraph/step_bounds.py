@@ -141,7 +141,8 @@ class WrapUp(str, Enum):
     PENDING = "pending"      # admitted; the call has not returned
     ANSWERED = "answered"    # the worker's text was returned
     EMPTY = "empty"          # the call returned no text (or only tool calls): Sage's notice was returned
-    FAILED = "failed"        # the call raised: Sage's notice was returned
+    FAILED = "failed"        # the call raised, or its text could not reach the Supervisor intact: Sage's notice
+    #                          was returned (the notice says which)
     TIMEOUT = "timeout"      # the call outran its reserve: Sage's notice was returned
     SKIPPED = "skipped"      # no time was left in the request: no call, Sage's notice was returned
     NOT_RUN = "not_run"      # the step closed before the call ran (a stop, a halt or another guard)
@@ -245,8 +246,15 @@ def budget_line(activity: StepActivity, record: StepRecord) -> str:
             "consecutive tool errors. Approval waits and guarded-action time do not count.")
 
 
-def wrap_up_notice(record: StepRecord, wrap_up: WrapUp) -> str:
-    """What the Supervisor receives when a bounded step's final call yields no answer."""
+def wrap_up_notice(record: StepRecord, wrap_up: WrapUp, *, undelivered: bool = False) -> str:
+    """What the Supervisor receives when a bounded step's final call yields no answer it can deliver.
+
+    `undelivered` (status FAILED) is a final answer the supervised scope filter would have altered on its way to the
+    Supervisor: the call itself succeeded, so the notice says the answer was withheld, not that the call failed."""
+    if undelivered:
+        return (f"[Sage] {record.worker} reached its step bound ({record.detail}). Its final answer was withheld: "
+                "it could not reach the Supervisor intact through supervised scope filtering. The tool results and "
+                "the step outcome are what this step produced; nothing more ran.")
     why = {
         WrapUp.EMPTY: "its final call returned no text",
         WrapUp.FAILED: "its final call failed",

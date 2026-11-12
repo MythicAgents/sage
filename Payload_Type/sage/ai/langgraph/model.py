@@ -1210,6 +1210,18 @@ def _strip_supervised_engagement_context(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", stripped).strip()
 
 
+def _supervised_handback_text(text: str) -> str:
+    """What the Supervisor receives of a specialist's summary in the supervised lane: the scope filter's result, or
+    the exact text when the filter only trimmed harmless outer whitespace."""
+    filtered = _strip_supervised_engagement_context(text)
+    return text if filtered == text.strip() else filtered
+
+
+def _supervised_handback_intact(text: str) -> bool:
+    """Whether the supervised handback would deliver `text` to the Supervisor exactly as written."""
+    return _supervised_handback_text(text) == text
+
+
 def _fix_payload_empty_content(payload: dict) -> dict:
     """Fix OpenAI-format payload dicts to prevent Bedrock blank text field errors.
 
@@ -3177,21 +3189,27 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
         reserve = _step_bounds.WRAP_UP_SECONDS
         return reserve if deadline is None else min(reserve, deadline - time.time())
 
-    def _wrap_up_notice(self, record: Any, status: "_step_bounds.WrapUp") -> AIMessage:
+    def _wrap_up_notice(self, record: Any, status: "_step_bounds.WrapUp", *, undelivered: bool = False) -> AIMessage:
         record.wrap_up = status
-        logger.info(f"⏹️ [{self._agent_name}] final call after the bound: {status.value}; Sage's notice returned")
-        return AIMessage(content=_step_bounds.wrap_up_notice(record, status), name=self._agent_name,
-                         additional_kwargs={"_step_wrap_up_notice": status.value})
+        why = "answer withheld: the supervised scope filter would alter it" if undelivered else status.value
+        logger.info(f"⏹️ [{self._agent_name}] final call after the bound: {why}; Sage's notice returned")
+        return AIMessage(content=_step_bounds.wrap_up_notice(record, status, undelivered=undelivered),
+                         name=self._agent_name, additional_kwargs={"_step_wrap_up_notice": status.value})
 
     def _finish_wrap_up(self, record: Any, response: Any) -> Any:
         """The final call's text exactly as written, with every tool call removed; Sage's notice when no text is
-        left. A provider-filtered response passes through untouched for the outermost filter to end the request."""
+        left, or when the supervised handback would not deliver that text intact (its scope filter would change it;
+        Sage withholds the whole answer rather than forward part of it). A provider-filtered response passes through
+        untouched for the outermost filter to end the request."""
         message = _response_message(response)
         if message is not None and _is_provider_filtered_message(message):
             return response
         if message is not None:
             _strip_tool_calls(message)
-            if _message_content_as_text(message.content).strip():
+            text = _message_content_as_text(message.content)
+            if text.strip():
+                if not _supervised_handback_intact(text):
+                    return self._wrap_up_notice(record, _step_bounds.WrapUp.FAILED, undelivered=True)
                 record.wrap_up = _step_bounds.WrapUp.ANSWERED
                 return response
         return self._wrap_up_notice(record, _step_bounds.WrapUp.EMPTY)
@@ -11825,11 +11843,9 @@ class Model:
                             _rc = getattr(self, "_request_contract", None)
                             if isinstance(_rc, RequestContract) and _rc.lane == RequestLane.SUPERVISED_WORKFLOW:
                                 _supervised_lane = True
-                                supervisor_summary_text = _strip_supervised_engagement_context(summary_text)
-                                # The scope filter also trims harmless outer whitespace. Keep
-                                # exact specialist wording when it removed no scoped content.
-                                if supervisor_summary_text == summary_text.strip():
-                                    supervisor_summary_text = summary_text
+                                # The same rule decides a bounded step's final answer
+                                # (`_SupervisedStepBoundMiddleware._finish_wrap_up`).
+                                supervisor_summary_text = _supervised_handback_text(summary_text)
                                 if len(supervisor_summary_text) < len(summary_text):
                                     logger.info(
                                         f"🔇 [{node_name}] Stripped engagement context from supervised summary "
