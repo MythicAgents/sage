@@ -311,6 +311,28 @@ def test_conversation_read_and_finish_dispatch_and_forged_omitted_call_is_denied
     _run(scenario)
 
 
+def test_schema_dictionary_tools_are_projected_like_tool_objects(harness):
+    """An enrolled executable reaches the menu as a strict schema dictionary, not a tool object."""
+    enrolled = {"type": "object", "required": ["command"], "properties": {
+        "command": {"type": "string"}, "callback_display_id": {"type": "integer"}, "parameters": {"type": "string"},
+    }}
+
+    async def operator_menu(mode):
+        model = await _model(harness, mode, False)
+        model.mythic_client._enrolled_issue_selection = {"issue_schema": enrolled}
+        return await _first_menu(harness, "Mythic_Operator")
+
+    async def scenario():
+        return await operator_menu("supervised"), await operator_menu("conversation")
+
+    supervised, conversation = _run(scenario)
+    issue = [tool for tool in supervised if _name(tool) == "issue_task_and_waitfor_task_output"]
+    assert len(issue) == 1 and issue[0]["function"]["strict"] is True
+    assert issue[0]["function"]["parameters"]["properties"] == enrolled["properties"]
+    assert not set(_names(conversation)) & EXECUTION_TOOLS
+    assert conversation == [tool for tool in supervised if _name(tool) not in EXECUTION_TOOLS]
+
+
 def test_conversation_menu_follows_current_mcp_policy_and_registry(harness, monkeypatch):
     async def scenario():
         model = await _model(harness, "conversation", False)
