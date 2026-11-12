@@ -1611,9 +1611,13 @@ class SageChat(Chat):
             #
             # Reuse it only while it is still the newest row the request created. Mythic orders the
             # transcript by row creation, so finalizing an older block put the request's checkpoint
-            # above the progress messages and sub-agent panels that came after it.
+            # above the progress messages and sub-agent panels that came after it. The key is chosen
+            # only after the pre-terminal closes below, which can still create rows.
             _main_turn_key = f"assistant:{request.RequestID}:turn"
-            response_key = stream_emitter.reusable_terminal_key() or _main_turn_key
+
+            def terminal_key() -> str:
+                return stream_emitter.reusable_terminal_key() or _main_turn_key
+
             _last_streamed = stream_emitter.last_content
             if _last_streamed and _last_streamed.lstrip().startswith("Command("):
                 _last_streamed = ""
@@ -1681,6 +1685,9 @@ class SageChat(Chat):
                     )
                 if callable(record_terminal):
                     record_terminal(terminal_status)
+                # Closing a delegation above creates a row when its close content is new text (a
+                # refusal appended to the specialist's streamed text), so the key is chosen only now.
+                response_key = terminal_key()
                 lifecycle_event_id = record_final(
                     response_content,
                     response_key=response_key,
@@ -1695,8 +1702,12 @@ class SageChat(Chat):
                     terminal_metadata["control_transitions"] = (
                         control_transitions()
                     )
-            elif callable(finalize_visibility):
-                await finalize_visibility()
+            else:
+                # A model without the request ledger closes nothing here. Its key is chosen before the
+                # reconcile, whose failure warning must stay a separate block, not be overwritten.
+                response_key = terminal_key()
+                if callable(finalize_visibility):
+                    await finalize_visibility()
             # Mythic stores only complete, error, and cancelled as a request's terminal status and rewrites
             # any other status sent with complete=True to `complete`. So a self-halt (`stopped`) still
             # terminates as `complete` here; its real ending rides in the terminal's `turn_outcome`
