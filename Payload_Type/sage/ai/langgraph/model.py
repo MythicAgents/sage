@@ -1666,6 +1666,20 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
     async def abefore_model(self, state, runtime):
         return self.before_model(state, runtime)
 
+    def _with_lane_tool_menu(self, request: Any) -> Any:
+        """Offer a Conversation model only tools its lane can run; the gates below still deny the rest."""
+        tools = getattr(request, "tools", None)
+        menu = self._model._conversation_tool_menu(tools)
+        if menu is None or len(menu) == len(tools or ()):
+            return request
+        return request.override(tools=menu)
+
+    def wrap_model_call(self, request, handler):
+        return handler(self._with_lane_tool_menu(request))
+
+    async def awrap_model_call(self, request, handler):
+        return await handler(self._with_lane_tool_menu(request))
+
     @staticmethod
     def _blocked_tool_message(request: Any, reason: str) -> ToolMessage:
         name = _tool_name_from_request(request) or "unknown_tool"
@@ -7861,6 +7875,46 @@ class Model:
             )
         return self._turn_authority
 
+    @staticmethod
+    def _conversation_lane_denial(tool_name: str) -> str:
+        """Why the Conversation lane refuses this tool, or "" when the lane may run it.
+
+        The one classification behind both the Conversation tool menu and execution denial.
+        """
+        if tool_name in GUARDED_TOOLS:
+            return "conversational request denies guarded tool execution"
+        if tool_name in CONTROL_PLANE_STAGING_TOOLS:
+            return "conversational request denies Mythic file staging"
+        try:
+            from ai.langgraph.mcp_tool_policy import is_mcp_tool_guarded
+            from ai.mcp import MCPManager
+            for server in MCPManager.get_connected_servers():
+                if any(
+                    getattr(t, "name", None) == tool_name
+                    for t in MCPManager.get_tools_by_server(server)
+                ):
+                    if is_mcp_tool_guarded(str(server), tool_name):
+                        return "conversational request denies guarded MCP tool execution"
+                    break
+        except Exception:
+            pass
+        return ""
+
+    def _conversation_tool_menu(self, tools: Any) -> list[Any] | None:
+        """The provider-bound tools a Conversation request may select, in their original order.
+
+        None when the installed request is not Conversation, so other lanes keep their menus.
+        """
+        from .request_contract import RequestContract, RequestLane
+
+        contract = getattr(self, "_request_contract", None)
+        if not isinstance(contract, RequestContract) or contract.lane != RequestLane.CONVERSATIONAL:
+            return None
+        return [
+            tool for tool in (tools or ())
+            if not self._conversation_lane_denial(_offered_tool_name(tool))
+        ]
+
     def _request_contract_block_reason(
         self,
         tool_name: str,
@@ -7894,24 +7948,10 @@ class Model:
             return "request contract digest does not match the active enforcement projection"
         if contract.intent == RequestIntent.STOP:
             return "stopped request denies tool execution"
-        if contract.lane == RequestLane.CONVERSATIONAL and tool_name in GUARDED_TOOLS:
-            return "conversational request denies guarded tool execution"
-        if contract.lane == RequestLane.CONVERSATIONAL and tool_name in CONTROL_PLANE_STAGING_TOOLS:
-            return "conversational request denies Mythic file staging"
-        if contract.lane == RequestLane.CONVERSATIONAL and tool_name not in GUARDED_TOOLS:
-            try:
-                from ai.langgraph.mcp_tool_policy import is_mcp_tool_guarded
-                from ai.mcp import MCPManager
-                for server in MCPManager.get_connected_servers():
-                    if any(
-                        getattr(t, "name", None) == tool_name
-                        for t in MCPManager.get_tools_by_server(server)
-                    ):
-                        if is_mcp_tool_guarded(str(server), tool_name):
-                            return "conversational request denies guarded MCP tool execution"
-                        break
-            except Exception:
-                pass
+        if contract.lane == RequestLane.CONVERSATIONAL:
+            conversation_reason = self._conversation_lane_denial(tool_name)
+            if conversation_reason:
+                return conversation_reason
         if tool_name in GUARDED_TOOLS:
             try:
                 action = action_spec_from_tool_call({
