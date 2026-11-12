@@ -612,24 +612,46 @@ def test_wall_limit_persists_in_flight_uncertainty(monkeypatch, tmp_path):
     profile = {"provider": "openai", "model": "fixture-model",
                "API_ENDPOINT": "http://127.0.0.1:9/v1", "API_KEY": "inert"}
     original = case.SeededTransport
+    in_flight = asyncio.Event()
 
     class WaitingProvider(httpx.AsyncBaseTransport):
         calls = 0
 
         async def handle_async_request(self, request):
+            # MatrixTransport records the request before dispatching here, so the call is in flight
+            # the moment we are entered. Signal that and hang; the wall cancel below ends it. The
+            # stop is driven by the call actually being in flight rather than by a wall-clock budget
+            # racing setup time, which is load-sensitive and previously flaked under CI load.
             self.calls += 1
+            in_flight.set()
             await asyncio.Event().wait()
 
     provider = WaitingProvider()
+    transports = {}
 
     class Local(original):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.inner = provider
+            transports["live"] = self
 
     monkeypatch.setattr(case, "SeededTransport", Local)
-    result = asyncio.run(case.run_case(profile, tmp_path, None, None, {"127.0.0.1"},
-        limits=case.SimpleNamespace(max_wall=1)))
+
+    async def drive():
+        run_task = asyncio.ensure_future(case.run_case(profile, tmp_path, None, None, {"127.0.0.1"},
+            limits=case.SimpleNamespace(max_wall=30)))
+        waiter = asyncio.ensure_future(in_flight.wait())
+        done, _ = await asyncio.wait({run_task, waiter}, return_when=asyncio.FIRST_COMPLETED)
+        if run_task in done:
+            waiter.cancel()
+            raise AssertionError("the run ended before the provider call was in flight")
+        # The wall limit has effectively been reached with the call in flight: trip the deadline the
+        # run classifies against, then cancel exactly as the run's own wall timer (deadline_cancel) does.
+        transports["live"].utc_deadline = datetime.now(timezone.utc) - timedelta(seconds=1)
+        run_task.cancel()
+        return await run_task
+
+    result = asyncio.run(drive())
     assert result["status"] == "time_limit"
     assert result["stop_reason"] == "wall_time"
     assert result["protocol_valid"] and not result["objective_success"]
@@ -678,26 +700,27 @@ def test_transport_deadline_first_is_reported_as_time_limit(monkeypatch, tmp_pat
     original = case.SeededTransport
 
     class WaitingProvider(httpx.AsyncBaseTransport):
+        def __init__(self):
+            self.transport = None
+
         async def handle_async_request(self, request):
-            await asyncio.Event().wait()
+            # The request is already recorded in flight. Trip the transport's response deadline now,
+            # exercising the response-timeout path, instead of relying on that deadline firing before
+            # setup finishes -- which is load-sensitive and previously flaked under CI load.
+            self.transport.utc_deadline = datetime.now(timezone.utc) - timedelta(seconds=1)
+            raise asyncio.TimeoutError
+
+    provider = WaitingProvider()
 
     class EarlierTransport(original):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
-            self.utc_deadline = datetime.now(timezone.utc) + timedelta(seconds=1.2)
-            self.inner = WaitingProvider()
-
-        async def handle_async_request(self, request):
-            try:
-                return await super().handle_async_request(request)
-            finally:
-                # A response timeout has no explicit pre-dispatch rejection.
-                self.rejections[:] = [row for row in self.rejections
-                    if row.get("reason") != "utc_deadline_expired"]
+            self.inner = provider
+            provider.transport = self
 
     monkeypatch.setattr(case, "SeededTransport", EarlierTransport)
     result = asyncio.run(case.run_case(profile, tmp_path, None, None, {"127.0.0.1"},
-        limits=case.SimpleNamespace(max_wall=3)))
+        limits=case.SimpleNamespace(max_wall=30)))
     assert result["status"] == "time_limit"
     assert result["stop_reason"] == "wall_time"
     assert result["usage_uncertain"] is True
