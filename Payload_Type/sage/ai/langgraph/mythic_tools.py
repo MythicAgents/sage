@@ -2808,12 +2808,23 @@ class MythicTools:
         if root_callback and actual_callback != root_callback:
             return False
         if root_name == "upload_file_by_file_uuid":
-            mapped = {
-                key: root_args.get(key)
+            # The helper hands these root arguments to its one child task. `actual_args` are the child's
+            # EFFECTIVE arguments (omitted/null defaults filled, the exact recorded resolver pair applied), so
+            # project the root onto the child's signature and normalize it by the same rules before comparing.
+            # Comparing raw root values with effective child values denied the operator's own approval whenever
+            # the resolver renamed a key (`file` -> `File`) or the root carried an explicit null timeout.
+            # Every material value stays bound: an omitted root key becomes the child's declared default, and
+            # any other difference in command, callback, parameters, token or timeout is denied.
+            projected = {
+                key: root_args[key]
                 for key in ("command", "parameters", "callback_display_id", "token_id", "timeout")
                 if key in root_args
             }
-            return all(actual_args.get(key) == value for key, value in mapped.items())
+            try:
+                expected = self._effective_request_action_arguments(tool_name, projected)
+            except (TypeError, ValueError):
+                return False
+            return expected == actual_args
         expected_capability = root_bindings.capability
         ambient_capability = self._capability_text(
             (visibility_context or {}).get("capability")
