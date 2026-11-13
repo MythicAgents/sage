@@ -10157,9 +10157,9 @@ class MythicTools:
 
     def _is_replication_access_denied(self, low: str) -> bool:
         """True ONLY for DS_DRA_ACCESS_DENIED (a real replication-RIGHTS denial): hresult 0x2105 / 8453, or
-        explicit access-denied text. NOTE: 0x20f7 / 8439 is DS_DRA_BAD_DN (a malformed DN / name-resolution
-        error — fix the /user DN, e.g. qualify with the NETBIOS short name), NOT a rights denial, so it must
-        NOT downgrade a rights hop.
+        explicit access-denied text. NOTE: this check ignores 0x20f7 / 8439 (DS_DRA_BAD_DN). After a
+        domain-qualified /user, a GetNCChanges 8439 is also a replication refusal, and the DCSync probe reports it
+        so, but downgrading a rights hop on it would change planner state in every lane and is not done here.
         """
         if "0x00002105" in low or "0x2105" in low or "ds_dra_access_denied" in low:
             return True
@@ -10212,7 +10212,7 @@ class MythicTools:
     def _apply_contradiction_downgrade(self, command, parameters, results_str) -> None:
         """When a task fails with an error that REFUTES a claimed-achieved precondition, downgrade that hop so
         the false premise REOPENS instead of the agent retrying the dependent action forever (the 8439-×8 loop).
-        Canonical case: a dcsync returning DS_DRA_ACCESS_DENIED (8439 / 0x20f7) proves the actor does NOT hold
+        Canonical case: a dcsync returning DS_DRA_ACCESS_DENIED (8453 / 0x2105) proves the actor does NOT hold
         DS-Replication rights on that domain — refuting da:/ea:/ds-replication-rights: for it. Intentionally
         decisive: even if the actor IS a real DA whose ticket/context was wrong, REOPENING the hop (re-verify, or
         fix the Kerberos execution context) is correct and cheap; an unbreakable retry loop is not.

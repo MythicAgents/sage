@@ -139,7 +139,8 @@ A privilege granted via GPO is NOT usable immediately. Two waits are mandatory b
    SID. THEN run the dependent action. Do not re-run it without purging first.
 
 **Error-code discipline (DCSync / replication):**
-- `8439` (0x20f7 / DS_DRA_BAD_DN) = wrong realm / DN / DC TARGETING → fix the target.
+- `8439` (0x20f7 / DS_DRA_BAD_DN) after a bare `/user` name = wrong realm / DN / DC TARGETING → fix the
+  target. After a domain-qualified `/user` (`DOMAIN\sam`, DN or SID) it is a replication refusal, as for 8453.
 - `8453` (0x2105 / DS_DRA_ACCESS_DENIED) = the identity you acted AS lacks DS-Replication rights → act as a
   principal that HOLDS them, or self-grant ONLY if your current context already holds WriteDACL on the head.
 

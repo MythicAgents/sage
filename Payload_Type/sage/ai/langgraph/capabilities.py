@@ -1985,6 +1985,35 @@ def extract_directory_rights_probe(
     return probe
 
 
+_MIMIKATZ_GETNCCHANGES_8439 = re.compile(r"getncchanges\s*:\s*0x0*20f7\b")
+_MIMIKATZ_DCSYNC_ACCOUNT_ECHO = re.compile(r"\[dc\]\s*'([^'\r\n]*)'\s*will be the user account")
+
+
+def _dcsync_account_is_domain_qualified(account: str) -> bool:
+    """True for `DOMAIN\\sam`, a distinguished name, or a SID: forms that name one object in one domain."""
+    account = account.strip()
+    return bool(
+        re.fullmatch(r"[^\\\s]+\\[^\\]+", account)
+        or re.fullmatch(r"s-1-\d+(-\d+)+", account)
+        or (re.match(r"[a-z]+=[^,]+,", account) and re.search(r"(^|,)\s*dc=", account))
+    )
+
+
+def _dcsync_qualified_getncchanges_8439(low: str) -> bool:
+    """Whether mimikatz's GetNCChanges returned 8439 after it resolved a domain-qualified account.
+
+    Mimikatz resolves `/user` to an objectGUID with DRSCrackNames before it calls GetNCChanges; a failed lookup
+    prints `CrackNames (name status)` and stops. A GetNCChanges 8439 that follows the echo of a domain-qualified
+    account therefore comes from a request whose name was already resolved: the DC refused the replication. A bare
+    name can resolve outside the DC's domain, so its 8439 keeps the invalid-DN reading.
+    """
+    failure = _MIMIKATZ_GETNCCHANGES_8439.search(low)
+    if failure is None:
+        return False
+    echoes = _MIMIKATZ_DCSYNC_ACCOUNT_ECHO.findall(low[:failure.start()])
+    return bool(echoes) and _dcsync_account_is_domain_qualified(echoes[-1])
+
+
 def extract_dcsync_secret_probe(output: Any = None) -> dict[str, Any]:
     """Build the structured probe for DCSync output."""
     try:
@@ -2002,13 +2031,14 @@ def extract_dcsync_secret_probe(output: Any = None) -> dict[str, Any]:
             "secretsdump_connected": False,
         }
     low = _text(output).casefold()
+    refused_after_name_resolved = _dcsync_qualified_getncchanges_8439(low)
     probe["dcsync_started"] = bool(probe.get("secretsdump_connected")) or _has_any(low, ("dcsync", "drsuapi"))
-    probe["replication_access_denied"] = _has_any(
+    probe["replication_access_denied"] = refused_after_name_resolved or _has_any(
         low,
         ("8453", "replication access was denied", "access denied", "access is denied"),
     )
     probe["access_denied"] = _has_any(low, ("access denied", "access is denied", "0x00000005"))
-    probe["bad_dn"] = _has_any(low, ("8439", "ds_dra_bad_dn", "bad dn"))
+    probe["bad_dn"] = not refused_after_name_resolved and _has_any(low, ("8439", "ds_dra_bad_dn", "bad dn"))
     probe["principal_not_found"] = _has_any(low, ("no such user", "principal not found", "object not found"))
     probe["target_not_found"] = _has_any(low, ("domain not found", "naming context not found"))
     probe["dc_unreachable"] = _has_any(low, ("dc unreachable", "connection refused", "network path was not found"))

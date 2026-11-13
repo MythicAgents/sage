@@ -5517,12 +5517,16 @@ def _terminal_execute_capability_report(
     proof_chain = payload.get("proof_chain") if isinstance(payload.get("proof_chain"), list) else []
 
     task_parts: list[str] = []
+    not_issued: list[str] = []
     for item in issued[:8]:
         if not isinstance(item, dict):
             continue
         command = str(item.get("command") or "").strip()
         task_id = item.get("task_id")
-        if task_id and command:
+        if item.get("task_issued") is False:
+            # Sage refused this step before Mythic created a task, so it is not a task and never enters `Task IDs`.
+            not_issued.append(f"`{command}`" if command else "(unnamed step)")
+        elif task_id and command:
             task_parts.append(f"{task_id} `{command}`")
         elif task_id:
             task_parts.append(str(task_id))
@@ -5538,6 +5542,8 @@ def _terminal_execute_capability_report(
     # that does not report tasks or effects gets no line rather than a false "none issued".
     if isinstance(payload.get("issued"), list):
         lines.append("Task IDs: " + (", ".join(task_parts) if task_parts else "none issued"))
+        if not_issued:
+            lines.append("Not issued: " + ", ".join(not_issued))
     if isinstance(payload.get("recorded_effects"), list):
         lines.append(
             "Recorded effects: "
@@ -20371,9 +20377,9 @@ def _redirect_stale_handoff_after_capability_progress(instruction: str, state: d
                 f"context. Execute the next capability now: DCSync `{user}` from callback {callback_id} against "
                 f"`{domain}` using the payload-native `dcsync` command or `execute_capability` for "
                 f"`dcsync-krbtgt` if available. Record `krbtgt-hash:{domain}` from the real secret material "
-                "before ticket forging or any parent/forest hop. If DCSync fails with 8439, fix DN/DC targeting; "
-                "if it fails with 8453 after the recorded Kerberos context, surface that as a rights/context "
-                "blocker instead of re-running the completed Kerberos proof.",
+                "before ticket forging or any parent/forest hop. With this domain-qualified user, an 8439 is a "
+                "replication refusal like 8453: if DCSync fails with either after the recorded Kerberos context, "
+                "surface that as a rights/context blocker instead of re-running the completed Kerberos proof.",
                 f"DCSync {domain}",
             )
 

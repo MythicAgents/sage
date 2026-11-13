@@ -75,7 +75,7 @@ placeholder key.**
 
 | Signature | Meaning | Do this |
 |-----------|---------|---------|
-| `8439 (0x20f7) DS_DRA_BAD_DN` | Wrong DN/DC/forest targeting | Make the DN and the DC both belong to the forest you're replicating (e.g. `DC=essos,DC=local` against the ESSOS DC). |
+| `8439 (0x20f7) DS_DRA_BAD_DN` | After a bare `/user` name: wrong DN/DC/forest targeting. After mimikatz echoed a domain-qualified account (`DOMAIN\sam`, DN or SID) the name already resolved, so the DC refused the replication, as for 8453 | Bare name: make the DN and the DC both belong to the forest you're replicating (e.g. `DC=essos,DC=local` against the ESSOS DC). Qualified: treat it as 8453; an identity that just gained the rights needs a fresh ticket first (`windows-execution-context`). |
 | `8453 (0x2105) DS_DRA_ACCESS_DENIED` | The identity you DCSync'd AS lacks DS-Replication rights | This is preventable: VALIDATE the right BEFORE DCSync (graph edge / ACL read), don't fire to test. To obtain it: run under a principal that HOLDS it (a DA/EA via the execution-context pattern), or grant it ONLY if your current identity holds domain-head `WriteDACL`. Then re-run against the SAME DC. |
 
 ## RPC / network / logon
@@ -98,6 +98,6 @@ placeholder key.**
 ## The decision rule
 On ANY failure: classify it with the tables above. If it is a **context/silent** failure → re-establish the
 right token + Kerberos ticket (`windows-execution-context`) and re-run ONCE. If it is a **targeting** failure
-(8439, wrong SPN) → fix the target. If it is **connectivity** (1722) → it is not auth. NEVER respond by
+(8439 after a bare name, wrong SPN) → fix the target. If it is **connectivity** (1722) → it is not auth. NEVER respond by
 re-issuing the identical command, permuting LUIDs, or inserting a placeholder key — those burn the step budget
 without changing the outcome.

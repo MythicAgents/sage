@@ -143,7 +143,7 @@ PowerShell, no PowerView — then DCSync.
 
 | Error | Meaning | Remedy |
 |-------|---------|--------|
-| `0x20f7` / **8439 `DS_DRA_BAD_DN`** | Invalid/wrong naming context — the request did not resolve a valid NC. | Correct the target realm, `/domain:`, `/dc:`, and DN. A rights grant cannot repair 8439. |
+| `0x20f7` / **8439 `DS_DRA_BAD_DN`** | After a bare `/user` name: invalid/wrong naming context — the request did not resolve a valid NC. After a domain-qualified `/user` (`DOMAIN\sam`, DN or SID) the name already resolved: the DC refused the replication, as for 8453. | Bare name: correct the target realm, `/domain:`, `/dc:`, and DN; a rights grant cannot repair it. Qualified: as for 8453, but an identity that just gained the rights needs a fresh ticket first. |
 | `0x2105` / **8453 `DS_DRA_ACCESS_DENIED`** | The principal lacks DS-Replication rights on the (correctly-targeted) NC. | Apply the two-ACE grant below, then re-DCSync. |
 
 The two required control-access rights (fixed Microsoft GUIDs):

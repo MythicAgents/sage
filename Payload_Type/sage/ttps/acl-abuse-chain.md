@@ -126,9 +126,11 @@ If that domain-head precondition is absent, do not attempt the grant. Re-plan fr
 graph or control-plane state instead of treating a member-host context as domain authority.
 
 **Read the GetNCChanges error code first:** `0x2105` / **8453 `DS_DRA_ACCESS_DENIED`** = you lack the
-replication rights → apply the grant below. `0x20f7` / **8439 `DS_DRA_BAD_DN`** = wrong/invalid naming
-context → this is a **targeting** bug (wrong forest/DN/DC), NOT a rights problem; fix the target first
-(see per-forest note below). Do not grant rights to "fix" an 8439.
+replication rights → apply the grant below. `0x20f7` / **8439 `DS_DRA_BAD_DN`** after a bare `/user` name =
+wrong/invalid naming context → a **targeting** bug (wrong forest/DN/DC), NOT a rights problem; fix the target
+first (see per-forest note below), and do not grant rights to "fix" it. After a domain-qualified `/user`
+(`DOMAIN\sam`, DN or SID) mimikatz already resolved the name, so an 8439 is the DC refusing the replication,
+as for 8453; if the identity just gained the rights, refresh its ticket before granting anything.
 
 **StandIn:**
 
