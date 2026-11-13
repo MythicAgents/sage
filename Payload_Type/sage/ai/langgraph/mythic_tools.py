@@ -21309,17 +21309,31 @@ class MythicTools:
             return unknown
 
     async def _is_task_completed(self, task_display_id: int) -> bool:
-        """True if the Mythic task is in a terminal (completed) state — gates completed-task output caching."""
+        """True if the Mythic task is in a terminal (completed) state — gates completed-task output caching.
+
+        Mythic sets the completed flag before it runs the agent's completion function, so a task whose status
+        is still settling is not terminal: caching its rows would freeze that status for every later read.
+        """
         if self.client is None:
             return False
         try:
+            from . import task_evidence
+        except ImportError:  # pragma: no cover
+            import task_evidence
+        try:
             r = await mythic.execute_custom_query(
                 self.client,
-                "query tc($id:Int!){ task(where:{display_id:{_eq:$id}}){ completed } }",
+                "query tc($id:Int!){ task(where:{display_id:{_eq:$id}}){ completed status } }",
                 variables={"id": task_display_id},
             )
             rows = r.get("task", []) if isinstance(r, dict) else []
-            return bool(rows and rows[0].get("completed"))
+            if not rows or not isinstance(rows[0], dict):
+                return False
+            return not task_evidence.is_settling(task_evidence.TaskRecord(
+                task_id=str(task_display_id),
+                completed=rows[0].get("completed") is True,
+                status=str(rows[0].get("status") or ""),
+            ))
         except Exception:
             return False
 

@@ -217,3 +217,196 @@ def test_production_shape_through_the_real_tools_reaches_the_excerpt(monkeypatch
     assert "failed to parse arguments" in observed["excerpt"]
     # Internal reads never feed the model-facing re-read clamp, so the worker still sees the output.
     assert tools._failed_read_counts.get(4242) is None
+
+
+# --- Mythic's completion-function window -------------------------------------------------------------------------
+# Mythic sets a task's completed flag before it runs the agent's completion function, and shows a settling status
+# until that function returns. A handback read in that window must keep re-reading, not label the task completed.
+
+from ai.langgraph.task_evidence import (  # noqa: E402
+    MYTHIC_COMPLETION_FUNCTION_ERROR,
+    MYTHIC_COMPLETION_FUNCTION_RUNNING,
+    MYTHIC_SETTLING_STATES,
+)
+
+_RUNNING = MYTHIC_COMPLETION_FUNCTION_RUNNING
+_SETTLING_OUTCOME = "completed_completion_function_running"
+
+
+def test_settling_read_then_completion_function_error_is_reconciled_as_agent_error():
+    """Case S1: the first read lands in the completion-function window; the next shows the function failed."""
+    reader = AsyncMock(side_effect=[
+        _rows("[*] replicated account output", status=_RUNNING),
+        _rows("[*] replicated account output", status=MYTHIC_COMPLETION_FUNCTION_ERROR),
+    ])
+    result, tools = _handback("settling-then-agent-error", reader)
+    assert isinstance(result, Command) and result.goto == "Supervisor"
+    assert tools._deferred_task_receipt is None
+    message = _reconciled(result)[0]
+    assert message.additional_kwargs["_deferred_task_reconciled"] == {
+        "task_id": 4242, "outcome": "completed_with_agent_error",
+    }
+    content = str(message.content)
+    assert "completion function failed" in content and "replicated account output" in content
+    assert reader.await_count >= 2
+
+
+def test_settling_then_agent_error_through_the_real_row_reader(monkeypatch):
+    """Case S1 through the real MythicTools._task_output_rows; only the SDK row fetch is faked."""
+    import base64
+
+    from ai.langgraph import mythic_tools
+
+    def production_rows(status):
+        return [{
+            "id": 7, "timestamp": "2026-11-12T00:00:00Z",
+            "response_text": base64.b64encode(b"[*] replicated account output").decode(),
+            "task": {"id": 4242, "operation_id": 1, "display_id": 4242, "status": status, "completed": True,
+                     "agent_task_id": "a-4242", "command_name": "whoami", "timestamp": "2026-11-12T00:00:00Z",
+                     "callback": {"display_id": 5}},
+        }]
+
+    statuses = iter([_RUNNING, MYTHIC_COMPLETION_FUNCTION_ERROR])
+    fetches = []
+
+    async def fake_fetch(**kwargs):
+        fetches.append(kwargs["task_display_id"])
+        return production_rows(next(statuses))
+
+    monkeypatch.setattr(mythic_tools.mythic, "get_all_task_output_by_id", fake_fetch)
+
+    async def run():
+        model, tools = _handback_model("chat:deferred-reconcile:request:settling-real-rows")
+        tools.get_all_task_output_by_task_id = AsyncMock(side_effect=AssertionError("model-facing read used"))
+        wrapped = _operator_wrapped(model, "Issued task 4242; output was deferred.")
+        state = dict(model.state)
+        state["mythic_operator_messages"] = [AIMessage(content="Issued task 4242; output was deferred.")]
+        return await wrapped(state, {}), tools
+
+    result, tools = asyncio.run(run())
+    assert isinstance(result, Command) and result.goto == "Supervisor"
+    message = _reconciled(result)[0]
+    assert message.additional_kwargs["_deferred_task_reconciled"]["outcome"] == "completed_with_agent_error"
+    assert "replicated account output" in str(message.content)
+    assert fetches == [4242, 4242]
+
+
+def test_task_still_settling_for_the_whole_window_continues_with_its_own_outcome():
+    """Case S2: no checkpoint, the receipt is cleared, and the handback names the status and the caveat."""
+    reader = AsyncMock(return_value=_rows("[*] replicated account output", status=_RUNNING))
+    result, tools = _handback("settling-whole-window", reader)
+    assert isinstance(result, Command) and result.goto == "Supervisor"
+    assert not _forced_end(result)
+    assert tools._deferred_task_receipt is None
+    message = _reconciled(result)[0]
+    assert message.additional_kwargs["_deferred_task_reconciled"] == {
+        "task_id": 4242, "outcome": _SETTLING_OUTCOME,
+    }
+    content = str(message.content)
+    assert json.dumps(_RUNNING.casefold()) in content
+    assert "may not be in Mythic yet" in content
+    assert "replicated account output" in content
+    assert "not reached a terminal state" not in content
+    assert reader.await_count == 1 + len(model_module._DEFERRED_RECONCILE_RETRY_DELAYS)
+
+
+@pytest.mark.parametrize("settling", sorted(MYTHIC_SETTLING_STATES))
+def test_every_settling_status_keeps_re_reading_and_a_later_success_is_completed(settling):
+    reader = AsyncMock(side_effect=[
+        _rows("[*] task output", status=settling),
+        _rows("[*] task output", status="success"),
+    ])
+    result, _ = _handback(f"settling-{settling[:12]}", reader)
+    assert isinstance(result, Command) and result.goto == "Supervisor"
+    message = _reconciled(result)[0]
+    assert message.additional_kwargs["_deferred_task_reconciled"]["outcome"] == "completed"
+    assert reader.await_count == 2
+
+
+@pytest.mark.parametrize("settling", sorted(MYTHIC_SETTLING_STATES))
+def test_settling_status_is_classified_as_its_own_outcome(settling):
+    assert model_module._reconciled_task_outcome(settling) == _SETTLING_OUTCOME
+
+
+def test_worker_read_during_the_settling_window_does_not_freeze_the_handback(monkeypatch):
+    """A worker read while Mythic still finishes the task must not cache the settling rows for the handback.
+
+    The completed-task output cache treats a task's rows as immutable once Mythic's completed flag is true. In
+    the completion-function window that flag is already true, so caching there would serve every later handback
+    read the settling status and hide the completion function's result.
+    """
+    import base64
+
+    from ai.langgraph import mythic_tools
+
+    current = {"status": _RUNNING}
+
+    def production_rows():
+        return [{
+            "id": 7, "timestamp": "2026-11-12T00:00:00Z",
+            "response_text": base64.b64encode(b"[*] replicated account output").decode(),
+            "task": {"id": 4242, "operation_id": 1, "display_id": 4242, "status": current["status"],
+                     "completed": True, "agent_task_id": "a-4242", "command_name": "whoami",
+                     "timestamp": "2026-11-12T00:00:00Z", "callback": {"display_id": 5}},
+        }]
+
+    async def fake_fetch(**kwargs):
+        return production_rows()
+
+    async def fake_query(*args, **kwargs):
+        return {"task": [{"display_id": 4242, "completed": True, "status": current["status"]}]}
+
+    monkeypatch.setattr(mythic_tools.mythic, "get_all_task_output_by_id", fake_fetch)
+    monkeypatch.setattr(mythic_tools.mythic, "execute_custom_query", fake_query)
+
+    async def run():
+        model, tools = _handback_model("chat:deferred-reconcile:request:settling-worker-read")
+        # The worker reads the deferred task while Mythic runs the completion function.
+        worker_view = json.loads(await tools.get_all_task_output_by_task_id(4242))
+        assert worker_view["task_output"][0]["task"]["status"] == _RUNNING
+        # The completion function then fails before the handback reads the task.
+        current["status"] = MYTHIC_COMPLETION_FUNCTION_ERROR
+        wrapped = _operator_wrapped(model, "Issued task 4242; output was deferred.")
+        state = dict(model.state)
+        state["mythic_operator_messages"] = [AIMessage(content="Issued task 4242; output was deferred.")]
+        return await wrapped(state, {}), tools
+
+    result, tools = asyncio.run(run())
+    assert isinstance(result, Command) and result.goto == "Supervisor"
+    message = _reconciled(result)[0]
+    assert message.additional_kwargs["_deferred_task_reconciled"]["outcome"] == "completed_with_agent_error"
+    assert 4242 not in tools._task_output_record_cache
+
+
+def test_settled_task_output_is_still_cached(monkeypatch):
+    """Near match: a task Mythic has finished (final status) keeps the completed-task cache."""
+    import base64
+
+    from ai.langgraph import mythic_tools
+
+    rows = [{
+        "id": 7, "response_text": base64.b64encode(b"[*] task output").decode(),
+        "task": {"id": 4242, "display_id": 4242, "status": "success", "completed": True,
+                 "callback": {"display_id": 5}, "command_name": "whoami"},
+    }]
+    fetches = []
+
+    async def fake_fetch(**kwargs):
+        fetches.append(kwargs["task_display_id"])
+        return [dict(r) for r in rows]
+
+    async def fake_query(*args, **kwargs):
+        return {"task": [{"display_id": 4242, "completed": True, "status": "success"}]}
+
+    monkeypatch.setattr(mythic_tools.mythic, "get_all_task_output_by_id", fake_fetch)
+    monkeypatch.setattr(mythic_tools.mythic, "execute_custom_query", fake_query)
+
+    async def run():
+        _, tools = _handback_model("chat:deferred-reconcile:request:settled-cache")
+        await tools.get_all_task_output_by_task_id(4242)
+        await tools.get_all_task_output_by_task_id(4242)
+        return tools
+
+    tools = asyncio.run(run())
+    assert 4242 in tools._task_output_record_cache
+    assert fetches == [4242]

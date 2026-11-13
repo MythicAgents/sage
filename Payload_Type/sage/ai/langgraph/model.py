@@ -69,6 +69,7 @@ from . import worker_outcome as _worker_outcome
 from . import handoff_brief as _handoff_brief
 from . import step_bounds as _step_bounds
 from . import step_references as _step_references
+from . import task_evidence as _task_evidence
 from . import prompt_context
 from ai.mcp import MCPManager, MCP_EXECUTION_CONTEXT_OFFENSIVE_RUNTIME
 from ai import observation_channel, provider_retry, resource_budget, resource_http
@@ -5672,10 +5673,16 @@ _DEFERRED_RECONCILE_RETRY_DELAYS = (0.5, 1.0, 2.0)
 # agent's post-processing (for example registering credentials or files in Mythic) did not complete.
 _RECONCILED_COMPLETED_WITH_AGENT_ERROR = "completed_with_agent_error"
 
+# A task Mythic marked completed but was still finishing when the handback window ended (Mythic sets the completed
+# flag before it runs the agent's completion function): its output is in hand, its post-processing result is not.
+_RECONCILED_COMPLETION_FUNCTION_RUNNING = "completed_completion_function_running"
+
 
 def _reconciled_task_outcome(status: str) -> str:
     """Classify a finished task's Mythic status for the deferred-task handback."""
     text = str(status or "").strip().casefold()
+    if text in _task_evidence.MYTHIC_SETTLING_STATES:
+        return _RECONCILED_COMPLETION_FUNCTION_RUNNING
     if text.startswith("error") and "completion function" in text:
         return _RECONCILED_COMPLETED_WITH_AGENT_ERROR
     if text in {"error", "failed", "timeout"} or text.startswith(("error:", "error ")):
@@ -7445,8 +7452,13 @@ class Model:
                     observed = {"status": str(record.get("status") or ""),
                                 "completed": record["completed"] is True, "excerpt": ""}
             # Finished with its output in hand: done. A record-only completion keeps re-reading so the
-            # handback can still carry the output if its rows land within the window.
-            if observed is not None and observed["completed"] and observed_rows:
+            # handback can still carry the output if its rows land within the window. Mythic sets the completed
+            # flag before it runs the agent's completion function, so a settling status keeps re-reading too.
+            if observed is not None and observed_rows and not _task_evidence.is_settling(
+                _task_evidence.TaskRecord(
+                    task_id=str(task_id), completed=observed["completed"], status=observed["status"],
+                )
+            ):
                 break
         return observed
 
@@ -11478,6 +11490,14 @@ class Model:
                             "registers from its output, such as credentials or files, may be missing from "
                             "Mythic; judge the result from the task output below, not from the credential "
                             "store or file browser"
+                        )
+                    elif outcome == _RECONCILED_COMPLETION_FUNCTION_RUNNING:
+                        status_word = (
+                            "completed and returned output, but Mythic was still finishing it when the handback "
+                            f"read it (Mythic status {json.dumps(reconcile_status)}). Artifacts the agent's "
+                            "completion function registers from its output, such as credentials or files, may "
+                            "not be in Mythic yet; judge the result from the task output below, not from the "
+                            "credential store or file browser"
                         )
                     else:
                         status_word = "completed" if outcome == "completed" else "FAILED"
