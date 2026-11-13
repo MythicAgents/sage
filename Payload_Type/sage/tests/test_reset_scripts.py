@@ -211,7 +211,12 @@ def test_sage_stop_accepts_absent_tmux_session_as_already_stopped(tmp_path):
     assert "is absent" in stopped.stdout
 
 
-def test_sage_stop_retries_interrupt_during_stuck_python_finalization(tmp_path):
+def _run_sage_stop(tmp_path, interrupt_handler):
+    """Run sage_stop.sh with 1 s waits against a live Python target and report what happened.
+
+    ``interrupt_handler`` is the source of the target's SIGINT handler ``interrupt``. It may set the
+    global ``exit_at`` to a monotonic time at which the target exits cleanly.
+    """
     ready = tmp_path / "ready"
     target = subprocess.Popen(
         [
@@ -220,15 +225,14 @@ def test_sage_stop_retries_interrupt_during_stuck_python_finalization(tmp_path):
             (
                 "import os, signal, time\n"
                 "count = 0\n"
-                "def interrupt(_signum, _frame):\n"
-                "    global count\n"
-                "    count += 1\n"
-                "    if count >= 3:\n"
-                "        raise SystemExit(0)\n"
+                "exit_at = None\n"
+                f"{interrupt_handler}"
                 "signal.signal(signal.SIGINT, interrupt)\n"
                 f"open({str(ready)!r}, 'w').close()\n"
                 "while True:\n"
-                "    time.sleep(0.1)\n"
+                "    time.sleep(0.05)\n"
+                "    if exit_at is not None and time.monotonic() >= exit_at:\n"
+                "        raise SystemExit(0)\n"
             ),
         ]
     )
@@ -280,15 +284,45 @@ def test_sage_stop_retries_interrupt_during_stuck_python_finalization(tmp_path):
             capture_output=True,
             timeout=10,
         )
-
-        assert stopped.returncode == 0, stopped.stderr
-        assert call_count.read_text() == "3"
-        assert "Stopped local Sage pid" in stopped.stdout
-        assert target.wait(timeout=2) == 0
+        return stopped, call_count.read_text(), target.wait(timeout=2)
     finally:
         if target.poll() is None:
             target.terminate()
             target.wait(timeout=2)
+
+
+def test_sage_stop_retries_interrupt_during_stuck_python_finalization(tmp_path):
+    stopped, interrupts, exit_code = _run_sage_stop(
+        tmp_path,
+        "def interrupt(_signum, _frame):\n"
+        "    global count\n"
+        "    count += 1\n"
+        "    if count >= 3:\n"
+        "        raise SystemExit(0)\n",
+    )
+
+    assert stopped.returncode == 0, stopped.stderr
+    assert interrupts == "3"
+    assert "Stopped local Sage pid" in stopped.stdout
+    assert exit_code == 0
+
+
+def test_sage_stop_counts_an_exit_during_the_last_second_of_a_wait(tmp_path):
+    # The target exits half a second after its first interrupt: inside the first 1 s wait, but
+    # after the check made as that wait begins. A wait that never looks again after its last
+    # sleep misses the exit and sends a needless second interrupt.
+    stopped, interrupts, exit_code = _run_sage_stop(
+        tmp_path,
+        "def interrupt(_signum, _frame):\n"
+        "    global exit_at\n"
+        "    if exit_at is None:\n"
+        "        exit_at = time.monotonic() + 0.5\n",
+    )
+
+    assert stopped.returncode == 0, stopped.stderr
+    assert interrupts == "1"
+    assert "Stopped local Sage pid" in stopped.stdout
+    assert exit_code == 0
 
 
 def test_mythic_reset_drops_container_only_host_overrides(tmp_path):

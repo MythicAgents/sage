@@ -27,16 +27,22 @@ if [[ -z "$PID" ]]; then
 fi
 
 tmux send-keys -t "$SESSION" C-c
+process_exited() {
+  local state
+  if ! kill -0 "$PID" 2>/dev/null; then
+    return 0
+  fi
+  state="$(ps -o stat= -p "$PID" 2>/dev/null || true)"
+  [[ "$state" == Z* ]]
+}
+
+# Check once more after the last sleep, so an exit in the final second of a wait still counts.
 wait_for_exit() {
   local seconds="$1"
-  local state
+  process_exited && return 0
   for _ in $(seq 1 "$seconds"); do
-    if ! kill -0 "$PID" 2>/dev/null; then
-      return 0
-    fi
-    state="$(ps -o stat= -p "$PID" 2>/dev/null || true)"
-    [[ "$state" == Z* ]] && return 0
     sleep 1
+    process_exited && return 0
   done
   return 1
 }
