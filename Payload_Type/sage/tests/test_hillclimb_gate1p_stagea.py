@@ -603,9 +603,9 @@ def test_observer_freezes_task_quiescence_at_deadline_while_oracle_keeps_polling
     def task_fetcher():
         with lock:
             terminal_at = observer._terminal_at
-            completed = terminal_at is not None and now[0] > terminal_at + 30
-            if terminal_at is not None and now[0] < terminal_at + 30:
-                now[0] = terminal_at + 30
+            completed = terminal_at is not None and now[0] > terminal_at + 5
+            if terminal_at is not None and now[0] < terminal_at + 5:
+                now[0] = terminal_at + 5
         return [{"display_id": 4, "completed": completed, "status": "processing"}]
 
     def objective_probe():
@@ -613,7 +613,7 @@ def test_observer_freezes_task_quiescence_at_deadline_while_oracle_keeps_polling
             terminal_at = observer._terminal_at
             if terminal_at is not None and observer._task_window_closed:
                 oracle_polls_after_task_deadline.append(now[0])
-                now[0] = terminal_at + 60
+                now[0] = terminal_at + 10
         return _typed_oracle_observation(False)
 
     observer = g1p.LiveEpisodeObserver(
@@ -621,9 +621,9 @@ def test_observer_freezes_task_quiescence_at_deadline_while_oracle_keeps_polling
         arm="shipping_sage",
         objective_probe=objective_probe,
         task_fetcher=task_fetcher,
-        objective_settle_seconds=60,
+        objective_settle_seconds=10,
         objective_poll_seconds=0.002,
-        task_quiescence_seconds=30,
+        task_quiescence_seconds=5,
         task_poll_seconds=0.002,
         clock=lambda: now[0],
     )
