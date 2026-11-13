@@ -107,7 +107,12 @@ def test_retained_task_outputs_reach_generalist_model_input_without_new_authorit
     assert all(generated_instruction not in str(m.content) for m in provider_messages
                if not m.additional_kwargs.get("_assisted_assignment_context"))
     assert worker_summary not in contents
-    assert "The worker reviewed stored task outputs." not in contents
+    # The Supervisor's previous reply reaches the follow-up worker only as Sage's labelled previous-reply data,
+    # never as an instruction or inside any other message.
+    [previous_reply] = [m for m in provider_messages if m.additional_kwargs.get("_carried_context") == "previous_reply"]
+    assert "The worker reviewed stored task outputs." in previous_reply.content
+    assert all("The worker reviewed stored task outputs." not in str(m.content)
+               for m in provider_messages if m is not previous_reply)
     assert not any(isinstance(m, ToolMessage) and m.name == "get_all_task_output_by_task_id"
                    for m in provider_messages)
 
