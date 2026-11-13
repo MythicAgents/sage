@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import functools
 import socket
 from types import SimpleNamespace
 
@@ -143,6 +144,8 @@ def _mutating_child(tools: MythicTools, change):
     """Change the helper's child task arguments after the root was accepted, then call the real task method."""
     real = tools.issue_task_and_waitfor_task_output
 
+    # Keep the real signature: the approval check reads the child's declared defaults from it.
+    @functools.wraps(real)
     async def child(**kwargs):
         kwargs = change(dict(kwargs))
         return await real(**kwargs)
@@ -249,6 +252,18 @@ def test_child_change_after_acceptance_issues_nothing(monkeypatch, no_network, n
     _assert_nothing_issued(run)
     assert "approved proposal does not cover this exact effect" in str(run.result)
     assert "approved proposal does not cover this exact effect" in run.denial["reason"]
+
+
+def test_unchanged_child_through_the_injector_still_issues_one_task(monkeypatch, no_network):
+    """The mutation injector itself must not cause the denials above: an unchanged child still issues."""
+    tools = _tools(monkeypatch)
+    args = _upload_args(ALIAS, timeout=120)
+    _accept(tools, args)
+    _mutating_child(tools, lambda kwargs: kwargs)
+
+    run = _run_upload(tools, args)
+
+    _assert_one_upload(run)
 
 
 def test_child_on_another_callback_issues_nothing(monkeypatch, no_network):
