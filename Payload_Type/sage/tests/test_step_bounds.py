@@ -1492,7 +1492,9 @@ def _proved_krbtgt_client(monkeypatch, tmp_path):
 
 
 async def _rescope_run(mt, split_issue, script: list, *, mode: str = "supervised",
-                       autonomous_solve: bool = False, policy_answers: list | None = None) -> SimpleNamespace:
+                       autonomous_solve: bool = False, policy_answers: list | None = None,
+                       decision: str = "accept", before_decision=None) -> SimpleNamespace:
+    """Run the native request; answer its first card with `decision`, after `before_decision()` if given."""
     model = model_module.Model(
         provider="openai", model="gpt-4o-mini", system_prompt="offline re-scope",
         config={"configurable": {"api_key": "offline-only", "API_ENDPOINT": "http://127.0.0.1:9/v1"}},
@@ -1512,6 +1514,7 @@ async def _rescope_run(mt, split_issue, script: list, *, mode: str = "supervised
     model._rebuild_graph()
     chat = _NativeDriverChat(model)
     calls: dict = {}
+    issued_before_decision: list = []
     try:
         with split_issue(lambda: "ok", calls, display_id=lambda: 30 + len(calls.get("issued", []))):
             first = build_chat_request(FORGE_PROMPT, channel_id=1, operation_id=1, request_id=1,
@@ -1519,13 +1522,17 @@ async def _rescope_run(mt, split_issue, script: list, *, mode: str = "supervised
             bind_channel_thread_id(first, model)
             await chat.chat(first)
             cards = _cards(chat)
+            issued_before_decision = list(calls.get("issued", []))
             if cards:
+                if before_decision is not None:
+                    before_decision()
                 second = build_chat_request("", channel_id=1, operation_id=1, request_id=2,
                                             config={"mode": mode})
-                second.InputResponse = _input_response("accept", cards[0])
+                second.InputResponse = _input_response(decision, cards[0])
                 await chat.chat(second)
         snapshot = await model.graph.aget_state(model._graph_run_config(model._session_thread_id()))
         return SimpleNamespace(cards=_cards(chat), emissions=chat.emissions, issued=calls.get("issued", []),
+                               issued_before_decision=issued_before_decision,
                                outcomes=_outcomes(snapshot.values.get("supervisor_messages", [])))
     finally:
         await drop_channel_session(build_chat_request("", channel_id=1, operation_id=1))
@@ -1566,13 +1573,13 @@ def test_a_read_only_step_hands_a_proved_krbtgt_to_one_fresh_rescoped_forge_card
     assert KRBTGT_KEY not in json.dumps(run.emissions, default=str)
 
 
-def _rescope_script() -> list:
+def _rescope_script(forge_inputs: dict | None = None) -> list:
     read_brief = {"handoff_title": "check the proved krbtgt", "handoff_instruction": FORGE_PROMPT,
                   "allowed_capabilities": ["control_plane"], "expected_result": "Whether krbtgt is proved."}
     forge_brief = {"handoff_title": "forge the golden ticket", "handoff_instruction": FORGE_PROMPT,
                    "allowed_capabilities": ["forge-golden-ticket"], "callback_display_id": 13,
                    "targets": ["lab.local"], "expected_result": "A verified golden ticket for lab.local."}
-    forge = {"action": dict(FORGE_ACTION), "inputs": {}}
+    forge = {"action": dict(FORGE_ACTION), "inputs": dict(forge_inputs or {})}
     return [_call("transfer_to_Mythic_Operator", read_brief, 1), _call("execute_capability", forge, 2),
             _call("transfer_to_Mythic_Operator", forge_brief, 3), _call("execute_capability", forge, 4),
             AIMessage(content="The forge ran."), AIMessage(content="Final answer."),
