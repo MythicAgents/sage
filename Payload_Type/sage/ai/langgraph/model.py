@@ -3059,6 +3059,16 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
             signature = (_handoff_brief.scope_signature(
                 brief_meta.get("allowed_capabilities"), brief_meta.get("allowed_tools"),
             ) if isinstance(brief_meta, Mapping) else "")
+            # The removed call's identity, before its arguments are discarded below: the Supervisor's step outcome
+            # and, if re-sending this scope ends the request, the terminal name it from this record, not from the
+            # worker's text. Display-safe: no parameters, inputs or other arguments.
+            refused = _step_bounds.refused_proposal(
+                brief_meta, name, guarded[0].get("args"), capability, catalog,
+                scope=signature, worker=self._agent_name,
+                delegation_seq=_get_seq(delegated) if delegated is not None else "",
+            )
+            if record.status is None:
+                record.refused = refused
             if signature:
                 # Record the scope that was rejected at execution, keyed by the delegated step, so the next
                 # brief check can see the Supervisor re-sending a scope that keeps failing (not the command).
@@ -3068,7 +3078,10 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
                         event_id=f"scope_rejected:{led.request_id}:{_get_seq(delegated)}",
                         kind="scope_rejected", phase="rejected", content=name,
                         metadata={"scope_signature": signature, "tool": name,
-                                  "kind": _step_bounds.scope_rejection_kind(brief_meta, name, capability, catalog)},
+                                  "kind": _step_bounds.scope_rejection_kind(brief_meta, name, capability, catalog),
+                                  "worker": refused["worker"], "delegation_seq": refused["delegation_seq"],
+                                  "step_callback": refused["step_callback"],
+                                  **{f"proposal_{key}": refused[key] for key in _step_bounds.REFUSED_KEYS}},
                     )
                 except Exception:
                     pass
@@ -6889,7 +6902,7 @@ class Model:
 
     def _check_handoff_brief(
         self, worker: str, brief: "_handoff_brief.HandoffBrief", instruction: str, title: str = "",
-    ) -> tuple[tuple[str, ...], bool] | None:
+    ) -> tuple[tuple[str, ...], bool] | tuple[tuple[str, ...], bool, tuple[str, ...]] | None:
         """Structurally check a delegation's brief before dispatch; None admits it.
 
         Reads the request lane and operator input from the Model's state, as the assisted-input lookup does: the
@@ -6948,15 +6961,20 @@ class Model:
         )
         if not errors:
             signature = _handoff_brief.scope_signature(brief.allowed_capabilities, brief.allowed_tools)
-            if lane == "supervised_workflow" and _handoff_brief.scope_resend_exhausted(
-                ledger.actual_events(kind="scope_rejected", phase="rejected"), signature,
-            ):
+            refusals = ledger.actual_events(kind="scope_rejected", phase="rejected")
+            if lane == "supervised_workflow" and _handoff_brief.scope_resend_exhausted(refusals, signature):
                 # The Supervisor re-sent a scope whose action was removed before a card: either the scope itself
-                # was wrong, or a worker already deviated from it twice. Re-sending it again loops; end the request.
+                # was wrong, or a worker already deviated from it twice. Re-sending it again loops; end the request,
+                # naming the proposals this worker's steps on this callback had refused under it.
+                refused = _handoff_brief.refused_proposals(
+                    refusals, signature, worker=worker,
+                    callback=_step_bounds.display_callback(brief.callback_display_id),
+                )
                 return (
                     (f"this step's scope ({signature}) already failed at execution and was re-sent unchanged; "
                      "re-scope the step to what the operator asked for",),
                     True,
+                    tuple(_step_bounds.describe_refused_proposal(proposal) for proposal in refused),
                 )
             if brief.off_catalog:
                 # A tool-scoped step is work outside the catalog. Durable through the sealed decision record:
@@ -18677,7 +18695,7 @@ def _create_handoff_tool(
     worker_outcome_lookup: Callable[[dict[str, Any]], tuple[dict[str, Any], str] | None] | None = None,
     subgoal_scheduler: Callable[..., dict[str, Any]] | None = None,
     assisted_operator_lookup: Callable[[], str | None] | None = None,
-    brief_check: Callable[..., tuple[tuple[str, ...], bool] | None] | None = None,
+    brief_check: Callable[..., tuple[tuple[str, ...], bool] | tuple[tuple[str, ...], bool, tuple[str, ...]] | None] | None = None,
     repeat_check: Callable[[str, str, Any], tuple[str, int, str] | None] | None = None,
     first_step: Callable[..., tuple[str, Any, str, str, str] | None] | None = None,
 ):
@@ -19254,11 +19272,19 @@ def _brief_rejection_command(
     agent_name: str,
     errors: tuple[str, ...],
     stop: bool,
+    refused: tuple[str, ...] = (),
     *,
     channels: Iterable[str],
 ) -> Command:
-    """Refuse a delegation whose brief failed structural checks; nothing reaches the worker."""
+    """Refuse a delegation whose brief failed structural checks; nothing reaches the worker.
+
+    `refused` names, from Sage's records, the proposals that scope refused when re-sending an exhausted scope is
+    what stops the request; the closing report lists them as neither approved nor executed."""
     detail = "\n".join(f"- {error}" for error in errors)
+    refused_detail = (
+        "\n\nRefused proposal, not approved and not executed (no approval card was offered and no Mythic task "
+        "was issued for it):\n" + "\n".join(f"- {line}" for line in refused)
+    ) if refused else ""
     tool_message = ToolMessage(
         content=f"Delegation to {agent_name} was not dispatched; its brief failed these checks:\n{detail}",
         name=tool_name,
@@ -19275,7 +19301,7 @@ def _brief_rejection_command(
         content=(
             f"**Blocked**\n\nI could not form an admissible delegation to {agent_name} for this request "
             f"after {_handoff_brief.REJECTIONS_BEFORE_STOP} attempts. The last brief failed these checks:"
-            f"\n{detail}\n\nName the callback and targets for the step, or narrow the request."
+            f"\n{detail}{refused_detail}\n\nName the callback and targets for the step, or narrow the request."
         ),
         name="Supervisor",
         additional_kwargs={"_is_final_report": True, "_turn_outcome": _TURN_OUTCOME_BLOCKED},

@@ -16,15 +16,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import json
 import math
 import os
+import re
 from typing import Any, Iterable, Mapping
 
 from . import step_references
 
 # 2: the outcome carries Sage-read references to the step's tasks, credentials and graph reads.
 # 3: it also carries the step's resolved bounds and their sources, blocked calls, and the final-answer status.
-STEP_OUTCOME_VERSION = 3
+# 4: a step rejected by scope also carries Sage's display-safe record of the refused proposal.
+STEP_OUTCOME_VERSION = 4
 QUEUED_PREFIX = "[Queued]"
 DENIED_PREFIX = "[DENIED by operator]"
 # Routing results that can appear in a worker's context; they are not work the step did.
@@ -171,6 +174,8 @@ class StepRecord:
     # Calls a model response proposed beyond the step's free call slots; removed before any ran.
     calls_blocked: int = 0
     wrap_up: WrapUp | None = None
+    # The guarded call the step's scope refused (`refused_proposal`); empty unless the step was rejected by scope.
+    refused: dict[str, str] = field(default_factory=dict)
 
     def end(self, status: StepStatus, bound: str = "", detail: str = "") -> None:
         if self.status is None:
@@ -304,12 +309,13 @@ def scope_violation(brief: Any, tool_name: str, capability_name: str = "", catal
         return reason
     capabilities, tools = _brief_scope(brief)
     if capabilities and not tools and capability_name not in capabilities:
+        shown = display_name(capability_name) or "unknown"  # never a parameter typed after the name
         if _malformed_capability(capability_name, catalog):
-            return (f"`{capability_name or 'unknown'}` is not a catalog procedure, so the worker's proposal was "
+            return (f"`{shown}` is not a catalog procedure, so the worker's proposal was "
                     f"malformed: this step's one guarded action is `execute_capability` for "
                     f"{', '.join(capabilities)}. Re-send this scope once if that procedure is what the operator "
                     "asked for; otherwise re-scope the step to what the operator asked for.")
-        return (f"capability `{capability_name or 'unknown'}` is not in this step's allowed_capabilities "
+        return (f"capability `{shown}` is not in this step's allowed_capabilities "
                 f"({', '.join(capabilities)}); re-scope the step to the capability the operator asked for")
     return ""
 
@@ -326,6 +332,89 @@ def scope_rejection_kind(brief: Any, tool_name: str, capability_name: str = "", 
     if tool_scope_violation(brief, tool_name) or _malformed_capability(capability_name, catalog):
         return NOT_OFFERED
     return MIS_SCOPED
+
+
+# A refused proposal is reported by its leading identifier only: a command, capability or tool name always fits, and
+# whatever followed it in the same field (parameters, a path, a credential typed into the name) is dropped.
+_DISPLAY_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}")
+_DISPLAY_CALLBACK = re.compile(r"[0-9]{1,9}")
+REFUSED_KEYS = ("tool", "action", "form", "callback")
+
+
+def display_name(value: Any) -> str:
+    """The leading identifier of a proposed name, or "" when the value starts with none."""
+    match = _DISPLAY_NAME.match(value.strip()) if isinstance(value, str) else None
+    return match.group(0) if match else ""
+
+
+def display_callback(value: Any) -> str:
+    """A proposed callback display id as digits, or "" when it is not one."""
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, int):
+        return str(value) if value >= 0 else ""
+    text = value.strip() if isinstance(value, str) else ""
+    return text if _DISPLAY_CALLBACK.fullmatch(text) else ""
+
+
+def _proposed_capability(args: Mapping[str, Any]) -> tuple[str, Any]:
+    """The capability name and callback an `execute_capability` call proposed, as written."""
+    action = args.get("action")
+    if isinstance(action, str):
+        try:
+            action = json.loads(action)
+        except ValueError:
+            return action, args.get("callback_display_id")
+    if isinstance(action, str):
+        return action, args.get("callback_display_id")
+    if isinstance(action, Mapping):
+        return (str(action.get("name") or action.get("capability") or ""),
+                action.get("callback_id", args.get("callback_display_id")))
+    return "", args.get("callback_display_id")
+
+
+def refused_proposal(brief: Any, tool_name: str, args: Any, capability_name: str = "", catalog: Iterable[str] = (),
+                     *, scope: str = "", worker: str = "", delegation_seq: Any = "") -> dict[str, str]:
+    """Sage's record of a guarded call its step's scope refused: the tool, the command or capability it named, the
+    callback, the refused scope and the step it came from. Display-safe: never its parameters, inputs or other
+    arguments, and never the worker's text. A command submitted as a capability is labelled malformed, not
+    converted. `capability_name` is the name the scope check classified, so the form agrees with its kind."""
+    args = args if isinstance(args, Mapping) else {}
+    if tool_name == "execute_capability":
+        proposed, callback = _proposed_capability(args)
+        action = display_name(proposed)
+        form = "malformed_capability" if _malformed_capability(capability_name, catalog) else "capability"
+    else:
+        callback = args.get("callback_display_id")
+        action = display_name(args.get("command"))
+        form = "command" if action else "tool"
+    return {
+        "tool": display_name(tool_name), "action": action, "form": form, "callback": display_callback(callback),
+        "scope": str(scope or ""), "worker": display_name(worker), "delegation_seq": display_callback(delegation_seq),
+        "step_callback": display_callback(brief.get("callback_display_id")) if isinstance(brief, Mapping) else "",
+    }
+
+
+def describe_refused_proposal(proposal: Mapping[str, Any]) -> str:
+    """One clause naming a refused proposal from its record, for the step handback and the request's terminal."""
+    tool = f"`{proposal.get('tool') or 'unknown tool'}`"
+    name = str(proposal.get("action") or "")
+    form = proposal.get("form")
+    if form == "malformed_capability":
+        what = (f"`{name}` submitted as a capability" if name else "an unnamed capability") + f" through {tool}"
+    elif form == "capability" and name:
+        what = f"catalog capability `{name}` through {tool}"
+    elif form == "command" and name:
+        what = f"`{name}` as a command through {tool}"
+    else:
+        what = f"a {tool} call"
+    callback = proposal.get("callback")
+    what += f" on callback {callback}" if callback else " with no readable callback"
+    if proposal.get("scope"):
+        what += f", outside this step's scope ({proposal['scope']})"
+    if form == "malformed_capability":
+        what += "; the proposal was malformed: it names no catalog procedure"
+    return what
 
 
 # Tools that teach how to run a technique by hand. A step scoped to catalog procedures has Sage run the procedure,
@@ -372,6 +461,8 @@ def step_outcome(record: StepRecord, activity: StepActivity, *, now: float, task
         "calls_blocked": record.calls_blocked,
         # The final, tool-free call after a bound; "" when the step reached none.
         "wrap_up": wrap_up.value if wrap_up else "",
+        # The guarded call the step's scope refused, as Sage recorded it; {} for any other ending.
+        "refused_proposal": dict(record.refused) if record.refused and final == record.status else {},
     }
 
 
@@ -398,6 +489,9 @@ def render_outcome(outcome: Mapping[str, Any]) -> str:
         f"Time: {outcome['active_seconds']:.0f}s active, {outcome['action_seconds']:.0f}s inside the guarded "
         f"action, {outcome['waiting_seconds']:.0f}s waiting (approval and other).",
     ]
+    if outcome.get("refused_proposal"):
+        lines.append(f"Refused proposal (Sage's record): {describe_refused_proposal(outcome['refused_proposal'])}. "
+                     "It was not approved and not executed: Sage removed it before any approval card or Mythic task.")
     if outcome.get("calls_blocked"):
         lines.append(f"Tool calls not run because the step had no call slots left: {outcome['calls_blocked']}.")
     if outcome.get("wrap_up"):

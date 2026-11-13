@@ -553,20 +553,43 @@ def _event_meta(event: Any, key: str) -> str:
     return ""
 
 
+def _failing_tail(events: Iterable[Any], signature: str) -> list[Any]:
+    """The request's latest scope rejections that all refused `signature`, newest first."""
+    tail = []
+    for event in reversed(tuple(events)):
+        if not signature or _event_meta(event, "scope_signature") != signature:
+            break
+        tail.append(event)
+    return tail
+
+
 def scope_resend_exhausted(events: Iterable[Any], signature: str) -> bool:
     """Whether re-sending `signature` unchanged would only fail again at execution.
 
     A scope whose own action named an excluded capability is wrong as it stands, so one such rejection ends it. A
     worker calling a tool its step does not offer is a deviation the same scope may retry once; a second ends it.
     Rejections recorded without a kind count as wrong scopes."""
-    tail = []
-    for event in reversed(tuple(events)):
-        if not signature or _event_meta(event, "scope_signature") != signature:
-            break
-        tail.append(event)
+    tail = _failing_tail(events, signature)
     if not tail:
         return False
     return len(tail) >= REJECTIONS_BEFORE_STOP or any(_event_meta(event, "kind") != "not_offered" for event in tail)
+
+
+def refused_proposals(events: Iterable[Any], signature: str, *, worker: str, callback: str) -> list[dict[str, str]]:
+    """The proposals refused under `signature` in the same failing tail `scope_resend_exhausted` reads, from
+    `worker`'s steps on `callback` only, oldest first and without repeats.
+
+    Each is the display-safe identity Sage recorded at the refusal (tool, command or capability, form, callback) and
+    the refused scope. Events are request-local, so an older request never supplies one."""
+    found: list[dict[str, str]] = []
+    for event in reversed(_failing_tail(events, signature)):
+        if _event_meta(event, "worker") != worker or _event_meta(event, "step_callback") != str(callback or ""):
+            continue
+        proposal = {key: _event_meta(event, f"proposal_{key}") for key in ("tool", "action", "form", "callback")}
+        proposal["scope"] = signature
+        if proposal["tool"] and proposal not in found:
+            found.append(proposal)
+    return found
 
 
 def rejection_count(events: Iterable[Any]) -> int:
