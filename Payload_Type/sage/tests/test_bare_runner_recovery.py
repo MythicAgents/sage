@@ -1,7 +1,6 @@
 """Disk-backed bare-arm recovery checks; model and tool boundaries are injected fakes."""
 import json
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -125,22 +124,30 @@ def test_elapsed_floor_expires_resumed_arm_before_any_new_model_call(tmp_path):
     assert result.stopped == "timeout"
 
 
-def test_pending_tool_reconciliation_crossing_deadline_ends_as_time_limit(tmp_path):
+@pytest.mark.parametrize("deadline_passed", [True, False])
+def test_pending_tool_reconciliation_crossing_deadline_ends_as_time_limit(tmp_path, deadline_passed):
+    # The arm clock is injected, so the deadline passes exactly when reconciliation says it does.
     path = tmp_path / "arm.json"
     selected = {"tool": "issue_command", "args": {"command": "hostname"}}
+    now = [0.0]
     first = runner(path, lambda *_: {**selected, "_usage": USAGE},
-                   lambda _: (_ for _ in ()).throw(Crash()), timeout=0.02)
+                   lambda _: (_ for _ in ()).throw(Crash()), timeout=10,
+                   elapsed_seconds_fn=lambda: now[0])
     with pytest.raises(Crash):
         first.run("objective")
     assert json.loads(path.read_text())["phase"] == "tool_pending"
 
     def late_reconcile(_):
-        time.sleep(0.03)
+        now[0] = 11.0 if deadline_passed else 5.0
         raise TimeoutError("existing Mythic task still pending")
 
     resumed = runner(path, lambda *_: pytest.fail("no new model request"),
                      lambda _: pytest.fail("no duplicate dispatch"), resume=True,
-                     timeout=0.02, reconcile=late_reconcile)
+                     timeout=10, reconcile=late_reconcile, elapsed_seconds_fn=lambda: now[0])
+    if not deadline_passed:
+        with pytest.raises(br.BareRunnerRecoveryError, match="reconciliation failed"):
+            resumed.run("objective")
+        return
     result = resumed.run("objective")
     assert result.termination["cause"] == "wall_time"
 

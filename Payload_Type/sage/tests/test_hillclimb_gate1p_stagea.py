@@ -589,24 +589,43 @@ def test_observer_stays_active_for_complete_task_quiescence_window():
 
 
 def test_observer_freezes_task_quiescence_at_deadline_while_oracle_keeps_polling():
-    origin = time.monotonic()
+    # Time is a fake clock that only the producers advance, so neither window can close on
+    # scheduling delay. The first task poll after the terminal lands exactly on the task deadline
+    # and still reports the task running; the task source reports it complete from then on. Once
+    # the task window has frozen, the oracle polls again and lands exactly on its own deadline.
+    # Waiting for the freeze keeps the oracle from moving the clock past the task deadline while
+    # an on-time task poll is still being stamped.
+    now = [0.0]
+    lock = threading.Lock()
+    oracle_polls_after_task_deadline = []
+    observer = None
 
     def task_fetcher():
-        return [{
-            "display_id": 4,
-            "completed": time.monotonic() - origin >= 0.04,
-            "status": "processing",
-        }]
+        with lock:
+            terminal_at = observer._terminal_at
+            completed = terminal_at is not None and now[0] > terminal_at + 30
+            if terminal_at is not None and now[0] < terminal_at + 30:
+                now[0] = terminal_at + 30
+        return [{"display_id": 4, "completed": completed, "status": "processing"}]
+
+    def objective_probe():
+        with lock:
+            terminal_at = observer._terminal_at
+            if terminal_at is not None and observer._task_window_closed:
+                oracle_polls_after_task_deadline.append(now[0])
+                now[0] = terminal_at + 60
+        return _typed_oracle_observation(False)
 
     observer = g1p.LiveEpisodeObserver(
         pair_id=g1p.PAIR_ID,
         arm="shipping_sage",
-        objective_probe=lambda: _typed_oracle_observation(False),
+        objective_probe=objective_probe,
         task_fetcher=task_fetcher,
-        objective_settle_seconds=0.06,
+        objective_settle_seconds=60,
         objective_poll_seconds=0.002,
-        task_quiescence_seconds=0.02,
+        task_quiescence_seconds=30,
         task_poll_seconds=0.002,
+        clock=lambda: now[0],
     )
     observer.start()
     result = observer.finish(
@@ -614,6 +633,7 @@ def test_observer_freezes_task_quiescence_at_deadline_while_oracle_keeps_polling
         wrapper_objective_recognized=False,
     )
 
+    assert oracle_polls_after_task_deadline
     outcome = _derived_observer_outcome(result)
     assert outcome["objective_success"] is False
     assert outcome["task_quiescent"] is False
