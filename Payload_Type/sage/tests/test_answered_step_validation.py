@@ -191,6 +191,17 @@ def _errors(run) -> list[dict]:
     return [e for e in run.emissions if e["kind"] == "error" or e.get("status") == "error"]
 
 
+def _assert_lifecycle_clean(run) -> None:
+    """The request's lifecycle ledger reconciles after the terminal: every opened delegation and tool closed, the
+    final response projected. The service only logs a failure of this last reconciliation, so read the ledger."""
+    ledger = run.model._request_event_ledger
+    assert ledger.open_lifecycles() == ()
+    final = ledger.reconcile(require_final=True)
+    assert final["ok"], final["errors"]
+    assert not any("reconciliation failed" in str(e.get("content", "")) + str(e.get("error", ""))
+                   for e in run.emissions)
+
+
 # --- ordinary supervised: the answered step is not dispatched again ----------------------------------------------
 
 def test_an_already_achieved_step_resent_twice_ends_at_a_checkpoint_with_its_proof(achieved):
@@ -209,14 +220,16 @@ def test_an_already_achieved_step_resent_twice_ends_at_a_checkpoint_with_its_pro
     # One worker dispatch; both resends refused without dispatch (the second rewords expected_result).
     assert len(_dispatches(run)) == 1
     assert len(_delegation_cards(run)) == 1
-    [first] = _refusals(run, FIRST_REFUSAL)
-    assert len(_refusals(run, FINAL_REFUSAL)) == 1
-    assert VERDICT in first and PROOF in first, first  # the first refusal hands the answer back
     # One native terminal, a checkpoint that carries the verdict and the existing proof; no no-progress stop.
     [terminal] = _terminals(run)
     assert terminal["kind"] == "complete" and terminal["metadata"].get("turn_outcome") == "checkpoint", terminal
     assert VERDICT in terminal["content"] and PROOF in terminal["content"], terminal["content"]
     assert _stops(run) == [] and _errors(run) == []
+    _assert_lifecycle_clean(run)
+    # Two refusals: the first hands the answer back, the second (a reworded expected_result) ends the request.
+    [first] = _refusals(run, FIRST_REFUSAL)
+    assert len(_refusals(run, FINAL_REFUSAL)) == 1
+    assert VERDICT in first and PROOF in first, first
 
 
 # --- bounded one-action: the answer ends the request directly ----------------------------------------------------
@@ -240,6 +253,7 @@ def test_a_bounded_one_action_already_achieved_request_completes_with_its_proof(
     assert terminal["kind"] == "complete" and terminal["metadata"].get("turn_outcome") == "completed", terminal
     assert VERDICT in terminal["content"] and PROOF in terminal["content"], terminal["content"]
     assert _stops(run) == [] and _errors(run) == []
+    _assert_lifecycle_clean(run)
 
 
 # --- controls: a different step, a new request and an effectful step are dispatched -----------------------------
@@ -264,6 +278,7 @@ def test_a_changed_step_after_an_already_achieved_answer_is_dispatched(achieved,
     assert len(_dispatches(run)) == 2 and len(_delegation_cards(run)) == 2
     assert _refusals(run, FIRST_REFUSAL) == [] and _refusals(run, FINAL_REFUSAL) == []
     assert _stops(run) == [] and _errors(run) == []
+    _assert_lifecycle_clean(run)
 
 
 def test_the_same_step_in_a_new_request_is_dispatched(achieved):
@@ -281,6 +296,7 @@ def test_the_same_step_in_a_new_request_is_dispatched(achieved):
     assert len(_dispatches(run)) == 2
     assert _refusals(run, FIRST_REFUSAL) == [] and _refusals(run, FINAL_REFUSAL) == []
     assert len(_terminals(run)) == 2 and _stops(run) == [] and _errors(run) == []
+    _assert_lifecycle_clean(run)
 
 
 def test_an_approved_capability_step_that_issued_a_task_is_dispatched_when_resent(monkeypatch, tmp_path, no_network):
@@ -297,6 +313,7 @@ def test_an_approved_capability_step_that_issued_a_task_is_dispatched_when_resen
     assert len(_dispatches(run)) == 2 and len(_delegation_cards(run)) == 2
     assert _refusals(run, FIRST_REFUSAL) == [] and _refusals(run, FINAL_REFUSAL) == []
     assert _stops(run) == [] and _errors(run) == []
+    _assert_lifecycle_clean(run)
 
 
 # --- other lanes: no new ending policy ---------------------------------------------------------------------------
@@ -313,6 +330,7 @@ def test_conversation_never_runs_the_guarded_capability(achieved):
 
     assert ran == [] and run.issued == [] and _cards(run.chat) == []
     assert len(_terminals(run)) == 1 and _errors(run) == []
+    _assert_lifecycle_clean(run)
 
 
 @pytest.mark.parametrize("mode, consulted", [("auto", False), ("supervised", True), ("conversation", True)])
