@@ -34,7 +34,7 @@ pywinrm==0.5.0
 # `skills/sage-goad-reset/scripts/pkinit_padata_probe.py` imports pyasn1 directly to decode KDC
 # PA-DATA. It arrives transitively through ldap3 today, which is declared — but a direct import
 # resting on someone else's transitive breaks silently the day that edge disappears.
-pyasn1==0.6.4
+pyasn1==0.6.5
 
 # `skills/sage-trace-analysis/tests/test_callback_probe.py` and
 # `Payload_Type/sage/tests/test_kernel_tracing.py` build a real TracerProvider with an in-memory

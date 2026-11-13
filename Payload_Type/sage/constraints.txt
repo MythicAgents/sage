@@ -193,7 +193,7 @@ protobuf==7.36.2
 psutil==5.9.8
 py-key-value-aio==0.4.6
 pyarrow==26.0.0
-pyasn1==0.6.4
+pyasn1==0.6.5
 pyasn1_modules==0.4.2
 pycparser==3.11
 pycryptodome==4.1.0
