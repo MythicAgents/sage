@@ -3524,6 +3524,28 @@ def forge_ticket_domain(action: CapabilityAction, inputs: dict[str, Any]) -> str
     )
 
 
+def forge_target_domain(action: CapabilityAction, inputs: dict[str, Any]) -> str:
+    """The domain a forged ticket is requested for, or "" when that is the domain it is issued in.
+
+    An explicit `target_domain` or `effect_domain` (inputs, then intent, then the action target) names it; otherwise
+    a `domain` that differs from a stated `source_domain` does. The input augment stores the result, so the approval
+    card, every executor pass, the plan, the ExtraSIDs check and the parent grant all read the same target.
+    """
+    fields = _target_fields(action.target)
+    target = _normalize(
+        _input_text(inputs, "target_domain", "effect_domain")
+        or action.intent.get("target_domain")
+        or action.intent.get("effect_domain")
+        or fields.get("target_domain")
+    )
+    if not target:
+        stated_source = _normalize(_input_text(inputs, "source_domain") or action.intent.get("source_domain"))
+        requested = _normalize(_input_text(inputs, "domain") or action.intent.get("domain"))
+        if stated_source and requested != stated_source:
+            target = requested
+    return "" if target == forge_ticket_domain(action, inputs) else target
+
+
 def _build_forge_golden_ticket_execution_plan(
     action: CapabilityAction,
     inputs: dict[str, Any],

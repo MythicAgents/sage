@@ -17475,13 +17475,17 @@ class MythicTools:
             if target_domain:
                 inputs["target_domain"] = target_domain
         elif capability == "forge-golden-ticket":
-            # The key, domain SID and child DC below belong to the domain the forge plan issues the ticket in.
+            # The key, domain SID and child DC below belong to the domain the forge plan issues the ticket in. The
+            # requested target is stored, so the parent inference below fills one only when the request names none,
+            # and the card, later passes, the plan and the grant all read this target.
             try:
                 from . import capabilities
             except ImportError:
                 import capabilities
             domain = capabilities.forge_ticket_domain(action, inputs)
-            target_domain = self._capability_target_domain(action, inputs)
+            target_domain = capabilities.forge_target_domain(action, inputs)
+            if target_domain:
+                inputs["target_domain"] = target_domain
         else:
             domain = self._capability_domain(action, inputs)
             target_domain = self._capability_target_domain(action, inputs)
@@ -17615,8 +17619,13 @@ class MythicTools:
             domain = self._capability_source_domain(action, inputs)
             target_domain = self._capability_target_domain(action, inputs) or self._capability_domain(action, inputs)
         else:
-            domain = self._capability_domain(action, inputs)
-            target_domain = self._capability_target_domain(action, inputs)
+            # The domain the forge plan issues the ticket in, however the request spells it.
+            try:
+                from . import capabilities
+            except ImportError:
+                import capabilities
+            domain = capabilities.forge_ticket_domain(action, inputs)
+            target_domain = capabilities.forge_target_domain(action, inputs)
         if not target_domain and inputs.get("extra_sids"):
             target_domain = self._parent_domain_for_capability(domain)
         if target_domain and target_domain != domain and inputs.get("extra_sids") and not self._has_trusted_extra_sid_source(inputs):
@@ -19105,12 +19114,17 @@ class MythicTools:
         """The PARENT domain of a SAME-FOREST child->parent forge-golden-ticket, else "". Same-forest only: the
         parent must be a DNS suffix of the child (child.root.example.local -> root.example.local). A
         cross-FOREST target (other.example.local) has no implicit Enterprise-Admins path to the parent and must never be
-        granted replication rights — so it returns "" and the DCSync precheck still applies.
+        granted replication rights — so it returns "" and the DCSync precheck still applies. The child is the domain
+        the forge plan issues the ticket in, however the request spells it.
         """
         if self._capability_text(getattr(action, "name", "")).casefold() != "forge-golden-ticket":
             return ""
-        child = self._capability_domain(action, inputs).strip(".")
-        parent = self._capability_target_domain(action, inputs).strip(".")
+        try:
+            from . import capabilities
+        except ImportError:
+            import capabilities
+        child = capabilities.forge_ticket_domain(action, inputs).strip(".")
+        parent = capabilities.forge_target_domain(action, inputs).strip(".")
         if not child or not parent or child == parent:
             return ""
         return parent if child.endswith("." + parent) else ""
