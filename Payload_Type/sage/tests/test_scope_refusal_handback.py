@@ -40,13 +40,15 @@ CAPABILITY = "execute_capability"
 PROMPT = "Escalate to SYSTEM on our current host."
 CALLBACK = 3
 OTHER_CALLBACK = 5
-SCOPE = "capabilities:execute-as-local-admin"
+SCOPE = "capabilities:collect-graph"
 SECRET = "Hunter2-synthetic-secret"
 CALLBACKS = [{"id": CALLBACK, "display_id": CALLBACK, "host": "MEEREEN", "user": "ESSOS\\daenerys"},
              {"id": OTHER_CALLBACK, "display_id": OTHER_CALLBACK, "host": "MEEREEN", "user": "ESSOS\\viserys"}]
+# A catalog step whose worker model still chooses its call: a collection over two targets is not fully bound. (Any
+# other catalog procedure binds one current candidate and no worker chooses: test_supervised_catalog_step_binding.)
 SCOPED = {"handoff_title": "Elevate", "handoff_instruction": PROMPT, "callback_display_id": CALLBACK,
-          "targets": ["meereen.essos.local"], "expected_result": "A SYSTEM callback.",
-          "allowed_capabilities": ["execute-as-local-admin"]}
+          "targets": ["meereen.essos.local", "essos.local"], "expected_result": "A SYSTEM callback.",
+          "allowed_capabilities": ["collect-graph"]}
 # The corrected scope: the same step, its one guarded action a direct task.
 TOOL_SCOPED = {**{k: v for k, v in SCOPED.items() if k != "allowed_capabilities"}, "allowed_tools": [ISSUE]}
 

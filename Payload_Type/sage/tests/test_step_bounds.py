@@ -12,6 +12,7 @@ import base64
 import json
 import importlib.util
 import os
+import re
 from pathlib import Path
 import threading
 import time
@@ -955,6 +956,7 @@ def _offered_per_call(monkeypatch, brief: dict) -> list[set[str]]:
         issue = sink.get_tools.side_effect
         extra = {"execute_capability": execute_capability, "get_ttp_guidance": get_ttp_guidance}
         sink.get_tools.side_effect = lambda names: [*issue(names), *(extra[n] for n in names if n in extra)]
+        sink._recon_snapshot_cache[("list_callbacks", "all")].append({"id": 6, "host": "WORKSTATION-6"})
         return original(self, *args, **kwargs)
 
     monkeypatch.setattr(model_module.Model, "_rebuild_graph", rebuild)
@@ -973,8 +975,10 @@ def _offered_per_call(monkeypatch, brief: dict) -> list[set[str]]:
 
 
 def test_a_collection_step_offers_the_worker_execute_capability_and_not_the_raw_path(monkeypatch):
-    # Two procedures, so the step is not fully bound and the worker's model chooses between them.
-    [offered] = _offered_per_call(monkeypatch, {"allowed_capabilities": ["collect-graph", "dcsync-krbtgt"]})
+    # Two targets, so the collection is not fully bound and the worker's model chooses. (Any other catalog procedure
+    # binds one current candidate and no worker model chooses: test_supervised_catalog_step_binding.)
+    [offered] = _offered_per_call(monkeypatch, {"allowed_capabilities": ["collect-graph"],
+                                                "targets": ["WORKSTATION-5", "WORKSTATION-6"]})
 
     assert "execute_capability" in offered
     assert ISSUE not in offered and "get_ttp_guidance" not in offered
@@ -1445,6 +1449,34 @@ DCSYNC_OK = (
 )
 
 
+def _live_on_13(mt) -> None:
+    """Callback 13 as a live foothold in lab.local, so the forge candidate runs on it."""
+    mt._engagement_footholds = [es.Foothold(callback_id="13", agent="apollo", host="DC01", forest="lab.local",
+                                            identity="LAB\\operator", integrity="medium", alive=True,
+                                            source="fixture", timestamp="2026-11-14T00:00:00+00:00")]
+
+
+def _bound_forge_handoff(brief: dict, index: int):
+    """The Supervisor's forge step, selecting the forge candidate listed in its current view (a scripted choice);
+    without a listed candidate (another lane) the brief names none."""
+    def choose(messages):
+        view = next((str(m.content) for m in reversed(messages) if "[Sage catalog candidates" in str(m.content)), "")
+        found = re.search(r"candidate_ref=(cand-[0-9a-f]{16}) \| forge-golden-ticket ", view)
+        return _call("transfer_to_Mythic_Operator", {**brief, **({"candidate_ref": found.group(1)} if found else {})},
+                     index)
+    return choose
+
+
+def _bound_forge_script(references=()) -> list:
+    """A forge step selecting the current forge candidate and naming `references` (`cred:`/`task:`) to bind."""
+    forge_brief = {"handoff_title": "forge the golden ticket", "handoff_instruction": FORGE_PROMPT,
+                   "allowed_capabilities": ["forge-golden-ticket"], "callback_display_id": 13,
+                   "targets": ["lab.local"], "expected_result": "A verified golden ticket for lab.local.",
+                   **({"inputs_by_reference": list(references)} if references else {})}
+    return [_bound_forge_handoff(forge_brief, 1), AIMessage(content="The forge ran."),
+            *[AIMessage(content="Final answer.")] * 3]
+
+
 def _proved_krbtgt_client(monkeypatch, tmp_path):
     from tests.test_engagement_wiring import _split_issue
 
@@ -1540,6 +1572,7 @@ async def _rescope_run(mt, split_issue, script: list, *, mode: str = "supervised
 
 def test_a_read_only_step_hands_a_proved_krbtgt_to_one_fresh_rescoped_forge_card(monkeypatch, tmp_path):
     mt, split_issue = _proved_krbtgt_client(monkeypatch, tmp_path)
+    _live_on_13(mt)
     read_brief = {"handoff_title": "check the proved krbtgt", "handoff_instruction": FORGE_PROMPT,
                   "allowed_capabilities": ["control_plane"], "expected_result": "Whether krbtgt is proved."}
     forge_brief = {"handoff_title": "forge the golden ticket", "handoff_instruction": FORGE_PROMPT,
@@ -1549,8 +1582,7 @@ def test_a_read_only_step_hands_a_proved_krbtgt_to_one_fresh_rescoped_forge_card
     script = [
         _call("transfer_to_Mythic_Operator", read_brief, 1),
         _call("execute_capability", forge, 2),            # removed: a control-plane step issues nothing
-        _call("transfer_to_Mythic_Operator", forge_brief, 3),
-        _call("execute_capability", forge, 4),            # grounded, carded, approved, executed once
+        _bound_forge_handoff(forge_brief, 3),             # Sage proposes the bound forge; carded, approved, run once
         AIMessage(content="The forge ran."),
         AIMessage(content="Final answer."),
     ]
@@ -1563,8 +1595,8 @@ def test_a_read_only_step_hands_a_proved_krbtgt_to_one_fresh_rescoped_forge_card
     proposed = [card for card in run.cards if card.get("status") not in {"accepted"}]
     [card] = proposed
     arguments = card["data"]["arguments"]
-    assert arguments["action"]["capability"] == "forge-golden-ticket"
-    assert str(arguments["action"]["callback_id"]) == "13" and arguments["action"]["domain"] == "lab.local"
+    assert arguments["action"]["name"] == "forge-golden-ticket"
+    assert str(arguments["inputs"]["callback_id"]) == "13" and arguments["action"]["intent"]["domain"] == "lab.local"
     # The approved forge ran once, from the proved key.
     rubeus = [json.dumps(issue["parameters"]) for issue in run.issued if issue["command_name"] == "execute_assembly"]
     assert len(rubeus) == 1 and f"/aes256:{KRBTGT_KEY}" in rubeus[0], [i["command_name"] for i in run.issued]

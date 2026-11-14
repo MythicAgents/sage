@@ -167,18 +167,14 @@ def test_a_preflight_that_can_prove_access_first_is_not_refused(monkeypatch, tmp
 
 
 def _supervised(monkeypatch, tmp_path, *, mode: str = "supervised", decision: str = "accept"):
-    from test_hitl_steer_current_intent import _call
-    from test_step_bounds import _proved_krbtgt_client, _rescope_run
+    from test_step_bounds import _bound_forge_script, _live_on_13, _proved_krbtgt_client, _rescope_run
 
+    # The supervised vehicle is the forge candidate current evidence supports (an ordinary supervised catalog step
+    # runs a bound candidate); its plan has the same unfilled service-proof target when no DC is known.
     mt, split_issue = _proved_krbtgt_client(monkeypatch, tmp_path)
+    _live_on_13(mt)
     mt._resolve_domain_controller_host = lambda domain: asyncio.sleep(0, result="")
-    brief = {"handoff_title": "establish the Kerberos context", "allowed_capabilities": ["ensure-kerberos-context"],
-             "handoff_instruction": "Establish a Kerberos context for lab.local on callback 13 and verify it.",
-             "callback_display_id": 13, "targets": [PARENT], "expected_result": "A verified Kerberos context."}
-    call = {"action": {**ENSURE, "domain": PARENT}, "inputs": {"source_domain": PARENT, "target_domain": PARENT}}
-    script = [_call("transfer_to_Mythic_Operator", brief, 1), _call("execute_capability", call, 2)]
-    script += [AIMessage(content="Final answer.")] * 4
-    return asyncio.run(_rescope_run(mt, split_issue, script, mode=mode, decision=decision))
+    return asyncio.run(_rescope_run(mt, split_issue, _bound_forge_script(), mode=mode, decision=decision))
 
 
 def test_supervised_accept_issues_nothing_and_reports_the_missing_input(monkeypatch, tmp_path):

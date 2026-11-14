@@ -16,7 +16,7 @@ from ai.langgraph import capabilities, engagement_state, task_evidence
 from ai.langgraph.mythic_tools import MythicTools
 from tests.esl_fixtures import AGENT_PROCESSED
 from tests.test_hitl_steer_current_intent import _call
-from tests.test_step_bounds import FORGE_ACTION, FORGE_PROMPT, _rescope_run
+from tests.test_step_bounds import FORGE_PROMPT, _bound_forge_handoff, _live_on_13, _rescope_run
 
 
 # --- material-only DCSync feeds the guarded forge only from its proof task --------------------------------------
@@ -140,13 +140,13 @@ def test_valid_review_backed_krbtgt_material_binds_the_forge_key_from_its_proof_
 def test_the_supervised_forge_runs_once_from_the_material_rows_proof_task(monkeypatch, tmp_path, mythic_task_records):
     """Channel 4 request 4: every forge proposal was refused. Now the forge step gets one card and runs from task 21."""
     mt, split_issue, _result = _material_krbtgt_client(monkeypatch, tmp_path, mythic_task_records)
+    _live_on_13(mt)
     forge_brief = {"handoff_title": "forge the golden ticket", "handoff_instruction": FORGE_PROMPT,
                    "allowed_capabilities": ["forge-golden-ticket"], "callback_display_id": 13,
                    "targets": [DOMAIN], "expected_result": "A verified golden ticket for lab.local."}
-    forge = {"action": dict(FORGE_ACTION), "inputs": {"key": "f" * 64}}  # a model-carried key is dropped
-    script = [_call("transfer_to_Mythic_Operator", forge_brief, 1), _call("execute_capability", forge, 2),
-              AIMessage(content="The forge ran."), AIMessage(content="Final answer."),
-              AIMessage(content="Final answer.")]
+    # Sage proposes the bound forge candidate itself, so no model-carried key (formerly "f" * 64) can reach it.
+    script = [_bound_forge_handoff(forge_brief, 1), AIMessage(content="The forge ran."),
+              AIMessage(content="Final answer."), AIMessage(content="Final answer.")]
 
     run = asyncio.run(_rescope_run(mt, split_issue, script))
 

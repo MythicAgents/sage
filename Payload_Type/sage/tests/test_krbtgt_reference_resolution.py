@@ -367,11 +367,13 @@ def test_with_nothing_proved_a_reference_is_reported_as_no_proved_key(monkeypatc
 # --- approval boundary: the assembled native supervised request ---------------------------------------------------
 
 def _non_top_client(monkeypatch, tmp_path):
-    from test_step_bounds import _proved_krbtgt_client
+    from test_step_bounds import _live_on_13, _proved_krbtgt_client
 
     mt, split_issue = _proved_krbtgt_client(monkeypatch, tmp_path)
+    _live_on_13(mt)
     rows = {row["id"]: row for row in asyncio.run(mt._fetch_credentials_cached(""))}
     assert rows[500]["credential_text"] == AES and rows[501]["credential_text"] == NTLM
+    mt._cred_cache = list(rows.values())  # what a production credential read leaves cached
     return mt, split_issue
 
 
@@ -380,11 +382,12 @@ def _proposed(run) -> list[dict]:
 
 
 def test_a_supervised_card_for_a_lower_ranked_reference_runs_exactly_that_forge(monkeypatch, tmp_path):
-    from test_step_bounds import _rescope_run, _rescope_script
+    from test_step_bounds import _bound_forge_script, _rescope_run
 
     mt, split_issue = _non_top_client(monkeypatch, tmp_path)
 
-    run = asyncio.run(_rescope_run(mt, split_issue, _rescope_script({"credential_id": 501})))
+    # The Supervisor's brief names the row; Sage carries it into the bound forge candidate's call.
+    run = asyncio.run(_rescope_run(mt, split_issue, _bound_forge_script(["cred:501"])))
 
     assert run.issued_before_decision == []  # nothing ran before the operator accepted
     [card] = _proposed(run)
@@ -397,11 +400,11 @@ def test_a_supervised_card_for_a_lower_ranked_reference_runs_exactly_that_forge(
 
 
 def test_a_rejected_card_for_a_lower_ranked_reference_runs_nothing(monkeypatch, tmp_path):
-    from test_step_bounds import _rescope_run, _rescope_script
+    from test_step_bounds import _bound_forge_script, _rescope_run
 
     mt, split_issue = _non_top_client(monkeypatch, tmp_path)
 
-    run = asyncio.run(_rescope_run(mt, split_issue, _rescope_script({"credential_id": 501}), decision="reject"))
+    run = asyncio.run(_rescope_run(mt, split_issue, _bound_forge_script(["cred:501"]), decision="reject"))
 
     assert len(run.cards) >= 1 and run.issued == [], [issue["command_name"] for issue in run.issued]
     _no_secret(run.emissions)
@@ -409,7 +412,7 @@ def test_a_rejected_card_for_a_lower_ranked_reference_runs_nothing(monkeypatch, 
 
 @pytest.mark.parametrize("change", ["deleted", "rotated"])
 def test_an_accepted_card_whose_reference_changed_runs_nothing(monkeypatch, tmp_path, change):
-    from test_step_bounds import _rescope_run, _rescope_script
+    from test_step_bounds import _bound_forge_script, _rescope_run
 
     mt, split_issue = _non_top_client(monkeypatch, tmp_path)
     fetch = mt._fetch_credentials_cached
@@ -422,7 +425,7 @@ def test_an_accepted_card_whose_reference_changed_runs_nothing(monkeypatch, tmp_
             return [{**row, "credential_text": TYPED} if row["id"] == 501 else row for row in rows]
         mt._fetch_credentials_cached = changed
 
-    run = asyncio.run(_rescope_run(mt, split_issue, _rescope_script({"credential_id": 501}),
+    run = asyncio.run(_rescope_run(mt, split_issue, _bound_forge_script(["cred:501"]),
                                    before_decision=change_row_501))
 
     assert len(_proposed(run)) == 1 and run.issued_before_decision == []

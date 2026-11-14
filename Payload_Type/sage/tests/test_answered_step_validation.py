@@ -1,10 +1,10 @@
-"""An already-achieved capability answer reaches native chat with its proof, and is not dispatched again.
+"""An answered capability step is not dispatched again, and an already-proved effect never reaches a card.
 
-A supervised step whose capability effect is already proved in the engagement ledger returns the executor's
-`already_achieved` verdict with the existing effect/task/callback proof and issues no Mythic task. Sending that same
-step again (same worker, title and structural scope) is not dispatched: the first resend gets the answer back, the
-second ends the request at a checkpoint carrying it, without the no-progress stop. A bounded one-action request ends
-directly with the answer.
+In ordinary supervised requests a catalog step runs only an action current evidence supports (catalog binding). A
+proved effect removes its procedure from those actions, so a step asking for it ends blocked before a card and
+issues nothing; the ledger rows the Supervisor reads carry the proof. A step that ran an approved procedure is never
+refused as an answered repeat; whether it can run again depends on whether its candidate is still current. The
+Supervisor's answered-step record is consulted only in assisted lanes.
 
 Everything on the path is real except the models and Mythic's network I/O: the public `MythicTools.execute_capability`
 tool with its request-contract check and ledger read, the approval card and its acceptance, the worker stop, step
@@ -35,14 +35,14 @@ from tests.test_engagement_wiring import _proof_hop
 from tests.test_hitl_steer_current_intent import (
     _NativeDriverChat, _NativeScriptedModel, _call, _cards, _input_response,
 )
-from tests.test_step_bounds import FORGE_ACTION, FORGE_PROMPT, _proved_krbtgt_client
+from tests.test_step_bounds import (
+    FORGE_ACTION, FORGE_PROMPT, _bound_forge_handoff, _live_on_13, _proved_krbtgt_client,
+)
 
 OPERATOR = "Mythic_Operator"
 HANDOFF = f"transfer_to_{OPERATOR}"
 FIRST_REFUSAL = f"Delegation to {OPERATOR} was not dispatched: this is the step that just returned"
 FINAL_REFUSAL = f"{OPERATOR} was sent the step that already answered again"
-VERDICT = "Executor verdict: `achieved` for `forge-golden-ticket`"
-PROOF = "`da:lab.local` task=41 cb=13"  # the seeded ledger proof, as the executor report names it
 NO_PROGRESS = ("Halted: no progress", "Stopped — no progress")
 
 FORGE_BRIEF = {
@@ -65,6 +65,7 @@ class _RoutedModel(_NativeScriptedModel):
         if not speaker:
             self.inputs.append(list(messages))  # what every non-worker model call was given, in order
         scripted = next(self.worker if speaker else self.messages)
+        scripted = scripted(messages) if callable(scripted) else scripted
         return ChatResult(generations=[ChatGeneration(message=scripted)])
 
 
@@ -202,116 +203,53 @@ def _assert_lifecycle_clean(run) -> None:
                    for e in run.emissions)
 
 
-# --- ordinary supervised: the answered step is not dispatched again ----------------------------------------------
+# --- ordinary supervised: an already-proved forge is no current candidate ------------------------------------------
+# An ordinary supervised catalog step runs only an action current evidence supports (catalog binding). A proved
+# `da:lab.local` removes the forge from those actions, so the step ends blocked before a card instead of reaching the
+# executor's `already_achieved` answer; the ledger rows the Supervisor reads already carry that proof.
 
-def test_an_already_achieved_step_resent_twice_ends_at_a_checkpoint_with_its_proof(achieved):
+def test_an_already_proved_forge_ends_blocked_before_a_card_and_runs_nothing(achieved):
     mt, split_issue = achieved
+    _live_on_13(mt)
     ran = _spy_capability(mt)
-    reworded = {**FORGE_BRIEF, "expected_result": "Golden ticket forged and verified for lab.local."}
-    supervisor = [_call(HANDOFF, FORGE_BRIEF, 1), _call(HANDOFF, FORGE_BRIEF, 2), _call(HANDOFF, reworded, 3),
-                  *_filler("Final answer.")]
-    worker = [_call("execute_capability", FORGE, 4), *_filler("The golden ticket effect is already proved.")]
+    supervisor = [_bound_forge_handoff(FORGE_BRIEF, 1), _call(HANDOFF, FORGE_BRIEF, 2), *_filler("Final answer.")]
 
-    run = asyncio.run(_native_run(mt, split_issue, supervisor, worker, prompts=[FORGE_PROMPT]))
+    run = asyncio.run(_native_run(mt, split_issue, supervisor, _filler("unused"), prompts=[FORGE_PROMPT]))
 
-    # The real producer answered from the ledger once and issued nothing.
-    assert [r["stopped_after"] for r in ran] == ["already_achieved"], ran
-    assert run.issued == []
-    # One worker dispatch; both resends refused without dispatch (the second rewords expected_result).
-    assert len(_dispatches(run)) == 1
-    assert len(_delegation_cards(run)) == 1
-    # One native terminal, a checkpoint that carries the verdict and the existing proof; no no-progress stop.
+    assert ran == [] and run.issued == [] and _dispatches(run) == [] and _cards(run.chat) == []
     [terminal] = _terminals(run)
-    assert terminal["kind"] == "complete" and terminal["metadata"].get("turn_outcome") == "checkpoint", terminal
-    assert VERDICT in terminal["content"] and PROOF in terminal["content"], terminal["content"]
-    assert _stops(run) == [] and _errors(run) == []
-    _assert_lifecycle_clean(run)
-    # Two refusals: the first hands the answer back, the second (a reworded expected_result) ends the request.
-    [first] = _refusals(run, FIRST_REFUSAL)
-    assert len(_refusals(run, FINAL_REFUSAL)) == 1
-    assert VERDICT in first and PROOF in first, first
-
-
-# --- bounded one-action: the answer ends the request directly ----------------------------------------------------
-
-def test_a_bounded_one_action_already_achieved_request_completes_with_its_proof(achieved):
-    mt, split_issue = achieved
-    ran = _spy_capability(mt)
-    # Supervised workers receive the operator's request itself, so the operator's words make the request bounded.
-    prompt = "Run execute_capability exactly once for forge-golden-ticket on lab.local via callback 13, then stop."
-    bounded = {**FORGE_BRIEF, "handoff_instruction": prompt}
-    supervisor = [_call(HANDOFF, bounded, 1), _call(HANDOFF, bounded, 2), *_filler("Final answer.")]
-    worker = [_call("execute_capability", FORGE, 3), *_filler("The golden ticket effect is already proved.")]
-
-    run = asyncio.run(_native_run(mt, split_issue, supervisor, worker, prompts=[prompt]))
-
-    assert [r["stopped_after"] for r in ran] == ["already_achieved"], ran
-    assert run.issued == []
-    assert len(_dispatches(run)) == 1 and len(_delegation_cards(run)) == 1
-    assert _refusals(run, FIRST_REFUSAL) == [] and _refusals(run, FINAL_REFUSAL) == []
-    [terminal] = _terminals(run)
-    assert terminal["kind"] == "complete" and terminal["metadata"].get("turn_outcome") == "completed", terminal
-    assert VERDICT in terminal["content"] and PROOF in terminal["content"], terminal["content"]
+    assert "Blocked" in terminal["content"] and "`forge-golden-ticket`" in terminal["content"], terminal["content"]
+    assert "da:lab.local" in "".join(str(m.content) for m in run.fake.inputs[0])   # the proof the Supervisor read
     assert _stops(run) == [] and _errors(run) == []
     _assert_lifecycle_clean(run)
 
 
-# --- controls: a different step, a new request and an effectful step are dispatched -----------------------------
+# --- control: an effectful step is dispatched when resent -------------------------------------------------------
 
-@pytest.mark.parametrize("change", [
-    {"callback_display_id": 14},
-    {"targets": ["lab.local", "DC01"]},  # callback 13's observed host
-    {"inputs_by_reference": ["task:21"]},
-    {"handoff_title": "forge the golden ticket again"},
-], ids=["callback", "target", "input", "title"])
-def test_a_changed_step_after_an_already_achieved_answer_is_dispatched(achieved, change):
-    mt, split_issue = achieved
-    mt._recon_snapshot_cache[("list_callbacks", "all")].append({"id": 14, "display_id": 14, "host": "DC02"})
-    ran = _spy_capability(mt)
-    supervisor = [_call(HANDOFF, FORGE_BRIEF, 1), _call(HANDOFF, {**FORGE_BRIEF, **change}, 2),
-                  *_filler("Final answer.")]
-    worker = [_call("execute_capability", FORGE, 3), *_filler("The golden ticket effect is already proved.")]
-
-    run = asyncio.run(_native_run(mt, split_issue, supervisor, worker, prompts=[FORGE_PROMPT]))
-
-    assert len(ran) == 1 and run.issued == []
-    assert len(_dispatches(run)) == 2 and len(_delegation_cards(run)) == 2
-    assert _refusals(run, FIRST_REFUSAL) == [] and _refusals(run, FINAL_REFUSAL) == []
-    assert _stops(run) == [] and _errors(run) == []
-    _assert_lifecycle_clean(run)
-
-
-def test_the_same_step_in_a_new_request_is_dispatched(achieved):
-    mt, split_issue = achieved
-    ran = _spy_capability(mt)
-    supervisor = [_call(HANDOFF, FORGE_BRIEF, 1), AIMessage(content="It is already proved."),
-                  _call(HANDOFF, FORGE_BRIEF, 2), *_filler("Final answer.")]
-    worker = [_call("execute_capability", FORGE, 3), _call("execute_capability", FORGE, 4),
-              *_filler("The golden ticket effect is already proved.")]
-
-    run = asyncio.run(_native_run(mt, split_issue, supervisor, worker, prompts=[FORGE_PROMPT, FORGE_PROMPT]))
-
-    assert [r["stopped_after"] for r in ran] == ["already_achieved", "already_achieved"], ran
-    assert run.issued == []
-    assert len(_dispatches(run)) == 2
-    assert _refusals(run, FIRST_REFUSAL) == [] and _refusals(run, FINAL_REFUSAL) == []
-    assert len(_terminals(run)) == 2 and _stops(run) == [] and _errors(run) == []
-    _assert_lifecycle_clean(run)
-
-
-def test_an_approved_capability_step_that_issued_a_task_is_dispatched_when_resent(monkeypatch, tmp_path, no_network):
-    """The step ran its approved forge, which issued Mythic tasks: sending it again is new work, not a repeat."""
+def test_an_approved_capability_step_that_issued_a_task_is_not_refused_as_a_repeat(monkeypatch, tmp_path, no_network):
+    """The step ran its approved forge, which issued Mythic tasks: sending it again is not an answered repeat. The
+    forge's failed attempt is retained for the request, so the resent candidate is no longer current and catalog
+    binding, not the repeat guard, stops it before a card."""
     mt, split_issue = _proved_krbtgt_client(monkeypatch, tmp_path)
+    _live_on_13(mt)
     ran = _spy_capability(mt)
-    supervisor = [_call(HANDOFF, FORGE_BRIEF, 1), _call(HANDOFF, FORGE_BRIEF, 2), *_filler("Final answer.")]
-    worker = [_call("execute_capability", FORGE, 3), *_filler("The forge ran.")]
+    chosen: list[dict] = []
 
-    run = asyncio.run(_native_run(mt, split_issue, supervisor, worker, prompts=[FORGE_PROMPT]))
+    def first(messages):
+        call = _bound_forge_handoff(FORGE_BRIEF, 1)(messages)
+        chosen.append(call.tool_calls[0]["args"])
+        return call
+
+    supervisor = [first, lambda messages: _call(HANDOFF, chosen[0], 2), *_filler("Final answer.")]
+
+    run = asyncio.run(_native_run(mt, split_issue, supervisor, _filler("The forge ran."), prompts=[FORGE_PROMPT]))
 
     assert len(ran) == 1 and ran[0].get("stopped_after") != "already_achieved", ran
     assert run.issued, "the approved forge issued no Mythic task"
-    assert len(_dispatches(run)) == 2 and len(_delegation_cards(run)) == 2
+    assert len(_dispatches(run)) == 1 and len(_delegation_cards(run)) == 1
     assert _refusals(run, FIRST_REFUSAL) == [] and _refusals(run, FINAL_REFUSAL) == []
+    [terminal] = _terminals(run)
+    assert "not supported by current evidence" in terminal["content"], terminal["content"]
     assert _stops(run) == [] and _errors(run) == []
     _assert_lifecycle_clean(run)
 

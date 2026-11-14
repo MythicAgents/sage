@@ -25,6 +25,9 @@ except ImportError:  # pragma: no cover - flat import layout
     import capabilities
 
 CONTROL_PLANE = "control_plane"
+# Catalog procedures whose step Sage compiles from the brief alone (`step_bounds.BRIEF_BOUND_PROCEDURES`); every other
+# catalog step in an ordinary supervised request binds one current candidate (`catalog_binding`).
+BRIEF_COMPILED_PROCEDURES = frozenset({"collect-graph"})
 TARGET_FACING_WORKERS = frozenset({"Mythic_Operator"})
 REJECTIONS_BEFORE_STOP = 2
 
@@ -77,6 +80,8 @@ class HandoffBrief:
     allowed_tools: tuple[str, ...] = ()
     inputs_by_reference: tuple[str, ...] = ()
     expected_result: str = ""
+    # The current catalog candidate a non-collection catalog step selects (`catalog_binding`); empty otherwise.
+    candidate_ref: str = ""
     # Reserved: step budgets are enforced by the step-bounds work and plan identity by the plan work.
     budget: str = ""
     step_id: str = ""
@@ -85,7 +90,7 @@ class HandoffBrief:
     @classmethod
     def from_args(cls, *, targets: Any = None, callback_display_id: Any = None, allowed_capabilities: Any = None,
                   allowed_tools: Any = None, inputs_by_reference: Any = None,
-                  expected_result: Any = None) -> "HandoffBrief":
+                  expected_result: Any = None, candidate_ref: Any = None) -> "HandoffBrief":
         return cls(
             targets=_items(targets),
             callback_display_id=_callback(callback_display_id),
@@ -93,6 +98,7 @@ class HandoffBrief:
             allowed_tools=tuple(dict.fromkeys(_items(allowed_tools))),
             inputs_by_reference=tuple(item.casefold() for item in _items(inputs_by_reference)),
             expected_result=str(expected_result or "").strip(),
+            candidate_ref=str(candidate_ref or "").strip(),
         )
 
     @property
@@ -112,6 +118,7 @@ class HandoffBrief:
             "allowed_tools": list(self.allowed_tools),
             "inputs_by_reference": list(self.inputs_by_reference),
             "expected_result": self.expected_result,
+            **({"candidate_ref": self.candidate_ref} if self.candidate_ref else {}),
         }
 
 
@@ -407,6 +414,9 @@ def validate_brief(brief: HandoffBrief, *, worker: str, require_scope: bool, sco
         unknown = [name for name in brief.allowed_tools if name not in set(worker_tools)]
         if unknown:
             errors.append(f"allowed_tools: {', '.join(unknown)} is not a guarded tool of {worker}")
+    if brief.candidate_ref and (not brief.allowed_capabilities or brief.control_plane_only
+                                or set(brief.allowed_capabilities) & BRIEF_COMPILED_PROCEDURES):
+        errors.append("candidate_ref: only a catalog procedure step other than graph collection selects a candidate")
     if CONTROL_PLANE in brief.allowed_capabilities and not brief.control_plane_only:
         errors.append(f"allowed_capabilities: `{CONTROL_PLANE}` cannot be combined with other classes")
     if require_scope and worker in TARGET_FACING_WORKERS:

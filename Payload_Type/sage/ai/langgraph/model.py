@@ -66,6 +66,7 @@ from .decision_record import seal_request_decision_record
 from .operator_error import operator_error_text
 from . import engagement_ledger
 from . import worker_outcome as _worker_outcome
+from . import catalog_binding as _catalog_binding
 from . import handoff_brief as _handoff_brief
 from . import step_bounds as _step_bounds
 from . import step_references as _step_references
@@ -2980,13 +2981,23 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
             return None  # the worker already acted in this step
         delegated = self._delegated_message(state_messages)
         brief = getattr(delegated, "additional_kwargs", {}).get("_handoff_brief")
-        try:
-            hosts = _handoff_brief.known_scope(getattr(self._model, "mythic_client", None)).hosts
-        except Exception:
-            return None
-        call = _step_bounds.bound_procedure_call(brief, hosts)
-        if call is None or "execute_capability" not in {
-                _offered_tool_name(tool) for tool in getattr(request, "tools", None) or []}:
+        offered = "execute_capability" in {_offered_tool_name(tool) for tool in getattr(request, "tools", None) or []}
+        if offered and _needs_catalog_binding(brief) and self._model._catalog_binding_active():
+            # The Supervisor selected one current candidate: Sage proposes exactly its action, re-derived now.
+            candidate, error = self._current_candidate(brief)
+            if candidate is None:
+                note = (f"Sage did not propose this catalog step: {error}. No approval card was offered and no Mythic "
+                        "task was issued; the Supervisor can select a current candidate or other work.")
+                record.end(_step_bounds.StepStatus.PRECONDITION_UNSATISFIABLE, "precondition", note)
+                return AIMessage(content=note, name=self._agent_name)
+            call = {"action": json.loads(json.dumps(candidate.action)), "inputs": json.loads(json.dumps(candidate.inputs))}
+        else:
+            try:
+                hosts = _handoff_brief.known_scope(getattr(self._model, "mythic_client", None)).hosts
+            except Exception:
+                return None
+            call = _step_bounds.bound_procedure_call(brief, hosts)
+        if call is None or not offered:
             return None
         record.procedure_dispatched = True
         try:
@@ -2999,6 +3010,35 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
                          "id": _bound_call_id(record.request_id, record.delegation_seq)}],
             additional_kwargs={"_sage_bound_procedure": True},
         )
+
+    def _current_candidate(self, brief: Mapping[str, Any]) -> tuple[Any, str]:
+        """The current candidate a delegated brief selects, re-derived from a fresh snapshot; (None, reason) if none."""
+        found, reason = self._model._catalog_candidates()
+        return _catalog_binding.bind(_handoff_brief.HandoffBrief.from_args(**brief), found, reason=reason)
+
+    def _refused_unsupported_candidate(self, request: Any) -> ToolMessage | None:
+        """Refuse an approved catalog call whose candidate current evidence no longer supports, or that is not that
+        candidate's action, before the executor issues anything. Only the root call is checked: a procedure's own
+        tasks follow from its approval."""
+        record = self._record(request)
+        if record is None or _tool_name_from_request(request) != "execute_capability":
+            return None
+        delegated = self._delegated_message(_agent_state_messages(getattr(request, "state", None)))
+        brief = getattr(delegated, "additional_kwargs", {}).get("_handoff_brief")
+        if not (_needs_catalog_binding(brief) and self._model._catalog_binding_active()):
+            return None
+        candidate, error = self._current_candidate(brief)
+        call = getattr(request, "tool_call", None)
+        args = call.get("args") if isinstance(call, dict) and isinstance(call.get("args"), dict) else {}
+        error = error or _catalog_binding.call_matches(args, candidate)
+        if not error:
+            return None
+        reason = f"the approved catalog action no longer matches current evidence: {error}; nothing was issued"
+        record.end(_step_bounds.StepStatus.PRECONDITION_UNSATISFIABLE, "precondition", reason)
+        logger.info(f"⛔ [catalog-binding] {self._agent_name} refused before execution: {error}")
+        payload = {"ok": False, "verdict": "blocked", "source": "catalog_binding", "reason": reason, "issued": []}
+        return ToolMessage(content=json.dumps(payload, sort_keys=True), name="execute_capability",
+                           tool_call_id=_tool_call_id_from_request(request))
 
     async def _announce(self, message: AIMessage) -> None:
         """Give Sage's own proposal to the worker's capture callback, as a model's response would be, so its tool
@@ -3329,7 +3369,7 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
         return response
 
     def wrap_tool_call(self, request, handler):
-        refused = self._refused_after_bound(request)
+        refused = self._refused_after_bound(request) or self._refused_unsupported_candidate(request)
         if refused is not None:
             return refused
         started = self._model._step_clock()
@@ -3339,7 +3379,7 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
             self._add_time(request, started, guarded=_tool_name_from_request(request) in self._guarded)
 
     async def awrap_tool_call(self, request, handler):
-        refused = self._refused_after_bound(request)
+        refused = self._refused_after_bound(request) or self._refused_unsupported_candidate(request)
         if refused is not None:
             return refused
         started = self._model._step_clock()
@@ -6949,8 +6989,11 @@ class Model:
 
     def _check_handoff_brief(
         self, worker: str, brief: "_handoff_brief.HandoffBrief", instruction: str, title: str = "",
-    ) -> tuple[tuple[str, ...], bool] | tuple[tuple[str, ...], bool, tuple[str, ...]] | None:
-        """Structurally check a delegation's brief before dispatch; None admits it.
+    ) -> tuple[tuple[str, ...], bool] | tuple[tuple[str, ...], bool, tuple[str, ...]] | tuple[
+            tuple[str, ...], bool, tuple[str, ...], str] | None:
+        """Structurally check a delegation's brief before dispatch; None admits it. In an ordinary supervised request a
+        non-collection catalog step must also bind one current candidate; failing that ends the request (with a
+        fourth element, the closing report's text).
 
         Reads the request lane and operator input from the Model's state, as the assisted-input lookup does: the
         handoff tool's runtime state is the Supervisor's own channel view. Rejections are request evidence.
@@ -6984,6 +7027,13 @@ class Model:
             brief, worker=worker, require_scope=lane == "supervised_workflow", scope=scope,
             worker_tools=_worker_guarded_tool_names(worker),
         )
+        binding_error = ""
+        if not errors and worker in _handoff_brief.TARGET_FACING_WORKERS and _needs_catalog_binding(brief) \
+                and self._catalog_binding_active():
+            # A catalog step runs one action current evidence supports, chosen by its candidate_ref; nothing else.
+            found, reason = self._catalog_candidates()
+            _candidate, binding_error = _catalog_binding.bind(brief, found, reason=reason)
+            errors = (f"catalog binding: {binding_error}",) if binding_error else ()
         restatement = _handoff_brief.restatement(instruction, operator_input)
         metadata = {
             "worker": worker,
@@ -7041,6 +7091,12 @@ class Model:
                 )
             self._consume_admitted_first_step(worker, brief)
             return None
+        if binding_error:
+            return errors, True, (), (
+                f"I could not bind this catalog step to an action current evidence supports: {binding_error}. No "
+                "approval card was offered and no Mythic task was issued. That is not a finding that the objective is "
+                "impossible: graph collection, control-plane reads and explicit off-catalog steps remain available, "
+                "and a new request can supply evidence.")
         rejections = _handoff_brief.rejection_count(ledger.actual_events(kind="brief"))
         return errors, rejections >= _handoff_brief.REJECTIONS_BEFORE_STOP
 
@@ -12190,8 +12246,11 @@ class Model:
         except Exception:
             return False
 
-    def _engagement_ledger_view(self, *, reader_tool: bool, submit_tool: bool, lane: str) -> tuple[str, int | None]:
+    def _engagement_ledger_view(self, *, reader_tool: bool, submit_tool: bool, lane: str,
+                                candidates: bool = False) -> tuple[str, int | None]:
         """(block, snapshot revision) from ONE fresh snapshot of the bound operation ledger, or an UNAVAILABLE block.
+        With ``candidates``, the catalog actions that snapshot supports follow the rows (unavailable, never empty, when
+        the snapshot cannot be read).
 
         Reads the store only: no reconciliation, objective write, Mythic call or model call.
         """
@@ -12201,16 +12260,21 @@ class Model:
         client = getattr(self, "mythic_client", None)
         snapshot_fn = getattr(client, "_ledger_snapshot", None)
         view_fn = getattr(client, "_ledger_model_view", None)
+
+        def unavailable(reason: Any) -> tuple[str, None]:
+            block = engagement_ledger.render_model_view_unavailable(reason, guidance=guidance)
+            if candidates:
+                block += "\n\n" + _catalog_binding.render(None, reason="the operation ledger could not be read")
+            return block, None
+
         if client is None or not callable(snapshot_fn) or not callable(view_fn):
-            return engagement_ledger.render_model_view_unavailable(
-                "no operation ledger is bound to this session", guidance=guidance), None
+            return unavailable("no operation ledger is bound to this session")
         try:
             snapshot = snapshot_fn()
         except Exception as exc:
-            return engagement_ledger.render_model_view_unavailable(exc, guidance=guidance), None
+            return unavailable(exc)
         if not isinstance(snapshot, LedgerSnapshot):
-            return engagement_ledger.render_model_view_unavailable(
-                "this session's client exposes no operation snapshot", guidance=guidance), None
+            return unavailable("this session's client exposes no operation snapshot")
         block = view_fn(
             snapshot,
             stored_objective=snapshot.objective_setting()[0],
@@ -12218,6 +12282,9 @@ class Model:
             reader_tool=reader_tool,
             guidance=guidance,
         )
+        if candidates:
+            found, reason = self._catalog_candidates(snapshot)
+            block += "\n\n" + _catalog_binding.render(found, reason=reason)
         return block, snapshot.revision
 
     def _engagement_ledger_view_for_call(self, agent_name: str, request: Any) -> tuple[str, int | None]:
@@ -12228,7 +12295,48 @@ class Model:
                   and self._model_tool_admissible(engagement_ledger.READER_TOOL))
         submit = (engagement_ledger.SUBMIT_TOOL in names
                   and self._model_tool_admissible(engagement_ledger.SUBMIT_TOOL))
-        return self._engagement_ledger_view(reader_tool=reader, submit_tool=submit, lane=self._ledger_view_lane())
+        return self._engagement_ledger_view(reader_tool=reader, submit_tool=submit, lane=self._ledger_view_lane(),
+                                            candidates=agent_name == "Supervisor" and self._catalog_binding_active())
+
+    def _catalog_binding_active(self) -> bool:
+        """Whether catalog steps bind current candidates: ordinary supervised requests only. Conversation has no
+        guarded execution; supervised Autonomous Solve and auto keep their controller."""
+        lane = str(getattr(getattr(getattr(self, "_request_contract", None), "lane", None), "value", "") or "")
+        return (getattr(self, "mode", "") == "supervised" and lane == "supervised_workflow"
+                and not self._autonomous_execution_enabled_for_turn())
+
+    def _catalog_candidates(self, snapshot: Any = None) -> tuple[tuple | None, str]:
+        """(candidates, "") from ONE ledger snapshot plus live footholds, account contexts and request attempts, or
+        (None, reason) when they cannot be derived. A state without hops is kept: graph facts can support a step."""
+        client = getattr(self, "mythic_client", None)
+        if client is None:
+            return None, "no operation ledger is bound to this session"
+        try:
+            from . import capabilities
+            from . import engagement_state as _es
+
+            if snapshot is None:
+                hops, facts, corrected = _ledger_lists(client)
+            else:
+                view = client._ledger_view(snapshot)
+                hops, facts, corrected = list(view.hops), list(view.graph_facts), list(view.corrected_hops)
+            try:
+                objective = client._engagement_objective()
+            except Exception:
+                objective = ""
+            engagement_id, runtime_scope = _runtime_engagement_scope(client)
+            state = _es.EngagementState(
+                objective=objective, footholds=list(getattr(client, "_engagement_footholds", []) or []),
+                hops=hops, graph_facts=facts, corrected_hops=corrected, engagement_id=engagement_id,
+                runtime_scope=runtime_scope, current_account_contexts=_runtime_current_account_contexts(client),
+                request_attempts=_runtime_request_attempts(client),
+            )
+            pairs = [(_capability_action_payload(action), _autonomous_capability_inputs(action, state))
+                     for action in capabilities.actions_from_state(state)]
+        except Exception as exc:
+            return None, f"the engagement state could not be read ({type(exc).__name__})"
+        request_id = str(getattr(getattr(self, "_request_contract", None), "request_id", "") or "")
+        return _catalog_binding.candidates(request_id, pairs), ""
 
     def _current_engagement_state_snapshot(self, *, require_autonomous: bool = True):
         """Cheap in-memory EngagementState snapshot for terminal objective checks.
@@ -18800,7 +18908,7 @@ def _create_handoff_tool(
     worker_outcome_lookup: Callable[[dict[str, Any]], tuple[dict[str, Any], str] | None] | None = None,
     subgoal_scheduler: Callable[..., dict[str, Any]] | None = None,
     assisted_operator_lookup: Callable[[], str | None] | None = None,
-    brief_check: Callable[..., tuple[tuple[str, ...], bool] | tuple[tuple[str, ...], bool, tuple[str, ...]] | None] | None = None,
+    brief_check: Callable[..., tuple | None] | None = None,
     repeat_check: Callable[[str, str, Any], tuple[str, int, str] | None] | None = None,
     first_step: Callable[..., tuple[str, Any, str, str, str] | None] | None = None,
 ):
@@ -19231,6 +19339,7 @@ def _create_handoff_tool(
             allowed_capabilities: Annotated[list[capability_choice] | None, "Catalog procedures (each a multi-step procedure run as one guarded action through execute_capability) this step may run, by name, or ['control_plane'] alone for a step that only reads Mythic or BloodHound records (callbacks, task output, credentials, graph) and tasks no callback. A procedure also needs the state in its 'needs' clause; if that is not met, do the upstream procedure first. For any other work, including a single payload command, name the guarded tools in allowed_tools instead (a command is an argument to issue_task_and_waitfor_task_output, never a capability). Catalog:\n" + capability_legend] = None,
             allowed_tools: Annotated[list[tool_choice] | None, "Instead of allowed_capabilities: the guarded tools this step's one action may use. Name either allowed_capabilities or allowed_tools, not both. Read-only tools are always available and need not be listed."] = None,
             inputs_by_reference: Annotated[list[str] | None, "Earlier results this step uses, as 'task:<display id>' or 'cred:<credential id>' records Sage already holds."] = None,
+            candidate_ref: Annotated[str, "For a catalog procedure other than collect-graph: the candidate_ref of one action in the current 'Sage catalog candidates' list, copied exactly, with that procedure, its callback and targets it names. Sage runs exactly that action after approval; without a current candidate the step is not dispatched."] = "",
         ) -> Command:
             brief = _handoff_brief.HandoffBrief.from_args(
                 targets=targets,
@@ -19239,6 +19348,7 @@ def _create_handoff_tool(
                 allowed_tools=allowed_tools,
                 inputs_by_reference=inputs_by_reference,
                 expected_result=expected_result,
+                candidate_ref=candidate_ref,
             )
             return _build_handoff_command(runtime, handoff_instruction, handoff_title, brief=brief)
     else:
@@ -19371,6 +19481,14 @@ def _answered_step_repeat_command(
     )
 
 
+def _needs_catalog_binding(brief: Any) -> bool:
+    """Whether a brief names a catalog procedure Sage does not compile from the brief alone (anything but graph
+    collection and control-plane reads), so its step must bind one current candidate."""
+    names = brief.get("allowed_capabilities") if isinstance(brief, Mapping) else getattr(
+        brief, "allowed_capabilities", ())
+    return bool(set(names or ()) - _step_bounds.BRIEF_BOUND_PROCEDURES - {_handoff_brief.CONTROL_PLANE})
+
+
 def _brief_rejection_command(
     runtime: ToolRuntime,
     tool_name: str,
@@ -19378,13 +19496,15 @@ def _brief_rejection_command(
     errors: tuple[str, ...],
     stop: bool,
     refused: tuple[str, ...] = (),
+    summary: str = "",
     *,
     channels: Iterable[str],
 ) -> Command:
     """Refuse a delegation whose brief failed structural checks; nothing reaches the worker.
 
     `refused` names, from Sage's records, the proposals that scope refused when re-sending an exhausted scope is
-    what stops the request; the closing report lists them as neither approved nor executed."""
+    what stops the request; the closing report lists them as neither approved nor executed. `summary` replaces the
+    closing report's text when the stop has its own reason (an unbindable catalog step)."""
     detail = "\n".join(f"- {error}" for error in errors)
     refused_detail = (
         "\n\nRefused proposal, not approved and not executed (no approval card was offered and no Mythic task "
@@ -19403,7 +19523,7 @@ def _brief_rejection_command(
         default=0,
     )
     final_message = AIMessage(
-        content=(
+        content=f"**Blocked**\n\n{summary}" if summary else (
             f"**Blocked**\n\nI could not form an admissible delegation to {agent_name} for this request "
             f"after {_handoff_brief.REJECTIONS_BEFORE_STOP} attempts. The last brief failed these checks:"
             f"\n{detail}{refused_detail}\n\nName the callback and targets for the step, or narrow the request."
