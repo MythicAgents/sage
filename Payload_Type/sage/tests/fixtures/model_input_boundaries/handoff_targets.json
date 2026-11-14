@@ -1,0 +1,38 @@
+{
+  "provenance": {
+    "kind": "recorded model-output shape with synthetic current state",
+    "description": "A retained Supervisor handoff named a host FQDN followed by its domain. Identities and callback are consistently renamed; prose is omitted. Candidate selection and ledger state are synthetic, not a full recorded replay.",
+    "preserved": "List and string types, target ordering, string callback, capability name, and host/domain suffix relationship."
+  },
+  "recorded_shape": {
+    "targets": ["ws02.child.lab.local", "child.lab.local"],
+    "callback_display_id": "14",
+    "allowed_capabilities": ["gpo-controlled-system-exec"]
+  },
+  "cases": [
+    {
+      "id": "valid_short_host",
+      "provenance": "Equivalent-form mutation: shorten the recorded host within the same domain.",
+      "targets": ["ws02", "child.lab.local"],
+      "expected_cards": 1
+    },
+    {
+      "id": "equivalent_fqdn",
+      "provenance": "Recorded target shape with renamed identities; no target-form mutation.",
+      "targets": ["ws02.child.lab.local", "child.lab.local"],
+      "expected_cards": 1
+    },
+    {
+      "id": "foreign_domain",
+      "provenance": "Invalid mutation: keep the host label but replace its domain suffix.",
+      "targets": ["ws02.foreign.test", "child.lab.local"],
+      "expected_cards": 0
+    },
+    {
+      "id": "near_match_host",
+      "provenance": "Invalid mutation: append a digit to the host label in the same domain.",
+      "targets": ["ws020.child.lab.local", "child.lab.local"],
+      "expected_cards": 0
+    }
+  ]
+}

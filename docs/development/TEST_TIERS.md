@@ -241,6 +241,35 @@ they are the layers that must exist for every feature. A test you cannot run off
 Worked examples in the tree: `tests/test_graph_builds.py` (layer 0) and `tests/test_scripted_handoff.py`
 (layer 1, the Supervisor→Mythic_Operator handoff end to end in under a second).
 
+## Recorded input shapes with synthetic state
+
+`tests/test_model_input_boundaries.py` feeds the redacted examples in
+`tests/fixtures/model_input_boundaries/handoff_targets.json` through the existing native catalog driver.
+It reuses the real candidate producer, brief admission, graph and approval-card consumer. Model output,
+transport calls and current ledger/callback state are synthetic. The fixture preserves the recorded field
+types, host-first target ordering and host/domain relationship, and labels each equivalent or invalid mutation.
+This is layer 1 informed by recorded input shapes, not layer 2 full recorded replay or evidence of model choice.
+Private source locators, hashes and redaction mappings stay outside the public fixture; tests need none of them.
+
+Extend these examples when changing the affected boundary: source inputs independently of the implementation,
+include equivalent forms and invalid near-matches, and assert the intended consumer effect. Keep real schema,
+identity and authorization checks on the path. Record substitutions and provenance beside the path trace;
+missing recordings limit the claim to synthetic wiring. No new runner or provider access is needed.
+
+Run the seed directly with ordinary pytest:
+
+```bash
+PYTHONPATH=Payload_Type/sage .venv/bin/python -m pytest -q -rxX Payload_Type/sage/tests/test_model_input_boundaries.py
+PYTHONPATH=Payload_Type/sage .venv/bin/python -m pytest -q --runxfail Payload_Type/sage/tests/test_model_input_boundaries.py -k equivalent_fqdn
+```
+
+The seed currently reports **3 passed, 1 strict xfail**. The xfail exposes an **open product defect**:
+catalog binding rejects an equivalent full host name before offering its approval card. Only that case's
+desired-card assertion is excepted; setup, network, parsing and other assertion failures still fail normally.
+The second command must exit 1 at that assertion. This single calibration exception is not permission to xfail
+future product acceptance. A line repairing this boundary must remove the exception and make the desired
+behavior pass. A temporary mutation expecting zero cards for the valid short host must fail, then be restored.
+
 ## Writing a scripted (layer 1) test
 
 Everything stays real except the model. Sage's specialists are reached through `transfer_to_*` tool calls, so

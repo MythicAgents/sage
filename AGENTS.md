@@ -133,6 +133,16 @@ not after every edit, and rerun only the affected test files after a test-only f
 - Assert on built objects and actual output, not source text or generated `passes` claims.
 - Execute changed scripts through a safe local path; parsing alone does not detect runtime errors.
 - Test the semantic class with relevant positive, negative, and near-match probes. Demonstrate a new guard can fail.
+- For changed model-written inputs, use independently sourced recorded shapes, accepted equivalents and
+  invalid near-matches through the real consumer. Label synthetic state and mutations; missing recordings
+  leave a model-evidence gap. Assert the intended effect, not the current rejection. Preserve valid behavior
+  when updating fixtures; changed expectations need a plan-supported reason. Record provenance, transport
+  and model substitutions, and red/green/red beside the path trace. Scripted output proves code behavior
+  given that output, not model choice.
+- Search the path for existing schema, identity and validation owners before adding a check. Extend or merge
+  overlapping checks and name the duplication removed, or justify a distinct invariant. Do not remove an
+  unrelated safety check to meet a gate-count quota. Reusing normalization must not turn a target known
+  somewhere into a target authorized for the selected action.
 - Run `Payload_Type/sage/tests/test_repository_boundaries.py` before handoff.
 - Verify the actual deliverable from a fresh clean extraction at integration/release. Keep the user's index intact;
   identify the tested tree separately from HEAD and do not claim uncommitted changes are released.
