@@ -140,7 +140,7 @@ def test_valid_review_backed_krbtgt_material_binds_the_forge_key_from_its_proof_
 def test_the_supervised_forge_runs_once_from_the_material_rows_proof_task(monkeypatch, tmp_path, mythic_task_records):
     """Channel 4 request 4: every forge proposal was refused. Now the forge step gets one card and runs from task 21."""
     mt, split_issue, _result = _material_krbtgt_client(monkeypatch, tmp_path, mythic_task_records)
-    _live_on_13(mt)
+    _live_on_13(mt, monkeypatch)
     forge_brief = {"handoff_title": "forge the golden ticket", "handoff_instruction": FORGE_PROMPT,
                    "allowed_capabilities": ["forge-golden-ticket"], "callback_display_id": 13,
                    "targets": [DOMAIN], "expected_result": "A verified golden ticket for lab.local."}

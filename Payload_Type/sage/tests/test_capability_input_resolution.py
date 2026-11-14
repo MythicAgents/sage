@@ -172,7 +172,7 @@ def _supervised(monkeypatch, tmp_path, *, mode: str = "supervised", decision: st
     # The supervised vehicle is the forge candidate current evidence supports (an ordinary supervised catalog step
     # runs a bound candidate); its plan has the same unfilled service-proof target when no DC is known.
     mt, split_issue = _proved_krbtgt_client(monkeypatch, tmp_path)
-    _live_on_13(mt)
+    _live_on_13(mt, monkeypatch)
     mt._resolve_domain_controller_host = lambda domain: asyncio.sleep(0, result="")
     return asyncio.run(_rescope_run(mt, split_issue, _bound_forge_script(), mode=mode, decision=decision))
 

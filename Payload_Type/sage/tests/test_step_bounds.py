@@ -1449,11 +1449,32 @@ DCSYNC_OK = (
 )
 
 
-def _live_on_13(mt) -> None:
-    """Callback 13 as a live foothold in lab.local, so the forge candidate runs on it."""
-    mt._engagement_footholds = [es.Foothold(callback_id="13", agent="apollo", host="DC01", forest="lab.local",
-                                            identity="LAB\\operator", integrity="medium", alive=True,
-                                            source="fixture", timestamp="2026-11-14T00:00:00+00:00")]
+def _callback(display_id: int, host: str, domain: str, user: str) -> dict:
+    return {"id": display_id, "display_id": display_id, "host": host, "domain": domain, "user": user,
+            "integrity_level": 2, "payload": {"payloadtype": {"name": "apollo"}}, "active": True}
+
+
+def _live_callbacks(mt, monkeypatch, callbacks) -> list[dict]:
+    """What Mythic reports as active and checking in (its transport stubbed); Sage reconciles live footholds from it.
+    Mutate the returned list to change what Mythic reports."""
+    from ai.langgraph import access_reconciler
+
+    rows = [dict(row) for row in callbacks]
+
+    async def active():
+        return json.dumps(rows)
+
+    async def liveness(client, display_id, **_kwargs):
+        return {"alive": any(int(row["display_id"]) == int(display_id) for row in rows)}
+
+    mt.get_all_active_callbacks = active
+    monkeypatch.setattr(access_reconciler, "assess_callback_liveness", liveness)
+    return rows
+
+
+def _live_on_13(mt, monkeypatch) -> list[dict]:
+    """Callback 13 live in lab.local, so the forge candidate runs on it."""
+    return _live_callbacks(mt, monkeypatch, [_callback(13, "DC01", "lab.local", "operator")])
 
 
 def _bound_forge_handoff(brief: dict, index: int):
@@ -1572,7 +1593,7 @@ async def _rescope_run(mt, split_issue, script: list, *, mode: str = "supervised
 
 def test_a_read_only_step_hands_a_proved_krbtgt_to_one_fresh_rescoped_forge_card(monkeypatch, tmp_path):
     mt, split_issue = _proved_krbtgt_client(monkeypatch, tmp_path)
-    _live_on_13(mt)
+    _live_on_13(mt, monkeypatch)
     read_brief = {"handoff_title": "check the proved krbtgt", "handoff_instruction": FORGE_PROMPT,
                   "allowed_capabilities": ["control_plane"], "expected_result": "Whether krbtgt is proved."}
     forge_brief = {"handoff_title": "forge the golden ticket", "handoff_instruction": FORGE_PROMPT,

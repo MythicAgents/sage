@@ -208,9 +208,9 @@ def _assert_lifecycle_clean(run) -> None:
 # `da:lab.local` removes the forge from those actions, so the step ends blocked before a card instead of reaching the
 # executor's `already_achieved` answer; the ledger rows the Supervisor reads already carry that proof.
 
-def test_an_already_proved_forge_ends_blocked_before_a_card_and_runs_nothing(achieved):
+def test_an_already_proved_forge_ends_blocked_before_a_card_and_runs_nothing(achieved, monkeypatch):
     mt, split_issue = achieved
-    _live_on_13(mt)
+    _live_on_13(mt, monkeypatch)
     ran = _spy_capability(mt)
     supervisor = [_bound_forge_handoff(FORGE_BRIEF, 1), _call(HANDOFF, FORGE_BRIEF, 2), *_filler("Final answer.")]
 
@@ -226,12 +226,11 @@ def test_an_already_proved_forge_ends_blocked_before_a_card_and_runs_nothing(ach
 
 # --- control: an effectful step is dispatched when resent -------------------------------------------------------
 
-def test_an_approved_capability_step_that_issued_a_task_is_not_refused_as_a_repeat(monkeypatch, tmp_path, no_network):
-    """The step ran its approved forge, which issued Mythic tasks: sending it again is not an answered repeat. The
-    forge's failed attempt is retained for the request, so the resent candidate is no longer current and catalog
-    binding, not the repeat guard, stops it before a card."""
+def test_an_approved_capability_step_that_issued_a_task_is_dispatched_when_resent(monkeypatch, tmp_path, no_network):
+    """The step ran its approved forge, which issued Mythic tasks: sending it again is new work, not a repeat. While
+    the forge is still a current candidate, the resend gets its own card and runs only after that approval."""
     mt, split_issue = _proved_krbtgt_client(monkeypatch, tmp_path)
-    _live_on_13(mt)
+    _live_on_13(mt, monkeypatch)
     ran = _spy_capability(mt)
     chosen: list[dict] = []
 
@@ -244,12 +243,11 @@ def test_an_approved_capability_step_that_issued_a_task_is_not_refused_as_a_repe
 
     run = asyncio.run(_native_run(mt, split_issue, supervisor, _filler("The forge ran."), prompts=[FORGE_PROMPT]))
 
-    assert len(ran) == 1 and ran[0].get("stopped_after") != "already_achieved", ran
+    assert len(ran) == 2 and all(r.get("stopped_after") != "already_achieved" for r in ran), ran
     assert run.issued, "the approved forge issued no Mythic task"
-    assert len(_dispatches(run)) == 1 and len(_delegation_cards(run)) == 1
+    assert len(_dispatches(run)) == 2 and len(_delegation_cards(run)) == 2
+    assert len([card for card in _cards(run.chat) if card.get("status") not in {"accepted", "rejected"}]) == 2
     assert _refusals(run, FIRST_REFUSAL) == [] and _refusals(run, FINAL_REFUSAL) == []
-    [terminal] = _terminals(run)
-    assert "not supported by current evidence" in terminal["content"], terminal["content"]
     assert _stops(run) == [] and _errors(run) == []
     _assert_lifecycle_clean(run)
 

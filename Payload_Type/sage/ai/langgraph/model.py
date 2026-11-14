@@ -2629,6 +2629,8 @@ class _EngagementLedgerViewMiddleware(AgentMiddleware):
         return handler(self._augment(request))
 
     async def awrap_model_call(self, request, handler):
+        if self._agent_name == "Supervisor":
+            await self._model._refresh_catalog_footholds()
         return await handler(self._augment(request))
 
 
@@ -3011,6 +3013,14 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
             additional_kwargs={"_sage_bound_procedure": True},
         )
 
+    async def _refresh_for_candidate(self, request: Any) -> None:
+        """Re-read live footholds when this step's brief binds a catalog candidate."""
+        if self._record(request) is None:
+            return
+        delegated = self._delegated_message(_agent_state_messages(getattr(request, "state", None)))
+        if _needs_catalog_binding(getattr(delegated, "additional_kwargs", {}).get("_handoff_brief")):
+            await self._model._refresh_catalog_footholds()
+
     def _current_candidate(self, brief: Mapping[str, Any]) -> tuple[Any, str]:
         """The current candidate a delegated brief selects, re-derived from a fresh snapshot; (None, reason) if none."""
         found, reason = self._model._catalog_candidates()
@@ -3352,6 +3362,7 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
             finally:
                 self._add_time(request, started, guarded=False)
         request = self._offer_scoped_tools(request)
+        await self._refresh_for_candidate(request)
         bound = self._bound_procedure_message(request)
         if bound is not None:
             self._limit_response(request, bound)
@@ -3379,6 +3390,8 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
             self._add_time(request, started, guarded=_tool_name_from_request(request) in self._guarded)
 
     async def awrap_tool_call(self, request, handler):
+        if _tool_name_from_request(request) == "execute_capability":
+            await self._refresh_for_candidate(request)
         refused = self._refused_after_bound(request) or self._refused_unsupported_candidate(request)
         if refused is not None:
             return refused
@@ -12305,12 +12318,32 @@ class Model:
         return (getattr(self, "mode", "") == "supervised" and lane == "supervised_workflow"
                 and not self._autonomous_execution_enabled_for_turn())
 
+    async def _refresh_catalog_footholds(self) -> None:
+        """Re-read live footholds from Mythic before an ordinary supervised request derives catalog candidates (the
+        Supervisor's view, the worker's proposal, execution). A failed read makes the candidates unavailable until the
+        next successful one, never derived from an older foothold list."""
+        client = getattr(self, "mythic_client", None)
+        if client is None or not self._catalog_binding_active():
+            return
+        from datetime import datetime, timezone
+
+        from . import access_reconciler
+        try:
+            footholds = await access_reconciler.reconcile_access(client, datetime.now(timezone.utc).isoformat())
+        except Exception as exc:
+            self._catalog_foothold_error = f"live footholds could not be read from Mythic ({type(exc).__name__})"
+            return
+        client._engagement_footholds = list(footholds)
+        self._catalog_foothold_error = ""
+
     def _catalog_candidates(self, snapshot: Any = None) -> tuple[tuple | None, str]:
         """(candidates, "") from ONE ledger snapshot plus live footholds, account contexts and request attempts, or
         (None, reason) when they cannot be derived. A state without hops is kept: graph facts can support a step."""
         client = getattr(self, "mythic_client", None)
         if client is None:
             return None, "no operation ledger is bound to this session"
+        if getattr(self, "_catalog_foothold_error", ""):
+            return None, self._catalog_foothold_error
         try:
             from . import capabilities
             from . import engagement_state as _es
@@ -19483,10 +19516,13 @@ def _answered_step_repeat_command(
 
 def _needs_catalog_binding(brief: Any) -> bool:
     """Whether a brief names a catalog procedure Sage does not compile from the brief alone (anything but graph
-    collection and control-plane reads), so its step must bind one current candidate."""
-    names = brief.get("allowed_capabilities") if isinstance(brief, Mapping) else getattr(
-        brief, "allowed_capabilities", ())
-    return bool(set(names or ()) - _step_bounds.BRIEF_BOUND_PROCEDURES - {_handoff_brief.CONTROL_PLANE})
+    collection and control-plane reads), or scopes `execute_capability` as a tool, so its step must bind one current
+    candidate."""
+    def field(name: str) -> set:
+        return set((brief.get(name) if isinstance(brief, Mapping) else getattr(brief, name, ())) or ())
+
+    return bool(field("allowed_capabilities") - _step_bounds.BRIEF_BOUND_PROCEDURES - {_handoff_brief.CONTROL_PLANE}
+                or "execute_capability" in field("allowed_tools"))
 
 
 def _brief_rejection_command(

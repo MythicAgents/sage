@@ -121,6 +121,9 @@ def bind(brief: Any, found: tuple[Candidate, ...] | None, *, reason: str = "") -
     procedures = tuple(getattr(brief, "allowed_capabilities", ()) or ())
     named = ", ".join(f"`{name}`" for name in procedures) or "the procedure"
     ref = str(getattr(brief, "candidate_ref", "") or "").strip()
+    if not procedures:
+        return None, ("`execute_capability` runs a catalog procedure: name it in allowed_capabilities with one current "
+                      "candidate_ref")
     if found is None:
         return None, f"the catalog candidates are unavailable ({reason or 'unreadable'}), so {named} cannot be bound"
     if not ref:

@@ -370,7 +370,7 @@ def _non_top_client(monkeypatch, tmp_path):
     from test_step_bounds import _live_on_13, _proved_krbtgt_client
 
     mt, split_issue = _proved_krbtgt_client(monkeypatch, tmp_path)
-    _live_on_13(mt)
+    _live_on_13(mt, monkeypatch)
     rows = {row["id"]: row for row in asyncio.run(mt._fetch_credentials_cached(""))}
     assert rows[500]["credential_text"] == AES and rows[501]["credential_text"] == NTLM
     mt._cred_cache = list(rows.values())  # what a production credential read leaves cached

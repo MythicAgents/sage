@@ -35,7 +35,7 @@ from tests.esl_fixtures import ingest_proof, seed_ledger
 from tests.test_hitl_steer_current_intent import (
     _NativeDriverChat, _NativeScriptedModel, _call, _cards, _input_response,
 )
-from tests.test_step_bounds import KRBTGT_KEY, _outcomes, _proved_krbtgt_client
+from tests.test_step_bounds import KRBTGT_KEY, _callback, _live_callbacks, _outcomes, _proved_krbtgt_client
 
 ISSUE = "issue_task_and_waitfor_task_output"
 PROMPT = "Work toward administrative control of lab.local, child.lab.local and foreign.test from callbacks 13 and 14."
@@ -54,8 +54,10 @@ def _client(monkeypatch, tmp_path):
 
     Candidates: `forge-golden-ticket` for lab.local and `gpo-controlled-system-exec` for each GPO."""
     mt, split = _proved_krbtgt_client(monkeypatch, tmp_path)
-    mt._engagement_footholds = [_foothold("13", "DC01", "lab.local", "LAB\\operator"),
-                                _foothold("14", "WS02", "child.lab.local", "CHILD\\analyst")]
+    # Mythic reports both callbacks live; Sage reconciles its footholds from that before each catalog check.
+    mt._callbacks = _live_callbacks(mt, monkeypatch, [_callback(13, "DC01", "lab.local", "operator"),
+                                                     _callback(14, "WS02", "child.lab.local", "analyst")])
+    assert mt._engagement_footholds == []                   # nothing seeds the cache: candidates need the live read
     mt._recon_snapshot_cache[("list_callbacks", "all")] += [{"id": 14, "display_id": 14, "host": "WS02"}]
     proof = ingest_proof(mt._require_ledger_binding().engagement_key, task_id="12", job_id="job-12", callback_id="14")
     facts = [predicate for gpo, guid in GPOS.items() for predicate in (
@@ -154,6 +156,13 @@ UNSUPPORTED = _call("transfer_to_Mythic_Operator", {
     "callback_display_id": 13, "targets": ["foreign.test"], "expected_result": "The foreign krbtgt key."}, 1)
 
 
+TOOL_SCOPED = [_call("transfer_to_Mythic_Operator", {
+    "handoff_title": "run a procedure", "handoff_instruction": PROMPT, "allowed_tools": ["execute_capability"],
+    "callback_display_id": 14, "targets": ["lab.local"], "expected_result": "The procedure's result."}, 1),
+    _call("execute_capability", {"action": {"capability": "forge-golden-ticket", "domain": "lab.local",
+                                            "callback_id": "14"}}, 2)]
+
+
 def _unavailable(mt):
     def fail(*_args, **_kwargs):
         raise RuntimeError("ledger offline")
@@ -161,7 +170,7 @@ def _unavailable(mt):
 
 
 @pytest.mark.parametrize("case", ["unsupported", "fabricated", "callback", "target", "reference", "procedure",
-                                  "unavailable"])
+                                  "unavailable", "tool-scoped"])
 def test_an_unbindable_catalog_step_ends_blocked_with_no_card_or_task(monkeypatch, tmp_path, case):
     mt, split = _client(monkeypatch, tmp_path)
     choice = {
@@ -172,9 +181,10 @@ def test_an_unbindable_catalog_step_ends_blocked_with_no_card_or_task(monkeypatc
         "reference": _select("gpo-controlled-system-exec", "alpha", inputs_by_reference=["task:21"]),
         "procedure": _select("forge-golden-ticket", allowed_capabilities=["dcsync-krbtgt"]),
         "unavailable": _select("forge-golden-ticket", before=_unavailable(mt)),
+        "tool-scoped": TOOL_SCOPED,       # execute_capability named as a tool is a catalog step, not a bypass
     }[case]
 
-    run = asyncio.run(_run(mt, split, [choice, *RAW_FALLBACK]))
+    run = asyncio.run(_run(mt, split, [*(choice if isinstance(choice, list) else [choice]), *RAW_FALLBACK]))
 
     # Nothing was carded or issued, and the raw fallback scripted next never ran: exactly one terminal.
     assert run.cards == [] and run.issued == [] and run.outcomes == []
@@ -186,7 +196,7 @@ def test_an_unbindable_catalog_step_ends_blocked_with_no_card_or_task(monkeypatc
     assert {"unsupported": "names no candidate_ref", "fabricated": "not supported by current evidence",
             "callback": "not callback 14", "target": "does not act on child.lab.local",
             "reference": "does not use the input reference task:21", "procedure": "not `dcsync-krbtgt`",
-            "unavailable": "unavailable"}[case] in content, content
+            "unavailable": "unavailable", "tool-scoped": "`execute_capability` runs a catalog procedure"}[case] in content, content
 
 
 # --- (b) two supported actions of one capability stay distinct and each runs exactly -----------------------------
@@ -217,12 +227,17 @@ def test_each_supported_action_of_one_capability_reaches_its_exact_card_and_task
 # --- (c) at execution: support withdrawn, bindings changed or ledger unavailable while the card waits ------------
 
 def _withdraw(mt):
-    return lambda: setattr(mt, "_engagement_footholds", mt._engagement_footholds[:1])
+    return lambda: mt._callbacks.pop()                      # callback 14 is no longer active in Mythic
 
 
 def _rebind(mt):
-    return lambda: setattr(mt, "_engagement_footholds", [
-        mt._engagement_footholds[0], _foothold("14", "WS02", "child.lab.local", "CHILD\\other")])
+    return lambda: mt._callbacks[1].update(user="other")    # callback 14 now runs as another account
+
+
+def _mythic_down(mt):
+    def unreachable():
+        raise RuntimeError("Mythic unreachable")
+    return lambda: setattr(mt, "get_all_active_callbacks", unreachable)
 
 
 def _unrelated(mt):
@@ -231,7 +246,8 @@ def _unrelated(mt):
 
 
 @pytest.mark.parametrize("change, runs", [(_withdraw, False), (_rebind, False), (_unavailable, False),
-                                          (_unrelated, True)], ids=["withdrawn", "rebound", "unavailable", "unrelated"])
+                                          (_mythic_down, False), (_unrelated, True)],
+                         ids=["withdrawn", "rebound", "unavailable", "mythic-down", "unrelated"])
 def test_a_waiting_card_runs_only_while_its_candidate_is_unchanged(monkeypatch, tmp_path, change, runs):
     mt, split = _client(monkeypatch, tmp_path)
 
