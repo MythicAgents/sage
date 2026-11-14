@@ -199,8 +199,13 @@ def _mythic_task_terminal_success(task_completed: Any, task_status: Any) -> bool
     }
 
 
-def _collection_task_receipt_failure(receipt: dict, callback_id: int, command: str) -> tuple[str, str]:
-    """Classify this collection child's own task receipt before consuming its output."""
+def _collection_task_receipt_failure(
+    receipt: dict, callback_id: int, command: str, *, retrieval: bool = False,
+) -> tuple[str, str]:
+    """Classify this collection child's own task receipt before consuming its output.
+
+    `retrieval` (the collector step only) also admits a proved collector whose output is retrieval eligible.
+    """
     task_id = receipt.get("task_id")
     if type(task_id) is not int or task_id <= 0:
         return "task_issue_failed", "no Mythic task was created"
@@ -214,9 +219,30 @@ def _collection_task_receipt_failure(receipt: dict, callback_id: int, command: s
         return ("task_failed" if failed else "task_nonterminal"), (
             f"Mythic task {task_id} status={status or 'unknown'}"
         )
-    if receipt.get("output_success") is not True:
+    if receipt.get("output_success") is not True and not (retrieval and receipt.get("retrieval_eligible") is True):
         return "task_failed", f"Mythic task {task_id} output did not classify as successful"
     return "", ""
+
+
+# Collection exits that are an authority, scope or precondition refusal rather than a failed attempt.
+_COLLECTION_BLOCKED_STATUSES = frozenset({
+    "blocked", "artifact_blocked", "missing_callback", "unavailable", "no_state", "no_target", "bad_callback",
+    "unresolved_scope", "callback_scope_mismatch", "no_domain_identity", "tool_preflight_failed",
+})
+
+
+def collection_verdict(ok: bool, status: str) -> str:
+    """The executor verdict for one collection exit; only a verified ingest is `achieved`."""
+    if ok is True and status in {"ingested", "already_ingested"}:
+        return "achieved"
+    if status == "uploaded_pending_ingest":
+        return "partial"
+    return "blocked" if status in _COLLECTION_BLOCKED_STATUSES else "failed"
+
+
+def _collector_retrievable(record: dict) -> bool:
+    """Collector terminal success, or a proved collector whose diagnostic output ends with its completion record."""
+    return record.get("terminal_success") is True or record.get("retrieval_eligible") is True
 
 
 class _CollectionProbeTaskError(RuntimeError):
@@ -1719,7 +1745,7 @@ class _PrivateCollectionTransaction:
             return ""
         if not current.get("task_id"):
             return "prior collection child has no Mythic task"
-        if current.get("terminal_success") is not True:
+        if current.get("terminal_success") is not True and current.get("retrieval_eligible") is not True:
             return "prior collection child lacks terminal success"
         return ""
 
@@ -1893,6 +1919,7 @@ class _PrivateCollectionTransaction:
         *,
         success: bool,
         status: str,
+        retrieval_eligible: bool = False,
     ) -> None:
         current = self._current_step()
         if current is None:
@@ -1906,7 +1933,11 @@ class _PrivateCollectionTransaction:
             return
         current["terminal_success"] = success is True
         current["terminal_status"] = str(status or ("completed" if success else "failed"))
-        if success is not True:
+        # Only the exact reserved collector step may continue to its artifact on retrieval eligibility.
+        current["retrieval_eligible"] = (
+            success is not True and retrieval_eligible is True and current.get("kind") == "runner"
+        )
+        if success is not True and not current["retrieval_eligible"]:
             return
         self._phase = str(current.get("next_phase") or self._phase)
         if current.get("kind") == "revert":
@@ -3379,7 +3410,7 @@ class MythicTools:
                 )
             status = str(record.get("terminal_status") or "").strip().casefold()
             if (
-                record.get("terminal_success") is not True
+                not _collector_retrievable(record)
                 and status
                 and status not in {"created", "completed"}
             ):
@@ -3478,7 +3509,7 @@ class MythicTools:
         transaction = request.get("transaction") or {}
         collector = transaction.get("collector") or {}
         download = transaction.get("download") or {}
-        if collector.get("terminal_success") is not True:
+        if not _collector_retrievable(collector):
             return "STOP — contract-bound collection denied: collector terminal success is required before ingest"
         if download.get("terminal_success") is not True:
             return "STOP — contract-bound collection denied: download terminal success is required before ingest"
@@ -3654,7 +3685,7 @@ class MythicTools:
         if token_id is not None or not expected_callback or callback_id != expected_callback:
             return "STOP — contract-bound collection denied: task does not match the bound callback/token"
         if normalized_command != _normalize_command_name(expected_runner):
-            if collector.get("terminal_success") is not True:
+            if not _collector_retrievable(collector):
                 return "STOP — contract-bound collection denied: collector has not reached terminal success"
             if normalized_command != _normalize_command_name(expected_download):
                 return ""
@@ -7351,14 +7382,24 @@ class MythicTools:
                         )
                         if completion_evidence_required else {}
                     )
+                    task_proved = _mythic_task_terminal_success(
+                        task_state.get("task_completed"), task_state.get("task_status"),
+                    )
+                    # A proved collector whose raw output ends with its one completion record may continue to its
+                    # artifact even when diagnostics made generic classification reject it. Only consumers bound
+                    # to the exact collector step read this; generic task success keeps its meaning.
+                    retrieval_eligible = bool(
+                        task_proved
+                        and result_class != command_builder.ResultClass.SUCCESS.value
+                        and command_builder.sharphound_retrieval_eligible(command, result_text, parameters)
+                    )
                     if isinstance(issuance_receipt, dict):
                         issuance_receipt.update(task_state)
                         issuance_receipt["output_success"] = (
                             result_class == command_builder.ResultClass.SUCCESS.value
                         )
-                    task_proved = _mythic_task_terminal_success(
-                        task_state.get("task_completed"), task_state.get("task_status"),
-                    )
+                        issuance_receipt["output_class"] = result_class
+                        issuance_receipt["retrieval_eligible"] = retrieval_eligible
                     contract = getattr(self, "_request_contract", None)
                     if (completion_evidence_required
                             and getattr(contract, "lane", None) == "supervised_workflow"
@@ -7397,6 +7438,7 @@ class MythicTools:
                             if completion_evidence_required
                             else self._last_issued_task_terminal_status
                         ),
+                        retrieval_eligible=retrieval_eligible,
                     )
                     await self._notify_execution_observer({
                         **base_event,
@@ -8625,6 +8667,7 @@ class MythicTools:
         *,
         success: bool,
         status: str,
+        retrieval_eligible: bool = False,
     ) -> None:
         transaction = getattr(self, "_private_collection_transaction", None)
         if isinstance(transaction, _PrivateCollectionTransaction) and transaction.active_for(self):
@@ -8635,6 +8678,7 @@ class MythicTools:
                 task_display_id,
                 success=success,
                 status=status,
+                retrieval_eligible=retrieval_eligible,
             )
         record = self._contract_task_record(command, parameters, callback_display_id)
         task_id = str(task_display_id or "").strip()
@@ -8642,6 +8686,10 @@ class MythicTools:
             return
         record["terminal_success"] = success is True
         record["terminal_status"] = str(status or ("completed" if success else "failed"))
+        collector = ((self._active_contract_collection_request() or {}).get("transaction") or {}).get("collector")
+        record["retrieval_eligible"] = bool(
+            record is collector and success is not True and retrieval_eligible is True
+        )
 
     async def _collection_in_flight_blocker(self, access_key: str) -> str | None:
         """Return a collect-graph SKIP message only when the marker is backed by a real Mythic task.
@@ -12083,6 +12131,9 @@ class MythicTools:
         binding = collection_capability_binding({"name": "execute_capability", "args": args}) or {}
 
         def reply(result: dict[str, Any]) -> str:
+            # Every exit carries the executor verdict the terminal consumer reads; refusals here precede any task.
+            result = {"phase": "preflight", "issued": [], **result}
+            result.setdefault("verdict", collection_verdict(result.get("ok") is True, str(result.get("status") or "")))
             return json.dumps({"capability": COLLECTION_CAPABILITY, **result}, default=str, sort_keys=True)
 
         if not binding.get("callback_id"):

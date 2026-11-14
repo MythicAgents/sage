@@ -82,7 +82,7 @@ except ImportError:
 from langchain_core.tools import tool
 from langchain.tools import ToolRuntime
 from langchain_core.exceptions import ContextOverflowError
-from langgraph.errors import GraphRecursionError, NodeCancelledError, NodeError, ParentCommand
+from langgraph.errors import GraphBubbleUp, GraphRecursionError, NodeCancelledError, NodeError, ParentCommand
 import operator
 
 #: Seconds a graph node may go without observable progress before LangGraph cancels the attempt.
@@ -1563,6 +1563,8 @@ _NODE_FAILURE_CONTROL_EXCEPTIONS = (
     GraphRecursionError,
     NodeCancelledError,
 )
+#: A collection exit is reported with its phase, but control (interrupts, stop, cancellation) still propagates.
+_COLLECTION_CONTROL_EXCEPTIONS = (GraphBubbleUp, *_NODE_FAILURE_CONTROL_EXCEPTIONS)
 
 
 class _StopCheckMiddleware(AgentMiddleware):
@@ -5588,6 +5590,14 @@ def _terminal_execute_capability_report(
     ]
     if reason:
         lines.append(f"Reason: {reason}")
+    if str(payload.get("phase") or "").strip():
+        lines.append(f"Phase: {str(payload.get('phase')).strip()}")
+    diagnostics = payload.get("collector_diagnostics")
+    if isinstance(diagnostics, dict) and diagnostics.get("task_id"):
+        lines.append(
+            f"Collector task {diagnostics['task_id']} reported diagnostic errors; "
+            "not every collection method is proven."
+        )
     # "none" is a claim about what happened, so make it only when the payload reports an empty list. A payload
     # that does not report tasks or effects gets no line rather than a false "none issued".
     if isinstance(payload.get("issued"), list):
@@ -14620,7 +14630,12 @@ class Model:
             from . import engagement_state as _es
         except ImportError:
             import engagement_state as _es
-        state = await self._build_current_engagement_state()
+        try:
+            state = await self._build_current_engagement_state()
+        except _COLLECTION_CONTROL_EXCEPTIONS:
+            raise
+        except Exception as exc:
+            return {"ok": False, "status": "no_state", "reason": f"engagement state: {type(exc).__name__}: {exc}"}
         if state is None:
             return {"ok": False, "status": "no_state", "reason": "Sage could not build the engagement state"}
         try:
@@ -14851,6 +14866,25 @@ class Model:
         return None
 
     async def _controller_collect(self, state, request=None) -> dict:
+        """Run one collection (`_controller_collect_steps`) and report the Mythic tasks it actually issued."""
+        try:
+            from . import mythic_tools as _mt
+        except ImportError:
+            import mythic_tools as _mt
+        issued = _mt._procedure_issued_tasks_context.get()
+        token = None
+        if not isinstance(issued, list):
+            issued = []
+            token = _mt._procedure_issued_tasks_context.set(issued)
+        try:
+            result = await self._controller_collect_steps(state, request)
+        finally:
+            if token is not None:
+                _mt._procedure_issued_tasks_context.reset(token)
+        result.setdefault("issued", list(issued))
+        return result
+
+    async def _controller_collect_steps(self, state, request=None) -> dict:
         """Deterministic collect-once for the controller: run SharpHound -> download the ZIP
         -> ingest the FRESH artifact. Polling/waiting is deterministic (issue_task_and_waitfor_task_output), OFF
         the model path (removing polling from model reasoning). Range-agnostic: canonical SharpHound
@@ -14865,6 +14899,7 @@ class Model:
         the collection gate. `ok` is driven by `graph_verified`: only `ingested`/`already_ingested`
         set it True; `ingest_failed`/`uploaded_pending_ingest`/`error` are NOT success, so the collection stays
         'missing' and the controller's per-request retry budget may re-run it (self-heal by composition).
+        Every return carries `verdict` (`collection_verdict`) and the `phase` it reached or failed in.
         """
         try:
             from . import mythic_tools as _mt
@@ -14887,14 +14922,20 @@ class Model:
                 import engagement_state as _es
             collection_key = _es.collection_target_key(state, foothold, scope_domain)
 
-        def outcome(ok: bool, status: str, reason: str = "") -> dict:
+        progress: dict[str, Any] = {"phase": "preflight", "diagnostics": None}
+
+        def outcome(ok: bool, status: str, reason: str = "", *, verdict: str = "") -> dict:
             result = {
                 "ok": ok,
                 "status": status,
+                "verdict": verdict or _mt.collection_verdict(ok, status),
+                "phase": progress["phase"],
                 "collection_reason": collection_reason,
                 "collection_key": collection_key,
                 "scope_domain": scope_domain,
             }
+            if progress["diagnostics"]:
+                result["collector_diagnostics"] = dict(progress["diagnostics"])
             if reason:
                 result["reason"] = reason
             if status in {"task_issue_failed", "task_nonterminal"}:
@@ -14904,24 +14945,32 @@ class Model:
                 }
             return result
 
-        async def collection_task(stage: str, command: str, parameters: Any):
+        async def collection_task(stage: str, command: str, parameters: Any, *, retrieval: bool = False):
             """Return this call's output only with its own completed Mythic task receipt."""
+            progress["phase"] = stage
             receipt: dict[str, Any] = {}
             receipt_token = _mt._task_issuance_receipt_context.set(receipt)
             try:
                 output = await self.mythic_client.issue_task_and_waitfor_task_output(
                     command, parameters, cb_int,
                 )
+            except _COLLECTION_CONTROL_EXCEPTIONS:
+                raise
             except Exception as exc:
                 stage_status = "task_failed" if receipt.get("task_id") else "task_issue_failed"
                 return None, outcome(False, stage_status, f"{stage}: {type(exc).__name__}: {exc}")
             finally:
                 _mt._task_issuance_receipt_context.reset(receipt_token)
-            stage_status, detail = _mt._collection_task_receipt_failure(receipt, cb_int, command)
+            stage_status, detail = _mt._collection_task_receipt_failure(
+                receipt, cb_int, command, retrieval=retrieval,
+            )
             if stage_status:
                 if stage_status == "task_issue_failed" and not receipt.get("task_id"):
                     detail = str(output or detail)[:600]
                 return None, outcome(False, stage_status, f"{stage}: {detail}; output={str(output or '')[:600]}")
+            if retrieval and receipt.get("output_success") is not True:
+                # Retrieval-eligible collector: keep its diagnostics with the task; they never prove every method.
+                progress["diagnostics"] = {"task_id": receipt["task_id"], "output_class": receipt.get("output_class")}
             return output, None
 
         if foothold is None:
@@ -14989,13 +15038,14 @@ class Model:
                     f"Result: {ingest_contract.operator_text()}"
                 ),
             )
-            result = outcome(False, "error", reason)
+            result = outcome(False, "error", reason, verdict="blocked")
             result["graph_verified"] = False
             result["ingest_error"] = {"kind": ingest_contract.kind, "detail": ingest_contract.reason}
             return result
 
         host = str(getattr(foothold, "host", "") or "").strip()
         forest = str(getattr(foothold, "forest", "") or "").strip()
+        progress["phase"] = "identity"
         try:
             context = await self.mythic_client.probe_authentication_context(
                 cb_int,
@@ -15005,6 +15055,8 @@ class Model:
             )
         except _mt._CollectionProbeTaskError as e:
             return outcome(False, e.status, f"identity: {e}")
+        except _COLLECTION_CONTROL_EXCEPTIONS:
+            raise
         except Exception as e:
             return outcome(False, "identity_probe_failed", f"{type(e).__name__}: {e}")
 
@@ -15023,6 +15075,7 @@ class Model:
                 _, restore_failure = await collection_task("restore", revert_command, "")
                 if restore_failure is not None:
                     return restore_failure
+                progress["phase"] = "identity"
                 context = await self.mythic_client.probe_authentication_context(
                     cb_int,
                     host=host,
@@ -15031,6 +15084,8 @@ class Model:
                 )
             except _mt._CollectionProbeTaskError as e:
                 return outcome(False, e.status, f"identity: {e}")
+            except _COLLECTION_CONTROL_EXCEPTIONS:
+                raise
             except Exception as e:
                 return outcome(False, "identity_restore_failed", f"{type(e).__name__}: {e}")
             if not context.domain_capable:
@@ -15079,12 +15134,14 @@ class Model:
             runner_output, runner_failure = await collection_task(
                 "runner", runner_command,
                 {runner_tool_param: "SharpHound.exe", runner_args_param: args},
+                retrieval=True,
             )
             if runner_failure is not None:
                 if str(runner_failure.get("reason") or "").startswith(
                     f"runner: {_mt._REGISTERED_FILE_PREFLIGHT_PREFIX}"
                 ):
                     runner_failure["status"] = "tool_preflight_failed"
+                    runner_failure["verdict"] = _mt.collection_verdict(False, "tool_preflight_failed")
                 fire(
                     f"SharpHound runner failed: {runner_failure.get('reason')}",
                     operator_message=(
@@ -15100,6 +15157,11 @@ class Model:
                     "**Collection runner completed**\n"
                     f"Sage completed the SharpHound runner task on callback `{cb_int}` for "
                     f"`{scope_domain or 'current forest'}`."
+                    + (
+                        f"\nTask `{progress['diagnostics']['task_id']}` also reported diagnostic errors, so not "
+                        "every collection method is proven. Sage is retrieving and verifying its artifact."
+                        if progress["diagnostics"] else ""
+                    )
                 ),
             )
             # DISCOVER the real on-disk path (SharpHound prepends a timestamp; never predict the name). `ls` the
@@ -15135,6 +15197,7 @@ class Model:
                 "download", download_command, {download_path_param: real_path})
             if download_failure is not None:
                 return download_failure
+            progress["phase"] = "artifact"
             # Resolve the Mythic download by our token -> file_uuid (bounded retry; completed-download filemeta is
             # not always visible immediately).
             row = None
@@ -15174,12 +15237,15 @@ class Model:
             )
             # file_uuid wins for RESOLUTION (the exact discovered artifact); callback_display_id lets
             # _record_graph_built flip the collection gate (it early-returns on a None callback).
+            progress["phase"] = "ingest"
             ingest_raw = await self.mythic_client.ingest_collection(
                 file_uuid=file_uuid,
                 callback_display_id=cb_int,
                 file_name=file_name,
                 collection_scope_domain=scope_domain,
             )
+        except _COLLECTION_CONTROL_EXCEPTIONS:
+            raise
         except Exception as e:
             fire(
                 f"collect failed: {type(e).__name__}: {e}",

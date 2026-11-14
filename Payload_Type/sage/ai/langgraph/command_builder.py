@@ -241,6 +241,31 @@ def _sharphound_completion_override(command: str, output: str, parameters: Any) 
         return False
 
 
+def sharphound_retrieval_eligible(command: str, output: str, parameters: Any) -> bool:
+    """Whether a bound SharpHound runner's raw output ends with its one canonical completion record.
+
+    Collection retrieval eligibility only: earlier records may carry diagnostic errors and stack traces. It never
+    changes `classify_result` and proves no graph effect; the fresh artifact and its exact ingest job decide that.
+    """
+    try:
+        if not _has_exact_sharphound_selector_binding(command, parameters):
+            return False
+        lines = [line for line in _text(output).splitlines() if line]
+        if lines and _valid_sharphound_opsec_suffix(lines[-1]):
+            lines.pop()
+        if not lines or sum(_has_sharphound_marker_signal(line) for line in lines) != 1:
+            return False
+        match = _SHARPHOUND_LOG_RECORD_RE.fullmatch(lines[-1])
+        timestamp = _strict_iso8601_timestamp(match.group("timestamp")) if match else None
+        return bool(
+            timestamp is not None
+            and match.group("level") == "INFORMATION"
+            and _strict_sharphound_completion_message(match.group("message"), timestamp.local)
+        )
+    except Exception:
+        return False
+
+
 def _has_sharphound_record_signal(value: Any) -> bool:
     try:
         return any("|" in line for line in _text(value).splitlines())
