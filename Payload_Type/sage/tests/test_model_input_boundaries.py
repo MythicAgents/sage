@@ -66,6 +66,7 @@ def test_handoff_targets_reach_native_consumer(monkeypatch, tmp_path, no_network
     assert run.issued == [] and run.before.issued == []
     assert run.before.worker_calls == 0
     assert run.outcomes == []
+    assert len(run.cards) <= 1, "duplicate approval cards are not the known missing-card defect"
     if run.cards:
         assert run.briefs == [("accepted", "Mythic_Operator")]
         for card in run.cards:
