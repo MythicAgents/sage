@@ -12323,6 +12323,15 @@ class MythicTools:
             if injected_blocker is not None:
                 return injected_blocker
 
+            unbuildable = await self._capability_unbuildable_plan_failure(
+                action_obj,
+                input_values,
+                callback_id,
+                capabilities,
+            )
+            if unbuildable is not None:
+                return unbuildable
+
             timeout = self._capability_executor_timeout(input_values)
             all_issued: list[dict] = []
             materialized_payload: dict | None = None
@@ -16089,6 +16098,69 @@ class MythicTools:
             or "kdc_err_client_not_trusted" in low
             or "krb-error (62)" in low
         )
+
+    async def _capability_unbuildable_plan_failure(self, action, inputs: dict, callback_id, capabilities_mod):
+        """Refuse, before any task, a plan whose commands still need an input that no step supplies.
+
+        Builds the plan from a copy of the resolved inputs and checks the commands the issue loop would reach:
+        leading current-context probes belong to the preflight, and the scan stops at the first step that can reach
+        `achieved`. A preflight whose own service proof resolves can achieve first, so it is not refused here. A
+        materializing capability or a failed build returns None; the existing path handles both unchanged.
+        """
+        if self._capability_needs_runtime_materialization(action, inputs):
+            return None
+        payload = await self._capability_build_command_payload(action, copy.deepcopy(inputs))
+        if not payload.get("ok"):
+            return None
+        missing: set[str] = set()
+        core_seen = False
+        for command_obj in list(payload.get("commands") or []):
+            if not core_seen and self._capability_executor_is_current_context_preflight(command_obj):
+                continue
+            core_seen = True
+            missing |= self._capability_executor_unresolved_placeholders(command_obj)
+            if self._capability_executor_is_final_probe(command_obj):
+                break
+        if not missing:
+            return None
+        capability = self._capability_text(getattr(action, "name", "")).casefold()
+        if capability in {"forge-golden-ticket", "ensure-kerberos-context", "ensure-account-kerberos-context"}:
+            preflight = self._capability_current_context_preflight_payload(
+                action, copy.deepcopy(inputs), capabilities_mod,
+            )
+            if any(
+                self._capability_executor_is_current_context_service_proof(command_obj)
+                and not self._capability_executor_unresolved_placeholders(command_obj)
+                for command_obj in list(preflight.get("commands") or [])
+            ):
+                return None
+        domain = (
+            self._capability_target_domain(action, inputs)
+            or self._capability_domain(action, inputs)
+            or self._capability_account_domain(action, inputs)
+            or "the target domain"
+        )
+        parts = []
+        for name in sorted(missing):
+            if name in {"kerberos_service_resource", "kerberos_service_host"}:
+                parts.append(
+                    f"`{name}` (no service-proof target for {domain}): pass `proof_host` or `proof_resource`, "
+                    f"or collect {domain}'s graph so BloodHound knows its domain controllers"
+                )
+            else:
+                parts.append(f"`{name}`: no input or earlier step supplies it")
+        return self._capability_executor_failure_json({
+            "ok": False,
+            "verdict": "failed",
+            "capability": self._capability_text(getattr(action, "name", "")),
+            "reason": "the capability plan needs input that nothing supplies: " + "; ".join(parts)
+                      + ". No task was issued.",
+            "missing": sorted(missing),
+            "action": asdict(action) if is_dataclass(action) else {},
+            "issued": [],
+            "recorded_effects": [],
+            "stopped_after": "unresolved_inputs",
+        }, action, inputs, callback_id, issued=[], build_payload=payload)
 
     def _capability_executor_unresolved_placeholders(self, command_obj: dict) -> set[str]:
         placeholders = self._capability_executor_placeholders(command_obj.get("parameters"))
