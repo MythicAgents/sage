@@ -26,12 +26,13 @@ from ai.langgraph import catalog_binding as cb
 from ai.langgraph import engagement_state as es
 from ai.langgraph import handoff_brief as hb
 from ai.langgraph import model as model_module
+from ai.langgraph import mythic_tools as package_mythic_tools
 from ai.langgraph import step_bounds as sb
 from ai.langgraph.mythic_tools import MythicTools
 from sage_chat.headless import build_chat_request
 from sage_chat.service import bind_channel_thread_id
 from sage_chat.session import drop_channel_session
-from tests.esl_fixtures import ingest_proof, seed_ledger
+from tests.esl_fixtures import AGENT_PROCESSED, ingest_proof, seed_ledger
 from tests.test_hitl_steer_current_intent import (
     _NativeDriverChat, _NativeScriptedModel, _call, _cards, _input_response,
 )
@@ -287,6 +288,110 @@ def test_the_decision_on_a_bound_forge_card_is_final(monkeypatch, tmp_path, deci
     assert len(run.terminals) == 1
 
 
+# --- (d2) a forge brief naming several key rows of one proved krbtgt binds that key set --------------------------
+
+OTHER_AES, OTHER_RC4, TYPED = "b" * 64, "e" * 32, "f" * 64
+
+
+def _reported(row_id, key, task_id, *, account="krbtgt", realm="lab.local", row_type="key"):
+    """A store row an agent reported from a completed Mythic task: its own lineage proves it."""
+    return {"id": row_id, "account": account, "realm": realm, "type": row_type, "credential_text": key,
+            "comment": "reported by the agent", "timestamp": NOW,
+            "task": {"display_id": task_id, "status": "completed", "completed": True, **AGENT_PROCESSED,
+                     "command_name": "dcsync", "callback": {"display_id": 13}}}
+
+
+def _store_client(monkeypatch, tmp_path, *extra):
+    """The catalog fixture with its rows 500 (aes256) and 501 (ntlm) of task 21 read through Sage's own credential
+    reader; only Mythic's GraphQL call is inert. Rows carry no task lineage, as run 2's did. `extra` rows join the
+    store; the returned list is the store, so a test can change it."""
+    mt, split = _client(monkeypatch, tmp_path)
+    store = [{**row, "task": None} for row in asyncio.run(mt._fetch_credentials_cached(NOW))] + list(extra)
+    del mt._fetch_credentials_cached                       # the fixture's stand-in; Sage's reader from here on
+    original = package_mythic_tools.mythic.execute_custom_query
+
+    async def query(client, text, *args, **kwargs):
+        if "SageReadCredentials" in text:
+            return {"credential": json.loads(json.dumps(store))}
+        return await original(client, text, *args, **kwargs)
+
+    monkeypatch.setattr(package_mythic_tools.mythic, "execute_custom_query", query)
+    asyncio.run(mt._fetch_credentials_cached(NOW, force=True))    # the Supervisor read the store before naming rows
+    return mt, split, store
+
+
+@pytest.mark.parametrize("references, credential_id, credential_ids", [
+    (["cred:500", "cred:501"], 500, ["500", "501"]),
+    (["cred:501", "cred:500"], 500, ["500", "501"]),
+    (["cred:501", "cred:500", "cred:501"], 500, ["500", "501"]),
+    (["@cred:501", "cred:500"], 500, ["500", "501"]),
+    (["cred:500", "cred:501", "task:21"], 500, ["500", "501"]),
+    (["cred:501"], 501, None),                             # one reference still pins that row
+    ([], 500, None),                                       # no reference keeps the existing selection
+], ids=["pair", "reversed", "duplicated", "at-spelling", "with-task", "one", "none"])
+def test_several_key_rows_of_one_proved_krbtgt_bind_its_best_key(monkeypatch, tmp_path, references, credential_id,
+                                                                credential_ids):
+    mt, split, _store = _store_client(monkeypatch, tmp_path)
+
+    run = asyncio.run(_run(mt, split, [_select("forge-golden-ticket", inputs_by_reference=references),
+                                       AIMessage(content="The forge ran.")]))
+
+    assert run.briefs == [("accepted", "Mythic_Operator")] and run.before.worker_calls == 0
+    assert run.before.issued == []
+    [card] = run.cards
+    inputs = card["data"]["arguments"]["inputs"]
+    assert str(inputs["credential_id"]) == str(credential_id) and str(inputs["credential_proof_task_id"]) == "21"
+    assert inputs.get("credential_ids") == credential_ids, inputs
+    assert KRBTGT_KEY not in json.dumps(run.cards, default=str) + json.dumps(run.terminals, default=str)
+    rubeus = [text for row, text in zip(run.issued, _commands(run)) if row["command_name"] == "execute_assembly"]
+    key = f"/aes256:{KRBTGT_KEY}" if credential_id == 500 else "/rc4:"
+    assert len(rubeus) == 1 and key in rubeus[0], rubeus
+    assert len(run.terminals) == 1
+
+
+@pytest.mark.parametrize("extra, references, named", [
+    ([_reported(600, OTHER_AES, 24, realm="child.lab.local")], ["cred:500", "cred:600"], "credentials 500, 600"),
+    ([_reported(601, OTHER_AES, 30)], ["cred:500", "cred:601"], "credentials 500, 601"),
+    ([{"id": 603, "account": "krbtgt", "realm": "lab.local", "type": "key", "credential_text": TYPED,
+       "comment": "entered by hand", "timestamp": NOW, "task": None}], ["cred:500", "cred:603"], "credentials 500, 603"),
+    ([_reported(604, OTHER_AES, 21, account="administrator")], ["cred:500", "cred:604"], "credentials 500, 604"),
+    ([_reported(601, OTHER_AES, 30), _reported(602, OTHER_RC4, 30, row_type="hash")],
+     ["cred:601", "cred:602", "task:21"], "proof task 21, credentials 601, 602"),
+], ids=["other-realm", "other-proof", "unproved", "not-krbtgt", "conflicting-task"])
+def test_key_rows_that_are_not_one_proved_krbtgt_key_set_card_nothing(monkeypatch, tmp_path, extra, references,
+                                                                     named):
+    mt, split, _store = _store_client(monkeypatch, tmp_path, *extra)
+
+    run = asyncio.run(_run(mt, split, [_select("forge-golden-ticket", inputs_by_reference=references),
+                                       AIMessage(content="The forge was refused.")]))
+
+    assert run.briefs == [("accepted", "Mythic_Operator")]   # admitted: every row exists; the key set is the question
+    assert run.cards == [] and run.issued == [] and len(run.terminals) == 1
+    [outcome] = run.outcomes
+    assert outcome["status"] == sb.StepStatus.PRECONDITION_UNSATISFIABLE.value and outcome["tasks_issued"] == []
+    assert f"({named})" in outcome["detail"] and "No forge was issued" in outcome["detail"], outcome["detail"]
+
+
+def test_a_waiting_key_set_card_whose_row_disappears_issues_nothing(monkeypatch, tmp_path):
+    mt, split, store = _store_client(monkeypatch, tmp_path)
+
+    def remove_501():
+        store[:] = [row for row in store if row["id"] != 501]
+        mt._cred_cache_ts = None                           # the card waited past the credential cache's lifetime
+
+    run = asyncio.run(_run(mt, split, [_select("forge-golden-ticket", inputs_by_reference=["cred:500", "cred:501"]),
+                                       AIMessage(content="The forge was refused.")], before_decision=remove_501))
+
+    [card] = run.cards
+    assert card["data"]["arguments"]["inputs"]["credential_ids"] == ["500", "501"]
+    assert run.issued == [] and len(run.terminals) == 1    # row 500 alone is not the approved key set
+    [outcome] = run.outcomes
+    assert outcome["tasks_issued"] == []
+    # The executor's stop names the approved set (and the proof it was bound from) in what the Supervisor reads next.
+    assert any("(proof task 21, credentials 500, 501) no longer resolves" in str(message.content)
+               for messages in run.fake.inputs[run.before.inputs:] for message in messages)
+
+
 # --- (e) settlement reaches the next Supervisor call with a fresh candidate view --------------------------------
 
 @pytest.mark.parametrize("decision", ["accept", "reject"])
@@ -401,6 +506,29 @@ def test_an_approved_call_must_be_the_candidates_action():
         {**grounded, "inputs": {**grounded["inputs"], "controlled_principal": "x"}}, item)
 
 
+GPO_ACTION = {**ACTION, "intent": {**ACTION["intent"], "capability": ACTION["name"], "affected_hosts": ["ws02"],
+                                   "affected_dc_hosts": [], "preferred_effect": "system-exec-proof",
+                                   "steps": ["trigger or wait for Group Policy refresh"]},
+              "source_facts": ["generic-write:gpo:alpha-policy", "gpo-domain:alpha-policy:child.lab.local",
+                               "gpo-affects-computer:alpha-policy:ws02:child.lab.local"]}
+
+
+@pytest.mark.parametrize("target, binds", [
+    ("WS02.CHILD.LAB.LOCAL", True), ("ws02.child.lab.local.", True), ("ws02", True), ("CHILD.LAB.LOCAL", True),
+    ("gpo=alpha-policy;domain=child.lab.local", True), ("alpha-policy", True),
+    ("ws02.foreign.test", False), ("ws02.lab.local", False), ("ws020.child.lab.local", False),
+    ("dc02.child.lab.local", False), ("trigger or wait for Group Policy refresh", False),
+    ("system-exec:gpo:alpha-policy@child.lab.local", False), ("system-exec-proof", False),
+    ("gpo-controlled-system-exec", False), ("14", False)])
+def test_a_brief_binds_the_candidates_host_in_any_equivalent_form_and_nothing_else(target, binds):
+    [item] = cb.candidates("r", [(GPO_ACTION, INPUTS)])
+    brief = hb.HandoffBrief.from_args(allowed_capabilities=[item.procedure], callback_display_id=14,
+                                      candidate_ref=item.ref, targets=[target, "child.lab.local"])
+    bound, error = cb.bind(brief, (item,))
+    assert (bound is item, error) == ((True, "") if binds else (False, f"candidate_ref {item.ref} "
+                                      f"({item.target}) does not act on {target}")), error
+
+
 def test_a_brief_binds_targets_the_candidate_names_in_any_account_form():
     account = {**ACTION, "name": "ensure-account-kerberos-context", "target": "account=jon;domain=north.test",
                "intent": {"account": "jon", "domain": "north.test"}}
@@ -428,5 +556,14 @@ def test_a_supplied_reference_pins_a_forge_key_and_is_never_ignored():
     assert bound.inputs == {"callback_id": "13", "credential_id": "501", "credential_proof_task_id": "21"}
     assert cb.call_matches({"action": forge, "inputs": {**bound.inputs, "credential_id": 501}}, bound) == ""
     assert "credential_id" in cb.call_matches({"action": forge, "inputs": {**bound.inputs, "credential_id": 500}}, bound)
-    assert "does not use the input reference cred:500" in cb.bind(brief("cred:501", "cred:500"), (item,))[1]
+    # Several rows of one key set pin it as a set, canonically; the executor resolves it to one proof.
+    for references in (("cred:501", "cred:500"), ("@cred:500", "cred:501", "cred:500")):
+        bound, error = cb.bind(brief(*references), (item,))
+        assert error == "" and bound.inputs == {"callback_id": "13", "credential_ids": ["500", "501"]}
+    grounded = {**bound.inputs, "credential_id": 500, "credential_proof_task_id": 21}
+    assert cb.call_matches({"action": forge, "inputs": grounded}, bound) == ""
+    assert "credential_ids" in cb.call_matches({"action": forge, "inputs": {**grounded, "credential_ids": ["500"]}},
+                                               bound)
+    assert cb.bind(brief("cred:500", "cred:501", "task:21"), (item,))[0].inputs["credential_proof_task_id"] == "21"
+    assert "does not use the input reference task:30" in cb.bind(brief("task:21", "task:30"), (item,))[1]
     assert cb.REFERENCE_PROCEDURES == MythicTools._KRBTGT_FORGE_CAPABILITIES

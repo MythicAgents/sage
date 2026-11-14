@@ -2,7 +2,7 @@
   "provenance": {
     "kind": "recorded model-output shape with synthetic current state",
     "description": "A retained Supervisor handoff named a host FQDN followed by its domain. Identities and callback are consistently renamed; prose is omitted. Candidate selection and ledger state are synthetic, not a full recorded replay.",
-    "preserved": "List and string types, target ordering, string callback, capability name, and host/domain suffix relationship."
+    "preserved": "List and string types, target ordering, string callback, capability name, and host/domain suffix relationship. The uppercase case also preserves a later run's letter case."
   },
   "recorded_shape": {
     "targets": ["ws02.child.lab.local", "child.lab.local"],
@@ -23,16 +23,45 @@
       "expected_cards": 1
     },
     {
+      "id": "recorded_uppercase_fqdn",
+      "provenance": "Recorded shape of a later run's handoffs (host FQDN and domain both uppercase), renamed; no target-form mutation.",
+      "targets": ["WS02.CHILD.LAB.LOCAL", "CHILD.LAB.LOCAL"],
+      "expected_cards": 1
+    },
+    {
+      "id": "trailing_dot_fqdn",
+      "provenance": "Equivalent-form mutation: the recorded host FQDN written as an absolute name with a trailing dot.",
+      "targets": ["ws02.child.lab.local.", "child.lab.local"],
+      "expected_cards": 1
+    },
+    {
       "id": "foreign_domain",
       "provenance": "Invalid mutation: keep the host label but replace its domain suffix.",
       "targets": ["ws02.foreign.test", "child.lab.local"],
-      "expected_cards": 0
+      "expected_cards": 0,
+      "refused_at": "admission"
     },
     {
       "id": "near_match_host",
       "provenance": "Invalid mutation: append a digit to the host label in the same domain.",
       "targets": ["ws020.child.lab.local", "child.lab.local"],
-      "expected_cards": 0
+      "expected_cards": 0,
+      "refused_at": "admission"
+    },
+    {
+      "id": "known_domain_suffix",
+      "provenance": "Invalid mutation: keep the host label but replace its domain with another domain Sage observed, which admission accepts and the candidate does not name.",
+      "targets": ["ws02.lab.local", "child.lab.local"],
+      "expected_cards": 0,
+      "refused_at": "binding"
+    },
+    {
+      "id": "unlisted_same_domain_host",
+      "provenance": "Invalid mutation: a host Sage observed in the candidate's domain that the candidate does not act on. Synthetic state: one added domain-controller graph fact.",
+      "targets": ["dc02.child.lab.local", "child.lab.local"],
+      "expected_cards": 0,
+      "refused_at": "binding",
+      "synthetic_graph_facts": ["domain-controller:dc02:child.lab.local"]
     }
   ]
 }

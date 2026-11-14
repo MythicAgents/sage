@@ -16,14 +16,18 @@ import json
 from typing import Any, Iterable, Mapping
 
 try:
+    from . import handoff_brief as _handoff_brief
     from .request_contract import action_fingerprint
 except ImportError:  # pragma: no cover - flat import layout
+    import handoff_brief as _handoff_brief
     from request_contract import action_fingerprint
 
 MAX_CHARS = 6000
 # A brief's `cred:`/`task:` reference becomes the input a procedure binds a proved key by (`credential_id`,
 # `credential_proof_task_id`), only for the procedures whose executor reads it (MythicTools._KRBTGT_FORGE_CAPABILITIES).
 REFERENCE_INPUTS = {"cred": "credential_id", "task": "credential_proof_task_id"}
+# Several `cred:` references name rows of one key set; the executor resolves them to one proof (`credential_ids`).
+REFERENCE_SET_INPUT = "credential_ids"
 REFERENCE_PROCEDURES = frozenset({"forge-golden-ticket", "ensure-kerberos-context"})
 _TITLE = "[Sage catalog candidates — supported by current evidence, for this model call]"
 _OTHER_WORK = ("`collect-graph`, control-plane reads and explicit off-catalog tool steps (allowed_tools) remain "
@@ -39,10 +43,6 @@ class Candidate:
     effects: tuple[str, ...]
     action: Mapping[str, Any]
     inputs: Mapping[str, Any]
-
-
-def _text(value: Any) -> str:
-    return str(value or "").strip().strip("'\"").rstrip(".").casefold()
 
 
 def _callback(value: Any) -> str:
@@ -105,15 +105,10 @@ def _values(value: Any, key: str = "") -> Iterable[tuple[str, str]]:
         yield key.casefold(), str(value)
 
 
-def _names(candidate: Candidate) -> set[str]:
-    """Every name the candidate binds: its target fields and intent values, plus user@domain / domain\\user forms."""
-    names = {_text(candidate.target)}
-    for segment in candidate.target.split(";"):
-        names.add(_text(segment.partition("=")[2] or segment))
-    names.update(_text(text) for _key, text in _values(candidate.action.get("intent") or {}))
-    names.discard("")
-    return names | {f"{user}@{domain}" for user in names for domain in names if "." in domain} | {
-        f"{domain}\\{user}" for user in names for domain in names}
+def credential_set(values: Any) -> list[str]:
+    """Credential IDs as one canonical set: distinct, in numeric order, so every pass compares the same list."""
+    items = values if isinstance(values, (list, tuple)) else () if values in (None, "") else (values,)
+    return sorted({str(item).strip() for item in items} - {""}, key=lambda text: (len(text), text))
 
 
 def bind(brief: Any, found: tuple[Candidate, ...] | None, *, reason: str = "") -> tuple[Candidate | None, str]:
@@ -139,22 +134,31 @@ def bind(brief: Any, found: tuple[Candidate, ...] | None, *, reason: str = "") -
     if callback != candidate.callback:
         return None, (f"candidate_ref {ref} runs on callback {candidate.callback or 'none'}, not callback "
                       f"{callback or 'none'}")
-    names = _names(candidate)
-    stray = [target for target in getattr(brief, "targets", ()) or () if _text(target) not in names]
+    # The candidate's own names in any equivalent form (case, trailing dot, its host's short label, account forms).
+    scope = _handoff_brief.action_scope(candidate.target, candidate.action.get("intent"),
+                                        candidate.action.get("source_facts") or ())
+    stray = [target for target in getattr(brief, "targets", ()) or () if not scope.names_current(target)]
     if stray:
         return None, f"candidate_ref {ref} ({candidate.target}) does not act on {', '.join(stray)}"
     bound = list(_values({"action": candidate.action, "inputs": candidate.inputs}))
-    pins: dict[str, str] = {}
+    supplied: dict[str, list[str]] = {"cred": [], "task": []}
     for reference in getattr(brief, "inputs_by_reference", ()) or ():
         kind, _, number = str(reference).lstrip("@").partition(":")
         word = "task" if kind == "task" else "cred"
         if any(word in key and text == number for key, text in bound):
             continue
         # A supplied reference is used, never ignored: it pins the key a forge binds, or the step cannot be bound.
-        field = REFERENCE_INPUTS[word] if candidate.procedure in REFERENCE_PROCEDURES else ""
-        if not field or pins.get(field, number) != number:
+        # Several credentials name one key set; a second, different proof task conflicts.
+        conflict = word == "task" and bool(supplied["task"]) and number != supplied["task"][0]
+        if candidate.procedure not in REFERENCE_PROCEDURES or conflict:
             return None, f"candidate_ref {ref} does not use the input reference {reference}"
-        pins[field] = number
+        supplied[word].append(number)
+    credentials = credential_set(supplied["cred"])
+    pins: dict[str, Any] = {REFERENCE_INPUTS["task"]: supplied["task"][0]} if supplied["task"] else {}
+    if len(credentials) == 1:
+        pins[REFERENCE_INPUTS["cred"]] = credentials[0]
+    elif credentials:
+        pins[REFERENCE_SET_INPUT] = credentials
     return (replace(candidate, inputs={**candidate.inputs, **pins}) if pins else candidate), ""
 
 

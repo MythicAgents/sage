@@ -5,6 +5,9 @@ The model output, current ledger/callback state and external transports are iner
 this checks code given a recorded shape, not model choice or a full incident replay.
 No approval is submitted. The inherited setup seeds a proved key using inert task
 output; zero-task assertions below concern the proposal turn after that setup.
+Equivalent forms of the selected candidate's host card once; a host the candidate
+does not name is refused, at admission when Sage never observed it and at binding
+when it is observed but not the candidate's.
 """
 
 import asyncio
@@ -14,14 +17,11 @@ import socket
 
 import pytest
 
-from tests.test_supervised_catalog_step_binding import _client, _run, _select
+from tests.esl_fixtures import seed_ledger
+from tests.test_supervised_catalog_step_binding import NOW, _client, _run, _select
 
 
 CORPUS = json.loads((Path(__file__).parent / "fixtures/model_input_boundaries/handoff_targets.json").read_text())
-
-
-class DesiredCardAssertion(AssertionError):
-    """Only the equivalent-FQDN desired-card count may be an expected failure."""
 
 
 @pytest.fixture
@@ -37,13 +37,7 @@ def no_network(monkeypatch):
     return attempts
 
 
-@pytest.mark.parametrize("case", [
-    pytest.param(case, id=case["id"], marks=pytest.mark.xfail(
-        strict=True, raises=DesiredCardAssertion,
-        reason="Open defect: the selected catalog action rejects its equivalent host FQDN before a card",
-    ) if case["id"] == "equivalent_fqdn" else ())
-    for case in CORPUS["cases"]
-])
+@pytest.mark.parametrize("case", CORPUS["cases"], ids=[case["id"] for case in CORPUS["cases"]])
 def test_handoff_targets_reach_native_consumer(monkeypatch, tmp_path, no_network, case):
     shape = CORPUS["recorded_shape"]
     assert isinstance(shape["callback_display_id"], str)
@@ -55,18 +49,20 @@ def test_handoff_targets_reach_native_consumer(monkeypatch, tmp_path, no_network
         assert shape["targets"][0].endswith("." + shape["targets"][1])
 
     mt, split = _client(monkeypatch, tmp_path)
+    if case.get("synthetic_graph_facts"):
+        seed_ledger(mt, graph_facts=[{"predicate": predicate, "source": "fixture", "timestamp": NOW,
+                                      "ttl_seconds": 86400} for predicate in case["synthetic_graph_facts"]])
     run = asyncio.run(_run(mt, split, [_select(
         shape["allowed_capabilities"][0], "alpha-policy",
         allowed_capabilities=shape["allowed_capabilities"],
         callback_display_id=shape["callback_display_id"], targets=case["targets"],
     )], decision=None))
 
-    # These assertions are outside the sole expected-failure exception type.
     assert no_network == []
     assert run.issued == [] and run.before.issued == []
     assert run.before.worker_calls == 0
     assert run.outcomes == []
-    assert len(run.cards) <= 1, "duplicate approval cards are not the known missing-card defect"
+    assert len(run.cards) == case["expected_cards"], (case["id"], run.briefs)
     if run.cards:
         assert run.briefs == [("accepted", "Mythic_Operator")]
         for card in run.cards:
@@ -75,20 +71,12 @@ def test_handoff_targets_reach_native_consumer(monkeypatch, tmp_path, no_network
             assert arguments["action"]["intent"]["gpo"] == "alpha-policy"
             assert arguments["inputs"]["callback_id"] == shape["callback_display_id"]
     else:
-        assert run.briefs and all(phase == "rejected" for phase, _ in run.briefs)
+        [(phase, reason)] = run.briefs
         [terminal] = run.terminals
-        if case["id"] == "equivalent_fqdn":
+        assert phase == "rejected", run.briefs
+        if case["refused_at"] == "binding":
+            # Admitted (Sage observed the host) but not the candidate's: the binder refuses and the request ends.
             assert "Blocked" in str(terminal.get("content")), terminal
-            [(_, reason)] = run.briefs
-            assert "catalog binding:" in reason
-            assert "does not act on ws02.child.lab.local" in reason
-
-    if case["id"] == "equivalent_fqdn":
-        # Only this assertion is calibrated as xfail. A fixed consumer is strict
-        # XPASS until this exception is removed by the boundary's repair line.
-        try:
-            assert len(run.cards) == case["expected_cards"], "equivalent FQDN must produce one approval card"
-        except AssertionError as exc:
-            raise DesiredCardAssertion(str(exc)) from exc
-    else:
-        assert len(run.cards) == case["expected_cards"], (case["id"], run.briefs)
+            assert reason.startswith("catalog binding:") and f"does not act on {case['targets'][0]}" in reason
+        else:
+            assert reason.startswith("targets:") and case["targets"][0] in reason, reason

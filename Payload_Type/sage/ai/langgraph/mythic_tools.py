@@ -17817,18 +17817,22 @@ class MythicTools:
         carried = any(self._capability_text(source.get(field)).strip()
                       for source in (inputs, intent) for field in self._TICKET_KEY_FIELDS)
         pinned_task = self._capability_text(inputs.get("credential_proof_task_id"))
-        pinned_id = self._capability_text(inputs.get("credential_id"))
+        pinned_ids = self._krbtgt_reference_set(inputs)
+        # A set is the reference; the `credential_id` an earlier pass bound from it is derived, not a second pin.
+        pinned_id = "" if pinned_ids else self._capability_text(inputs.get("credential_id"))
         for field in (*self._TICKET_KEY_FIELDS, "key_type", "etype", "credential_id", "credential_source",
-                      "credential_proof_task_id", self._KRBTGT_REFERENCE_OUTCOME):
+                      "credential_proof_task_id", "credential_ids", self._KRBTGT_REFERENCE_OUTCOME):
             inputs.pop(field, None)
         for field in (*self._TICKET_KEY_FIELDS, "key_type", "etype"):
             intent.pop(field, None)
+        if pinned_ids:
+            inputs["credential_ids"] = pinned_ids
         credential, outcome = await self._resolve_krbtgt_reference(
-            domain, pinned_id=pinned_id, pinned_task=pinned_task)
+            domain, pinned_id=pinned_id, pinned_task=pinned_task, pinned_ids=pinned_ids)
         if not credential:
             if carried:
                 logger.info("krbtgt forge input: a key carried by the request is not a proved krbtgt-hash; dropped")
-            if pinned_task or pinned_id:
+            if pinned_task or pinned_id or pinned_ids:
                 logger.info(f"krbtgt forge input: the credential reference did not resolve ({outcome}); no key bound")
                 inputs[self._KRBTGT_REFERENCE_OUTCOME] = outcome
             if pinned_task:
@@ -17868,6 +17872,7 @@ class MythicTools:
         pinned = [f"{label} {value}" for label, value in (
             ("proof task", self._capability_text(inputs.get("credential_proof_task_id"))),
             ("credential", self._capability_text(inputs.get("credential_id"))),
+            ("credentials", ", ".join(self._krbtgt_reference_set(inputs))),
         ) if value]
         # "No forge was issued": checks that ran before the build may have issued their own tasks, which the
         # result's `issued` list reports. A reference with no proved key at all to resolve to is reported as that.
@@ -17896,8 +17901,17 @@ class MythicTools:
         if capability not in self._KRBTGT_FORGE_CAPABILITIES:
             return False
         pinned = (self._capability_text(inputs.get("credential_proof_task_id"))
-                  or self._capability_text(inputs.get("credential_id")))
+                  or self._capability_text(inputs.get("credential_id")) or self._krbtgt_reference_set(inputs))
         return bool(pinned) and not self._capability_has_ticket_key(inputs)
+
+    @staticmethod
+    def _krbtgt_reference_set(inputs: dict) -> list[str]:
+        """The credential IDs a forge names as one key set (`credential_ids`), canonically; [] when none."""
+        try:
+            from . import catalog_binding
+        except ImportError:
+            import catalog_binding
+        return catalog_binding.credential_set(inputs.get("credential_ids"))
 
     def _drop_card_secret_inputs(self, inputs: dict, *mappings: Any) -> None:
         """Remove ticket-key values from what an approval card carries once Sage bound a proved key by reference.
@@ -17953,8 +17967,8 @@ class MythicTools:
         named = self._krbtgt_row_holding(creds, domain_cf, recovered)
         return {**recovered, "id": named.get("id")}
 
-    async def _resolve_krbtgt_reference(self, domain: str, *, pinned_id: str = "",
-                                        pinned_task: str = "") -> tuple[dict, str]:
+    async def _resolve_krbtgt_reference(self, domain: str, *, pinned_id: str = "", pinned_task: str = "",
+                                        pinned_ids: list[str] | tuple[str, ...] = ()) -> tuple[dict, str]:
         """The proved krbtgt credential a forge's reference names, with how it resolved.
 
         The outcome is "bound", "unresolved" (the reference names nothing eligible while another proved key
@@ -17962,10 +17976,12 @@ class MythicTools:
         `krbtgt`, this realm, a usable key type), proved by its own complete source-task lineage or by an admitted
         proof task whose parsed material holds the row's exact key and type. A proof-task reference restricts proof
         to that task and ranks only within it, store rows first; with both references, both must hold. A missing
-        row never falls back to its task. Without a reference the existing selection applies. Read-only.
+        row never falls back to its task. A set of credential IDs names rows of one key set: each resolves by the
+        credential-ID rule, all to one proof task (one kvno holds one key per type; another proof may be another
+        key), and the best-ranked row binds. Without a reference the existing selection applies. Read-only.
         """
         domain_cf = self._capability_text(domain).casefold()
-        if not pinned_id and not pinned_task:
+        if not pinned_id and not pinned_task and not pinned_ids:
             credential = await self._select_krbtgt_credential(domain_cf)
             return credential, ("bound" if credential else "no_proved_key")
         if not domain_cf:
@@ -17978,21 +17994,15 @@ class MythicTools:
             if task_id not in admitted:
                 admitted[task_id] = await self._admitted_krbtgt_task_keys(task_id, domain_cf)
         credential: dict = {}
-        if pinned_id:
-            row = next((item for item in creds if self._capability_text(item.get("id")) == pinned_id), {})
-            key = self._best_kerberos_key_credential([row], "krbtgt", domain_cf) if row else {}
-            if key and self._credential_store_proof_envelope(row, now):
-                task_id = self._credential_row_proof_task(row)
-                if not pinned_task or pinned_task == self._capability_text(task_id):
-                    credential = {**key, "proof_task_id": task_id, "source": "mythic_credential_store"}
-            if key and not credential:
-                credential = next((
-                    {**key, "proof_task_id": task_id, "source": "engagement_proof_task"}
-                    for task_id, keys in admitted.items()
-                    if (not pinned_task or pinned_task == self._capability_text(task_id))
-                    and any(item["credential"] == key["credential"] and item["key_type"] == key["key_type"]
-                            for item in keys)
-                ), {})
+        if pinned_ids:
+            resolved = [self._krbtgt_row_reference(row_id, pinned_task, creds, admitted, domain_cf, now)
+                        for row_id in pinned_ids]
+            proofs = {self._capability_text(found.get("proof_task_id")) for _row, found in resolved}
+            if all(found for _row, found in resolved) and len(proofs) == 1:
+                best = self._best_kerberos_key_credential([row for row, _found in resolved], "krbtgt", domain_cf)
+                credential = next(found for row, found in resolved if row.get("id") == best.get("id"))
+        elif pinned_id:
+            _row, credential = self._krbtgt_row_reference(pinned_id, pinned_task, creds, admitted, domain_cf, now)
         else:
             store_matches = [row for row in proved_rows
                              if self._capability_text(self._credential_row_proof_task(row)) == pinned_task]
@@ -18012,6 +18022,25 @@ class MythicTools:
         eligible = (bool(self._best_kerberos_key_credential(proved_rows, "krbtgt", domain_cf))
                     or any(admitted.values()))
         return {}, ("unresolved" if eligible else "no_proved_key")
+
+    def _krbtgt_row_reference(self, row_id: str, pinned_task: str, creds: list, admitted: dict, domain_cf: str,
+                              now: str) -> tuple[dict, dict]:
+        """The store row a credential ID names and its proved krbtgt key with proof task, or {} for the key: account
+        `krbtgt`, this realm, a usable type, proved by its own lineage or by an admitted task holding that exact key."""
+        row = next((item for item in creds if self._capability_text(item.get("id")) == row_id), {})
+        key = self._best_kerberos_key_credential([row], "krbtgt", domain_cf) if row else {}
+        if not key:
+            return row, {}
+        if self._credential_store_proof_envelope(row, now):
+            task_id = self._credential_row_proof_task(row)
+            if not pinned_task or pinned_task == self._capability_text(task_id):
+                return row, {**key, "proof_task_id": task_id, "source": "mythic_credential_store"}
+        return row, next((
+            {**key, "proof_task_id": task_id, "source": "engagement_proof_task"}
+            for task_id, keys in admitted.items()
+            if (not pinned_task or pinned_task == self._capability_text(task_id))
+            and any(item["credential"] == key["credential"] and item["key_type"] == key["key_type"] for item in keys)
+        ), {})
 
     @staticmethod
     def _credential_row_proof_task(row: dict):

@@ -299,6 +299,63 @@ def test_a_retracted_proof_no_longer_resolves_its_row(monkeypatch, tmp_path):
         _assert_refused(mt, {"credential_id": 501, "credential_proof_task_id": "21"}, capability, stale=False)
 
 
+# --- several rows of one proof are one key set ------------------------------------------------------------------
+
+@pytest.mark.parametrize("capability", CAPABILITIES)
+@pytest.mark.parametrize("route", ROUTES)
+@pytest.mark.parametrize("pin", [{"credential_ids": [501, "500"]}, {"credential_ids": ["500", "501", "500"]},
+                                 {"credential_ids": ["501", "500"], "credential_proof_task_id": "21"}],
+                         ids=["ids", "repeated", "ids-and-task"])
+def test_a_set_of_rows_of_one_proof_binds_its_best_ranked_row(monkeypatch, tmp_path, capability, route, pin):
+    mt, store = _two_row_tools(monkeypatch, tmp_path, route)
+    writes_before = len(store["writes"])
+
+    [call] = _ground_without_issue(mt, dict(pin), _action(capability)).tool_calls
+
+    inputs = call["args"]["inputs"]
+    assert inputs["credential_ids"] == ["500", "501"] and str(inputs["credential_id"]) == "500", inputs
+    assert str(inputs["credential_proof_task_id"]) == "21" and inputs["key_type"] == "aes256"
+    _no_secret(call)
+    assert len(store["writes"]) == writes_before
+
+    result, calls = _forge_from(mt, inputs, call["args"]["action"])
+
+    [forge] = _rubeus_issues(calls)
+    assert f"/aes256:{AES}" in forge and NTLM not in forge, forge
+    _no_secret(result)
+
+
+def _set_with_500(make_pin):
+    """`make_pin`'s unresolvable row named together with row 500, a row task 21 does prove."""
+    def make(mt, store):
+        pin = make_pin(mt, store)
+        row_id = pin.pop("credential_id")
+        return {**pin, "credential_ids": [500, row_id]}
+    make.__name__ = make_pin.__name__
+    return make
+
+
+UNRESOLVABLE_SETS = [_set_with_500(case) for case in (
+    _other_realm, _other_account, _trust_account, _id_and_other_admitted_task, _id_and_unknown_task, _absent_row,
+    _absent_row_with_its_task, _unproved_row, _unproved_row_with_a_proved_task, _row_from_a_failed_task,
+    _caller_asserted_status_and_key)]
+
+
+@pytest.mark.parametrize("capability", CAPABILITIES)
+@pytest.mark.parametrize("make_pin", UNRESOLVABLE_SETS, ids=[case.__name__.strip("_") for case in UNRESOLVABLE_SETS])
+def test_a_set_with_a_row_that_cannot_resolve_issues_nothing(monkeypatch, tmp_path, capability, make_pin):
+    mt, store = _two_row_tools(monkeypatch, tmp_path, "admitted-task")
+
+    _assert_refused(mt, make_pin(mt, store), capability, stale=True)
+
+
+@pytest.mark.parametrize("capability", CAPABILITIES)
+def test_rows_of_two_proofs_of_one_realm_are_not_one_key_set(monkeypatch, tmp_path, capability):
+    mt, _ = _two_task_tools(monkeypatch, tmp_path, "agent-row")   # row 600 from task 21, row 601 from task 30
+
+    _assert_refused(mt, {"credential_ids": [600, 601]}, capability, stale=True)
+
+
 # --- the outcome is recomputed on every binding pass -------------------------------------------------------------
 
 @pytest.mark.parametrize("route", ROUTES)

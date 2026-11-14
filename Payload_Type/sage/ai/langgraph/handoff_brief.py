@@ -288,6 +288,47 @@ def _managed_secret_host(predicate: str) -> tuple[str, str] | None:
     return _host_identity(fields) if fields else None
 
 
+def _fact_names(predicate: str) -> tuple[set[str], set[str], set[str]]:
+    """The hosts, domains and directory objects one graph fact names, by the parsers above."""
+    hosts, objects = _graph_fact_names(predicate)
+    domains = {_name(segment) for segment in predicate.split(":")[1:] if "." in segment and not _encoded(segment)}
+    identity = _managed_secret_host(predicate)
+    if identity:
+        hosts.add(identity[0])
+        domains.add(identity[1])
+    return hosts, domains, objects
+
+
+# The target and intent fields a catalog action names what it acts on in, by kind, as `capabilities` writes them.
+# Other fields (steps, effects, capability, callback, options) are never names.
+_ACTION_NAME_FIELDS = {
+    "hosts": frozenset({"target", "target_host", "ca_host", "affected_hosts", "affected_dc_hosts"}),
+    "domains": frozenset({"domain", "account_domain", "source_domain", "target_domain"}),
+    "principals": frozenset({"account", "local_account", "user"}),
+    "objects": frozenset({"gpo", "gpo_guid"}),
+}
+_NOT_A_NAME = re.compile(r"[\s;=:/]")
+
+
+def action_scope(target: Any, intent: Any, source_facts: Iterable[Any] = ()) -> KnownScope:
+    """The names one catalog action acts on, as a scope `names_current` reads, so a brief may name them in any
+    equivalent form: the full target string, its `key=value` fields and its intent's name fields by kind, and the
+    graph facts the action was derived from. Engagement state and operator input contribute nothing."""
+    names: dict[str, set[str]] = {kind: set() for kind in _ACTION_NAME_FIELDS}
+    names["objects"].add(_name(target))
+    fields = [segment.split("=", 1) for segment in str(target or "").split(";") if "=" in segment]
+    for key, value in [*fields, *(intent.items() if isinstance(intent, Mapping) else ())]:
+        kind = next((kind for kind, keys in _ACTION_NAME_FIELDS.items() if str(key).casefold() in keys), None)
+        if kind is not None:
+            names[kind].update(text for text in map(_name, _items(value)) if text and not _NOT_A_NAME.search(text))
+    for fact in source_facts or ():
+        hosts, domains, objects = _fact_names(str(fact or ""))
+        names["hosts"] |= hosts
+        names["domains"] |= domains
+        names["objects"] |= objects
+    return KnownScope(**{kind: frozenset(found - {""}) for kind, found in names.items()})
+
+
 def known_scope(mythic_client: Any, *, operator_input: str = "", bound_callback: Any = "",
                 operator_target_inputs: Iterable[OperatorTargetInput] = ()) -> KnownScope:
     """Collect callbacks, names, tasks and credentials Sage already holds in memory. Never queries Mythic.
@@ -356,17 +397,10 @@ def known_scope(mythic_client: Any, *, operator_input: str = "", bound_callback:
             tasks.update(_items(evidence.get(key) for key in ("mythic_task_id", "task_id", "display_id")
                                 if evidence.get(key) is not None))
     for fact in ledger_facts:
-        predicate = str(getattr(fact, "predicate", "") or "")
-        for segment in predicate.split(":")[1:]:
-            if "." in segment and not _encoded(segment):
-                domains.add(_name(segment))
-        fact_hosts, fact_objects = _graph_fact_names(predicate)
+        fact_hosts, fact_domains, fact_objects = _fact_names(str(getattr(fact, "predicate", "") or ""))
         hosts.update(fact_hosts)
+        domains.update(fact_domains)
         objects.update(fact_objects)
-        identity = _managed_secret_host(predicate)
-        if identity:
-            hosts.add(identity[0])
-            domains.add(identity[1])
     for cache in ("_task_source_request_ids", "_task_output_record_cache", "_task_output_cache"):
         tasks.update(str(key) for key in attr(cache, dict))
     last_task = getattr(mythic_client, "_last_issued_task_display_id", None)
