@@ -307,6 +307,10 @@ _ACTION_NAME_FIELDS = {
     "principals": frozenset({"account", "local_account", "user"}),
     "objects": frozenset({"gpo", "gpo_guid"}),
 }
+# The domain field that qualifies each host field's short name, so a label never pairs with another named domain.
+_HOST_DOMAIN_FIELDS = {"target": ("target_domain",), "target_host": ("target_domain",),
+                       "affected_hosts": ("domain",), "affected_dc_hosts": ("domain",),
+                       "ca_host": ("domain", "target_domain")}
 _NOT_A_NAME = re.compile(r"[\s;=:/]")
 
 
@@ -316,11 +320,19 @@ def action_scope(target: Any, intent: Any, source_facts: Iterable[Any] = ()) -> 
     graph facts the action was derived from. Engagement state and operator input contribute nothing."""
     names: dict[str, set[str]] = {kind: set() for kind in _ACTION_NAME_FIELDS}
     names["objects"].add(_name(target))
-    fields = [segment.split("=", 1) for segment in str(target or "").split(";") if "=" in segment]
-    for key, value in [*fields, *(intent.items() if isinstance(intent, Mapping) else ())]:
-        kind = next((kind for kind, keys in _ACTION_NAME_FIELDS.items() if str(key).casefold() in keys), None)
-        if kind is not None:
-            names[kind].update(text for text in map(_name, _items(value)) if text and not _NOT_A_NAME.search(text))
+    fields = dict(segment.split("=", 1) for segment in str(target or "").split(";") if "=" in segment)
+    for source in (fields, intent if isinstance(intent, Mapping) else {}):
+        source = {str(key).casefold(): value for key, value in source.items()}
+        for key, value in source.items():
+            kind = next((kind for kind, keys in _ACTION_NAME_FIELDS.items() if key in keys), None)
+            texts = [text for text in map(_name, _items(value)) if text and not _NOT_A_NAME.search(text)]
+            if kind == "hosts":
+                # A short host name is qualified by its own domain field only (`_host_identity`), never left bare.
+                domain = next((str(source[field]) for field in _HOST_DOMAIN_FIELDS[key] if source.get(field)), "")
+                texts = [(_host_identity({"target": text, "target_domain": domain}) or ("",))[0]
+                         if "." not in text else text for text in texts]
+            if kind is not None:
+                names[kind].update(texts)
     for fact in source_facts or ():
         hosts, domains, objects = _fact_names(str(fact or ""))
         names["hosts"] |= hosts

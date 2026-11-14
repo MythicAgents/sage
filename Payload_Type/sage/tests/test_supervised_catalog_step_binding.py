@@ -288,6 +288,28 @@ def test_the_decision_on_a_bound_forge_card_is_final(monkeypatch, tmp_path, deci
     assert len(run.terminals) == 1
 
 
+# --- (a2) a host's short name pairs only with its own domain, never with another domain the candidate names ------
+
+CROSS_DOMAIN_SECRET = ("can-read-managed-local-admin-secret:account=operator;account_domain=lab.local;target=ws02;"
+                       "target_domain=child.lab.local")
+
+
+@pytest.mark.parametrize("target, cards", [("ws02.child.lab.local", 1), ("WS02", 1), ("ws02.lab.local", 0)])
+def test_a_cross_domain_candidates_host_binds_only_under_its_own_domain(monkeypatch, tmp_path, target, cards):
+    mt, split = _client(monkeypatch, tmp_path)
+    seed_ledger(mt, graph_facts=[{"predicate": CROSS_DOMAIN_SECRET, "source": "fixture", "timestamp": NOW,
+                                  "ttl_seconds": 86400}])
+
+    run = asyncio.run(_run(mt, split, [_select("read-managed-local-admin-secret", targets=[target])], decision=None))
+
+    assert len(run.cards) == cards and run.issued == [] and run.before.worker_calls == 0, run.briefs
+    if not cards:   # admitted (Sage observed ws02 and lab.local), refused by the binder
+        [(phase, reason)] = run.briefs
+        assert phase == "rejected" and f"does not act on {target}" in reason, reason
+        [terminal] = run.terminals
+        assert "Blocked" in str(terminal.get("content"))
+
+
 # --- (d2) a forge brief naming several key rows of one proved krbtgt binds that key set --------------------------
 
 OTHER_AES, OTHER_RC4, TYPED = "b" * 64, "e" * 32, "f" * 64
@@ -527,6 +549,21 @@ def test_a_brief_binds_the_candidates_host_in_any_equivalent_form_and_nothing_el
     bound, error = cb.bind(brief, (item,))
     assert (bound is item, error) == ((True, "") if binds else (False, f"candidate_ref {item.ref} "
                                       f"({item.target}) does not act on {target}")), error
+
+
+def test_a_short_host_name_pairs_only_with_its_own_domain():
+    secret = {"name": "read-managed-local-admin-secret",
+              "target": "account=operator;account_domain=lab.local;target=ws02;target_domain=child.lab.local;callback=13",
+              "intent": {"account": "operator", "account_domain": "lab.local", "target_host": "ws02",
+                         "target_domain": "child.lab.local"}}
+    [item] = cb.candidates("r", [(secret, {"callback_id": "13"})])
+
+    def error(target):
+        return cb.bind(hb.HandoffBrief.from_args(allowed_capabilities=[item.procedure], callback_display_id=13,
+                                                 candidate_ref=item.ref, targets=[target]), (item,))[1]
+
+    assert [error(t) for t in ("ws02.child.lab.local", "WS02", "operator@lab.local", "lab.local")] == [""] * 4
+    assert "does not act on ws02.lab.local" in error("ws02.lab.local")
 
 
 def test_a_brief_binds_targets_the_candidate_names_in_any_account_form():
