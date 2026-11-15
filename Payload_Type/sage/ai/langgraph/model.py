@@ -7005,8 +7005,8 @@ class Model:
     ) -> tuple[tuple[str, ...], bool] | tuple[tuple[str, ...], bool, tuple[str, ...]] | tuple[
             tuple[str, ...], bool, tuple[str, ...], str] | None:
         """Structurally check a delegation's brief before dispatch; None admits it. In an ordinary supervised request a
-        non-collection catalog step must also bind one current candidate; failing that ends the request (with a
-        fourth element, the closing report's text).
+        non-collection catalog step must also bind one current candidate, whose action decides what it acts on (its
+        targets are only recorded); failing that ends the request (with a fourth element, the closing report's text).
 
         Reads the request lane and operator input from the Model's state, as the assisted-input lookup does: the
         handoff tool's runtime state is the Supervisor's own channel view. Rejections are request evidence.
@@ -7036,13 +7036,13 @@ class Model:
             # the request like a typed binding: a brief naming another one is rejected, naming the binding. Binding
             # adds nothing to the observed callbacks.
             scope = replace(scope, bound_callback=str(pending["callback_id"]))
+        bound = self._candidate_bound(worker, brief)
         errors = _handoff_brief.validate_brief(
             brief, worker=worker, require_scope=lane == "supervised_workflow", scope=scope,
-            worker_tools=_worker_guarded_tool_names(worker),
+            worker_tools=_worker_guarded_tool_names(worker), candidate_bound=bound,
         )
         binding_error = ""
-        if not errors and worker in _handoff_brief.TARGET_FACING_WORKERS and _needs_catalog_binding(brief) \
-                and self._catalog_binding_active():
+        if not errors and bound:
             # A catalog step runs one action current evidence supports, chosen by its candidate_ref; nothing else.
             found, reason = self._catalog_candidates()
             _candidate, binding_error = _catalog_binding.bind(brief, found, reason=reason)
@@ -11169,7 +11169,9 @@ class Model:
                     )
                     sanitized_channel = (sanitized_channel[:-1] + [assignment_message]
                                          + sanitized_channel[-1:])
-                scope = (_handoff_brief.render_scope(delegated.additional_kwargs.get("_handoff_brief"))
+                brief_meta = delegated.additional_kwargs.get("_handoff_brief")
+                scope = (_handoff_brief.render_scope(brief_meta,
+                                                     candidate_bound=self._candidate_bound(node_name, brief_meta))
                          if state.get("_request_lane") == "supervised_workflow" else "")
                 if state.get("_request_lane") == "supervised_workflow":
                     # The delegation's transcript is fresh, so what earlier work this step needs arrives as Sage's
@@ -12317,6 +12319,11 @@ class Model:
         lane = str(getattr(getattr(getattr(self, "_request_contract", None), "lane", None), "value", "") or "")
         return (getattr(self, "mode", "") == "supervised" and lane == "supervised_workflow"
                 and not self._autonomous_execution_enabled_for_turn())
+
+    def _candidate_bound(self, worker: str, brief: Any) -> bool:
+        """Whether `worker`'s step must bind a current catalog candidate, which then owns its targeting."""
+        return (worker in _handoff_brief.TARGET_FACING_WORKERS and _needs_catalog_binding(brief)
+                and self._catalog_binding_active())
 
     async def _refresh_catalog_footholds(self) -> None:
         """Re-read live footholds from Mythic before an ordinary supervised request derives catalog candidates (the
@@ -19367,12 +19374,12 @@ def _create_handoff_tool(
             handoff_instruction: Annotated[str, "The specific worker task, including what needs resolving after a prior result. In assisted modes this is non-authoritative task context; Sage separately supplies the exact operator input. Omit when that input already states the whole task."] = "",
             handoff_title: Annotated[str, "A short operator-facing title for the sub-agent card, usually 3-8 words and never the full instruction. Example: 'List active callbacks'."] = "",
             callback_display_id: Annotated[int | str | None, "The Mythic callback display id this step runs on. Required for a supervised Mythic_Operator step unless allowed_capabilities is ['control_plane']; must be a callback already observed, and the request's bound callback when it has one."] = None,
-            targets: Annotated[list[str] | None, "Hosts, domains, or principals this step acts on, each named in the operator's request or already in engagement state. Required for a supervised Mythic_Operator step unless allowed_capabilities is ['control_plane']."] = None,
+            targets: Annotated[list[str] | None, "Hosts, domains, or principals this step acts on, each named in the operator's request or already in engagement state. Required for a supervised Mythic_Operator step unless allowed_capabilities is ['control_plane'] or the step selects a listed candidate_ref, whose action decides what runs (its targets are then only recorded)."] = None,
             expected_result: Annotated[str, "One line stating what this step should produce. Required for a supervised Mythic_Operator step."] = "",
             allowed_capabilities: Annotated[list[capability_choice] | None, "Catalog procedures (each a multi-step procedure run as one guarded action through execute_capability) this step may run, by name, or ['control_plane'] alone for a step that only reads Mythic or BloodHound records (callbacks, task output, credentials, graph) and tasks no callback. A procedure also needs the state in its 'needs' clause; if that is not met, do the upstream procedure first. For any other work, including a single payload command, name the guarded tools in allowed_tools instead (a command is an argument to issue_task_and_waitfor_task_output, never a capability). Catalog:\n" + capability_legend] = None,
             allowed_tools: Annotated[list[tool_choice] | None, "Instead of allowed_capabilities: the guarded tools this step's one action may use. Name either allowed_capabilities or allowed_tools, not both. Read-only tools are always available and need not be listed."] = None,
             inputs_by_reference: Annotated[list[str] | None, "Earlier results this step uses, as 'task:<display id>' or 'cred:<credential id>' records Sage already holds."] = None,
-            candidate_ref: Annotated[str, "For a catalog procedure other than collect-graph: the candidate_ref of one action in the current 'Sage catalog candidates' list, copied exactly, with that procedure, its callback and targets it names. Sage runs exactly that action after approval; without a current candidate the step is not dispatched."] = "",
+            candidate_ref: Annotated[str, "For a catalog procedure other than collect-graph: the candidate_ref of one action in the current 'Sage catalog candidates' list, copied exactly, with that procedure and its callback. Sage runs exactly that action after approval; without a current candidate the step is not dispatched."] = "",
         ) -> Command:
             brief = _handoff_brief.HandoffBrief.from_args(
                 targets=targets,

@@ -5,12 +5,18 @@ The model output, current ledger/callback state and external transports are iner
 this checks code given a recorded shape, not model choice or a full incident replay.
 No approval is submitted. The inherited setup seeds a proved key using inert task
 output; zero-task assertions below concern the proposal turn after that setup.
-Equivalent forms of the selected candidate's host card once; a host the candidate
-does not name is refused, at admission when Sage never observed it and at binding
-when it is observed but not the candidate's.
+A catalog step's targets are recorded annotations of its candidate: any form,
+including a host the candidate does not name, cards that candidate's action once.
+
+The run 2/3 corpus (`catalog_brief_targets.json`) replays each recorded target shape
+of a non-collection catalog brief against a real candidate of the same procedure.
+Its refs, callback and references are mapped to the fixture's (references are not
+replayed); collection and raw rows are inventoried and their target checks are
+tested in test_supervised_catalog_step_binding.py.
 """
 
 import asyncio
+from collections import Counter
 import json
 from pathlib import Path
 import socket
@@ -18,10 +24,16 @@ import socket
 import pytest
 
 from tests.esl_fixtures import seed_ledger
-from tests.test_supervised_catalog_step_binding import NOW, _client, _run, _select
+from tests.test_supervised_catalog_step_binding import NOW, _brief_targets, _client, _run, _select, _state_for
 
 
-CORPUS = json.loads((Path(__file__).parent / "fixtures/model_input_boundaries/handoff_targets.json").read_text())
+FIXTURES = Path(__file__).parent / "fixtures/model_input_boundaries"
+CORPUS = json.loads((FIXTURES / "handoff_targets.json").read_text())
+ROWS = json.loads((FIXTURES / "catalog_brief_targets.json").read_text())["rows"]
+CATALOG_ROWS = [row for row in ROWS if row["candidate_ref"] and "collect-graph" not in row["allowed_capabilities"]]
+# One replay per distinct recorded (procedures, targets) shape, named by its first row.
+SHAPES = list({json.dumps([row["allowed_capabilities"], row["targets"]]): row for row in reversed(CATALOG_ROWS)}
+              .values())[::-1]
 
 
 @pytest.fixture
@@ -62,21 +74,44 @@ def test_handoff_targets_reach_native_consumer(monkeypatch, tmp_path, no_network
     assert run.issued == [] and run.before.issued == []
     assert run.before.worker_calls == 0
     assert run.outcomes == []
-    assert len(run.cards) == case["expected_cards"], (case["id"], run.briefs)
-    if run.cards:
-        assert run.briefs == [("accepted", "Mythic_Operator")]
-        for card in run.cards:
-            arguments = card["data"]["arguments"]
-            assert arguments["action"]["name"] == shape["allowed_capabilities"][0]
-            assert arguments["action"]["intent"]["gpo"] == "alpha-policy"
-            assert arguments["inputs"]["callback_id"] == shape["callback_display_id"]
-    else:
-        [(phase, reason)] = run.briefs
+    assert len(run.cards) == case["expected_cards"] == 1, (case["id"], run.briefs)
+    assert run.briefs == [("accepted", "Mythic_Operator")] and _brief_targets(run) == case["targets"]
+    arguments = run.cards[0]["data"]["arguments"]
+    assert arguments["action"]["name"] == shape["allowed_capabilities"][0]
+    assert arguments["action"]["intent"]["gpo"] == "alpha-policy"
+    assert arguments["inputs"]["callback_id"] == shape["callback_display_id"]
+
+
+def test_recorded_catalog_briefs_are_inventoried():
+    assert len(ROWS) == 42 and sum(row["candidate_ref"] for row in ROWS) == 30
+    assert Counter(row["recorded_refusal"] for row in ROWS) == {
+        "none": 26, "brief-target": 6, "binder-target": 5, "reference": 3, "candidate-on-collection": 1, "repeat": 1}
+    kinds = Counter("collection" if "collect-graph" in row["allowed_capabilities"] else
+                    "catalog" if row["allowed_capabilities"] else "raw" for row in ROWS)
+    assert kinds == {"catalog": 29, "collection": 5, "raw": 8} and len(CATALOG_ROWS) == 29
+    # Every recorded target refusal was a catalog brief's; each is replayed below.
+    assert {row["id"] for row in ROWS if row["recorded_refusal"].endswith("-target")} <= {
+        row["id"] for row in CATALOG_ROWS}
+    assert {json.dumps([row["allowed_capabilities"], row["targets"]]) for row in CATALOG_ROWS} == {
+        json.dumps([row["allowed_capabilities"], row["targets"]]) for row in SHAPES}
+
+
+@pytest.mark.parametrize("row", SHAPES, ids=[row["id"] for row in SHAPES])
+def test_recorded_catalog_target_shapes_card_their_candidate(monkeypatch, tmp_path, no_network, row):
+    procedure = row["allowed_capabilities"][0]
+    mt, split = _client(monkeypatch, tmp_path)
+
+    run = asyncio.run(_run(_state_for(mt, procedure), split, [_select(
+        procedure, "alpha-policy" if procedure.startswith("gpo-") else "",
+        allowed_capabilities=row["allowed_capabilities"], targets=row["targets"])], decision=None))
+
+    assert no_network == [] and run.issued == [] and run.before.worker_calls == 0
+    if len(row["allowed_capabilities"]) > 1:
+        # Two procedures in one step stay unbindable: no card, and the request ends blocked.
+        assert run.cards == [] and "runs `ensure-kerberos-context`, not" in run.briefs[0][1], run.briefs
         [terminal] = run.terminals
-        assert phase == "rejected", run.briefs
-        if case["refused_at"] == "binding":
-            # Admitted (Sage observed the host) but not the candidate's: the binder refuses and the request ends.
-            assert "Blocked" in str(terminal.get("content")), terminal
-            assert reason.startswith("catalog binding:") and f"does not act on {case['targets'][0]}" in reason
-        else:
-            assert reason.startswith("targets:") and case["targets"][0] in reason, reason
+        assert "Blocked" in str(terminal.get("content"))
+        return
+    assert run.briefs == [("accepted", "Mythic_Operator")] and _brief_targets(run) == row["targets"]
+    [card] = run.cards
+    assert card["data"]["arguments"]["action"]["name"] == procedure

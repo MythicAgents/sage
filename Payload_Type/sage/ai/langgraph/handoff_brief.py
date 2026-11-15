@@ -4,7 +4,8 @@ A brief names what one delegated step acts on: the callback, the targets, the ca
 uses by reference, and the result it should produce. Validation is structural only. Required fields must be
 present, the callback and targets must be ones Sage already knows or the operator named, and references must
 resolve within data Sage already holds. Wording is never judged, and the brief grants no authority: the worker
-still receives the exact operator input, and every guarded action still needs the operator's approval.
+still receives the exact operator input, and every guarded action still needs the operator's approval. A catalog step
+that binds one current candidate (`catalog_binding`) runs that candidate's action, so its targets are only recorded.
 
 The operator may have named a target in an earlier input of the same live chat generation ("collect essos.local",
 then "Yes, run it"). Those retained inputs are exact-name evidence for targets only: they never name a callback,
@@ -299,48 +300,6 @@ def _fact_names(predicate: str) -> tuple[set[str], set[str], set[str]]:
     return hosts, domains, objects
 
 
-# The target and intent fields a catalog action names what it acts on in, by kind, as `capabilities` writes them.
-# Other fields (steps, effects, capability, callback, options) are never names.
-_ACTION_NAME_FIELDS = {
-    "hosts": frozenset({"target", "target_host", "ca_host", "affected_hosts", "affected_dc_hosts"}),
-    "domains": frozenset({"domain", "account_domain", "source_domain", "target_domain"}),
-    "principals": frozenset({"account", "local_account", "user"}),
-    "objects": frozenset({"gpo", "gpo_guid"}),
-}
-# The domain field that qualifies each host field's short name, so a label never pairs with another named domain.
-_HOST_DOMAIN_FIELDS = {"target": ("target_domain",), "target_host": ("target_domain",),
-                       "affected_hosts": ("domain",), "affected_dc_hosts": ("domain",),
-                       "ca_host": ("domain", "target_domain")}
-_NOT_A_NAME = re.compile(r"[\s;=:/]")
-
-
-def action_scope(target: Any, intent: Any, source_facts: Iterable[Any] = ()) -> KnownScope:
-    """The names one catalog action acts on, as a scope `names_current` reads, so a brief may name them in any
-    equivalent form: the full target string, its `key=value` fields and its intent's name fields by kind, and the
-    graph facts the action was derived from. Engagement state and operator input contribute nothing."""
-    names: dict[str, set[str]] = {kind: set() for kind in _ACTION_NAME_FIELDS}
-    names["objects"].add(_name(target))
-    fields = dict(segment.split("=", 1) for segment in str(target or "").split(";") if "=" in segment)
-    for source in (fields, intent if isinstance(intent, Mapping) else {}):
-        source = {str(key).casefold(): value for key, value in source.items()}
-        for key, value in source.items():
-            kind = next((kind for kind, keys in _ACTION_NAME_FIELDS.items() if key in keys), None)
-            texts = [text for text in map(_name, _items(value)) if text and not _NOT_A_NAME.search(text)]
-            if kind == "hosts":
-                # A short host name is qualified by its own domain field only (`_host_identity`), never left bare.
-                domain = next((str(source[field]) for field in _HOST_DOMAIN_FIELDS[key] if source.get(field)), "")
-                texts = [(_host_identity({"target": text, "target_domain": domain}) or ("",))[0]
-                         if "." not in text else text for text in texts]
-            if kind is not None:
-                names[kind].update(texts)
-    for fact in source_facts or ():
-        hosts, domains, objects = _fact_names(str(fact or ""))
-        names["hosts"] |= hosts
-        names["domains"] |= domains
-        names["objects"] |= objects
-    return KnownScope(**{kind: frozenset(found - {""}) for kind, found in names.items()})
-
-
 def known_scope(mythic_client: Any, *, operator_input: str = "", bound_callback: Any = "",
                 operator_target_inputs: Iterable[OperatorTargetInput] = ()) -> KnownScope:
     """Collect callbacks, names, tasks and credentials Sage already holds in memory. Never queries Mythic.
@@ -447,8 +406,9 @@ def known_scope(mythic_client: Any, *, operator_input: str = "", bound_callback:
 
 
 def validate_brief(brief: HandoffBrief, *, worker: str, require_scope: bool, scope: KnownScope,
-                   worker_tools: Iterable[str] | None = None) -> tuple[str, ...]:
-    """Return one error per failing field; empty when the brief may be dispatched."""
+                   worker_tools: Iterable[str] | None = None, candidate_bound: bool = False) -> tuple[str, ...]:
+    """Return one error per failing field; empty when the brief may be dispatched. A `candidate_bound` step's
+    candidate decides what it acts on, so its targets are neither required nor checked."""
     errors: list[str] = []
     unknown = [name for name in brief.allowed_capabilities if name not in {*catalog_names(), CONTROL_PLANE}]
     if unknown:
@@ -470,7 +430,7 @@ def validate_brief(brief: HandoffBrief, *, worker: str, require_scope: bool, sco
         if not brief.control_plane_only:
             missing = [name for name, value in (
                 ("callback_display_id", brief.callback_display_id),
-                ("targets", brief.targets),
+                ("targets", brief.targets or candidate_bound),
                 ("allowed_capabilities or allowed_tools", brief.allowed_capabilities or brief.allowed_tools),
             ) if not value] + missing
         if missing:
@@ -491,7 +451,7 @@ def validate_brief(brief: HandoffBrief, *, worker: str, require_scope: bool, sco
                 f"callback_display_id: callback {brief.callback_display_id} is not one Sage has observed; "
                 f"list callbacks first with a `{CONTROL_PLANE}` step"
             )
-    unrequested = [target for target in brief.targets if not scope.names_target(target)]
+    unrequested = [] if candidate_bound else [target for target in brief.targets if not scope.names_target(target)]
     if unrequested:
         hosts_in_known_domains = [target for target in unrequested if _host_in_known_domain(_name(target), scope)]
         guidance = ""
@@ -540,11 +500,12 @@ def operator_target_sources(brief: HandoffBrief, scope: KnownScope) -> list[dict
     return sources
 
 
-def render_scope(brief: Mapping[str, Any] | None) -> str:
+def render_scope(brief: Mapping[str, Any] | None, *, candidate_bound: bool = False) -> str:
     """The step's enforced scope, as Sage tells the worker before its step; empty when the brief sets none.
 
     Only what Sage enforces is rendered: what the one guarded action may use, and the validated callback and
-    targets. The Supervisor's free-text fields stay out of this Sage-authored block.
+    targets (none for a `candidate_bound` step, whose targets are only recorded). The Supervisor's free-text fields
+    stay out of this Sage-authored block.
     """
     if not isinstance(brief, Mapping):
         return ""
@@ -571,7 +532,7 @@ def render_scope(brief: Mapping[str, Any] | None) -> str:
     lines = ["<step_scope>", f"Sage checks this step against its brief. {rule}"]
     if callback:
         lines.append(f"Callback: {callback}.")
-    targets = [str(item) for item in brief.get("targets") or [] if str(item).strip()]
+    targets = [] if candidate_bound else [str(item) for item in brief.get("targets") or [] if str(item).strip()]
     if targets:
         lines.append("Targets: " + json.dumps(targets, ensure_ascii=False) + ".")
     lines.append("</step_scope>")

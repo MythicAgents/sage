@@ -1,0 +1,603 @@
+{
+ "provenance": {
+  "kind": "recorded model-output shapes with synthetic current state",
+  "description": "Every catalog-relevant Supervisor brief of two retained supervised runs (42 rows): its scope fields, target list and the refusal its recorded result shows. Identities are consistently renamed (one replacement per original name, letter case kept); prose, candidate refs, callbacks and outputs are omitted. Candidates, callbacks, references and ledger state in the tests are synthetic, so this is not a replay of either run.",
+  "preserved": "Target list order, duplicates, letter case, host/domain/principal/label forms, procedure names, whether a candidate_ref was sent, and the recorded reference spellings."
+ },
+ "rows": [
+  {
+   "id": "run2-42",
+   "allowed_capabilities": [
+    "collect-graph"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "child.lab.local"
+   ],
+   "candidate_ref": false,
+   "recorded_references": [],
+   "recorded_refusal": "none"
+  },
+  {
+   "id": "run2-257",
+   "allowed_capabilities": [
+    "gpo-controlled-system-exec"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "ALPHA-POLICY@CHILD.LAB.LOCAL",
+    "CHILD.LAB.LOCAL"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [],
+   "recorded_refusal": "none"
+  },
+  {
+   "id": "run2-305",
+   "allowed_capabilities": [
+    "gpo-controlled-system-exec"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "ALPHA-POLICY GPO",
+    "child.lab.local"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [],
+   "recorded_refusal": "brief-target"
+  },
+  {
+   "id": "run2-314",
+   "allowed_capabilities": [
+    "gpo-controlled-system-exec"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "child.lab.local"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [],
+   "recorded_refusal": "none"
+  },
+  {
+   "id": "run2-374",
+   "allowed_capabilities": [
+    "gpo-controlled-system-exec"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "WS02.CHILD.LAB.LOCAL",
+    "CHILD.LAB.LOCAL"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [],
+   "recorded_refusal": "binder-target"
+  },
+  {
+   "id": "run2-388",
+   "allowed_capabilities": [
+    "gpo-controlled-system-exec"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "WS02.CHILD.LAB.LOCAL",
+    "CHILD.LAB.LOCAL"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [],
+   "recorded_refusal": "binder-target"
+  },
+  {
+   "id": "run2-413",
+   "allowed_capabilities": [
+    "gpo-controlled-system-exec"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "WS02.CHILD.LAB.LOCAL",
+    "CHILD.LAB.LOCAL"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [],
+   "recorded_refusal": "binder-target"
+  },
+  {
+   "id": "run2-427",
+   "allowed_capabilities": [
+    "gpo-controlled-system-exec"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "child.lab.local"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [],
+   "recorded_refusal": "none"
+  },
+  {
+   "id": "run2-494",
+   "allowed_capabilities": [
+    "ensure-kerberos-context",
+    "dcsync-krbtgt"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "child.lab.local",
+    "krbtgt@child.lab.local"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [],
+   "recorded_refusal": "brief-target"
+  },
+  {
+   "id": "run2-512",
+   "allowed_capabilities": [
+    "ensure-kerberos-context"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "child.lab.local"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [],
+   "recorded_refusal": "none"
+  },
+  {
+   "id": "run2-544",
+   "allowed_capabilities": [
+    "dcsync-krbtgt"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "krbtgt@child.lab.local"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [],
+   "recorded_refusal": "brief-target"
+  },
+  {
+   "id": "run2-553",
+   "allowed_capabilities": [
+    "dcsync-krbtgt"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "child.lab.local"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [],
+   "recorded_refusal": "none"
+  },
+  {
+   "id": "run2-618",
+   "allowed_capabilities": [
+    "forge-golden-ticket"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "lab.local"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [
+    "cred:1",
+    "cred:2",
+    "cred:3"
+   ],
+   "recorded_refusal": "reference"
+  },
+  {
+   "id": "run2-632",
+   "allowed_capabilities": [
+    "forge-golden-ticket"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "lab.local"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [
+    "cred:1",
+    "cred:2",
+    "cred:3"
+   ],
+   "recorded_refusal": "reference"
+  },
+  {
+   "id": "run2-645",
+   "allowed_capabilities": [
+    "forge-golden-ticket"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "lab.local"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [],
+   "recorded_refusal": "none"
+  },
+  {
+   "id": "run2-758",
+   "allowed_capabilities": [
+    "forge-golden-ticket"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "lab.local",
+    "DC09.LAB.LOCAL"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [
+    "cred:1",
+    "cred:2",
+    "cred:3"
+   ],
+   "recorded_refusal": "brief-target"
+  },
+  {
+   "id": "run2-767",
+   "allowed_capabilities": [
+    "forge-golden-ticket"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "child.lab.local",
+    "lab.local"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [
+    "cred:1",
+    "cred:2",
+    "cred:3"
+   ],
+   "recorded_refusal": "reference"
+  },
+  {
+   "id": "run2-780",
+   "allowed_capabilities": [
+    "collect-graph"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "lab.local"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [],
+   "recorded_refusal": "candidate-on-collection"
+  },
+  {
+   "id": "run2-789",
+   "allowed_capabilities": [
+    "collect-graph"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "lab.local"
+   ],
+   "candidate_ref": false,
+   "recorded_references": [],
+   "recorded_refusal": "none"
+  },
+  {
+   "id": "run2-853",
+   "allowed_capabilities": [
+    "forge-golden-ticket"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "lab.local"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [
+    "task:16"
+   ],
+   "recorded_refusal": "none"
+  },
+  {
+   "id": "run2-953",
+   "allowed_capabilities": [
+    "dcsync-krbtgt"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "lab.local"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [],
+   "recorded_refusal": "none"
+  },
+  {
+   "id": "run2-1121",
+   "allowed_capabilities": [],
+   "allowed_tools": [
+    "issue_task_and_waitfor_task_output"
+   ],
+   "targets": [
+    "lab.local",
+    "foreign.test"
+   ],
+   "candidate_ref": false,
+   "recorded_references": [],
+   "recorded_refusal": "none"
+  },
+  {
+   "id": "run2-1181",
+   "allowed_capabilities": [],
+   "allowed_tools": [
+    "issue_task_and_waitfor_task_output"
+   ],
+   "targets": [
+    "lab.local",
+    "foreign.test"
+   ],
+   "candidate_ref": false,
+   "recorded_references": [],
+   "recorded_refusal": "none"
+  },
+  {
+   "id": "run2-1241",
+   "allowed_capabilities": [
+    "collect-graph"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "foreign.test"
+   ],
+   "candidate_ref": false,
+   "recorded_references": [
+    "task:29"
+   ],
+   "recorded_refusal": "none"
+  },
+  {
+   "id": "run2-1379",
+   "allowed_capabilities": [],
+   "allowed_tools": [
+    "issue_task_and_waitfor_task_output"
+   ],
+   "targets": [
+    "foreign.test",
+    "SRV03.FOREIGN.TEST"
+   ],
+   "candidate_ref": false,
+   "recorded_references": [],
+   "recorded_refusal": "none"
+  },
+  {
+   "id": "run2-1430",
+   "allowed_capabilities": [],
+   "allowed_tools": [
+    "issue_task_and_waitfor_task_output"
+   ],
+   "targets": [
+    "foreign.test",
+    "SRV03.FOREIGN.TEST"
+   ],
+   "candidate_ref": false,
+   "recorded_references": [],
+   "recorded_refusal": "none"
+  },
+  {
+   "id": "run2-1490",
+   "allowed_capabilities": [],
+   "allowed_tools": [
+    "issue_task_and_waitfor_task_output"
+   ],
+   "targets": [
+    "foreign.test",
+    "SRV03.FOREIGN.TEST"
+   ],
+   "candidate_ref": false,
+   "recorded_references": [],
+   "recorded_refusal": "none"
+  },
+  {
+   "id": "run2-1558",
+   "allowed_capabilities": [],
+   "allowed_tools": [
+    "issue_task_and_waitfor_task_output"
+   ],
+   "targets": [
+    "foreign.test",
+    "SRV03.FOREIGN.TEST"
+   ],
+   "candidate_ref": false,
+   "recorded_references": [],
+   "recorded_refusal": "repeat"
+  },
+  {
+   "id": "run2-1567",
+   "allowed_capabilities": [],
+   "allowed_tools": [
+    "issue_task_and_waitfor_task_output"
+   ],
+   "targets": [
+    "foreign.test",
+    "SRV03.FOREIGN.TEST"
+   ],
+   "candidate_ref": false,
+   "recorded_references": [],
+   "recorded_refusal": "none"
+  },
+  {
+   "id": "run2-1616",
+   "allowed_capabilities": [],
+   "allowed_tools": [
+    "issue_task_and_waitfor_task_output"
+   ],
+   "targets": [
+    "foreign.test",
+    "SRV03.FOREIGN.TEST"
+   ],
+   "candidate_ref": false,
+   "recorded_references": [],
+   "recorded_refusal": "none"
+  },
+  {
+   "id": "run3-40",
+   "allowed_capabilities": [
+    "collect-graph"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "child.lab.local"
+   ],
+   "candidate_ref": false,
+   "recorded_references": [],
+   "recorded_refusal": "none"
+  },
+  {
+   "id": "run3-260",
+   "allowed_capabilities": [
+    "gpo-controlled-system-exec"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "ALPHA-POLICY@CHILD.LAB.LOCAL",
+    "WS02.CHILD.LAB.LOCAL"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [],
+   "recorded_refusal": "none"
+  },
+  {
+   "id": "run3-308",
+   "allowed_capabilities": [
+    "gpo-controlled-system-exec"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "ALPHA-POLICY@CHILD.LAB.LOCAL",
+    "WS02.CHILD.LAB.LOCAL"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [],
+   "recorded_refusal": "none"
+  },
+  {
+   "id": "run3-356",
+   "allowed_capabilities": [
+    "gpo-controlled-system-exec"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "ALPHA-POLICY@CHILD.LAB.LOCAL",
+    "WS02.CHILD.LAB.LOCAL"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [],
+   "recorded_refusal": "none"
+  },
+  {
+   "id": "run3-416",
+   "allowed_capabilities": [
+    "gpo-controlled-system-exec"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "WS02.CHILD.LAB.LOCAL",
+    "ALPHA-POLICY@CHILD.LAB.LOCAL"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [],
+   "recorded_refusal": "none"
+  },
+  {
+   "id": "run3-479",
+   "allowed_capabilities": [
+    "ensure-kerberos-context"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "child.lab.local"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [],
+   "recorded_refusal": "none"
+  },
+  {
+   "id": "run3-511",
+   "allowed_capabilities": [
+    "dcsync-krbtgt"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "WS02.CHILD.LAB.LOCAL",
+    "krbtgt@CHILD.LAB.LOCAL"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [],
+   "recorded_refusal": "brief-target"
+  },
+  {
+   "id": "run3-520",
+   "allowed_capabilities": [
+    "dcsync-krbtgt"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "WS02.CHILD.LAB.LOCAL"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [],
+   "recorded_refusal": "binder-target"
+  },
+  {
+   "id": "run3-533",
+   "allowed_capabilities": [
+    "dcsync-krbtgt"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "WS02.CHILD.LAB.LOCAL",
+    "krbtgt@child.lab.local"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [],
+   "recorded_refusal": "brief-target"
+  },
+  {
+   "id": "run3-542",
+   "allowed_capabilities": [
+    "dcsync-krbtgt"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "WS02.CHILD.LAB.LOCAL"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [],
+   "recorded_refusal": "binder-target"
+  },
+  {
+   "id": "run3-555",
+   "allowed_capabilities": [
+    "dcsync-krbtgt"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "child.lab.local",
+    "krbtgt"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [],
+   "recorded_refusal": "none"
+  },
+  {
+   "id": "run3-658",
+   "allowed_capabilities": [
+    "forge-golden-ticket"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "lab.local"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [
+    "cred:1",
+    "cred:2",
+    "cred:3"
+   ],
+   "recorded_refusal": "none"
+  }
+ ]
+}

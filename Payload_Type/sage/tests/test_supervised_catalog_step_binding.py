@@ -3,7 +3,8 @@
 The Supervisor sees the catalog actions `actions_from_state` derives from one fresh ledger snapshot, each with a
 `candidate_ref`. A non-collection catalog step names one; Sage binds it at brief admission, proposes exactly its
 action without a worker-model call, and checks it again before execution. An unsupported selection ends with a
-factual blocker before any card or task.
+factual blocker before any card or task. The brief's targets are recorded with it: they never refuse the step or
+change what it runs. Raw, collection and Autonomous Solve steps still check theirs.
 
 Everything on the path is real except the models' choices and Mythic's network I/O: the graph, the ledger store with
 a krbtgt key proved through the production dcsync executor, the producer, the brief check, the binding, the step
@@ -31,8 +32,10 @@ from ai.langgraph import step_bounds as sb
 from ai.langgraph.mythic_tools import MythicTools
 from sage_chat.headless import build_chat_request
 from sage_chat.service import bind_channel_thread_id
+from sage_chat import session as chat_session
 from sage_chat.session import drop_channel_session
 from tests.esl_fixtures import AGENT_PROCESSED, ingest_proof, seed_ledger
+from tests.test_engagement_wiring import _proof_hop
 from tests.test_hitl_steer_current_intent import (
     _NativeDriverChat, _NativeScriptedModel, _call, _cards, _input_response,
 )
@@ -67,6 +70,23 @@ def _client(monkeypatch, tmp_path):
     seed_ledger(mt, graph_facts=[{"predicate": predicate, "source": "fixture", "timestamp": NOW,
                                   "ttl_seconds": 86400, "proof_envelope": proof} for predicate in facts])
     return mt, split
+
+
+def _state_for(mt, procedure: str):
+    """The synthetic state a procedure's candidate needs beyond `_client`: DCSync of child.lab.local on callback 14
+    from a replication right, and that callback's Kerberos context refresh from an admitted Domain Admins proof."""
+    if procedure == "dcsync-krbtgt":
+        seed_ledger(mt, graph_facts=[{"predicate": "ds-replication-rights:child.lab.local", "source": "fixture",
+                                      "timestamp": NOW, "ttl_seconds": 86400}])
+    elif procedure == "ensure-kerberos-context":
+        seed_ledger(mt, hops=[_proof_hop("da:child.lab.local", 40, callback_id="14")])
+    return mt
+
+
+def _brief_targets(run) -> list:
+    """The targets the brief event recorded for the request's one brief."""
+    [event] = run.model._request_event_ledger.actual_events(kind="brief")
+    return json.loads(dict(event.metadata)["brief"])["targets"]
 
 
 def _view(messages) -> str:
@@ -152,16 +172,23 @@ RAW_FALLBACK = [_call("transfer_to_Mythic_Operator", {
     "handoff_title": "raw fallback", "handoff_instruction": PROMPT, "callback_display_id": 13,
     "targets": ["foreign.test"], "expected_result": "A replication result.", "allowed_tools": [ISSUE]}, 7),
     _call(ISSUE, {"command": "dcsync", "parameters": "-Domain foreign.test", "callback_display_id": 13}, 8)]
-UNSUPPORTED = _call("transfer_to_Mythic_Operator", {
-    "handoff_title": "replicate foreign.test", "handoff_instruction": PROMPT, "allowed_capabilities": ["dcsync-krbtgt"],
-    "callback_display_id": 13, "targets": ["foreign.test"], "expected_result": "The foreign krbtgt key."}, 1)
+
+def _unsupported(**fields):
+    return _call("transfer_to_Mythic_Operator", {
+        "handoff_title": "replicate foreign.test", "handoff_instruction": PROMPT,
+        "allowed_capabilities": ["dcsync-krbtgt"], "callback_display_id": 13, "targets": ["foreign.test"],
+        "expected_result": "The foreign krbtgt key.", **fields}, 1)
 
 
-TOOL_SCOPED = [_call("transfer_to_Mythic_Operator", {
-    "handoff_title": "run a procedure", "handoff_instruction": PROMPT, "allowed_tools": ["execute_capability"],
-    "callback_display_id": 14, "targets": ["lab.local"], "expected_result": "The procedure's result."}, 1),
-    _call("execute_capability", {"action": {"capability": "forge-golden-ticket", "domain": "lab.local",
-                                            "callback_id": "14"}}, 2)]
+UNSUPPORTED = _unsupported()
+
+
+def _tool_scoped(**fields):
+    return [_call("transfer_to_Mythic_Operator", {
+        "handoff_title": "run a procedure", "handoff_instruction": PROMPT, "allowed_tools": ["execute_capability"],
+        "callback_display_id": 14, "targets": ["lab.local"], "expected_result": "The procedure's result.", **fields}, 1),
+        _call("execute_capability", {"action": {"capability": "forge-golden-ticket", "domain": "lab.local",
+                                                "callback_id": "14"}}, 2)]
 
 
 def _unavailable(mt):
@@ -170,19 +197,20 @@ def _unavailable(mt):
     return lambda: setattr(mt, "_ledger_view", fail)
 
 
-@pytest.mark.parametrize("case", ["unsupported", "fabricated", "callback", "target", "reference", "procedure",
-                                  "unavailable", "tool-scoped"])
-def test_an_unbindable_catalog_step_ends_blocked_with_no_card_or_task(monkeypatch, tmp_path, case):
+@pytest.mark.parametrize("named", [True, False], ids=["targets", "no-targets"])
+@pytest.mark.parametrize("case", ["unsupported", "fabricated", "callback", "reference", "procedure", "unavailable",
+                                  "tool-scoped"])
+def test_an_unbindable_catalog_step_ends_blocked_with_no_card_or_task(monkeypatch, tmp_path, case, named):
     mt, split = _client(monkeypatch, tmp_path)
+    omit = {} if named else {"targets": None}      # recorded targets neither cause nor excuse a refusal
     choice = {
-        "unsupported": UNSUPPORTED,
-        "fabricated": _select("forge-golden-ticket", candidate_ref="cand-0000000000000000"),
-        "callback": _select("forge-golden-ticket", callback_display_id=14),
-        "target": _select("forge-golden-ticket", targets=["child.lab.local"]),
-        "reference": _select("gpo-controlled-system-exec", "alpha", inputs_by_reference=["task:21"]),
-        "procedure": _select("forge-golden-ticket", allowed_capabilities=["dcsync-krbtgt"]),
-        "unavailable": _select("forge-golden-ticket", before=_unavailable(mt)),
-        "tool-scoped": TOOL_SCOPED,       # execute_capability named as a tool is a catalog step, not a bypass
+        "unsupported": _unsupported(**omit),
+        "fabricated": _select("forge-golden-ticket", candidate_ref="cand-0000000000000000", **omit),
+        "callback": _select("forge-golden-ticket", callback_display_id=14, **omit),
+        "reference": _select("gpo-controlled-system-exec", "alpha", inputs_by_reference=["task:21"], **omit),
+        "procedure": _select("forge-golden-ticket", allowed_capabilities=["dcsync-krbtgt"], **omit),
+        "unavailable": _select("forge-golden-ticket", before=_unavailable(mt), **omit),
+        "tool-scoped": _tool_scoped(**omit),  # execute_capability named as a tool is a catalog step, not a bypass
     }[case]
 
     run = asyncio.run(_run(mt, split, [*(choice if isinstance(choice, list) else [choice]), *RAW_FALLBACK]))
@@ -195,7 +223,7 @@ def test_an_unbindable_catalog_step_ends_blocked_with_no_card_or_task(monkeypatc
     assert "not a finding that the objective is impossible" in content
     assert run.briefs == [("rejected", run.briefs[0][1])] and "catalog binding:" in run.briefs[0][1]
     assert {"unsupported": "names no candidate_ref", "fabricated": "not supported by current evidence",
-            "callback": "not callback 14", "target": "does not act on child.lab.local",
+            "callback": "not callback 14",
             "reference": "does not use the input reference task:21", "procedure": "not `dcsync-krbtgt`",
             "unavailable": "unavailable", "tool-scoped": "`execute_capability` runs a catalog procedure"}[case] in content, content
 
@@ -266,12 +294,14 @@ def test_a_waiting_card_runs_only_while_its_candidate_is_unchanged(monkeypatch, 
 
 # --- (d) Accept runs exactly the carded procedure, Reject runs none, Respond cancels the binding -----------------
 
+@pytest.mark.parametrize("targets", [["lab.local"], ["WS02.CHILD.LAB.LOCAL", "krbtgt@CHILD.LAB.LOCAL"]],
+                         ids=["own-domain", "other-names"])
 @pytest.mark.parametrize("decision", ["accept", "reject", "respond"])
-def test_the_decision_on_a_bound_forge_card_is_final(monkeypatch, tmp_path, decision):
+def test_the_decision_on_a_bound_forge_card_is_final(monkeypatch, tmp_path, decision, targets):
     mt, split = _client(monkeypatch, tmp_path)
 
-    run = asyncio.run(_run(mt, split, [_select("forge-golden-ticket"), AIMessage(content="The forge ran.")],
-                           decision=decision))
+    run = asyncio.run(_run(mt, split, [_select("forge-golden-ticket", targets=targets),
+                                       AIMessage(content="The forge ran.")], decision=decision))
 
     [card] = run.cards
     arguments = card["data"]["arguments"]
@@ -288,26 +318,24 @@ def test_the_decision_on_a_bound_forge_card_is_final(monkeypatch, tmp_path, deci
     assert len(run.terminals) == 1
 
 
-# --- (a2) a host's short name pairs only with its own domain, never with another domain the candidate names ------
+# --- (a2) a cross-domain candidate cards its own action whichever host form the brief records ---------------------
 
 CROSS_DOMAIN_SECRET = ("can-read-managed-local-admin-secret:account=operator;account_domain=lab.local;target=ws02;"
                        "target_domain=child.lab.local")
 
 
-@pytest.mark.parametrize("target, cards", [("ws02.child.lab.local", 1), ("WS02", 1), ("ws02.lab.local", 0)])
-def test_a_cross_domain_candidates_host_binds_only_under_its_own_domain(monkeypatch, tmp_path, target, cards):
+@pytest.mark.parametrize("target", ["ws02.child.lab.local", "WS02", "ws02.lab.local"])
+def test_a_cross_domain_candidate_cards_its_action_for_any_recorded_host_form(monkeypatch, tmp_path, target):
     mt, split = _client(monkeypatch, tmp_path)
     seed_ledger(mt, graph_facts=[{"predicate": CROSS_DOMAIN_SECRET, "source": "fixture", "timestamp": NOW,
                                   "ttl_seconds": 86400}])
 
     run = asyncio.run(_run(mt, split, [_select("read-managed-local-admin-secret", targets=[target])], decision=None))
 
-    assert len(run.cards) == cards and run.issued == [] and run.before.worker_calls == 0, run.briefs
-    if not cards:   # admitted (Sage observed ws02 and lab.local), refused by the binder
-        [(phase, reason)] = run.briefs
-        assert phase == "rejected" and f"does not act on {target}" in reason, reason
-        [terminal] = run.terminals
-        assert "Blocked" in str(terminal.get("content"))
+    assert run.issued == [] and run.before.worker_calls == 0 and run.briefs == [("accepted", "Mythic_Operator")]
+    [card] = run.cards
+    assert card["data"]["arguments"]["action"]["target"] == CROSS_DOMAIN_SECRET.split(":", 1)[1] + ";callback=13"
+    assert _brief_targets(run) == [target]
 
 
 # --- (d2) a forge brief naming several key rows of one proved krbtgt binds that key set --------------------------
@@ -466,6 +494,7 @@ def test_an_empty_frontier_still_compiles_graph_collection():
     assert not model_module._needs_catalog_binding(collection)
     assert sb.bound_procedure_call(collection, ()) == {
         "action": {"capability": "collect-graph", "callback_id": "14", "domain": "foreign.test"}}
+    assert sb.bound_procedure_call({**collection, "targets": ["lab.local"]}, ())["action"]["domain"] == "lab.local"
     assert not model_module._needs_catalog_binding({"allowed_capabilities": ["control_plane"]})
     assert not model_module._needs_catalog_binding({"allowed_tools": [ISSUE]})
     assert hb.BRIEF_COMPILED_PROCEDURES == sb.BRIEF_BOUND_PROCEDURES
@@ -486,6 +515,10 @@ def test_only_ordinary_supervised_requests_bind_catalog_steps(mode, solve, contr
     model._request_contract = SimpleNamespace(lane=SimpleNamespace(value=contract_lane), request_id="r")
     model._turn_authority = None
     assert model._catalog_binding_active() is active
+    # Only there does a catalog step's candidate own its targeting; elsewhere admission still checks its targets.
+    assert model._candidate_bound("Mythic_Operator", {"allowed_capabilities": ["dcsync-krbtgt"]}) is active
+    assert not model._candidate_bound("Mythic_Operator", {"allowed_tools": [ISSUE]})
+    assert not model._candidate_bound("Mythic_Operator", {"allowed_capabilities": ["collect-graph"]})
 
 
 def test_conversation_sees_no_candidates_and_cards_nothing(monkeypatch, tmp_path):
@@ -495,6 +528,74 @@ def test_conversation_sees_no_candidates_and_cards_nothing(monkeypatch, tmp_path
 
     assert run.cards == [] and run.issued == []
     assert not any("[Sage catalog candidates" in str(m.content) for messages in run.fake.inputs for m in messages)
+
+
+# --- (g) a catalog step's targets are recorded: they never refuse it or change what it runs -----------------------
+
+# Target lists as a Supervisor wrote them, relative to the candidate's own domain {d} and another observed domain {o}.
+VARIANTS = {
+    "own-domain": ["{d}"], "upper-case": ["{D}"], "observed-host": ["WS02.CHILD.LAB.LOCAL"], "short-host": ["ws02"],
+    "principal": ["krbtgt@{D}"], "gpo-label": ["ALPHA-POLICY GPO"], "unobserved-host": ["srv03.foreign.test"],
+    "other-domain": ["{o}"], "arbitrary": ["not a name at all"], "order-duplicates": ["ws02", "{d}", "ws02"],
+    "empty": [], "omitted": None}
+# procedure: (candidate filter, its domain, another observed domain)
+INVARIANT = {"gpo-controlled-system-exec": ("alpha-policy", "child.lab.local", "lab.local"),
+             "dcsync-krbtgt": ("", "child.lab.local", "lab.local"),
+             "forge-golden-ticket": ("", "lab.local", "child.lab.local")}
+_BASELINES: dict = {}
+
+
+def _bound(run) -> tuple:
+    """The card's action and inputs and the accepted task sequence; only per-run transaction ids are dropped."""
+    arguments = json.loads(json.dumps(run.cards[0]["data"]["arguments"]))
+    arguments["inputs"].pop("transaction_id", None)
+    return arguments, [(row["command_name"], row["parameters"], row["callback_display_id"]) for row in run.issued]
+
+
+@pytest.mark.parametrize("variant", list(VARIANTS))
+@pytest.mark.parametrize("procedure", list(INVARIANT))
+def test_a_catalog_steps_targets_never_refuse_or_change_its_action(monkeypatch, tmp_path, procedure, variant):
+    contains, domain, other = INVARIANT[procedure]
+
+    def accepted(targets, path):
+        path.mkdir()                                      # each client in this test gets its own ledger database
+        monkeypatch.setenv("SAGE_DATABASE_PATH", str(path / "sage.db"))
+        monkeypatch.setattr(chat_session, "_CHANNEL_MARKER_DB_PATH", str(path / "sage.db"))
+        mt, split = _client(monkeypatch, path)
+        return asyncio.run(_run(_state_for(mt, procedure), split, [_select(procedure, contains, targets=targets),
+                                                                   AIMessage(content="The procedure ran.")]))
+
+    if procedure not in _BASELINES:
+        baseline = accepted([domain], tmp_path / "baseline")
+        assert len(baseline.cards) == 1 and baseline.issued, baseline.briefs
+        _BASELINES[procedure] = _bound(baseline)
+    targets = None if VARIANTS[variant] is None else [
+        text.format(d=domain, D=domain.upper(), o=other) for text in VARIANTS[variant]]
+
+    run = accepted(targets, tmp_path / "variant")
+
+    assert run.briefs == [("accepted", "Mythic_Operator")] and _brief_targets(run) == (targets or [])
+    assert run.before.worker_calls == 0 and run.before.issued == [] and len(run.cards) == 1
+    assert _bound(run) == _BASELINES[procedure]          # the same card and the same tasks, whatever was recorded
+
+
+# --- (h) raw and collection steps keep their target checks (Autonomous Solve's controller never takes a brief) -----
+
+@pytest.mark.parametrize("scope, targets, error", [
+    ({"allowed_tools": [ISSUE]}, ["foreign.test", "SRV03.FOREIGN.TEST"], "targets: SRV03.FOREIGN.TEST named"),
+    ({"allowed_tools": [ISSUE]}, None, "missing required field(s): targets"),
+    ({"allowed_capabilities": ["collect-graph"]}, ["srv03.foreign.test"], "targets: srv03.foreign.test named"),
+    ({"allowed_capabilities": ["collect-graph"]}, None, "missing required field(s): targets"),
+], ids=["raw-unknown", "raw-missing", "collection-unknown", "collection-missing"])
+def test_raw_and_collection_steps_still_check_targets(monkeypatch, tmp_path, scope, targets, error):
+    mt, split = _client(monkeypatch, tmp_path)
+    brief = {"handoff_title": "a step", "handoff_instruction": PROMPT, "callback_display_id": 14, "targets": targets,
+             "expected_result": "The step's result.", **scope}
+
+    run = asyncio.run(_run(mt, split, [_call("transfer_to_Mythic_Operator", brief, 1)], decision=None))
+
+    assert run.cards == [] and run.issued == [] and run.before.worker_calls == 0
+    assert run.briefs and run.briefs[0][0] == "rejected" and error in run.briefs[0][1], run.briefs
 
 
 # --- the pure binding --------------------------------------------------------------------------------------------
@@ -535,49 +636,15 @@ GPO_ACTION = {**ACTION, "intent": {**ACTION["intent"], "capability": ACTION["nam
                                "gpo-affects-computer:alpha-policy:ws02:child.lab.local"]}
 
 
-@pytest.mark.parametrize("target, binds", [
-    ("WS02.CHILD.LAB.LOCAL", True), ("ws02.child.lab.local.", True), ("ws02", True), ("CHILD.LAB.LOCAL", True),
-    ("gpo=alpha-policy;domain=child.lab.local", True), ("alpha-policy", True),
-    ("ws02.foreign.test", False), ("ws02.lab.local", False), ("ws020.child.lab.local", False),
-    ("dc02.child.lab.local", False), ("trigger or wait for Group Policy refresh", False),
-    ("system-exec:gpo:alpha-policy@child.lab.local", False), ("system-exec-proof", False),
-    ("gpo-controlled-system-exec", False), ("14", False)])
-def test_a_brief_binds_the_candidates_host_in_any_equivalent_form_and_nothing_else(target, binds):
+@pytest.mark.parametrize("targets", [
+    ["WS02.CHILD.LAB.LOCAL"], ["ws02"], ["gpo=alpha-policy;domain=child.lab.local"], ["ws02.foreign.test"],
+    ["ws02.lab.local"], ["dc02.child.lab.local"], ["trigger or wait for Group Policy refresh"], ["14"],
+    ["sam@north.test", "NORTH.TEST\\jon"], ["ws02", "child.lab.local", "ws02"], []])
+def test_a_brief_binds_its_candidate_whatever_targets_it_records(targets):
     [item] = cb.candidates("r", [(GPO_ACTION, INPUTS)])
     brief = hb.HandoffBrief.from_args(allowed_capabilities=[item.procedure], callback_display_id=14,
-                                      candidate_ref=item.ref, targets=[target, "child.lab.local"])
-    bound, error = cb.bind(brief, (item,))
-    assert (bound is item, error) == ((True, "") if binds else (False, f"candidate_ref {item.ref} "
-                                      f"({item.target}) does not act on {target}")), error
-
-
-def test_a_short_host_name_pairs_only_with_its_own_domain():
-    secret = {"name": "read-managed-local-admin-secret",
-              "target": "account=operator;account_domain=lab.local;target=ws02;target_domain=child.lab.local;callback=13",
-              "intent": {"account": "operator", "account_domain": "lab.local", "target_host": "ws02",
-                         "target_domain": "child.lab.local"}}
-    [item] = cb.candidates("r", [(secret, {"callback_id": "13"})])
-
-    def error(target):
-        return cb.bind(hb.HandoffBrief.from_args(allowed_capabilities=[item.procedure], callback_display_id=13,
-                                                 candidate_ref=item.ref, targets=[target]), (item,))[1]
-
-    assert [error(t) for t in ("ws02.child.lab.local", "WS02", "operator@lab.local", "lab.local")] == [""] * 4
-    assert "does not act on ws02.lab.local" in error("ws02.lab.local")
-
-
-def test_a_brief_binds_targets_the_candidate_names_in_any_account_form():
-    account = {**ACTION, "name": "ensure-account-kerberos-context", "target": "account=jon;domain=north.test",
-               "intent": {"account": "jon", "domain": "north.test"}}
-    [item] = cb.candidates("r", [(account, INPUTS)])
-    brief = hb.HandoffBrief.from_args(allowed_capabilities=[item.procedure], callback_display_id=14,
-                                      candidate_ref=item.ref, targets=["jon@north.test", "NORTH.TEST\\jon"])
+                                      candidate_ref=item.ref, targets=targets)
     assert cb.bind(brief, (item,)) == (item, "")
-    stray = hb.HandoffBrief.from_args(allowed_capabilities=[item.procedure], callback_display_id=14,
-                                      candidate_ref=item.ref, targets=["sam@north.test"])
-    assert "does not act on sam@north.test" in cb.bind(stray, (item,))[1]
-    assert hb.validate_brief(hb.HandoffBrief.from_args(allowed_capabilities=["collect-graph"], candidate_ref="x"),
-                             worker="Mythic_Operator", require_scope=False, scope=hb.KnownScope())
 
 
 def test_a_supplied_reference_pins_a_forge_key_and_is_never_ignored():

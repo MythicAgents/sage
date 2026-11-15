@@ -16,10 +16,8 @@ import json
 from typing import Any, Iterable, Mapping
 
 try:
-    from . import handoff_brief as _handoff_brief
     from .request_contract import action_fingerprint
 except ImportError:  # pragma: no cover - flat import layout
-    import handoff_brief as _handoff_brief
     from request_contract import action_fingerprint
 
 MAX_CHARS = 6000
@@ -78,8 +76,9 @@ def render(found: tuple[Candidate, ...] | None, *, reason: str = "", max_chars: 
     if not found:
         return (f"{_TITLE}\nNo catalog procedure is supported by current evidence. That is not a finding that nothing "
                 f"is possible: {_OTHER_WORK}")
-    head = [_TITLE, "A catalog step (allowed_capabilities) must name exactly one candidate_ref below, that procedure, "
-                    "its callback and targets the candidate names. Sage runs exactly that action after approval."]
+    head = [_TITLE, "A catalog step (allowed_capabilities) must name exactly one candidate_ref below, that procedure "
+                    "and its callback. Sage runs exactly that action after approval; the step's targets are only "
+                    "recorded."]
     lines, used = [], len("\n".join(head)) + 200
     for item in found:
         line = (f"- candidate_ref={item.ref} | {item.procedure} -> {item.target} | callback "
@@ -134,12 +133,6 @@ def bind(brief: Any, found: tuple[Candidate, ...] | None, *, reason: str = "") -
     if callback != candidate.callback:
         return None, (f"candidate_ref {ref} runs on callback {candidate.callback or 'none'}, not callback "
                       f"{callback or 'none'}")
-    # The candidate's own names in any equivalent form (case, trailing dot, its host's short label, account forms).
-    scope = _handoff_brief.action_scope(candidate.target, candidate.action.get("intent"),
-                                        candidate.action.get("source_facts") or ())
-    stray = [target for target in getattr(brief, "targets", ()) or () if not scope.names_current(target)]
-    if stray:
-        return None, f"candidate_ref {ref} ({candidate.target}) does not act on {', '.join(stray)}"
     bound = list(_values({"action": candidate.action, "inputs": candidate.inputs}))
     supplied: dict[str, list[str]] = {"cred": [], "task": []}
     for reference in getattr(brief, "inputs_by_reference", ()) or ():

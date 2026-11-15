@@ -612,6 +612,30 @@ def test_no_scope_renders_nothing(brief):
     assert hb.render_scope(brief) == ""
 
 
+def test_a_candidate_bound_step_records_its_targets_and_keeps_every_other_check():
+    scope = hb.KnownScope(callbacks=frozenset({"14"}), domains=frozenset({"child.lab.local"}),
+                          credentials=frozenset({"500"}))
+    base = {"allowed_capabilities": ["dcsync-krbtgt"], "callback_display_id": 14, "expected_result": "A key.",
+            "candidate_ref": "cand-0000000000000000"}
+
+    def errors(bound: bool, **fields) -> tuple[str, ...]:
+        return hb.validate_brief(hb.HandoffBrief.from_args(**{**base, **fields}), worker="Mythic_Operator",
+                                 require_scope=True, scope=scope, candidate_bound=bound)
+
+    for targets in (None, [], ["srv03.foreign.test"], ["krbtgt@CHILD.LAB.LOCAL"], ["child.lab.local"]):
+        assert errors(True, targets=targets) == ()
+        # Outside the bound path (raw, collection, Autonomous Solve) the same targets keep their checks.
+        assert bool(errors(False, targets=targets)) is (targets != ["child.lab.local"])
+    for fields, error in (({"callback_display_id": 99}, "callback_display_id: callback 99"),
+                          ({"inputs_by_reference": ["cred:7"]}, "`cred:7` does not resolve"),
+                          ({"allowed_capabilities": ["collect-graph"]}, "candidate_ref: only a catalog procedure"),
+                          ({"expected_result": ""}, "missing required field(s): expected_result")):
+        assert any(error in text for text in errors(True, **fields)), errors(True, **fields)
+    # The worker is not told that Sage enforces targets it only records.
+    rendered = {**base, "targets": ["srv03.foreign.test"]}
+    assert "srv03" in hb.render_scope(rendered) and "srv03" not in hb.render_scope(rendered, candidate_bound=True)
+
+
 # --- Targets Sage knows only from its graph facts ---------------------------------------------------------------
 
 NORTH_PROMPT = "proceed"
