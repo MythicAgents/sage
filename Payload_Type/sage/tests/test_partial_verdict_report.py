@@ -279,6 +279,9 @@ def test_recorded_payload_reads_missing_effects_not_issued_result_class():
     status = {"task_id": 16, "read": "ok", "completed": True, "status": "error: completion function"}
     read = sb.verdict_lines([_outcome([result], [status])])
     assert "task 16 status not read" in unread[0] and "`error: completion function`" in read[0]
+    # Output read but the task record not (record query failed or ambiguous): the status is still unread.
+    no_record = {"task_id": 16, "read": "ok", "completed": None, "status": None}
+    assert "task 16 status not read" in sb.verdict_lines([_outcome([result], [no_record])])[0]
 
 
 def test_unconfirmed_effects_without_missing_effects_are_declared_minus_achieved():

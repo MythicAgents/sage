@@ -486,10 +486,11 @@ def verdict_lines(outcomes: Iterable[Mapping[str, Any]]) -> list[str]:
         for task_id in result["task_ids"]:
             task = tasks.get(str(task_id)) or {}
             status = str(task.get("status") or "")
-            if task.get("read") != "ok":
+            # Output can be read when the record is not (`read: ok`, no status): that status is still unread.
+            if task.get("read") != "ok" or not status.strip() or task.get("completed") is None:
                 statuses.append(f"task {task_id} status not read")
             elif task.get("completed") is not True or status.strip().casefold() not in task_evidence._SUCCESS_STATES:
-                statuses.append(f"task {task_id} `{status or 'no status'}`"
+                statuses.append(f"task {task_id} `{status}`"
                                 + ("" if task.get("completed") is True else " (not completed)"))
         if statuses:
             line += " Mythic status: " + "; ".join(statuses) + "."
