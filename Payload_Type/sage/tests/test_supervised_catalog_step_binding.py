@@ -75,9 +75,13 @@ def _client(monkeypatch, tmp_path):
 
 def _state_for(mt, procedure: str):
     """The synthetic state a procedure's candidate needs beyond `_client`: DCSync of child.lab.local on callback 14
-    from a replication right, and that callback's Kerberos context refresh from an admitted Domain Admins proof."""
-    if procedure == "dcsync-krbtgt":
+    from a replication right (of one account, `alice`, for `dcsync-account`), and that callback's Kerberos context
+    refresh from an admitted Domain Admins proof."""
+    if procedure in {"dcsync-krbtgt", "dcsync-account"}:
         seed_ledger(mt, graph_facts=[{"predicate": "ds-replication-rights:child.lab.local", "source": "fixture",
+                                      "timestamp": NOW, "ttl_seconds": 86400}])
+    if procedure == "dcsync-account":
+        seed_ledger(mt, graph_facts=[{"predicate": "credential-target:alice@child.lab.local", "source": "fixture",
                                       "timestamp": NOW, "ttl_seconds": 86400}])
     elif procedure == "ensure-kerberos-context":
         seed_ledger(mt, hops=[_proof_hop("da:child.lab.local", 40, callback_id="14")])
@@ -164,12 +168,12 @@ async def _run(mt, split, script, *, decision="accept", mode="supervised", auton
         await drop_channel_session(build_chat_request("", channel_id=1, operation_id=1))
 
 
-def _isolated(monkeypatch, path):
-    """A fresh `_client` with its own ledger database, for a test that builds more than one client."""
+def _isolated(monkeypatch, path, client=None):
+    """A fresh `_client` (or `client`) with its own ledger database, for a test that builds more than one client."""
     path.mkdir()
     monkeypatch.setenv("SAGE_DATABASE_PATH", str(path / "sage.db"))
     monkeypatch.setattr(chat_session, "_CHANNEL_MARKER_DB_PATH", str(path / "sage.db"))
-    return _client(monkeypatch, path)
+    return (client or _client)(monkeypatch, path)
 
 
 def _commands(run) -> list[str]:
@@ -208,8 +212,7 @@ def _unavailable(mt):
 
 
 @pytest.mark.parametrize("named", [True, False], ids=["targets", "no-targets"])
-@pytest.mark.parametrize("case", ["unsupported", "fabricated", "callback", "reference", "procedure", "unavailable",
-                                  "tool-scoped"])
+@pytest.mark.parametrize("case", ["unsupported", "fabricated", "callback", "procedure", "unavailable", "tool-scoped"])
 def test_an_unbindable_catalog_step_ends_blocked_with_no_card_or_task(monkeypatch, tmp_path, case, named):
     mt, split = _client(monkeypatch, tmp_path)
     omit = {} if named else {"targets": None}      # recorded targets neither cause nor excuse a refusal
@@ -217,7 +220,6 @@ def test_an_unbindable_catalog_step_ends_blocked_with_no_card_or_task(monkeypatc
         "unsupported": _unsupported(**omit),
         "fabricated": _select("forge-golden-ticket", candidate_ref="cand-0000000000000000", **omit),
         "callback": _select("forge-golden-ticket", callback_display_id=14, **omit),
-        "reference": _select("gpo-controlled-system-exec", "alpha", inputs_by_reference=["task:21"], **omit),
         "procedure": _select("forge-golden-ticket", allowed_capabilities=["dcsync-krbtgt"], **omit),
         "unavailable": _select("forge-golden-ticket", before=_unavailable(mt), **omit),
         "tool-scoped": _tool_scoped(**omit),  # execute_capability named as a tool is a catalog step, not a bypass
@@ -233,8 +235,7 @@ def test_an_unbindable_catalog_step_ends_blocked_with_no_card_or_task(monkeypatc
     assert "not a finding that the objective is impossible" in content
     assert run.briefs == [("rejected", run.briefs[0][1])] and "catalog binding:" in run.briefs[0][1]
     assert {"unsupported": "names no candidate_ref", "fabricated": "not supported by current evidence",
-            "callback": "not callback 14",
-            "reference": "does not use the input reference task:21", "procedure": "not `dcsync-krbtgt`",
+            "callback": "not callback 14", "procedure": "not `dcsync-krbtgt`",
             "unavailable": "unavailable", "tool-scoped": "`execute_capability` runs a catalog procedure"}[case] in content, content
 
 
@@ -759,6 +760,109 @@ def test_after_the_bound_prerequisite_settles_the_next_view_offers_the_goal_proc
     assert run.all_cards[-1]["data"]["arguments"]["inputs"]["callback_id"] == "14"
 
 
+# --- (j) a held reference the selected candidate does not use is dropped from the step and reported ------------
+
+ACCOUNT = "dcsync-account"
+# The recorded shapes (renamed; run 5 TOOL spans 1164 and 1186): an offered dcsync-account candidate selected with
+# task 21, a held task (the fixture's krbtgt proof) that this candidate does not use.
+RECORDED_UNUSED = {name: (_RECORDED[name]["targets"], _RECORDED[name]["recorded_references"])
+                   for name in ("run5-1164", "run5-1186")}
+_ONE = RECORDED_UNUSED["run5-1164"][0]
+# name: (procedure, candidate filter, brief overrides, the references Sage drops and reports, as normalized)
+UNUSED = {
+    **{name: (ACCOUNT, "", {"targets": targets, "inputs_by_reference": references}, references)
+       for name, (targets, references) in RECORDED_UNUSED.items()},
+    "several": (ACCOUNT, "", {"targets": _ONE, "inputs_by_reference": ["task:21", "cred:500"]}, ["task:21", "cred:500"]),
+    "duplicates": (ACCOUNT, "", {"targets": _ONE, "inputs_by_reference": ["task:21", "task:21"]}, ["task:21"]),
+    "case-space": (ACCOUNT, "", {"targets": _ONE, "inputs_by_reference": [" TASK:21 ", "@CRED:500"]},
+                   ["task:21", "@cred:500"]),
+    "with-procedure": (ACCOUNT, "", {"targets": _ONE, "inputs_by_reference": ["task:21"],
+                                     "allowed_capabilities": [ACCOUNT, DCSYNC]}, ["task:21"]),
+    "gpo": ("gpo-controlled-system-exec", "alpha", {"inputs_by_reference": ["task:21"]}, ["task:21"]),
+}
+_CONTROLS: dict = {}
+
+
+def _unused_run(monkeypatch, path, procedure, contains, overrides, decision):
+    mt, split, _store = _isolated(monkeypatch, path, _store_client)     # credential rows 500/501 are held
+    return asyncio.run(_run(_state_for(mt, procedure), split, [
+        _select(procedure, contains, **overrides), AIMessage(content="The procedure result was read.")],
+        decision=decision))
+
+
+@pytest.mark.parametrize("decision", ["accept", "reject"])
+@pytest.mark.parametrize("shape", list(UNUSED))
+def test_a_held_reference_its_candidate_does_not_use_is_dropped_and_reported(monkeypatch, tmp_path, shape, decision):
+    procedure, contains, overrides, dropped = UNUSED[shape]
+    plain = {key: value for key, value in overrides.items() if key == "targets"}
+    key = (procedure, contains, json.dumps(plain), decision)
+    if key not in _CONTROLS:                              # the same step without references, one procedure listed
+        control = _unused_run(monkeypatch, tmp_path / "control", procedure, contains, plain, decision)
+        assert len(control.cards) == 1 and control.before.issued == [], control.briefs
+        _CONTROLS[key] = (_bound(control), _delegated_brief(control), _outcome_text(control))
+    bound, canonical, control_outcome = _CONTROLS[key]
+
+    run = _unused_run(monkeypatch, tmp_path / "run", procedure, contains, overrides, decision)
+
+    # The control's card, nothing before approval, its task sequence on Accept and none on Reject.
+    assert run.before.issued == [] and run.before.worker_calls == 0 and len(run.cards) == 1, run.briefs
+    assert _bound(run) == bound and bool(run.issued) is (decision == "accept") and len(run.terminals) == 1
+    # One canonical brief without the unused references; the brief event keeps the Supervisor's own beside it.
+    assert _delegated_brief(run) == canonical and canonical["inputs_by_reference"] == []
+    [event] = run.model._request_event_ledger.actual_events(kind="brief")
+    metadata = dict(event.metadata)
+    supplied = hb.HandoffBrief.from_args(inputs_by_reference=overrides["inputs_by_reference"]).inputs_by_reference
+    assert json.loads(metadata["brief"])["inputs_by_reference"] == list(supplied)
+    assert json.loads(metadata["admitted_references"]) == []
+    # The Supervisor's next input names the procedure and every dropped reference; the control's adds no notice.
+    outcome = _outcome_text(run)
+    named = ", ".join(f"`{item}`" for item in dropped)
+    assert f"Sage dropped the input reference(s) {named} from this step: `{procedure}`" in outcome, outcome
+    assert "dropped the input reference" not in control_outcome
+    assert (f"also listed `{DCSYNC}`, which this step did not run" in outcome) is (shape == "with-procedure")
+
+
+@pytest.mark.parametrize("references, refusal", [
+    (["task:99999"], "does not resolve to a record Sage holds"),
+    (["task:21x"], "is not `task:<id>` or `cred:<id>`"),
+    (["task:21", "cred:99999"], "does not resolve to a record Sage holds"),
+], ids=["unknown", "malformed", "unused-with-unknown"])
+def test_an_unheld_or_malformed_reference_still_cards_nothing(monkeypatch, tmp_path, references, refusal):
+    mt, split = _client(monkeypatch, tmp_path)
+
+    run = asyncio.run(_run(_state_for(mt, ACCOUNT), split, [
+        _select(ACCOUNT, inputs_by_reference=references, targets=_ONE)], decision=None))
+
+    assert run.cards == [] and run.issued == [] and run.before.worker_calls == 0
+    assert run.briefs[0][0] == "rejected" and refusal in run.briefs[0][1], run.briefs
+
+
+def test_a_card_admitted_without_an_unused_reference_runs_only_while_its_candidate_is_current(monkeypatch, tmp_path):
+    mt, split = _client(monkeypatch, tmp_path)
+
+    run = asyncio.run(_run(_state_for(mt, ACCOUNT), split, [
+        _select(ACCOUNT, inputs_by_reference=["task:21"], targets=_ONE),
+        AIMessage(content="The procedure result was read.")], before_decision=_withdraw(mt)))
+
+    assert len(run.cards) == 1 and run.before.issued == [] and run.issued == []
+    [outcome] = run.outcomes
+    assert outcome["status"] == sb.StepStatus.PRECONDITION_UNSATISFIABLE.value
+    assert "no longer matches current evidence" in outcome["detail"]
+    assert f"Sage dropped the input reference(s) `task:21` from this step: `{ACCOUNT}`" in _outcome_text(run)
+
+
+def test_a_step_that_binds_no_candidate_keeps_its_references(monkeypatch, tmp_path):
+    mt, split = _client(monkeypatch, tmp_path)
+    brief = {"handoff_title": "a raw step", "handoff_instruction": PROMPT, "callback_display_id": 14,
+             "targets": ["child.lab.local"], "expected_result": "The step's result.", "allowed_tools": [ISSUE],
+             "inputs_by_reference": ["task:21"]}
+
+    run = asyncio.run(_run(mt, split, [_call("transfer_to_Mythic_Operator", brief, 1)], decision=None))
+
+    assert run.briefs == [("accepted", "Mythic_Operator")]
+    assert _delegated_brief(run)["inputs_by_reference"] == ["task:21"]
+
+
 # --- the pure binding --------------------------------------------------------------------------------------------
 
 ACTION = {"name": "gpo-controlled-system-exec", "target": "gpo=alpha-policy;domain=child.lab.local",
@@ -831,6 +935,7 @@ def test_a_supplied_reference_pins_a_forge_key_and_is_never_ignored():
                                                bound)
     assert cb.bind(brief("cred:500", "cred:501", "task:21"), (item,))[0].inputs["credential_proof_task_id"] == "21"
     assert "does not use the input reference task:30" in cb.bind(brief("task:21", "task:30"), (item,))[1]
+    assert cb.unused_references(brief("cred:501", "task:21"), item) == ()      # a forge uses every held reference
     assert cb.REFERENCE_PROCEDURES == MythicTools._KRBTGT_FORGE_CAPABILITIES
 
 
@@ -845,3 +950,20 @@ def test_a_brief_binds_its_candidate_when_it_also_lists_other_procedures():
         assert cb.bind(brief(*procedures), (item,)) == (item, "")
     assert cb.bind(brief("dcsync-krbtgt", "forge-golden-ticket"), (item,)) == (
         None, f"candidate_ref {item.ref} runs `{item.procedure}`, not `dcsync-krbtgt`, `forge-golden-ticket`")
+
+
+def test_a_reference_its_candidate_does_not_use_is_reported_not_refused():
+    [item] = cb.candidates("r", [(GPO_ACTION, INPUTS)])
+
+    def brief(candidate, *references):
+        return hb.HandoffBrief.from_args(allowed_capabilities=[candidate.procedure], callback_display_id=14,
+                                         candidate_ref=candidate.ref, inputs_by_reference=list(references))
+
+    original = brief(item, "task:21", "cred:7", "@cred:7", "task:21")
+    assert cb.bind(original, (item,)) == (item, "")
+    assert cb.unused_references(original, item) == ("task:21", "cred:7", "@cred:7")
+    assert cb.bind(brief(item), (item,)) == cb.bind(original, (item,))   # rebinding the admitted brief: no change
+    # A reference the candidate's own action or inputs name is used, and stays in the step.
+    [used] = cb.candidates("r", [(GPO_ACTION, {**INPUTS, "source_task_id": "21"})])
+    kept = brief(used, "task:21", "cred:7")
+    assert cb.bind(kept, (used,)) == (used, "") and cb.unused_references(kept, used) == ("cred:7",)

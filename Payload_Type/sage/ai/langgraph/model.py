@@ -6976,6 +6976,7 @@ class Model:
             status=status,
             not_run=kwargs.get("_handoff_not_run") or (),
             procedures=(kwargs.get("_handoff_brief") or {}).get("allowed_capabilities") or (),
+            unused_references=kwargs.get("_handoff_unused_references") or (),
         )
         self._step_records.pop((record.request_id, worker, record.delegation_seq), None)
         return outcome
@@ -7013,8 +7014,9 @@ class Model:
         """Structurally check a delegation's brief before dispatch; None admits it. In an ordinary supervised request a
         non-collection catalog step must also bind one current candidate, whose action decides what it acts on (its
         targets are only recorded); failing that ends the request (with a fourth element, the closing report's text).
-        A bound brief that also lists other procedures is admitted narrowed to its candidate's: the narrowed brief is
-        returned in place of None, and the brief event keeps the Supervisor's list.
+        A bound brief that also lists other procedures, or references its candidate does not use, is admitted narrowed
+        to its candidate's procedure and used references: the narrowed brief is returned in place of None, and the
+        brief event keeps the Supervisor's lists.
 
         Reads the request lane and operator input from the Model's state, as the assisted-input lookup does: the
         handoff tool's runtime state is the Supervisor's own channel view. Rejections are request evidence.
@@ -7057,16 +7059,21 @@ class Model:
             candidate, binding_error = _catalog_binding.bind(brief, found, reason=reason)
             errors = (f"catalog binding: {binding_error}",) if binding_error else ()
             if candidate is not None:
-                # Narrowed once, here, so the stored brief, the card and every later check see one procedure.
-                admitted = replace(brief, allowed_capabilities=(candidate.procedure,))
+                # Narrowed once, here, so the stored brief, the card and every later check see one procedure and only
+                # the references its candidate uses.
+                unused = _catalog_binding.unused_references(brief, candidate)
+                admitted = replace(brief, allowed_capabilities=(candidate.procedure,), inputs_by_reference=tuple(
+                    item for item in brief.inputs_by_reference if item not in unused))
         restatement = _handoff_brief.restatement(instruction, operator_input)
         metadata = {
             "worker": worker,
             "restatement": restatement,
             "brief": json.dumps(brief.as_metadata(), sort_keys=True),
         }
-        if admitted != brief:
+        if admitted.allowed_capabilities != brief.allowed_capabilities:
             metadata["admitted_capabilities"] = json.dumps(list(admitted.allowed_capabilities))
+        if admitted.inputs_by_reference != brief.inputs_by_reference:
+            metadata["admitted_references"] = json.dumps(list(admitted.inputs_by_reference))
         # Which targets only an earlier operator input named, and which input: the request and revision, no text.
         sources = _handoff_brief.operator_target_sources(brief, scope)
         if sources:
@@ -19029,15 +19036,18 @@ def _create_handoff_tool(
             if substitute is not None:
                 delegate_to, brief, handoff_title, handoff_instruction, replaced_note = substitute
         not_run: tuple[str, ...] = ()
+        unused: tuple[str, ...] = ()
         if brief_check is not None:
             checked = brief_check(
                 delegate_to, brief or _handoff_brief.HandoffBrief(), str(handoff_instruction or ""),
                 str(handoff_title or ""),
             )
             if isinstance(checked, _handoff_brief.HandoffBrief):
-                # Admitted narrowed to its candidate's procedure: the repeat check, the acknowledgment and the stored
-                # brief use what was admitted, and the Supervisor is told which listed procedures this step skips.
+                # Admitted narrowed to its candidate: the repeat check, the acknowledgment and the stored brief use
+                # what was admitted, and the Supervisor is told which listed procedures and references it dropped.
                 not_run = tuple(item for item in brief.allowed_capabilities if item not in checked.allowed_capabilities)
+                unused = tuple(dict.fromkeys(item for item in brief.inputs_by_reference
+                                             if item not in checked.inputs_by_reference))
                 brief = checked
             elif checked is not None:
                 return _brief_rejection_command(runtime, name, delegate_to, *checked, channels=channel_map.values())
@@ -19315,6 +19325,8 @@ def _create_handoff_tool(
         if not_run:
             # Beside the canonical brief, never in it: Sage's step outcome names what this step does not run.
             injected_human.additional_kwargs["_handoff_not_run"] = list(not_run)
+        if unused:
+            injected_human.additional_kwargs["_handoff_unused_references"] = list(unused)
         if assisted_operator_input is not None and not terminal_redirect and actual_instruction.strip():
             # Materialized as explicitly non-authoritative AI context at the worker
             # invocation, after the current request/operator binding is checked.

@@ -437,7 +437,8 @@ def withheld_tools(brief: Any, tool_names: Iterable[str], guarded: frozenset[str
 
 def step_outcome(record: StepRecord, activity: StepActivity, *, now: float, tasks_issued: Iterable[str] = (),
                  credentials_added: Iterable[int] = (), status: StepStatus | None = None,
-                 not_run: Iterable[str] = (), procedures: Iterable[str] = ()) -> dict[str, Any]:
+                 not_run: Iterable[str] = (), procedures: Iterable[str] = (),
+                 unused_references: Iterable[str] = ()) -> dict[str, Any]:
     final = status or record.status or StepStatus.ENDED
     wall = max(0.0, now - record.started)
     wrap_up = WrapUp.NOT_RUN if record.wrap_up is WrapUp.PENDING else record.wrap_up
@@ -464,9 +465,10 @@ def step_outcome(record: StepRecord, activity: StepActivity, *, now: float, task
         "wrap_up": wrap_up.value if wrap_up else "",
         # The guarded call the step's scope refused, as Sage recorded it; {} for any other ending.
         "refused_proposal": dict(record.refused) if record.refused and final == record.status else {},
-        # A brief admitted narrowed to its candidate's procedure: what the step ran and the listed procedures it
-        # did not; {} for any other step.
-        "narrowed": {"procedures": list(procedures), "not_run": list(not_run)} if not_run else {},
+        # A brief admitted narrowed to its candidate: the procedure it ran, the listed procedures it did not and the
+        # references its candidate does not use, which admission dropped; {} for any other step.
+        "narrowed": {"procedures": list(procedures), "not_run": list(not_run),
+                     "unused_references": list(unused_references)} if not_run or unused_references else {},
     }
 
 
@@ -499,6 +501,11 @@ def render_outcome(outcome: Mapping[str, Any]) -> str:
         lines.append(f"Sage bound this step to {ran}, the selected candidate's procedure; the brief also listed "
                      f"{skipped}, which this step did not run: each needs its own step that selects a current "
                      "candidate.")
+    if narrowed.get("unused_references"):
+        dropped = ", ".join(f"`{item}`" for item in narrowed["unused_references"])
+        procedure = ", ".join(f"`{name}`" for name in narrowed.get("procedures") or ())
+        lines.append(f"Sage dropped the input reference(s) {dropped} from this step: {procedure}, the selected "
+                     "candidate's procedure, does not use them, so its action is the same without them.")
     if outcome.get("refused_proposal"):
         lines.append(f"Refused proposal (Sage's record): {describe_refused_proposal(outcome['refused_proposal'])}. "
                      "It was not approved and not executed: Sage removed it before any approval card or Mythic task.")

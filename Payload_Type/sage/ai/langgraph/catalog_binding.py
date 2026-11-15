@@ -110,11 +110,41 @@ def credential_set(values: Any) -> list[str]:
     return sorted({str(item).strip() for item in items} - {""}, key=lambda text: (len(text), text))
 
 
+def _reference_use(brief: Any, candidate: Candidate) -> tuple[dict[str, list[str]], tuple[str, ...], str]:
+    """How `candidate` uses the brief's references: the numbers a forge pins by kind, the references it does not use
+    (distinct, in the brief's order) and the first conflicting reference ("" when none)."""
+    bound = list(_values({"action": candidate.action, "inputs": candidate.inputs}))
+    supplied: dict[str, list[str]] = {"cred": [], "task": []}
+    unused: list[str] = []
+    for reference in getattr(brief, "inputs_by_reference", ()) or ():
+        kind, _, number = str(reference).lstrip("@").partition(":")
+        word = "task" if kind == "task" else "cred"
+        if any(word in key and text == number for key, text in bound):
+            continue
+        if candidate.procedure not in REFERENCE_PROCEDURES:
+            # A procedure that binds no key by reference never reads it: its action is the same without it, so
+            # admission drops it from the step and the step outcome names it.
+            unused.append(reference)
+            continue
+        # On a forge a supplied reference is used, never ignored: it pins the key the forge binds. Several
+        # credentials name one key set; a second, different proof task conflicts.
+        if word == "task" and supplied["task"] and number != supplied["task"][0]:
+            return supplied, tuple(dict.fromkeys(unused)), str(reference)
+        supplied[word].append(number)
+    return supplied, tuple(dict.fromkeys(unused)), ""
+
+
+def unused_references(brief: Any, candidate: Candidate) -> tuple[str, ...]:
+    """The brief's references that its bound `candidate` does not use; admission drops them from the stored brief."""
+    return _reference_use(brief, candidate)[1]
+
+
 def bind(brief: Any, found: tuple[Candidate, ...] | None, *, reason: str = "") -> tuple[Candidate | None, str]:
     """The one current candidate a catalog brief selects, or None and the factual reason it cannot be bound.
 
     The brief must list the candidate's procedure; it may also list others (the procedure it feeds), which the step
-    does not run: admission narrows the step to the candidate's procedure."""
+    does not run: admission narrows the step to the candidate's procedure. Likewise a held reference that a procedure
+    outside REFERENCE_PROCEDURES does not use is dropped at admission (`unused_references`), not refused."""
     procedures = tuple(getattr(brief, "allowed_capabilities", ()) or ())
     named = ", ".join(f"`{name}`" for name in procedures) or "the procedure"
     ref = str(getattr(brief, "candidate_ref", "") or "").strip()
@@ -136,19 +166,9 @@ def bind(brief: Any, found: tuple[Candidate, ...] | None, *, reason: str = "") -
     if callback != candidate.callback:
         return None, (f"candidate_ref {ref} runs on callback {candidate.callback or 'none'}, not callback "
                       f"{callback or 'none'}")
-    bound = list(_values({"action": candidate.action, "inputs": candidate.inputs}))
-    supplied: dict[str, list[str]] = {"cred": [], "task": []}
-    for reference in getattr(brief, "inputs_by_reference", ()) or ():
-        kind, _, number = str(reference).lstrip("@").partition(":")
-        word = "task" if kind == "task" else "cred"
-        if any(word in key and text == number for key, text in bound):
-            continue
-        # A supplied reference is used, never ignored: it pins the key a forge binds, or the step cannot be bound.
-        # Several credentials name one key set; a second, different proof task conflicts.
-        conflict = word == "task" and bool(supplied["task"]) and number != supplied["task"][0]
-        if candidate.procedure not in REFERENCE_PROCEDURES or conflict:
-            return None, f"candidate_ref {ref} does not use the input reference {reference}"
-        supplied[word].append(number)
+    supplied, _unused, conflict = _reference_use(brief, candidate)
+    if conflict:
+        return None, f"candidate_ref {ref} does not use the input reference {conflict}"
     credentials = credential_set(supplied["cred"])
     pins: dict[str, Any] = {REFERENCE_INPUTS["task"]: supplied["task"][0]} if supplied["task"] else {}
     if len(credentials) == 1:

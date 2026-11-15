@@ -1,7 +1,7 @@
 {
  "provenance": {
   "kind": "recorded model-output shapes with synthetic current state",
-  "description": "Every catalog-relevant Supervisor brief of two retained supervised runs (42 rows), and from a third run the brief that selected one candidate but listed two procedures (row run4-422): its scope fields, target list and the refusal its recorded result shows. Identities are consistently renamed (one replacement per original name, letter case kept); prose, candidate refs, callbacks and outputs are omitted. Candidates, callbacks, references and ledger state in the tests are synthetic, so this is not a replay of either run.",
+  "description": "Every catalog-relevant Supervisor brief of two retained supervised runs (42 rows), from a third run the brief that selected one candidate but listed two procedures (row run4-422), and from a fourth run the two briefs that selected an offered dcsync-account candidate and supplied a held task that candidate does not use (rows run5-1164 and run5-1186, TOOL spans 1164 and 1186): their scope fields, target list and the refusal their recorded result shows. Identities are consistently renamed (one replacement per original name, letter case kept); prose, candidate refs, callbacks and outputs are omitted. Candidates, callbacks, references and ledger state in the tests are synthetic, so this is not a replay of any run.",
   "preserved": "Target list order, duplicates, letter case, host/domain/principal/label forms, procedure names, whether a candidate_ref was sent, and the recorded reference spellings."
  },
  "rows": [
@@ -613,6 +613,37 @@
    "candidate_ref": true,
    "recorded_references": [],
    "recorded_refusal": "binder-procedure"
+  },
+  {
+   "id": "run5-1164",
+   "allowed_capabilities": [
+    "dcsync-account"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "alice@child.lab.local"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [
+    "task:21"
+   ],
+   "recorded_refusal": "unused-reference"
+  },
+  {
+   "id": "run5-1186",
+   "allowed_capabilities": [
+    "dcsync-account"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "alice@child.lab.local",
+    "WS02.CHILD.LAB.LOCAL"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [
+    "task:21"
+   ],
+   "recorded_refusal": "unused-reference"
   }
  ]
 }
