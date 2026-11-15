@@ -623,6 +623,12 @@ def _delegated_brief(run) -> dict:
     return message.additional_kwargs["_handoff_brief"]
 
 
+def _outcome_text(run) -> str:
+    """The `[step outcome]` the Supervisor read in its first model call after the operator's decision."""
+    return next(str(m.content) for messages in run.fake.inputs[run.before.inputs:] for m in messages
+                if str(m.content).startswith("[step outcome]"))
+
+
 def _acknowledgment(run) -> str:
     """The delegation call's acknowledgment, as the graph records it (main and worker channels)."""
     [message] = [m for m in run.values.get("messages", []) if isinstance(m, ToolMessage)
@@ -675,6 +681,11 @@ def test_the_narrowed_step_runs_what_the_one_procedure_step_runs(monkeypatch, tm
     assert bool(run.issued) is (decision == "accept") and len(run.terminals) == 1
     assert _delegated_brief(run) == _delegated_brief(control)        # one canonical brief for every later check
     assert "bound this step to" not in _acknowledgment(control)       # a one-procedure brief passes through
+    # What the Supervisor reads when the step returns names the bound procedure and what the step did not run.
+    outcome = _outcome_text(run)
+    assert f"Sage bound this step to `{ENSURE}`" in outcome, outcome
+    assert f"also listed `{DCSYNC}`, which this step did not run" in outcome
+    assert "bound this step to" not in _outcome_text(control)
 
 
 REJECTS = {

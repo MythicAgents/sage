@@ -436,7 +436,8 @@ def withheld_tools(brief: Any, tool_names: Iterable[str], guarded: frozenset[str
 
 
 def step_outcome(record: StepRecord, activity: StepActivity, *, now: float, tasks_issued: Iterable[str] = (),
-                 credentials_added: Iterable[int] = (), status: StepStatus | None = None) -> dict[str, Any]:
+                 credentials_added: Iterable[int] = (), status: StepStatus | None = None,
+                 not_run: Iterable[str] = (), procedures: Iterable[str] = ()) -> dict[str, Any]:
     final = status or record.status or StepStatus.ENDED
     wall = max(0.0, now - record.started)
     wrap_up = WrapUp.NOT_RUN if record.wrap_up is WrapUp.PENDING else record.wrap_up
@@ -463,6 +464,9 @@ def step_outcome(record: StepRecord, activity: StepActivity, *, now: float, task
         "wrap_up": wrap_up.value if wrap_up else "",
         # The guarded call the step's scope refused, as Sage recorded it; {} for any other ending.
         "refused_proposal": dict(record.refused) if record.refused and final == record.status else {},
+        # A brief admitted narrowed to its candidate's procedure: what the step ran and the listed procedures it
+        # did not; {} for any other step.
+        "narrowed": {"procedures": list(procedures), "not_run": list(not_run)} if not_run else {},
     }
 
 
@@ -489,6 +493,12 @@ def render_outcome(outcome: Mapping[str, Any]) -> str:
         f"Time: {outcome['active_seconds']:.0f}s active, {outcome['action_seconds']:.0f}s inside the guarded "
         f"action, {outcome['waiting_seconds']:.0f}s waiting (approval and other).",
     ]
+    narrowed = outcome.get("narrowed") or {}
+    if narrowed.get("not_run"):
+        ran, skipped = (", ".join(f"`{name}`" for name in narrowed[key]) for key in ("procedures", "not_run"))
+        lines.append(f"Sage bound this step to {ran}, the selected candidate's procedure; the brief also listed "
+                     f"{skipped}, which this step did not run: each needs its own step that selects a current "
+                     "candidate.")
     if outcome.get("refused_proposal"):
         lines.append(f"Refused proposal (Sage's record): {describe_refused_proposal(outcome['refused_proposal'])}. "
                      "It was not approved and not executed: Sage removed it before any approval card or Mythic task.")

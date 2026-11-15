@@ -6963,6 +6963,10 @@ class Model:
         if record is None:
             return None
         guarded = getattr(self, "_step_guarded_tools", {}).get(worker, frozenset(GUARDED_TOOLS))
+        delegated = next((message for message in messages if isinstance(message, HumanMessage)
+                          and message.additional_kwargs.get("_delegated_to") == worker
+                          and _get_seq(message) == record.delegation_seq), None)
+        kwargs = getattr(delegated, "additional_kwargs", {}) or {}
         outcome = _step_bounds.step_outcome(
             record,
             _step_bounds.step_activity(_current_delegation_messages(messages), guarded),
@@ -6970,6 +6974,8 @@ class Model:
             tasks_issued=self._issued_task_ids() - record.tasks_before,
             credentials_added=self._added_credential_ids() - record.credentials_before,
             status=status,
+            not_run=kwargs.get("_handoff_not_run") or (),
+            procedures=(kwargs.get("_handoff_brief") or {}).get("allowed_capabilities") or (),
         )
         self._step_records.pop((record.request_id, worker, record.delegation_seq), None)
         return outcome
@@ -19306,6 +19312,9 @@ def _create_handoff_tool(
         injected_human.additional_kwargs["_handoff_title"] = actual_title
         if brief is not None:
             injected_human.additional_kwargs["_handoff_brief"] = brief.as_metadata()
+        if not_run:
+            # Beside the canonical brief, never in it: Sage's step outcome names what this step does not run.
+            injected_human.additional_kwargs["_handoff_not_run"] = list(not_run)
         if assisted_operator_input is not None and not terminal_redirect and actual_instruction.strip():
             # Materialized as explicitly non-authoritative AI context at the worker
             # invocation, after the current request/operator binding is checked.
