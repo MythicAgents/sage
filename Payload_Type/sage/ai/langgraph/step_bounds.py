@@ -23,11 +23,13 @@ import re
 from typing import Any, Iterable, Mapping
 
 from . import step_references
+from . import task_evidence
 
 # 2: the outcome carries Sage-read references to the step's tasks, credentials and graph reads.
 # 3: it also carries the step's resolved bounds and their sources, blocked calls, and the final-answer status.
 # 4: a step rejected by scope also carries Sage's display-safe record of the refused proposal.
-STEP_OUTCOME_VERSION = 4
+# 5: it also carries each terminal executor result of the step (`executor_results`).
+STEP_OUTCOME_VERSION = 5
 QUEUED_PREFIX = "[Queued]"
 DENIED_PREFIX = "[DENIED by operator]"
 # Routing results that can appear in a worker's context; they are not work the step did.
@@ -435,10 +437,71 @@ def withheld_tools(brief: Any, tool_names: Iterable[str], guarded: frozenset[str
                      or (procedures and name in TECHNIQUE_GUIDANCE_TOOLS))
 
 
+def executor_result(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """One terminal `execute_capability` payload as a step outcome keeps it: the capability, its target, the verdict,
+    the tasks it issued, the effects it recorded and the declared effects it did not confirm (the executor's
+    `missing_effects`, else the action's declared effects that are neither achieved nor recorded)."""
+    action = payload.get("action") if isinstance(payload.get("action"), Mapping) else {}
+    recorded = [str(effect) for effect in payload.get("recorded_effects") or []]
+    if payload.get("missing_effects"):
+        unconfirmed = [str(effect) for effect in payload["missing_effects"]]
+    else:
+        held = {str(effect).casefold() for effect in [*(payload.get("achieved_effects") or []), *recorded]}
+        unconfirmed = [str(effect) for effect in action.get("effects") or [] if str(effect).casefold() not in held]
+    return {"capability": str(payload.get("capability") or ""),
+            "target": str(action.get("target") or payload.get("domain") or ""),
+            "verdict": str(payload.get("verdict") or ""),
+            "task_ids": [row["task_id"] for row in payload.get("issued") or []
+                         if isinstance(row, Mapping) and row.get("task_id") is not None],
+            "recorded": recorded, "unconfirmed": unconfirmed}
+
+
+VERIFICATION_LEAD = "**Sage verification:**"
+
+
+def verdict_lines(outcomes: Iterable[Mapping[str, Any]]) -> list[str]:
+    """Sage's lines for a request's closing, from its step outcomes in order: the latest executor result for each
+    capability and target, one line for each that is not `achieved`. Task status is Sage's own Mythic read (the same
+    outcome's references), never the payload's `issued` labels; a status Sage could not read is reported as such."""
+    latest: dict[tuple[str, str], tuple[Mapping[str, Any], dict[str, Mapping[str, Any]]]] = {}
+    for outcome in outcomes:
+        tasks = {str(task.get("task_id")): task for task in (outcome.get("references") or {}).get("tasks") or []}
+        for result in outcome.get("executor_results") or []:
+            key = (result["capability"].casefold(), result["target"].casefold())
+            latest.pop(key, None)
+            latest[key] = (result, tasks)
+    lines = []
+    for result, tasks in latest.values():
+        if result["verdict"] == "achieved":
+            continue
+        ids = ", ".join(str(task_id) for task_id in result["task_ids"])
+        line = (f"{VERIFICATION_LEAD} `{result['capability']}`"
+                + (f" on `{result['target']}`" if result["target"] else "")
+                + f" ended with executor verdict `{result['verdict']}`"
+                + (f" (task {ids})." if ids else " (no Mythic task issued).")
+                + " Recorded: " + (", ".join(f"`{effect}`" for effect in result["recorded"]) or "nothing") + ".")
+        if result["unconfirmed"]:
+            line += " Not confirmed: " + ", ".join(f"`{effect}`" for effect in result["unconfirmed"]) + "."
+        statuses = []
+        for task_id in result["task_ids"]:
+            task = tasks.get(str(task_id)) or {}
+            status = str(task.get("status") or "")
+            if task.get("read") != "ok":
+                statuses.append(f"task {task_id} status not read")
+            elif task.get("completed") is not True or status.strip().casefold() not in task_evidence._SUCCESS_STATES:
+                statuses.append(f"task {task_id} `{status or 'no status'}`"
+                                + ("" if task.get("completed") is True else " (not completed)"))
+        if statuses:
+            line += " Mythic status: " + "; ".join(statuses) + "."
+        lines.append(line)
+    return lines
+
+
 def step_outcome(record: StepRecord, activity: StepActivity, *, now: float, tasks_issued: Iterable[str] = (),
                  credentials_added: Iterable[int] = (), status: StepStatus | None = None,
                  not_run: Iterable[str] = (), procedures: Iterable[str] = (),
-                 unused_references: Iterable[str] = ()) -> dict[str, Any]:
+                 unused_references: Iterable[str] = (),
+                 executor_results: Iterable[Mapping[str, Any]] = ()) -> dict[str, Any]:
     final = status or record.status or StepStatus.ENDED
     wall = max(0.0, now - record.started)
     wrap_up = WrapUp.NOT_RUN if record.wrap_up is WrapUp.PENDING else record.wrap_up
@@ -469,6 +532,8 @@ def step_outcome(record: StepRecord, activity: StepActivity, *, now: float, task
         # references its candidate does not use, which admission dropped; {} for any other step.
         "narrowed": {"procedures": list(procedures), "not_run": list(not_run),
                      "unused_references": list(unused_references)} if not_run or unused_references else {},
+        # Each terminal `execute_capability` result in the step (executor_result), for the request's closing.
+        "executor_results": [executor_result(payload) for payload in executor_results],
     }
 
 

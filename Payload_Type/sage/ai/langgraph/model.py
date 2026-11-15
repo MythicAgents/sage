@@ -5335,8 +5335,15 @@ def _is_bounded_one_action_capability_request(messages: list[AnyMessage]) -> boo
 
 def _terminal_execute_capability_payload(messages: list[AnyMessage]) -> dict[str, Any] | None:
     """Return the latest terminal execute_capability JSON payload, if one is present."""
+    payloads = _terminal_execute_capability_payloads(messages)
+    return payloads[-1] if payloads else None
+
+
+def _terminal_execute_capability_payloads(messages: list[AnyMessage]) -> list[dict[str, Any]]:
+    """Every terminal execute_capability JSON payload in `messages`, in order."""
     terminal_verdicts = {"achieved", "failed", "blocked", "partial"}
-    for msg in reversed(messages):
+    payloads: list[dict[str, Any]] = []
+    for msg in messages:
         if not isinstance(msg, ToolMessage):
             continue
         if (getattr(msg, "name", "") or "") != "execute_capability":
@@ -5363,8 +5370,8 @@ def _terminal_execute_capability_payload(messages: list[AnyMessage]) -> dict[str
         normalized = dict(payload)
         normalized["capability"] = capability
         normalized["verdict"] = verdict or ("achieved" if ok else "unknown")
-        return normalized
-    return None
+        payloads.append(normalized)
+    return payloads
 
 
 def _current_delegation_messages(messages: list[AnyMessage]) -> list[AnyMessage]:
@@ -6967,9 +6974,10 @@ class Model:
                           and message.additional_kwargs.get("_delegated_to") == worker
                           and _get_seq(message) == record.delegation_seq), None)
         kwargs = getattr(delegated, "additional_kwargs", {}) or {}
+        delegation = _current_delegation_messages(messages)
         outcome = _step_bounds.step_outcome(
             record,
-            _step_bounds.step_activity(_current_delegation_messages(messages), guarded),
+            _step_bounds.step_activity(delegation, guarded),
             now=self._step_clock(),
             tasks_issued=self._issued_task_ids() - record.tasks_before,
             credentials_added=self._added_credential_ids() - record.credentials_before,
@@ -6977,8 +6985,13 @@ class Model:
             not_run=kwargs.get("_handoff_not_run") or (),
             procedures=(kwargs.get("_handoff_brief") or {}).get("allowed_capabilities") or (),
             unused_references=kwargs.get("_handoff_unused_references") or (),
+            executor_results=_terminal_execute_capability_payloads(delegation),
         )
         self._step_records.pop((record.request_id, worker, record.delegation_seq), None)
+        # Kept for this request's closing (_lead_with_step_verdicts): the stream after an approval resume does not
+        # sync `self.state`, so the closing cannot read the step messages there.
+        kept = [item for item in getattr(self, "_request_step_outcomes", []) if item[0] == record.request_id]
+        self._request_step_outcomes = [*kept, (record.request_id, outcome)]
         return outcome
 
     async def _attach_step_references(
@@ -10504,6 +10517,8 @@ class Model:
                 # stream exactly one closing executive summary after the specialist live stream.
                 elif isinstance(msg, AIMessage) and getattr(msg, 'name', None) == "Supervisor":
                     if msg.additional_kwargs.get("_is_final_report"):
+                        if msg.additional_kwargs.get("_model_closing"):
+                            msg = self._lead_with_step_verdicts(msg)
                         # Keep the agent prefix first (nothing before it); the turn-end banner
                         # goes AFTER the prefix: 🤖[Supervisor]> 📊 **Final Report**\n<content>
                         # The banner classifies the ending: completed / blocked /
@@ -10540,7 +10555,8 @@ class Model:
                         # Routing/handoff/ respond_to_user messages (all carry tool_calls or the
                         # _is_final_report tag) are unaffected, so the delegation path does not
                         # double-stream.
-                        formatted = self._format_message_for_streaming(msg, agent_name="Supervisor")
+                        formatted = self._format_message_for_streaming(
+                            self._lead_with_step_verdicts(msg), agent_name="Supervisor")
                         if formatted:
                             await self._stream_message_to_mythic(formatted)
                     elif _message_content_as_text(msg.content).strip():
@@ -10563,6 +10579,18 @@ class Model:
                                     await self._stream_message_to_mythic(formatted)
                     else:
                         logger.debug(f"📨 [Stream] Suppressing Supervisor routing/respond_to_user message from user output")
+
+    def _lead_with_step_verdicts(self, message: AIMessage) -> AIMessage:
+        """A model-written closing as streamed: Sage's verification lines for this request's steps first
+        (`step_bounds.verdict_lines`), then the model's text unchanged. Proposals JSON is exempt, and the stored
+        message is not changed (like the engagement-state table, the lines ride only in the streamed copy)."""
+        request_id = str(getattr(getattr(self, "_request_contract", None), "request_id", "") or "")
+        lines = _step_bounds.verdict_lines(outcome for rid, outcome in getattr(self, "_request_step_outcomes", [])
+                                           if request_id and rid == request_id)
+        if not lines or _closing_content_is_proposals_json(message.content):
+            return message
+        text = _message_content_as_text(message.content).strip()
+        return message.model_copy(update={"content": "\n\n".join(lines) + "\n\n" + text})
 
     async def _extract_new_messages_from_event(self, state_update: dict) -> list[BaseMessage]:
         """Extract messages from a stream event's state update.
@@ -18662,7 +18690,8 @@ def _create_respond_to_user_tool():
         # the invariant: a blank final report never ends a request.
         if not final_response.strip():
             raise ValueError("final_response must be complete")
-        outcome_kwargs: dict[str, Any] = {"_is_final_report": True}
+        # `_model_closing`: the Supervisor model wrote this report (Sage-authored finals carry only the first tag).
+        outcome_kwargs: dict[str, Any] = {"_is_final_report": True, "_model_closing": True}
         declared = str(outcome or "").strip()
         if declared:
             if declared not in {
