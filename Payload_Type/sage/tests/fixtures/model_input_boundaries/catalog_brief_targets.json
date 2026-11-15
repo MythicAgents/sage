@@ -1,7 +1,7 @@
 {
  "provenance": {
   "kind": "recorded model-output shapes with synthetic current state",
-  "description": "Every catalog-relevant Supervisor brief of two retained supervised runs (42 rows): its scope fields, target list and the refusal its recorded result shows. Identities are consistently renamed (one replacement per original name, letter case kept); prose, candidate refs, callbacks and outputs are omitted. Candidates, callbacks, references and ledger state in the tests are synthetic, so this is not a replay of either run.",
+  "description": "Every catalog-relevant Supervisor brief of two retained supervised runs (42 rows), and from a third run the brief that selected one candidate but listed two procedures (row run4-422): its scope fields, target list and the refusal its recorded result shows. Identities are consistently renamed (one replacement per original name, letter case kept); prose, candidate refs, callbacks and outputs are omitted. Candidates, callbacks, references and ledger state in the tests are synthetic, so this is not a replay of either run.",
   "preserved": "Target list order, duplicates, letter case, host/domain/principal/label forms, procedure names, whether a candidate_ref was sent, and the recorded reference spellings."
  },
  "rows": [
@@ -598,6 +598,21 @@
     "cred:3"
    ],
    "recorded_refusal": "none"
+  },
+  {
+   "id": "run4-422",
+   "allowed_capabilities": [
+    "ensure-kerberos-context",
+    "dcsync-krbtgt"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "child.lab.local",
+    "DC02"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [],
+   "recorded_refusal": "binder-procedure"
   }
  ]
 }

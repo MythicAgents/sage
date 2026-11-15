@@ -7003,10 +7003,12 @@ class Model:
     def _check_handoff_brief(
         self, worker: str, brief: "_handoff_brief.HandoffBrief", instruction: str, title: str = "",
     ) -> tuple[tuple[str, ...], bool] | tuple[tuple[str, ...], bool, tuple[str, ...]] | tuple[
-            tuple[str, ...], bool, tuple[str, ...], str] | None:
+            tuple[str, ...], bool, tuple[str, ...], str] | "_handoff_brief.HandoffBrief" | None:
         """Structurally check a delegation's brief before dispatch; None admits it. In an ordinary supervised request a
         non-collection catalog step must also bind one current candidate, whose action decides what it acts on (its
         targets are only recorded); failing that ends the request (with a fourth element, the closing report's text).
+        A bound brief that also lists other procedures is admitted narrowed to its candidate's: the narrowed brief is
+        returned in place of None, and the brief event keeps the Supervisor's list.
 
         Reads the request lane and operator input from the Model's state, as the assisted-input lookup does: the
         handoff tool's runtime state is the Supervisor's own channel view. Rejections are request evidence.
@@ -7042,17 +7044,23 @@ class Model:
             worker_tools=_worker_guarded_tool_names(worker), candidate_bound=bound,
         )
         binding_error = ""
+        admitted = brief
         if not errors and bound:
             # A catalog step runs one action current evidence supports, chosen by its candidate_ref; nothing else.
             found, reason = self._catalog_candidates()
-            _candidate, binding_error = _catalog_binding.bind(brief, found, reason=reason)
+            candidate, binding_error = _catalog_binding.bind(brief, found, reason=reason)
             errors = (f"catalog binding: {binding_error}",) if binding_error else ()
+            if candidate is not None:
+                # Narrowed once, here, so the stored brief, the card and every later check see one procedure.
+                admitted = replace(brief, allowed_capabilities=(candidate.procedure,))
         restatement = _handoff_brief.restatement(instruction, operator_input)
         metadata = {
             "worker": worker,
             "restatement": restatement,
             "brief": json.dumps(brief.as_metadata(), sort_keys=True),
         }
+        if admitted != brief:
+            metadata["admitted_capabilities"] = json.dumps(list(admitted.allowed_capabilities))
         # Which targets only an earlier operator input named, and which input: the request and revision, no text.
         sources = _handoff_brief.operator_target_sources(brief, scope)
         if sources:
@@ -7070,7 +7078,7 @@ class Model:
             f"restatement={restatement} | errors={list(errors)}"
         )
         if not errors:
-            signature = _handoff_brief.scope_signature(brief.allowed_capabilities, brief.allowed_tools)
+            signature = _handoff_brief.scope_signature(admitted.allowed_capabilities, admitted.allowed_tools)
             refusals = ledger.actual_events(kind="scope_rejected", phase="rejected")
             if lane == "supervised_workflow" and _handoff_brief.scope_resend_exhausted(refusals, signature):
                 # The Supervisor re-sent a scope whose action was removed before a card: either the scope itself
@@ -7102,8 +7110,8 @@ class Model:
                         "brief": json.dumps(brief.as_metadata(), sort_keys=True),
                     },
                 )
-            self._consume_admitted_first_step(worker, brief)
-            return None
+            self._consume_admitted_first_step(worker, admitted)
+            return None if admitted == brief else admitted
         if binding_error:
             return errors, True, (), (
                 f"I could not bind this catalog step to an action current evidence supports: {binding_error}. No "
@@ -19014,13 +19022,19 @@ def _create_handoff_tool(
             substitute = first_step(agent_name, brief, str(handoff_instruction or ""), str(handoff_title or ""))
             if substitute is not None:
                 delegate_to, brief, handoff_title, handoff_instruction, replaced_note = substitute
+        not_run: tuple[str, ...] = ()
         if brief_check is not None:
-            rejected = brief_check(
+            checked = brief_check(
                 delegate_to, brief or _handoff_brief.HandoffBrief(), str(handoff_instruction or ""),
                 str(handoff_title or ""),
             )
-            if rejected is not None:
-                return _brief_rejection_command(runtime, name, delegate_to, *rejected, channels=channel_map.values())
+            if isinstance(checked, _handoff_brief.HandoffBrief):
+                # Admitted narrowed to its candidate's procedure: the repeat check, the acknowledgment and the stored
+                # brief use what was admitted, and the Supervisor is told which listed procedures this step skips.
+                not_run = tuple(item for item in brief.allowed_capabilities if item not in checked.allowed_capabilities)
+                brief = checked
+            elif checked is not None:
+                return _brief_rejection_command(runtime, name, delegate_to, *checked, channels=channel_map.values())
         requested = _handoff_directive(delegate_to, handoff_instruction, handoff_title)
         if repeat_check is not None:
             repeated = repeat_check(delegate_to, requested.title, brief)
@@ -19272,8 +19286,13 @@ def _create_handoff_tool(
             ack_prefix = f"Redirected to {actual_agent_name}" if redirect else f"Delegated to {actual_agent_name}"
             if replaced_note and not redirect:
                 ack_prefix = f"{replaced_note} {ack_prefix}"
+        bound_note = ""
+        if not_run and not terminal_redirect:
+            bound_note = (f"\n\nSage bound this step to `{brief.allowed_capabilities[0]}`, the selected candidate's "
+                          f"procedure. This step does not run {', '.join(f'`{item}`' for item in not_run)}: each needs "
+                          "its own step that selects a current candidate.")
         acknowledgment = ToolMessage(
-            content=f"{ack_prefix} with instruction: {delegated_instruction}",
+            content=f"{ack_prefix} with instruction: {delegated_instruction}{bound_note}",
             name=name,
             tool_call_id=runtime.tool_call_id,
         )

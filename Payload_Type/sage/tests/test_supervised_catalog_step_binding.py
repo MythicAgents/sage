@@ -16,11 +16,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 import re
 from types import SimpleNamespace
 
 import pytest
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from ai.langgraph import catalog_binding as cb
@@ -154,12 +155,21 @@ async def _run(mt, split, script, *, decision="accept", mode="supervised", auton
         snapshot = await model.graph.aget_state(model._graph_run_config(model._session_thread_id()))
         return SimpleNamespace(
             model=model, fake=fake, cards=cards, before=before, issued=calls.get("issued", []),
+            values=snapshot.values, all_cards=_cards(chat),
             terminals=[e for e in chat.emissions if e.get("complete_request") and not (
                 isinstance(e.get("metadata"), dict) and e["metadata"].get("special_type") == "input_requested")],
             outcomes=_outcomes(snapshot.values.get("supervisor_messages", [])),
             briefs=[(e.phase, e.content) for e in model._request_event_ledger.actual_events(kind="brief")])
     finally:
         await drop_channel_session(build_chat_request("", channel_id=1, operation_id=1))
+
+
+def _isolated(monkeypatch, path):
+    """A fresh `_client` with its own ledger database, for a test that builds more than one client."""
+    path.mkdir()
+    monkeypatch.setenv("SAGE_DATABASE_PATH", str(path / "sage.db"))
+    monkeypatch.setattr(chat_session, "_CHANNEL_MARKER_DB_PATH", str(path / "sage.db"))
+    return _client(monkeypatch, path)
 
 
 def _commands(run) -> list[str]:
@@ -558,10 +568,7 @@ def test_a_catalog_steps_targets_never_refuse_or_change_its_action(monkeypatch, 
     contains, domain, other = INVARIANT[procedure]
 
     def accepted(targets, path):
-        path.mkdir()                                      # each client in this test gets its own ledger database
-        monkeypatch.setenv("SAGE_DATABASE_PATH", str(path / "sage.db"))
-        monkeypatch.setattr(chat_session, "_CHANNEL_MARKER_DB_PATH", str(path / "sage.db"))
-        mt, split = _client(monkeypatch, path)
+        mt, split = _isolated(monkeypatch, path)          # each client in this test gets its own ledger database
         return asyncio.run(_run(_state_for(mt, procedure), split, [_select(procedure, contains, targets=targets),
                                                                    AIMessage(content="The procedure ran.")]))
 
@@ -596,6 +603,149 @@ def test_raw_and_collection_steps_still_check_targets(monkeypatch, tmp_path, sco
 
     assert run.cards == [] and run.issued == [] and run.before.worker_calls == 0
     assert run.briefs and run.briefs[0][0] == "rejected" and error in run.briefs[0][1], run.briefs
+
+
+# --- (i) a brief that also lists the procedure its candidate feeds binds that candidate alone --------------------
+
+ENSURE, DCSYNC = "ensure-kerberos-context", "dcsync-krbtgt"
+_RECORDED = {row["id"]: row for row in json.loads(
+    (Path(__file__).parent / "fixtures/model_input_boundaries/catalog_brief_targets.json").read_text())["rows"]}
+# The recorded shapes (renamed; run 4 TOOL span 422, run 2 TOOL span 494): the prerequisite's candidate selected,
+# the procedure it feeds listed with it. The view listed only the prerequisite. Plus the reversed order.
+LISTED = {**{name: (_RECORDED[name]["allowed_capabilities"], _RECORDED[name]["targets"])
+             for name in ("run4-422", "run2-494")}, "reversed": ([DCSYNC, ENSURE], ["child.lab.local"])}
+
+
+def _delegated_brief(run) -> dict:
+    """The brief Sage stored on the step's delegated message, which every later check of the step reads."""
+    [message] = [m for m in run.values.get("messages", []) if isinstance(m, HumanMessage)
+                 and m.additional_kwargs.get("_delegated_to") == "Mythic_Operator"]
+    return message.additional_kwargs["_handoff_brief"]
+
+
+def _acknowledgment(run) -> str:
+    """The delegation call's acknowledgment, as the graph records it (main and worker channels)."""
+    [message] = [m for m in run.values.get("messages", []) if isinstance(m, ToolMessage)
+                 and m.name == "transfer_to_Mythic_Operator"]
+    return str(message.content)
+
+
+@pytest.mark.parametrize("shape", list(LISTED))
+def test_a_brief_listing_its_candidates_procedure_with_another_cards_only_that_candidate(monkeypatch, tmp_path,
+                                                                                        shape):
+    listed, targets = LISTED[shape]
+    mt, split = _client(monkeypatch, tmp_path)
+
+    run = asyncio.run(_run(_state_for(mt, ENSURE), split, [_select(ENSURE, allowed_capabilities=listed,
+                                                                   targets=targets)], decision=None))
+
+    assert run.issued == [] and run.before.worker_calls == 0 and run.terminals == []
+    [card] = run.cards
+    assert card["data"]["arguments"]["action"]["name"] == ENSURE
+    assert card["data"]["arguments"]["inputs"]["callback_id"] == "14"
+    # Admission narrowed the step: the stored brief names only the candidate's procedure, and the brief event keeps
+    # the Supervisor's own list beside the admitted one.
+    assert run.briefs == [("accepted", "Mythic_Operator")] and _brief_targets(run) == targets
+    [event] = run.model._request_event_ledger.actual_events(kind="brief")
+    assert json.loads(dict(event.metadata)["brief"])["allowed_capabilities"] == listed
+    assert json.loads(dict(event.metadata)["admitted_capabilities"]) == [ENSURE]
+    assert _delegated_brief(run)["allowed_capabilities"] == [ENSURE]
+    # The scope the worker invocation renders from that stored brief names the bound procedure only.
+    scope = hb.render_scope(_delegated_brief(run), candidate_bound=True)
+    assert f"`{ENSURE}`" in scope and DCSYNC not in scope
+    acknowledgment = _acknowledgment(run)
+    assert f"bound this step to `{ENSURE}`" in acknowledgment and f"does not run `{DCSYNC}`" in acknowledgment
+
+
+@pytest.mark.parametrize("decision", ["accept", "reject"])
+@pytest.mark.parametrize("shape", list(LISTED))
+def test_the_narrowed_step_runs_what_the_one_procedure_step_runs(monkeypatch, tmp_path, shape, decision):
+    listed, targets = LISTED[shape]
+
+    def run_with(capabilities, path):
+        mt, split = _isolated(monkeypatch, path)
+        return asyncio.run(_run(_state_for(mt, ENSURE), split, [
+            _select(ENSURE, allowed_capabilities=capabilities, targets=targets),
+            AIMessage(content="The procedure result was read.")], decision=decision))
+
+    control, run = run_with([ENSURE], tmp_path / "control"), run_with(listed, tmp_path / "listed")
+
+    assert len(control.cards) == len(run.cards) == 1 and run.before.issued == []
+    assert _bound(run) == _bound(control)                 # the same card, and on Accept the same task sequence
+    assert bool(run.issued) is (decision == "accept") and len(run.terminals) == 1
+    assert _delegated_brief(run) == _delegated_brief(control)        # one canonical brief for every later check
+    assert "bound this step to" not in _acknowledgment(control)       # a one-procedure brief passes through
+
+
+REJECTS = {
+    # name: (allowed_capabilities, other brief fields, refusal text, whether the binder ends the request)
+    "goal-only": ([DCSYNC], {}, f"runs `{ENSURE}`, not `{DCSYNC}`", True),
+    "two-others": ([DCSYNC, "forge-golden-ticket"], {}, f"runs `{ENSURE}`, not `{DCSYNC}`, `forge-golden-ticket`",
+                   True),
+    "collection": ([ENSURE, "collect-graph"], {}, "candidate_ref: only a catalog procedure step other than graph",
+                   False),
+    "control-plane": ([ENSURE, "control_plane"], {}, "`control_plane` cannot be combined with other classes", False),
+    "no-ref": ([ENSURE, DCSYNC], {"candidate_ref": ""}, "names no candidate_ref", True),
+    "unknown-ref": ([ENSURE, DCSYNC], {"candidate_ref": "cand-0000000000000000"}, "not supported by current evidence",
+                    True),
+    "callback": ([ENSURE, DCSYNC], {"callback_display_id": 13}, "runs on callback 14, not callback 13", True),
+    "reference": ([ENSURE, DCSYNC], {"inputs_by_reference": ["task:21", "task:40"]},   # a second, other proof task
+                  "does not use the input reference task:40", True),
+}
+
+
+@pytest.mark.parametrize("case", list(REJECTS))
+def test_a_listed_brief_that_cannot_bind_its_candidate_stays_refused(monkeypatch, tmp_path, case):
+    listed, fields, refusal, ends = REJECTS[case]
+    mt, split = _client(monkeypatch, tmp_path)
+
+    run = asyncio.run(_run(_state_for(mt, ENSURE), split, [_select(ENSURE, allowed_capabilities=listed,
+                                                                   targets=["child.lab.local"], **fields)]))
+
+    assert run.cards == [] and run.issued == [] and run.outcomes == []
+    assert run.briefs[0][0] == "rejected" and refusal in run.briefs[0][1], run.briefs
+    [terminal] = run.terminals
+    content = str(terminal.get("content") or "")
+    assert ("Blocked" in content and "could not bind this catalog step" in content) is ends, content
+
+
+def test_unknown_names_in_a_listed_brief_are_refused_before_admission(monkeypatch, tmp_path):
+    mt, split = _client(monkeypatch, tmp_path)
+
+    run = asyncio.run(_run(_state_for(mt, ENSURE), split, [_select(ENSURE, allowed_capabilities=[ENSURE, "dcsync"],
+                                                                   targets=["child.lab.local"])]))
+
+    assert run.cards == [] and run.issued == [] and run.outcomes == []
+    assert ("accepted", "Mythic_Operator") not in run.briefs
+
+
+def test_after_the_bound_prerequisite_settles_the_next_view_offers_the_goal_procedure(monkeypatch, tmp_path):
+    listed, targets = LISTED["run4-422"]
+    mt, split = _client(monkeypatch, tmp_path)
+    _state_for(_state_for(mt, ENSURE), DCSYNC)
+    views, record = [], mt._record_step_ledger
+
+    async def settle(references, task_ids):
+        # SYNTHETIC: the fixture's inert task output proves no Kerberos context, so the effect the accepted procedure
+        # exists to prove is seeded at its settlement, after its tasks were issued and before the next view.
+        result = await record(references, task_ids)
+        seed_ledger(mt, hops=[_proof_hop("kerberos-context:child.lab.local@callback:14", 41, callback_id="14")])
+        return result
+
+    monkeypatch.setattr(mt, "_record_step_ledger", settle)
+    goal = _select(DCSYNC, index=2)
+
+    def next_step(messages):
+        views.append([line[1] for line in _listed(messages)])
+        return goal(messages)                             # a scripted selection: wiring, not the model's choice
+
+    run = asyncio.run(_run(mt, split, [_select(ENSURE, allowed_capabilities=listed, targets=targets), next_step]))
+
+    assert DCSYNC not in [line[1] for line in _listed(run.fake.inputs[0])]
+    assert run.issued and views and DCSYNC in views[0]
+    # Every card emitted in order: the accepted prerequisite, then the goal procedure on the same callback.
+    assert [card["data"]["arguments"]["action"]["name"] for card in run.all_cards] == [ENSURE, DCSYNC]
+    assert run.all_cards[-1]["data"]["arguments"]["inputs"]["callback_id"] == "14"
 
 
 # --- the pure binding --------------------------------------------------------------------------------------------
@@ -671,3 +821,16 @@ def test_a_supplied_reference_pins_a_forge_key_and_is_never_ignored():
     assert cb.bind(brief("cred:500", "cred:501", "task:21"), (item,))[0].inputs["credential_proof_task_id"] == "21"
     assert "does not use the input reference task:30" in cb.bind(brief("task:21", "task:30"), (item,))[1]
     assert cb.REFERENCE_PROCEDURES == MythicTools._KRBTGT_FORGE_CAPABILITIES
+
+
+def test_a_brief_binds_its_candidate_when_it_also_lists_other_procedures():
+    [item] = cb.candidates("r", [(GPO_ACTION, INPUTS)])
+
+    def brief(*procedures):
+        return hb.HandoffBrief.from_args(allowed_capabilities=list(procedures), callback_display_id=14,
+                                         candidate_ref=item.ref)
+
+    for procedures in ([item.procedure, "dcsync-krbtgt"], ["dcsync-krbtgt", item.procedure]):
+        assert cb.bind(brief(*procedures), (item,)) == (item, "")
+    assert cb.bind(brief("dcsync-krbtgt", "forge-golden-ticket"), (item,)) == (
+        None, f"candidate_ref {item.ref} runs `{item.procedure}`, not `dcsync-krbtgt`, `forge-golden-ticket`")

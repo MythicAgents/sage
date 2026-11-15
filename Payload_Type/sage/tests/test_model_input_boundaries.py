@@ -8,8 +8,10 @@ output; zero-task assertions below concern the proposal turn after that setup.
 A catalog step's targets are recorded annotations of its candidate: any form,
 including a host the candidate does not name, cards that candidate's action once.
 
-The run 2/3 corpus (`catalog_brief_targets.json`) replays each recorded target shape
-of a non-collection catalog brief against a real candidate of the same procedure.
+The run 2/3 corpus (`catalog_brief_targets.json`, plus one run 4 row) replays each
+recorded target shape of a non-collection catalog brief against a real candidate of
+the same procedure. A brief that selected a candidate but listed two procedures cards
+that candidate's procedure alone.
 Its refs, callback and references are mapped to the fixture's (references are not
 replayed); collection and raw rows are inventoried and their target checks are
 tested in test_supervised_catalog_step_binding.py.
@@ -83,12 +85,13 @@ def test_handoff_targets_reach_native_consumer(monkeypatch, tmp_path, no_network
 
 
 def test_recorded_catalog_briefs_are_inventoried():
-    assert len(ROWS) == 42 and sum(row["candidate_ref"] for row in ROWS) == 30
+    assert len(ROWS) == 43 and sum(row["candidate_ref"] for row in ROWS) == 31
     assert Counter(row["recorded_refusal"] for row in ROWS) == {
-        "none": 26, "brief-target": 6, "binder-target": 5, "reference": 3, "candidate-on-collection": 1, "repeat": 1}
+        "none": 26, "brief-target": 6, "binder-target": 5, "reference": 3, "candidate-on-collection": 1, "repeat": 1,
+        "binder-procedure": 1}
     kinds = Counter("collection" if "collect-graph" in row["allowed_capabilities"] else
                     "catalog" if row["allowed_capabilities"] else "raw" for row in ROWS)
-    assert kinds == {"catalog": 29, "collection": 5, "raw": 8} and len(CATALOG_ROWS) == 29
+    assert kinds == {"catalog": 30, "collection": 5, "raw": 8} and len(CATALOG_ROWS) == 30
     # Every recorded target refusal was a catalog brief's; each is replayed below.
     assert {row["id"] for row in ROWS if row["recorded_refusal"].endswith("-target")} <= {
         row["id"] for row in CATALOG_ROWS}
@@ -106,12 +109,8 @@ def test_recorded_catalog_target_shapes_card_their_candidate(monkeypatch, tmp_pa
         allowed_capabilities=row["allowed_capabilities"], targets=row["targets"])], decision=None))
 
     assert no_network == [] and run.issued == [] and run.before.worker_calls == 0
-    if len(row["allowed_capabilities"]) > 1:
-        # Two procedures in one step stay unbindable: no card, and the request ends blocked.
-        assert run.cards == [] and "runs `ensure-kerberos-context`, not" in run.briefs[0][1], run.briefs
-        [terminal] = run.terminals
-        assert "Blocked" in str(terminal.get("content"))
-        return
+    # A brief listing the selected candidate's procedure with the one it feeds binds that candidate alone.
     assert run.briefs == [("accepted", "Mythic_Operator")] and _brief_targets(run) == row["targets"]
     [card] = run.cards
     assert card["data"]["arguments"]["action"]["name"] == procedure
+    assert run.terminals == []

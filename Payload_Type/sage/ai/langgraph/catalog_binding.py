@@ -111,7 +111,10 @@ def credential_set(values: Any) -> list[str]:
 
 
 def bind(brief: Any, found: tuple[Candidate, ...] | None, *, reason: str = "") -> tuple[Candidate | None, str]:
-    """The one current candidate a catalog brief selects, or None and the factual reason it cannot be bound."""
+    """The one current candidate a catalog brief selects, or None and the factual reason it cannot be bound.
+
+    The brief must list the candidate's procedure; it may also list others (the procedure it feeds), which the step
+    does not run: admission narrows the step to the candidate's procedure."""
     procedures = tuple(getattr(brief, "allowed_capabilities", ()) or ())
     named = ", ".join(f"`{name}`" for name in procedures) or "the procedure"
     ref = str(getattr(brief, "candidate_ref", "") or "").strip()
@@ -127,7 +130,7 @@ def bind(brief: Any, found: tuple[Candidate, ...] | None, *, reason: str = "") -
         offered = sum(item.procedure in procedures for item in found)
         return None, (f"candidate_ref {ref} is not supported by current evidence; {offered} current candidate(s) "
                       f"run {named}")
-    if procedures != (candidate.procedure,):
+    if candidate.procedure not in procedures:
         return None, f"candidate_ref {ref} runs `{candidate.procedure}`, not {named}"
     callback = _callback(getattr(brief, "callback_display_id", ""))
     if callback != candidate.callback:
