@@ -219,7 +219,8 @@ def test_line_is_not_carried_into_a_later_request(monkeypatch, tmp_path, mythic_
     # Only the closing (its streamed chunk and its final response) carries the line: no card, tool or handoff.
     assert led and all(str(e["content"]).startswith(LEAD) and not (e.get("metadata") or {}).get("special_type")
                        for e in led)
-    assert LEAD not in second and later in second
+    # The later request ran no step, so its closing is Sage's zero-step notice (test_supervisor_report_provenance).
+    assert LEAD not in second and later not in second and "Sage has no completed step recorded" in second
 
 
 def test_reused_answer_is_led_and_a_sage_authored_final_is_not(monkeypatch, tmp_path, mythic_task_records):

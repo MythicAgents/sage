@@ -159,7 +159,7 @@ async def _run(mt, split, script, *, decision="accept", mode="supervised", auton
         snapshot = await model.graph.aget_state(model._graph_run_config(model._session_thread_id()))
         return SimpleNamespace(
             model=model, fake=fake, cards=cards, before=before, issued=calls.get("issued", []),
-            values=snapshot.values, all_cards=_cards(chat),
+            values=snapshot.values, all_cards=_cards(chat), emissions=chat.emissions,
             terminals=[e for e in chat.emissions if e.get("complete_request") and not (
                 isinstance(e.get("metadata"), dict) and e["metadata"].get("special_type") == "input_requested")],
             outcomes=_outcomes(snapshot.values.get("supervisor_messages", [])),

@@ -5452,14 +5452,18 @@ def _previous_reply_context(supervisor_messages: list[AnyMessage], request_id: s
         reply, request_id)
 
 
+def _persisted_step_outcomes(messages: list[AnyMessage], request_id: str) -> list[Mapping[str, Any]]:
+    """Sage's own step outcomes kept in a channel for one request: `_step_outcome` beside its `_request_id`, which only
+    Sage's step owner writes (model output cannot set either)."""
+    return [kwargs["_step_outcome"] for message in messages or []
+            for kwargs in (getattr(message, "additional_kwargs", {}) or {},)
+            if isinstance(kwargs.get("_step_outcome"), Mapping) and str(kwargs.get("_request_id") or "") == request_id]
+
+
 def _earlier_steps_context(supervisor_messages: list[AnyMessage], request_id: str) -> AIMessage | None:
     """One line per earlier supervised step in this request, from Sage's own step outcomes."""
     lines: list[str] = []
-    for message in supervisor_messages or []:
-        kwargs = getattr(message, "additional_kwargs", {}) or {}
-        outcome = kwargs.get("_step_outcome")
-        if not isinstance(outcome, Mapping) or str(kwargs.get("_request_id") or "") != request_id:
-            continue
+    for outcome in _persisted_step_outcomes(supervisor_messages, request_id):
         detail = f" ({outcome.get('detail')})" if outcome.get("detail") else ""
         tasks = ", ".join(str(task) for task in outcome.get("tasks_issued") or []) or "none"
         lines.append(f"- {outcome.get('worker')}: {outcome.get('status')}{detail}; Mythic tasks {tasks}; guarded "
@@ -5699,6 +5703,9 @@ def _terminal_execute_capability_report(
 _TURN_OUTCOME_COMPLETED = "completed"
 _TURN_OUTCOME_BLOCKED = "blocked"
 _TURN_OUTCOME_CHECKPOINT = "checkpoint"
+# Replaces every Supervisor model closing in an ordinary supervised request that has no step outcome from Sage's step
+# owner. Missing provenance is unverified, not proof that nothing ran, so the notice claims neither.
+_ZERO_STEP_NOTICE = "Sage has no completed step recorded for this request, so it cannot report an execution result."
 
 _TURN_END_BANNERS = {
     _TURN_OUTCOME_COMPLETED: "📊 **Final Report**",
@@ -6993,6 +7000,25 @@ class Model:
         kept = [item for item in getattr(self, "_request_step_outcomes", []) if item[0] == record.request_id]
         self._request_step_outcomes = [*kept, (record.request_id, outcome)]
         return outcome
+
+    async def _close_step_on_parent_command(
+        self, worker: str, state: Mapping[str, Any], state_key: str, channel: list[AnyMessage], bubble: ParentCommand,
+    ) -> None:
+        """Close an ordinary supervised step that a worker ended through the parent graph, through the same step owner
+        as a plain return, and add Sage's outcome to the command's Supervisor update. Outside one, nothing changes."""
+        update = getattr(bubble.args[0] if bubble.args else None, "update", None)
+        if worker == "Supervisor" or not isinstance(update, dict) or not self._ordinary_supervised_request():
+            return
+        # The delegation as invoked, then what this delegation's command carries back on the worker's channel.
+        messages = [*channel, *(update.get(state_key) or [])]
+        outcome = self._supervised_step_outcome(worker, messages)
+        if outcome is None:
+            return
+        await self._attach_step_references(outcome, messages)
+        step_message = AIMessage(content=_step_bounds.render_outcome(outcome), name="Sage", additional_kwargs={
+            "_step_outcome": outcome, "_request_id": str(state.get("_request_id") or "")})
+        _tag_msg(step_message, self._next_seq())
+        update["supervisor_messages"] = [*(update.get("supervisor_messages") or []), step_message]
 
     async def _attach_step_references(
         self, outcome: dict[str, Any] | None, messages: list[AnyMessage],
@@ -10518,7 +10544,8 @@ class Model:
                 elif isinstance(msg, AIMessage) and getattr(msg, 'name', None) == "Supervisor":
                     if msg.additional_kwargs.get("_is_final_report"):
                         if msg.additional_kwargs.get("_model_closing"):
-                            msg = self._lead_with_step_verdicts(msg)
+                            msg = await self._lead_with_step_verdicts(msg)
+                        withheld = bool(msg.additional_kwargs.get("_closing_withheld"))
                         # Keep the agent prefix first (nothing before it); the turn-end banner
                         # goes AFTER the prefix: 🤖[Supervisor]> 📊 **Final Report**\n<content>
                         # The banner classifies the ending: completed / blocked /
@@ -10535,7 +10562,7 @@ class Model:
                         try:
                             state_summary = (
                                 ""
-                                if _closing_content_is_proposals_json(msg.content)
+                                if withheld or _closing_content_is_proposals_json(msg.content)
                                 else await self._engagement_state_turn_summary_text()
                             )
                         except Exception as e:
@@ -10556,7 +10583,7 @@ class Model:
                         # _is_final_report tag) are unaffected, so the delegation path does not
                         # double-stream.
                         formatted = self._format_message_for_streaming(
-                            self._lead_with_step_verdicts(msg), agent_name="Supervisor")
+                            await self._lead_with_step_verdicts(msg), agent_name="Supervisor")
                         if formatted:
                             await self._stream_message_to_mythic(formatted)
                     elif _message_content_as_text(msg.content).strip():
@@ -10565,7 +10592,9 @@ class Model:
                         is_handoff = bool(tool_names) and all(
                             name.startswith("transfer_to_") for name in tool_names
                         )
-                        if is_handoff:
+                        # In ordinary supervised the delegation card shows the routing; the model's text beside the
+                        # transfer is written before any step ran, so it is not streamed.
+                        if is_handoff and not self._ordinary_supervised_request():
                             tool_ids = ",".join(str(tc.get("id") or "") for tc in tool_calls)
                             message_key = f"{tool_ids}|{_message_content_as_text(msg.content).strip()}"
                             streamed = getattr(self, "_streamed_supervisor_message_keys", None)
@@ -10580,13 +10609,38 @@ class Model:
                     else:
                         logger.debug(f"📨 [Stream] Suppressing Supervisor routing/respond_to_user message from user output")
 
-    def _lead_with_step_verdicts(self, message: AIMessage) -> AIMessage:
+    def _ordinary_supervised_request(self) -> str:
+        """The current request ID when it is ordinary supervised (not Autonomous Solve), else ""."""
+        contract = getattr(self, "_request_contract", None)
+        kind = getattr(getattr(getattr(contract, "stop_condition", None), "kind", None), "value", "")
+        if getattr(getattr(contract, "lane", None), "value", "") != "supervised_workflow" or kind != "actions_complete":
+            return ""
+        return str(getattr(contract, "request_id", "") or "")
+
+    async def _lead_with_step_verdicts(self, message: AIMessage) -> AIMessage:
         """A model-written closing as streamed: Sage's verification lines for this request's steps first
         (`step_bounds.verdict_lines`), then the model's text unchanged. Proposals JSON is exempt, and the stored
-        message is not changed (like the engagement-state table, the lines ride only in the streamed copy)."""
+        message is not changed (like the engagement-state table, the lines ride only in the streamed copy).
+
+        An ordinary supervised request with no step outcome from Sage's step owner (kept for this request, else
+        persisted in its checkpoint) gets `_ZERO_STEP_NOTICE` instead of the model's text, whatever outcome the model
+        declared, and the turn ends `blocked`. An unreadable checkpoint counts as no outcome: unverified."""
         request_id = str(getattr(getattr(self, "_request_contract", None), "request_id", "") or "")
-        lines = _step_bounds.verdict_lines(outcome for rid, outcome in getattr(self, "_request_step_outcomes", [])
-                                           if request_id and rid == request_id)
+        outcomes = [outcome for rid, outcome in getattr(self, "_request_step_outcomes", [])
+                    if request_id and rid == request_id]
+        if not outcomes and self._ordinary_supervised_request():
+            try:
+                snapshot = await self.graph.aget_state(self._graph_run_config(self._session_thread_id()))
+                outcomes = _persisted_step_outcomes(
+                    list((getattr(snapshot, "values", None) or {}).get("supervisor_messages") or []), request_id)
+            except Exception as exc:
+                logger.warning(f"closing provenance: checkpoint read failed ({type(exc).__name__}); unverified")
+            if not outcomes:
+                self._final_turn_outcome = _TURN_OUTCOME_BLOCKED
+                kwargs = {key: value for key, value in message.additional_kwargs.items() if key != "_turn_outcome"}
+                return message.model_copy(update={"content": _ZERO_STEP_NOTICE, "tool_calls": [],
+                                                  "additional_kwargs": {**kwargs, "_closing_withheld": True}})
+        lines = _step_bounds.verdict_lines(outcomes)
         if not lines or _closing_content_is_proposals_json(message.content):
             return message
         text = _message_content_as_text(message.content).strip()
@@ -11287,6 +11341,13 @@ class Model:
                     )
                 try:
                     result = await agent_runnable.ainvoke({"messages": _agent_input}, invoke_config)
+                except ParentCommand as bubble:
+                    # handback_to_supervisor (or a worker transfer) leaves before the step close below.
+                    try:
+                        await self._close_step_on_parent_command(node_name, state, state_key, _agent_input, bubble)
+                    except Exception as exc:  # the handback itself must still reach the parent graph
+                        logger.warning(f"[{node_name}] step close on handback failed ({type(exc).__name__})")
+                    raise
                 finally:
                     if execution_context_token is not None:
                         MCPManager.reset_execution_context(execution_context_token)
