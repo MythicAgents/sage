@@ -7019,6 +7019,8 @@ class Model:
             "_step_outcome": outcome, "_request_id": str(state.get("_request_id") or "")})
         _tag_msg(step_message, self._next_seq())
         update["supervisor_messages"] = [*(update.get("supervisor_messages") or []), step_message]
+        # The command recorded the counter before this message took its number.
+        update["_message_seq"] = max(int(update.get("_message_seq") or 0), self._message_seq)
 
     async def _attach_step_references(
         self, outcome: dict[str, Any] | None, messages: list[AnyMessage],

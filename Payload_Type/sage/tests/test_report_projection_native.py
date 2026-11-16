@@ -110,7 +110,13 @@ def test_stored_observations_and_conditional_followup_complete(tmp_path, monkeyp
         task_reads,
         AIMessage(content='{"proposals":[]}'),
         matrix.CASE.call("respond_to_user", {"reuse_latest_worker_answer": True}, 4),
+        # The follow-up recommendation goes through a real read-free step: in supervised chat a Supervisor answer
+        # with no step in its own request shows only Sage's no-step notice.
+        matrix.CASE.call("transfer_to_Mythic_Operator", {
+            "handoff_title": "recommend", "handoff_instruction": matrix.FOLLOWUPS[
+                "09_stored_enumeration"][0][1], **matrix.READ_BRIEF}, 5),
         AIMessage(content=proposal),
+        matrix.CASE.call("respond_to_user", {"reuse_latest_worker_answer": True}, 6),
     ]
     result, audit = run_scripted(matrix, candidate, limits, monkeypatch, tmp_path,
                                   "09_stored_enumeration", prompt, messages)
@@ -185,7 +191,8 @@ def test_structural_proposal_can_carry_unsupported_presupposition(tmp_path, monk
     assert all("existing domain administrator credentials" not in str(row["content"])
                for row in audit["observations"])
     assert any(event["format_valid"] for event in audit["events"])
-    assert audit["candidate_format_failures"] == []
+    # The claim is about the first request. The zero-step follow-up (request 2) shows only Sage's no-step notice.
+    assert [row for row in audit["candidate_format_failures"] if row["request_id"] != "chat:1:request:2"] == []
 
 
 @pytest.mark.parametrize("decision", ["accept", "reject"])

@@ -25,6 +25,7 @@ from langchain_core.messages import ToolMessage
 # process state leaks into it that is not yet traced. Run in the offline suite's serial pass until it is.
 pytestmark = pytest.mark.serial
 
+NO_STEP_NOTICE = "Sage has no completed step recorded for this request, so it cannot report an execution result."
 SCRIPT = (Path(__file__).resolve().parents[3] / "skills" /
           "sage-focused-capability-tests" / "scripts" / "run_real_model_human_led_case.py")
 
@@ -1431,7 +1432,9 @@ def test_recon_followup_steering_cases_use_same_guarded_two_turn_path(
     assert [turn for turn, _messages in observed] == ["first", "second"]
     second_input = "\n".join(str(message.content) for message in observed[1][1])
     assert getattr(module, followup) in second_input
-    assert result["followup_emissions"][-1]["content"].strip() == reply
+    # The follow-up runs no step in its own supervised request, so the operator sees Sage's no-step notice.
+    assert result["followup_emissions"][-1]["content"].strip() == NO_STEP_NOTICE
+    assert all(reply not in str(row.get("content") or "") for row in result["followup_emissions"])
 
 
 def test_recon_steering_case_inputs_are_fixed():
@@ -1497,7 +1500,9 @@ def test_recon_source_withdrawal_recap_assembled_three_turns(monkeypatch):
     assert result["followup_sent"] is result["third_sent"] is True
     assert [result[name] for name in ("first_terminal_count", "second_terminal_count",
                                       "third_terminal_count")] == [1, 1, 1]
-    assert result["third_emissions"][-1]["content"].strip() == third_reply
+    # Neither follow-up runs a step in its own supervised request, so each shows Sage's no-step notice.
+    assert result["third_emissions"][-1]["content"].strip() == NO_STEP_NOTICE
+    assert all(third_reply not in str(row.get("content") or "") for row in result["third_emissions"])
     assert result["evidence_reads"] == [51, 52]
     assert result["effect_calls"] == []
     assert result["card_count"] == 0
