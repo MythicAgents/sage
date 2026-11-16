@@ -489,6 +489,28 @@ def test_archive_exports_the_archived_cut_and_carries_the_ledger_only_between_ar
         assert (runtime / ".sage_engagement" / "decision_records" / "seal.json").exists()
 
 
+def test_a_reset_into_an_archive_dir_exports_the_ledger_there_and_starts_the_next_database_without_it(tmp_path):
+    archiver = _load_archiver()
+    runtime = tmp_path / "Payload_Type" / "sage"
+    runtime.mkdir(parents=True)
+    database = runtime / "sage.db"
+    store = store_mod.EngagementStore(database, legacy_dir=str(tmp_path / "none"))
+    binding = store.bind_namespace("archived-op")
+    store.apply(binding, store_mod.hop_mutations([], [_hop("gpo-abuse", "a", "system:a", "pending")]))
+    archive = tmp_path / "evidence" / "reset-20261116-1200" / "local"
+
+    moves = archiver.archive_runtime_dbs(tmp_path, timestamp="20261116-1200", sage_database_path=database,
+                                         include_ledger=True, archive_dir=archive)
+
+    assert (archive / "sage.db", archive / "esl_exports") in moves
+    [export_path] = list((archive / "esl_exports").glob("*.esl.json"))
+    archived_store = store_mod.EngagementStore(archive / "sage.db", legacy_dir=str(tmp_path / "none"))
+    assert json.loads(export_path.read_text())["revision"] == archived_store.snapshot(
+        archived_store.find_binding("archived-op")).revision
+    assert not database.exists()
+    assert not list(runtime.glob("esl_exports*")) and not list(runtime.glob("sage_*.db"))
+
+
 def test_operator_invalidation_over_an_automatic_marker_stays_sticky_after_a_new_achievement():
     """Cold-review reproduction: an operator "no longer holds" must record even when an automatic marker exists."""
     tools = _session()

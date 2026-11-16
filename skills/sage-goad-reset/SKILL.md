@@ -9,7 +9,9 @@ Use from the repository root. The reset brings back the Sage named by `SAGE_DEPL
 tree in the `sage` tmux session), `container` (Mythic's Sage container built from the working tree) or
 `published` (the GHCR image `config.json` names, running that image's own code). See
 [Deployment modes](#deployment-modes). Mythic remains Docker-backed and is managed through `mythic-cli`. Do not
-delete runtime databases or retained archives.
+delete runtime databases or retained archives; move old archives off the host only with `offload_history.py`
+(see [Moving old archives off the host](#moving-old-archives-off-the-host)), which deletes a local copy only after
+verifying it.
 
 ## Invocation
 
@@ -122,43 +124,71 @@ executable path, and executable hash together before starting the task.
 It stops whichever is running (tmux through `sage_stop.sh`, the container through `mythic-cli stop sage`) and
 exits non-zero if either is still up. An absent `sage` tmux session is an already-stopped state.
 
-2. Preserve the run's evidence, then archive the active databases. The helper first copies the installed
-   container's `sage*.db`, `.phoenix/phoenix*.db` and `.sage_engagement/` with SQLite online backup (safe while
-   the container runs), and dumps Mythic's database with `pg_dump` inside its Postgres container, into
-   `.sage_history/runtime-db-archive/reset-YYYYMMDD-HHMM/` with a hashed `MANIFEST.json`. Only after every copy
-   verifies does it move the local databases beside their originals as `sage_YYYYMMDD-HHMM.db` and
-   `phoenix_YYYYMMDD-HHMM.db`. A failed copy stops here and nothing is moved, so the reset does not continue.
-   It never overwrites an existing archive. The installed directory comes from `MYTHIC_ENV_PATH`; without it the
-   container copy is skipped and recorded in the manifest:
+2. Preserve the run's evidence, then move the serving Sage's state into the same folder. Each reset writes one
+   self-contained `.sage_history/runtime-db-archive/reset-YYYYMMDD-HHMM/` with a hashed `MANIFEST.json`:
+
+   - `mythic_db.pgdump`: Mythic's database, dumped with `pg_dump` inside its Postgres container.
+   - `local/` (tmux) or `installed/` (container, published): the serving Sage's `sage.db`,
+     `sage_operation_memory.db`, `.phoenix/phoenix.db` (each with its `-wal`/`-shm`), its `.sage_engagement/`
+     ledger and `esl_exports/`. These are moved (renamed on one filesystem), not copied, so nothing is left
+     beside the live databases and each run is stored once.
+   - With the local target, `installed/` also holds copies of the container's serving databases and ledger,
+     taken with SQLite online backup, because a container may have run since its own last reset.
+
+   The copies run first, and only after every one verifies does anything move, so a failed copy stops here and
+   the reset does not continue. It never overwrites an existing folder, and a folder on another filesystem from
+   the databases is refused before anything moves. The installed directory comes from `MYTHIC_ENV_PATH`; without
+   it the container copy is skipped and recorded in the manifest:
 
 ```bash
 .venv/bin/python skills/sage-goad-reset/scripts/archive_reset_evidence.py                     # local
 .venv/bin/python skills/sage-goad-reset/scripts/archive_reset_evidence.py --target installed  # container, published
 ```
 
-   Data an earlier reset already preserved is referenced in the manifest instead of copied again (matched by
-   size and timestamps, else by the copy's SHA-256, and only while that earlier copy still exists). The local
-   target also moves the tmux Sage's ledger, `Payload_Type/sage/.sage_engagement`, aside as
-   `.sage_engagement_<stamp>` (standalone `archive_runtime_dbs.py` does so only with `--include-ledger`, so the
-   eval gauge's between-arm teardowns are unchanged). **Do not delete an evidence folder that later folders
-   reference**: a later manifest item with `already_preserved: reset-<stamp>/...` holds no copy of its own, so
-   removing `reset-<stamp>` loses that data. Search the later manifests for the folder name first. `--target installed` moves the container's own state instead: `sage.db`, `.phoenix/phoenix.db` and
-   `.sage_engagement/` inside the installed service directory, leaving the repo's databases (the local Sage's)
-   alone. Mythic reuses channel and operation ids after its reset, so state left there makes the next run
-   refuse its first prompt or start from an old run's facts.
+   Every folder holds its own bytes, so any folder can be moved off the host or deleted on its own. Folders
+   written before 2026-11-16 may instead carry `already_preserved: reset-<stamp>/...` items that point into an
+   earlier folder; `offload_history.py` keeps such an earlier folder until the folders that point at it go too.
+   Stamped files that older resets left beside the databases (`sage_<stamp>.db`, `.phoenix/phoenix_<stamp>.db`,
+   `.sage_engagement_<stamp>/`) are not copied again; offload them. `--target installed` moves the container's
+   state and leaves the repo's databases (the local Sage's) alone. Mythic reuses channel and operation ids after
+   its reset, so state left in place makes the next run refuse its first prompt or start from an old run's facts.
 
    Step 3 wipes Mythic's database, including every task's output. Pass `--skip-mythic-dump` only when that
    history is deliberately not needed; the manifest records the skip. `archive_runtime_dbs.py` remains the
-   local-only move for callers that do not reset Mythic.
+   local-only move for callers that do not reset Mythic. Without `--archive-dir` it renames each database beside
+   itself (`sage_<stamp>.db`), which the eval gauge's between-arm teardown expects; those files stay until offloaded.
 
    The Engagement State Ledger (ESL) lives in `sage.db`. Every archive writes JSON exports of it from the
-   archived snapshot (`esl_exports_<stamp>/` beside the archived database, with a manifest); evidence copies get
-   exports from their own backup under `installed/esl_exports/`. The reset (`--include-ledger`, and the installed
-   target) starts the next database without the ESL. A standalone `archive_runtime_dbs.py` without
+   archived snapshot (`esl_exports/` in the reset folder, or `esl_exports_<stamp>/` beside a database renamed in
+   place, with a manifest); evidence copies get exports from their own backup under `installed/esl_exports/`.
+   The reset (`--include-ledger`, and the installed target) starts the next database without the ESL. A standalone `archive_runtime_dbs.py` without
    `--include-ledger` (the eval gauge between arms) carries the complete ESL tables, their sequences, import
    records and objective settings into a fresh `sage.db`; checkpoints and findings are not carried. Every
    destination is preflighted before anything moves, and a failed export or carry-forward leaves the archived
    database in place.
+
+### Moving old archives off the host
+
+Reset folders and stamped leftovers accumulate until something moves them. `offload_history.py` copies every
+item older than `--older-than-days` (default 7) to a drive, checks each file's SHA-256 against the original, and
+deletes the local copy only when every file of that item matches:
+
+```bash
+.venv/bin/python skills/sage-goad-reset/scripts/offload_history.py --to <drive>/.sage_history          # plan only
+.venv/bin/python skills/sage-goad-reset/scripts/offload_history.py --to <drive>/.sage_history --yes    # move
+```
+
+- Reset folders go to `<to>/runtime-db-archive/<name>/`. Stamped files beside the live databases go to
+  `<to>/rotated-dbs/local/` (from `Payload_Type/sage`) and `<to>/rotated-dbs/installed/` (from the installed
+  service directory, found through `MYTHIC_ENV_PATH`). Only names of the form `sage_<stamp>.db`,
+  `sage_operation_memory_<stamp>.db`, `.phoenix/phoenix_<stamp>.db` (with `-wal`, `-shm` or `.zst`),
+  `.sage_engagement_<stamp>/` and `esl_exports_<stamp>/` qualify; the live databases and source files never do.
+- `--to` (or `SAGE_HISTORY_OFFLOAD_DIR`) must be an existing directory on a different filesystem, so an unmounted
+  drive's empty mount point is refused instead of filling this disk.
+- A destination file that already exists is reused only when its hash matches, so an interrupted run can be
+  repeated. A database moves together with its `-wal`/`-shm`.
+- A folder that a folder staying behind still references (`already_preserved`) is kept and named; widen
+  `--older-than-days` to move both.
 
 ### Engagement State Ledger migration and export
 
@@ -375,8 +405,9 @@ same directory, and the MCP loads its BloodHound URL and token from its own `.en
 
 - `_sage_relaunch.py`
 - `sage_runtime_env.py` (resolves a Sage runtime setting in Sage's own order; `mcp-run` for BloodHound MCP scripts)
-- `archive_reset_evidence.py` (copies container databases and dumps Mythic before the reset, then archives)
+- `archive_reset_evidence.py` (dumps Mythic and moves the serving Sage's state into one folder per reset)
 - `archive_runtime_dbs.py`
+- `offload_history.py` (moves old archives and stamped leftovers to another drive, verified by SHA-256)
 - `bh_reset.py`
 - `check_cross_forest_laps_bridge.py`
 - `liveness.py`

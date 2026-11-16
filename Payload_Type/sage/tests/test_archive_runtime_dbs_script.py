@@ -1,8 +1,10 @@
 import importlib.util
 from pathlib import Path
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 
 import pytest
 
@@ -177,3 +179,61 @@ def test_archived_ledgers_are_ignored_by_git_and_docker():
         cwd=repo, capture_output=True, text=True, check=False,
     )
     assert result.returncode == 0, "an archived ledger must never show up as untracked"
+
+
+def test_archive_dir_moves_everything_under_its_served_names_and_leaves_nothing_beside_it(tmp_path):
+    sage_db, operation_memory_db, phoenix_db = make_runtime_dbs(tmp_path)
+    runtime = sage_db.parent
+    (runtime / ".sage_engagement").mkdir()
+    (runtime / ".sage_engagement" / "seal.json").write_text("{}")
+    archive = tmp_path / "evidence" / "reset-20261116-1200" / "local"
+
+    moves = archive_runtime_dbs.archive_runtime_dbs(tmp_path, timestamp="20261116-1200", include_ledger=True,
+                                                    archive_dir=archive)
+
+    assert moves == [(sage_db, archive / "sage.db"),
+                     (operation_memory_db, archive / "sage_operation_memory.db"),
+                     (phoenix_db, archive / ".phoenix" / "phoenix.db"),
+                     (runtime / ".sage_engagement", archive / ".sage_engagement")]
+    for (_source, target), content in zip(moves, ("checkpoint", "operation-memory", "trace")):
+        assert target.read_text(encoding="utf-8") == content
+        for suffix in ("-wal", "-shm"):
+            assert target.with_name(target.name + suffix).read_text(encoding="utf-8") == content + suffix
+    assert (archive / ".sage_engagement" / "seal.json").exists()
+    assert sorted(p.name for p in runtime.rglob("*")) == [".phoenix"], "nothing stamped is left behind"
+
+
+def test_archive_dir_cli_reports_each_move(tmp_path):
+    sage_db, _operation_memory_db, _phoenix_db = make_runtime_dbs(tmp_path)
+    archive = tmp_path / "archive"
+    env = {key: value for key, value in os.environ.items() if key != "SAGE_DATABASE_PATH"}
+    result = subprocess.run([sys.executable, str(SCRIPT), "--repo-root", str(tmp_path), "--timestamp",
+                             "20261116-1200", "--archive-dir", str(archive)], env=env,
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert f"Archived {sage_db} -> {archive / 'sage.db'}" in result.stdout
+    assert not sage_db.exists() and (archive / "sage.db").read_text(encoding="utf-8") == "checkpoint"
+
+
+def _other_filesystem(tmp_path: Path) -> Path:
+    for candidate in (Path("/dev/shm"), Path("/run/user") / str(os.getuid())):
+        try:
+            if candidate.is_dir() and os.access(candidate, os.W_OK) and \
+                    candidate.stat().st_dev != tmp_path.stat().st_dev:
+                return candidate
+        except OSError:
+            continue
+    pytest.skip("needs a writable directory on a second filesystem")
+
+
+def test_an_archive_dir_on_another_filesystem_is_refused_before_anything_moves(tmp_path):
+    databases = make_runtime_dbs(tmp_path)
+    other = Path(tempfile.mkdtemp(dir=_other_filesystem(tmp_path)))
+    try:
+        with pytest.raises(OSError, match="different filesystem"):
+            archive_runtime_dbs.archive_runtime_dbs(tmp_path, timestamp="20261116-1200",
+                                                    archive_dir=other / "local")
+        assert all(database.exists() for database in databases)
+        assert not any((other / "local").iterdir())
+    finally:
+        shutil.rmtree(other)

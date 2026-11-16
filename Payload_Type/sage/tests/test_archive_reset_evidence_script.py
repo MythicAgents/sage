@@ -1,6 +1,8 @@
 import importlib.util
 import json
 from pathlib import Path
+import re
+import shutil
 import sqlite3
 import subprocess
 
@@ -64,7 +66,7 @@ def _rows(path: Path) -> int:
         conn.close()
 
 
-def test_live_wal_databases_are_copied_with_uncheckpointed_rows_and_sources_untouched(tmp_path):
+def test_live_wal_serving_databases_are_copied_with_uncheckpointed_rows_and_sources_untouched(tmp_path):
     env, installed, conns = _install(tmp_path)
     before = {p: p.stat().st_mtime_ns for p in installed.rglob("*") if p.is_file()}
     docker = _FakeDocker()
@@ -75,8 +77,10 @@ def test_live_wal_databases_are_copied_with_uncheckpointed_rows_and_sources_unto
 
     out = tmp_path / "out" / "installed"
     assert _rows(out / "sage.db") == 5
-    assert _rows(out / "sage_20261029-1902.db") == 2
     assert _rows(out / ".phoenix" / "phoenix.db") == 3
+    # A stamped file beside the live databases is an older reset's history, not this run's evidence. Copying
+    # every one on each reset is what grew the archive by gigabytes per reset (2026-11-04 and 2026-11-16).
+    assert not (out / "sage_20261029-1902.db").exists()
     assert (out / ".sage_engagement" / "decision_records" / "chat_3_request_1.seal.json").read_text() == '{"sealed": true}'
     assert not (out / "sage.db.controller.1.4.lock").exists()
     assert {p: p.stat().st_mtime_ns for p in installed.rglob("*") if p.is_file()} == before
@@ -126,9 +130,14 @@ def test_success_preserves_evidence_then_archives_local_databases(tmp_path, caps
                    "--timestamp", "20261030-0900", "--mythic-env-path", str(env)], run=_FakeDocker())
 
     summary = json.loads(capsys.readouterr().out)
-    assert summary["evidence_dir"].endswith("reset-20261030-0900")
-    assert summary["archived"] == [[str(local_db), str(local_db.with_name("sage_20261030-0900.db"))]]
+    folder = tmp_path / "ev" / "reset-20261030-0900"
+    assert summary["evidence_dir"] == str(folder)
+    assert summary["archived"] == [[str(local_db), str(folder / "local" / "sage.db")]]
     assert not local_db.exists()
+    assert (folder / "local" / "sage.db").read_text() == "checkpoint"
+    moved = {item["path"]: item for item in json.loads((folder / "MANIFEST.json").read_text())["items"]}
+    assert moved["local/sage.db"]["kind"] == "moved" and moved["local/sage.db"]["source"] == str(local_db)
+    assert len(moved["local/sage.db"]["sha256"]) == 64
     for conn in conns:
         conn.close()
 
@@ -169,14 +178,86 @@ def test_installed_target_moves_the_containers_state_and_leaves_the_repo_alone(t
         "--skip-mythic-dump", "--target", "installed",
     ]) == 0
 
-    assert not (installed / "sage.db").exists() and (installed / "sage_20261104-1200.db").exists()
-    assert not (installed / ".phoenix" / "phoenix.db").exists()
-    assert (installed / ".phoenix" / "phoenix_20261104-1200.db").exists()
+    folder = tmp_path / "evidence" / "reset-20261104-1200" / "installed"
+    assert not (installed / "sage.db").exists() and _rows(folder / "sage.db") == 5
+    assert not (installed / ".phoenix" / "phoenix.db").exists() and _rows(folder / ".phoenix" / "phoenix.db") == 3
     assert not (installed / ".sage_engagement").exists()
-    assert (installed / ".sage_engagement_20261104-1200" / "decision_records" / "chat_3_request_1.seal.json").exists()
+    assert (folder / ".sage_engagement" / "decision_records" / "chat_3_request_1.seal.json").exists()
     assert local_db.read_text() == "local tmux trace", "the local tmux databases belong to a different Sage"
     report = json.loads(capsys.readouterr().out)
     assert report["target"] == "installed"
+
+
+_STAMPED = re.compile(r"_\d{8}-\d{4}")
+
+
+def _stamped(directory: Path) -> list[str]:
+    return sorted(str(p.relative_to(directory)) for p in directory.rglob("*") if _STAMPED.search(p.name))
+
+
+def test_a_container_reset_leaves_nothing_stamped_beside_the_live_databases(tmp_path, capsys):
+    """Through 2026-11-15 every reset renamed the live databases beside themselves and also copied them into
+    its evidence folder, so each run was stored twice and the installed directory grew without bound."""
+    env_path, installed, conns = _install(tmp_path)
+    for conn in conns:
+        conn.close()
+
+    evidence.main(["--repo-root", str(tmp_path / "repo"), "--evidence-root", str(tmp_path / "evidence"),
+                   "--timestamp", "20261116-1200", "--mythic-env-path", str(env_path),
+                   "--skip-mythic-dump", "--target", "installed"])
+
+    assert _stamped(installed) == ["sage_20261029-1902.db"], "only the older reset's leftover, for offload"
+    folder = tmp_path / "evidence" / "reset-20261116-1200"
+    manifest = json.loads((folder / "MANIFEST.json").read_text())
+    by_path = {item["path"]: item for item in manifest["items"]}
+    assert by_path["installed/sage.db"]["source"] == str(installed / "sage.db")
+    assert "installed/sage_20261029-1902.db" not in by_path
+    for path, item in by_path.items():
+        assert evidence._sha256(folder / path) == item["sha256"]
+    capsys.readouterr()
+
+
+def test_a_tmux_reset_moves_its_state_into_the_folder_and_copies_only_the_containers_serving_databases(
+        tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv("SAGE_DATABASE_PATH", raising=False)
+    env_path, installed, conns = _install(tmp_path)
+    for conn in conns:
+        conn.close()
+    runtime = tmp_path / "repo" / "Payload_Type" / "sage"
+    _live_wal_db(runtime / "sage.db", 4).close()
+    _live_wal_db(runtime / ".phoenix" / "phoenix.db", 1).close()
+    (runtime / ".sage_engagement").mkdir()
+    (runtime / ".sage_engagement" / "seal.json").write_text("{}")
+
+    evidence.main(["--repo-root", str(tmp_path / "repo"), "--evidence-root", str(tmp_path / "evidence"),
+                   "--timestamp", "20261116-1300", "--mythic-env-path", str(env_path), "--skip-mythic-dump"])
+
+    folder = tmp_path / "evidence" / "reset-20261116-1300"
+    assert _stamped(runtime) == []
+    assert not (runtime / "sage.db").exists() and _rows(folder / "local" / "sage.db") == 4
+    assert _rows(folder / "local" / ".phoenix" / "phoenix.db") == 1
+    assert (folder / "local" / ".sage_engagement" / "seal.json").exists()
+    assert _rows(folder / "installed" / "sage.db") == 5 and (installed / "sage.db").exists()
+    assert not (folder / "installed" / "sage_20261029-1902.db").exists()
+    capsys.readouterr()
+
+
+def test_each_folder_holds_its_own_copies_so_removing_an_earlier_one_loses_nothing(tmp_path):
+    """Folders used to reference an earlier folder's copy instead of holding one (`already_preserved`), so
+    deleting or offloading an old folder silently emptied every later folder that pointed at it."""
+    env, installed, conns = _install(tmp_path)
+    for conn in conns:
+        conn.close()
+    first = tmp_path / "evidence" / "reset-20261116-0900"
+    second = tmp_path / "evidence" / "reset-20261116-1000"
+    evidence.preserve_evidence(first, installed=installed, postgres_container=None)
+    manifest = evidence.preserve_evidence(second, installed=installed, postgres_container=None)
+
+    shutil.rmtree(first)
+
+    assert _rows(second / "installed" / "sage.db") == 5
+    assert _rows(second / "installed" / ".phoenix" / "phoenix.db") == 3
+    assert not any("already_preserved" in item for item in manifest["items"])
 
 
 def test_installed_target_refuses_without_an_install(tmp_path):
@@ -185,92 +266,3 @@ def test_installed_target_refuses_without_an_install(tmp_path):
             "--repo-root", str(tmp_path), "--evidence-root", str(tmp_path / "evidence"),
             "--mythic-env-path", "", "--skip-mythic-dump", "--target", "installed",
         ])
-
-
-def _preserve(tmp_path: Path, installed: Path, stamp: str, monkeypatch=None, backed_up: list | None = None):
-    if backed_up is not None and monkeypatch is not None:
-        real = evidence.backup_sqlite
-        monkeypatch.setattr(evidence, "backup_sqlite", lambda s, d: backed_up.append(s.name) or real(s, d))
-    return evidence.preserve_evidence(tmp_path / "evidence" / f"reset-{stamp}", installed=installed,
-                                      postgres_container=None)
-
-
-def test_data_an_earlier_reset_already_holds_is_not_copied_again(tmp_path, monkeypatch):
-    """Each container reset used to re-copy every stamped archive into its new evidence folder (26 GB by
-    2026-11-04). Data already preserved is referenced, not duplicated; new data is still copied."""
-    env, installed, conns = _install(tmp_path)
-    for conn in conns:
-        conn.close()
-    first = _preserve(tmp_path, installed, "20261104-1000")
-
-    live = sqlite3.connect(installed / "sage.db")
-    live.execute("INSERT INTO t VALUES (99)")
-    live.commit()
-    live.close()
-    second = _preserve(tmp_path, installed, "20261104-1100")
-
-    by_path = {item["path"]: item for item in second["items"]}
-    archive = by_path["installed/sage_20261029-1902.db"]
-    assert archive["already_preserved"] == "reset-20261104-1000/installed/sage_20261029-1902.db"
-    assert not (tmp_path / "evidence" / "reset-20261104-1100" / "installed" / "sage_20261029-1902.db").exists()
-    assert archive["sha256"] == {i["path"]: i for i in first["items"]}["installed/sage_20261029-1902.db"]["sha256"]
-    assert "already_preserved" not in by_path["installed/sage.db"], "changed data is new evidence"
-    assert _rows(tmp_path / "evidence" / "reset-20261104-1100" / "installed" / "sage.db") == 6
-
-
-def test_unchanged_files_are_recognized_without_another_backup(tmp_path, monkeypatch):
-    env, installed, conns = _install(tmp_path)
-    for conn in conns:
-        conn.close()
-    _preserve(tmp_path, installed, "20261104-1000")
-    _preserve(tmp_path, installed, "20261104-1100")
-    backed_up: list[str] = []
-    third = _preserve(tmp_path, installed, "20261104-1200", monkeypatch, backed_up)
-
-    assert backed_up == [], "files whose size and timestamps match a recorded copy need no new backup"
-    assert all(item.get("already_preserved", "").startswith("reset-20261104-1000/")
-               for item in third["items"] if item["kind"] == "sqlite-backup")
-
-
-def test_an_earlier_copy_that_changed_size_is_not_trusted(tmp_path):
-    """The fresh backup is deleted on the earlier manifest's word, so that copy must still look intact."""
-    env, installed, conns = _install(tmp_path)
-    for conn in conns:
-        conn.close()
-    _preserve(tmp_path, installed, "20261104-1000")
-    earlier = tmp_path / "evidence" / "reset-20261104-1000" / "installed" / "sage_20261029-1902.db"
-    earlier.write_bytes(earlier.read_bytes()[:4096])
-    second = _preserve(tmp_path, installed, "20261104-1100")
-
-    archive = {i["path"]: i for i in second["items"]}["installed/sage_20261029-1902.db"]
-    assert "already_preserved" not in archive
-
-
-def test_a_source_that_changes_during_its_backup_records_no_reusable_identity(tmp_path, monkeypatch):
-    env, installed, conns = _install(tmp_path)
-    for conn in conns:
-        conn.close()
-    real = evidence.backup_sqlite
-
-    def backup_then_write(source, target):
-        info = real(source, target)
-        if source.name == "sage.db":
-            source.with_name("sage.db-wal").write_bytes(b"x" * 10)  # a write after the snapshot
-        return info
-
-    monkeypatch.setattr(evidence, "backup_sqlite", backup_then_write)
-    first = _preserve(tmp_path, installed, "20261104-1000")
-    assert "source" not in {i["path"]: i for i in first["items"]}["installed/sage.db"]
-
-
-def test_a_missing_earlier_copy_is_not_trusted(tmp_path):
-    env, installed, conns = _install(tmp_path)
-    for conn in conns:
-        conn.close()
-    _preserve(tmp_path, installed, "20261104-1000")
-    (tmp_path / "evidence" / "reset-20261104-1000" / "installed" / "sage_20261029-1902.db").unlink()
-    second = _preserve(tmp_path, installed, "20261104-1100")
-
-    archive = {i["path"]: i for i in second["items"]}["installed/sage_20261029-1902.db"]
-    assert "already_preserved" not in archive
-    assert _rows(tmp_path / "evidence" / "reset-20261104-1100" / "installed" / "sage_20261029-1902.db") == 2
