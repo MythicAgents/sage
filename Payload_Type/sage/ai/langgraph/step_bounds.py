@@ -583,8 +583,8 @@ def render_outcome(outcome: Mapping[str, Any]) -> str:
                      "candidate's procedure, does not use them, so its action is the same without them.")
     if narrowed.get("dropped_proof_host"):
         dropped = narrowed["dropped_proof_host"]
-        lines.append(f"Sage dropped the proof host `{dropped.get('host')}` from this step: {dropped.get('reason')}. It "
-                     "did not refuse the step and reached no approval card or task.")
+        lines.append(f"Sage dropped the proof host `{dropped.get('host')}` from this step: {dropped.get('reason')}. The "
+                     "step ran without it (no approval card or task carries it); it did not refuse the step.")
     if outcome.get("refused_proposal"):
         lines.append(f"Refused proposal (Sage's record): {describe_refused_proposal(outcome['refused_proposal'])}. "
                      "It was not approved and not executed: Sage removed it before any approval card or Mythic task.")

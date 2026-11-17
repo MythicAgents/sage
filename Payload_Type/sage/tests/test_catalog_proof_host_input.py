@@ -130,9 +130,15 @@ def test_a_parent_kerberos_context_carries_the_operator_named_host(monkeypatch, 
 
 # --- (b) and (c) no host, or a host Sage may not use: the same card and refusal as without it ---------------------
 
+NAMED_HERE = "no operator input of this chat names it"
 NEAR = {
-    "unnamed-run2-758": ("", _RECORDED["run2-758"]["targets"][1], "no operator input of this chat names it"),
+    "unnamed-run2-758": ("", _RECORDED["run2-758"]["targets"][1], NAMED_HERE),
+    "supervisor-prose-only": ("", HOST, NAMED_HERE),
     "child-domain": ("Prove it on dc02.child.lab.local.", "dc02.child.lab.local", "not a host in lab.local"),
+    # The request already names child.lab.local, a domain Sage holds: its name and label are a domain, not a host.
+    "child-domain-name": ("", "child.lab.local", "a domain, not a host"),
+    "child-domain-label": ("", "CHILD", "a domain, not a host"),
+    "sibling-domain": ("Prove it on srv03.foreign.test.", "srv03.foreign.test", "not a host in lab.local"),
     "label-prefix": ("Prove it on dc012.lab.local.", HOST, "no operator input of this chat names it"),
     "label-inside-fqdn": ("Prove it on dc01.child.lab.local.", "dc01", "no operator input of this chat names it"),
     "bare-domain": ("Prove it on lab.local.", "lab.local", "a domain, not a host"),
@@ -144,7 +150,9 @@ NEAR = {
 @pytest.mark.parametrize("shape", ["none", *NEAR])
 def test_a_missing_or_unusable_host_leaves_todays_card_and_refusal(monkeypatch, tmp_path, shape):
     said, sent, reason = NEAR.get(shape, ("", "", ""))
-    brief = {"targets": _RECORDED["run2-758"]["targets"]} if shape.startswith("unnamed") else {}
+    brief = {"targets": _RECORDED["run2-758"]["targets"]} if shape.startswith("unnamed") else {
+        # Only the Supervisor's own instruction names the host; the operator's input does not.
+        "handoff_instruction": binding.PROMPT + f" Prove it on {HOST}."} if shape == "supervisor-prose-only" else {}
 
     run = _forge(monkeypatch, tmp_path, said, **brief, **({"proof_host": sent} if sent else {}))
 
@@ -230,11 +238,15 @@ def test_rebinding_the_stored_brief_pins_the_same_host_and_a_changed_call_is_ref
      {"domain": "north.lab.local", "target_domain": "lab.local"}, "dc01", HOST),
     (FORGE, "domain=north.lab.local;target_domain=lab.local",
      {"domain": "north.lab.local", "target_domain": "lab.local"}, "dc02.north.lab.local", ""),
+    *[(FORGE, "domain=north.lab.local;target_domain=lab.local",
+       {"domain": "north.lab.local", "target_domain": "lab.local"}, sent, "")
+      for sent in ("north.lab.local", "NORTH", "\\\\north.lab.local\\C$", "lab.local", "LAB")],
     (ENSURE, "domain=lab.local;callback=13;source_domain=north.lab.local",
      {"domain": "lab.local", "target_domain": "lab.local", "source_domain": "north.lab.local"}, "dc01.lab.local.",
      HOST),
     ("dcsync-krbtgt", "domain=lab.local", {"domain": "lab.local"}, HOST, ""),
-], ids=["parent-forge", "child-host-for-parent-forge", "parent-context", "no-service-proof"])
+], ids=["parent-forge", "child-host-for-parent-forge", "source-domain-name", "source-domain-label", "source-domain-unc",
+        "proof-domain-name", "proof-domain-label", "parent-context", "no-service-proof"])
 def test_the_pin_follows_the_domain_the_service_proof_must_prove(procedure, target, intent, sent, expected):
     found = _candidate(procedure, target, intent)
     bound, error = cb.bind(_brief(found, sent), (found,))
@@ -290,3 +302,16 @@ def test_steps_outside_catalog_binding_run_as_without_the_field(monkeypatch, tmp
     events = [dict(event.metadata) for event in host.model._request_event_ledger.actual_events(kind="brief")]
     assert [json.loads(event["proof_host_dropped"])["host"] for event in events] == ([] if lane == "autonomous-solve"
                                                                                      else [HOST]), events
+
+
+def test_a_host_admission_drops_never_rearms_an_explicit_collection_first_step():
+    from dataclasses import replace
+
+    from tests.test_supervised_request_closure import _explicit_hook_model
+
+    model = _explicit_hook_model(operator_callback="7", typed="7")
+    sent = hb.HandoffBrief.from_args(allowed_capabilities=["collect-graph"], callback_display_id="7",
+                                     targets=["north.test"], expected_result="Collected.", proof_host=HOST)
+    assert model._graph_collection_first_step("Mythic_Operator", sent, "", "collect") is None    # already the procedure
+    model._consume_admitted_first_step("Mythic_Operator", replace(sent, proof_host=""))     # as admission stores it
+    assert model._graph_first_step["done"] is True

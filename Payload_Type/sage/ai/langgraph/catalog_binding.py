@@ -42,6 +42,7 @@ REFERENCE_PROCEDURES = frozenset({"forge-golden-ticket", "ensure-kerberos-contex
 PROOF_HOST_PROCEDURES = frozenset({"forge-golden-ticket", "ensure-kerberos-context"})
 PROOF_HOST_INPUTS = ("proof_host", "proof_resource_source")
 PROOF_HOST_SOURCE = "operator-named"
+_DOMAIN_KEYS = ("domain", "source_domain", "target_domain", "effect_domain", "forge_domain")
 _HOST_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*")
 _TITLE = "[Sage catalog candidates — supported by current evidence, for this model call]"
 _OTHER_WORK = ("`collect-graph`, control-plane reads and explicit off-catalog tool steps (allowed_tools) remain "
@@ -175,9 +176,11 @@ def proof_domain(candidate: Candidate) -> str:
     return ""
 
 
-def qualified_proof_host(candidate: Candidate, value: Any) -> tuple[str, str]:
+def qualified_proof_host(candidate: Candidate, value: Any, known_domains: Iterable[str] = ()) -> tuple[str, str]:
     """(host, "") when `value` names one host of the domain the candidate's service proof must prove, qualified there
-    (case, a trailing dot, a first label or a UNC path's host are the same host); else ("", why it cannot be used)."""
+    (case, a trailing dot, a first label or a UNC path's host are the same host); else ("", why it cannot be used).
+    A domain's name is never a host: the candidate's own domains and `known_domains` (a child domain's DCs answer
+    for its name) are refused, as are the proof domain's first label and any name outside the proof domain."""
     if candidate.procedure not in PROOF_HOST_PROCEDURES:
         return "", f"`{candidate.procedure}` takes no proof host"
     domain = proof_domain(candidate)
@@ -189,9 +192,12 @@ def qualified_proof_host(candidate: Candidate, value: Any) -> tuple[str, str]:
         return "", "the bound action names no domain for its service proof"
     if not _HOST_RE.fullmatch(host) or host.replace(".", "").isdigit():     # an IPv6 literal fails the pattern
         return "", "it is not a host name"
-    if host in {domain, domain.split(".", 1)[0]}:
+    named = {_normalize(source.get(key)) for source in (candidate.action.get("intent"), _target_fields(
+        candidate.target), candidate.inputs) if isinstance(source, Mapping) for key in _DOMAIN_KEYS}
+    qualified = host if "." in host else f"{host}.{domain}"
+    if host == domain.split(".", 1)[0] or qualified in {domain, *named, *map(_normalize, known_domains)}:
         return "", "it names a domain, not a host"
-    host = host if "." in host else f"{host}.{domain}"
+    host = qualified
     if host.split(".", 1)[1] != domain:
         return "", f"it is not a host in {domain}, the domain this step's service proof must prove"
     return host, ""

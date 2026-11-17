@@ -7054,7 +7054,7 @@ class Model:
 
     def _admit_proof_host(
         self, brief: "_handoff_brief.HandoffBrief", candidate: Any,
-        inputs: Iterable["_handoff_brief.OperatorTargetInput"],
+        inputs: Iterable["_handoff_brief.OperatorTargetInput"], domains: Iterable[str] = (),
     ) -> tuple["_handoff_brief.HandoffBrief", dict[str, str]]:
         """Keep a brief's `proof_host` only when its bound candidate's service proof may target it and an operator input
         of this chat names it; otherwise drop it with the reason, never refusing the step. Returns the brief and its
@@ -7062,7 +7062,7 @@ class Model:
         sent = brief.proof_host
         if not sent:
             return brief, {}
-        host, reason = (_catalog_binding.qualified_proof_host(candidate, sent) if candidate is not None else (
+        host, reason = (_catalog_binding.qualified_proof_host(candidate, sent, domains) if candidate is not None else (
             "", "only a step bound to a current forge-golden-ticket or ensure-kerberos-context candidate takes one"))
         source = _handoff_brief.operator_host_source(host, inputs) if host else None
         if source is not None:
@@ -7134,7 +7134,7 @@ class Model:
         proof_metadata: dict[str, str] = {}
         if not errors:
             current = _handoff_brief.OperatorTargetInput(str(state.get("_request_id") or ""), revision, operator_input)
-            admitted, proof_metadata = self._admit_proof_host(admitted, candidate, (*history, current))
+            admitted, proof_metadata = self._admit_proof_host(admitted, candidate, (*history, current), scope.domains)
         restatement = _handoff_brief.restatement(instruction, operator_input)
         metadata = {
             "worker": worker,
@@ -19033,6 +19033,7 @@ def _callback_inventory_refusal(message: Any) -> str:
 def _admission_key(worker: str, brief: Any) -> tuple[str, str]:
     """Identity of one delegation as the brief check admits it: its worker and exact structural brief."""
     metadata = brief.as_metadata() if isinstance(brief, _handoff_brief.HandoffBrief) else {}
+    metadata.pop("proof_host", None)  # admission may drop it; collection never reads it
     return worker, json.dumps(metadata, sort_keys=True)
 
 
