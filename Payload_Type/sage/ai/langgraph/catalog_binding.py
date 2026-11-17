@@ -16,13 +16,16 @@ import json
 from typing import Any, Iterable, Mapping
 
 try:
+    from .capabilities import refreshes_kerberos_context
     from .request_contract import action_fingerprint
 except ImportError:  # pragma: no cover - flat import layout
+    from capabilities import refreshes_kerberos_context
     from request_contract import action_fingerprint
 
 MAX_CHARS = 6000
 # A brief's `cred:`/`task:` reference becomes the input a procedure binds a proved key by (`credential_id`,
-# `credential_proof_task_id`), only for the procedures whose executor reads it (MythicTools._KRBTGT_FORGE_CAPABILITIES).
+# `credential_proof_task_id`), only for the procedures whose executor reads it (MythicTools._KRBTGT_FORGE_CAPABILITIES)
+# and only when the candidate reads a key: an `ensure-kerberos-context` flagged to refresh reads none.
 REFERENCE_INPUTS = {"cred": "credential_id", "task": "credential_proof_task_id"}
 # Several `cred:` references name rows of one key set; the executor resolves them to one proof (`credential_ids`).
 REFERENCE_SET_INPUT = "credential_ids"
@@ -116,13 +119,15 @@ def _reference_use(brief: Any, candidate: Candidate) -> tuple[dict[str, list[str
     bound = list(_values({"action": candidate.action, "inputs": candidate.inputs}))
     supplied: dict[str, list[str]] = {"cred": [], "task": []}
     unused: list[str] = []
+    pins_key = candidate.procedure in REFERENCE_PROCEDURES and not refreshes_kerberos_context(
+        candidate.action.get("intent"), candidate.inputs)
     for reference in getattr(brief, "inputs_by_reference", ()) or ():
         kind, _, number = str(reference).lstrip("@").partition(":")
         word = "task" if kind == "task" else "cred"
         if any(word in key and text == number for key, text in bound):
             continue
-        if candidate.procedure not in REFERENCE_PROCEDURES:
-            # A procedure that binds no key by reference never reads it: its action is the same without it, so
+        if not pins_key:
+            # A candidate that binds no key by reference never reads it: its action is the same without it, so
             # admission drops it from the step and the step outcome names it.
             unused.append(reference)
             continue
@@ -143,8 +148,8 @@ def bind(brief: Any, found: tuple[Candidate, ...] | None, *, reason: str = "") -
     """The one current candidate a catalog brief selects, or None and the factual reason it cannot be bound.
 
     The brief must list the candidate's procedure; it may also list others (the procedure it feeds), which the step
-    does not run: admission narrows the step to the candidate's procedure. Likewise a held reference that a procedure
-    outside REFERENCE_PROCEDURES does not use is dropped at admission (`unused_references`), not refused."""
+    does not run: admission narrows the step to the candidate's procedure. Likewise a held reference that a candidate
+    reading no key does not use is dropped at admission (`unused_references`), not refused."""
     procedures = tuple(getattr(brief, "allowed_capabilities", ()) or ())
     named = ", ".join(f"`{name}`" for name in procedures) or "the procedure"
     ref = str(getattr(brief, "candidate_ref", "") or "").strip()

@@ -1,7 +1,7 @@
 {
  "provenance": {
   "kind": "recorded model-output shapes with synthetic current state",
-  "description": "Every catalog-relevant Supervisor brief of two retained supervised runs (42 rows), from a third run the brief that selected one candidate but listed two procedures (row run4-422), and from a fourth run the two briefs that selected an offered dcsync-account candidate and supplied a held task that candidate does not use (rows run5-1164 and run5-1186, TOOL spans 1164 and 1186): their scope fields, target list and the refusal their recorded result shows. Identities are consistently renamed (one replacement per original name, letter case kept); prose, candidate refs, callbacks and outputs are omitted. Candidates, callbacks, references and ledger state in the tests are synthetic, so this is not a replay of any run.",
+  "description": "Every catalog-relevant Supervisor brief of two retained supervised runs (42 rows), from a third run the brief that selected one candidate but listed two procedures (row run4-422), from a fourth run the two briefs that selected an offered dcsync-account candidate and supplied a held task that candidate does not use (rows run5-1164 and run5-1186, TOOL spans 1164 and 1186), and from a fifth run the two briefs that selected an offered ensure-kerberos-context refresh candidate (no krbtgt key read) and supplied a held task it does not use (rows run6-412 and run6-1419, TOOL spans 412 and 1419; their references are mapped by role to the fixture's tasks: the Domain Admins proof to task 40, the other realm's krbtgt proof to task 21): their scope fields, target list and the refusal their recorded result shows. Identities are consistently renamed (one replacement per original name, letter case kept); prose, candidate refs, callbacks and outputs are omitted. Candidates, callbacks, references and ledger state in the tests are synthetic, so this is not a replay of any run.",
   "preserved": "Target list order, duplicates, letter case, host/domain/principal/label forms, procedure names, whether a candidate_ref was sent, and the recorded reference spellings."
  },
  "rows": [
@@ -644,6 +644,38 @@
     "task:21"
    ],
    "recorded_refusal": "unused-reference"
+  },
+  {
+   "id": "run6-412",
+   "allowed_capabilities": [
+    "ensure-kerberos-context",
+    "dcsync-krbtgt"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "child.lab.local",
+    "DC02.CHILD.LAB.LOCAL"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [
+    "task:40"
+   ],
+   "recorded_refusal": "pinned-reference"
+  },
+  {
+   "id": "run6-1419",
+   "allowed_capabilities": [
+    "ensure-kerberos-context"
+   ],
+   "allowed_tools": [],
+   "targets": [
+    "lab.local"
+   ],
+   "candidate_ref": true,
+   "recorded_references": [
+    "task:21"
+   ],
+   "recorded_refusal": "pinned-reference"
   }
  ]
 }

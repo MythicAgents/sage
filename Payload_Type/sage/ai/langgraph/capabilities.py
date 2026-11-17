@@ -3916,6 +3916,12 @@ def _build_forge_golden_ticket_execution_plan(
     )
 
 
+def refreshes_kerberos_context(intent: Any, inputs: Any) -> bool:
+    """Whether an `ensure-kerberos-context` action is flagged to run its refresh plan, which reads no krbtgt key."""
+    return any(_input_bool(values, "refresh_current_context")
+               for values in (intent, inputs) if isinstance(values, dict))
+
+
 def _build_ensure_kerberos_context_execution_plan(
     action: CapabilityAction,
     inputs: dict[str, Any],
@@ -3940,11 +3946,7 @@ def _build_ensure_kerberos_context_execution_plan(
             reason="ensure-kerberos-context needs a target domain",
         )
     _key_type, key_value = _ticket_key(inputs, action.intent)
-    if (
-        _input_bool(action.intent, "refresh_current_context")
-        or _input_bool(inputs, "refresh_current_context")
-        or not key_value
-    ):
+    if refreshes_kerberos_context(action.intent, inputs) or not key_value:
         return _build_refresh_current_kerberos_context_execution_plan(action, inputs, target_domain)
     if not source_domain:
         return CapabilityExecutionPlan(

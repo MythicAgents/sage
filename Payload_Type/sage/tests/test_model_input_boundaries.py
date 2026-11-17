@@ -8,11 +8,11 @@ output; zero-task assertions below concern the proposal turn after that setup.
 A catalog step's targets are recorded annotations of its candidate: any form,
 including a host the candidate does not name, cards that candidate's action once.
 
-The run 2/3 corpus (`catalog_brief_targets.json`, plus one run 4 row and two run 5 rows)
+The run 2/3 corpus (`catalog_brief_targets.json`, plus one run 4 row and two rows each of runs 5 and 6)
 replays each recorded target shape of a non-collection catalog brief against a real
 candidate of the same procedure. A brief that selected a candidate but listed two
-procedures cards that candidate's procedure alone. The run 5 rows' unused references are
-replayed in test_supervised_catalog_step_binding.py.
+procedures cards that candidate's procedure alone. The run 5 and run 6 rows' unused references
+are replayed in test_supervised_catalog_step_binding.py.
 Its refs, callback and references are mapped to the fixture's (references are not
 replayed); collection and raw rows are inventoried and their target checks are
 tested in test_supervised_catalog_step_binding.py.
@@ -86,13 +86,13 @@ def test_handoff_targets_reach_native_consumer(monkeypatch, tmp_path, no_network
 
 
 def test_recorded_catalog_briefs_are_inventoried():
-    assert len(ROWS) == 45 and sum(row["candidate_ref"] for row in ROWS) == 33
+    assert len(ROWS) == 47 and sum(row["candidate_ref"] for row in ROWS) == 35
     assert Counter(row["recorded_refusal"] for row in ROWS) == {
         "none": 26, "brief-target": 6, "binder-target": 5, "reference": 3, "candidate-on-collection": 1, "repeat": 1,
-        "binder-procedure": 1, "unused-reference": 2}
+        "binder-procedure": 1, "unused-reference": 2, "pinned-reference": 2}
     kinds = Counter("collection" if "collect-graph" in row["allowed_capabilities"] else
                     "catalog" if row["allowed_capabilities"] else "raw" for row in ROWS)
-    assert kinds == {"catalog": 32, "collection": 5, "raw": 8} and len(CATALOG_ROWS) == 32
+    assert kinds == {"catalog": 34, "collection": 5, "raw": 8} and len(CATALOG_ROWS) == 34
     # Every recorded target refusal was a catalog brief's; each is replayed below.
     assert {row["id"] for row in ROWS if row["recorded_refusal"].endswith("-target")} <= {
         row["id"] for row in CATALOG_ROWS}

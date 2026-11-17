@@ -701,8 +701,6 @@ REJECTS = {
     "unknown-ref": ([ENSURE, DCSYNC], {"candidate_ref": "cand-0000000000000000"}, "not supported by current evidence",
                     True),
     "callback": ([ENSURE, DCSYNC], {"callback_display_id": 13}, "runs on callback 14, not callback 13", True),
-    "reference": ([ENSURE, DCSYNC], {"inputs_by_reference": ["task:21", "task:40"]},   # a second, other proof task
-                  "does not use the input reference task:40", True),
 }
 
 
@@ -768,6 +766,12 @@ ACCOUNT = "dcsync-account"
 RECORDED_UNUSED = {name: (_RECORDED[name]["targets"], _RECORDED[name]["recorded_references"])
                    for name in ("run5-1164", "run5-1186")}
 _ONE = RECORDED_UNUSED["run5-1164"][0]
+# The recorded shapes (renamed; run 6 TOOL spans 412 and 1419): the offered `ensure-kerberos-context` refresh candidate,
+# which reads no krbtgt key, selected with one held task; span 412 also listed the procedure it feeds. Each is replayed
+# with the Domain Admins proof (task 40, span 412's role) and another realm's krbtgt proof (task 21, span 1419's role).
+RECORDED_REFRESH = {name: (_RECORDED[name]["allowed_capabilities"], _RECORDED[name]["targets"])
+                    for name in ("run6-412", "run6-1419")}
+_CHILD = ["child.lab.local"]
 # name: (procedure, candidate filter, brief overrides, the references Sage drops and reports, as normalized)
 UNUSED = {
     **{name: (ACCOUNT, "", {"targets": targets, "inputs_by_reference": references}, references)
@@ -779,6 +783,16 @@ UNUSED = {
     "with-procedure": (ACCOUNT, "", {"targets": _ONE, "inputs_by_reference": ["task:21"],
                                      "allowed_capabilities": [ACCOUNT, DCSYNC]}, ["task:21"]),
     "gpo": ("gpo-controlled-system-exec", "alpha", {"inputs_by_reference": ["task:21"]}, ["task:21"]),
+    **{f"{name}-task{task}": (ENSURE, "", {"allowed_capabilities": listed, "targets": targets,
+                                           "inputs_by_reference": [f"task:{task}"]}, [f"task:{task}"])
+       for name, (listed, targets) in RECORDED_REFRESH.items() for task in (40, 21)},
+    # Two proof tasks: a conflict on a key-pinning candidate, two unused references on the refresh variant.
+    "refresh-two-tasks": (ENSURE, "", {"allowed_capabilities": [ENSURE, DCSYNC], "targets": _CHILD,
+                                       "inputs_by_reference": ["task:21", "task:40"]}, ["task:21", "task:40"]),
+    "refresh-cred": (ENSURE, "", {"targets": _CHILD, "inputs_by_reference": ["cred:500"]}, ["cred:500"]),
+    "refresh-duplicates": (ENSURE, "", {"targets": _CHILD, "inputs_by_reference": ["task:40", "task:40"]}, ["task:40"]),
+    "refresh-case-space": (ENSURE, "", {"targets": _CHILD, "inputs_by_reference": [" TASK:40 ", "@CRED:500"]},
+                           ["task:40", "@cred:500"]),
 }
 _CONTROLS: dict = {}
 
@@ -807,6 +821,7 @@ def test_a_held_reference_its_candidate_does_not_use_is_dropped_and_reported(mon
     # The control's card, nothing before approval, its task sequence on Accept and none on Reject.
     assert run.before.issued == [] and run.before.worker_calls == 0 and len(run.cards) == 1, run.briefs
     assert _bound(run) == bound and bool(run.issued) is (decision == "accept") and len(run.terminals) == 1
+    assert not {"credential_proof_task_id", "credential_id", "credential_ids"} & set(bound[0]["inputs"])
     # One canonical brief without the unused references; the brief event keeps the Supervisor's own beside it.
     assert _delegated_brief(run) == canonical and canonical["inputs_by_reference"] == []
     [event] = run.model._request_event_ledger.actual_events(kind="brief")
@@ -819,7 +834,77 @@ def test_a_held_reference_its_candidate_does_not_use_is_dropped_and_reported(mon
     named = ", ".join(f"`{item}`" for item in dropped)
     assert f"Sage dropped the input reference(s) {named} from this step: `{procedure}`" in outcome, outcome
     assert "dropped the input reference" not in control_outcome
-    assert (f"also listed `{DCSYNC}`, which this step did not run" in outcome) is (shape == "with-procedure")
+    assert (f"also listed `{DCSYNC}`, which this step did not run" in outcome) is (
+        DCSYNC in overrides.get("allowed_capabilities", ()))
+
+
+def test_the_recorded_request_reaches_the_refresh_card(monkeypatch, tmp_path):
+    """Run 6 request 8 as recorded (renamed): the refresh step with the Domain Admins proof task, then the goal
+    procedure named without a candidate_ref. The first step cards its candidate; the request does not end Blocked."""
+    listed, targets = RECORDED_REFRESH["run6-412"]
+    mt, split = _client(monkeypatch, tmp_path)
+    goal = _call("transfer_to_Mythic_Operator", {
+        "handoff_title": "DCSync krbtgt", "handoff_instruction": PROMPT, "allowed_capabilities": [DCSYNC],
+        "callback_display_id": 14, "targets": ["child.lab.local", "krbtgt@child.lab.local"],
+        "expected_result": "The krbtgt key."}, 2)
+
+    run = asyncio.run(_run(_state_for(mt, ENSURE), split, [
+        _select(ENSURE, allowed_capabilities=listed, targets=targets, inputs_by_reference=["task:40"]), goal],
+        decision=None))
+
+    assert run.briefs == [("accepted", "Mythic_Operator")] and run.issued == [] and run.terminals == []
+    [card] = run.cards
+    assert card["data"]["arguments"]["action"]["name"] == ENSURE
+    assert card["data"]["arguments"]["action"]["intent"]["refresh_current_context"] is True
+
+
+def _forge_variant(monkeypatch, tmp_path):
+    """SYNTHETIC: `ensure-kerberos-context`'s forge variant, which forges from lab.local's proved krbtgt (task 21,
+    rows 500/501): Domain Admins of lab.local is proved (task 41) and no live callback is in lab.local."""
+    mt, split, _store = _store_client(monkeypatch, tmp_path)
+    mt._callbacks = _live_callbacks(mt, monkeypatch, [_callback(14, "WS02", "child.lab.local", "analyst")])
+    seed_ledger(mt, hops=[_proof_hop("da:lab.local", 41, callback_id="14")])
+    return mt, split
+
+
+def _forge_variant_step(**overrides):
+    return _select(ENSURE, "domain=lab.local", targets=["lab.local"], **overrides)
+
+
+@pytest.mark.parametrize("references, pins", [
+    (["task:21"], {"credential_proof_task_id": "21"}),
+    (["cred:501", "@CRED:500"], {"credential_ids": ["500", "501"]}),
+], ids=["task", "key-set"])
+def test_a_forge_variant_candidate_still_pins_a_held_reference(monkeypatch, tmp_path, references, pins):
+    mt, split = _forge_variant(monkeypatch, tmp_path)
+
+    run = asyncio.run(_run(mt, split, [_forge_variant_step(inputs_by_reference=references)], decision=None))
+
+    assert run.briefs == [("accepted", "Mythic_Operator")] and run.issued == [] and run.before.worker_calls == 0
+    [card] = run.cards
+    action, inputs = card["data"]["arguments"]["action"], card["data"]["arguments"]["inputs"]
+    assert action["name"] == ENSURE and "refresh_current_context" not in action["intent"]
+    assert "krbtgt-hash:lab.local" in action["preconditions"]
+    assert {key: inputs[key] if key == "credential_ids" else str(inputs[key]) for key in pins} == pins
+    assert _delegated_brief(run)["inputs_by_reference"] == list(
+        hb.HandoffBrief.from_args(inputs_by_reference=references).inputs_by_reference)
+
+
+@pytest.mark.parametrize("references, refusal", [
+    (["task:21", "task:41"], "does not use the input reference task:41"),
+    (["task:41"], "no longer resolves"),
+], ids=["conflicting", "unresolvable"])
+def test_a_forge_variant_candidate_still_refuses_a_conflicting_or_unresolvable_reference(monkeypatch, tmp_path,
+                                                                                       references, refusal):
+    mt, split = _forge_variant(monkeypatch, tmp_path)
+
+    run = asyncio.run(_run(mt, split, [_forge_variant_step(inputs_by_reference=references)], decision=None))
+
+    assert run.cards == [] and run.issued == [] and run.before.worker_calls == 0
+    refused = [content for phase, content in run.briefs if phase == "rejected"] + [
+        str(outcome["detail"]) for outcome in run.outcomes
+        if outcome["status"] == sb.StepStatus.PRECONDITION_UNSATISFIABLE.value]
+    assert len(refused) == 1 and refusal in refused[0], (run.briefs, run.outcomes)
 
 
 @pytest.mark.parametrize("references, refusal", [
@@ -937,6 +1022,31 @@ def test_a_supplied_reference_pins_a_forge_key_and_is_never_ignored():
     assert "does not use the input reference task:30" in cb.bind(brief("task:21", "task:30"), (item,))[1]
     assert cb.unused_references(brief("cred:501", "task:21"), item) == ()      # a forge uses every held reference
     assert cb.REFERENCE_PROCEDURES == MythicTools._KRBTGT_FORGE_CAPABILITIES
+
+
+def test_only_the_key_reading_variant_of_the_context_procedure_uses_a_reference():
+    from ai.langgraph import capabilities
+
+    refresh = capabilities._refresh_kerberos_context_action("child.lab.local", "14")
+    forge = capabilities._ensure_kerberos_context_action("lab.local", "lab.local", "14")
+    payload = model_module._capability_action_payload
+    [fresh, forging, flagged] = cb.candidates("r", [
+        (payload(refresh), {"callback_id": "14"}), (payload(forge), {"callback_id": "14"}),
+        (payload(forge), {"callback_id": "14", "refresh_current_context": "true"})])
+
+    def brief(candidate, *references):
+        return hb.HandoffBrief.from_args(allowed_capabilities=[ENSURE], callback_display_id=14,
+                                         candidate_ref=candidate.ref, inputs_by_reference=list(references))
+
+    # The refresh plan reads no key (by its intent or input flag): it pins nothing and drops every reference.
+    for item in (fresh, flagged):
+        assert cb.bind(brief(item, "task:21", "task:40", "cred:500"), (item,)) == (item, "")
+        assert cb.unused_references(brief(item, "task:21", "task:40", "cred:500"), item) == (
+            "task:21", "task:40", "cred:500")
+    # The forge variant reads the key it is given: a reference pins it, and a second proof task conflicts.
+    bound, error = cb.bind(brief(forging, "task:21"), (forging,))
+    assert error == "" and bound.inputs == {"callback_id": "14", "credential_proof_task_id": "21"}
+    assert "does not use the input reference task:40" in cb.bind(brief(forging, "task:21", "task:40"), (forging,))[1]
 
 
 def test_a_brief_binds_its_candidate_when_it_also_lists_other_procedures():
