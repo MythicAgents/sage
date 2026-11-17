@@ -15,7 +15,7 @@ Pure and offline: the caller passes in what Sage holds; nothing here queries Myt
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import re
 from typing import Any, Iterable, Mapping
@@ -83,6 +83,11 @@ class HandoffBrief:
     expected_result: str = ""
     # The current catalog candidate a non-collection catalog step selects (`catalog_binding`); empty otherwise.
     candidate_ref: str = ""
+    # A host the operator named for the bound procedure's service proof (`catalog_binding.qualified_proof_host`);
+    # admission keeps it only when an operator input of this chat names it, else drops it, never refusing the step.
+    proof_host: str = ""
+    # Admission's (host, reason) for a dropped `proof_host`, carried only to the delegated message; never metadata.
+    dropped_proof_host: tuple[str, ...] = field(default=(), compare=False)
     # Reserved: step budgets are enforced by the step-bounds work and plan identity by the plan work.
     budget: str = ""
     step_id: str = ""
@@ -91,7 +96,8 @@ class HandoffBrief:
     @classmethod
     def from_args(cls, *, targets: Any = None, callback_display_id: Any = None, allowed_capabilities: Any = None,
                   allowed_tools: Any = None, inputs_by_reference: Any = None,
-                  expected_result: Any = None, candidate_ref: Any = None) -> "HandoffBrief":
+                  expected_result: Any = None, candidate_ref: Any = None,
+                  proof_host: Any = None) -> "HandoffBrief":
         return cls(
             targets=_items(targets),
             callback_display_id=_callback(callback_display_id),
@@ -100,6 +106,7 @@ class HandoffBrief:
             inputs_by_reference=tuple(item.casefold() for item in _items(inputs_by_reference)),
             expected_result=str(expected_result or "").strip(),
             candidate_ref=str(candidate_ref or "").strip(),
+            proof_host=str(proof_host or "").strip(),
         )
 
     @property
@@ -120,6 +127,7 @@ class HandoffBrief:
             "inputs_by_reference": list(self.inputs_by_reference),
             "expected_result": self.expected_result,
             **({"candidate_ref": self.candidate_ref} if self.candidate_ref else {}),
+            **({"proof_host": self.proof_host} if self.proof_host else {}),
         }
 
 
@@ -192,6 +200,23 @@ class KnownScope:
 def _named_in(name: str, text: str) -> bool:
     pattern = r"(?<![\w.\\@-])" + re.escape(name) + r"(?![\w\\@-]|\.\w)"
     return re.search(pattern, text.casefold()) is not None
+
+
+# A UNC path `\\host[\share...]` names its host.
+_UNC_RE = re.compile(r"\\\\([^\\\s]+)(?:\\[^\s]*)?")
+
+
+def operator_host_source(host: str, inputs: Iterable[OperatorTargetInput]) -> OperatorTargetInput | None:
+    """The newest operator input that names the qualified `host` exactly, by its full name or its first label, alone
+    or as a UNC path's host; None when none does. Matching is `_named_in`'s, so a label inside another name, a longer
+    label or a `DOMAIN\\name` never counts."""
+    name = _name(host)
+    label = name.split(".", 1)[0]
+    for item in reversed(tuple(inputs)):
+        text = _UNC_RE.sub(lambda match: f" {match.group(1)} ", item.text)
+        if name and (_named_in(name, text) or _named_in(label, text)):
+            return item
+    return None
 
 
 # Graph facts that name a host and the GPO applying to it, as `graph_reconciler` writes them:

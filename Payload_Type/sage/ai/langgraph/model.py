@@ -6995,6 +6995,7 @@ class Model:
             not_run=kwargs.get("_handoff_not_run") or (),
             procedures=(kwargs.get("_handoff_brief") or {}).get("allowed_capabilities") or (),
             unused_references=kwargs.get("_handoff_unused_references") or (),
+            dropped_proof_host=kwargs.get("_handoff_dropped_proof_host") or {},
             executor_results=_terminal_execute_capability_payloads(delegation),
         )
         self._step_records.pop((record.request_id, worker, record.delegation_seq), None)
@@ -7051,6 +7052,26 @@ class Model:
                 logger.warning(f"step ledger not written: {type(exc).__name__}: {exc}")
         return rows
 
+    def _admit_proof_host(
+        self, brief: "_handoff_brief.HandoffBrief", candidate: Any,
+        inputs: Iterable["_handoff_brief.OperatorTargetInput"],
+    ) -> tuple["_handoff_brief.HandoffBrief", dict[str, str]]:
+        """Keep a brief's `proof_host` only when its bound candidate's service proof may target it and an operator input
+        of this chat names it; otherwise drop it with the reason, never refusing the step. Returns the brief and its
+        brief-event metadata: the kept host's operator source (request and revision, no text) or the dropped one."""
+        sent = brief.proof_host
+        if not sent:
+            return brief, {}
+        host, reason = (_catalog_binding.qualified_proof_host(candidate, sent) if candidate is not None else (
+            "", "only a step bound to a current forge-golden-ticket or ensure-kerberos-context candidate takes one"))
+        source = _handoff_brief.operator_host_source(host, inputs) if host else None
+        if source is not None:
+            return replace(brief, proof_host=host), {"proof_host": json.dumps(
+                {"host": host, "request_id": source.request_id, "revision": source.revision}, sort_keys=True)}
+        reason = reason or "no operator input of this chat names it"
+        return replace(brief, proof_host="", dropped_proof_host=(sent, reason)), {
+            "proof_host_dropped": json.dumps({"host": sent, "reason": reason}, sort_keys=True)}
+
     def _check_handoff_brief(
         self, worker: str, brief: "_handoff_brief.HandoffBrief", instruction: str, title: str = "",
     ) -> tuple[tuple[str, ...], bool] | tuple[tuple[str, ...], bool, tuple[str, ...]] | tuple[
@@ -7071,11 +7092,12 @@ class Model:
         contract = getattr(self, "_request_contract", None)
         lane = str(getattr(getattr(contract, "lane", None), "value", "") or state.get("_request_lane") or "")
         if lane == "autonomous_objective":
-            return None
+            return self._admit_proof_host(brief, None, ())[0] if brief.proof_host else None
         try:
             operator_input = _current_assisted_operator_input(state) or ""
+            revision = max((item for item, _text in _assisted_operator_input_entries(state) or ()), default=0)
         except RuntimeError:
-            operator_input = ""
+            operator_input, revision = "", 0
         # Earlier operator inputs of this chat generation name targets only, and only while the current input is valid.
         history = self._assisted_operator_target_inputs() if operator_input else ()
         scope = _handoff_brief.known_scope(
@@ -7097,6 +7119,7 @@ class Model:
         )
         binding_error = ""
         admitted = brief
+        candidate = None
         if not errors and bound:
             # A catalog step runs one action current evidence supports, chosen by its candidate_ref; nothing else.
             found, reason = self._catalog_candidates()
@@ -7108,11 +7131,16 @@ class Model:
                 unused = _catalog_binding.unused_references(brief, candidate)
                 admitted = replace(brief, allowed_capabilities=(candidate.procedure,), inputs_by_reference=tuple(
                     item for item in brief.inputs_by_reference if item not in unused))
+        proof_metadata: dict[str, str] = {}
+        if not errors:
+            current = _handoff_brief.OperatorTargetInput(str(state.get("_request_id") or ""), revision, operator_input)
+            admitted, proof_metadata = self._admit_proof_host(admitted, candidate, (*history, current))
         restatement = _handoff_brief.restatement(instruction, operator_input)
         metadata = {
             "worker": worker,
             "restatement": restatement,
             "brief": json.dumps(brief.as_metadata(), sort_keys=True),
+            **proof_metadata,
         }
         if admitted.allowed_capabilities != brief.allowed_capabilities:
             metadata["admitted_capabilities"] = json.dumps(list(admitted.allowed_capabilities))
@@ -19146,6 +19174,7 @@ def _create_handoff_tool(
                 delegate_to, brief, handoff_title, handoff_instruction, replaced_note = substitute
         not_run: tuple[str, ...] = ()
         unused: tuple[str, ...] = ()
+        dropped_host: tuple[str, ...] = ()
         if brief_check is not None:
             checked = brief_check(
                 delegate_to, brief or _handoff_brief.HandoffBrief(), str(handoff_instruction or ""),
@@ -19157,6 +19186,7 @@ def _create_handoff_tool(
                 not_run = tuple(item for item in brief.allowed_capabilities if item not in checked.allowed_capabilities)
                 unused = tuple(dict.fromkeys(item for item in brief.inputs_by_reference
                                              if item not in checked.inputs_by_reference))
+                dropped_host = checked.dropped_proof_host
                 brief = checked
             elif checked is not None:
                 return _brief_rejection_command(runtime, name, delegate_to, *checked, channels=channel_map.values())
@@ -19436,6 +19466,8 @@ def _create_handoff_tool(
             injected_human.additional_kwargs["_handoff_not_run"] = list(not_run)
         if unused:
             injected_human.additional_kwargs["_handoff_unused_references"] = list(unused)
+        if dropped_host:
+            injected_human.additional_kwargs["_handoff_dropped_proof_host"] = dict(zip(("host", "reason"), dropped_host))
         if assisted_operator_input is not None and not terminal_redirect and actual_instruction.strip():
             # Materialized as explicitly non-authoritative AI context at the worker
             # invocation, after the current request/operator binding is checked.
@@ -19529,6 +19561,7 @@ def _create_handoff_tool(
             allowed_tools: Annotated[list[tool_choice] | None, "Instead of allowed_capabilities: the guarded tools this step's one action may use. Name either allowed_capabilities or allowed_tools, not both. Read-only tools are always available and need not be listed."] = None,
             inputs_by_reference: Annotated[list[str] | None, "Earlier results this step uses, as 'task:<display id>' or 'cred:<credential id>' records Sage already holds."] = None,
             candidate_ref: Annotated[str, "For a catalog procedure other than collect-graph: the candidate_ref of one action in the current 'Sage catalog candidates' list, copied exactly, with that procedure and its callback. Sage runs exactly that action after approval; without a current candidate the step is not dispatched."] = "",
+            proof_host: Annotated[str, "Only for a forge-golden-ticket or ensure-kerberos-context step that selects a candidate_ref, and only when the operator named the host: the host the operator named for its service proof, as the operator wrote it. Sage uses it only when an operator input of this chat names it and it lies in the domain that procedure proves; otherwise Sage drops it and runs the step without it. Leave blank when the operator named no host."] = "",
         ) -> Command:
             brief = _handoff_brief.HandoffBrief.from_args(
                 targets=targets,
@@ -19538,6 +19571,7 @@ def _create_handoff_tool(
                 inputs_by_reference=inputs_by_reference,
                 expected_result=expected_result,
                 candidate_ref=candidate_ref,
+                proof_host=proof_host,
             )
             return _build_handoff_command(runtime, handoff_instruction, handoff_title, brief=brief)
     else:

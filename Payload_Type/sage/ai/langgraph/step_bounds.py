@@ -507,7 +507,7 @@ def verdict_lines(outcomes: Iterable[Mapping[str, Any]]) -> list[str]:
 def step_outcome(record: StepRecord, activity: StepActivity, *, now: float, tasks_issued: Iterable[str] = (),
                  credentials_added: Iterable[int] = (), status: StepStatus | None = None,
                  not_run: Iterable[str] = (), procedures: Iterable[str] = (),
-                 unused_references: Iterable[str] = (),
+                 unused_references: Iterable[str] = (), dropped_proof_host: Mapping[str, Any] | None = None,
                  executor_results: Iterable[Mapping[str, Any]] = ()) -> dict[str, Any]:
     final = status or record.status or StepStatus.ENDED
     wall = max(0.0, now - record.started)
@@ -535,10 +535,13 @@ def step_outcome(record: StepRecord, activity: StepActivity, *, now: float, task
         "wrap_up": wrap_up.value if wrap_up else "",
         # The guarded call the step's scope refused, as Sage recorded it; {} for any other ending.
         "refused_proposal": dict(record.refused) if record.refused and final == record.status else {},
-        # A brief admitted narrowed to its candidate: the procedure it ran, the listed procedures it did not and the
-        # references its candidate does not use, which admission dropped; {} for any other step.
+        # A brief admitted narrowed to its candidate: the procedure it ran, the listed procedures it did not, the
+        # references its candidate does not use and a proof host Sage may not use, which admission dropped; {} for any
+        # other step.
         "narrowed": {"procedures": list(procedures), "not_run": list(not_run),
-                     "unused_references": list(unused_references)} if not_run or unused_references else {},
+                     "unused_references": list(unused_references),
+                     **({"dropped_proof_host": dict(dropped_proof_host)} if dropped_proof_host else {})}
+        if not_run or unused_references or dropped_proof_host else {},
         # Each terminal `execute_capability` result in the step (executor_result), for the request's closing.
         "executor_results": [executor_result(payload) for payload in executor_results],
     }
@@ -578,6 +581,10 @@ def render_outcome(outcome: Mapping[str, Any]) -> str:
         procedure = ", ".join(f"`{name}`" for name in narrowed.get("procedures") or ())
         lines.append(f"Sage dropped the input reference(s) {dropped} from this step: {procedure}, the selected "
                      "candidate's procedure, does not use them, so its action is the same without them.")
+    if narrowed.get("dropped_proof_host"):
+        dropped = narrowed["dropped_proof_host"]
+        lines.append(f"Sage dropped the proof host `{dropped.get('host')}` from this step: {dropped.get('reason')}. It "
+                     "did not refuse the step and reached no approval card or task.")
     if outcome.get("refused_proposal"):
         lines.append(f"Refused proposal (Sage's record): {describe_refused_proposal(outcome['refused_proposal'])}. "
                      "It was not approved and not executed: Sage removed it before any approval card or Mythic task.")

@@ -13,13 +13,20 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import hashlib
 import json
+import re
 from typing import Any, Iterable, Mapping
 
 try:
-    from .capabilities import refreshes_kerberos_context
+    from .capabilities import (
+        CapabilityAction, _input_text, _normalize, _target_fields, forge_target_domain, forge_ticket_domain,
+        refreshes_kerberos_context,
+    )
     from .request_contract import action_fingerprint
 except ImportError:  # pragma: no cover - flat import layout
-    from capabilities import refreshes_kerberos_context
+    from capabilities import (
+        CapabilityAction, _input_text, _normalize, _target_fields, forge_target_domain, forge_ticket_domain,
+        refreshes_kerberos_context,
+    )
     from request_contract import action_fingerprint
 
 MAX_CHARS = 6000
@@ -30,6 +37,12 @@ REFERENCE_INPUTS = {"cred": "credential_id", "task": "credential_proof_task_id"}
 # Several `cred:` references name rows of one key set; the executor resolves them to one proof (`credential_ids`).
 REFERENCE_SET_INPUT = "credential_ids"
 REFERENCE_PROCEDURES = frozenset({"forge-golden-ticket", "ensure-kerberos-context"})
+# The procedures whose service proof an operator-named host may target (the executor reads `proof_host` for both), and
+# the bound inputs that pin it: an approved call must carry them exactly as bound.
+PROOF_HOST_PROCEDURES = frozenset({"forge-golden-ticket", "ensure-kerberos-context"})
+PROOF_HOST_INPUTS = ("proof_host", "proof_resource_source")
+PROOF_HOST_SOURCE = "operator-named"
+_HOST_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*")
 _TITLE = "[Sage catalog candidates — supported by current evidence, for this model call]"
 _OTHER_WORK = ("`collect-graph`, control-plane reads and explicit off-catalog tool steps (allowed_tools) remain "
                "available, and new evidence or a new operator request can add candidates.")
@@ -144,6 +157,46 @@ def _reference_use(brief: Any, candidate: Candidate) -> tuple[dict[str, list[str
     return supplied, tuple(dict.fromkeys(unused)), ""
 
 
+def proof_domain(candidate: Candidate) -> str:
+    """The domain the candidate's service proof must prove, as the executor reads it; "" for other procedures. A forge
+    proves the domain its ticket is requested for, else the one it is issued in; a Kerberos context its target domain,
+    else its domain."""
+    intent = candidate.action.get("intent") if isinstance(candidate.action.get("intent"), Mapping) else {}
+    inputs = dict(candidate.inputs)
+    if candidate.procedure == "forge-golden-ticket":
+        action = CapabilityAction(name=candidate.procedure, target=candidate.target, intent=dict(intent))
+        return forge_target_domain(action, inputs) or forge_ticket_domain(action, inputs)
+    if candidate.procedure == "ensure-kerberos-context":
+        fields = _target_fields(candidate.target)
+        return _normalize(_input_text(inputs, "target_domain", "effect_domain") or intent.get("target_domain")
+                          or intent.get("effect_domain") or fields.get("target_domain")
+                          or _input_text(inputs, "domain", "source_domain") or intent.get("domain")
+                          or intent.get("source_domain") or fields.get("domain"))
+    return ""
+
+
+def qualified_proof_host(candidate: Candidate, value: Any) -> tuple[str, str]:
+    """(host, "") when `value` names one host of the domain the candidate's service proof must prove, qualified there
+    (case, a trailing dot, a first label or a UNC path's host are the same host); else ("", why it cannot be used)."""
+    if candidate.procedure not in PROOF_HOST_PROCEDURES:
+        return "", f"`{candidate.procedure}` takes no proof host"
+    domain = proof_domain(candidate)
+    text = str(value or "").strip().strip("'\"")
+    if text.startswith("\\\\"):
+        text = text[2:].split("\\", 1)[0]
+    host = text.rstrip(".").casefold()
+    if not domain:
+        return "", "the bound action names no domain for its service proof"
+    if not _HOST_RE.fullmatch(host) or host.replace(".", "").isdigit():     # an IPv6 literal fails the pattern
+        return "", "it is not a host name"
+    if host in {domain, domain.split(".", 1)[0]}:
+        return "", "it names a domain, not a host"
+    host = host if "." in host else f"{host}.{domain}"
+    if host.split(".", 1)[1] != domain:
+        return "", f"it is not a host in {domain}, the domain this step's service proof must prove"
+    return host, ""
+
+
 def unused_references(brief: Any, candidate: Candidate) -> tuple[str, ...]:
     """The brief's references that its bound `candidate` does not use; admission drops them from the stored brief."""
     return _reference_use(brief, candidate)[1]
@@ -185,6 +238,10 @@ def bind(brief: Any, found: tuple[Candidate, ...] | None, *, reason: str = "") -
         pins[REFERENCE_INPUTS["cred"]] = credentials[0]
     elif credentials:
         pins[REFERENCE_SET_INPUT] = credentials
+    # An admitted operator-named proof host is pinned like a key reference; one outside the proof domain never is.
+    host = qualified_proof_host(candidate, brief.proof_host)[0] if getattr(brief, "proof_host", "") else ""
+    if host:
+        pins.update(dict(zip(PROOF_HOST_INPUTS, (host, PROOF_HOST_SOURCE))))
     return (replace(candidate, inputs={**candidate.inputs, **pins}) if pins else candidate), ""
 
 
@@ -214,4 +271,6 @@ def call_matches(args: Mapping[str, Any], candidate: Candidate) -> str:
     if not _within(action, candidate.action):
         return "the call's action differs from the current candidate"
     changed = [key for key in inputs if key in candidate.inputs and not _same(inputs[key], candidate.inputs[key])]
+    # Card-time augmentation may add a resolved proof target the candidate lacks; a pinned one must stay as bound.
+    changed += [key for key in PROOF_HOST_INPUTS if key in candidate.inputs and key not in inputs]
     return f"the call changed bound inputs: {', '.join(sorted(changed))}" if changed else ""
