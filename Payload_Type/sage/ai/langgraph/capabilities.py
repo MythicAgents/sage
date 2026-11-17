@@ -358,8 +358,11 @@ def _current_account_context_keys(state: Any) -> set[tuple[str, str, str]]:
     return keys
 
 
-def actions_from_state(state: Any) -> list[CapabilityAction]:
-    """Return generic capability actions available from the observed state."""
+def actions_from_state(state: Any, *, reviewed_account_material: bool = False) -> list[CapabilityAction]:
+    """Return generic capability actions available from the observed state.
+
+    `reviewed_account_material` (the ordinary supervised catalog only) also offers an account Kerberos context from a
+    valid review-backed material row, pinned to its source; every other caller keeps the working-credential gate."""
     actions: list[CapabilityAction] = []
     facts = _graph_fact_predicates(state)
     live_domains = _live_foothold_domains(state)
@@ -486,7 +489,12 @@ def actions_from_state(state: Any) -> list[CapabilityAction]:
         if domain in explicit_replication_domains:
             actions.append(_dcsync_account_action(domain, account, source_fact=source_fact))
 
-    for domain, account in _credential_material_accounts(achieved):
+    # An account's key input: a working credential, else (opt-in) reviewed material, pinned in the action.
+    account_inputs: dict[tuple[str, str], dict | None] = dict.fromkeys(_credential_material_accounts(achieved))
+    if reviewed_account_material:
+        for pair, material in _reviewed_account_material(state).items():
+            account_inputs.setdefault(pair, material)
+    for (domain, account), material in sorted(account_inputs.items()):
         if (
             downstream_account_targets
             and (domain, account) not in downstream_account_targets
@@ -519,7 +527,7 @@ def actions_from_state(state: Any) -> list[CapabilityAction]:
             )
             if callback_id:
                 actions.append(_ensure_account_kerberos_context_action(
-                    domain, account, callback_id, force_revalidate=True,
+                    domain, account, callback_id, force_revalidate=True, material=material,
                 ))
             continue
         callback_id = _select_context_callback_id(
@@ -529,7 +537,7 @@ def actions_from_state(state: Any) -> list[CapabilityAction]:
             effect_for_callback=lambda candidate: _kerberos_account_context_effect(domain, account, candidate),
         )
         if callback_id:
-            actions.append(_ensure_account_kerberos_context_action(domain, account, callback_id))
+            actions.append(_ensure_account_kerberos_context_action(domain, account, callback_id, material=material))
 
     for domain in _krbtgt_hash_domains(achieved):
         if domain not in admin_domains:
@@ -5597,11 +5605,16 @@ def _ensure_account_kerberos_context_action(
     callback_id: str,
     *,
     force_revalidate: bool = False,
+    material: dict | None = None,
 ) -> CapabilityAction:
+    """`material` (from `_reviewed_account_material`) makes the key input reviewed material, not a working
+    credential: its effect is the precondition and its source task, review and output digest are pinned in the intent,
+    which the executor re-reads after approval."""
     domain = _normalize(domain)
     account = _normalize(account)
     callback_id = _normalize_callback_id(callback_id)
     effect = _kerberos_account_context_effect(domain, account, callback_id)
+    key_input = material["effect"] if material else f"creds:{account}@{domain}"
     intent = {
         "capability": "ensure-account-kerberos-context",
         "domain": domain,
@@ -5617,10 +5630,12 @@ def _ensure_account_kerberos_context_action(
     }
     if force_revalidate:
         intent["force_revalidate"] = True
+    if material:
+        intent["credential_material"] = {key: material[key] for key in MATERIAL_REFERENCE_KEYS}
     return CapabilityAction(
         name="ensure-account-kerberos-context",
         target=f"domain={domain};account={account};callback={callback_id}",
-        preconditions=[f"creds:{account}@{domain}", f"live-callback:{callback_id}"],
+        preconditions=[key_input, f"live-callback:{callback_id}"],
         effects=[effect],
         intent=intent,
         verifier={
@@ -5641,8 +5656,10 @@ def _ensure_account_kerberos_context_action(
                 "callback_dead",
             ],
         },
-        reason="verified account secret can create a callback-scoped Kerberos context for follow-on access",
-        source_facts=[f"creds:{account}@{domain}", f"live-callback:{callback_id}"],
+        reason=("reviewed credential material, not proved to work, may create a callback-scoped Kerberos context; "
+                "the operator's approval authorizes the attempt" if material else
+                "verified account secret can create a callback-scoped Kerberos context for follow-on access"),
+        source_facts=[key_input, f"live-callback:{callback_id}"],
     )
 
 
@@ -6396,6 +6413,29 @@ def _review_backed_krbtgt_material(state: Any) -> dict[str, str]:
             proof = None
         if proof and proof["realm"]:
             out.setdefault(_normalize(proof["realm"]), proof["effect"])
+    return out
+
+
+# The reviewed-material source an account action pins (`credential_material` in its intent).
+MATERIAL_REFERENCE_KEYS = ("effect", "task_id", "review_id", "output_sha256")
+
+
+def _reviewed_account_material(state: Any) -> dict[tuple[str, str], dict]:
+    """(domain, account) -> the source of each valid review-backed account material row whose review cites a Kerberos
+    key (`credential_review.reviewed_account_material`). Input provenance only: it never asserts a working key."""
+    try:
+        from . import credential_review
+    except ImportError:
+        import credential_review
+    out: dict[tuple[str, str], dict] = {}
+    for hop in list(getattr(state, "hops", None) or []):
+        try:
+            material = credential_review.reviewed_account_material(
+                hop, engagement_id=str(getattr(state, "engagement_id", "") or ""))
+        except Exception:
+            material = None
+        if material and _dcsync_account_target_allowed(material["account"], material["realm"], set()):
+            out.setdefault((_normalize(material["realm"]), _normalize(material["account"])), material)
     return out
 
 

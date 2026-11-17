@@ -736,3 +736,58 @@ def review_observation(
         "credential_review": record,
     }
     return effect, evidence, envelope.to_dict()
+
+
+# --- a reviewed key as a procedure's input ----------------------------------------------------------------------
+
+# Review candidate types that are Kerberos keys, with the key type a TGT request names for each.
+KERBEROS_KEY_TYPES = {"ntlm": "rc4", "rc4": "rc4", "aes128": "aes128", "aes256": "aes256"}
+
+
+def reviewed_account_material(hop: Any, *, engagement_id: str) -> dict[str, Any] | None:
+    """The source of an achieved account material row whose re-admitted review-backed proof commits to a stored
+    review citing a Kerberos key: effect, account, realm, source task and callback, review id, output digest and the
+    review's key type, with the committed review record; None otherwise. Reads no output and asserts no working key."""
+    _, _, subject = str(getattr(hop, "effect", "") or "").rpartition(":")
+    account, _, realm = subject.rpartition("@")
+    proof = proof_boundary.review_backed_account_material(hop, account, realm, engagement_id=engagement_id)
+    if proof is None:
+        return None
+    record = next((dict(contribution["reviews"][proof["review_id"]])
+                   for contribution in getattr(hop, "contributions", None) or []
+                   if isinstance(contribution, Mapping) and str(contribution.get("task_id")) == proof["task_id"]
+                   and isinstance(contribution.get("reviews"), Mapping)
+                   and isinstance(contribution["reviews"].get(proof["review_id"]), Mapping)), None)
+    if record is None or proof_boundary.canonical_commitment_sha256(record) != proof["result_sha256"]:
+        return None
+    candidate = record.get("candidate") if isinstance(record.get("candidate"), Mapping) else {}
+    key_type = KERBEROS_KEY_TYPES.get(str(candidate.get("type") or ""))
+    if record.get("verdict") != VALID or not key_type:
+        return None
+    return {**{k: proof[k] for k in ("effect", "realm", "task_id", "callback_id", "review_id", "output_sha256")},
+            "account": account.casefold(), "key_type": key_type, "record": record}
+
+
+def reviewed_key(output: Any, record: Mapping[str, Any], *, account: str, realm: str) -> dict[str, str] | None:
+    """The key a committed valid review cited, re-read from the task output it reviewed, or None.
+
+    The output must be the reviewed one (its digest), the cited span must still validate by type and bind to the
+    account and realm as the reviewer bound it, and the value must match the review's salted value hash."""
+    text = review_text(output)
+    candidate = record.get("candidate") if isinstance(record.get("candidate"), Mapping) else {}
+    location = record.get("location") if isinstance(record.get("location"), Mapping) else {}
+    credential_type = str(candidate.get("type") or "")
+    account, realm = str(account or "").casefold(), str(realm or "").casefold()
+    if (output_sha256(text) != record.get("input_sha256") or credential_type not in KERBEROS_KEY_TYPES
+            or not check_citation(text, location, credential_type)[0]):
+        return None
+    start, end = int(location["start"]), int(location["end"])
+    if record.get("reviewer_kind") == REVIEWER_DETERMINISTIC:
+        located = next((item for item in locate_candidates(text) if (item.start, item.end) == (start, end)), None)
+        bound = located is not None and check_binding(located, account, realm)[0]
+    else:
+        bound = check_citation_binding(text, start, account, realm)[0]
+    value = re.sub(r"\s+", "", text[start:end])
+    if not bound or value_sha256(value) != candidate.get("value_sha256"):
+        return None
+    return {"credential": value, "key_type": KERBEROS_KEY_TYPES[credential_type]}

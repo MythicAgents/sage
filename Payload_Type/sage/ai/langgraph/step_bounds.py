@@ -448,12 +448,18 @@ def executor_result(payload: Mapping[str, Any]) -> dict[str, Any]:
     else:
         held = {str(effect).casefold() for effect in [*(payload.get("achieved_effects") or []), *recorded]}
         unconfirmed = [str(effect) for effect in action.get("effects") or [] if str(effect).casefold() not in held]
-    return {"capability": str(payload.get("capability") or ""),
-            "target": str(action.get("target") or payload.get("domain") or ""),
-            "verdict": str(payload.get("verdict") or ""),
-            "task_ids": [row["task_id"] for row in payload.get("issued") or []
-                         if isinstance(row, Mapping) and row.get("task_id") is not None],
-            "recorded": recorded, "unconfirmed": unconfirmed}
+    result = {"capability": str(payload.get("capability") or ""),
+              "target": str(action.get("target") or payload.get("domain") or ""),
+              "verdict": str(payload.get("verdict") or ""),
+              "task_ids": [row["task_id"] for row in payload.get("issued") or []
+                           if isinstance(row, Mapping) and row.get("task_id") is not None],
+              "recorded": recorded, "unconfirmed": unconfirmed}
+    intent = action.get("intent") if isinstance(action.get("intent"), Mapping) else {}
+    if isinstance(intent.get("credential_material"), Mapping):
+        # The reviewed material the operator approved as this step's input: references only, never a value.
+        result["material"] = {key: str(intent["credential_material"].get(key) or "")
+                              for key in ("effect", "task_id", "review_id")}
+    return result
 
 
 VERIFICATION_LEAD = "**Sage verification:**"
@@ -575,6 +581,12 @@ def render_outcome(outcome: Mapping[str, Any]) -> str:
     if outcome.get("refused_proposal"):
         lines.append(f"Refused proposal (Sage's record): {describe_refused_proposal(outcome['refused_proposal'])}. "
                      "It was not approved and not executed: Sage removed it before any approval card or Mythic task.")
+    for result in outcome.get("executor_results") or []:
+        if result.get("material"):
+            used = result["material"]
+            lines.append(f"Input to `{result['capability']}`: reviewed credential material `{used['effect']}` from task "
+                         f"{used['task_id']} (review {used['review_id'][:16]}), as the operator approved. It is not a "
+                         "proved working credential; neither it nor the approval proves an effect.")
     if outcome.get("calls_blocked"):
         lines.append(f"Tool calls not run because the step had no call slots left: {outcome['calls_blocked']}.")
     if outcome.get("wrap_up"):

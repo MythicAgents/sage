@@ -121,11 +121,16 @@ def _reference_use(brief: Any, candidate: Candidate) -> tuple[dict[str, list[str
     unused: list[str] = []
     pins_key = candidate.procedure in REFERENCE_PROCEDURES and not refreshes_kerberos_context(
         candidate.action.get("intent"), candidate.inputs)
+    intent = candidate.action.get("intent") if isinstance(candidate.action.get("intent"), Mapping) else {}
+    # Reviewed material pins its source task in the candidate: that task's reference is used, any other conflicts.
+    pins_source = isinstance(intent.get("credential_material"), Mapping)
     for reference in getattr(brief, "inputs_by_reference", ()) or ():
         kind, _, number = str(reference).lstrip("@").partition(":")
         word = "task" if kind == "task" else "cred"
         if any(word in key and text == number for key, text in bound):
             continue
+        if pins_source and word == "task":
+            return supplied, tuple(dict.fromkeys(unused)), str(reference)
         if not pins_key:
             # A candidate that binds no key by reference never reads it: its action is the same without it, so
             # admission drops it from the step and the step outcome names it.

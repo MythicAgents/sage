@@ -12232,6 +12232,15 @@ class MythicTools:
                     "stopped_after": "already_achieved",
                 }, sort_keys=True)
 
+            if self._account_material_reference(action_obj) is not None and not (
+                    self._material_use_permitted() and _capability_execution_context.get() is not None):
+                return self._capability_executor_failure_json({
+                    "ok": False, "verdict": "blocked", "capability": self._capability_text(action_obj.name),
+                    "reason": ("reviewed credential material is an input only to the operator-approved account context "
+                               "step of an ordinary supervised request; nothing was issued"),
+                    "action": asdict(action_obj) if is_dataclass(action_obj) else {}, "issued": [],
+                    "recorded_effects": [],
+                }, action_obj, input_values, None)
             await self._augment_capability_runtime_inputs(action_obj, input_values)
             await self._bind_capability_mythic_adapter(action_obj, input_values)
             await self._ensure_capability_executor_proof_target(action_obj, input_values)
@@ -17572,20 +17581,25 @@ class MythicTools:
                 inputs["account"] = account
             if callback_id:
                 inputs["callback_id"] = callback_id
-            if not self._capability_has_ticket_key(inputs):
+            material = self._account_material_reference(action)
+            if material is not None:
+                await self._bind_reviewed_account_material(inputs, action, domain, account, material)
+            elif not self._capability_has_ticket_key(inputs):
                 credential = await self._select_account_credential(domain, account)
                 if credential:
                     inputs["key"] = credential["credential"]
                     inputs["key_type"] = credential["key_type"]
                     inputs["credential_id"] = credential.get("id")
                     inputs["credential_source"] = "mythic_credential_store"
-            context_password = self._capability_text(
-                inputs.get("context_password") or inputs.get("logon_password") or "SageNetOnlyContext1!"
-            )
-            logon_credential = await self._ensure_netonly_plaintext_credential(domain, context_password)
-            if logon_credential:
-                inputs["logon_credential_id"] = logon_credential.get("id")
-                inputs["logon_credential_source"] = logon_credential.get("status")
+            # Grounding a reviewed-material call writes nothing: its sacrificial logon row waits for the approved call.
+            if material is None or _capability_execution_context.get() is not None:
+                context_password = self._capability_text(
+                    inputs.get("context_password") or inputs.get("logon_password") or "SageNetOnlyContext1!"
+                )
+                logon_credential = await self._ensure_netonly_plaintext_credential(domain, context_password)
+                if logon_credential:
+                    inputs["logon_credential_id"] = logon_credential.get("id")
+                    inputs["logon_credential_source"] = logon_credential.get("status")
             self._sanitize_account_context_proof_target(action, inputs)
             self._normalize_capability_service_proof_target(action, inputs, default_share="SYSVOL")
             await self._augment_capability_account_ticket_proof_target(inputs, domain)
@@ -17856,6 +17870,12 @@ class MythicTools:
         """
         capability = self._capability_text(getattr(action, "name", "")).casefold()
         missing_items = [str(item) for item in (missing or [])]
+        material = self._account_material_reference(action)
+        if material is not None and "key" in missing_items:
+            return (f"`{capability}`: the reviewed credential material it pins ({material['effect'] or 'unnamed'}, "
+                    f"task {material['task_id'] or 'unknown'}) no longer re-reads to the key its review cited: the row "
+                    "was withdrawn or replaced, or the task's output changed. Sage uses only that source, never "
+                    "another task, a store row or a supplied key. Nothing was issued.")
         if capability not in self._KRBTGT_FORGE_CAPABILITIES or "key" not in missing_items:
             return ""
         if capability == "forge-golden-ticket":
@@ -17898,6 +17918,8 @@ class MythicTools:
         refresh plan instead of the forge its card showed, and a forge has no referenced key to forge from.
         """
         capability = self._capability_text(getattr(action, "name", "")).casefold()
+        if self._account_material_reference(action) is not None:
+            return not self._capability_has_ticket_key(inputs)
         if capability not in self._KRBTGT_FORGE_CAPABILITIES:
             return False
         pinned = (self._capability_text(inputs.get("credential_proof_task_id"))
@@ -17919,7 +17941,8 @@ class MythicTools:
         `mappings` are the card's other argument dicts (its action and that action's intent): a key written there
         is neither shown nor used, since the executor binds the proved credential again after approval.
         """
-        if not self._capability_text(inputs.get("credential_proof_task_id")):
+        if not (self._capability_text(inputs.get("credential_proof_task_id"))
+                or inputs.get("credential_source") == self._REVIEWED_MATERIAL_SOURCE):
             return
         targets = [inputs]
         for mapping in mappings:
@@ -17937,7 +17960,8 @@ class MythicTools:
         if self._adcs_certificate_auth_verified_ca_effect(action, plan_inputs):
             self._drop_adcs_ca_path_inputs(plan_inputs)
             plan_inputs["ca_pfx_path"] = "{{verified_ca_pfx_staged_path}}"
-        if (self._capability_text(plan_inputs.get("credential_proof_task_id"))
+        if ((self._capability_text(plan_inputs.get("credential_proof_task_id"))
+             or self._account_material_reference(action) is not None)
                 and not self._capability_has_ticket_key(plan_inputs)):
             plan_inputs["key"] = self._PROVED_KRBTGT_KEY_PLACEHOLDER
         return plan_inputs
@@ -18116,8 +18140,10 @@ class MythicTools:
                         f"input binder re-reads the krbtgt key from task {task}'s output, and only the forge's own "
                         "verifier records an effect")
         else:
-            recovery = ("no capability that needs a working credential accepts this material; a terminal-success "
-                        "task must prove the working credential")
+            recovery = (f"in an ordinary supervised request, ensure-account-kerberos-context is offered for this "
+                        f"account while the material row is valid; its card asks the operator to authorize trying the "
+                        f"reviewed material from task {task}, and only that procedure's verifier records an effect. "
+                        "Elsewhere a terminal-success task must prove the working credential")
         reason = (f"Recorded credential material only ({', '.join(sorted(set(material)))}) from task {task}: its "
                   f"Mythic record is not a terminal success, so {', '.join(missing)} is not proved and a working key "
                   f"has not been proved. Recovery: {recovery}.")
@@ -18372,6 +18398,61 @@ class MythicTools:
                 "credential_type": "plaintext",
             }]
         return []
+
+    _REVIEWED_MATERIAL_SOURCE = "credential_review_material"
+
+    def _account_material_reference(self, action) -> dict | None:
+        """The reviewed-material source an account context action pins (`intent.credential_material`, see
+        `capabilities.MATERIAL_REFERENCE_KEYS`), or None for a working-credential action."""
+        intent = getattr(action, "intent", None)
+        if not isinstance(intent, dict) or "credential_material" not in intent:
+            return None
+        pinned = intent["credential_material"] if isinstance(intent["credential_material"], dict) else {}
+        return {key: self._capability_text(pinned.get(key)) for key in ("effect", "task_id", "review_id",
+                                                                        "output_sha256")}
+
+    def _material_use_permitted(self) -> bool:
+        """Reviewed material is an input only in an ordinary supervised request (not Autonomous Solve or auto), read
+        from the request contract, never from the call."""
+        contract = getattr(self, "_request_contract", None)
+        kind = getattr(getattr(getattr(contract, "stop_condition", None), "kind", None), "value", "")
+        return getattr(getattr(contract, "lane", None), "value", "") == "supervised_workflow" and kind == "actions_complete"
+
+    async def _bind_reviewed_account_material(self, inputs: dict, action, domain: str, account: str,
+                                              material: dict) -> None:
+        """Bind an account context's key from the reviewed material its action pins, without writing.
+
+        A key the call carries is dropped. The pinned row must still re-admit with the same effect, source task,
+        review and output digest (`credential_review.reviewed_account_material`); the key is the one that review cited,
+        re-read from that task's output (`credential_review.reviewed_key`). Nothing falls back to the credential store,
+        another task or a carried key: an unbound key stops the step before any task (`_unresolved_krbtgt_reference`).
+        """
+        intent = getattr(action, "intent", None) if isinstance(getattr(action, "intent", None), dict) else {}
+        for target in (inputs, intent):
+            for field in (*self._TICKET_KEY_FIELDS, "key_type", "etype", "credential_id", "credential_source"):
+                target.pop(field, None)
+        if not self._material_use_permitted():
+            return
+        try:
+            from . import credential_review
+        except ImportError:
+            import credential_review
+        try:
+            hops = list(self._ledger_view().hops)
+        except Exception:
+            return
+        for hop in hops:
+            source = credential_review.reviewed_account_material(hop, engagement_id=self._eng_key())
+            if (not source or source["account"] != self._capability_text(account).casefold()
+                    or source["realm"] != self._capability_text(domain).casefold()
+                    or any(source[key] != value for key, value in material.items())):
+                continue
+            output = await self._fetch_plain_task_output(int(source["task_id"]))
+            key = credential_review.reviewed_key(output, source["record"], account=account, realm=domain)
+            if key:
+                inputs.update(key=key["credential"], key_type=key["key_type"],
+                              credential_source=self._REVIEWED_MATERIAL_SOURCE)
+            return
 
     async def _select_account_credential(self, domain: str, account: str) -> dict:
         domain_cf = self._capability_text(domain).casefold()

@@ -3197,9 +3197,12 @@ class _SupervisedStepBoundMiddleware(AgentMiddleware):
                         inputs, args.get("action") if isinstance(args.get("action"), dict) else None,
                     )
                     plan_inputs = {**inputs, "ca_pfx_path": "{{verified_ca_pfx_staged_path}}"}
-                if client._capability_text(inputs.get("credential_proof_task_id")):
-                    # A proved krbtgt key is bound by reference: the plan is checked with it here, but the card,
-                    # stream and checkpoint carry only the reference the executor resolves after approval.
+                material_source = getattr(client, "_REVIEWED_MATERIAL_SOURCE", "")
+                if (client._capability_text(inputs.get("credential_proof_task_id"))
+                        or (material_source and inputs.get("credential_source") == material_source)):
+                    # A proved krbtgt key, or reviewed account material, is bound by reference: the plan is checked
+                    # with it here, but the card, stream and checkpoint carry only the reference the executor
+                    # resolves after approval.
                     plan_inputs = {**plan_inputs, **{field: inputs[field] for field in client._TICKET_KEY_FIELDS
                                                      if field in inputs}}
                     client._drop_card_secret_inputs(
@@ -12483,8 +12486,11 @@ class Model:
                 runtime_scope=runtime_scope, current_account_contexts=_runtime_current_account_contexts(client),
                 request_attempts=_runtime_request_attempts(client),
             )
+            # Only this producer (every caller is ordinary supervised) offers an account context from reviewed
+            # material; its card asks the operator, and the executor checks the lane again.
+            actions = capabilities.actions_from_state(state, reviewed_account_material=True)
             pairs = [(_capability_action_payload(action), _autonomous_capability_inputs(action, state))
-                     for action in capabilities.actions_from_state(state)]
+                     for action in actions]
         except Exception as exc:
             return None, f"the engagement state could not be read ({type(exc).__name__})"
         request_id = str(getattr(getattr(self, "_request_contract", None), "request_id", "") or "")
@@ -17037,6 +17043,17 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         plan = capabilities_mod.build_capability_execution_plan(action_obj, input_values)
         cost = getattr(action_obj, "operational_cost", None) or {}
         lines: list[str] = []
+        material_reference = getattr(client, "_account_material_reference", None)
+        material = material_reference(action_obj) if callable(material_reference) else None
+        if material is not None:
+            # The operator's authorization is for this material: say what it is and that approval proves nothing.
+            intent = action_obj.intent
+            lines.append(
+                f"Credential material use: Accept authorizes this procedure to try the reviewed credential material "
+                f"for {intent.get('account')}@{intent.get('domain')} from Mythic task {material['task_id']} (review "
+                f"{material['review_id'][:16]}) on callback {intent.get('callback_id')}. It is material-only: no task "
+                "proved it is a working credential, and approving does not prove it. Sage re-reads that task's output "
+                "after approval; only this procedure's verifier can record the context.")
         if not getattr(plan, "ok", False):
             missing = ", ".join(str(item) for item in getattr(plan, "missing", []) or [])
             reason = str(getattr(plan, "reason", "") or "").strip()

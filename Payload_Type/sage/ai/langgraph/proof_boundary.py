@@ -700,7 +700,9 @@ def review_backed_account_material(hop: Any, account: str, realm: str = "", *,
     if not envelope.task_id or not envelope.callback_id:
         return None
     return {"effect": effect, "realm": subject_realm, "task_id": envelope.task_id,
-            "callback_id": envelope.callback_id, "review_id": _lower(envelope.metadata.get("review_id"))}
+            "callback_id": envelope.callback_id, "review_id": _lower(envelope.metadata.get("review_id")),
+            "output_sha256": _lower(envelope.metadata.get("review_output_sha256")),
+            "result_sha256": envelope.verifier_result_sha256}
 
 
 def row_headline_claims(envelope: ProofEnvelope | None, satisfied_effects: Any) -> list[str]:
