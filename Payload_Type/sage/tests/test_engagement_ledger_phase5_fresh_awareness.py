@@ -1326,9 +1326,10 @@ def test_a_supervisor_only_answer_is_not_a_worker_observation(session, sdk_guard
 
     [read] = _tool_results(fake.calls[1], el.READER_TOOL)
     assert _typed_sources(read.content) == {1: ["cred:2"], 3: ["cred:10"]}  # the answer itself is correct
-    # No step ran in this supervised request, so the operator sees Sage's no-step notice; the raw answer stays stored.
-    assert _final_reports(result) == [_AUDIT_FINAL] and not any(_AUDIT_FINAL in text for text in emitted)
-    assert sum("Sage has no completed step recorded" in text for text in emitted) == 1
+    # No worker step ran, but this Supervisor-only answer carries none of Sage's reserved step-report forms, so it
+    # reaches the operator; it is still not recorded as a worker observation (the point of this control).
+    assert _final_reports(result) == [_AUDIT_FINAL] and any(_AUDIT_FINAL in text for text in emitted)
+    assert sum("Sage has no completed step recorded" in text for text in emitted) == 0
 
     assert [_prompt_role(call) for call in fake.calls] == ["Supervisor", "Supervisor"]
     assert not any(_tool_results(call, "list_open_artifacts") for call in fake.calls)

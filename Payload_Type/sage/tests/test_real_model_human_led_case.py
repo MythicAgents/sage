@@ -1432,9 +1432,10 @@ def test_recon_followup_steering_cases_use_same_guarded_two_turn_path(
     assert [turn for turn, _messages in observed] == ["first", "second"]
     second_input = "\n".join(str(message.content) for message in observed[1][1])
     assert getattr(module, followup) in second_input
-    # The follow-up runs no step in its own supervised request, so the operator sees Sage's no-step notice.
-    assert result["followup_emissions"][-1]["content"].strip() == NO_STEP_NOTICE
-    assert all(reply not in str(row.get("content") or "") for row in result["followup_emissions"])
+    # The follow-up runs no step, but its consultation reply carries none of Sage's reserved step-report forms, so the
+    # operator sees the answer — these human-led recon answers were being swallowed by the blanket notice.
+    assert result["followup_emissions"][-1]["content"].strip() == reply
+    assert all(NO_STEP_NOTICE not in str(row.get("content") or "") for row in result["followup_emissions"])
 
 
 def test_recon_steering_case_inputs_are_fixed():
@@ -1500,9 +1501,10 @@ def test_recon_source_withdrawal_recap_assembled_three_turns(monkeypatch):
     assert result["followup_sent"] is result["third_sent"] is True
     assert [result[name] for name in ("first_terminal_count", "second_terminal_count",
                                       "third_terminal_count")] == [1, 1, 1]
-    # Neither follow-up runs a step in its own supervised request, so each shows Sage's no-step notice.
-    assert result["third_emissions"][-1]["content"].strip() == NO_STEP_NOTICE
-    assert all(third_reply not in str(row.get("content") or "") for row in result["third_emissions"])
+    # Neither follow-up runs a step, but each reply carries none of Sage's reserved step-report forms, so the operator
+    # sees the consultation answer rather than the blanket notice.
+    assert result["third_emissions"][-1]["content"].strip() == third_reply
+    assert all(NO_STEP_NOTICE not in str(row.get("content") or "") for row in result["third_emissions"])
     assert result["evidence_reads"] == [51, 52]
     assert result["effect_calls"] == []
     assert result["card_count"] == 0

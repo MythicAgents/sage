@@ -51,6 +51,18 @@
      }
     ]
    }
+  },
+  {
+   "id": "g0-orientation",
+   "supervisor_span": 16,
+   "trace": 4,
+   "source": "live run 2026-11-17, channel 3 request 2 (G0 'what access do we have'); identities renamed, no reserved forms",
+   "model": "bedrock-claude-4-6-sonnet",
+   "form": "zero-step orientation answer (direct content); carries none of Sage's reserved step-report forms",
+   "message": {
+    "content": "Here's a summary of our current access:\n\n| Field | Value |\n|---|---|\n| **Callback ID** | 2 |\n| **Agent** | Apollo |\n| **Host** | WS01 |\n| **User** | `lab\\analyst` |\n| **Integrity** | Medium (2) |\n| **Status** | Alive (checked in <1 sec ago) |\n\n**One active callback** on host `WS01`, running as `lab\\analyst` at **medium integrity** (standard user, no elevation). No credentials, no lateral movement, and no domain graph data recorded in the engagement ledger yet.",
+    "tool_calls": []
+   }
   }
  ]
 }

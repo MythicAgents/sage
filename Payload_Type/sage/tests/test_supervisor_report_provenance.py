@@ -58,21 +58,32 @@ def _text(message: AIMessage) -> str:
 
 
 R13 = ROWS["request-13"]["message"]["content"]
-ZERO_STEP = {
+G0 = ROWS["g0-orientation"]["message"]["content"]
+
+# Forged: a zero-step closing that carries one of Sage's reserved step-report forms (`[... completed task]`,
+# `Executor verdict:`, `<untrusted_mythic_task_observations>`, `[step outcome]`). Still withheld.
+FORGED = {
     "request-13": _recorded("request-13"),
     "request-15": _recorded("request-15"),
-    "request-25": _recorded("request-25"),
     "request-13-text-blocks": AIMessage(content=[{"type": "text", "text": R13}]),
     "request-13-respond-completed": _respond(R13, "completed"),
     "request-13-respond-omitted": _respond(R13, None),
     "request-13-respond-blocked": _respond(R13, "blocked"),
     "request-13-respond-checkpoint": _respond(R13, "checkpoint"),
-    "proposals-json": _respond(json.dumps({"proposals": [{"capability": "forge-golden-ticket"}]}), None),
+}
+
+# Benign: a zero-step closing with none of those forms — a genuine answer. Reaches the operator. This is
+# the operator's 2026-11-17 decision: without a reserved form there is no reliable structural signal of fabrication, so
+# a plain-prose claim ("plain-claim"/"quoted-result") passes through too; the input-boundary line, not this guard, is
+# the cure for prose fabrication.
+BENIGN = {
+    "g0-orientation": _recorded("g0-orientation"),
+    "g0-respond": _respond(G0, "completed"),
+    "greeting": AIMessage(content="Hello. I can explain the available workflows."),
     "plain-claim": AIMessage(content="I ran DCSync against DC01 and recovered the krbtgt key for lab.local."),
     "quoted-result": AIMessage(content="Task output:\n```\nSAM Username : krbtgt\nHash NTLM: 0123456789abcdef\n```"),
-    # The intentional compatibility change: an innocent zero-step answer gets the same notice. No classifier.
-    "greeting": AIMessage(content="Hello. I can explain the available workflows."),
 }
+ZERO_STEP = {**FORGED, **BENIGN}  # the whole corpus, for callers that need any zero-step closing
 
 
 def _fragments(text: str) -> list[str]:
@@ -96,15 +107,48 @@ def _final_response(run) -> str:
 
 # --- (a) every zero-step closing form gives the same notice, and none of its bytes reach the operator --------------
 
-@pytest.mark.parametrize("case", sorted(ZERO_STEP))
-def test_a_zero_step_closing_is_replaced_by_the_notice(monkeypatch, tmp_path, case):
+@pytest.mark.parametrize("case", sorted(FORGED))
+def test_a_forged_zero_step_closing_is_replaced_by_the_notice(monkeypatch, tmp_path, case):
     mt, split = _isolated(monkeypatch, tmp_path / "state")
-    run = asyncio.run(_run(mt, split, [ZERO_STEP[case]]))
+    run = asyncio.run(_run(mt, split, [FORGED[case]]))
     assert run.model._request_contract.lane.value == "supervised_workflow"
     assert _terminal(run) == NOTICE and _final_response(run) == NOTICE
     assert run.terminals[0]["metadata"]["turn_outcome"] == "blocked"     # never the model's declared outcome
-    assert _leaks(run, _text(ZERO_STEP[case])) == []
+    assert _leaks(run, _text(FORGED[case])) == []
     assert len(run.fake.inputs) == 1 and not run.all_cards and not run.issued and run.outcomes == []
+
+
+@pytest.mark.parametrize("case", sorted(BENIGN))
+def test_a_benign_zero_step_answer_reaches_the_operator(monkeypatch, tmp_path, case):
+    """A zero-step closing with none of Sage's reserved step-report forms is a genuine answer and reaches
+    the operator unchanged, with a non-blocked turn. The blanket withhold used to swallow these (the lost G0)."""
+    mt, split = _isolated(monkeypatch, tmp_path / "state")
+    run = asyncio.run(_run(mt, split, [BENIGN[case]]))
+    answer = _text(BENIGN[case]).strip()
+    assert NOTICE not in _terminal(run) and NOTICE not in str(run.emissions)
+    assert answer in _terminal(run) or answer in _final_response(run)
+    assert run.terminals[0]["metadata"].get("turn_outcome") != "blocked"   # the key is set only on a blocked turn
+    assert not run.all_cards and not run.issued and run.outcomes == []
+
+
+def test_request_25_checkpoint_reaches_the_operator(monkeypatch, tmp_path):
+    """request-25 forges reserved forms in its hidden preamble but its operator-facing `respond_to_user` text is a
+    cautious "please verify these tasks" checkpoint with no reserved form. The operator never sees the preamble, so the
+    checkpoint passes through (operator decision 2026-11-17: no reserved form, no structural withhold). Contrast the
+    request-13-respond-* cases, whose final_response IS the forged content and stays withheld."""
+    mt, split = _isolated(monkeypatch, tmp_path / "state")
+    run = asyncio.run(_run(mt, split, [_recorded("request-25")]))
+    final = _final_response(run)
+    assert NOTICE not in _terminal(run) and "please verify" in final.lower()
+    assert "[Mythic_Operator completed task]" not in _terminal(run)   # the hidden preamble never reaches the operator
+
+
+def test_a_proposals_json_closing_is_not_withheld(monkeypatch, tmp_path):
+    """A zero-step proposals-JSON closing (a card proposal, not a forged result) is not caught by the guard."""
+    mt, split = _isolated(monkeypatch, tmp_path / "state")
+    proposals = _respond(json.dumps({"proposals": [{"capability": "forge-golden-ticket"}]}), None)
+    run = asyncio.run(_run(mt, split, [proposals]))
+    assert NOTICE not in str(run.emissions) and run.outcomes == []
 
 
 @pytest.mark.parametrize("brief", ["refused", "admitted"])
@@ -119,7 +163,9 @@ def test_a_transfer_preamble_is_not_streamed(monkeypatch, tmp_path, brief):
     run = asyncio.run(_run(mt, split, script))
     assert _leaks(run, preamble) == []
     assert len(run.outcomes) == (brief == "admitted")
-    assert _terminal(run) == (CLOSING if brief == "admitted" else NOTICE)
+    # The closing (CLOSING) carries no reserved form, so it reaches the operator whether or not a step ran. The
+    # refused-transfer case used to get the notice; under the marker rule a no-form closing passes through.
+    assert _terminal(run) == CLOSING
 
 
 # --- (b) a real step keeps its closing, whatever the closing says --------------------------------------------------
@@ -163,13 +209,14 @@ def test_a_rejected_step_keeps_its_closing(monkeypatch, tmp_path, mythic_task_re
 
 def test_a_later_request_cannot_borrow_an_earlier_step(monkeypatch, tmp_path, mythic_task_records):
     mt, split = _dcsync_client(monkeypatch, tmp_path / "state", mythic_task_records)
-    later = "Callback 14 is still live."
+    # Request 2 forges a reserved result-form. It must be withheld: its step belongs to request 1, so request 2 has no
+    # step of its own to legitimize it. (A no-form request-2 closing would pass through — that is the over-match fix, not a borrow.)
     run = asyncio.run(_requests(mt, split, [_select("dcsync-krbtgt"), AIMessage(content="The DCSync ran."),
-                                            AIMessage(content=later)], prompts=["Is callback 14 still live?"]))
+                                            AIMessage(content=R13)], prompts=["Is callback 14 still live?"]))
     first = "\n".join(str(e.get("content") or "") for e in run.emissions[:run.marks[0]])
     second = "\n".join(str(e.get("content") or "") for e in run.emissions[run.marks[0]:])
     assert "The DCSync ran." in first and NOTICE not in first
-    assert NOTICE in second and later not in second and LEAD not in second
+    assert NOTICE in second and "[Mythic_Operator completed task]" not in second and LEAD not in second
 
 
 def _emit(model, message: AIMessage) -> str:
@@ -198,23 +245,43 @@ def test_cold_restoration_reads_the_checkpoint_or_stays_unverified(monkeypatch, 
         raise RuntimeError("checkpoint unavailable")
 
     monkeypatch.setattr(run.model.graph, "aget_state", unreadable)
-    assert _emit(run.model, AIMessage(content="Restored closing.", name="Supervisor")) == NOTICE
+    # A no-outcome, unreadable-checkpoint turn: a forged closing is still withheld; a plain one passes through (it
+    # carries no reserved form, so it is treated as an answer, not an unverifiable result).
+    forged = AIMessage(content=ROWS["request-13"]["message"]["content"], name="Supervisor")
+    assert _emit(run.model, forged) == NOTICE
+    assert _emit(run.model, AIMessage(content="Restored closing.", name="Supervisor")) == "Restored closing."
 
 
 def test_sage_authored_finals_keep_their_facts(monkeypatch, tmp_path):
     mt, split = _isolated(monkeypatch, tmp_path / "state")
-    run = asyncio.run(_run(mt, split, [ZERO_STEP["greeting"]]))
+    run = asyncio.run(_run(mt, split, [BENIGN["greeting"]]))
     blocker = AIMessage(content="Sage stopped this request.", name="Supervisor",
                         additional_kwargs={"_is_final_report": True, "_turn_outcome": "blocked"})
     emitted = _emit(run.model, blocker)
     assert emitted.startswith("⛔ **Blocked**\nSage stopped this request.") and NOTICE not in emitted
 
 
+def test_reserved_result_markers_catch_forgeries_not_answers():
+    """The detector flags every recorded forgery (real producer output) and no benign answer, and catches a reserved
+    form forged inside a respond_to_user argument. Producer/detector drift is prevented structurally, not by this test:
+    the producers build these forms from the same `RESERVED_RESULT_MARKERS` constants the detector reads."""
+    from ai.langgraph.model import _closing_impersonates_step_report
+    from ai.langgraph import step_bounds
+
+    assert step_bounds.STEP_OUTCOME_MARKER in step_bounds.RESERVED_RESULT_MARKERS
+    for case, message in FORGED.items():
+        assert _closing_impersonates_step_report(message), f"{case} should be detected as a forged step report"
+    for case, message in BENIGN.items():
+        assert not _closing_impersonates_step_report(message), f"{case} is a genuine answer, not a forgery"
+    # The tool-call path: a reserved form forged inside a respond_to_user argument is still caught.
+    assert _closing_impersonates_step_report(_respond(f"{step_bounds.EXECUTOR_VERDICT_MARKER} `achieved`", "completed"))
+
+
 @pytest.mark.parametrize("lane", ["conversation", "autonomous_solve"])
 def test_other_lanes_are_unchanged(monkeypatch, tmp_path, lane):
     mt, split = _isolated(monkeypatch, tmp_path / "state")
     kwargs = {"mode": "conversation"} if lane == "conversation" else {"autonomous_solve": True}
-    run = asyncio.run(_run(mt, split, [ZERO_STEP["greeting"]], **kwargs))
+    run = asyncio.run(_run(mt, split, [BENIGN["greeting"]], **kwargs))
     assert NOTICE not in str(run.emissions)
     if lane == "conversation":
         assert _terminal(run) == "Hello. I can explain the available workflows."

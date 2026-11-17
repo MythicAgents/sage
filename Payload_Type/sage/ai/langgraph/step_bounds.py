@@ -31,6 +31,21 @@ from . import task_evidence
 # 5: it also carries each terminal executor result of the step (`executor_results`).
 STEP_OUTCOME_VERSION = 5
 QUEUED_PREFIX = "[Queued]"
+
+# Sage's reserved step-report forms: distinctive, bracketed strings that only Sage's own code emits when a step runs
+# (the step-outcome line here; the worker completion header, task-observation wrapper and executor-verdict line in
+# model.py). A benign answer does not produce them, so their presence in a zero-step Supervisor closing means the model
+# impersonated a step report. The generic `Task IDs:` / `Recorded effects:` lines are deliberately NOT listed: a model
+# answering "what tasks ran" could produce them, and these four already cover every observed fabrication. One owner;
+# the producers below and model's zero-step closing guard both read this tuple. `test_reserved_result_markers` guards
+# against a producer drifting away from it.
+TASK_OBSERVATIONS_OPEN = "<untrusted_mythic_task_observations>"  # task_evidence wrapper (model._worker_task_evidence_message)
+STEP_OUTCOME_MARKER = "[step outcome]"                           # this module's render_outcome
+COMPLETED_TASK_MARKER = "completed task]"                        # worker header [<worker> completed task] (model.py)
+EXECUTOR_VERDICT_MARKER = "Executor verdict:"                    # executor result line (model.py)
+RESERVED_RESULT_MARKERS = (
+    TASK_OBSERVATIONS_OPEN, STEP_OUTCOME_MARKER, COMPLETED_TASK_MARKER, EXECUTOR_VERDICT_MARKER,
+)
 DENIED_PREFIX = "[DENIED by operator]"
 # Routing results that can appear in a worker's context; they are not work the step did.
 CONTROL_TOOLS = frozenset({"handback_to_supervisor", "summarize_and_handback", "request_continuation",
@@ -564,7 +579,7 @@ def render_outcome(outcome: Mapping[str, Any]) -> str:
     reason = outcome["status"] + (f" ({outcome['detail']})" if outcome.get("detail") else "")
     tasks = ", ".join(str(task) for task in outcome.get("tasks_issued") or []) or "none"
     lines = [
-        f"[step outcome] {outcome['worker']} step ended: {reason}.",
+        f"{STEP_OUTCOME_MARKER} {outcome['worker']} step ended: {reason}.",
         f"Guarded actions: {outcome['guarded_executed']} executed, {outcome['guarded_rejected']} rejected by the "
         f"operator. Mythic tasks issued: {tasks}. Tool calls: {outcome['tool_calls']}.",
         f"Time: {outcome['active_seconds']:.0f}s active, {outcome['action_seconds']:.0f}s inside the guarded "
