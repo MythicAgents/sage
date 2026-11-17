@@ -59,15 +59,21 @@ def _produce(mt, split, records, task: int, key: str) -> dict:
             {"timeout": 5})))
 
 
-def _material_client(monkeypatch, tmp_path, records, *, working: bool = False, key: str = NTLM):
+def _material_client(monkeypatch, tmp_path, records, *, working: bool = False, key: str = NTLM, responses: int = 2):
     """`_client`'s callbacks and lab.local krbtgt, plus replication rights on foreign.test (task 12's collection) and
-    the material-only DCSync of alice as task 37. With `working`, a terminal-success proof of `creds:` as well."""
+    the material-only DCSync of alice as task 37. With `working`, a terminal-success proof of `creds:` as well.
+
+    Mythic returns a DCSync's output as `responses` rows. The issue sink reviews their aggregate, while a re-read gets
+    the rows. Row 94 records this shape: task 37 has two valid reviews, one of the aggregate (citation 1394-1426) and
+    one of the re-read rows joined by a line break (1395-1427), and only the first is the row's proof."""
     mt, split = _client(monkeypatch, tmp_path)
     mt._outputs = {21: DCSYNC_OK}
 
     async def task_output(mythic, task_display_id, custom_return_attributes=None):
-        text = mt._outputs.get(int(task_display_id))
-        return [{"response_text": base64.b64encode(text.encode()).decode()}] if text else []
+        text = mt._outputs.get(int(task_display_id)) or ""
+        cut = text.find("Credentials:") if responses == 2 and int(task_display_id) != 21 else -1
+        rows = [text[:cut], text[cut:]] if cut > 0 else [text] if text else []
+        return [{"response_text": base64.b64encode(row.encode()).decode()} for row in rows]
 
     monkeypatch.setattr(package_mythic_tools.mythic, "get_all_task_output_by_id", task_output)
     proof = ingest_proof(mt._require_ledger_binding().engagement_key, task_id="12", job_id="job-12", callback_id="14")
@@ -133,9 +139,10 @@ def _executor_material(run) -> list:
 
 # --- (a) the material-only producer stays partial; its candidate reaches one explicit material-use card -----------
 
+@pytest.mark.parametrize("responses", [2, 1])
 def test_a_material_only_account_dcsync_reaches_one_material_use_card_and_nothing_else(
-        monkeypatch, tmp_path, mythic_task_records):
-    mt, split = _material_client(monkeypatch, tmp_path, mythic_task_records)
+        monkeypatch, tmp_path, mythic_task_records, responses):
+    mt, split = _material_client(monkeypatch, tmp_path, mythic_task_records, responses=responses)
     produced = mt._produced
     assert produced["verdict"] == "partial" and produced["material_only"] is True
     assert produced["recorded_effects"] == [MATERIAL] and WORKING not in json.dumps(produced["recorded_effects"])
@@ -179,7 +186,7 @@ def test_accept_runs_the_proved_procedure_from_the_pinned_material_once(monkeypa
     assert [_material_refs(card)["task_id"] for card in run.cards] == ["37"]
     assert _executor_material(run) == [{"effect": MATERIAL, "task_id": "37", "review_id": _row_review(mt)}]
     step_text = "\n".join(str(m.content) for m in run.values["supervisor_messages"] if "[step outcome]" in str(m.content))
-    assert f"reviewed credential material `{MATERIAL}` from task 37" in step_text
+    assert f"approved reviewed credential material `{MATERIAL}` from task 37" in step_text
     achieved = set(mt._capability_achieved_effects())
     assert (CONTEXT in achieved) is proved
     assert WORKING not in achieved and MATERIAL in achieved
@@ -264,27 +271,29 @@ def _replace_material_row(mt, only_task: str = ""):
     mt._ledger_view = view
 
 
-@pytest.mark.parametrize("change", ["withdrawn", "replaced_by_another_source", "output_changed"])
+@pytest.mark.parametrize("change", ["withdrawn", "replaced_by_another_source", "output_changed", "output_rebound"])
 def test_evidence_changed_after_the_card_refuses_before_any_task(monkeypatch, tmp_path, mythic_task_records, change):
     mt, split = _material_client(monkeypatch, tmp_path, mythic_task_records)
     if change == "replaced_by_another_source":
         _produce(mt, split, mythic_task_records, 41, OTHER_NTLM)   # a second valid source; task 37 stays the proof
+    rows_before = len(_store_rows(mt))
 
     def mutate():
         if change == "withdrawn":
             _replace_material_row(mt)
         elif change == "replaced_by_another_source":
             _replace_material_row(mt, only_task="41")
-        else:
-            mt._outputs[37] = _dcsync_output(OTHER_NTLM)
+        else:   # another key; or the reviewed value now named only for another account
+            mt._outputs[37] = (_dcsync_output(OTHER_NTLM) if change == "output_changed"
+                               else _dcsync_output(NTLM).replace(ACCOUNT, "bob"))
             mt._task_output_cache = {}
 
     run = asyncio.run(_run(mt, _context_split(split), [_select(PROCEDURE, contains=ACCOUNT)],
                            before_decision=mutate))
     assert len(_cards_for(run)) == 1
-    assert run.issued == []
+    assert run.issued == [] and len(_store_rows(mt)) == rows_before   # not even the sacrificial logon row
     [outcome] = run.outcomes
-    if change == "output_changed":                           # the executor's binder: the key no longer re-reads
+    if change.startswith("output_"):                         # the executor's binder: the key no longer re-reads
         assert [(r["verdict"], r["task_ids"], r["material"]["task_id"]) for r in outcome["executor_results"]] == [
             ("failed", [], "37")]
     else:                                                    # the pre-execution re-check: the pinned source is gone

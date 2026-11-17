@@ -17591,8 +17591,10 @@ class MythicTools:
                     inputs["key_type"] = credential["key_type"]
                     inputs["credential_id"] = credential.get("id")
                     inputs["credential_source"] = "mythic_credential_store"
-            # Grounding a reviewed-material call writes nothing: its sacrificial logon row waits for the approved call.
-            if material is None or _capability_execution_context.get() is not None:
+            # Grounding a reviewed-material call writes nothing: its sacrificial logon row waits for the approved call
+            # with a bound key.
+            if material is None or (_capability_execution_context.get() is not None
+                                    and self._capability_has_ticket_key(inputs)):
                 context_password = self._capability_text(
                     inputs.get("context_password") or inputs.get("logon_password") or "SageNetOnlyContext1!"
                 )
@@ -18442,13 +18444,19 @@ class MythicTools:
         except Exception:
             return
         for hop in hops:
-            source = credential_review.reviewed_account_material(hop, engagement_id=self._eng_key())
+            try:
+                source = credential_review.reviewed_account_material(hop, engagement_id=self._eng_key())
+            except Exception:
+                source = None
             if (not source or source["account"] != self._capability_text(account).casefold()
                     or source["realm"] != self._capability_text(domain).casefold()
                     or any(source[key] != value for key, value in material.items())):
                 continue
             output = await self._fetch_plain_task_output(int(source["task_id"]))
-            key = credential_review.reviewed_key(output, source["record"], account=account, realm=domain)
+            try:
+                key = credential_review.reviewed_key(output, source["record"], account=account, realm=domain)
+            except Exception:
+                key = None
             if key:
                 inputs.update(key=key["credential"], key_type=key["key_type"],
                               credential_source=self._REVIEWED_MATERIAL_SOURCE)

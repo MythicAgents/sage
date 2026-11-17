@@ -584,9 +584,9 @@ def render_outcome(outcome: Mapping[str, Any]) -> str:
     for result in outcome.get("executor_results") or []:
         if result.get("material"):
             used = result["material"]
-            lines.append(f"Input to `{result['capability']}`: reviewed credential material `{used['effect']}` from task "
-                         f"{used['task_id']} (review {used['review_id'][:16]}), as the operator approved. It is not a "
-                         "proved working credential; neither it nor the approval proves an effect.")
+            lines.append(f"The operator approved reviewed credential material `{used['effect']}` from task "
+                         f"{used['task_id']} (review {used['review_id'][:16]}) as the input to `{result['capability']}`. "
+                         "It is not a proved working credential; neither it nor the approval proves an effect.")
     if outcome.get("calls_blocked"):
         lines.append(f"Tool calls not run because the step had no call slots left: {outcome['calls_blocked']}.")
     if outcome.get("wrap_up"):

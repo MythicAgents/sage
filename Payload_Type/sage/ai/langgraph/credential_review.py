@@ -769,25 +769,29 @@ def reviewed_account_material(hop: Any, *, engagement_id: str) -> dict[str, Any]
 
 
 def reviewed_key(output: Any, record: Mapping[str, Any], *, account: str, realm: str) -> dict[str, str] | None:
-    """The key a committed valid review cited, re-read from the task output it reviewed, or None.
+    """The key a committed valid review cited, re-read from the reviewed task's output, or None.
 
-    The output must be the reviewed one (its digest), the cited span must still validate by type and bind to the
-    account and realm as the reviewer bound it, and the value must match the review's salted value hash."""
+    The value must match the review's salted value hash, validate by type and bind to the account and realm. When the
+    re-read text is the reviewed text (its digest), the cited span is read. Mythic's per-response rows are not the
+    issue aggregate a writer reviewed (nor any note Sage appended to it), so otherwise the deterministic locator
+    re-finds the committed value in this output, bound by the review's own rule."""
     text = review_text(output)
     candidate = record.get("candidate") if isinstance(record.get("candidate"), Mapping) else {}
     location = record.get("location") if isinstance(record.get("location"), Mapping) else {}
     credential_type = str(candidate.get("type") or "")
     account, realm = str(account or "").casefold(), str(realm or "").casefold()
-    if (output_sha256(text) != record.get("input_sha256") or credential_type not in KERBEROS_KEY_TYPES
-            or not check_citation(text, location, credential_type)[0]):
+    if credential_type not in KERBEROS_KEY_TYPES:
         return None
-    start, end = int(location["start"]), int(location["end"])
-    if record.get("reviewer_kind") == REVIEWER_DETERMINISTIC:
-        located = next((item for item in locate_candidates(text) if (item.start, item.end) == (start, end)), None)
-        bound = located is not None and check_binding(located, account, realm)[0]
-    else:
-        bound = check_citation_binding(text, start, account, realm)[0]
-    value = re.sub(r"\s+", "", text[start:end])
-    if not bound or value_sha256(value) != candidate.get("value_sha256"):
-        return None
-    return {"credential": value, "key_type": KERBEROS_KEY_TYPES[credential_type]}
+    spans: list[tuple[int, int]] = []
+    if (output_sha256(text) == record.get("input_sha256") and record.get("reviewer_kind") != REVIEWER_DETERMINISTIC
+            and check_citation(text, location, credential_type)[0]
+            and check_citation_binding(text, int(location["start"]), account, realm)[0]):
+        spans.append((int(location["start"]), int(location["end"])))
+    spans += [(item.start, item.end) for item in locate_candidates(text)
+              if item.credential_type == credential_type and check_binding(item, account, realm)[0]
+              and check_citation(text, {"start": item.start, "end": item.end}, credential_type)[0]]
+    for start, end in spans:
+        value = re.sub(r"\s+", "", text[start:end])
+        if value_sha256(value) == candidate.get("value_sha256"):
+            return {"credential": value, "key_type": KERBEROS_KEY_TYPES[credential_type]}
+    return None
