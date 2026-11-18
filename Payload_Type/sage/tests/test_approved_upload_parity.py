@@ -443,8 +443,8 @@ async def _assembled_run(tools: MythicTools, proposed: list) -> SimpleNamespace:
         return AIMessage(content=f"Callback {CALLBACK} runs as {WHOAMI_OUTPUT}.")
 
     def supervisor(messages):
-        # The Supervisor is given Sage's record of each ended worker step.
-        done = len([m for m in messages if isinstance(m, AIMessage) and m.additional_kwargs.get("_step_outcome")])
+        # The Supervisor is given Sage's record of each ended worker step (a user-role record on its model call).
+        done = len([m for m in messages if m.additional_kwargs.get("_step_outcome")])
         if done == 0:
             return _call(HANDOFF, dict(WHOAMI_STEP), next(counter))
         if done == 1:
@@ -533,8 +533,7 @@ def test_accepted_upload_in_a_later_step_issues_one_task_and_reaches_the_worker(
     # The upload step handed back as an executed step, and the Supervisor answered from both steps.
     supervisor_inputs = [msgs for msgs in run.fake.inputs if not any(
         isinstance(m, SystemMessage) and "You are the **Mythic Operator**" in str(m.content) for m in msgs)]
-    outcomes = [str(m.content) for m in supervisor_inputs[-1]
-                if isinstance(m, AIMessage) and m.additional_kwargs.get("_step_outcome")]
+    outcomes = [str(m.content) for m in supervisor_inputs[-1] if m.additional_kwargs.get("_step_outcome")]
     assert len(outcomes) == 2 and "1 executed" in outcomes[-1], outcomes
     text = "\n".join(str(e.get("content") or "") for e in run.emissions)
     assert "exact effect" not in text and "live target" not in text and "Blocked" not in text

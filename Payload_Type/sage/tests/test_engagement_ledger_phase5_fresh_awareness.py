@@ -1303,8 +1303,10 @@ def test_supervised_audit_reaches_the_worker_owned_artifact_tool_and_typed_rows(
     _assert_one_fresh_view_per_call(supervisor, "Supervisor", revision)
     _assert_one_fresh_view_per_call(worker, "Mythic_Operator", revision)
 
-    # The handback reached the Supervisor, whose respond_to_user report reached native chat once.
-    assert any(isinstance(m, AIMessage) and m.content == _WORKER_REPORT for m in supervisor[1])
+    # The handback reached the Supervisor's call as an attributed Sage record:
+    # projected into the user role with a [Sage record ...] header, its text unchanged. Its respond_to_user report
+    # reaches native chat once.
+    assert any(m.additional_kwargs.get("_sage_record") and _WORKER_REPORT in str(m.content) for m in supervisor[1])
     assert _final_reports(result) == [_AUDIT_FINAL]
     assert sum(_AUDIT_FINAL in text for text in emitted) == 1
 

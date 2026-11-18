@@ -117,8 +117,12 @@ def test_source_identity_reaches_supervisor_and_a_bloodhound_reask_is_not_dispat
         provenance = json.loads(header.content.splitlines()[-2])
         assert provenance == {"request_id": "chat:1:request:1", "caller": "Supervisor",
                               "worker": worker, "assignment": assignment}
-    assert returned[1] in seen[5]
-    assert first_answer in str(seen[5][seen[5].index(returned[1]) + 1].content)
+    # The return reaches the Supervisor's next call as an attributed Sage record (user role, text unchanged), and the
+    # specialist's answer follows it.
+    [position] = [index for index, m in enumerate(seen[5])
+                  if m.additional_kwargs.get("_sage_record") == "specialist return"
+                  and str(m.content).endswith(str(returned[1].content))]
+    assert first_answer in str(seen[5][position + 1].content)
     assert not any(
         m.additional_kwargs.get("_assisted_assignment") == correction
         for m in result["bloodhound_messages"])

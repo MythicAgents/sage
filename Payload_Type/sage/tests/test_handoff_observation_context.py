@@ -73,22 +73,26 @@ def test_retained_task_outputs_reach_generalist_model_input_without_new_authorit
     assert result["status"] == followup_row["status"] == "observed", result.get("error")
     assert result["effects"] == followup_row["effects"] == []
     assert len(supervisor_seen) == 1
-    supervisor_envelopes = [m for m in supervisor_seen[0] if isinstance(m, AIMessage)
-                            and m.additional_kwargs.get("_worker_task_evidence")]
+    # On a supervised model call the task-observation envelope is projected into the user role as an attributed Sage
+    # record: its kwargs and name are kept and the <untrusted...> block follows
+    # a [Sage record ...] header. The stored channel still holds it as an AIMessage (asserted elsewhere).
+    supervisor_envelopes = [m for m in supervisor_seen[0]
+                            if m.additional_kwargs.get("_worker_task_evidence")]
     assert len(supervisor_envelopes) == 1
     assert supervisor_envelopes[0].name == "Mythic_Operator"
     assert supervisor_envelopes[0].additional_kwargs["_request_id"] == "chat:1:request:1"
-    assert supervisor_envelopes[0].content.startswith("<untrusted_mythic_task_observations>\n")
+    assert "<untrusted_mythic_task_observations>\n" in supervisor_envelopes[0].content
+    assert supervisor_envelopes[0].content.rstrip().endswith("</untrusted_mythic_task_observations>")
     assert len(seen) == 1
     provider_messages = seen[0]
-    delegated = [m for m in provider_messages if isinstance(m, HumanMessage)]
+    delegated = [m for m in provider_messages if isinstance(m, HumanMessage)
+                 and m.additional_kwargs.get("_delegated_to") == "Generalist"]
     assert delegated[-1].content == followup
-    assert delegated[-1].additional_kwargs.get("_delegated_to") == "Generalist"
-    envelopes = [m for m in provider_messages if isinstance(m, AIMessage)
-                 and m.additional_kwargs.get("_worker_task_evidence") is True]
+    envelopes = [m for m in provider_messages
+                 if m.additional_kwargs.get("_worker_task_evidence") is True]
     assert len(envelopes) == 1
     assert envelopes[0].additional_kwargs["_request_id"] == "chat:1:request:1"
-    assert envelopes[0].content.startswith("<untrusted_mythic_task_observations>\n")
+    assert "<untrusted_mythic_task_observations>\n" in envelopes[0].content
     evidence = json.loads(envelopes[0].content.splitlines()[-2])
     assert {row["task_id"] for row in evidence} == {701, 702, 703}
     assert {row["request_id"] for row in evidence} == {"chat:1:request:1"}

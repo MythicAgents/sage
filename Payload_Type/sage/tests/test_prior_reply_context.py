@@ -171,8 +171,13 @@ def test_every_worker_call_in_a_follow_up_carries_the_previous_reply(kind):
     for messages, assignment in zip(workers.inputs, (ASSIGN_ONE, ASSIGN_TWO)):
         [block] = _blocks(messages)
         assert MENU in str(block.content)
-        assert str(block.content).startswith(f"<{TAG}>") and str(block.content).endswith(f"</{TAG}>")
-        assert "not operator input" in str(block.content)
+        # On the assembled model call the previous reply is projected into the user role as an attributed Sage
+        # record: a [Sage record ...] header then the unchanged block.
+        assert isinstance(block, HumanMessage) and block.additional_kwargs.get("_sage_record") == "previous reply"
+        header, _, body = str(block.content).partition("\n")
+        assert header.startswith("[Sage record ") and "previous reply" in header
+        assert body.startswith(f"<{TAG}>") and body.endswith(f"</{TAG}>")
+        assert "not operator input" in body
         # The exact operator text is still the only delegated HumanMessage, and the block comes before it.
         [delegated] = _delegated(messages)
         assert delegated.content == FOLLOW_UP

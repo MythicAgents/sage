@@ -171,6 +171,23 @@ def _text(message: dict) -> str:
     return content if isinstance(content, str) else json.dumps(content)
 
 
+def _envelope(message: dict) -> tuple[str | None, str]:
+    """The Sage-authored block in a message, or (None, "").
+
+    The assignment and step scope stay in the assistant role. Carried context (earlier steps, previous reply, ...) is
+    now projected into the user role as an attributed Sage record — a `[Sage record ...]` header line before the same
+    `<tag>` block. A user-role Sage record is Sage-authored data, not transcript.
+    """
+    text = message.get("content")
+    text = text if isinstance(text, str) else json.dumps(text)
+    is_record = message["role"] == "user" and text.startswith("[Sage record ")
+    inner = text.split("\n", 1)[1] if is_record and "\n" in text else ("" if is_record else text)
+    match = ENVELOPE.match(inner)
+    if match and (message["role"] == "assistant" or is_record):
+        return match.group(1), inner
+    return None, ""
+
+
 def _assert_isolated(run: dict, decision: str, *, earlier_steps: bool = True) -> None:
     """The second step's provider requests: no earlier-step transcript, and every current-step carrier present.
 
@@ -184,15 +201,14 @@ def _assert_isolated(run: dict, decision: str, *, earlier_steps: bool = True) ->
     for index, messages in enumerate(step_two):
         label = f"step two call {index + 1}"
         # Transcript is everything but Sage's tagged envelopes, read whole (content and tool-call arguments).
-        transcript = [m for m in messages if not (m["role"] == "assistant" and ENVELOPE.match(_text(m)))]
+        transcript = [m for m in messages if _envelope(m)[0] is None]
         leaked = [json.dumps(m)[:160] for m in transcript if OLD in json.dumps(m)]
         leaked += sorted(old_ids & ({m.get("tool_call_id") for m in messages}
                                     | {call["id"] for m in messages for call in m.get("tool_calls") or []}))
         assert not leaked, f"old transcript reached the {label}: {leaked}"
         users = [m for m in messages if m["role"] == "user" and _text(m) == PROMPT]
         assert len(users) == 1, f"current operator input missing or repeated in the {label}: {len(users)}"
-        envelopes = {ENVELOPE.match(_text(m)).group(1): _text(m) for m in messages
-                     if m["role"] == "assistant" and ENVELOPE.match(_text(m))}
+        envelopes = {tag: inner for m in messages for tag, inner in [_envelope(m)] if tag}
         assert f"{CURRENT}-assignment" in envelopes.get("untrusted_delegated_assignment", ""), \
             f"current assignment missing in the {label}"
         assert "issue_task_and_waitfor_task_output" in envelopes.get("step_scope", ""), \

@@ -624,10 +624,16 @@ def _delegated_brief(run) -> dict:
     return message.additional_kwargs["_handoff_brief"]
 
 
+def _record_body(text: str) -> str:
+    """A model-call message's text without the `[Sage record ...]` header line Sage puts on its records of earlier
+    work in an ordinary supervised call (they reach the model in the user role); other text unchanged."""
+    return text.split("\n", 1)[1] if text.startswith("[Sage record ") and "\n" in text else text
+
+
 def _outcome_text(run) -> str:
     """The `[step outcome]` the Supervisor read in its first model call after the operator's decision."""
-    return next(str(m.content) for messages in run.fake.inputs[run.before.inputs:] for m in messages
-                if str(m.content).startswith("[step outcome]"))
+    return next(text for messages in run.fake.inputs[run.before.inputs:] for m in messages
+                for text in (_record_body(str(m.content)),) if text.startswith("[step outcome]"))
 
 
 def _acknowledgment(run) -> str:

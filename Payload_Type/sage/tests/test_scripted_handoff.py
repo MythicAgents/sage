@@ -547,9 +547,12 @@ def test_filtered_worker_answer_reuse_error_allows_supervisor_synthesis(monkeypa
     harness = _Harness([_handoff_call(), AIMessage(content=answer), reuse, finish])
     result = asyncio.run(harness.run("Summarize task 51 without new tasks.", assisted=True))
     assert len(seen) == 4
-    assert any(message.content == "Task 51 reports filesrv-01 as a file server."
+    # On the supervised synthesis call the worker report reaches the Supervisor as an attributed Sage record,
+    # projected into the user role, its text unchanged.
+    assert any(message.additional_kwargs.get("_sage_record")
                and not message.additional_kwargs.get("_worker_final_answer")
-               for message in seen[2] if isinstance(message, AIMessage))
+               and message.content.endswith("Task 51 reports filesrv-01 as a file server.")
+               for message in seen[2])
     assert any(isinstance(message, ToolMessage)
                and message.name == "respond_to_user"
                and "Worker answer reuse unavailable" in str(message.content)
@@ -641,7 +644,9 @@ def test_supervisor_receives_bounded_task_observation_after_worker_answer(monkey
     assert handbacks.index(refs[0]) < handbacks.index(evidence[0])
     assert "Task 3 observed: privilege enabled." in evidence[0].content
     assert "partial_snapshot" in evidence[0].content
-    assert any(evidence[0].content in [str(m.content) for m in turn] for turn in seen[-1:])
+    # The stored envelope reaches the next supervised call as an attributed Sage record: its
+    # <untrusted...> block is carried unchanged after a [Sage record ...] header.
+    assert any(evidence[0].content in str(m.content) for m in seen[-1])
     assert not harness.mythic.issue_task.called
 
 
@@ -1055,7 +1060,9 @@ def test_sqlite_checkpoint_preserves_worker_evidence_for_later_consultant_turn(
             next_input = seen[4]
             worker_input = [message for message in next_input
                             if getattr(message, "name", None) == "Mythic_Operator"]
-            assert any(message.content == summary for message in worker_input)
+            # The worker summary reaches the later consultant call as an attributed Sage record,
+            # projected into the user role, its text unchanged.
+            assert any(summary in str(message.content) for message in worker_input)
             evidence = [message for message in worker_input
                         if message.additional_kwargs.get("_worker_task_evidence")]
             assert len(evidence) == 1

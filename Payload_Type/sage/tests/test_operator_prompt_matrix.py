@@ -397,8 +397,10 @@ def test_direct_evidence_control_reads_seeded_output_without_effect(tmp_path, mo
     monkeypatch.setattr(socket.socket, "connect_ex", lambda *_: (_ for _ in ()).throw(AssertionError("network")))
     supervisor_evidence = []
     def supervisor_after_worker(messages):
-        supervisor_evidence.extend(message for message in messages if isinstance(message, AIMessage)
-            and message.additional_kwargs.get("_worker_task_evidence"))
+        # On a supervised model call the evidence is projected into the user role as a Sage record;
+        # match it by its kept kwarg, not its class.
+        supervisor_evidence.extend(message for message in messages
+            if message.additional_kwargs.get("_worker_task_evidence"))
         return AIMessage(content="Task 811 shows LAB-WS01 is joined to example.test; trusts were not collected.")
     fake = runner.CASE.ScriptedModel(messages=iter([
         runner.CASE.call("transfer_to_Mythic_Operator", {
@@ -448,8 +450,10 @@ def test_stored_enumeration_reads_prior_tasks_then_recommends_without_effect(tmp
         for task_id in (701, 702, 703)])
     supervisor_evidence = []
     def supervisor_after_worker(messages):
-        supervisor_evidence.extend(message for message in messages if isinstance(message, AIMessage)
-            and message.additional_kwargs.get("_worker_task_evidence"))
+        # On a supervised model call the evidence is projected into the user role as a Sage record;
+        # match it by its kept kwarg, not its class.
+        supervisor_evidence.extend(message for message in messages
+            if message.additional_kwargs.get("_worker_task_evidence"))
         return AIMessage(content="Task 701 shows LAB\\analyst; 702 shows two processes; 703 lists local accounts. Trusts are unknown.")
     fake = runner.CASE.ScriptedModel(messages=iter([
         runner.CASE.call("transfer_to_Mythic_Operator", {

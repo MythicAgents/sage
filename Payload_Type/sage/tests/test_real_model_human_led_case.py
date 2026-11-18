@@ -531,12 +531,12 @@ def test_historical_mock_read_reaches_supervisor_as_current_request_evidence(mon
         return module.CASE.call(module.CASE.EXPECTED["name"],
                                 module.CASE.EXPECTED["args"], 3)
     def supervisor_after_return(messages):
+        # On a supervised model call these are projected into the user role as Sage records;
+        # match them by their kept kwargs, not their class.
         observed["references"] = [message for message in messages
-            if isinstance(message, AIMessage)
-            and message.additional_kwargs.get("_worker_task_references")]
+            if message.additional_kwargs.get("_worker_task_references")]
         observed["evidence"] = [message for message in messages
-            if isinstance(message, AIMessage)
-            and message.additional_kwargs.get("_worker_task_evidence")]
+            if message.additional_kwargs.get("_worker_task_evidence")]
         return AIMessage(content="Task 41 is historical; fresh check reported EXAMPLE\\current-user.")
     script = [
         module.CASE.call("transfer_to_Mythic_Operator", {
@@ -822,15 +822,14 @@ def test_identity_v2_scripted_explicit_handback_after_native_decision(
     supervisor = seen["supervisor"]  # Actual next model input, not a saved-channel guess.
     runtime = [str(m.content) for m in supervisor if isinstance(m, SystemMessage)
                and "[supervised-runtime]" in str(m.content)]
-    summaries = [m for m in supervisor if isinstance(m, AIMessage)
-                 and m.additional_kwargs.get("_worker_outcome")]
-    references = [m for m in supervisor if isinstance(m, AIMessage)
-                  and m.additional_kwargs.get("_worker_task_references")]
-    evidence = [m for m in supervisor if isinstance(m, AIMessage)
-                and m.additional_kwargs.get("_worker_task_evidence")]
+    # On a supervised model call the summary, references and evidence are projected into the user role as Sage
+    # records; match them by their kept kwargs, not their class.
+    summaries = [m for m in supervisor if m.additional_kwargs.get("_worker_outcome")]
+    references = [m for m in supervisor if m.additional_kwargs.get("_worker_task_references")]
+    evidence = [m for m in supervisor if m.additional_kwargs.get("_worker_task_evidence")]
     assert len(runtime) == len(summaries) == len(references) == len(evidence) == 1
     assert f'"native_decision":"{native_decision}"' in runtime[0]
-    assert summaries[0].content == summary
+    assert summaries[0].content.endswith(summary)
     assert summaries[0].additional_kwargs["_worker_outcome"]["outcome"] == "progress"
     historical = json.loads(next(m.content for m in seen["worker"]
                                  if isinstance(m, ToolMessage)
@@ -997,8 +996,9 @@ def test_report_fresh_native_task_evidence_boundary(decision, handback, monkeypa
                and "[supervised-runtime]" in str(m.content)]
     assert len(runtime) == 1
     assert "Active Connections" not in runtime[0]
-    evidence = [m for m in supervisor if isinstance(m, AIMessage)
-                and m.additional_kwargs.get("_worker_task_evidence")]
+    # Projected into the user role as a Sage record on a supervised call;
+    # match it by its kept kwarg, not its class.
+    evidence = [m for m in supervisor if m.additional_kwargs.get("_worker_task_evidence")]
     if decision == "accept":
         assert len(evidence) == 1
         rows = json.loads(evidence[0].content.splitlines()[-2])
@@ -1014,8 +1014,8 @@ def test_report_fresh_native_task_evidence_boundary(decision, handback, monkeypa
         assert "Active Connections" in row["response_text_excerpts"][0]
         assert "TIME_WAIT" in row["response_text_excerpts"][0]
         assert len(row["response_text_excerpts"][0]) <= 4096
-        later_evidence = [m for m in seen["report"] if isinstance(m, AIMessage)
-                          and m.additional_kwargs.get("_worker_task_evidence")]
+        later_evidence = [m for m in seen["report"]
+                          if m.additional_kwargs.get("_worker_task_evidence")]   # projected to the user role
         assert later_evidence
         later_rows = [r for m in later_evidence
                       for r in json.loads(m.content.splitlines()[-2])
