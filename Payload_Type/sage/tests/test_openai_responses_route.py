@@ -351,3 +351,44 @@ def test_transient_and_history_errors_are_not_configuration_errors(status, error
     exc = _rejection(status, error)
     assert provider_configuration_rejection(exc) is None
     assert provider_configuration_notice(exc, None) == ""
+
+
+def test_dotenv_files_supply_the_settings_through_the_environment_layer(wire, tmp_path, monkeypatch):
+    """`.env.local` then `.env` load into the process environment at startup (dotenv_bootstrap); the resolver's
+    environment layer then reads them, below the chat field and the user secret."""
+    import os
+
+    import dotenv_bootstrap
+
+    (tmp_path / ".env.local").write_text("SAGE_OPENAI_API=responses\nSAGE_OPENAI_ACCESS_PROGRAM=daybreak_blue\n")
+    (tmp_path / ".env").write_text("SAGE_OPENAI_API=chat_completions\nSAGE_OPENAI_SAFETY_IDENTIFIER=user_env\n")
+    environ = dict(os.environ)
+    monkeypatch.setattr(os, "environ", environ)
+    applied = dotenv_bootstrap.load_sage_dotenv(str(tmp_path))
+    assert set(NEW_ENV) <= set(applied)
+
+    profile = resolve_llm_profile(build_chat_request("x", config=_config()))
+    assert (profile.openai_api, profile.openai_access_program, profile.openai_safety_identifier) == (
+        "responses", "daybreak_blue", "user_env")
+    assert {profile.source_for(f) for f in ("openai_api", "openai_access_program")} == {"environment"}
+    _send(_config())
+    ((path, body),) = wire.requests
+    assert path == "/v1/responses"
+    assert body["access_programs"] == {"cyber": "daybreak_blue"} and body["safety_identifier"] == "user_env"
+
+    # A user secret still outranks the files, and the chat field outranks both.
+    secret = resolve_llm_profile(build_chat_request("x", config=_config(),
+                                                    secrets={"SAGE_OPENAI_ACCESS_PROGRAM": "standard"}))
+    assert secret.openai_access_program == "standard" and secret.source_for("openai_access_program") == "user-secret"
+    field = resolve_llm_profile(build_chat_request("x", config=_config(SAGE_OPENAI_ACCESS_PROGRAM="daybreak_red"),
+                                                   secrets={"SAGE_OPENAI_ACCESS_PROGRAM": "standard"}))
+    assert field.openai_access_program == "daybreak_red" and field.source_for("openai_access_program") == "ui-config"
+
+
+def test_shipped_env_template_names_the_settings_but_sets_none():
+    from pathlib import Path
+
+    template = (Path(__file__).resolve().parents[1] / ".env").read_text().splitlines()
+    for name in NEW_ENV:
+        assert any(line.startswith(f"#{name}=") for line in template), name
+        assert not any(line.startswith(f"{name}=") for line in template), name
