@@ -153,6 +153,17 @@ def _mythic_dir() -> Path:
     return Path(cli).resolve().parent
 
 
+async def _wait_container(client: Any, running: bool, timeout: float = 240) -> bool:
+    """Wait until Mythic's own record of the Sage chat container shows the wanted state."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        rows = (await _query(client, nc.READINESS_QUERY)).get("consuming_container") or []
+        if rows and bool(rows[0].get("container_running")) == running:
+            return True
+        await asyncio.sleep(3)
+    return False
+
+
 def _count_restart(run: dict[str, Any]) -> None:
     run["restarts"] = int(run.get("restarts", 0)) + 1
     if run["restarts"] > BUDGET["service_restarts"]:
@@ -213,9 +224,21 @@ async def cmd_seed(client: Any, run: dict[str, Any], args: argparse.Namespace) -
     return case
 
 
-async def cmd_deploy(_client: Any, run: dict[str, Any], _args: argparse.Namespace) -> dict[str, Any]:
+async def cmd_start_old(client: Any, run: dict[str, Any], _args: argparse.Namespace) -> dict[str, Any]:
+    """Start the installed (pre-feature) Sage so a legacy chat can be seeded before deploy."""
+    _count_restart(run)
+    cli = os.environ.get("MYTHIC_CLI", "")
+    completed = subprocess.run([cli, "start", "sage"], capture_output=True, text=True,
+                               cwd=_mythic_dir())
+    result = {"returncode": completed.returncode, "serving": await _wait_container(client, True)}
+    run["started_at"] = run.get("started_at") or time.time()
+    return result
+
+
+async def cmd_deploy(client: Any, run: dict[str, Any], _args: argparse.Namespace) -> dict[str, Any]:
     _count_restart(run)
     result = {"deploy": _deployment("deploy", "--mode", "container"), "identity": _identity()}
+    result["serving"] = await _wait_container(client, True)
     run.setdefault("deployments", []).append(result)
     return result
 
@@ -264,12 +287,18 @@ async def cmd_down(client: Any, run: dict[str, Any], args: argparse.Namespace) -
     case = run["cases"][args.as_]
     _count_restart(run)
     subprocess.run(["docker", "compose", "stop", "sage"], cwd=_mythic_dir(), check=True)
+    # Mythic must record the container as stopped, or it queues the decision for later delivery
+    # instead of storing it undelivered, which is the case under test.
+    case["mythic_saw_stopped"] = await _wait_container(client, False)
+    if not case["mythic_saw_stopped"]:
+        raise SystemExit("Mythic never recorded the Sage container as stopped; decision not sent")
     try:
         case["decision_while_down"] = await nc.approve_pending_input_card(
             client, case["card_request"]["request_id"])
     except Exception as exc:  # Mythic stores the decision, then reports the stopped container
         case["decision_while_down"] = f"{type(exc).__name__}: {exc}"
     case["start"] = _deployment("deploy", "--mode", "container")
+    case["serving"] = await _wait_container(client, True)
     case["next_request"] = await _send(client, case["channel_id"], STATUS_PROMPT)
     case["tasks_after"] = await _max_task(client)
     return case
@@ -289,6 +318,7 @@ async def cmd_crash(client: Any, run: dict[str, Any], args: argparse.Namespace) 
     subprocess.run(["docker", "kill", "sage"], check=False, capture_output=True)
     case["killed_after_task"] = issued[:1]
     case["start"] = _deployment("deploy", "--mode", "container")
+    case["serving"] = await _wait_container(client, True)
     case["next_request"] = await _send(client, case["channel_id"], STATUS_PROMPT)
     case["tasks_after"] = await _max_task(client)
     return case
@@ -344,7 +374,7 @@ async def cmd_verify(client: Any, run: dict[str, Any], _args: argparse.Namespace
 
 
 COMMANDS = {
-    "readiness": cmd_readiness, "seed": cmd_seed, "deploy": cmd_deploy, "restart": cmd_deploy,
+    "readiness": cmd_readiness, "start-old": cmd_start_old, "seed": cmd_seed, "deploy": cmd_deploy, "restart": cmd_deploy,
     "recall": cmd_recall, "card": cmd_card, "decide": cmd_decide, "down": cmd_down,
     "crash": cmd_crash, "verify": cmd_verify,
 }
