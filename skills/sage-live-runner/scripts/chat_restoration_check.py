@@ -18,8 +18,10 @@ Order (see the plan named in the run file):
   card --as accept|reject|down|crash
   restart                         (accept/reject cards only)
   decide --as accept|reject       decide the restored card through Mythic
-  down --as down                  stop Sage, accept the card while it is down, start, send a prompt
-  crash --as crash                accept, kill Sage once Mythic shows the task, start, ask a question
+  down --as down                  stop Sage, accept the card while it is down, start and send nothing;
+                                  wait for Sage's new card in the same request, accept it, then send a prompt
+  crash --as crash                accept, kill Sage once Mythic shows the task, start; wait for the request
+                                  to end with no operator action, then ask a question
   verify                          evaluate every recorded case against its rule
 
 Pass rules are written in `verify` before any run and read Mythic's own rows: request/message
@@ -52,19 +54,21 @@ LABEL_PROMPT = f"Remember the label {LABEL}. Do not run tools."
 RECALL_PROMPT = "What label did I ask you to remember? Do not run tools."
 STATUS_PROMPT = "Is anything still pending from before? Answer from what you know. Do not run tools."
 REFUSAL = "Sage restarted or this channel's session was replaced"
-RECOVERED = "decision was recovered"
+REASKED = "was not applied"
 UNRESOLVED = "will not resend"
 CHANGED_FILES = (
     "Payload_Type/sage/sage_chat/service.py",
     "Payload_Type/sage/sage_chat/session.py",
     "Payload_Type/sage/sage_chat/restoration.py",
     "Payload_Type/sage/sage_chat/hitl.py",
+    "Payload_Type/sage/sage_chat/watcher_control.py",
     "Payload_Type/sage/ai/langgraph/model.py",
     "Payload_Type/sage/ai/langgraph/mythic_tools.py",
     "Payload_Type/sage/ai/langgraph/request_contract.py",
 )
-BUDGET = {"minutes": 30, "approved_pwd_tasks": 3, "service_restarts": 8, "model_calls": 20,
-          "total_tokens": 400_000, "output_tokens_per_call": 4096, "retries": 0}
+BUDGET = {"minutes": 35, "approved_pwd_tasks": 3, "service_restarts": 8, "model_calls": 24,
+          "total_tokens": 480_000, "output_tokens_per_call": 4096, "retries": 0}
+TERMINAL = {"complete", "error", "cancelled"}
 
 CALLBACK_QUERY = """
 query RestorationCallback($cb: Int!) {
@@ -283,9 +287,35 @@ async def cmd_decide(client: Any, run: dict[str, Any], args: argparse.Namespace)
     return case
 
 
+def _cards(messages: list[dict[str, Any]], request_id: int) -> list[dict[str, Any]]:
+    """Approval cards of one request: message id, status and Sage's approval correlation."""
+    cards = []
+    for message in messages:
+        metadata = message.get("metadata") or {}
+        card = metadata.get("input_requested") if isinstance(metadata, dict) else None
+        if message.get("chat_request_id") != request_id or not isinstance(card, dict):
+            continue
+        context = (card.get("data") or {}).get("sage_approval_context") or {}
+        cards.append({"message_id": message["id"], "status": card.get("status"),
+                      "approval_id": context.get("approval_id"),
+                      "action_digest": context.get("action_digest")})
+    return cards
+
+
+async def _wait_status(client: Any, request_id: int, done, timeout: float = 240) -> dict[str, Any]:
+    """Poll Mythic's own request snapshot until ``done(snapshot)`` holds or the time runs out."""
+    deadline = time.monotonic() + timeout
+    snapshot = await nc.fetch_request_snapshot(client, request_id)
+    while not done(snapshot) and time.monotonic() < deadline:
+        await asyncio.sleep(3)
+        snapshot = await nc.fetch_request_snapshot(client, request_id)
+    return snapshot
+
+
 async def cmd_down(client: Any, run: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     case = run["cases"][args.as_]
     _count_restart(run)
+    request_id = case["card_request"]["request_id"]
     subprocess.run(["docker", "compose", "stop", "sage"], cwd=_mythic_dir(), check=True)
     # Mythic must record the container as stopped, or it queues the decision for later delivery
     # instead of storing it undelivered, which is the case under test.
@@ -299,6 +329,19 @@ async def cmd_down(client: Any, run: dict[str, Any], args: argparse.Namespace) -
         case["decision_while_down"] = f"{type(exc).__name__}: {exc}"
     case["start"] = _deployment("deploy", "--mode", "container")
     case["serving"] = await _wait_container(client, True)
+    # No prompt: Sage's on-start reconciliation must re-ask the card in the same request.
+    reasked = await _wait_status(
+        client, request_id, lambda snap: bool(nc._pending_input_requested_messages(snap["messages"])))
+    case["cards"] = _cards(reasked["messages"], request_id)
+    case["tasks_before_answer"] = await _max_task(client)
+    if not nc._pending_input_requested_messages(reasked["messages"]):
+        case["reasked"] = False
+        return case
+    case["reasked"] = True
+    case["answer"] = await nc.approve_pending_input_card(client, request_id)
+    answered = await _wait_status(client, request_id, lambda snap: snap["request"].get("status") in TERMINAL, 600)
+    case["request_status_after_answer"] = answered["request"].get("status")
+    case["tasks_after_answer"] = await _max_task(client)
     case["next_request"] = await _send(client, case["channel_id"], STATUS_PROMPT)
     case["tasks_after"] = await _max_task(client)
     return case
@@ -319,6 +362,10 @@ async def cmd_crash(client: Any, run: dict[str, Any], args: argparse.Namespace) 
     case["killed_after_task"] = issued[:1]
     case["start"] = _deployment("deploy", "--mode", "container")
     case["serving"] = await _wait_container(client, True)
+    # No operator action: Sage's on-start reconciliation must end the orphaned request.
+    ended = await _wait_status(client, case["card_request"]["request_id"],
+                               lambda snap: snap["request"].get("status") in TERMINAL)
+    case["request_status_after_start"] = ended["request"].get("status")
     case["next_request"] = await _send(client, case["channel_id"], STATUS_PROMPT)
     case["tasks_after"] = await _max_task(client)
     return case
@@ -355,11 +402,10 @@ async def cmd_verify(client: Any, run: dict[str, Any], _args: argparse.Namespace
         own = [t for t in pwd if int(t["display_id"]) > int(case["tasks_before"])
                and (upper is None or int(t["display_id"]) <= int(upper))]
         detail: dict[str, Any] = {"pwd_tasks": len(own), "expected": expected}
-        if name in {"down", "crash"}:
-            text = _text(await _messages(client, case["channel_id"]), case["next_request"]["request_id"])
-            marker = RECOVERED if name == "down" else UNRESOLVED
-            detail["notice"] = marker in text
-            detail["pass"] = len(own) == expected and marker in text and REFUSAL not in text
+        if name == "down":
+            detail.update(await _verify_down(client, case, own))
+        elif name == "crash":
+            detail.update(await _verify_crash(client, case, own))
         else:
             detail["duplicate"] = case.get("duplicate")
             detail["pass"] = len(own) == expected and str(case.get("duplicate", "")).startswith("refused")
@@ -371,6 +417,54 @@ async def cmd_verify(client: Any, run: dict[str, Any], _args: argparse.Namespace
     verdicts["restarts"] = run.get("restarts", 0)
     run["verify"] = verdicts
     return verdicts
+
+
+async def _verify_down(client: Any, case: dict[str, Any], own: list[dict[str, Any]]) -> dict[str, Any]:
+    """New card, same action, new id, no task before it is answered; one task after; request ends."""
+    request_id = case["card_request"]["request_id"]
+    messages = await _messages(client, case["channel_id"])
+    cards = _cards(messages, request_id)
+    original = cards[0] if cards else {}
+    new = cards[1:] if len(cards) > 1 else []
+    reasked = (len(new) == 1 and new[0]["approval_id"] and new[0]["approval_id"] != original.get("approval_id")
+               and new[0]["action_digest"] == original.get("action_digest"))
+    before_answer = [t for t in own if int(t["display_id"]) <= int(case.get("tasks_before_answer") or 0)]
+    closing = [m for m in messages if m.get("chat_request_id") == request_id and new
+               and int(m["id"]) > int(new[0]["message_id"]) and str(m.get("message") or "").strip()]
+    next_request = case.get("next_request") or {}
+    next_text = _text(messages, next_request.get("request_id"))
+    checks = {
+        "reasked_same_action_new_id": bool(reasked),
+        "notice": REASKED in _text(messages, request_id),
+        "tasks_before_answer": len(before_answer),
+        "closing_after_answer": bool(closing),
+        "request_status_after_answer": case.get("request_status_after_answer"),
+        "next_request_status": next_request.get("status"),
+    }
+    checks["pass"] = (checks["reasked_same_action_new_id"] and checks["notice"] and not before_answer
+                      and len(own) == 1 and checks["closing_after_answer"]
+                      and checks["request_status_after_answer"] == "complete"
+                      and checks["next_request_status"] == "complete" and REFUSAL not in next_text)
+    return checks
+
+
+async def _verify_crash(client: Any, case: dict[str, Any], own: list[dict[str, Any]]) -> dict[str, Any]:
+    """The orphaned request ends with no operator action; the next prompt reports the exact task."""
+    next_request = case.get("next_request") or {}
+    text = _text(await _messages(client, case["channel_id"]), next_request.get("request_id"))
+    killed = case.get("killed_after_task") or [{}]
+    task_id = killed[0].get("display_id")
+    states_task = (task_id is not None and f"Mythic task {task_id}" in text) or "unknown" in text
+    checks = {
+        "request_status_after_start": case.get("request_status_after_start"),
+        "notice": UNRESOLVED in text,
+        "states_task": states_task,
+        "next_request_status": next_request.get("status"),
+    }
+    checks["pass"] = (checks["request_status_after_start"] in TERMINAL and len(own) == 1
+                      and checks["notice"] and states_task
+                      and checks["next_request_status"] == "complete" and REFUSAL not in text)
+    return checks
 
 
 COMMANDS = {
