@@ -1,31 +1,34 @@
 #!/usr/bin/env python3
-"""Native container-restart check for existing-chat restoration.
+"""Native container-restart check for continuing restored chats.
 
 Runs the restoration line's own live check as ordered steps that share one run file, so each
 step survives the Sage restarts between them. Every mutating step (channel creation, prompts,
 card decisions, deployment, stop/kill) is the operator's authorized live activity; `readiness`
-and `status` only read Mythic and the local tree.
+and `verify` only read Mythic and the local tree.
 
 Order (see the plan named in the run file):
 
   readiness --callback N          read-only: Mythic login, container mode/parity, live callback
-                                  with `pwd`, frozen source identity, task baseline
-  seed --as legacy                before deploying the feature: one conversation chat
+                                  with `pwd`, frozen source identity, task baseline, no open requests
+  start-old / seed --as legacy    pre-feature Sage: one conversation chat with the label
   deploy                          deploy the feature branch (database retained)
-  seed --as feature [--mode-override supervised]
+  seed --as feature --mode-override supervised
   restart                         recreate the container (database retained)
   recall                          ask both chats for the label; no task may be created
-  card --as accept|reject|down|crash
-  restart                         (accept/reject cards only)
-  decide --as accept|reject       decide the restored card through Mythic
-  down --as down                  stop Sage, accept the card while it is down, start and send nothing;
-                                  wait for Sage's new card in the same request, accept it, then send a prompt
-  crash --as crash                accept, kill Sage once Mythic shows the task, start; wait for the request
-                                  to end with no operator action, then ask a question
+  propose                         the restored feature chat is asked to run pwd once; its card is
+                                  case `queued_accept` (the model seam after a restart)
+  card --as queued_reject         a second supervised card
+  queued                          restart with both cards pending; accept/reject them as soon as Mythic
+                                  shows Sage running (before Sage consumes); wait for both requests
+  card --as down_accept / card --as down_reject
+  down                            stop Sage; decide both cards while Mythic records it stopped; start and
+                                  send nothing; select Continue on each Continue/Stop card
+  card --as crash / crash         accept, kill Sage once Mythic shows the task, start; the request must end
+                                  with no operator action; `/mode` then reports the task
   verify                          evaluate every recorded case against its rule
 
-Pass rules are written in `verify` before any run and read Mythic's own rows: request/message
-status and text, card status, and the callback's task rows. Sage's SQLite is never the proof.
+Pass rules are written in `verify` before any run and read Mythic's own rows: request status,
+message text and card metadata, and the callback's task rows. Sage's SQLite is never the proof.
 """
 
 from __future__ import annotations
@@ -54,15 +57,22 @@ LABEL_PROMPT = f"Remember the label {LABEL}. Do not run tools."
 RECALL_PROMPT = "What label did I ask you to remember? Do not run tools."
 STATUS_PROMPT = "Is anything still pending from before? Answer from what you know. Do not run tools."
 REFUSAL = "Sage restarted or this channel's session was replaced"
-REASKED = "was not applied"
 UNRESOLVED = "will not resend"
+LIFECYCLE_ERROR = "Request lifecycle reconciliation failed"
+STALE = ("no longer active", "already handled")
+CONTINUE_TITLE = "Continue saved decision?"
+NEXT_PROMPT = "/mode"  # read-only: proves the channel accepts a prompt without a model call
+CASE_IDS = ("legacy", "feature", "queued_accept", "queued_reject", "down_accept", "down_reject", "crash")
+ROUTE = "bedrock-claude-4-6-sonnet"  # the plan's frozen route; checked against Phoenix by the run session
 CHANGED_FILES = (
     "Payload_Type/sage/sage_chat/service.py",
     "Payload_Type/sage/sage_chat/session.py",
     "Payload_Type/sage/sage_chat/restoration.py",
     "Payload_Type/sage/sage_chat/hitl.py",
+    "Payload_Type/sage/sage_chat/streaming.py",
     "Payload_Type/sage/sage_chat/watcher_control.py",
     "Payload_Type/sage/ai/langgraph/model.py",
+    "Payload_Type/sage/ai/langgraph/request_events.py",
     "Payload_Type/sage/ai/langgraph/mythic_tools.py",
     "Payload_Type/sage/ai/langgraph/request_contract.py",
 )
@@ -91,6 +101,12 @@ query RestorationTasks($after: Int!) {
 """
 MAX_TASK_QUERY = """
 query RestorationMaxTask { task(order_by: {display_id: desc}, limit: 1) { display_id } }
+"""
+REQUESTS_QUERY = """
+query RestorationRequests($ids: [Int!]!) { chat_request(where: {id: {_in: $ids}}) { id status } }
+"""
+OPEN_REQUESTS_QUERY = """
+query RestorationOpen { chat_request(where: {status: {_in: ["pending", "streaming"]}}) { id channel_id status } }
 """
 CHANNEL_MESSAGES_QUERY = """
 query RestorationMessages($ch: Int!, $after: Int!) {
@@ -206,11 +222,15 @@ async def cmd_readiness(client: Any, run: dict[str, Any], args: argparse.Namespa
         "deployment": _deployment("check"),
         "identity": _identity(),
         "task_baseline": await _max_task(client),
+        "open_requests": (await _query(client, OPEN_REQUESTS_QUERY)).get("chat_request") or [],
         "budget": BUDGET,
+        "route": ROUTE,
+        "case_ids": list(CASE_IDS),
     }
     report["ready"] = bool(report["callback"] and report["pwd_loaded"]
                            and report["sage_container_running"]
-                           and report["deployment"]["returncode"] == 0)
+                           and report["deployment"]["returncode"] == 0
+                           and not report["open_requests"])
     run.setdefault("readiness", report)
     run["callback"] = callback
     run.setdefault("task_baseline", report["task_baseline"])
@@ -259,46 +279,42 @@ async def cmd_recall(client: Any, run: dict[str, Any], _args: argparse.Namespace
     return results
 
 
+async def _card_case(client: Any, run: dict[str, Any], name: str, channel_id: int) -> dict[str, Any]:
+    prompt = f"Run pwd once on callback {run['callback']}; do nothing else."
+    tasks_before = await _max_task(client)
+    sent = await _send(client, channel_id, prompt, wait_card=True)
+    run["cases"][name] = {"channel_id": channel_id, "card_request": sent, "tasks_before": tasks_before}
+    return run["cases"][name]
+
+
+async def cmd_propose(client: Any, run: dict[str, Any], _args: argparse.Namespace) -> dict[str, Any]:
+    """The restored feature chat (supervised via `/mode`) proposes the action after the restart."""
+    feature = run["cases"]["feature"]
+    return await _card_case(client, run, "queued_accept", int(feature["channel_id"]))
+
+
 async def cmd_card(client: Any, run: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     channel_id = await _create_channel(client, mode="supervised", name=f"Restoration card {args.as_}")
-    prompt = f"Run pwd once on callback {run['callback']}; do nothing else."
-    sent = await _send(client, channel_id, prompt, wait_card=True)
-    run["cases"][args.as_] = {"channel_id": channel_id, "card_request": sent,
-                              "tasks_before": await _max_task(client)}
-    return run["cases"][args.as_]
+    return await _card_case(client, run, args.as_, channel_id)
 
 
-async def cmd_decide(client: Any, run: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
-    case = run["cases"][args.as_]
-    request_id = case["card_request"]["request_id"]
-    if args.as_ == "accept":
-        decision = await nc.approve_pending_input_card(client, request_id)
-    else:
-        decision = await nc.reject_pending_input_card(client, request_id)
-    await nc.wait_for_request(client, request_id, timeout_seconds=600)
-    case["decision"] = decision
-    # A second delivery attempt of the same decision must not act again.
-    try:
-        await nc.approve_pending_input_card(client, request_id)
-        case["duplicate"] = "accepted-by-mythic"
-    except Exception as exc:  # Mythic refuses a card that is no longer pending
-        case["duplicate"] = f"refused: {type(exc).__name__}"
-    case["tasks_after"] = await _max_task(client)
-    return case
-
-
-def _cards(messages: list[dict[str, Any]], request_id: int) -> list[dict[str, Any]]:
-    """Approval cards of one request: message id, status and Sage's approval correlation."""
+def _input_cards(messages: list[dict[str, Any]], request_id: int) -> list[dict[str, Any]]:
+    """Input cards of one request: approval cards and Continue/Stop controls, with their status."""
     cards = []
     for message in messages:
         metadata = message.get("metadata") or {}
         card = metadata.get("input_requested") if isinstance(metadata, dict) else None
         if message.get("chat_request_id") != request_id or not isinstance(card, dict):
             continue
-        context = (card.get("data") or {}).get("sage_approval_context") or {}
+        data = card.get("data") or {}
+        context = data.get("sage_approval_context") or {}
+        control = data.get("sage_continuation") or {}
         cards.append({"message_id": message["id"], "status": card.get("status"),
-                      "approval_id": context.get("approval_id"),
-                      "action_digest": context.get("action_digest")})
+                      "kind": "control" if control else "approval",
+                      "approval_id": context.get("approval_id") or control.get("source_approval_id"),
+                      "action_digest": context.get("action_digest"),
+                      "actions": list(data.get("actions") or []),
+                      "response": card.get("response") or {}})
     return cards
 
 
@@ -312,39 +328,93 @@ async def _wait_status(client: Any, request_id: int, done, timeout: float = 240)
     return snapshot
 
 
-async def cmd_down(client: Any, run: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
-    case = run["cases"][args.as_]
-    _count_restart(run)
+async def _select_continue(client: Any, request_id: int) -> dict[str, Any]:
+    """Select Continue on the request's one pending Continue/Stop card (the UI's own mutation)."""
+    snapshot = await nc.fetch_request_snapshot(client, request_id)
+    pending = [m for m in nc._pending_input_requested_messages(snapshot["messages"])
+               if "sage_continuation" in (((m.get("metadata") or {}).get("input_requested") or {}).get("data") or {})]
+    if len(pending) != 1:
+        raise RuntimeError(f"expected one pending Continue/Stop card in request {request_id}, saw {len(pending)}")
+    result = await nc.mythic.execute_custom_query(client, nc.CHAT_INPUT_RESPONSE_MUTATION, variables={
+        "messageId": int(pending[0]["id"]), "action": "select", "response": None, "choiceId": "continue"})
+    return {"message_id": int(pending[0]["id"]), "result": result.get("chatInputResponse")}
+
+
+async def _duplicate(client: Any, request_id: int) -> str:
+    """A second answer to the request's cards must be refused or change nothing."""
+    try:
+        await nc.approve_pending_input_card(client, request_id)
+        return "accepted-by-mythic"
+    except Exception as exc:  # Mythic refuses a card that is no longer pending or a closed request
+        return f"refused: {type(exc).__name__}"
+
+
+async def _finish(client: Any, case: dict[str, Any]) -> None:
     request_id = case["card_request"]["request_id"]
+    ended = await _wait_status(client, request_id, lambda snap: snap["request"].get("status") in TERMINAL, 600)
+    case["request_status"] = ended["request"].get("status")
+    case["duplicate"] = await _duplicate(client, request_id)
+    case["tasks_after"] = await _max_task(client)
+    case["next_request"] = await _send(client, case["channel_id"], NEXT_PROMPT)
+
+
+async def cmd_queued(client: Any, run: dict[str, Any], _args: argparse.Namespace) -> dict[str, Any]:
+    """Restart with both cards pending and decide them while Sage boots, before it consumes."""
+    _count_restart(run)
+    cases = {name: run["cases"][name] for name in ("queued_accept", "queued_reject")}
+    subprocess.run(["docker", "compose", "stop", "sage"], cwd=_mythic_dir(), check=True)
+    await _wait_container(client, False)
+    starting = subprocess.Popen(
+        [str(REPO_ROOT / ".venv/bin/python"), str(REPO_ROOT / "skills/sage-goad-reset/scripts/sage_deployment.py"),
+         "deploy", "--mode", "container"], cwd=REPO_ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    running = await _wait_container(client, True, timeout=300)
+    for name, case in cases.items():
+        request_id = case["card_request"]["request_id"]
+        decide = nc.approve_pending_input_card if name == "queued_accept" else nc.reject_pending_input_card
+        try:
+            case["decision"] = await decide(client, request_id)
+        except Exception as exc:
+            case["decision"] = f"{type(exc).__name__}: {exc}"
+        case["decided_at"] = time.time()
+        case["mythic_saw_running"] = running
+    case_returncode = starting.wait(timeout=600)
+    for case in cases.values():
+        case["start_returncode"] = case_returncode
+        await _finish(client, case)
+    return cases
+
+
+async def cmd_down(client: Any, run: dict[str, Any], _args: argparse.Namespace) -> dict[str, Any]:
+    """Decide both cards while Mythic records Sage stopped; start, send nothing, then Continue."""
+    _count_restart(run)
+    cases = {name: run["cases"][name] for name in ("down_accept", "down_reject")}
     subprocess.run(["docker", "compose", "stop", "sage"], cwd=_mythic_dir(), check=True)
     # Mythic must record the container as stopped, or it queues the decision for later delivery
     # instead of storing it undelivered, which is the case under test.
-    case["mythic_saw_stopped"] = await _wait_container(client, False)
-    if not case["mythic_saw_stopped"]:
-        raise SystemExit("Mythic never recorded the Sage container as stopped; decision not sent")
-    try:
-        case["decision_while_down"] = await nc.approve_pending_input_card(
-            client, case["card_request"]["request_id"])
-    except Exception as exc:  # Mythic stores the decision, then reports the stopped container
-        case["decision_while_down"] = f"{type(exc).__name__}: {exc}"
-    case["start"] = _deployment("deploy", "--mode", "container")
-    case["serving"] = await _wait_container(client, True)
-    # No prompt: Sage's on-start reconciliation must re-ask the card in the same request.
-    reasked = await _wait_status(
-        client, request_id, lambda snap: bool(nc._pending_input_requested_messages(snap["messages"])))
-    case["cards"] = _cards(reasked["messages"], request_id)
-    case["tasks_before_answer"] = await _max_task(client)
-    if not nc._pending_input_requested_messages(reasked["messages"]):
-        case["reasked"] = False
-        return case
-    case["reasked"] = True
-    case["answer"] = await nc.approve_pending_input_card(client, request_id)
-    answered = await _wait_status(client, request_id, lambda snap: snap["request"].get("status") in TERMINAL, 600)
-    case["request_status_after_answer"] = answered["request"].get("status")
-    case["tasks_after_answer"] = await _max_task(client)
-    case["next_request"] = await _send(client, case["channel_id"], STATUS_PROMPT)
-    case["tasks_after"] = await _max_task(client)
-    return case
+    if not await _wait_container(client, False):
+        raise SystemExit("Mythic never recorded the Sage container as stopped; decisions not sent")
+    for name, case in cases.items():
+        request_id = case["card_request"]["request_id"]
+        decide = nc.approve_pending_input_card if name == "down_accept" else nc.reject_pending_input_card
+        try:
+            case["decision_while_down"] = await decide(client, request_id)
+        except Exception as exc:  # Mythic stores the decision, then reports the stopped container
+            case["decision_while_down"] = f"{type(exc).__name__}: {exc}"
+    start = _deployment("deploy", "--mode", "container")
+    serving = await _wait_container(client, True)
+    for case in cases.values():
+        case["start"], case["serving"] = start, serving
+        request_id = case["card_request"]["request_id"]
+        # No prompt: Sage's on-start must add one Continue/Stop card to the same request.
+        offered = await _wait_status(client, request_id, lambda snap: any(
+            c["kind"] == "control" and c["status"] == "pending"
+            for c in _input_cards(snap["messages"], request_id)))
+        case["cards_at_offer"] = _input_cards(offered["messages"], request_id)
+        case["tasks_before_answer"] = await _max_task(client)
+        if any(c["kind"] == "control" and c["status"] == "pending" for c in case["cards_at_offer"]):
+            case["continue"] = await _select_continue(client, request_id)
+        await _finish(client, case)
+    return cases
 
 
 async def cmd_crash(client: Any, run: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
@@ -366,14 +436,20 @@ async def cmd_crash(client: Any, run: dict[str, Any], args: argparse.Namespace) 
     ended = await _wait_status(client, case["card_request"]["request_id"],
                                lambda snap: snap["request"].get("status") in TERMINAL)
     case["request_status_after_start"] = ended["request"].get("status")
-    case["next_request"] = await _send(client, case["channel_id"], STATUS_PROMPT)
+    case["next_request"] = await _send(client, case["channel_id"], NEXT_PROMPT)
     case["tasks_after"] = await _max_task(client)
     return case
 
 
-def _text(messages: list[dict[str, Any]], request_id: int) -> str:
+def _text(messages: list[dict[str, Any]], request_id: Any) -> str:
     return "\n".join(str(m.get("message") or "") for m in messages
                      if m.get("chat_request_id") == request_id)
+
+
+def _tool_statuses(messages: list[dict[str, Any]], request_id: int) -> list[str]:
+    return [str(((m.get("metadata") or {}).get("tool_use") or {}).get("status") or "")
+            for m in messages if m.get("chat_request_id") == request_id
+            and (m.get("metadata") or {}).get("special_type") == "tool_use"]
 
 
 async def cmd_verify(client: Any, run: dict[str, Any], _args: argparse.Namespace) -> dict[str, Any]:
@@ -381,6 +457,10 @@ async def cmd_verify(client: Any, run: dict[str, Any], _args: argparse.Namespace
     callback = run.get("callback")
     pwd = [t for t in await _tasks_after(client, int(run.get("task_baseline", 0)))
            if t.get("command_name") == "pwd" and (t.get("callback") or {}).get("display_id") == callback]
+    request_ids = [int(c["card_request"]["request_id"]) for c in run["cases"].values() if c.get("card_request")]
+    request_ids += [int(c["next_request"]["request_id"]) for c in run["cases"].values() if c.get("next_request")]
+    statuses = {int(r["id"]): r.get("status") for r in
+                ((await _query(client, REQUESTS_QUERY, ids=request_ids)).get("chat_request") or [])}
     verdicts: dict[str, Any] = {}
     for name in ("legacy", "feature"):
         case = run["cases"].get(name)
@@ -393,65 +473,89 @@ async def cmd_verify(client: Any, run: dict[str, Any], _args: argparse.Namespace
             "label_retained": LABEL in text,
         }
     verdicts["recall_created_no_task"] = not run.get("recall_tasks")
-    for name, expected in (("accept", 1), ("reject", 0), ("down", 1), ("crash", 1)):
+    for name, expected in (("queued_accept", 1), ("queued_reject", 0), ("down_accept", 1),
+                           ("down_reject", 0), ("crash", 1)):
         case = run["cases"].get(name)
-        if not case:
+        if not case or not case.get("card_request"):
             verdicts[name] = "not run"
             continue
         upper = case.get("tasks_after")
         own = [t for t in pwd if int(t["display_id"]) > int(case["tasks_before"])
                and (upper is None or int(t["display_id"]) <= int(upper))]
+        messages = await _messages(client, case["channel_id"])
         detail: dict[str, Any] = {"pwd_tasks": len(own), "expected": expected}
-        if name == "down":
-            detail.update(await _verify_down(client, case, own))
-        elif name == "crash":
-            detail.update(await _verify_crash(client, case, own))
+        if name == "crash":
+            detail.update(_verify_crash(case, own, messages, statuses))
         else:
-            detail["duplicate"] = case.get("duplicate")
-            detail["pass"] = len(own) == expected and str(case.get("duplicate", "")).startswith("refused")
+            detail.update(_verify_resolved(name, case, own, expected, messages, statuses, callback))
         verdicts[name] = detail
-    if run["cases"].get("feature", {}).get("mode_override"):
-        verdicts["mode_override_recorded"] = "check the restored channel's header mode in Mythic"
     verdicts["approved_pwd_tasks"] = len(pwd)
     verdicts["within_task_budget"] = len(pwd) <= BUDGET["approved_pwd_tasks"]
     verdicts["restarts"] = run.get("restarts", 0)
+    verdicts["within_restart_budget"] = int(run.get("restarts", 0)) <= BUDGET["service_restarts"]
     run["verify"] = verdicts
     return verdicts
 
 
-async def _verify_down(client: Any, case: dict[str, Any], own: list[dict[str, Any]]) -> dict[str, Any]:
-    """New card, same action, new id, no task before it is answered; one task after; request ends."""
-    request_id = case["card_request"]["request_id"]
-    messages = await _messages(client, case["channel_id"])
-    cards = _cards(messages, request_id)
-    original = cards[0] if cards else {}
-    new = cards[1:] if len(cards) > 1 else []
-    reasked = (len(new) == 1 and new[0]["approval_id"] and new[0]["approval_id"] != original.get("approval_id")
-               and new[0]["action_digest"] == original.get("action_digest"))
-    before_answer = [t for t in own if int(t["display_id"]) <= int(case.get("tasks_before_answer") or 0)]
-    closing = [m for m in messages if m.get("chat_request_id") == request_id and new
-               and int(m["id"]) > int(new[0]["message_id"]) and str(m.get("message") or "").strip()]
+def _verify_resolved(name: str, case: dict[str, Any], own: list[dict[str, Any]], expected: int,
+                     messages: list[dict[str, Any]], statuses: dict[int, Any], callback: Any) -> dict[str, Any]:
+    """One task (accept) or none (reject), the request complete with no lifecycle error, no Continue/Stop
+    card left pending, a stale notice never shown for the winning decision, and the next prompt accepted."""
+    request_id = int(case["card_request"]["request_id"])
+    cards = _input_cards(messages, request_id)
+    approvals = [c for c in cards if c["kind"] == "approval"]
+    controls = [c for c in cards if c["kind"] == "control"]
+    text = _text(messages, request_id)
     next_request = case.get("next_request") or {}
-    next_text = _text(messages, next_request.get("request_id"))
-    checks = {
-        "reasked_same_action_new_id": bool(reasked),
-        "notice": REASKED in _text(messages, request_id),
-        "tasks_before_answer": len(before_answer),
-        "closing_after_answer": bool(closing),
-        "request_status_after_answer": case.get("request_status_after_answer"),
-        "next_request_status": next_request.get("status"),
+    checks: dict[str, Any] = {
+        "request_status": statuses.get(request_id),
+        "lifecycle_error": LIFECYCLE_ERROR in text,
+        "stale_notice": any(word in text for word in STALE),
+        "pending_cards_left": [c["message_id"] for c in cards if c["status"] == "pending"],
+        "one_approval_card": len(approvals) == 1,
+        "controls": [(c["message_id"], c["status"]) for c in controls],
+        "next_request_status": statuses.get(int(next_request.get("request_id") or 0)),
+        "duplicate": case.get("duplicate"),
     }
-    checks["pass"] = (checks["reasked_same_action_new_id"] and checks["notice"] and not before_answer
-                      and len(own) == 1 and checks["closing_after_answer"]
-                      and checks["request_status_after_answer"] == "complete"
-                      and checks["next_request_status"] == "complete" and REFUSAL not in next_text)
+    common = (len(own) == expected and checks["request_status"] == "complete"
+              and not checks["lifecycle_error"] and not checks["pending_cards_left"]
+              and checks["one_approval_card"] and checks["next_request_status"] == "complete"
+              and not str(case.get("duplicate", "")).startswith("accepted"))
+    if name.endswith("reject"):
+        # Code-owned denial evidence: the guarded call's card ends without completing.
+        checks["tool_denied"] = bool(_tool_statuses(messages, request_id)) and "completed" not in _tool_statuses(
+            messages, request_id)
+        common = common and checks["tool_denied"]
+    if name == "queued_accept":
+        actions = approvals[0]["actions"] if approvals else []
+        args = (actions[0].get("arguments") or {}) if len(actions) == 1 else {}
+        checks["seam_exact_proposal"] = (len(actions) == 1 and args.get("command") == "pwd"
+                                         and args.get("callback_display_id") == callback)
+        common = common and checks["seam_exact_proposal"]
+    if name.startswith("queued"):
+        # Elicited only when on-start saw the decision before Sage consumed it: a control exists and
+        # the operator never answered it (the original delivery won and retired it).
+        checks["race_elicited"] = bool(controls)
+        checks["control_unanswered"] = all(c["status"] == "cancelled" for c in controls)
+        checks["pass"] = (common and checks["race_elicited"] and checks["control_unanswered"]
+                          and not checks["stale_notice"]) if checks["race_elicited"] else "not run"
+    else:
+        before = case.get("tasks_before_answer")
+        early = [t for t in own if before is not None and int(t["display_id"]) <= int(before)]
+        checks["tasks_before_continue"] = len(early)
+        checks["continued_once"] = len(controls) == 1 and controls[0]["status"] == "selected" and (
+            (controls[0]["response"].get("choice") or {}).get("id") == "continue")
+        offered = bool(controls)
+        checks["pass"] = (common and checks["continued_once"] and not early
+                          and not checks["stale_notice"]) if offered else False
     return checks
 
 
-async def _verify_crash(client: Any, case: dict[str, Any], own: list[dict[str, Any]]) -> dict[str, Any]:
+def _verify_crash(case: dict[str, Any], own: list[dict[str, Any]], messages: list[dict[str, Any]],
+                  statuses: dict[int, Any]) -> dict[str, Any]:
     """The orphaned request ends with no operator action; the next prompt reports the exact task."""
     next_request = case.get("next_request") or {}
-    text = _text(await _messages(client, case["channel_id"]), next_request.get("request_id"))
+    text = _text(messages, next_request.get("request_id"))
     killed = case.get("killed_after_task") or [{}]
     task_id = killed[0].get("display_id")
     states_task = (task_id is not None and f"Mythic task {task_id}" in text) or "unknown" in text
@@ -459,7 +563,8 @@ async def _verify_crash(client: Any, case: dict[str, Any], own: list[dict[str, A
         "request_status_after_start": case.get("request_status_after_start"),
         "notice": UNRESOLVED in text,
         "states_task": states_task,
-        "next_request_status": next_request.get("status"),
+        "next_request_status": statuses.get(int(next_request.get("request_id") or 0),
+                                            next_request.get("status")),
     }
     checks["pass"] = (checks["request_status_after_start"] in TERMINAL and len(own) == 1
                       and checks["notice"] and states_task
@@ -469,7 +574,7 @@ async def _verify_crash(client: Any, case: dict[str, Any], own: list[dict[str, A
 
 COMMANDS = {
     "readiness": cmd_readiness, "start-old": cmd_start_old, "seed": cmd_seed, "deploy": cmd_deploy, "restart": cmd_deploy,
-    "recall": cmd_recall, "card": cmd_card, "decide": cmd_decide, "down": cmd_down,
+    "recall": cmd_recall, "propose": cmd_propose, "card": cmd_card, "queued": cmd_queued, "down": cmd_down,
     "crash": cmd_crash, "verify": cmd_verify,
 }
 
@@ -481,7 +586,7 @@ def _parser() -> argparse.ArgumentParser:
                         help="JSON run record shared by every step (keep it under .sage_history)")
     parser.add_argument("--callback", type=int, help="readiness: the verified live callback display id")
     parser.add_argument("--as", dest="as_", default="",
-                        help="case name: legacy|feature (seed), accept|reject|down|crash (card/decide/down/crash)")
+                        help="case name: legacy|feature (seed), queued_reject|down_accept|down_reject|crash (card/crash)")
     parser.add_argument("--mode-override", choices=("conversation", "supervised"), default="")
     parser.add_argument("--readiness", action="store_true", help="alias for the readiness command")
     parser.add_argument("--server", default=nc.DEFAULT_SERVER)

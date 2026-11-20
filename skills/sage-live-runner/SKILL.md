@@ -153,8 +153,12 @@ one `--run-file` (keep it under `.sage_history/`), so each step survives the Sag
 `readiness` (also `--readiness`) and `verify` are read-only; every other step creates channels, sends prompts,
 decides cards, deploys, stops or kills the Sage container, and needs its own live authorization. Run
 `readiness --callback <id>` first: it requires the callback active with `pwd` loaded, a ready container
-deployment, and records the source identity and task baseline. Seed the legacy chat before `deploy`. `verify`
-applies the pass rules written in the script to Mythic's own rows; Sage's database is never the proof.
+deployment and no open chat request, and records the source identity, route, case ids and task baseline. Seed
+the legacy chat before `deploy`. The step order is in the script's `--help`: recall, a post-restart proposal,
+decisions queued while Sage boots (`queued`), decisions made while it is stopped followed by Continue (`down`),
+and a kill after an approved task (`crash`). `verify` applies the pass rules written in the script to Mythic's
+own rows; a queued case whose Continue/Stop card never appeared is reported `not run`, not passed. Sage's
+database is never the proof.
 
 ## Readiness
 
