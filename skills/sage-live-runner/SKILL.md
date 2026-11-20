@@ -146,6 +146,16 @@ Mythic conditionally updates only a still-pending card, but the request can beco
 preflight and Mythic's later request-status check. That upstream race can leave the card resolved while the
 approval returns failure; the helper reports the failure and does not retry.
 
+## Chat Restoration Check
+
+`scripts/chat_restoration_check.py` runs the existing-chat restoration live check as ordered steps that share
+one `--run-file` (keep it under `.sage_history/`), so each step survives the Sage restarts between them. Only
+`readiness` (also `--readiness`) and `verify` are read-only; every other step creates channels, sends prompts,
+decides cards, deploys, stops or kills the Sage container, and needs its own live authorization. Run
+`readiness --callback <id>` first: it requires the callback active with `pwd` loaded, a ready container
+deployment, and records the source identity and task baseline. Seed the legacy chat before `deploy`. `verify`
+applies the pass rules written in the script to Mythic's own rows; Sage's database is never the proof.
+
 ## Readiness
 
 The proof path requires:

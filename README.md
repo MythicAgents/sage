@@ -891,11 +891,20 @@ report observations; it does not erase chat checkpoints in the same file.
 `Payload_Type/sage/.phoenix/phoenix.db` stores observability history. Treat both as retained trajectory data.
 
 An active chat channel retains its session across ordinary turns, including pending approvals and objective
-context. After a Sage restart or session replacement, ordinary Supervised chat does not restore its prior
-conversational scope and evidence. Read-only `/state`, `/report` and tool discovery remain
-available. Shared report observations do not restore conversational scope or pending approvals. Start a fresh
-channel and restate scope and evidence before continuing model work; separately bound Auto-controller
-recovery does not restore the Supervised conversation.
+context. When Sage restarts with its database retained, an existing channel continues on its next request:
+Sage rebuilds the session from the channel's saved record and its checkpoint, with its conversation,
+`/mode` override and engagement binding, and says so in the channel. Nothing that grants authority is carried
+over: the request's current Mythic identity and configuration must match what the session was saved under,
+and secrets are resolved fresh. A pending approval card still resolves only by an exact decision on that card;
+a decision made in Mythic while Sage was down is applied on the next request after the same validation, and
+Sage says the new message was not processed. An approved action interrupted by the restart is never resent:
+Sage reports the exact Mythic task it produced, or that its outcome is unknown, and the chat continues.
+A restart never restarts autonomous work, and a controller-owned autonomous approval is not resumed.
+
+A channel still needs a fresh chat when its session ended on purpose (stop, cancel, an error, or a changed
+configuration or token), when its saved state cannot be read, or when a chat from before restorable sessions
+cannot be matched to exactly one saved conversation. Sage names the reason. Read-only `/state`, `/report` and
+tool discovery remain available either way.
 
 Never delete runtime databases to obtain a clean run. Stop Sage and archive active databases first:
 
