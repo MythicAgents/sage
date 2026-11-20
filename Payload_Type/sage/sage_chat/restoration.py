@@ -50,11 +50,13 @@ def unreadable_refusal(detail: str) -> str:
 
 
 def unproven_refusal(detail: str) -> str:
+    # With no saved record Sage cannot tell a restart from a replaced session, so the reply keeps
+    # the original sentence and adds why the earlier conversation was not adopted.
     return (
-        "Sage restarted, and this channel was created before Sage saved restorable sessions. "
-        f"Its earlier conversation could not be matched with certainty ({detail}), so its prior "
-        "scope and evidence are not restored. Start a new Sage chat and state the current scope "
-        f"and evidence before continuing. {_NO_TOOLS}"
+        "Sage restarted or this channel's session was replaced, and this channel's earlier "
+        f"conversation could not be matched with certainty ({detail}). Its prior scope and evidence "
+        "are not restored. Start a new Sage chat and state the current scope and evidence before "
+        f"continuing. {_NO_TOOLS}"
     )
 
 

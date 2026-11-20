@@ -46,6 +46,7 @@ def _public_tool_methods() -> list[str]:
         "reset_request_loop_guards",
         "reserve_ingest",
         "set_approval_claim",
+        "set_approval_receipt_sink",
         "set_capability_command_observer",
         "set_collection_runner",
         "set_credential_reviewer",

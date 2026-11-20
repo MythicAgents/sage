@@ -1,4 +1,4 @@
-"""An existing native chat continues after a Sage process restart (cairn #219).
+"""An existing native chat continues after a Sage process restart.
 
 Before this change, a channel whose Model was lost with the process was refused: "Sage restarted or
 this channel's session was replaced". These cases drive the real HeadlessSageChat handler, the real
