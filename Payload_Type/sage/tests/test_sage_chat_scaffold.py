@@ -4552,6 +4552,8 @@ _EXPECTED_CONFIG_OPTIONS = {
     "provider", "model", "mode", "autonomous_solve", "policy_mode", "max_steps",
     "system_prompt", "API_ENDPOINT", "API_KEY", "SAGE_REASONING_EFFORT",
     "SAGE_PROVIDER_RETRY_POLICY",
+    # OpenAI API selection, Daybreak access program and safety identifier (OpenAI Responses support).
+    "SAGE_OPENAI_API", "SAGE_OPENAI_ACCESS_PROGRAM", "SAGE_OPENAI_SAFETY_IDENTIFIER",
     "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_DEFAULT_REGION",
     # BloodHound MCP connection. Kept in this exact-equality inventory rather than relaxing the
     # assertion to a subset: the point of the set is that every option Mythic renders is

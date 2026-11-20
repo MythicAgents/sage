@@ -40,7 +40,13 @@ from mythic_container.logging import logger
 
 from _version import agent_version
 
-from .config import autonomous_solve_ignored, build_bloodhound_env, build_model_kwargs
+from .config import (
+    OPENAI_ROUTE_FIELDS,
+    autonomous_solve_ignored,
+    build_bloodhound_env,
+    build_model_kwargs,
+    resolve_llm_profile,
+)
 from .findings_watcher import FindingsWatcherManager, render_watcher_status
 from .hitl import (
     STOP_CHOICE,
@@ -156,6 +162,27 @@ def _channel_has_prior_context(request: ChatRequest) -> bool:
     return False
 
 
+def provider_configuration_rejection(error: BaseException) -> Any:
+    try:
+        from ai.langgraph.operator_error import provider_configuration_rejection as classify
+    except ImportError:  # pragma: no cover - packaged import fallback
+        from ..ai.langgraph.operator_error import provider_configuration_rejection as classify  # type: ignore
+    return classify(error)
+
+
+def _provider_configuration_text(error: BaseException, request: ChatRequest) -> str:
+    """The configuration action for a provider refusal of this chat's route, naming each setting's source."""
+    try:
+        from ai.langgraph.operator_error import provider_configuration_notice
+    except ImportError:  # pragma: no cover - packaged import fallback
+        from ..ai.langgraph.operator_error import provider_configuration_notice  # type: ignore
+    try:
+        profile = resolve_llm_profile(request)
+    except Exception:
+        profile = None
+    return provider_configuration_notice(error, profile)
+
+
 def _resource_budget_notice(error: BaseException) -> str:
     """Distinguish a locally refused reservation from a provider connection failure.
 
@@ -218,6 +245,47 @@ def _model_config_signature(
         payload["__bloodhound__"] = dict(sorted(bloodhound_env.items()))
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _core_config_signature(
+    kwargs: dict[str, Any],
+    bloodhound_env: dict[str, str] | None = None,
+) -> str:
+    """The session signature without the OpenAI route settings (API, Daybreak, safety identifier).
+
+    Two configurations with equal core signatures differ only in how this chat reaches the same model, so an
+    idle channel may apply the change on its existing conversation generation. Everything else (provider,
+    model, endpoint, key, mode, BloodHound) still rotates the session.
+    """
+    payload = dict(kwargs)
+    config = dict(payload.get("config") or {})
+    configurable = {
+        key: value
+        for key, value in dict(config.get("configurable") or {}).items()
+        if key not in OPENAI_ROUTE_FIELDS
+    }
+    payload["config"] = {**config, "configurable": configurable}
+    return _model_config_signature(payload, bloodhound_env)
+
+
+def _bloodhound_env_or_empty(request: ChatRequest) -> dict[str, str]:
+    try:
+        return build_bloodhound_env(request)
+    except Exception as exc:  # pragma: no cover - resolution must never block a chat turn
+        logger.debug(f"BloodHound credential resolution skipped for signature: {exc}")
+        return {}
+
+
+def _claim_outstanding(record: dict[str, Any]) -> bool:
+    """An approval decision claimed but not yet known to have finished (a consumed claim is history)."""
+    claim = record.get("claim")
+    return isinstance(claim, dict) and claim.get("status") != "consumed"
+
+
+SETTINGS_CONTINUED_NOTICE = (
+    "Applied this chat's updated OpenAI settings (OpenAI API, Daybreak or Safety Identifier). The "
+    "conversation continues with its earlier messages; the model, provider and endpoint are unchanged."
+)
 
 
 def _runtime_routing_matches(
@@ -1109,6 +1177,12 @@ class SageChat(Chat):
                 config_signature=config_signature,
             )
         ):
+            continued = await self._continue_settings_change(
+                request, existing, kwargs, config_signature,
+                _core_config_signature(kwargs, bloodhound_env),
+            )
+            if continued is not None:
+                return continued, True
             await self._stop_and_close_request_lifecycles(
                 existing,
                 status="stopped",
@@ -1155,6 +1229,80 @@ class SageChat(Chat):
         await self._save_session_record(request, model)
         return model, False
 
+    async def _settings_change_is_idle(self, request: ChatRequest, model: Any) -> bool:
+        """True when nothing on this session could carry consent or work across a settings change."""
+        if getattr(request, "InputResponse", None) is not None:
+            return False
+        if getattr(model, "_hitl_card_pending", False) or isinstance(
+            getattr(model, "_controller_hitl_pending", None), dict
+        ):
+            return False
+        thread_id = str(getattr(model, "_thread_id_override", "") or "")
+        if not thread_id:
+            return False
+        try:
+            if await model._hitl_interrupt_pending(thread_id):
+                return False
+            record = await load_channel_session_record(int(request.OperationID), int(request.ChannelID))
+        except Exception:
+            logger.warning("Settings change could not verify an idle channel", exc_info=True)
+            return False
+        return (
+            record is not None
+            and record.get("status") == CHANNEL_SESSION_ACTIVE
+            and record.get("thread_id") == thread_id
+            and not record.get("pending")
+            and not _claim_outstanding(record)
+        )
+
+    async def _continue_settings_change(
+        self,
+        request: ChatRequest,
+        existing: Any,
+        kwargs: dict[str, Any],
+        config_signature: str,
+        core_signature: str,
+    ) -> Any | None:
+        """Rebuild an idle session on its own generation when only the OpenAI route settings changed.
+
+        Returns the new registered Model, or ``None`` to keep today's rotation (any other change, an
+        outstanding approval or controller step, an approval response, or a record that cannot be verified).
+        The checkpoint stays the owner of history; the new Model restores from it exactly as a restart does.
+        """
+        stored_core = str(getattr(existing, "_chat_request_core_signature", "") or "")
+        if not stored_core or stored_core != core_signature:
+            return None
+        if not await self._settings_change_is_idle(request, existing):
+            return None
+        thread_id = str(existing._thread_id_override)
+        old_signature = str(getattr(existing, "_chat_request_config_signature", "") or "")
+        await drop_channel_session(request, expected_model=existing, retire=False)
+        model = await self._build_model(request, kwargs, config_signature, thread_id=thread_id)
+        model._chat_request_base_autonomous_solve = bool(
+            getattr(existing, "_chat_request_base_autonomous_solve", kwargs.get("autonomous_solve"))
+        )
+        override = str(getattr(existing, "_chat_mode_override", "") or "")
+        if override and getattr(existing, "_chat_mode_override_base_signature", "") == old_signature:
+            self._apply_saved_mode_override(model, {
+                "mode_override": override,
+                "mode_override_base_signature": config_signature,
+                "mode_override_base_autonomous_solve": getattr(
+                    existing, "_chat_mode_override_base_autonomous_solve", None
+                ),
+            }, config_signature)
+        engagement = getattr(existing, "_report_engagement_uuid", None)
+        if engagement:
+            model._report_engagement_uuid = engagement
+        try:
+            await model.restore_session_state_from_checkpoint(thread_id)
+        except LookupError:
+            pass  # a generation whose only request failed before any checkpoint write
+        await put_channel_session(request, model)
+        await self._save_session_record(request, model)
+        model._settings_continuation_notice = SETTINGS_CONTINUED_NOTICE
+        logger.info("Applied OpenAI route settings on the channel's existing generation")
+        return model
+
     async def _construct_model(self, kwargs: dict[str, Any]) -> Any:
         # Lazy import: keep the heavy LangGraph/LangChain import off the module load path so the pure
         # config/streaming/models modules (and their tests) don't pull it in.
@@ -1183,6 +1331,9 @@ class SageChat(Chat):
         """Construct and initialize one channel Model; a restore passes its stored generation."""
         model = await self._construct_model(kwargs)
         model._chat_request_config_signature = config_signature
+        model._chat_request_core_signature = _core_config_signature(
+            kwargs, _bloodhound_env_or_empty(request)
+        )
         model._chat_request_base_autonomous_solve = bool(kwargs.get("autonomous_solve"))
         model._chat_mode_override = ""
         model._chat_mode_override_base_signature = ""
@@ -1220,6 +1371,7 @@ class SageChat(Chat):
             "thread_id": str(getattr(model, "_thread_id_override", "") or ""),
             "apitoken_id": int(request.APITokenID),
             "config_signature": str(getattr(model, "_chat_request_config_signature", "") or ""),
+            "core_signature": str(getattr(model, "_chat_request_core_signature", "") or ""),
             "base_autonomous_solve": bool(
                 getattr(model, "_chat_request_base_autonomous_solve", False)
             ),
@@ -1377,10 +1529,7 @@ class SageChat(Chat):
         except ChannelSessionRecordInvalid as exc:
             return None, unreadable_refusal(str(exc)), []
         kwargs = build_model_kwargs(request)
-        try:
-            bloodhound_env = build_bloodhound_env(request)
-        except Exception:  # pragma: no cover - resolution must never block a chat turn
-            bloodhound_env = {}
+        bloodhound_env = _bloodhound_env_or_empty(request)
         signature = _model_config_signature(kwargs, bloodhound_env)
         if record is None:
             return await self._adopt_legacy_session(request, kwargs, signature)
@@ -1388,8 +1537,24 @@ class SageChat(Chat):
             return None, RETIRED_REFUSAL, []
         if record.get("apitoken_id") != int(request.APITokenID):
             return None, changed_refusal("Mythic identity"), []
+        settings_changed = False
         if record.get("config_signature") != signature:
-            return None, changed_refusal("configuration"), []
+            # Only the OpenAI route settings changed, and nothing is pending: continue this generation.
+            core = str(record.get("core_signature") or "")
+            if (
+                not core
+                or core != _core_config_signature(kwargs, bloodhound_env)
+                or record.get("pending")
+                or _claim_outstanding(record)
+                or getattr(request, "InputResponse", None) is not None
+            ):
+                return None, changed_refusal("configuration"), []
+            settings_changed = True
+            old_signature = record.get("config_signature")
+            record = dict(record)
+            if record.get("mode_override_base_signature") == old_signature:
+                record["mode_override_base_signature"] = signature
+            record["config_signature"] = signature
         thread_id = str(record["thread_id"])
         model = await self._build_model(request, kwargs, signature, thread_id=thread_id)
         model._chat_request_base_autonomous_solve = bool(
@@ -1401,7 +1566,10 @@ class SageChat(Chat):
         engagement = record.get("engagement_uuid")
         if isinstance(engagement, str) and engagement:
             model._report_engagement_uuid = engagement
-        notices = [RESTORED_NOTICE]
+        notices = [RESTORED_NOTICE] + ([SETTINGS_CONTINUED_NOTICE] if settings_changed else [])
+        if settings_changed:
+            await save_channel_session_record({**record, **self._session_record_for(request, model),
+                                               "pending": None, "claim": None})
         try:
             values = await model.restore_session_state_from_checkpoint(thread_id)
         except LookupError:
@@ -2012,6 +2180,17 @@ class SageChat(Chat):
                     complete_request=True,
                 )
                 return None
+            settings_notice = str(getattr(model, "_settings_continuation_notice", "") or "")
+            if settings_notice:
+                model._settings_continuation_notice = ""
+                await self.send_response(
+                    request,
+                    response_key=f"settings:{request.RequestID}",
+                    content=settings_notice,
+                    status="complete",
+                    complete=False,
+                    metadata={},
+                )
             thread_id = bind_channel_thread_id(request, model)
             has_input_response = getattr(request, "InputResponse", None) is not None
             retry_state = getattr(model, "_provider_retry_state", None)
@@ -2528,7 +2707,13 @@ class SageChat(Chat):
                     status="error",
                     reason="runtime_error",  # a fault in Sage, not an operator action
                 )
-                await drop_channel_session(request, expected_model=model)
+                configuration_rejected = (
+                    provider_configuration_rejection(error) is not None and not has_input_response
+                )
+                if not configuration_rejected:
+                    # A provider refusal of this chat's route leaves the session and its history in
+                    # place: correcting the configuration and sending again continues this channel.
+                    await drop_channel_session(request, expected_model=model)
                 record_terminal = getattr(model, "record_request_terminal", None)
                 record_final = getattr(model, "record_final_response", None)
                 record_projection = getattr(
@@ -2572,6 +2757,7 @@ class SageChat(Chat):
                     else:
                         error_text = (
                             _resource_budget_notice(error)
+                            or _provider_configuration_text(error, request)
                             or operator_error_text(error)
                             or "Sage request failed."
                         )

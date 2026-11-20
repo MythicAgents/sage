@@ -224,11 +224,16 @@ async def drop_channel_session(
     *,
     expected_model: "Model | None" = None,
     reason: str = "dropped",
+    retire: bool = True,
 ) -> bool:
     current = await get_channel_session(request)
     if expected_model is not None and current is not expected_model:
         return False
     await remove_session(channel_session_key(request))
+    if not retire:
+        # The caller replaces this Model on the same generation at once (an OpenAI route settings change
+        # on an idle channel); the record stays active and keeps naming that generation.
+        return True
     # An intentional drop (stop, cancel, runtime error, rotation) keeps today's "start a new chat"
     # outcome after a restart too. Only a session still registered when the process died is restored.
     thread_id = str(getattr(current, "_thread_id_override", "") or "")

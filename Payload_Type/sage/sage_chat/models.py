@@ -77,6 +77,67 @@ _CONFIG_OPTIONS = [
         Required=False,
     ),
     ChatModelConfigurationOption(
+        Name="SAGE_OPENAI_API",
+        DisplayName="OpenAI API",
+        Type=OptType.Choice,
+        Description=(
+            "Which OpenAI API this chat calls; applies to the OpenAI provider. Use configured default falls back "
+            "to the SAGE_OPENAI_API user secret, then the container environment; with neither, the adapter keeps "
+            "its usual route (Chat Completions for most models). GPT-6 Cyber needs Responses."
+        ),
+        Required=False,
+        DefaultValue="",
+        Choices=[
+            ChatModelConfigurationOptionChoice(Label="Use configured default", Value=""),
+            ChatModelConfigurationOptionChoice(Label="Chat Completions", Value="chat_completions"),
+            ChatModelConfigurationOptionChoice(Label="Responses", Value="responses"),
+        ],
+        HelpText=(
+            "Resolution order: this field → the SAGE_OPENAI_API user secret → the container environment. "
+            "API Endpoint stays the base URL (for example https://api.openai.com/v1); Sage adds /responses or "
+            "/chat/completions itself."
+        ),
+    ),
+    ChatModelConfigurationOption(
+        Name="SAGE_OPENAI_ACCESS_PROGRAM",
+        DisplayName="Daybreak",
+        Type=OptType.Choice,
+        Description=(
+            "OpenAI Daybreak access program for Responses requests; applies to the OpenAI provider. Off "
+            "explicitly requests standard safeguards. Use configured default falls back to the "
+            "SAGE_OPENAI_ACCESS_PROGRAM user secret, then the container environment; with neither, Sage sends "
+            "Off, never a project's own default program. Blue or Red requires OpenAI API = Responses and an "
+            "approved project; GPT-6 Cyber uses Red."
+        ),
+        Required=False,
+        DefaultValue="",
+        Choices=[
+            ChatModelConfigurationOptionChoice(Label="Use configured default", Value=""),
+            ChatModelConfigurationOptionChoice(Label="Off", Value="standard"),
+            ChatModelConfigurationOptionChoice(Label="Blue", Value="daybreak_blue"),
+            ChatModelConfigurationOptionChoice(Label="Red", Value="daybreak_red"),
+        ],
+        HelpText=(
+            "Resolution order: this field → the SAGE_OPENAI_ACCESS_PROGRAM user secret → the container "
+            "environment → Off (standard safeguards). Not sent on Chat Completions."
+        ),
+    ),
+    ChatModelConfigurationOption(
+        Name="SAGE_OPENAI_SAFETY_IDENTIFIER",
+        DisplayName="OpenAI Safety Identifier",
+        Type=OptType.String,
+        Description=(
+            "[OPTIONAL] A stable pseudonym for the person using this chat, sent to OpenAI as safety_identifier; "
+            "applies to the OpenAI provider and is required for GPT-6 Cyber on Responses."
+        ),
+        Required=False,
+        HelpText=(
+            "Use the same pseudonymous value for the same person every time, never a username or email "
+            "address. Resolution order: this field → the SAGE_OPENAI_SAFETY_IDENTIFIER user secret → the "
+            "container environment."
+        ),
+    ),
+    ChatModelConfigurationOption(
         Name="SAGE_REASONING_EFFORT",
         DisplayName="Reasoning Effort",
         Type=OptType.Choice,
@@ -354,6 +415,9 @@ SAGE_MODELS = [
             OptionalUserSecrets=[
                 "API_KEY",
                 "API_ENDPOINT",
+                "SAGE_OPENAI_API",
+                "SAGE_OPENAI_ACCESS_PROGRAM",
+                "SAGE_OPENAI_SAFETY_IDENTIFIER",
                 "AWS_ACCESS_KEY_ID",
                 "AWS_SECRET_ACCESS_KEY",
                 "AWS_SESSION_TOKEN",

@@ -33,3 +33,138 @@ def operator_error_text(exc: BaseException) -> str:
     if payload_is_text:
         return str(exc)
     return f"{type(exc).__name__}: {SUPPRESSED_SUFFIX}"
+
+
+# --------------------------------------------------------------------------------------------------
+# Provider configuration rejections (OpenAI): recoverable by changing the chat's configuration.
+# --------------------------------------------------------------------------------------------------
+
+# Codes OpenAI documents for Daybreak access programs (Daybreak guide, 2026-11-20).
+_ACCESS_PROGRAM_CODES = frozenset({
+    "invalid_access_program", "unsupported_access_program", "access_program_not_enabled",
+})
+_CONFIG_PARAMS = frozenset({"model", "safety_identifier"})
+
+
+def _status_error(exc: BaseException):
+    try:
+        import openai
+    except ImportError:  # pragma: no cover - openai ships with the runtime
+        return None
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, openai.APIStatusError):
+            return current
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _error_fields(error) -> tuple[int, str, str, str]:
+    body = getattr(error, "body", None)
+    if isinstance(body, dict) and isinstance(body.get("error"), dict):
+        body = body["error"]
+    body = body if isinstance(body, dict) else {}
+    code = str(getattr(error, "code", None) or body.get("code") or "")
+    param = str(getattr(error, "param", None) or body.get("param") or "")
+    message = str(body.get("message") or getattr(error, "message", "") or "")
+    return int(getattr(error, "status_code", 0) or 0), code, param, message
+
+
+def provider_configuration_rejection(exc: BaseException):
+    """The provider rejection in ``exc``'s cause chain that a configuration change can fix, else ``None``.
+
+    Authentication and permission failures, a model or endpoint the provider will not serve, and the
+    documented Daybreak access-program errors qualify. Rate limits, server errors and request-content errors
+    (for example a malformed history) do not: changing the chat's route would not fix them.
+    """
+    error = _status_error(exc)
+    if error is None:
+        return None
+    status, code, param, _message = _error_fields(error)
+    if status in {401, 403, 404}:
+        return error
+    if status == 400 and (
+        code in _ACCESS_PROGRAM_CODES or param in _CONFIG_PARAMS or param.startswith("access_programs")
+    ):
+        return error
+    return None
+
+
+def _endpoint_origin(endpoint: str) -> str:
+    from urllib.parse import urlsplit
+
+    text = str(endpoint or "").strip()
+    if not text:
+        return "provider default"
+    parts = urlsplit(text)
+    host = parts.hostname or ""
+    port = f":{parts.port}" if parts.port else ""
+    return f"{parts.scheme}://{host}{port}{parts.path}" if parts.scheme and host else "configured"
+
+
+def _configuration_action(status: int, code: str, param: str, message: str, api: str) -> str:
+    if code == "invalid_access_program":
+        return ("set **Daybreak** to the value named in the error (Off, Blue or Red), or the "
+                "SAGE_OPENAI_ACCESS_PROGRAM user secret or environment value")
+    if code == "unsupported_access_program":
+        return "choose a model that supports Daybreak, or set **Daybreak** to **Off** to keep this model"
+    if code == "access_program_not_enabled":
+        return ("check that the API key belongs to an OpenAI project with this Daybreak program enabled "
+                "(and, for GPT-6 Cyber, that the sending IP address is allowlisted)")
+    if status == 401:
+        return "update the API key (the API_KEY field, user secret or environment value)"
+    if status == 403:
+        return "check the API key's project access for this model and Daybreak program"
+    if status == 404 and param == "model" and "responses" in message.casefold() and api != "responses":
+        return ("set **OpenAI API** to **Responses** in this chat's configuration (or the SAGE_OPENAI_API "
+                "user secret or environment value)")
+    if param == "safety_identifier":
+        return "set **OpenAI Safety Identifier** to a stable pseudonym for the person using this chat"
+    return "check the model, OpenAI API and API Endpoint settings for this chat"
+
+
+def provider_configuration_notice(exc: BaseException, profile) -> str:
+    """Operator-facing text for a configuration rejection; ``""`` for any other error.
+
+    Names the provider's status, code, parameter and message, the route Sage used with each setting's source,
+    and the configuration action. Never includes the API key or the safety identifier's value.
+    """
+    error = provider_configuration_rejection(exc)
+    if error is None:
+        return ""
+    status, code, param, message = _error_fields(error)
+
+    def value(name: str, default: str = "") -> str:
+        return str(getattr(profile, name, default) or default) if profile is not None else default
+
+    def source(name: str) -> str:
+        getter = getattr(profile, "source_for", None)
+        return str(getter(name)) if callable(getter) else "unknown"
+
+    from ai import openai_api
+
+    api = value("openai_api")
+    program = value("openai_access_program")
+    if api == openai_api.RESPONSES:
+        daybreak = (openai_api.ACCESS_PROGRAM_LABELS.get(program, program) + f" ({source('openai_access_program')})"
+                    if program else "Off (Sage default)")
+    else:
+        daybreak = "not sent (Chat Completions or adapter route)"
+    details = ", ".join(part for part in (f"HTTP {status}", f"code `{code}`" if code else "",
+                                           f"param `{param}`" if param else "") if part)
+    api_label = openai_api.API_LABELS.get(api, api) + (f" ({source('openai_api')})" if api else "")
+    route = (
+        f"provider {value('provider', 'openai')} · model `{value('model')}` · OpenAI API: {api_label} · "
+        f"Daybreak: {daybreak} · Safety Identifier: "
+        f"{'configured' if value('openai_safety_identifier') else 'not configured'} · "
+        f"endpoint {_endpoint_origin(value('api_endpoint'))}"
+    )
+    action = _configuration_action(status, code, param, message, api)
+    return (
+        f"The model provider rejected this request ({details}): {message}\n\n"
+        f"Route used: {route}.\n\n"
+        f"This chat is still usable and keeps its conversation. To fix it, {action}, then send your request "
+        "again. Sage did not change the model, provider or endpoint."
+    )

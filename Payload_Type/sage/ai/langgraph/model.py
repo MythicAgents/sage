@@ -65,7 +65,7 @@ from .turn_authority import (
 )
 from .request_events import RequestEventLedger, exported_content_digest, stable_event_id
 from .decision_record import seal_request_decision_record
-from .operator_error import operator_error_text
+from .operator_error import operator_error_text, provider_configuration_rejection
 from . import engagement_ledger
 from . import worker_outcome as _worker_outcome
 from . import catalog_binding as _catalog_binding
@@ -75,7 +75,7 @@ from . import step_references as _step_references
 from . import task_evidence as _task_evidence
 from . import prompt_context
 from ai.mcp import MCPManager, MCP_EXECUTION_CONTEXT_OFFENSIVE_RUNTIME
-from ai import observation_channel, provider_retry, resource_budget, resource_http
+from ai import observation_channel, openai_api, provider_retry, resource_budget, resource_http
 
 # Import logging fix - handle both relative and absolute imports
 try:
@@ -568,6 +568,17 @@ def _provider_content_call_record(
 ) -> tuple[dict[str, Any] | None, str]:
     if not isinstance(item, dict):
         return None, "content tool block is not a dictionary"
+    if item.get("type") == "function_call":
+        # OpenAI Responses item: identity is ``call_id`` (``id`` is the item id) and arguments are the
+        # provider's JSON string, decoded strictly so a partial streamed argument never parses as a call.
+        args, args_error = _strict_provider_argument_object(item.get("arguments"))
+        if args_error:
+            return None, f"content function_call {args_error}"
+        canonical = {"name": item.get("name"), "args": args, "id": item.get("call_id")}
+        call_error = _tool_call_batch_error([canonical])
+        if call_error:
+            return None, f"content function_call {call_error}"
+        return canonical, ""
     has_id = "id" in item
     has_tool_use_id = "tool_use_id" in item
     if has_id and has_tool_use_id:
@@ -595,6 +606,36 @@ def _provider_content_call_record(
     if call_error:
         return None, f"content tool block {call_error}"
     return canonical, ""
+
+
+_PROVIDER_CONTENT_CALL_TYPES = frozenset({"tool_use", "tool_call", "function_call"})
+_RESPONSES_TEXT_BLOCK_EXTRA_KEYS = frozenset({"annotations", "id", "phase"})
+
+
+def _sole_provider_text(content: Any) -> str | None:
+    """The one text a provider message carries, for parsers that accept exactly one label.
+
+    A plain string, or exactly one text block. OpenAI Responses blocks may also carry an empty
+    ``annotations`` list, an item ``id`` and a ``phase``, and may be preceded by hidden ``reasoning`` items,
+    which are not output. Any other block, a second text, a citation or an unknown key is rejected.
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return None
+    blocks = [block for block in content if not (isinstance(block, dict) and block.get("type") == "reasoning")]
+    if len(blocks) != 1 or not isinstance(blocks[0], dict):
+        return None
+    block = blocks[0]
+    if str(block.get("type") or "").casefold() != "text" or not isinstance(block.get("text"), str):
+        return None
+    if not set(block) - {"type", "text"} <= _RESPONSES_TEXT_BLOCK_EXTRA_KEYS:
+        return None
+    if "annotations" in block and block["annotations"] != []:
+        return None
+    if "id" in block and not isinstance(block["id"], str):
+        return None
+    return block["text"]
 
 
 def _canonical_call_sequences_match(
@@ -685,7 +726,7 @@ def _tool_call_envelope_error(
             block
             for block in content
             if isinstance(block, dict)
-            and block.get("type") in {"tool_use", "tool_call"}
+            and block.get("type") in _PROVIDER_CONTENT_CALL_TYPES
         ]
         if isinstance(content, list)
         else []
@@ -706,7 +747,11 @@ def _tool_call_envelope_error(
 
 
 def _strip_tool_call_payload(message: AIMessage) -> AIMessage | None:
-    """Remove structured tool-call data from an assistant message, keeping only real remaining content."""
+    """Remove structured tool-call data from an assistant message, keeping only real remaining content.
+
+    A Responses message also loses its ``reasoning`` items: replayed without the call that followed them they
+    are an incomplete provider item.
+    """
     content = getattr(message, "content", None)
     if isinstance(content, list):
         content = [
@@ -714,7 +759,7 @@ def _strip_tool_call_payload(message: AIMessage) -> AIMessage | None:
             for block in content
             if not (
                 isinstance(block, dict)
-                and block.get("type") in {"tool_use", "tool_call"}
+                and block.get("type") in {*_PROVIDER_CONTENT_CALL_TYPES, "reasoning"}
             )
         ]
 
@@ -4627,6 +4672,8 @@ def _message_content_as_text(content: Any) -> str:
         parts: list[str] = []
         for item in content:
             if isinstance(item, dict):
+                if item.get("type") in {"reasoning", "function_call"}:
+                    continue  # OpenAI Responses items: hidden reasoning and call payloads are never text
                 text = item.get("text") or item.get("content")
                 if isinstance(text, str):
                     parts.append(text)
@@ -6665,18 +6712,8 @@ class Model:
                     for key in ("stop_reason", "finish_reason")
                 ):
                     return ""
-                content = getattr(value, "content", None)
-                if isinstance(content, str):
-                    candidate = content
-                elif (
-                    isinstance(content, list)
-                    and len(content) == 1
-                    and isinstance(content[0], dict)
-                    and set(content[0]) == {"type", "text"}
-                    and str(content[0].get("type") or "").casefold() == "text"
-                ):
-                    candidate = content[0].get("text")
-                else:
+                candidate = _sole_provider_text(getattr(value, "content", None))
+                if candidate is None:
                     return ""
         if not isinstance(candidate, str):
             return ""
@@ -9650,6 +9687,9 @@ class Model:
                 raise ValueError("SAGE_REASONING_EFFORT must be one of none, minimal, low, medium, high, xhigh, max")
             if self.provider.lower() != "openai":
                 raise ValueError("SAGE_REASONING_EFFORT requires the openai model provider")
+        # One validator and one request projection for the OpenAI API, Daybreak program and safety
+        # identifier, shared with the profile-based factory (ai/openai_api.py).
+        openai_route = openai_api.route_from_configurable(self.provider, self.model, cfg)
 
         llm = None
         eval_max_output_tokens = 0
@@ -9699,6 +9739,7 @@ class Model:
                 model_kwargs["max_tokens"] = eval_max_output_tokens
             if eval_temperature is not None:
                 model_kwargs["temperature"] = eval_temperature
+            model_kwargs.update(openai_api.adapter_options(openai_route))
             if ledger is not None or retry_policy is not None:
                 sync_transport: httpx.BaseTransport = (
                     resource_http.MeteredHTTPTransport("provider", ledger=ledger, allow_non2xx=retry_policy is not None)
@@ -9724,7 +9765,10 @@ class Model:
             logger.debug(
                 f"Initializing model with provider={self.provider}, model={self.model}, "
                 f"api_key={'configured' if 'api_key' in model_kwargs else 'provider default'}, "
-                f"base_url={model_kwargs.get('base_url', 'provider default')}"
+                f"base_url={model_kwargs.get('base_url', 'provider default')}, "
+                f"openai_api={openai_api.API_LABELS.get(openai_route.api, openai_route.api)}, "
+                f"access_program={openai_route.effective_access_program or 'none'}, "
+                f"safety_identifier={'configured' if openai_route.safety_identifier else 'none'}"
             )
             llm = init_chat_model(
                 model_provider=self.provider,
@@ -12654,8 +12698,7 @@ class Model:
                             )
                             try:
                                 resp = await self.llm.ainvoke(synthesis_prompt)
-                                resp_content = resp.content if hasattr(resp, 'content') else str(resp)
-                                summary_text = (resp_content or "").strip()
+                                summary_text = _message_content_as_text(getattr(resp, "content", resp)).strip()
                             except Exception as e:
                                 logger.debug(f"⚠️  Summary synthesis failed for {node_name}: {e}")
                                 summary_text = ""
@@ -17142,8 +17185,8 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
 
                 summary_resp = await self.llm.ainvoke(summary_input)
 
-                logger.info(f"DEBUG: {agent_name} generated summary: {summary_resp.content[:500]}...")
-                summary_content = summary_resp.content if hasattr(summary_resp, 'content') else str(summary_resp)
+                summary_content = _message_content_as_text(getattr(summary_resp, "content", summary_resp)).strip()
+                logger.info(f"DEBUG: {agent_name} generated summary: {summary_content[:500]}...")
 
                 summaries.append(f"**{agent_name}:**\n{summary_content}")
 
@@ -18680,6 +18723,11 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         except Exception as e:
             # Catch any other errors (API errors, context limit exceeded, etc.)
             logger.error(f"Error during graph execution: {e}", exc_info=True)
+            if provider_configuration_rejection(e) is not None:
+                # The provider refused this route (model, API, access program, key). The native service
+                # reports it once with the configuration action and keeps the channel; generic "partial
+                # work / try a different model" advice and a rewritten local state would both be wrong.
+                raise
 
             # Collect partial work from state/checkpoints
             thread_id = self._session_thread_id()
@@ -18832,18 +18880,8 @@ The conversation history below shows all work completed before the error occurre
             for key in ("stop_reason", "finish_reason")
         ):
             return ""
-        content = getattr(value, "content", None)
-        if isinstance(content, str):
-            candidate = content
-        elif (
-            isinstance(content, list)
-            and len(content) == 1
-            and isinstance(content[0], dict)
-            and set(content[0]) == {"type", "text"}
-            and str(content[0].get("type") or "").casefold() == "text"
-        ):
-            candidate = content[0].get("text")
-        else:
+        candidate = _sole_provider_text(getattr(value, "content", None))
+        if candidate is None:
             return ""
         label = str(candidate or "").strip().upper()
         return label if label in {"CONTINUE", "STOP", "REDIRECT"} else ""

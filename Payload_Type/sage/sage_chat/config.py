@@ -104,8 +104,14 @@ SAGE_LLM_KEY_MAP = MappingProxyType(
         "region": "AWS_DEFAULT_REGION",
         "reasoning_effort": "SAGE_REASONING_EFFORT",
         "provider_retry_policy": "SAGE_PROVIDER_RETRY_POLICY",
+        "openai_api": "SAGE_OPENAI_API",
+        "openai_access_program": "SAGE_OPENAI_ACCESS_PROGRAM",
+        "openai_safety_identifier": "SAGE_OPENAI_SAFETY_IDENTIFIER",
     }
 )
+# The OpenAI route settings that may change on an idle channel without starting a new conversation
+# generation (see ``core_config_signature`` in the service). Model, provider, endpoint and key are not here.
+OPENAI_ROUTE_FIELDS = ("openai_api", "openai_access_program", "openai_safety_identifier")
 WATCHER_LLM_KEY_MAP = MappingProxyType(
     {
         "provider": "SAGE_WATCHER_PROVIDER",
@@ -143,6 +149,9 @@ class ResolvedLLMProfile:
     sources: tuple[tuple[str, str], ...] = ()
     reasoning_effort: str = ""
     provider_retry_policy: str = ""
+    openai_api: str = ""
+    openai_access_program: str = ""
+    openai_safety_identifier: str = ""
 
     def configurable(self) -> dict[str, str]:
         if self.provider == "bedrock":
@@ -158,8 +167,22 @@ class ResolvedLLMProfile:
                 "base_url": self.api_endpoint,
                 "reasoning_effort": self.reasoning_effort,
                 "provider_retry_policy": self.provider_retry_policy,
+                "openai_api": self.openai_api,
+                "openai_access_program": self.openai_access_program,
+                "openai_safety_identifier": self.openai_safety_identifier,
             }
         return {key: value for key, value in values.items() if value}
+
+    def openai_route(self) -> Any:
+        from ai.openai_api import validate_route
+
+        return validate_route(
+            provider=self.provider,
+            model=self.model,
+            api=self.openai_api,
+            access_program=self.openai_access_program,
+            safety_identifier=self.openai_safety_identifier,
+        )
 
     def init_chat_model_kwargs(self) -> dict[str, str]:
         return {
@@ -201,6 +224,19 @@ def _normalized_llm_profile(
         if normalized["provider"] != "openai":
             raise ValueError("SAGE_PROVIDER_RETRY_POLICY requires the openai model provider")
     normalized["provider_retry_policy"] = retry_policy
+    for field in OPENAI_ROUTE_FIELDS:
+        normalized[field] = str(normalized.get(field, "") or "").strip()
+    if validate_reasoning_effort:
+        # The environment-only projection skips this: a per-chat value may still complete it.
+        from ai.openai_api import validate_route
+
+        validate_route(
+            provider=normalized["provider"],
+            model=normalized["model"],
+            api=normalized["openai_api"],
+            access_program=normalized["openai_access_program"],
+            safety_identifier=normalized["openai_safety_identifier"],
+        )
     return ResolvedLLMProfile(**normalized, sources=tuple(sources))
 
 
@@ -308,6 +344,12 @@ def init_chat_model_from_profile(profile: ResolvedLLMProfile) -> Any:
     from langchain.chat_models import init_chat_model
 
     kwargs = profile.init_chat_model_kwargs()
+    for field in OPENAI_ROUTE_FIELDS:
+        kwargs.pop(field, None)
+    if profile.provider == "openai":
+        from ai.openai_api import adapter_options
+
+        kwargs.update(adapter_options(profile.openai_route()))
     if profile.provider == "bedrock":
         missing = tuple(
             field

@@ -604,6 +604,9 @@ Model settings resolve through the chain above. The main settings are:
 | `autonomous_solve` | Enable objective-led controller execution; supervised mode still requires approval for each guarded action. Ignored in conversation mode, which stays read-only |
 | `policy_mode` | `hybrid` (default), `symbolic`, or `llm` capability selection |
 | `max_steps` | Model-step ceiling per chat request; unset defaults to `200`, `0` means unlimited |
+| `SAGE_OPENAI_API` | **OpenAI API**: blank keeps the adapter's usual route; `chat_completions` or `responses` selects one (OpenAI provider only) |
+| `SAGE_OPENAI_ACCESS_PROGRAM` | **Daybreak**: `standard` (Off), `daybreak_blue` or `daybreak_red`; Responses only, and blank sends Off |
+| `SAGE_OPENAI_SAFETY_IDENTIFIER` | **OpenAI Safety Identifier**: a stable pseudonym for the person using the chat, sent as `safety_identifier` |
 
 **Providers.** The four above are the tested set. Sage builds the model through LangChain's `init_chat_model`, so
 other providers it supports may work but are unverified. Bedrock is the only provider with dedicated AWS
@@ -615,6 +618,20 @@ model name alone; record the provider and route for live runs.
 and gateways implement — so you can set `API_ENDPOINT` to any server that exposes it: a self-hosted model, an
 internal gateway, or a proxy. For example, run a [LiteLLM](https://docs.litellm.ai/docs/simple_proxy) proxy and
 point `API_ENDPOINT` at it to reach 100+ providers behind a single OpenAI-compatible endpoint.
+
+**OpenAI Responses and Daybreak.** Some OpenAI models are served only on the Responses API; GPT-6 Cyber is one.
+Set **OpenAI API** to **Responses** and keep `API_ENDPOINT` as the base URL (`https://api.openai.com/v1`); Sage
+adds `/responses` itself. Responses requests are stateless (`store: false`): Sage keeps the conversation and sends
+it, with the model's encrypted reasoning, on each request. On Responses, Sage always names the Daybreak program and
+sends **Off** (`standard`, standard safeguards) unless you choose Blue or Red, so a project's own default program is
+never used implicitly. Blue or Red requires an OpenAI project approved for that program. GPT-6 Cyber uses
+**Responses + Red** plus an **OpenAI Safety Identifier**, and needs Daybreak Red approval, separate model approval,
+a non-default project with access enabled, and an allowlisted sending IP; ZDR projects also need Private Safety
+Processing. Sage never derives a safety identifier from a Mythic username; use the same pseudonym for the same
+person. Invalid combinations (Daybreak without Responses, any of these with a non-OpenAI provider) fail before any
+request. When the provider rejects a route (for example a Responses-only model on Chat Completions, or a Daybreak
+access error), the chat keeps its conversation: the error names the setting to change, and after you change it the
+next message continues the same chat. Sage never switches the model, provider, endpoint or API on its own.
 
 **Policy.** `policy_mode` controls how the next capability is chosen. `hybrid` (default) has deterministic code
 constrain the admissible actions and lets the model pick among them — the intended production mode. `symbolic` is
