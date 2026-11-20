@@ -63,7 +63,7 @@ from .turn_authority import (
     apply_supervised_semantic_intent,
     authority_from_request_contract,
 )
-from .request_events import RequestEventLedger, stable_event_id
+from .request_events import RequestEventLedger, exported_content_digest, stable_event_id
 from .decision_record import seal_request_decision_record
 from .operator_error import operator_error_text
 from . import engagement_ledger
@@ -6899,6 +6899,231 @@ class Model:
         self._thread_id_override = new_thread_id
         return closed
 
+    PENDING_LIFECYCLE_VERSION = 1
+
+    def pending_lifecycle_snapshot(self, native_request_id: int) -> dict[str, Any]:
+        """The paused request's lifecycle and spent authority that a restart must continue.
+
+        Saved beside its approval card so a restored process resumes the same request instead of
+        a fresh one: the request ledger (identities, phases, order, projections), open sub-agent
+        cards, row bookkeeping, step and retry spend, and in-request denials. No text body, raw
+        argument value, client or credential is saved: bodies are digests, and actions are
+        fingerprints resolved again from the checkpoint's exact tool calls.
+        """
+        from sage_chat.hitl import approval_action_fingerprint
+
+        native = int(native_request_id)
+        ledger = self._ensure_request_event_ledger()
+        emitter = getattr(self, "_response_emitter", None)
+        export_rows = getattr(emitter, "export_rows", None)
+        rows = export_rows() if callable(export_rows) else None
+        if not isinstance(rows, dict) or rows.get("request_id") != native:
+            rows = None
+        delegations = []
+        for agent_name, delegation in (getattr(self, "_active_delegations", {}) or {}).items():
+            texts = [
+                str(delegation.get("last_text") or ""),
+                str(delegation.get("final_summary") or ""),
+                *(str(chunk) for chunk in delegation.get("streamed_text_chunks") or ()),
+            ]
+            source_seq = delegation.get("source_seq")
+            delegations.append({
+                "agent_name": str(agent_name),
+                "id": str(delegation.get("id") or ""),
+                "event_id": str(delegation.get("event_id") or ""),
+                "name": str(delegation.get("name") or agent_name),
+                "title": str(delegation.get("title") or ""),
+                "instruction_sha256": exported_content_digest(str(delegation.get("instruction") or "")),
+                "tool_count": int(delegation.get("tool_count", 0) or 0),
+                "icon": str(delegation.get("icon") or ""),
+                "icon_color": str(delegation.get("icon_color") or ""),
+                "source_seq": source_seq if type(source_seq) is int else None,
+                "text_seq": int(delegation.get("text_seq", 0) or 0),
+                "text_present": any(text.strip() for text in texts),
+            })
+        snapshots = []
+        for item in getattr(self, "_supervised_execution_snapshots", []) or ():
+            entry = {
+                key: copy.deepcopy(value)
+                for key, value in item.items()
+                if key not in {"action", "task_events"}
+            }
+            entry["action_fingerprint"] = approval_action_fingerprint(item.get("action"))
+            events = []
+            for event in item.get("task_events") or ():
+                saved = {k: copy.deepcopy(v) for k, v in event.items() if k != "response_text_excerpt"}
+                excerpt = event.get("response_text_excerpt")
+                if isinstance(excerpt, str):
+                    saved["response_text_sha256"] = exported_content_digest(excerpt)
+                events.append(saved)
+            entry["task_events"] = events
+            snapshots.append(entry)
+        # Turn-authority denied digests are not saved: every turn reinstalls authority from the
+        # contract (``install_request_contract``), so they do not outlive a turn in-process either.
+        retry = getattr(self, "_provider_retry_state", None)
+        return {
+            "version": self.PENDING_LIFECYCLE_VERSION,
+            "native_request_id": native,
+            "ledger": ledger.export_state(),
+            "delegations": delegations,
+            "delegation_seq": int(getattr(self, "_delegation_seq", 0) or 0),
+            "execution_activity_seq": int(getattr(self, "_execution_activity_seq", 0) or 0),
+            "emitter": rows,
+            "spent": {
+                "steps": int(getattr(self, "_global_step_count", 0) or 0),
+                "step_limit_hit": bool(getattr(self, "_global_step_limit_hit", False)),
+                "provider_retry": retry.snapshot() if retry is not None else None,
+            },
+            "authority": {
+                "denied_action_keys": sorted(getattr(self, "_denied_action_keys", set()) or ()),
+                "repeat_refusals": int(getattr(self, "_supervised_repeat_refusals", 0) or 0),
+                "execution_digest": str(getattr(self, "_request_execution_digest", "") or ""),
+                "admitted_action_digests": sorted(
+                    getattr(self, "_request_admitted_action_digests", set()) or ()),
+                "settled_action_digests": sorted(
+                    getattr(self, "_request_settled_action_digests", set()) or ()),
+            },
+            "execution_snapshots": snapshots,
+        }
+
+    def _restored_delegation_instruction(self, agent_name: str, source_seq: Any, digest: str) -> str:
+        """The handoff text a sub-agent card showed, read again from the restored checkpoint."""
+        if type(source_seq) is not int:
+            return ""
+        for channel in self._RESTORED_MESSAGE_CHANNELS:
+            for message in self.state.get(channel) or ():
+                if (
+                    isinstance(message, HumanMessage)
+                    and _get_seq(message) == source_seq
+                    and message.additional_kwargs.get("_delegated_to") == agent_name
+                ):
+                    text = _message_content_as_text(message.content).strip()
+                    if exported_content_digest(text) == digest:
+                        return text
+        return ""
+
+    def _restored_action_by_fingerprint(self, fingerprint: str) -> dict[str, Any] | None:
+        from sage_chat.hitl import approval_action_fingerprint, approval_claim_actions
+
+        for channel in self._RESTORED_MESSAGE_CHANNELS:
+            for message in self.state.get(channel) or ():
+                for call in getattr(message, "tool_calls", None) or ():
+                    try:
+                        action = approval_claim_actions([
+                            {"name": call.get("name"), "args": call.get("args")}
+                        ])[0]
+                        if approval_action_fingerprint(action) == fingerprint:
+                            return action
+                    except (TypeError, ValueError):
+                        continue
+        return None
+
+    def restore_pending_request(self, contract: Any, lifecycle: Any) -> dict[str, Any] | None:
+        """Continue a paused request saved by an earlier process; returns its saved row bookkeeping.
+
+        The saved ledger is installed before the contract, so the contract's own install events
+        match the recorded ones instead of starting a second lifecycle. Every malformed or
+        unresolvable part raises ``ValueError`` and the caller retires the paused work explicitly;
+        nothing is inferred. One new ``lifecycle_restored`` event names the snapshot it came from.
+        """
+        if not isinstance(lifecycle, dict) or lifecycle.get("version") != self.PENDING_LIFECYCLE_VERSION:
+            raise ValueError("saved request lifecycle has an unsupported version")
+        ledger = RequestEventLedger.from_export(lifecycle.get("ledger"))
+        if ledger.request_id != contract.request_id:
+            raise ValueError("saved request lifecycle belongs to another request")
+        authority = lifecycle.get("authority")
+        spent = lifecycle.get("spent")
+        delegations = lifecycle.get("delegations")
+        snapshots = lifecycle.get("execution_snapshots")
+        if not all(isinstance(part, dict) for part in (authority, spent)) or not all(
+            isinstance(part, list) for part in (delegations, snapshots)
+        ):
+            raise ValueError("saved request lifecycle is incomplete")
+        if any(type(lifecycle.get(name)) is not int or lifecycle[name] < 0
+               for name in ("delegation_seq", "execution_activity_seq")):
+            raise ValueError("saved request lifecycle counters are invalid")
+        steps = spent.get("steps")
+        if type(steps) is not int or steps < 0 or type(spent.get("step_limit_hit")) is not bool:
+            raise ValueError("saved request step spend is invalid")
+        string_lists = {
+            name: authority.get(name)
+            for name in ("denied_action_keys", "admitted_action_digests", "settled_action_digests")
+        }
+        if any(not isinstance(values, list) or any(not isinstance(v, str) for v in values)
+               for values in string_lists.values()) or type(authority.get("repeat_refusals")) is not int:
+            raise ValueError("saved request authority is invalid")
+        restored_snapshots = []
+        for entry in snapshots:
+            if not isinstance(entry, dict) or not isinstance(entry.get("task_events"), list):
+                raise ValueError("saved execution snapshot is invalid")
+            action = self._restored_action_by_fingerprint(str(entry.get("action_fingerprint") or ""))
+            if action is None:
+                raise ValueError("saved execution snapshot names an action missing from the checkpoint")
+            restored = {k: copy.deepcopy(v) for k, v in entry.items() if k != "action_fingerprint"}
+            restored["action"] = action
+            restored_snapshots.append(restored)
+        restored_delegations: dict[str, dict[str, Any]] = {}
+        for entry in delegations:
+            if (
+                not isinstance(entry, dict)
+                or any(not isinstance(entry.get(k), str) or not entry.get(k)
+                       for k in ("agent_name", "id", "event_id", "name"))
+                or type(entry.get("tool_count")) is not int
+                or type(entry.get("text_seq")) is not int
+                or type(entry.get("text_present")) is not bool
+                or not ledger.actual_events(event_id=entry["event_id"], kind="delegation", phase="opened")
+            ):
+                raise ValueError("saved sub-agent card is invalid or was never opened")
+            restored_delegations[entry["agent_name"]] = {
+                "id": entry["id"],
+                "event_id": entry["event_id"],
+                "name": entry["name"],
+                "title": str(entry.get("title") or ""),
+                "instruction": self._restored_delegation_instruction(
+                    entry["name"], entry.get("source_seq"), str(entry.get("instruction_sha256") or "")),
+                "tool_count": entry["tool_count"],
+                "icon": str(entry.get("icon") or ""),
+                "icon_color": str(entry.get("icon_color") or ""),
+                "source_seq": entry.get("source_seq"),
+                "last_text": "",
+                "streamed_text_chunks": [],
+                "final_summary": "",
+                "text_seq": entry["text_seq"],
+                # Its earlier text is already on the card; closing must neither repeat it nor
+                # report the delegation as empty.
+                "restored_text_present": entry["text_present"],
+            }
+        retry_snapshot = spent.get("provider_retry")
+        retry = getattr(self, "_provider_retry_state", None)
+        if retry is not None and retry_snapshot is not None:
+            retry.restore(retry_snapshot)
+
+        self._request_event_ledger = ledger
+        self.install_request_contract(contract)
+        self._global_step_count = steps
+        self._global_step_limit_hit = spent["step_limit_hit"]
+        self._delegation_seq = lifecycle["delegation_seq"]
+        self._execution_activity_seq = lifecycle["execution_activity_seq"]
+        self._active_delegations = restored_delegations
+        self._denied_action_keys = set(string_lists["denied_action_keys"])
+        self._supervised_repeat_refusals = authority["repeat_refusals"]
+        if authority.get("execution_digest") == contract.digest:
+            self._request_admitted_action_digests = set(string_lists["admitted_action_digests"])
+            self._request_settled_action_digests = set(string_lists["settled_action_digests"])
+        self._supervised_execution_snapshots = restored_snapshots
+        snapshot_digest = hashlib.sha256(
+            json.dumps(lifecycle, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        ledger.record_once(
+            event_id=stable_event_id(ledger.request_id, "lifecycle_restored", snapshot_digest),
+            kind="lifecycle_restored",
+            phase="restored",
+            content=snapshot_digest,
+            metadata={"native_request_id": str(lifecycle.get("native_request_id") or "")},
+        )
+        emitter_rows = lifecycle.get("emitter")
+        return emitter_rows if isinstance(emitter_rows, dict) else None
+
     async def _persist_pending_objective_refinement_checkpoint(self, thread_id: str) -> bool:
         """Write the current marker, including clears, before any early clarification return."""
         if not getattr(self, "_thread_id_override", None):
@@ -10478,7 +10703,7 @@ class Model:
             # subagent_final_output drill-down message. Text already emitted through emit_agent_text
             # must therefore not be repeated as card-close content.
             summary = explicit_content or final_summary or last_text
-            if status == "finished" and not summary:
+            if status == "finished" and not summary and not delegation.get("restored_text_present"):
                 # A delegation that ends without any text or tool output completed nothing.
                 # Closing it as "finished" with filler text hid the empty return from both the
                 # operator and the Supervisor. Close it honestly as an error instead.

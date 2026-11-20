@@ -899,11 +899,18 @@ and secrets are resolved fresh. A pending approval card still resolves only by a
 
 A restart leaves the request Sage was answering open in Mythic, and Mythic accepts no new prompt in that channel
 until it ends. When Mythic sends the container's startup message, Sage settles each such request without a model
-call or a task: a card still waiting stays open for your decision; a card you decided while Sage was down is
-asked again in the same request (that decision is never applied, and only an answer to the new card runs the
-action); any other request is closed with a notice. An approved action interrupted by the restart is never
-resent: your next message gets the exact Mythic task it produced, or says its outcome is unknown, and the chat
-continues. Mythic sends the startup message only to an operation with an active bot account assigned to it;
+call or a task: a card still waiting stays open for your decision. For a card that already shows your decision
+(made while Sage was down, or while it was starting), Sage cannot tell whether Mythic will still deliver it, so
+it adds one **Continue saved decision / Stop** card to the same request and applies nothing yet. If Mythic
+delivers your original decision, Sage applies it once and retires the Continue/Stop card; otherwise choose
+Continue to apply the saved decision exactly as you made it (an approval runs the action once, a rejection runs
+nothing), or Stop to discard it. Continue never changes the decision, and Cancel on the request also discards
+it. Sage first re-checks the saved decision against the card, the session's identity and configuration, and the
+paused action; if any of them changed, nothing runs and the request closes with the reason. A card saved by a
+Sage version from before this request state was kept is closed with a notice instead. Any other request is closed
+with a notice. The resumed request keeps its original tool and sub-agent cards, step budget and in-request
+denials, and ends normally. An approved action interrupted by the restart is never resent: your next message gets
+the exact Mythic task it produced, or says its outcome is unknown, and the chat continues. Mythic sends the startup message only to an operation with an active bot account assigned to it;
 without one, use Cancel on the open request in Mythic to free the channel. A restart never restarts autonomous
 work, and a controller-owned autonomous approval is not resumed.
 

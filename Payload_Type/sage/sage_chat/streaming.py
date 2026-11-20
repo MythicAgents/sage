@@ -55,6 +55,34 @@ class ChatStreamEmitter:
             self._block = continues._block
             self._agent_text_block = continues._agent_text_block
 
+    def export_rows(self) -> dict[str, Any]:
+        """The row bookkeeping an approval resume continues (see ``continues`` above)."""
+        return {
+            "request_id": int(self._request.RequestID),
+            "created": list(self._created),
+            "block": self._block,
+            "agent_text_block": self._agent_text_block,
+        }
+
+    def import_rows(self, rows: Any) -> None:
+        """Continue a request's rows saved by an earlier process; malformed rows raise ``ValueError``."""
+        created = rows.get("created") if isinstance(rows, dict) else None
+        if (
+            not isinstance(rows, dict)
+            or rows.get("request_id") != int(self._request.RequestID)
+            or not isinstance(created, list)
+            or any(not isinstance(key, str) or not key for key in created)
+            or len(set(created)) != len(created)
+            or any(
+                type(rows.get(name)) is not int or rows[name] < 0
+                for name in ("block", "agent_text_block")
+            )
+        ):
+            raise ValueError("saved chat rows do not belong to this request")
+        self._created = {key: index + 1 for index, key in enumerate(created)}
+        self._block = rows["block"]
+        self._agent_text_block = rows["agent_text_block"]
+
     def note_created(self, response_key: str) -> None:
         """Record that a send created (or may have created) the row for ``response_key``."""
         if response_key and response_key not in self._created:

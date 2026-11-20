@@ -120,18 +120,25 @@ def test_recorded_catalog_target_shapes_card_their_candidate(monkeypatch, tmp_pa
 REASK = json.loads((FIXTURES / "approval_reask_cards.json").read_text())
 
 
-@pytest.mark.parametrize("row", REASK["rows"], ids=[row["id"] for row in REASK["rows"]])
-def test_recorded_card_decided_while_down_is_reasked_not_applied(monkeypatch, tmp_path, no_network, row):
-    """A recorded decided card reaches the real on-start reconciler, checkpoint reader and validator.
+_OFFER_ROWS = [row for row in REASK["rows"] if row["kind"] in {"legacy", "down", "queued"}]
+_LIFECYCLE_ROWS = [row for row in REASK["rows"] if row["kind"] == "lifecycle"]
 
-    Expected outcome changed by plan r2 (operator product decision): the stored decision is never
-    applied; the same exact action is re-asked with a new approval id in the same request.
+
+@pytest.mark.parametrize("row", _OFFER_ROWS, ids=[row["id"] for row in _OFFER_ROWS])
+def test_recorded_decided_card_is_offered_once_never_reasked_or_discarded(monkeypatch, tmp_path, no_network, row):
+    """A recorded decided card reaches the real on-start reconciler, resolver, checkpoint reader and validator.
+
+    Expected outcome changed from plan r2's re-ask by the operator's 2026-11-20 recovery decision
+    (reason in each row): startup offers Continue/Stop and keeps the original approval valid; a
+    record saved without its request state is closed with nothing run.
     """
+    import copy
     from types import SimpleNamespace
 
     import aiosqlite
     from langgraph.checkpoint.base import empty_checkpoint
     from langgraph.types import Interrupt
+    from mythic_container.ChatBase import ChatRequest
     from mythic_container.SharedClasses import ContainerOnStartMessage
 
     import sage_chat.restoration as restoration
@@ -148,20 +155,21 @@ def test_recorded_card_decided_while_down_is_reasked_not_applied(monkeypatch, tm
     record = row["channel_record"]
     operation, channel = record["operation_id"], record["channel_id"]
     request_row = row["request_row"]
+    controls: list[dict] = []
 
     class Mythic:
-        queries: list[str] = []
-
         async def execute(self, query, variables):
-            self.queries.append(query)
             if "sageOpenRequests" in query:
                 assert variables["op"] == operation and variables["container"] == "sage"
                 return {"chat_request": [request_row]}
             if "sageRestoredCard" in query:
-                wanted = variables["ctx"]["input_requested"]["data"]["sage_approval_context"]["approval_id"]
-                card = row["card_row"]
-                echoed = card["metadata"]["input_requested"]["data"]["sage_approval_context"]["approval_id"]
-                return {"chat_message": [card] if echoed == wanted else []}
+                ((data_key, identity),) = variables["ctx"]["input_requested"]["data"].items()
+                ((id_key, wanted),) = identity.items()
+                rows = [row["card_row"], *controls]
+                return {"chat_message": [
+                    r for r in rows
+                    if (r["metadata"]["input_requested"].get("data") or {}).get(data_key, {}).get(id_key) == wanted
+                ]}
             raise AssertionError(query)
 
     mythic = Mythic()
@@ -179,8 +187,13 @@ def test_recorded_card_decided_while_down_is_reasked_not_applied(monkeypatch, tm
         async def _onstart_client(self, message):
             return mythic
 
+        async def _mythic_read_client(self, request, model=None):
+            return mythic
+
         async def _construct_model(self, kwargs):
             raise AssertionError("reconciliation must not build a Model")
+
+    action_requests = checkpoint["interrupt_value"]["action_requests"]
 
     async def scenario():
         async with aiosqlite.connect(db_path) as conn:
@@ -200,39 +213,118 @@ def test_recorded_card_decided_while_down_is_reasked_not_applied(monkeypatch, tm
         response = await chat.on_container_start(ContainerOnStartMessage(
             container_name="sage", operation_id=operation, server_name="mythic", apitoken="onstart-token"))
         saved = await chat_session.load_channel_session_record(operation, channel)
-        return chat, response, saved
+        outcomes = {}
+        if row["kind"] != "legacy":
+            restored, _contract, reason = restoration.restored_pending_context(
+                saved["pending"], action_requests, checkpoint["thread_id"])
+            assert restored is not None, reason
+            model = SimpleNamespace(_thread_id_override=checkpoint["thread_id"],
+                                    _pending_approval_context=restored)
+            control = next(e["metadata"]["input_requested"] for e in chat.emissions
+                           if (e.get("metadata") or {}).get("special_type") == "input_requested")
+            controls.append({"id": 95, "channel_id": channel, "operation_id": operation,
+                             "metadata": {"special_type": "input_requested", "input_requested": control}})
+            if row["kind"] == "queued":
+                # Mythic's recorded dispatch of the decision queued while Sage booted.
+                delivered = ChatRequest(container_name="sage", operation_id=operation, channel_id=channel,
+                                        request_id=request_row["id"], input_response=row["dispatch"])
+                outcomes["delivered"] = await chat._resolve_saved_decision(delivered, model)
+                outcomes["delivered_matches"] = approval_response_matches(delivered, restored)
+            from tests.test_chat_session_restoration import _control_response
+
+            answer = ChatRequest(container_name="sage", operation_id=operation, channel_id=channel,
+                                 request_id=request_row["id"])
+            answer.InputResponse = _control_response(control, "continue")
+            controls[0]["metadata"]["input_requested"] = copy.deepcopy(answer.InputResponse.InputRequest)
+            outcomes["continue"] = await chat._resolve_saved_decision(answer, model)
+            outcomes["continue_matches"] = approval_response_matches(answer, restored)
+            outcomes["continued_envelope"] = answer.InputResponse
+        return chat, response, saved, outcomes
 
     try:
-        chat, response, saved = asyncio.run(scenario())
+        chat, response, saved, outcomes = asyncio.run(scenario())
     finally:
         service._CHANNEL_TURN_LOCKS.clear()
 
-    assert no_network == []
-    assert response.EventLogErrorMessage == ""
-    on_request = chat.emissions
-    assert not [e for e in on_request if e.get("complete_request")], on_request
-    cards = [e["metadata"]["input_requested"] for e in on_request
-             if isinstance(e.get("metadata"), dict) and e["metadata"].get("special_type") == "input_requested"]
-    assert len(cards) == 1
-    new = cards[0]["data"]["sage_approval_context"]
-    old = row["card_row"]["metadata"]["input_requested"]["data"]["sage_approval_context"]
-    assert new["approval_id"] != row["expected"]["old_approval_id"]
-    assert new["action_digest"] == row["expected"]["action_digest"]
-    assert new["proposal_digest"] == row["expected"]["proposal_digest"]
-    for key in ("thread_id", "turn_id", "request_id", "request_contract_digest", "operation_id", "apitoken_id"):
-        assert new[key] == old[key], key
-    assert any("not applied" in str(e.get("content") or "") for e in on_request)
-    assert saved["pending"]["context"]["approval_id"] == new["approval_id"]
+    assert no_network == [] and response.EventLogErrorMessage == ""
+    cards = [e for e in chat.emissions
+             if (e.get("metadata") or {}).get("special_type") == "input_requested"]
+    closings = [e for e in chat.emissions if e.get("complete_request")]
+    if row["kind"] == "legacy":
+        assert not cards and len(closings) == 1
+        assert "without its request state" in closings[0]["content"]
+        assert saved["pending"] is None
+        return
+    assert not closings, closings
+    assert len(cards) == 1 and "sage_continuation" in cards[0]["metadata"]["input_requested"]["data"]
+    # Never plan r2's re-ask: no new approval card for the action, no "decide again" notice.
+    assert "sage_approval_context" not in cards[0]["metadata"]["input_requested"]["data"]
+    assert not any("Decide on the new card" in str(e.get("content") or "") for e in chat.emissions)
+    source = row["expected"]["source_approval_id"]
+    assert saved["pending"]["context"]["approval_id"] == source
+    assert saved["continuation"]["source_approval_id"] == source and saved["continuation"]["status"] == "offered"
     assert saved["claim"] is None
+    if row["kind"] == "queued":
+        assert outcomes["delivered"][0] == "superseded", outcomes["delivered"]
+        assert outcomes["delivered_matches"] is True
+        recorded = restoration.input_response_from_card_row(row["card_row"])
+        dispatched = ChatRequest(input_response=row["dispatch"]).InputResponse
+        assert restoration.saved_decision_digest(recorded) == restoration.saved_decision_digest(dispatched)
+    assert outcomes["continue"][0] == "continue", outcomes["continue"]
+    assert outcomes["continue_matches"] is True
+    assert outcomes["continued_envelope"].Action == row["expected"]["action"]
 
-    # The decision turn rebuilds its expectation from the saved record and the checkpoint.
-    action_requests = checkpoint["interrupt_value"]["action_requests"]
-    expected, _contract, reason = restoration.restored_pending_context(
-        saved["pending"], action_requests, checkpoint["thread_id"])
-    assert expected is not None, reason
-    old_answer = restoration.input_response_from_card_row(row["card_row"])
-    assert old_answer is not None
-    assert not approval_response_matches(SimpleNamespace(InputResponse=old_answer), expected)
-    from tests.test_hitl_steer_current_intent import _input_response
 
-    assert approval_response_matches(SimpleNamespace(InputResponse=_input_response("accept", cards[0])), expected)
+@pytest.mark.parametrize("row", _LIFECYCLE_ROWS, ids=[row["id"] for row in _LIFECYCLE_ROWS])
+def test_recorded_lifecycle_identities_reconcile_only_when_restored(row):
+    """Request 22's recorded pre-card projections (Mythic rows 439/440) through the real reconciliation.
+
+    The resume's own events reuse those recorded identities (row 440 was completed in place live).
+    Without the saved request state they are unmatched: the recorded `tool started count=0`.
+    """
+    import hashlib
+
+    from ai.langgraph.request_events import RequestEventLedger, exported_content_digest
+
+    request_id = row["request_id"]
+
+    def synthetic_record_id(*parts):
+        return hashlib.sha256("\0".join(parts).encode()).hexdigest()
+
+    events = [
+        ("operator_input", "operator_input:recorded", "received", exported_content_digest("prompt"), False, ""),
+        ("control_transition", "control_transition:installed", "request_installed",
+         "request contract installed", False, ""),
+    ]
+    for item in row["pre_card_projections"]:
+        phase = "opened" if item["kind"] == "delegation" else "started"
+        events.append((item["kind"], item["event_id"], phase, exported_content_digest(""), False, ""))
+        events.append((item["kind"], item["event_id"], phase, exported_content_digest(""), True, item["response_key"]))
+    export = {"version": 1, "request_id": request_id, "events": [
+        {"record_id": synthetic_record_id(str(i), *map(str, event)), "kind": event[0], "event_id": event[1],
+         "phase": event[2], "content": event[3], "projected": event[4], "projection_key": event[5], "metadata": {}}
+        for i, event in enumerate(events)
+    ]}
+
+    def resume(ledger):
+        for item in row["pre_card_projections"]:
+            phase = "finished" if item["kind"] == "delegation" else "completed"
+            ledger.record_once(event_id=item["event_id"], kind=item["kind"], phase=phase)
+            ledger.record_projection(event_id=item["event_id"], kind=item["kind"], phase=phase,
+                                     projection_key=item["response_key"])
+        ledger.record_once(event_id="control_transition:terminal", kind="control_transition",
+                           phase="request_terminal", content="complete")
+        ledger.record_once(event_id="final_response:terminal", kind="final_response", phase="emitted")
+        ledger.record_projection(event_id="final_response:terminal", kind="final_response",
+                                 phase="emitted", projection_key="assistant:22:turn")
+        return ledger.reconcile()
+
+    restored = resume(RequestEventLedger.from_export(export))
+    assert restored["ok"], restored
+    fresh = RequestEventLedger(request_id)
+    fresh.record(event_id="operator_input:recorded", kind="operator_input", phase="received")
+    fresh.record(event_id="control_transition:installed", kind="control_transition",
+                 phase="request_installed", content="request contract installed")
+    lost = resume(fresh)
+    assert not lost["ok"]
+    assert any(row["expected"]["recorded_error"] in error for error in lost["errors"]), lost["errors"]

@@ -26,6 +26,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from uuid import uuid4
 
 import aiosqlite
 from mythic_container import ChatBase as _sdk_chat
@@ -42,9 +43,12 @@ from _version import agent_version
 from .config import autonomous_solve_ignored, build_bloodhound_env, build_model_kwargs
 from .findings_watcher import FindingsWatcherManager, render_watcher_status
 from .hitl import (
-    approval_card,
+    STOP_CHOICE,
     approved_action_ids_for_request,
     approval_response_matches,
+    continuation_binding_of,
+    continuation_card,
+    continuation_choice,
     make_card_emitter,
     resume_steer_message_for_request,
 )
@@ -59,8 +63,13 @@ from .operation_memory_runtime import (
 from .operation_memory import WatcherOwnerConflict
 from .restoration import (
     CLAIM_CLOSED_NOTICE,
+    CONTINUATION_STOPPED_NOTICE,
+    CONTROL_UNCONFIRMED_NOTICE,
+    SAVED_DECISION_UNAVAILABLE_NOTICE,
+    STALE_RESPONSE_NOTICE,
+    STOPPED_CLOSURE,
     LEGACY_MODE_NOTICE,
-    REASK_NOTICE,
+    LEGACY_PENDING_NOTICE,
     RESTORED_NOTICE,
     REJECTED_CLAIM_CLOSURE,
     RETIRED_CARD_CLOSURE,
@@ -69,16 +78,20 @@ from .restoration import (
     UNKNOWN_OUTCOME_CLOSURE,
     card_closed_notice,
     card_row_state,
+    control_row_choice,
     changed_refusal,
     channel_generations,
     describe_receipts,
+    input_response_from_card_row,
     open_container_requests,
     operator_prompt_for_request,
     paused_action_requests,
     pending_record,
     read_card_row,
+    read_control_row,
     request_number,
     restored_pending_context,
+    saved_decision_digest,
     stored_request_prompt,
     unproven_refusal,
     unreadable_refusal,
@@ -454,7 +467,7 @@ class SageChat(Chat):
         )
 
     async def _reconcile_open_requests(self, message: ContainerOnStartMessage) -> None:
-        """End or re-ask each of this container's requests that a restart left without an owner."""
+        """End, or offer the saved decision of, each request a restart left without an owner."""
         operation_id = int(message.OperationID)
         if operation_id <= 0:
             return
@@ -521,24 +534,42 @@ class SageChat(Chat):
                 pending = record.get("pending")
                 context = pending.get("context") if isinstance(pending, dict) else None
                 if isinstance(context, dict) and context.get("request_id") == request_key:
-                    return await self._reask_or_close(client, target, record, context)
+                    return await self._offer_or_close(client, target, record, context)
             await self._close_open_request(target, TURN_CLOSED_NOTICE)
             return "closed: no card"
 
-    async def _reask_or_close(
+    _CONTINUATION_BINDING_KEYS = (
+        "control_id", "request_id", "native_request_id", "thread_id",
+        "source_approval_id", "source_message_id", "decision_digest", "operation_id",
+    )
+
+    @classmethod
+    def _continuation_binding(cls, continuation: dict[str, Any]) -> dict[str, str]:
+        return {key: str(continuation.get(key) or "") for key in cls._CONTINUATION_BINDING_KEYS}
+
+    @staticmethod
+    def _continuation_key(continuation: dict[str, Any]) -> str:
+        return f"restoration:{continuation.get('native_request_id')}:continue:{continuation.get('control_id')}"
+
+    async def _offer_or_close(
         self,
         client: Any,
         target: ChatRequest,
         record: dict[str, Any],
         context: dict[str, Any],
     ) -> str:
-        """Leave a still-pending card open; re-ask a decided one; close anything unprovable."""
+        """Leave a pending card open; offer a decided card's saved decision; close anything unprovable.
+
+        A decided card row cannot say whether Mythic delivered the decision, still has it queued,
+        or refused it while Sage was down. Startup therefore never applies or discards it: it
+        offers one Continue/Stop control in the same request and keeps the original approval
+        context valid, so either the original delivery or Continue claims it exactly once.
+        """
         operation_id, channel_id = int(target.OperationID), int(target.ChannelID)
         thread_id = str(record.get("thread_id") or "")
+        approval_id = str(context.get("approval_id") or "")
         try:
-            row = await read_card_row(
-                client, operation_id, channel_id, str(context.get("approval_id") or "")
-            )
+            row = await read_card_row(client, operation_id, channel_id, approval_id)
         except Exception:
             row = None
         state = card_row_state(row)
@@ -548,48 +579,239 @@ class SageChat(Chat):
             return await self._close_card_request(
                 target, thread_id, "its card could not be read in Mythic"
             )
+        pending = record.get("pending") if isinstance(record.get("pending"), dict) else {}
+        if not isinstance(pending.get("lifecycle"), dict):
+            return await self._close_card_request(
+                target, thread_id, "it was saved without its request state"
+            )
         try:
             action_requests = await paused_action_requests(channel_session_db_path(), thread_id)
         except Exception:
             action_requests = []
-        restored, contract, reason = restored_pending_context(
-            record.get("pending"), action_requests, thread_id
-        )
+        restored, _contract, reason = restored_pending_context(pending, action_requests, thread_id)
         if restored is None:
             return await self._close_card_request(target, thread_id, reason)
-        kwargs, new_context = approval_card(
-            action_requests,
-            restored,
-            decision_context=str(restored.get("decision_context") or ""),
+        envelope = input_response_from_card_row(row)
+        digest = saved_decision_digest(envelope)
+        continuation = record.get("continuation") if isinstance(record.get("continuation"), dict) else None
+        same = bool(
+            continuation
+            and continuation.get("source_approval_id") == approval_id
+            and continuation.get("decision_digest") == digest
+            and continuation.get("native_request_id") == str(target.RequestID)
+            and continuation.get("thread_id") == thread_id
         )
-        # Write-ahead: once saved, only the new card's id can match; a crash before the send
-        # leaves no card, which the next on-start closes.
+        n = 1
+        if same:
+            if continuation.get("status") != "offered":
+                return await self._close_card_request(
+                    target, thread_id, "its saved decision was already handled"
+                )
+            try:
+                control = await read_control_row(
+                    client, operation_id, channel_id, str(continuation.get("control_id") or "")
+                )
+            except Exception:
+                return "left open: Continue/Stop card unreadable"
+            choice = control_row_choice(control)
+            if choice == "pending":
+                return "left open: Continue/Stop card pending"
+            if choice == "stop":
+                return await self._revoke_continuation(target, thread_id, continuation)
+            if control is None:
+                # Saved before its card reached Mythic: send it under the same stable key.
+                await self._send_continuation_card(target, continuation, envelope, row)
+                return "continuation sent"
+            if choice != "continue":
+                return await self._close_card_request(
+                    target, thread_id, "its Continue/Stop card could not be read in Mythic"
+                )
+            # Continue was chosen while Sage could not receive it: never resend an answered key.
+            n = int(continuation.get("n") or 1) + 1
+        binding = {
+            "control_id": f"{approval_id}:{n}",
+            "request_id": str(context.get("request_id") or ""),
+            "native_request_id": str(target.RequestID),
+            "thread_id": thread_id,
+            "source_approval_id": approval_id,
+            "source_message_id": str(row.get("id")),
+            "decision_digest": digest,
+            "operation_id": str(operation_id),
+        }
+        continuation = {**binding, "n": n, "status": "offered"}
+        # Write-ahead: the record names the control before it exists, so a crash before the send
+        # is repaired by sending the same key at the next start.
         saved = await update_channel_session_record(
-            operation_id,
-            channel_id,
-            expected_thread_id=thread_id,
-            pending=pending_record(new_context, contract),
+            operation_id, channel_id, expected_thread_id=thread_id, continuation=continuation,
         )
         if not saved:
-            return await self._close_card_request(
-                target, thread_id, "its saved session changed"
-            )
-        await self.send_response(
-            target,
-            response_key=f"restoration:{target.RequestID}:reask:{new_context['approval_id']}",
-            content=REASK_NOTICE,
-            status="complete",
-            complete=False,
-            metadata={},
+            return await self._close_card_request(target, thread_id, "its saved session changed")
+        await self._send_continuation_card(target, continuation, envelope, row)
+        return "continuation offered"
+
+    async def _send_continuation_card(
+        self,
+        target: ChatRequest,
+        continuation: dict[str, Any],
+        envelope: Any,
+        source_row: dict[str, Any],
+    ) -> None:
+        source_card = ((source_row.get("metadata") or {}).get("input_requested") or {})
+        title = str(source_card.get("title") or "").strip()
+        kwargs = continuation_card(
+            self._continuation_binding(continuation),
+            saved_action=str(getattr(envelope, "Action", "") or ""),
+            tool_label=f"“{title}”" if title else "",
         )
-        await self.send_approval_request(
+        await self.send_single_choice_request(
             target,
             title=kwargs["title"],
             prompt=kwargs["prompt"],
+            choices=kwargs["choices"],
             description=kwargs["description"],
             data=kwargs["data"],
+            response_key=self._continuation_key(continuation),
         )
-        return "re-asked"
+
+    async def _revoke_continuation(
+        self, target: ChatRequest, thread_id: str, continuation: dict[str, Any]
+    ) -> str:
+        """Stop chosen (or the request cancelled) while Sage could not receive it: nothing runs."""
+        try:
+            await update_channel_session_record(
+                int(target.OperationID),
+                int(target.ChannelID),
+                expected_thread_id=thread_id,
+                pending=None,
+                continuation={**continuation, "status": "stopped"},
+            )
+        except Exception:
+            logger.warning("Stopped saved decision was not recorded", exc_info=True)
+        await self._close_open_request(target, CONTINUATION_STOPPED_NOTICE)
+        return "closed: saved decision stopped"
+
+    async def _resolve_saved_decision(
+        self, request: ChatRequest, model: Any
+    ) -> tuple[str, str, dict[str, Any] | None]:
+        """Route an input response against the channel's saved decision: ``(outcome, notice, continuation)``.
+
+        ``continue``: a Continue answer; ``request.InputResponse`` now carries the original card's
+        stored decision, re-read from Mythic and unchanged. ``superseded``: the original decision
+        arrived itself while a control was offered and not stopped. ``stop``: Stop was chosen (or
+        the request cancelled, or the saved decision cannot be proven); nothing may run.
+        ``hold``: whether the control was answered cannot be read; nothing runs, the request stays
+        open. ``stale``: a duplicate or late answer for a request whose decision is already handled
+        or still pending on another card; it must neither act nor end that request. ``""``: no
+        saved decision is involved; the existing claim path decides.
+        """
+        operation_id, channel_id = int(request.OperationID), int(request.ChannelID)
+        native = int(request.RequestID)
+        try:
+            record = await load_channel_session_record(operation_id, channel_id)
+        except Exception:
+            record = None
+        if (
+            not isinstance(record, dict)
+            or record.get("status") != CHANNEL_SESSION_ACTIVE
+            or record.get("thread_id") != getattr(model, "_thread_id_override", None)
+        ):
+            return "", "", None
+        continuation = record.get("continuation") if isinstance(record.get("continuation"), dict) else None
+        offered = bool(
+            continuation
+            and continuation.get("status") == "offered"
+            and continuation.get("native_request_id") == str(native)
+        )
+        pending = record.get("pending") if isinstance(record.get("pending"), dict) else {}
+        pending_context = pending.get("context") if isinstance(pending.get("context"), dict) else {}
+        binding = continuation_binding_of(request)
+        if binding is not None:
+            expected = self._continuation_binding(continuation) if offered else None
+            if expected is None or binding != expected:
+                return "stale", STALE_RESPONSE_NOTICE, None
+            choice = continuation_choice(request, expected)
+            if not choice:
+                return "stale", STALE_RESPONSE_NOTICE, None
+            if choice == STOP_CHOICE:
+                return "stop", CONTINUATION_STOPPED_NOTICE, continuation
+            try:
+                client = await self._mythic_read_client(request, model)
+                row = await read_card_row(
+                    client, operation_id, channel_id, str(continuation.get("source_approval_id") or "")
+                )
+            except Exception:
+                row = None
+            envelope = input_response_from_card_row(row)
+            if (
+                envelope is None
+                or saved_decision_digest(envelope) != continuation.get("decision_digest")
+                or str(envelope.InputRequestMessageID) != str(continuation.get("source_message_id"))
+            ):
+                return "stop", SAVED_DECISION_UNAVAILABLE_NOTICE, continuation
+            request.InputResponse = envelope
+            return "continue", "", continuation
+        matches = approval_response_matches(request, getattr(model, "_pending_approval_context", None))
+        if (
+            offered
+            and matches
+            and pending_context.get("approval_id") == continuation.get("source_approval_id")
+        ):
+            try:
+                client = await self._mythic_read_client(request, model)
+                control = await read_control_row(
+                    client, operation_id, channel_id, str(continuation.get("control_id") or "")
+                )
+            except Exception:
+                control = None
+            choice = control_row_choice(control)
+            if choice == "stop":
+                return "stop", CONTINUATION_STOPPED_NOTICE, continuation
+            if choice in {"pending", "continue"}:
+                return "superseded", "", continuation
+            return "hold", CONTROL_UNCONFIRMED_NOTICE, continuation
+        if not matches:
+            claim = record.get("claim") if isinstance(record.get("claim"), dict) else {}
+            owned = (
+                request_number(claim.get("request_id"), channel_id) == native
+                or request_number(pending_context.get("request_id"), channel_id) == native
+                or bool(continuation and continuation.get("native_request_id") == str(native))
+            )
+            if owned:
+                return "stale", STALE_RESPONSE_NOTICE, None
+        return "", "", None
+
+    async def _retire_control_row(
+        self, request: ChatRequest, model: Any, continuation: dict[str, Any]
+    ) -> None:
+        """Mark an unused Continue/Stop card no longer answerable before its request ends."""
+        try:
+            client = await self._mythic_read_client(request, model)
+            row = await read_control_row(
+                client, int(request.OperationID), int(request.ChannelID),
+                str(continuation.get("control_id") or ""),
+            )
+            if control_row_choice(row) != "pending":
+                return
+            card = dict(((row.get("metadata") or {}).get("input_requested")) or {})
+            card.update({
+                "status": "cancelled",
+                "response": {
+                    "action": "cancel",
+                    "reason": "The original decision arrived and was applied; this card is no longer needed.",
+                    "input_request_message_id": row.get("id"),
+                },
+            })
+            await self.send_response(
+                request,
+                response_key=self._continuation_key(continuation),
+                content="",
+                status="complete",
+                complete=False,
+                complete_request=False,
+                metadata={"special_type": "input_requested", "input_requested": card},
+            )
+        except Exception:
+            logger.warning("Unused Continue/Stop card was not retired", exc_info=True)
 
     async def _close_card_request(self, target: ChatRequest, thread_id: str, reason: str) -> str:
         # Clearing the card lets the next prompt's restore retire the paused call with history kept.
@@ -1235,8 +1457,31 @@ class SageChat(Chat):
                 f"The action waiting for approval before the restart was not restored ({reason}). "
                 "It was not executed and will not be resent."
             ]
+        lifecycle = (record.get("pending") or {}).get("lifecycle")
+        if lifecycle is None:
+            # Saved by an earlier version without its request state: resuming would start a second
+            # lifecycle for the same request, so it is retired with its history kept.
+            await self._retire_into_new_generation(request, model, RETIRED_CARD_CLOSURE)
+            return [LEGACY_PENDING_NOTICE]
         checkpoint_subgoal = copy.deepcopy((getattr(model, "state", None) or {}).get("_subgoal_state"))
-        model.install_request_contract(contract)
+        resuming = (
+            getattr(request, "InputResponse", None) is not None
+            and isinstance(lifecycle, dict)
+            and lifecycle.get("native_request_id") == int(request.RequestID)
+        )
+        if resuming:
+            # The decision arrives in the card's own request: continue that request's lifecycle.
+            try:
+                model._restored_emitter_rows = model.restore_pending_request(contract, lifecycle)
+            except (TypeError, ValueError) as exc:
+                await self._retire_into_new_generation(request, model, RETIRED_CARD_CLOSURE)
+                return [
+                    "The action waiting for approval before the restart was not restored (its saved "
+                    f"request state is unreadable: {type(exc).__name__}). It was not executed and "
+                    "will not be resent."
+                ]
+        else:
+            model.install_request_contract(contract)
         self._restore_subgoal_state(model, contract, checkpoint_subgoal)
         model._pending_approval_context = context
         return []
@@ -1666,6 +1911,12 @@ class SageChat(Chat):
                 # lifecycle notice before the turn's own emitter (a set-aside card) reaches this
                 # channel instead of the legacy task RPC.
                 restored_model._response_emitter = ChatStreamEmitter(self, request)
+                # Continue the rows this request created before the restart, so new blocks never
+                # reuse (and overwrite) one of them.
+                saved_rows = getattr(restored_model, "_restored_emitter_rows", None)
+                restored_model._restored_emitter_rows = None
+                if saved_rows is not None:
+                    restored_model._response_emitter.import_rows(saved_rows)
                 if restoration_notices:
                     await self.send_response(
                         request,
@@ -1756,6 +2007,24 @@ class SageChat(Chat):
                 await drop_channel_session(request, expected_model=model)
                 raise RuntimeError("Unable to verify fresh Sage HITL checkpoint state.")
 
+            saved_decision, saved_notice, saved_continuation = "", "", None
+            if has_input_response and not hitl_probe_failed:
+                saved_decision, saved_notice, saved_continuation = await self._resolve_saved_decision(
+                    request, model
+                )
+                if saved_decision in {"stale", "hold"}:
+                    # Never a terminal: the request belongs to the decision already handled, or
+                    # its Continue/Stop card is still the operator's to answer.
+                    await self.send_response(
+                        request,
+                        response_key=f"restoration:{request.RequestID}:{saved_decision}:{uuid4().hex}",
+                        content=saved_notice,
+                        status="complete",
+                        complete=False,
+                        complete_request=False,
+                        metadata={},
+                    )
+                    return None
             if not has_input_response:
                 model._pending_approval_context = None
             request_contract = _build_request_contract(
@@ -1866,17 +2135,28 @@ class SageChat(Chat):
                     "apitoken_id": str(request.APITokenID),
                 }
 
-            async def store_pending_approval(context: dict[str, Any]) -> None:
-                model._pending_approval_context = dict(context)
-                # Durable before the request releases: a restart can then reattach this exact card.
-                # A new card also ends any earlier claim, whose action is already checkpointed.
+            def pending_with_lifecycle(context: dict[str, Any]) -> dict[str, Any]:
+                snapshot = getattr(model, "pending_lifecycle_snapshot", None)
+                return pending_record(
+                    context,
+                    getattr(model, "_request_contract", None),
+                    snapshot(int(request.RequestID)) if callable(snapshot) else None,
+                )
+
+            async def prepare_pending_approval(context: dict[str, Any]) -> None:
+                # Durable before the card is exposed: a restart can then reattach this exact card
+                # and continue its request lifecycle. A new card also ends any earlier claim, whose
+                # action is already checkpointed.
                 await self._update_session_record(
                     request,
                     model,
                     required=True,
-                    pending=pending_record(context, getattr(model, "_request_contract", None)),
+                    pending=pending_with_lifecycle(context),
                     claim=None,
                 )
+
+            async def store_pending_approval(context: dict[str, Any]) -> None:
+                model._pending_approval_context = dict(context)
 
             async def record_approval_receipt(receipt: dict[str, Any]) -> None:
                 record = await load_channel_session_record(
@@ -1908,6 +2188,7 @@ class SageChat(Chat):
                 approval_context_lookup=approval_context,
                 approval_context_store=store_pending_approval,
                 decision_context_lookup=getattr(model, "_hitl_decision_context", None),
+                approval_context_prepare=prepare_pending_approval,
             )
             model._hitl_card_pending = False
             set_active_agent = getattr(model, "set_active_agent", None)
@@ -1949,6 +2230,7 @@ class SageChat(Chat):
                 if (
                     has_input_response
                     and not hitl_probe_failed
+                    and saved_decision != "stop"
                     and (controller_pending or hitl_pending)
                     and approval_response_matches(
                         request,
@@ -1976,9 +2258,20 @@ class SageChat(Chat):
                             "status": "claimed",
                             "receipts": [],
                         },
+                        **(
+                            {"continuation": {
+                                **saved_continuation,
+                                "status": "used" if saved_decision == "continue" else "superseded",
+                            }}
+                            if saved_continuation is not None
+                            and saved_decision in {"continue", "superseded"}
+                            else {}
+                        ),
                     )
                     approval_claimed = True
-                stale_approval_response = bool(has_input_response and not approval_claimed)
+                stale_approval_response = bool(
+                    has_input_response and not approval_claimed and saved_decision != "stop"
+                )
                 approved_action_ids = (
                     approved_action_ids_for_request(
                         request,
@@ -2059,6 +2352,12 @@ class SageChat(Chat):
                                     "Operation findings are unavailable because Sage could not "
                                     "read the watcher-owned operation evidence index."
                                 )
+                    elif saved_decision == "stop":
+                        # Nothing resumes: the paused work is retired in code with its history kept,
+                        # and the request's restored lifecycle closes on the normal terminal path.
+                        model._pending_approval_context = None
+                        await self._retire_into_new_generation(request, model, STOPPED_CLOSURE)
+                        native_response_text = saved_notice
                     elif stale_approval_response:
                         await stream_emitter(
                             "That approval request is no longer active. No action was executed; "
@@ -2119,6 +2418,8 @@ class SageChat(Chat):
                     await self._mark_claim_consumed(
                         request, model, str(approval_claim_context.get("approval_id") or "")
                     )
+                    if saved_decision == "superseded" and saved_continuation is not None:
+                        await self._retire_control_row(request, model, saved_continuation)
                     # LangGraph does not emit a normal tool-end callback for a
                     # denied/unselected guarded call. Close only the tool events
                     # that remain open after resume; approved calls that already
@@ -2271,6 +2572,23 @@ class SageChat(Chat):
             if getattr(model, "_hitl_card_pending", False):
                 # A confirmation card already released this request (complete_request=False). Returning None
                 # tells run_chat_turn to send no terminal while the graph waits on disk.
+                # Refresh the saved request state to its exact state at release; the write made
+                # before the card was exposed stays in force if this one fails.
+                released = getattr(model, "_pending_approval_context", None)
+                if isinstance(released, dict):
+                    try:
+                        record = await load_channel_session_record(
+                            int(request.OperationID), int(request.ChannelID)
+                        )
+                        saved = ((record or {}).get("pending") or {}).get("context") or {}
+                        if (
+                            saved.get("approval_id") == released.get("approval_id")
+                            and record.get("thread_id") == getattr(model, "_thread_id_override", None)
+                        ):
+                            record["pending"] = pending_with_lifecycle(released)
+                            await save_channel_session_record(record)
+                    except Exception:
+                        logger.warning("Saved request state was not refreshed at release", exc_info=True)
                 return None
             runtime_telemetry = {}
             get_runtime_telemetry = getattr(model, "controller_runtime_telemetry", None)

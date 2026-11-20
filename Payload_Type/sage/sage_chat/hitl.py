@@ -385,6 +385,7 @@ def make_card_emitter(
     approval_context_lookup: Callable[[], dict[str, Any]] | None = None,
     approval_context_store: Callable[[dict[str, Any]], Any] | None = None,
     decision_context_lookup: Callable[[list[dict[str, Any]]], str] | None = None,
+    approval_context_prepare: Callable[[dict[str, Any]], Any] | None = None,
 ) -> Callable[[list[dict[str, Any]]], Awaitable[None]]:
     """Return an async `(action_requests) -> None` that raises the approval request for this turn.
 
@@ -424,8 +425,15 @@ def make_card_emitter(
                     metadata["delegation_name"] = active[1]
             except Exception as e:
                 logger.debug(f"approval delegation lookup failed (non-fatal): {e}")
-        # Store the resumable context only after Mythic confirms that it surfaced the card. A failed send
-        # must propagate so the caller can rotate the inaccessible paused checkpoint.
+        # Durable write-ahead: saved before the card can be answered, so a process that dies after
+        # the send still has the exact card and its request state on disk. A failed prepare
+        # propagates before any card exists.
+        if approval_context_prepare is not None:
+            prepared = approval_context_prepare(dict(approval_context))
+            if inspect.isawaitable(prepared):
+                await prepared
+        # Install the in-process resumable context only after Mythic confirms that it surfaced the
+        # card. A failed send must propagate so the caller can rotate the inaccessible paused checkpoint.
         await chat.send_approval_request(
             request,
             title=kwargs["title"],
@@ -663,3 +671,105 @@ def resume_steer_message_for_request(request: ChatRequest) -> str:
     if action in ("respond", "select"):
         return str(getattr(ir, "Response", "") or "").strip()
     return ""
+
+
+# ----------------------------------------------------------------------------------------------
+# Saved-decision continuation (after a restart)
+# ----------------------------------------------------------------------------------------------
+# A decision Mythic stored on an approval card may never have reached Sage (Sage was down), or
+# may still be queued for delivery. Startup cannot tell the two apart, so it never applies the
+# stored decision itself: it offers one Continue/Stop control in the same request. The control
+# is fresh authenticated transport for the stored decision, not a new approval: Continue re-reads
+# and revalidates the original card's stored decision, and only that decision can run.
+CONTINUE_CHOICE = "continue"
+STOP_CHOICE = "stop"
+_SAVED_DECISION_LABELS = {
+    "accept": "approved",
+    "reject": "rejected",
+    "respond": "answered with guidance",
+    "select": "selected an action",
+}
+
+
+def continuation_card(binding: dict[str, str], *, saved_action: str, tool_label: str) -> dict[str, Any]:
+    """``send_single_choice_request`` kwargs for one saved-decision control."""
+    if any(not isinstance(value, str) for value in binding.values()):
+        raise ValueError("continuation binding values must be strings")
+    label = _SAVED_DECISION_LABELS.get(saved_action, "decided")
+    return {
+        "title": "Continue saved decision?",
+        "prompt": (
+            f"While Sage was restarting, Mythic saved your decision on the approval card for "
+            f"{tool_label or 'the pending action'}: you {label} it. Sage has not applied it yet."
+        ),
+        "description": (
+            "Continue applies that saved decision exactly once, as you made it. "
+            "Stop discards it and runs nothing."
+        ),
+        "choices": [
+            {"id": CONTINUE_CHOICE, "label": "Continue saved decision",
+             "description": "Apply the saved decision once."},
+            {"id": STOP_CHOICE, "label": "Stop",
+             "description": "Discard the saved decision; nothing runs."},
+        ],
+        "data": {"sage_continuation": dict(binding)},
+    }
+
+
+def continuation_binding_of(request: ChatRequest) -> dict[str, Any] | None:
+    """The control binding echoed by an input response, or ``None`` for any other response."""
+    response = getattr(request, "InputResponse", None)
+    input_request = getattr(response, "InputRequest", None) if response is not None else None
+    data = input_request.get("data") if isinstance(input_request, dict) else None
+    binding = data.get("sage_continuation") if isinstance(data, dict) else None
+    return binding if isinstance(binding, dict) else None
+
+
+def continuation_choice(request: ChatRequest, binding: dict[str, str]) -> str:
+    """``continue`` or ``stop`` for an exact answer to this control; ``""`` for anything else.
+
+    No recording of Mythic's stored form of this code-made card exists yet, so the check is on
+    meaning rather than byte equality: the card's own fields, the exact binding, a resolved status
+    consistent with the action, and Mythic's resolver fields. Only ``select`` of the Continue
+    choice continues; every other answer to the exact control stops (default deny).
+    """
+    response = getattr(request, "InputResponse", None)
+    input_request = getattr(response, "InputRequest", None) if response is not None else None
+    if not isinstance(input_request, dict) or getattr(response, "AdditionalItems", None):
+        return ""
+    expected = continuation_card(binding, saved_action="", tool_label="")
+    data = input_request.get("data")
+    if (
+        input_request.get("input_type") != "single_choice"
+        or input_request.get("title") != expected["title"]
+        or not isinstance(data, dict)
+        or data.get("sage_continuation") != binding
+    ):
+        return ""
+    choices = input_request.get("choices")
+    if not isinstance(choices, list) or [
+        (c.get("id"), c.get("label")) if isinstance(c, dict) else None for c in choices
+    ] != [(c["id"], c["label"]) for c in expected["choices"]]:
+        return ""
+    action = getattr(response, "Action", None)
+    status_by_action = {"accept": "accepted", "reject": "rejected", "respond": "responded",
+                        "select": "selected"}
+    if action not in status_by_action or input_request.get("status") != status_by_action[action]:
+        return ""
+    message_id = getattr(response, "InputRequestMessageID", 0)
+    resolver = getattr(response, "ResolvedByOperatorID", 0)
+    stored = input_request.get("response")
+    if (
+        type(message_id) is not int or message_id <= 0
+        or type(resolver) is not int or resolver <= 0
+        or not isinstance(stored, dict)
+        or stored.get("action") != action
+        or stored.get("input_request_message_id") != message_id
+    ):
+        return ""
+    choice = getattr(response, "Choice", None)
+    if action == "select":
+        if not isinstance(choice, dict) or choice.get("id") not in {CONTINUE_CHOICE, STOP_CHOICE}:
+            return ""
+        return CONTINUE_CHOICE if choice["id"] == CONTINUE_CHOICE else STOP_CHOICE
+    return STOP_CHOICE

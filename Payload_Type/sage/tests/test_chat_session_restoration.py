@@ -201,10 +201,11 @@ class _Process:
             assert variables == {"op": OPERATION, "container": "sage"}, variables
             return {"chat_request": [dict(row) for row in self.open_requests]}
         if "chat_message" in query:
-            wanted = variables["ctx"]["input_requested"]["data"]["sage_approval_context"]["approval_id"]
+            ((data_key, identity),) = variables["ctx"]["input_requested"]["data"].items()
+            ((id_key, wanted),) = identity.items()
             return {"chat_message": [
                 row for row in self.card_rows
-                if row["metadata"]["input_requested"]["data"]["sage_approval_context"]["approval_id"] == wanted
+                if (row["metadata"]["input_requested"].get("data") or {}).get(data_key, {}).get(id_key) == wanted
             ]}
         if "chat_request" in query:
             row = self.request_rows.get(variables["id"])
@@ -333,47 +334,375 @@ def test_a_pending_card_decided_after_restart_resolves_exactly_once(action, expe
     assert any("no longer active" in text for text in texts)
 
 
-@pytest.mark.parametrize("decided", ["accept", "reject"])
-def test_a_decision_made_while_sage_was_down_is_reasked_in_the_same_request(decided):
-    """Expectation changed by plan r2 (operator product decision): never applied, re-asked."""
+def _lifecycle_errors(chat) -> list[str]:
+    return [text for text in (str(e.get("content") or "") + str(e.get("error") or "") for e in chat.emissions)
+            if "reconciliation failed" in text.lower()]
+
+
+@pytest.mark.parametrize("action,expected_effects", [("accept", 1), ("reject", 0)])
+def test_a_restored_approval_continues_the_original_request_lifecycle(action, expected_effects):
+    """Mythic dispatches a card decision in the card's own request (`chat_update_webhook.go:772`).
+
+    Live requests 11 and 22 ended `error` here: the tool and sub-agent lifecycle opened before the
+    restart lived only in the dead process, so the resumed tool end had no start.
+    """
+    async def scenario():
+        first, card = await _raise_card()
+        first_keys = {e["response_key"] for e in first.chat.emissions}
+        ledger = first.models[0]._request_event_ledger
+        started = [event.event_id for event in ledger.actual_events(kind="tool", phase="started")]
+        opened = [event.event_id for event in ledger.actual_events(kind="delegation", phase="opened")]
+        second = _Process(_after_card_script() if action == "accept" else [
+            AIMessage(content="Not run."), AIMessage(content="The operator rejected pwd; nothing ran.")])
+        request = _request("", 1, mode="supervised")
+        request.InputResponse = _input_response(action, card)
+        await second.chat.chat(request)
+        return first_keys, started, opened, second
+
+    first_keys, started, opened, second = asyncio.run(scenario())
+    assert len(second.effects) == expected_effects
+    assert not _lifecycle_errors(second.chat), _lifecycle_errors(second.chat)
+    closings = _closings(second.chat)
+    assert len(closings) == 1 and closings[0]["kind"] == "complete", closings
+    ledger = second.models[-1]._request_event_ledger
+    report = ledger.reconcile()
+    assert report["ok"], report
+    # The guarded call's card and the sub-agent card opened before the restart end after it, once,
+    # under their original identities.
+    assert started and opened
+    for event_id in started:
+        assert ledger.phase_count(event_id, "tool", "started", projected=False) == 1
+        assert sum(ledger.phase_count(event_id, "tool", phase, projected=False)
+                   for phase in ("completed", "error", "stopped", "cancelled")) == 1
+    for event_id in opened:
+        assert sum(ledger.phase_count(event_id, "delegation", phase, projected=False)
+                   for phase in ("finished", "error", "stopped", "cancelled")) == 1
+        assert any(e["response_key"] == f"event:{event_id}" and e.get("complete")
+                   for e in second.chat.emissions)
+    # New text never overwrites a block the request created before the restart.
+    reused = [e["response_key"] for e in second.chat.emissions
+              if e["kind"] in {"text", "delta", "streaming"} and e["response_key"] in first_keys]
+    assert not reused, reused
+
+
+def _approval_cards(chat) -> list[dict]:
+    return [card for card in _cards(chat) if "sage_approval_context" in (card.get("data") or {})]
+
+
+def _controls(chat) -> list[dict]:
+    return [card for card in _cards(chat) if "sage_continuation" in (card.get("data") or {})]
+
+
+_CONTROL_MESSAGE_ID = 95
+
+
+def _control_response(control: dict, choice_id: str, *, message_id: int = _CONTROL_MESSAGE_ID):
+    """Mythic's dispatch for a selected Continue/Stop control (synthetic: no recording exists yet;
+    shape follows `chat_update_webhook.go:657-786` for a single_choice card)."""
+    choice = next(dict(item) for item in control["choices"] if item["id"] == choice_id)
+    resolved = {"input_request_message_id": message_id, "resolved_by_operator_id": 19,
+                "resolved_by": "offline operator", "resolved_at": "2026-11-20T00:00:00Z"}
+    echo = copy.deepcopy(control)
+    echo.update({"status": "selected", "response": {**resolved, "action": "select", "choice": choice},
+                 "resolved_by_operator_id": 19, "resolved_by": "offline operator",
+                 "resolved_at": resolved["resolved_at"]})
+    return ChatBase.ChatInputResponse(
+        action="select", response="", choice=choice, input_request_message_id=message_id,
+        input_request=echo, resolved_by_operator_id=19, resolved_by="offline operator",
+        resolved_at=resolved["resolved_at"])
+
+
+def _control_row(control: dict, *, answer=None, cancelled: bool = False,
+                 message_id: int = _CONTROL_MESSAGE_ID) -> dict:
+    """A stored Continue/Stop row (synthetic, Mythic's columns): pending, answered or cancelled."""
+    card = copy.deepcopy(answer.InputRequest if answer is not None else control)
+    if cancelled:
+        card.update({"status": "cancelled", "response": {
+            "action": "cancel", "reason": "request cancelled", "input_request_message_id": message_id,
+            "resolved_by_operator_id": 19, "resolved_by": "offline operator",
+            "resolved_at": "2026-11-20T00:00:00Z"}})
+    return {"id": message_id, "channel_id": CHANNEL, "operation_id": OPERATION,
+            "metadata": {"special_type": "input_requested", "input_requested": card}}
+
+
+def _decided_answer(action: str, card: dict, request_id: int = 1):
+    request = _request("", request_id, mode="supervised")
+    request.InputResponse = _input_response(action, card)
+    return request
+
+
+def _answer(response, request_id: int = 1):
+    request = _request("", request_id, mode="supervised")
+    request.InputResponse = response
+    return request
+
+
+async def _offer(card, decided="accept", *, script=None, extra_rows=()):
+    """Restart with the card decided in Mythic and its request open, then run on-start."""
+    stored = _input_response(decided, card)
+    process = _Process(_after_card_script() if script is None else script,
+                       card_rows=[_card_row(card, stored), *extra_rows], open_requests=[_open(1)])
+    await _onstart(process)
+    return process, stored
+
+
+@pytest.mark.parametrize("decided,expected_effects", [("accept", 1), ("reject", 0)])
+def test_a_decision_saved_while_sage_was_down_is_offered_and_continue_applies_it_once(
+        decided, expected_effects):
+    """Operator decision 2026-11-20: a provably unconsumed stored decision is recovered."""
     async def scenario():
         _first, card = await _raise_card()
-        stored = _input_response(decided, card)
-        second = _Process(_after_card_script(), card_rows=[_card_row(card, stored)], open_requests=[_open(1)])
-        response = await _onstart(second)
-        reconciled = list(second.chat.emissions)
-        models_at_onstart = len(second.models)
-        effects_at_onstart = list(second.effects)
+        second, stored = await _offer(card, decided, script=_after_card_script() if decided == "accept" else [
+            AIMessage(content="Not run."), AIMessage(content="The operator rejected pwd; nothing ran.")])
+        at_offer = list(second.chat.emissions)
         record = await load_channel_session_record(OPERATION, CHANNEL)
-        # The decision Mythic stored on the old card can never be replayed.
-        old = _request("", 1, mode="supervised")
-        old.InputResponse = stored
-        await second.chat.chat(old)
-        effects_after_old = list(second.effects)
-        new_card = _cards(second.chat)[0]
-        answer = _request("", 1, mode="supervised")
-        answer.InputResponse = _input_response("accept", new_card)
-        await second.chat.chat(answer)
-        return second, card, response, reconciled, models_at_onstart, effects_at_onstart, record, effects_after_old
+        effects_at_offer = list(second.effects)
+        control = _controls(second.chat)[0]
+        second.card_rows.append(_control_row(control, answer=_control_response(control, "continue")))
+        await second.chat.chat(_answer(_control_response(control, "continue")))
+        effects_after = list(second.effects)
+        # Duplicates in both orders neither act again nor end the request again.
+        before = len(second.chat.emissions)
+        await second.chat.chat(_answer(_control_response(control, "continue")))
+        await second.chat.chat(_decided_answer(decided, card))
+        late = second.chat.emissions[before:]
+        return second, card, at_offer, record, effects_at_offer, effects_after, late
 
-    (second, card, response, reconciled, models_at_onstart, effects_at_onstart, record,
-     effects_after_old) = asyncio.run(scenario())
-    assert response.EventLogErrorMessage == ""
-    assert models_at_onstart == 0 and effects_at_onstart == []
-    assert not [e for e in reconciled if e.get("complete_request")], reconciled
-    cards = [e["metadata"]["input_requested"] for e in reconciled
-             if isinstance(e.get("metadata"), dict) and e["metadata"].get("special_type") == "input_requested"]
-    assert len(cards) == 1
-    new, old = cards[0]["data"]["sage_approval_context"], card["data"]["sage_approval_context"]
-    assert new["approval_id"] != old["approval_id"]
-    assert new["action_digest"] == old["action_digest"] and new["proposal_digest"] == old["proposal_digest"]
-    assert record["pending"]["context"]["approval_id"] == new["approval_id"]
-    assert any("not applied" in str(e.get("content") or "") for e in reconciled)
-    assert effects_after_old == []
-    assert any("no longer active" in text for text in _texts(second.chat))
-    # Only the operator's answer to the new card runs the action, exactly once.
+    second, card, at_offer, record, effects_at_offer, effects_after, late = asyncio.run(scenario())
+    assert effects_at_offer == [] and not [e for e in at_offer if e.get("complete_request")]
+    offered = [e for e in at_offer if (e.get("metadata") or {}).get("special_type") == "input_requested"]
+    assert len(offered) == 1 and offered[0]["response_key"].startswith("restoration:1:continue:")
+    source_id = card["data"]["sage_approval_context"]["approval_id"]
+    assert record["pending"]["context"]["approval_id"] == source_id
+    assert record["continuation"]["status"] == "offered"
+    assert record["continuation"]["source_approval_id"] == source_id
+    assert effects_after == second.effects and len(second.effects) == expected_effects
+    assert not _lifecycle_errors(second.chat), _lifecycle_errors(second.chat)
+    closings = _closings(second.chat)
+    assert len(closings) == 1 and closings[0]["kind"] == "complete", closings
+    assert not [e for e in late if e.get("complete_request")]
+    assert any("already handled" in str(e.get("content") or "") for e in late)
+
+
+def test_a_queued_original_decision_wins_once_and_retires_the_unused_offer():
+    """Live cards 418/430: the decision was queued while Sage booted, and arrived after on-start."""
+    async def scenario():
+        _first, card = await _raise_card()
+        second, stored = await _offer(card, "accept")
+        control = _controls(second.chat)[0]
+        second.card_rows.append(_control_row(control))
+        await second.chat.chat(_decided_answer("accept", card))
+        mid = list(second.chat.emissions)
+        await second.chat.chat(_answer(_control_response(control, "continue")))
+        return second, control, mid
+
+    second, control, mid = asyncio.run(scenario())
     assert second.effects == [{"command": "pwd", "callback_display_id": 5}]
-    assert _closings(second.chat), "the answered request never completed"
+    assert not _lifecycle_errors(second.chat)
+    closings = _closings(second.chat)
+    assert len(closings) == 1 and closings[0]["kind"] == "complete"
+    key = next(e["response_key"] for e in mid
+               if (e.get("metadata") or {}).get("input_requested", {}).get("data", {}).get("sage_continuation"))
+    retired = [i for i, e in enumerate(mid) if e["response_key"] == key
+               and e["metadata"]["input_requested"]["status"] == "cancelled"]
+    terminal = next(i for i, e in enumerate(mid) if e.get("complete_request"))
+    assert retired and retired[0] < terminal, "the unused Continue/Stop card must be retired first"
+    texts = _texts(second.chat)
+    assert not any("no longer active" in t or "already handled" in t for t in texts[:len(mid)]), texts
+
+
+@pytest.mark.parametrize("how", ["stop_answer", "stop_seen_by_original", "request_cancelled"])
+def test_stop_or_cancel_discards_the_saved_decision(how):
+    async def scenario():
+        _first, card = await _raise_card()
+        second, stored = await _offer(card, "accept", script=[AIMessage(content="Nothing pending.")])
+        control = _controls(second.chat)[0]
+        if how == "stop_answer":
+            second.card_rows.append(_control_row(control, answer=_control_response(control, "stop")))
+            await second.chat.chat(_answer(_control_response(control, "stop")))
+        elif how == "stop_seen_by_original":
+            # Stop's own delivery is still queued behind the original decision.
+            second.card_rows.append(_control_row(control, answer=_control_response(control, "stop")))
+            await second.chat.chat(_decided_answer("accept", card))
+            await second.chat.chat(_answer(_control_response(control, "stop")))
+        else:
+            second.card_rows.append(_control_row(control, cancelled=True))
+            await second.chat.chat(_decided_answer("accept", card))
+        record = await load_channel_session_record(OPERATION, CHANNEL)
+        await second.chat.chat(_request("Is anything pending? Do not run tools.", 2, mode="supervised"))
+        return second, record
+
+    second, record = asyncio.run(scenario())
+    assert second.effects == []
+    stopped = [e for e in second.chat.emissions if e.get("complete_request")
+               and "Stopped" in str(e.get("content") or "")]
+    assert len(stopped) == 1, second.chat.emissions
+    assert not _lifecycle_errors(second.chat), _lifecycle_errors(second.chat)
+    assert record["pending"] is None
+    # Same-channel conversation continues with no open tool call left behind.
+    restored = second.models[-1]
+    for channel, messages in restored.state.items():
+        if channel.endswith("messages") and isinstance(messages, list):
+            answered = {m.tool_call_id for m in messages if isinstance(m, ToolMessage)}
+            assert not [c["id"] for m in messages if isinstance(m, AIMessage)
+                        for c in (m.tool_calls or []) if c["id"] not in answered], channel
+
+
+def test_startup_repairs_a_lost_offer_and_never_resends_an_answered_control():
+    """Crash boundaries: offer saved but not sent; pending; Continue chosen while down."""
+    async def scenario():
+        _first, card = await _raise_card()
+        stored = _input_response("accept", card)
+        rows = [_card_row(card, stored)]
+        dying = _Process([], card_rows=rows, open_requests=[_open(1)])
+
+        async def lost_send(*_args, **_kwargs):
+            raise ConnectionError("process died before the control reached Mythic")
+
+        dying.chat.send_single_choice_request = lost_send
+        await _onstart(dying)
+        saved = await load_channel_session_record(OPERATION, CHANNEL)
+        await _restart(dying)
+        repaired = _Process([], card_rows=rows, open_requests=[_open(1)])
+        await _onstart(repaired)
+        sent = _controls(repaired.chat)
+        rows.append(_control_row(sent[0]))
+        await _onstart(repaired)  # still pending: nothing is resent
+        pending_again = _controls(repaired.chat)
+        await _restart(repaired)
+        rows[-1] = _control_row(sent[0], answer=_control_response(sent[0], "continue"))
+        again = _Process(_after_card_script(), card_rows=rows, open_requests=[_open(1)])
+        await _onstart(again)
+        fresh = _controls(again.chat)
+        rows.append(_control_row(fresh[0], message_id=96))
+        await again.chat.chat(_answer(_control_response(sent[0], "continue")))  # the old control
+        effects_after_old = list(again.effects)
+        await again.chat.chat(_answer(_control_response(fresh[0], "continue", message_id=96)))
+        return saved, sent, pending_again, fresh, effects_after_old, again
+
+    saved, sent, pending_again, fresh, effects_after_old, again = asyncio.run(scenario())
+    assert saved["continuation"]["status"] == "offered" and saved["continuation"]["n"] == 1
+    assert len(sent) == 1 and len(pending_again) == 1
+    assert sent[0]["data"]["sage_continuation"]["control_id"] == saved["continuation"]["control_id"]
+    assert len(fresh) == 1
+    assert fresh[0]["data"]["sage_continuation"]["control_id"] != sent[0]["data"]["sage_continuation"]["control_id"]
+    assert effects_after_old == []
+    assert again.effects == [{"command": "pwd", "callback_display_id": 5}]
+    assert len(_closings(again.chat)) == 1 and not _lifecycle_errors(again.chat)
+
+
+@pytest.mark.parametrize("alteration", ["other_control", "changed_source", "copied_choice_text"])
+def test_an_altered_control_or_changed_saved_decision_never_continues(alteration):
+    async def scenario():
+        _first, card = await _raise_card()
+        second, stored = await _offer(card, "accept", script=[AIMessage(content="Nothing ran.")])
+        control = _controls(second.chat)[0]
+        answer = _control_response(control, "continue")
+        if alteration == "other_control":
+            answer.InputRequest["data"]["sage_continuation"]["control_id"] = "f" * 32 + ":1"
+        elif alteration == "copied_choice_text":
+            answer.InputRequest["choices"][0]["label"] = "Approve"
+        else:
+            source = next(row for row in second.card_rows
+                          if "sage_approval_context" in row["metadata"]["input_requested"]["data"])
+            source["metadata"]["input_requested"]["response"]["resolved_at"] = "2026-11-21T00:00:00Z"
+        second.card_rows.append(_control_row(control, answer=answer))
+        await second.chat.chat(_answer(answer))
+        return second
+
+    second = asyncio.run(scenario())
+    assert second.effects == []
+    if alteration == "changed_source":
+        stopped = [e for e in _closings(second.chat) if "could not read" in str(e.get("content") or "")]
+        assert len(stopped) == 1
+    else:
+        assert not _closings(second.chat)
+        assert any("already handled" in str(e.get("content") or "") for e in second.chat.emissions)
+
+
+def test_a_late_duplicate_never_ends_a_request_waiting_on_a_new_card():
+    async def scenario():
+        _first, card = await _raise_card()
+        # The resumed specialist proposes a second guarded call, which raises a new card in R.
+        second = _Process([AIMessage(content="pwd done; running it once more."),
+                           _call("issue_task_and_waitfor_task_output", PWD, 7)])
+        await second.chat.chat(_decided_answer("accept", card))
+        before = len(second.chat.emissions)
+        await second.chat.chat(_decided_answer("accept", card))
+        return second, before
+
+    second, before = asyncio.run(scenario())
+    new_cards = _approval_cards(second.chat)
+    late = second.chat.emissions[before:]
+    assert len(second.effects) == 1
+    assert len(new_cards) == 1, "the resumed request must be waiting on a new card"
+    assert not [e for e in late if e.get("complete_request")], late
+    assert any("already handled" in str(e.get("content") or "") for e in late)
+
+
+def test_a_card_saved_without_its_request_state_is_retired_with_history():
+    async def scenario():
+        _first, card = await _raise_card()
+        record = await load_channel_session_record(OPERATION, CHANNEL)
+        record["pending"].pop("lifecycle")
+        await chat_session.save_channel_session_record(record)
+        stored = _input_response("accept", card)
+        second = _Process([AIMessage(content="Nothing is pending.")],
+                          card_rows=[_card_row(card, stored)], open_requests=[_open(1)])
+        await _onstart(second)
+        closed = list(_closings(second.chat))
+        await second.chat.chat(_decided_answer("accept", card, request_id=1))
+        return second, closed
+
+    second, closed = asyncio.run(scenario())
+    assert second.effects == []
+    assert len(closed) == 1 and "without its request state" in closed[0]["content"]
+
+
+def test_spent_steps_and_denials_survive_a_restored_resume():
+    async def scenario():
+        first, card = await _raise_card()
+        record = await load_channel_session_record(OPERATION, CHANNEL)
+        lifecycle = record["pending"]["lifecycle"]
+        lifecycle["spent"]["steps"] = 7
+        lifecycle["authority"]["denied_action_keys"] = ["issue_task_and_waitfor_task_output:whoami:5"]
+        await chat_session.save_channel_session_record(record)
+        second = _Process(_after_card_script())
+        seen = {}
+        original = Model.handle_hitl_resume
+
+        async def observe(self, *args, **kwargs):
+            seen.update(steps=self._global_step_count, keys=set(self._denied_action_keys))
+            return await original(self, *args, **kwargs)
+
+        Model.handle_hitl_resume = observe
+        try:
+            await second.chat.chat(_decided_answer("accept", card))
+        finally:
+            Model.handle_hitl_resume = original
+        return seen, second
+
+    seen, second = asyncio.run(scenario())
+    assert seen["steps"] == 7
+    assert "issue_task_and_waitfor_task_output:whoami:5" in seen["keys"]
+    assert len(second.effects) == 1
+
+
+def test_an_exported_ledger_never_carries_text_bodies():
+    from ai.langgraph.request_events import RequestEventLedger
+
+    ledger = RequestEventLedger("chat:41:request:1")
+    ledger.record(event_id="operator_input:x", kind="operator_input", phase="received",
+                  content="secret-looking operator text")
+    exported = ledger.export_state()
+    assert exported["events"][0]["content"].startswith("sha256:")
+    assert "secret-looking" not in json.dumps(exported)
+    tampered = copy.deepcopy(exported)
+    tampered["events"][0]["content"] = "raw text"
+    with pytest.raises(ValueError):
+        RequestEventLedger.from_export(tampered)
+    restored = RequestEventLedger.from_export(exported)
+    assert [e.record_id for e in restored.events] == [e.record_id for e in ledger.events]
 
 
 def test_without_on_start_a_stored_decision_is_never_applied():
@@ -473,32 +802,6 @@ def test_requests_this_process_is_serving_are_never_touched():
     live_session, live_task, held_lock, record, card = asyncio.run(scenario())
     assert live_session == [] and live_task == [] and held_lock == []
     assert record["pending"]["context"]["approval_id"] == card["data"]["sage_approval_context"]["approval_id"]
-
-
-def test_a_reask_lost_before_its_card_was_sent_is_closed_by_the_next_on_start():
-    """Crash boundary (trace R2.3): the new id is saved first; without its card, nothing can run."""
-    async def scenario():
-        _first, card = await _raise_card()
-        rows = [_card_row(card, _input_response("accept", card))]
-        dying = _Process([], card_rows=rows, open_requests=[_open(1)])
-
-        async def lost_send(*_args, **_kwargs):
-            raise ConnectionError("process died before the card reached Mythic")
-
-        dying.chat.send_approval_request = lost_send
-        await _onstart(dying)
-        saved = await load_channel_session_record(OPERATION, CHANNEL)
-        await _restart(dying)
-        after = _Process([AIMessage(content="Nothing is pending.")], card_rows=rows, open_requests=[_open(1)])
-        await _onstart(after)
-        cleared = await load_channel_session_record(OPERATION, CHANNEL)
-        return card, saved, after, cleared
-
-    card, saved, after, cleared = asyncio.run(scenario())
-    assert saved["pending"]["context"]["approval_id"] != card["data"]["sage_approval_context"]["approval_id"]
-    closings = _closings(after.chat)
-    assert len(closings) == 1 and "could not be read in Mythic" in closings[0]["content"]
-    assert not _cards(after.chat) and cleared["pending"] is None and after.effects == []
 
 
 async def _raise_card_without_restart():

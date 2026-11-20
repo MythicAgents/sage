@@ -4,13 +4,14 @@ The LangGraph checkpoint owns the conversation; ``session.py`` owns the per-chan
 names its generation and binding. This module holds the read-only Mythic lookups and the pure
 shaping used by ``SageChat`` when a channel's Model is missing from this process:
 
-* the stored approval card row, to tell a still-pending card from one decided while Sage was down;
+* the stored approval card row and its Continue/Stop control, to tell a pending card from a decided one;
 * the stored request rows, to prove which generation a pre-record (legacy) channel used;
 * this container's requests that a restart left open, for the on-start reconciliation;
 * exact task records for a receipt left by an interrupted approved action.
 
-Nothing here grants authority. A decision Mythic stored while Sage was down is never applied: the
-same exact action is asked again on a new card, and only the answer to that card can run it.
+Nothing here grants authority. Startup never applies a decision Mythic stored on a card: it offers a
+Continue/Stop control in the same request, and only the original decision's own delivery or Continue
+(which re-reads and revalidates that stored decision) can claim it, once.
 """
 
 from __future__ import annotations
@@ -66,6 +67,10 @@ LEGACY_MODE_NOTICE = (
     "This chat was saved before Sage recorded `/mode` changes, so it continues in its configured "
     "`{mode}` mode. Run `/mode {previous}` again if you still want `{previous}`."
 )
+LEGACY_PENDING_NOTICE = (
+    "The action waiting for approval before the restart was saved without its request state, so "
+    "it was not restored. It was not executed and will not be resent."
+)
 RETIRED_CARD_CLOSURE = (
     "[Not executed: Sage restarted while this action was waiting for approval, and the pending "
     "approval could not be restored. Sage did not run it and will not resend it.]"
@@ -78,11 +83,6 @@ UNKNOWN_OUTCOME_CLOSURE = (
     "[Outcome unknown: Sage restarted after this action was approved and before its result was "
     "saved. Sage will not resend it. {detail}]"
 )
-REASK_NOTICE = (
-    "Sage restarted while this action was waiting for approval. Your decision on the earlier card "
-    "reached Mythic while Sage was down and was not applied, so nothing ran. Decide on the new card "
-    "below; only an answer to it can run the action."
-)
 CLAIM_CLOSED_NOTICE = (
     "Sage restarted while an approved action from this request was running, so this request could "
     "not finish. Sage will not resend the action. Send your next message to see what Mythic recorded "
@@ -91,6 +91,28 @@ CLAIM_CLOSED_NOTICE = (
 TURN_CLOSED_NOTICE = (
     "Sage restarted while this request was being handled, so it could not finish. Nothing from it "
     "will be resent. Send your message again if it is still needed."
+)
+
+
+CONTINUATION_STOPPED_NOTICE = (
+    "Stopped: the decision Mythic saved while Sage was restarting was discarded. The action was not "
+    "run and will not be resent. Send your request again if it is still needed."
+)
+SAVED_DECISION_UNAVAILABLE_NOTICE = (
+    "Sage could not read the decision Mythic saved while it was restarting, or it changed, so it was "
+    "not applied. The action was not run and will not be resent. Send your request again if it is "
+    "still needed."
+)
+CONTROL_UNCONFIRMED_NOTICE = (
+    "Sage could not confirm whether the Continue/Stop card below was answered, so it did not apply "
+    "the saved decision. Nothing ran. Answer that card to continue or stop."
+)
+STALE_RESPONSE_NOTICE = (
+    "That answer arrived after this request's decision was already handled. No action was executed."
+)
+STOPPED_CLOSURE = (
+    "[Not executed: the operator chose Stop for the decision saved while Sage was restarting. Sage "
+    "did not run it and will not resend it.]"
 )
 
 
@@ -121,8 +143,13 @@ _OPEN_REQUESTS_QUERY = (
 _MYTHIC_TIMEOUT_SECONDS = 5.0
 
 
-def pending_record(context: Mapping[str, Any], contract: Any) -> dict[str, Any]:
-    """Durable form of a raised card: its context without actions, and the exact contract."""
+def pending_record(
+    context: Mapping[str, Any],
+    contract: Any,
+    lifecycle: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Durable form of a raised card: its context without actions, the exact contract, and the
+    paused request's lifecycle (``Model.pending_lifecycle_snapshot``)."""
     stored = {
         key: copy.deepcopy(value)
         for key, value in dict(context).items()
@@ -131,6 +158,7 @@ def pending_record(context: Mapping[str, Any], contract: Any) -> dict[str, Any]:
     return {
         "context": stored,
         "contract": contract.to_payload() if contract is not None else None,
+        "lifecycle": copy.deepcopy(dict(lifecycle)) if lifecycle is not None else None,
     }
 
 
@@ -181,11 +209,36 @@ async def read_card_row(
     approval_id: str,
 ) -> dict[str, Any] | None:
     """Return the one stored card carrying this approval id in this channel, else ``None``."""
-    if client is None or not approval_id:
+    return await _read_input_card(
+        client, operation_id, channel_id, "sage_approval_context", "approval_id", approval_id
+    )
+
+
+async def read_control_row(
+    client: Any,
+    operation_id: int,
+    channel_id: int,
+    control_id: str,
+) -> dict[str, Any] | None:
+    """Return the one stored saved-decision control with this id in this channel, else ``None``."""
+    return await _read_input_card(
+        client, operation_id, channel_id, "sage_continuation", "control_id", control_id
+    )
+
+
+async def _read_input_card(
+    client: Any,
+    operation_id: int,
+    channel_id: int,
+    data_key: str,
+    id_key: str,
+    value: str,
+) -> dict[str, Any] | None:
+    if client is None or not value:
         return None
     contains = {
         "special_type": "input_requested",
-        "input_requested": {"data": {"sage_approval_context": {"approval_id": approval_id}}},
+        "input_requested": {"data": {data_key: {id_key: value}}},
     }
     result = await asyncio.wait_for(
         mythic.execute_custom_query(
@@ -254,6 +307,41 @@ def card_row_state(row: Mapping[str, Any] | None) -> str:
     ):
         return "pending"
     return "unreadable"
+
+
+def saved_decision_digest(envelope: ChatInputResponse) -> str:
+    """Identity of one stored operator decision: what was decided, by whom, on which card, when."""
+    import hashlib
+    import json
+
+    payload = {
+        "action": envelope.Action,
+        "response": envelope.Response,
+        "choice": envelope.Choice,
+        "input_request_message_id": envelope.InputRequestMessageID,
+        "resolved_by_operator_id": envelope.ResolvedByOperatorID,
+        "resolved_at": envelope.ResolvedAt,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def control_row_choice(row: Mapping[str, Any] | None) -> str:
+    """``pending``, ``continue``, ``stop`` (any other stored answer, cancel included) or ``unreadable``.
+
+    Used only to decide what startup or the original response may do; revoking needs no proof, and
+    a stored Continue that was never delivered only earns a new control, never an effect.
+    """
+    state = card_row_state(row)
+    if state != "decided":
+        return state
+    envelope = input_response_from_card_row(row)
+    choice = envelope.Choice if envelope is not None else None
+    if envelope is not None and envelope.Action == "select" and isinstance(choice, dict) \
+            and choice.get("id") == "continue":
+        return "continue"
+    return "stop"
 
 
 async def open_container_requests(

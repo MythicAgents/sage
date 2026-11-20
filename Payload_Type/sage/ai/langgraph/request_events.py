@@ -119,6 +119,23 @@ def control_transition_errors(
     return tuple(errors)
 
 
+LEDGER_EXPORT_VERSION = 1
+# Typed control data stays verbatim in an exported ledger (its grammar is validated on every
+# reconcile). Every other event body is model, operator or target text: an export keeps only its
+# SHA-256 digest, so a durable lifecycle snapshot never becomes a second transcript copy.
+_EXPORT_VERBATIM_KINDS = frozenset({"control_transition", "authority"})
+_RECORD_ID_HEX = frozenset("0123456789abcdef")
+
+
+def exported_content_digest(content: str) -> str:
+    return "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _is_exported_digest(content: str) -> bool:
+    tail = content[len("sha256:"):] if content.startswith("sha256:") else ""
+    return len(tail) == 64 and set(tail) <= _RECORD_ID_HEX
+
+
 def stable_event_id(request_id: str, kind: str, external_identity: str) -> str:
     values = (request_id, kind, external_identity)
     if any(not isinstance(value, str) or not value for value in values):
@@ -163,6 +180,94 @@ class RequestEventLedger:
     @property
     def events(self) -> tuple[RequestEvent, ...]:
         return tuple(self._events)
+
+    def export_state(self) -> dict[str, Any]:
+        """Durable form of this request's evidence: identities, phases, order and projections.
+
+        Record ids are kept as recorded, so the restored chain is the same chain. Bodies other
+        than typed control data are replaced by their digest (see ``_EXPORT_VERBATIM_KINDS``).
+        """
+        return {
+            "version": LEDGER_EXPORT_VERSION,
+            "request_id": self.request_id,
+            "events": [
+                {
+                    "record_id": event.record_id,
+                    "event_id": event.event_id,
+                    "kind": event.kind,
+                    "phase": event.phase,
+                    "content": (
+                        event.content
+                        if event.kind in _EXPORT_VERBATIM_KINDS
+                        else exported_content_digest(event.content)
+                    ),
+                    "projected": event.projected,
+                    "projection_key": event.projection_key,
+                    "metadata": dict(event.metadata),
+                }
+                for event in self._events
+            ],
+        }
+
+    @classmethod
+    def from_export(cls, data: Any) -> "RequestEventLedger":
+        """Rebuild exactly the exported events, in order; any malformed row raises ``ValueError``.
+
+        Nothing is added or inferred here: a start, terminal or projection exists after restore
+        only if the process that recorded it exported it.
+        """
+        if not isinstance(data, dict) or data.get("version") != LEDGER_EXPORT_VERSION:
+            raise ValueError("request ledger export has an unsupported version")
+        rows = data.get("events")
+        if not isinstance(rows, list):
+            raise ValueError("request ledger export has no event list")
+        ledger = cls(data.get("request_id"))
+        fields = {
+            "record_id", "event_id", "kind", "phase", "content",
+            "projected", "projection_key", "metadata",
+        }
+        seen_records: set[str] = set()
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict) or set(row) != fields:
+                raise ValueError(f"request ledger export row {index} has an invalid schema")
+            record_id = row["record_id"]
+            if (
+                not isinstance(record_id, str)
+                or len(record_id) != 64
+                or not set(record_id) <= _RECORD_ID_HEX
+                or record_id in seen_records
+            ):
+                raise ValueError(f"request ledger export row {index} has an invalid record id")
+            seen_records.add(record_id)
+            if any(
+                not isinstance(row[key], str) or not row[key]
+                for key in ("event_id", "kind", "phase")
+            ):
+                raise ValueError(f"request ledger export row {index} has an invalid identity")
+            content = row["content"]
+            if not isinstance(content, str) or (
+                row["kind"] not in _EXPORT_VERBATIM_KINDS and not _is_exported_digest(content)
+            ):
+                raise ValueError(f"request ledger export row {index} carries an undigested body")
+            if type(row["projected"]) is not bool or not isinstance(row["projection_key"], str):
+                raise ValueError(f"request ledger export row {index} has an invalid projection")
+            metadata = row["metadata"]
+            if not isinstance(metadata, dict) or any(
+                not isinstance(key, str) or not isinstance(value, str)
+                for key, value in metadata.items()
+            ):
+                raise ValueError(f"request ledger export row {index} has invalid metadata")
+            ledger._events.append(RequestEvent(
+                record_id=record_id,
+                event_id=row["event_id"],
+                kind=row["kind"],
+                phase=row["phase"],
+                content=content,
+                projected=row["projected"],
+                projection_key=row["projection_key"],
+                metadata=tuple(sorted(metadata.items())),
+            ))
+        return ledger
 
     def actual_events(
         self,
