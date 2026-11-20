@@ -1352,6 +1352,210 @@
     }
    ],
    "request_id": "chat:14:request:22"
+  },
+  {
+   "card_row": {
+    "channel_id": 17,
+    "chat_request_id": 31,
+    "id": 499,
+    "metadata": {
+     "chat_request_id": 31,
+     "chat_response_key": "input_requested:87b99c09-4f94-4c56-bd94-00843a405047",
+     "container_metadata": null,
+     "delegation_id": "mythic_operator:chat:17:request:31:1",
+     "delegation_name": "Mythic_Operator",
+     "error": "",
+     "eventing_user_interaction": null,
+     "input_requested": {
+      "choices": [],
+      "data": {
+       "action_digest": "7b45e781e23097afe797e413f5cf1870239ffaee43f713f72d8134b0de343b71",
+       "actions": [
+        {
+         "arguments": {
+          "callback_display_id": 2,
+          "command": "pwd",
+          "parameters": "",
+          "timeout": 300,
+          "token_id": null,
+          "visibility_context": {
+           "_sage_prepared_action": true,
+           "_sage_prepared_binding": {
+            "file": null,
+            "group": null,
+            "schema_digest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+           }
+          }
+         },
+         "display_name": "issue_task_and_waitfor_task_output",
+         "tool_name": "issue_task_and_waitfor_task_output"
+        }
+       ],
+       "arguments": {
+        "callback_display_id": 2,
+        "command": "pwd",
+        "parameters": "",
+        "timeout": 300,
+        "token_id": null,
+        "visibility_context": {
+         "_sage_prepared_action": true,
+         "_sage_prepared_binding": {
+          "file": null,
+          "group": null,
+          "schema_digest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+         }
+        }
+       },
+       "display_name": "issue_task_and_waitfor_task_output",
+       "guarded_action_count": 1,
+       "sage_approval_context": {
+        "action_digest": "7b45e781e23097afe797e413f5cf1870239ffaee43f713f72d8134b0de343b71",
+        "actions": [
+         {
+          "args": {
+           "callback_display_id": 2,
+           "command": "pwd",
+           "parameters": "",
+           "timeout": 300,
+           "token_id": null,
+           "visibility_context": {
+            "_sage_prepared_action": true,
+            "_sage_prepared_binding": {
+             "file": null,
+             "group": null,
+             "schema_digest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+            }
+           }
+          },
+          "name": "issue_task_and_waitfor_task_output"
+         }
+        ],
+        "apitoken_id": "3",
+        "approval_id": "7f4df2d31a8a479a897745608e93b01c",
+        "decision_context": "",
+        "operation_id": "1",
+        "proposal_digest": "0d31194d904850bc6c49d66a7de8a892e6e31a0e403fb3eecfaabda2ed025ea8",
+        "request_contract_digest": "9b445a9c93290d559e058bd3489bad8554f9c65d729e7166526151372a471294",
+        "request_id": "chat:17:request:31",
+        "selection_mode": "single",
+        "thread_id": "17:generation:0bd2b486f738409bb02abe0ba400b3a9",
+        "tool_name": "issue_task_and_waitfor_task_output",
+        "turn_id": "chat:17:request:31"
+       },
+       "tool_name": "issue_task_and_waitfor_task_output"
+      },
+      "description": "Action 1: issue_task_and_waitfor_task_output (tool: issue_task_and_waitfor_task_output)\n  \u2022 callback_display_id: 2\n  \u2022 command: pwd\n  \u2022 parameters: \n  \u2022 timeout: 300\n  \u2022 token_id: None",
+      "input_type": "approval",
+      "prompt": "Sage wants to run the guarded action issue_task_and_waitfor_task_output. Accept approves; Reject denies without any reply; Respond denies the action and sends your typed text to Sage as steering guidance.",
+      "resolved_at": "2026-11-20T14:09:05Z",
+      "resolved_by": "mythic_admin",
+      "resolved_by_operator_id": 1,
+      "response": {
+       "action": "accept",
+       "input_request_message_id": 499,
+       "resolved_at": "2026-11-20T14:09:05Z",
+       "resolved_by": "mythic_admin",
+       "resolved_by_operator_id": 1
+      },
+      "status": "accepted",
+      "title": "Approve: issue_task_and_waitfor_task_output"
+     },
+     "refresh": null,
+     "refreshed_at": "",
+     "source": "",
+     "source_id": "",
+     "special_message_version": 0,
+     "special_type": "input_requested",
+     "updated_at": "2026-11-20T14:09:05Z",
+     "updated_by": "mythic_admin",
+     "updated_by_operator_id": 1
+    },
+    "operation_id": 1
+   },
+   "dispatch_action": "accept",
+   "expected": {
+    "effects": 1,
+    "near_match_without_override": "refused",
+    "reason": "Live request 31 (2026-11-20): a card raised after `/mode supervised` in a conversation-configured chat was accepted while Sage restarted; the restored graph was compiled for the configured mode, so the claimed accept ran nothing and the request ended complete. Revision 2 rebuilds the graph for the restored mode and request before resuming: the recorded decision runs its action once. Near-match without the saved /mode override refuses and claims nothing.",
+    "terminal": "complete"
+   },
+   "id": "mode-feature-chat-request-31",
+   "kind": "restored_graph",
+   "record_mode": {
+    "base_autonomous_solve": false,
+    "configured_mode": "conversation",
+    "mode_override": "supervised",
+    "mode_override_base_autonomous_solve": false,
+    "override_base_signature_matches_config": true
+   },
+   "root_checkpoint": {
+    "interrupt_task_is_worker_namespace": true,
+    "interrupt_value": {
+     "action_requests": [
+      {
+       "args": {
+        "callback_display_id": 2,
+        "command": "pwd",
+        "parameters": "",
+        "timeout": 300,
+        "token_id": null,
+        "visibility_context": {
+         "_sage_prepared_action": true,
+         "_sage_prepared_binding": {
+          "file": null,
+          "group": null,
+          "schema_digest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+         }
+        }
+       },
+       "description": "Sage supervised mode \u2014 approve or deny this guarded tool call\n\nTool: issue_task_and_waitfor_task_output\nArgs: {'command': 'pwd', 'parameters': '', 'callback_display_id': 2, 'timeout': 300, 'token_id': None, 'visibility_context': {'_sage_prepared_action': True, '_sage_prepared_binding': {'schema_digest': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945', 'group': None, 'file': None}}}",
+       "name": "issue_task_and_waitfor_task_output"
+      }
+     ],
+     "review_configs": [
+      {
+       "action_name": "issue_task_and_waitfor_task_output",
+       "allowed_decisions": [
+        "approve",
+        "reject"
+       ]
+      }
+     ]
+    },
+    "pending_branches": [
+     "branch:to:Mythic_Operator"
+    ]
+   },
+   "source": ".sage_history/2026/11/diagnostics/chat-restoration/20261120T1825Z-request31-recorded-inputs.json (container sage.db read in place, read-only, WAL-aware; card 499 and request 31 through Mythic GraphQL, queries only, verified HTTPS)",
+   "substitutions": "The checkpoint is regenerated through the real graph by a scripted model (wiring only) and its structure is compared with this recording; callback 5 stands in for the recorded callback 2. The decision is delivered on the regenerated card with the recorded action. Saved request state is code-produced and synthetic. Checkpoint and interrupt identifiers are omitted; card 499's row is kept as Mythic stored it.",
+   "worker_checkpoint": {
+    "last_message_type": "AIMessage",
+    "namespace": "Mythic_Operator",
+    "pending_branches": [
+     "branch:to:HumanInTheLoopMiddleware.after_model"
+    ],
+    "same_interrupt_as_root": true,
+    "tool_calls": [
+     {
+      "args": {
+       "callback_display_id": 2,
+       "command": "pwd",
+       "parameters": "",
+       "timeout": 300,
+       "token_id": null,
+       "visibility_context": {
+        "_sage_prepared_action": true,
+        "_sage_prepared_binding": {
+         "file": null,
+         "group": null,
+         "schema_digest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        }
+       }
+      },
+      "name": "issue_task_and_waitfor_task_output"
+     }
+    ]
+   }
   }
  ]
 }

@@ -7124,6 +7124,62 @@ class Model:
         emitter_rows = lifecycle.get("emitter")
         return emitter_rows if isinstance(emitter_rows, dict) else None
 
+    async def restored_paused_tool_calls(
+        self, thread_id: str, action_digest: str
+    ) -> tuple[bool, dict[str, str]]:
+        """Whether this compiled graph will resume the paused step, and its guarded calls.
+
+        Returns ``(present, calls)``. ``calls`` maps each guarded call on the paused sub-agent
+        message to its ``tool_call_id`` (``{action fingerprint: tool_call_id}``), read from the
+        checkpoint whether or not the step is present. The root checkpoint shows a sub-agent's
+        approval interrupt whether or not the graph built in this process still has the paused
+        step; ``aget_state(subgraphs=True)`` prepares each sub-agent's tasks against its compiled
+        graph, so the interrupt appears there only when the step exists for the chat's current mode
+        and tool access. ``present`` requires every interrupted root task to reach such a state,
+        its interrupts to reproduce the saved action digest, and each action to be a call on the
+        paused message. When it is false, nothing may be claimed.
+        """
+        from langgraph.types import StateSnapshot
+        from sage_chat.hitl import approval_action_digest, approval_action_fingerprint
+
+        root = await self.graph.aget_state(self._graph_run_config(thread_id), subgraphs=True)
+        interrupted = [task for task in root.tasks or () if task.interrupts]
+        present = bool(interrupted)
+        requests: list = []
+        calls: dict[str, str] = {}
+        for task in interrupted:
+            worker = task.state
+            if not isinstance(worker, StateSnapshot):
+                present = False
+                continue
+            messages = (worker.values or {}).get("messages") or ()
+            paused = next((m for m in reversed(messages) if isinstance(m, AIMessage)), None)
+            ids: dict[str, str] = {}
+            for call in getattr(paused, "tool_calls", None) or ():
+                try:
+                    fingerprint = approval_action_fingerprint(
+                        {"name": call.get("name"), "args": call.get("args")}
+                    )
+                except (TypeError, ValueError):
+                    continue
+                if call.get("id"):
+                    ids[fingerprint] = str(call["id"])
+            calls.update(ids)
+            worker_requests = _collect_hitl_action_requests(worker)
+            try:
+                if not worker_requests or any(
+                    approval_action_fingerprint(action) not in ids for action in worker_requests
+                ):
+                    present = False
+            except (TypeError, ValueError):
+                present = False
+            requests.extend(worker_requests)
+        try:
+            present = present and approval_action_digest(requests) == action_digest
+        except (TypeError, ValueError):
+            present = False
+        return present, calls
+
     async def _persist_pending_objective_refinement_checkpoint(self, thread_id: str) -> bool:
         """Write the current marker, including clears, before any early clarification return."""
         if not getattr(self, "_thread_id_override", None):

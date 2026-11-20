@@ -18,6 +18,7 @@ import asyncio
 import copy
 import json
 import sqlite3
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -86,8 +87,12 @@ class _Process:
     """One Sage process: a fresh SageChat whose Models use the scripted chat model."""
 
     def __init__(self, script, *, card_rows=None, request_rows=None, effects=None, die_after_effect=False,
-                 task_records=None, open_requests=None, onstart_error=None, watcher_error=None):
+                 task_records=None, open_requests=None, onstart_error=None, watcher_error=None,
+                 withhold_task_tool=False):
         _PROCESSES.append(self)
+        # Synthetic: this process's worker is built without the task tool, so a resumed approved
+        # call has no tool to run (the restored worker's tool access narrowed after the card).
+        self.withhold_task_tool = withhold_task_tool
         self.open_requests = open_requests if open_requests is not None else []
         self.onstart_error = onstart_error
         self.watcher_error = watcher_error
@@ -176,7 +181,8 @@ class _Process:
         preparer._fetch_command_schema = known_schema
         sink._prepare_supervised_issue_action = preparer._prepare_supervised_issue_action
         sink.get_tools.side_effect = lambda names: (
-            [issue_task_and_waitfor_task_output] if "issue_task_and_waitfor_task_output" in names else [])
+            [issue_task_and_waitfor_task_output]
+            if "issue_task_and_waitfor_task_output" in names and not process.withhold_task_tool else [])
         sink._recon_snapshot_cache = {("list_callbacks", "all"): [{"id": 5, "host": "WORKSTATION-5"}]}
         sink.client = None
 
@@ -1016,3 +1022,328 @@ def test_the_real_sink_saves_an_approved_tasks_receipt_before_waiting_for_output
         assert seen_before_output == [1]
     else:
         assert receipts == []
+
+
+# --- The restored graph must contain the paused step, for the chat's current mode and tool access ---
+
+
+def _mode_request(request_id: int, mode: str):
+    request = _request("", request_id)
+    request.SlashCommand = type("Slash", (), {"Name": "mode", "Argument": mode})()
+    return request
+
+
+MODE_CARD_REQUEST = 3
+
+
+async def _raise_mode_card(*, restart: bool = True):
+    """Live request 31's shape: a conversation-configured chat switched by `/mode supervised` raises
+    the card in its third request."""
+    first = _Process([AIMessage(content="Noted: amber-seven.")] + _card_script())
+    await first.chat.chat(_request(LABEL_PROMPT, 1))
+    await first.chat.chat(_mode_request(2, "supervised"))
+    await first.chat.chat(_request(SUPERVISED_PROMPT, MODE_CARD_REQUEST))
+    cards = _cards(first.chat)
+    assert len(cards) == 1 and not first.effects
+    assert (await load_channel_session_record(OPERATION, CHANNEL))["mode_override"] == "supervised"
+    if restart:
+        await _restart(first)
+    return first, cards[0]
+
+
+async def _deliver_after_restart(card, *, request_id: int, config_mode: str, delivery: str, script,
+                                 decided: str = "accept", withhold_task_tool: bool = False):
+    """Deliver the decision to a new process: as the original answer, or through Continue after
+    on-start offered the decision Mythic saved while Sage was down."""
+    if delivery == "original":
+        process = _Process(script, withhold_task_tool=withhold_task_tool)
+        request = _request("", request_id, mode=config_mode)
+        request.InputResponse = _input_response(decided, card)
+    else:
+        stored = _input_response(decided, card)
+        process = _Process(script, card_rows=[_card_row(card, stored)], open_requests=[_open(request_id)],
+                           withhold_task_tool=withhold_task_tool)
+        await _onstart(process)
+        control = _controls(process.chat)[0]
+        answer = _control_response(control, "continue")
+        process.card_rows.append(_control_row(control, answer=answer))
+        request = _request("", request_id, mode=config_mode)
+        request.InputResponse = answer
+    await process.chat.chat(request)
+    return process
+
+
+def _terminal_phases(ledger, kind: str) -> dict[str, list[str]]:
+    starts = {"tool": "started", "delegation": "opened"}[kind]
+    return {
+        event.event_id: [e.phase for e in ledger.actual_events(event_id=event.event_id, kind=kind)
+                         if e.phase != starts]
+        for event in ledger.actual_events(kind=kind, phase=starts)
+    }
+
+
+@pytest.mark.parametrize("delivery", ["original", "continue"])
+def test_a_mode_supervised_card_runs_its_approved_action_once_after_restart(delivery):
+    """Live request 31 (2026-11-20): the accept was claimed and the request ended `complete` with no
+    Mythic task, because the restored graph was compiled for the configured mode."""
+    async def scenario():
+        _first, card = await _raise_mode_card()
+        return await _deliver_after_restart(card, request_id=MODE_CARD_REQUEST, config_mode="conversation",
+                                            delivery=delivery, script=_after_card_script())
+
+    process = asyncio.run(scenario())
+    assert process.effects == [{"command": "pwd", "callback_display_id": 5}]
+    closings = _closings(process.chat)
+    assert len(closings) == 1 and closings[0]["kind"] == "complete", closings
+    assert not _lifecycle_errors(process.chat)
+    ledger = process.models[-1]._request_event_ledger
+    assert ledger.reconcile()["ok"]
+    assert all(phases == ["completed"] for phases in _terminal_phases(ledger, "tool").values())
+
+
+MODE_CHANGED_NOTICE = "chat's mode or tool access no longer matches the card"
+
+
+@pytest.mark.parametrize("delivery", ["original", "continue"])
+def test_a_card_whose_mode_changed_after_it_was_raised_is_refused_after_restart(delivery):
+    """Synthetic record write: `/mode conversation` saved after the card, as `/mode` writes it. Mythic's
+    request lock keeps a real `/mode` from reaching Sage while the card's request is open; the
+    live-reachable twin is a `/mode supervised` whose save failed (`required=False`)."""
+    async def scenario():
+        _first, card = await _raise_card()
+        record = await load_channel_session_record(OPERATION, CHANNEL)
+        record.update(mode_override="conversation", mode_override_base_signature=record["config_signature"],
+                      mode_override_base_autonomous_solve=bool(record["base_autonomous_solve"]))
+        await chat_session.save_channel_session_record(record)
+        process = await _deliver_after_restart(card, request_id=1, config_mode="supervised", delivery=delivery,
+                                               script=_after_card_script())
+        after = await load_channel_session_record(OPERATION, CHANNEL)
+        return process, record, after
+
+    process, before, after = asyncio.run(scenario())
+    assert process.effects == []
+    closings = _closings(process.chat)
+    assert len(closings) == 1 and closings[0]["kind"] == "complete", closings
+    assert MODE_CHANGED_NOTICE in closings[0]["content"] and "not executed" in closings[0]["content"]
+    assert not _lifecycle_errors(process.chat)
+    # Nothing was claimed, and the paused work was retired into a new generation.
+    assert after["claim"] is None and after["pending"] is None
+    assert after["thread_id"] != before["thread_id"]
+    ledger = process.models[-1]._request_event_ledger
+    assert ledger.reconcile()["ok"]
+    for kind in ("tool", "delegation"):
+        phases = _terminal_phases(ledger, kind)
+        assert phases and all(p == ["stopped"] for p in phases.values()), (kind, phases)
+
+
+def test_a_restored_approved_call_that_never_runs_ends_the_request_as_an_error():
+    async def scenario():
+        _first, card = await _raise_card()
+        return await _deliver_after_restart(card, request_id=1, config_mode="supervised", delivery="original",
+                                            script=_after_card_script(), withhold_task_tool=True)
+
+    process = asyncio.run(scenario())
+    assert process.effects == []
+    closings = _closings(process.chat)
+    assert len(closings) == 1 and closings[0]["kind"] == "error", closings
+    text = "\n".join(_texts(process.chat)) + "\n".join(str(c.get("error") or "") for c in closings)
+    assert "`issue_task_and_waitfor_task_output` did not run after the restart" in text, text
+
+
+_REJECT_SCRIPT = [AIMessage(content="Not run."), AIMessage(content="The operator rejected pwd; nothing ran.")]
+# (how supervised mode was set, the card's request, the chat's configured mode)
+_SOURCES = {"configured": (1, "supervised"), "mode": (MODE_CARD_REQUEST, "conversation")}
+
+
+def _outcome(process, since: int = 0) -> dict:
+    ledger = process.models[-1]._request_event_ledger
+    return {
+        "effects": len(process.effects),
+        "terminal": [e["kind"] for e in process.chat.emissions[since:] if e.get("complete_request")],
+        "tool": _terminal_phases(ledger, "tool"),
+        "delegation": _terminal_phases(ledger, "delegation"),
+        "reconciled": ledger.reconcile()["ok"],
+    }
+
+
+@pytest.mark.parametrize("delivery", ["original", "continue"])
+@pytest.mark.parametrize("decided", ["accept", "reject"])
+@pytest.mark.parametrize("source", ["configured", "mode"])
+def test_a_restored_resume_ends_like_the_same_card_resumed_in_process(source, decided, delivery,
+                                                                      tmp_path, monkeypatch):
+    request_id, config_mode = _SOURCES[source]
+    script = _after_card_script() if decided == "accept" else _REJECT_SCRIPT
+
+    async def in_process():
+        first, card = await (_raise_card_without_restart() if source == "configured"
+                             else _raise_mode_card(restart=False))
+        first.fake.messages = iter(list(script))
+        since = len(first.chat.emissions)
+        request = _request("", request_id, mode=config_mode)
+        request.InputResponse = _input_response(decided, card)
+        await first.chat.chat(request)
+        return _outcome(first, since)
+
+    async def restored():
+        _first, card = await (_raise_card() if source == "configured" else _raise_mode_card())
+        process = await _deliver_after_restart(card, request_id=request_id, config_mode=config_mode,
+                                               delivery=delivery, script=list(script), decided=decided)
+        return _outcome(process)
+
+    expected = asyncio.run(in_process())
+    asyncio.run(_restart(_PROCESSES[-1]))
+    # The restored run starts from an empty runtime DB of its own: same channel, no shared rows.
+    monkeypatch.setenv("SAGE_DATABASE_PATH", str(tmp_path / "restored-run.db"))
+    monkeypatch.setattr(chat_session, "_CHANNEL_MARKER_DB_PATH", str(tmp_path / "restored-run.db"))
+    actual = asyncio.run(restored())
+    assert expected["effects"] == (1 if decided == "accept" else 0)
+    assert expected["terminal"] == ["complete"] and expected["reconciled"]
+    assert actual == expected
+
+
+@pytest.mark.parametrize("order", ["original_first", "offer_first"])
+@pytest.mark.parametrize("source,decided", [("mode", "accept"), ("configured", "reject")])
+def test_a_queued_decision_applies_once_in_either_delivery_order(source, decided, order):
+    """Live segments queued_accept (the `/mode` chat) and queued_reject (configured supervised): the
+    decision was saved in Mythic while Sage was down and is delivered after it boots, either before
+    on-start runs or after on-start has offered Continue/Stop for it."""
+    request_id, config_mode = _SOURCES[source]
+    script = _after_card_script() if decided == "accept" else _REJECT_SCRIPT
+
+    async def scenario():
+        _first, card = await (_raise_card() if source == "configured" else _raise_mode_card())
+        stored = _input_response(decided, card)
+        process = _Process(list(script), card_rows=[_card_row(card, stored)], open_requests=[_open(request_id)])
+        if order == "offer_first":
+            await _onstart(process)
+            process.card_rows.append(_control_row(_controls(process.chat)[0]))
+        request = _request("", request_id, mode=config_mode)
+        request.InputResponse = _input_response(decided, card)
+        await process.chat.chat(request)
+        return process
+
+    process = asyncio.run(scenario())
+    assert len(process.effects) == (1 if decided == "accept" else 0)
+    closings = _closings(process.chat)
+    assert len(closings) == 1 and closings[0]["kind"] == "complete", closings
+    assert not _lifecycle_errors(process.chat)
+    assert process.models[-1]._request_event_ledger.reconcile()["ok"]
+    offered = {c["data"]["sage_continuation"]["control_id"] for c in _controls(process.chat)}
+    assert len(offered) == (1 if order == "offer_first" else 0)
+    if order == "offer_first":
+        key = next(e["response_key"] for e in process.chat.emissions
+                   if (e.get("metadata") or {}).get("input_requested", {}).get("data", {}).get("sage_continuation"))
+        assert any(e["response_key"] == key and e["metadata"]["input_requested"]["status"] == "cancelled"
+                   for e in process.chat.emissions), "the unused Continue/Stop card must be retired"
+
+
+_BATTERY = json.loads((Path(__file__).parent / "fixtures" / "model_input_boundaries"
+                       / "approval_reask_cards.json").read_text())
+_RESTORED_GRAPH_ROWS = [row for row in _BATTERY["rows"] if row["kind"] == "restored_graph"]
+
+
+def _paused_checkpoint_structure(thread_id: str) -> dict:
+    """The paused checkpoint's structure, read from this test's runtime DB the way the recording was."""
+    from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+
+    serde = JsonPlusSerializer()
+    with sqlite3.connect(chat_session.channel_session_db_path()) as db:
+        def interrupted(namespace_like):
+            ns, cp = db.execute(
+                "SELECT w.checkpoint_ns, w.checkpoint_id FROM writes w WHERE w.thread_id=? AND w.checkpoint_ns LIKE ? "
+                "AND w.channel='__interrupt__' ORDER BY w.checkpoint_id DESC LIMIT 1", (thread_id, namespace_like)).fetchone()
+            typ, blob = db.execute("SELECT type, checkpoint FROM checkpoints WHERE thread_id=? AND checkpoint_ns=? "
+                                   "AND checkpoint_id=?", (thread_id, ns, cp)).fetchone()
+            values = serde.loads_typed((typ, blob)).get("channel_values") or {}
+            writes = [(task, serde.loads_typed((t, v))) for task, t, v in db.execute(
+                "SELECT task_id, type, value FROM writes WHERE thread_id=? AND checkpoint_ns=? AND checkpoint_id=? "
+                "AND channel='__interrupt__'", (thread_id, ns, cp))]
+            [(task_id, [item])] = writes
+            return ns, values, task_id, item
+
+        _ns, root_values, root_task, root_item = interrupted("")
+        worker_ns, worker_values, _task, worker_item = interrupted("%:%")
+    last = worker_values["messages"][-1]
+    return {
+        "root_pending_branches": sorted(k for k in root_values if k.startswith("branch:to:")),
+        "root_task_is_worker_namespace": worker_ns.split(":", 1)[1] == root_task,
+        "worker_namespace": worker_ns.split(":", 1)[0],
+        "worker_pending_branches": sorted(k for k in worker_values if k.startswith("branch:to:")),
+        "last_message_type": type(last).__name__,
+        "tool_calls": [{"name": c["name"], "args": c["args"]} for c in last.tool_calls],
+        "same_interrupt": root_item.id == worker_item.id and root_item.value == worker_item.value,
+        "interrupt_value": root_item.value,
+    }
+
+
+def _shape(value):
+    """Keys and types, not values: the recorded callback is 2, the regenerated one 5."""
+    if isinstance(value, dict):
+        return {key: _shape(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_shape(item) for item in value]
+    return type(value).__name__
+
+
+@pytest.mark.parametrize("override", ["recorded", "missing"])
+@pytest.mark.parametrize("row", _RESTORED_GRAPH_ROWS, ids=[row["id"] for row in _RESTORED_GRAPH_ROWS])
+def test_recorded_mode_card_regenerates_its_checkpoint_and_resumes_once(row, override):
+    """Battery row: live request 31's checkpoint structure, card 499 and the record's `/mode` fields.
+
+    The checkpoint is regenerated through the real graph (scripted model: wiring only) and must match
+    the recording's structure; it then replays through restore, refresh, check, resume and terminal.
+    Near-match: the same chat without its saved `/mode` override refuses and claims nothing.
+    """
+    recorded_mode = row["record_mode"]
+    card_response = row["card_row"]["metadata"]["input_requested"]["response"]
+    assert row["dispatch_action"] == card_response["action"] == "accept"
+
+    async def scenario():
+        first, card = await _raise_mode_card(restart=False)
+        record = await load_channel_session_record(OPERATION, CHANNEL)
+        structure = _paused_checkpoint_structure(record["thread_id"])
+        await _restart(first)
+        if override == "missing":
+            record.update(mode_override="", mode_override_base_signature="",
+                          mode_override_base_autonomous_solve=None)
+            await chat_session.save_channel_session_record(record)
+        process = await _deliver_after_restart(card, request_id=MODE_CARD_REQUEST,
+                                               config_mode=recorded_mode["configured_mode"],
+                                               delivery="original", script=_after_card_script(),
+                                               decided=card_response["action"])
+        after = await load_channel_session_record(OPERATION, CHANNEL)
+        return record, structure, process, after
+
+    record, structure, process, after = asyncio.run(scenario())
+    # The regenerated chat and checkpoint have the recorded structure.
+    assert recorded_mode["configured_mode"] == "conversation"
+    if override == "recorded":
+        assert record["mode_override"] == recorded_mode["mode_override"] == "supervised"
+        assert record["mode_override_base_autonomous_solve"] == recorded_mode["mode_override_base_autonomous_solve"]
+        assert record["base_autonomous_solve"] == recorded_mode["base_autonomous_solve"]
+        assert (record["mode_override_base_signature"] == record["config_signature"]) is \
+            recorded_mode["override_base_signature_matches_config"]
+    root, worker = row["root_checkpoint"], row["worker_checkpoint"]
+    assert structure["root_pending_branches"] == root["pending_branches"]
+    assert structure["root_task_is_worker_namespace"] is root["interrupt_task_is_worker_namespace"]
+    assert structure["worker_namespace"] == worker["namespace"]
+    assert structure["worker_pending_branches"] == worker["pending_branches"]
+    assert structure["last_message_type"] == worker["last_message_type"]
+    assert structure["same_interrupt"] is worker["same_interrupt_as_root"]
+    assert _shape(structure["tool_calls"]) == _shape(worker["tool_calls"])
+    assert [c["name"] for c in structure["tool_calls"]] == [c["name"] for c in worker["tool_calls"]]
+    recorded_value, value = root["interrupt_value"], structure["interrupt_value"]
+    assert value["review_configs"] == recorded_value["review_configs"]
+    assert [a["name"] for a in value["action_requests"]] == [a["name"] for a in recorded_value["action_requests"]]
+    assert _shape(value["action_requests"]) == _shape(recorded_value["action_requests"])
+    # Replay through the restored entry.
+    closings = _closings(process.chat)
+    assert len(closings) == 1 and closings[0]["kind"] == row["expected"]["terminal"], closings
+    assert process.models[-1]._request_event_ledger.reconcile()["ok"]
+    if override == "recorded":
+        assert len(process.effects) == row["expected"]["effects"]
+        assert after["claim"]["status"] == "consumed" and after["claim"]["decision"] == "approve"
+    else:
+        assert row["expected"]["near_match_without_override"] == "refused"
+        assert process.effects == [] and after["claim"] is None
+        assert MODE_CHANGED_NOTICE in closings[0]["content"]

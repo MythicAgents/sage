@@ -75,6 +75,24 @@ RETIRED_CARD_CLOSURE = (
     "[Not executed: Sage restarted while this action was waiting for approval, and the pending "
     "approval could not be restored. Sage did not run it and will not resend it.]"
 )
+MISMATCHED_CARD_CLOSURE = (
+    "[Not executed: Sage restarted while this action was waiting for approval, and this chat's mode "
+    "or tool access no longer matches the card. Sage did not run it and will not resend it.]"
+)
+MISMATCHED_CARD_NOTICE = (
+    "The action waiting for approval before the restart was not restored, because this chat's mode "
+    "or tool access no longer matches the card. It was not executed and will not be resent. Send your "
+    "request again if it is still needed."
+)
+
+
+def unrun_approved_action_error(tool_name: str) -> str:
+    return (
+        f"The approved action `{tool_name}` did not run after the restart. It was not executed and "
+        "will not be resent."
+    )
+
+
 REJECTED_CLAIM_CLOSURE = (
     "[Not executed: the operator rejected this action. Sage restarted before the rejection was "
     "saved, so it is recorded here; the action will not be resent.]"

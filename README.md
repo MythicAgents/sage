@@ -906,7 +906,9 @@ delivers your original decision, Sage applies it once and retires the Continue/S
 Continue to apply the saved decision exactly as you made it (an approval runs the action once, a rejection runs
 nothing), or Stop to discard it. Continue never changes the decision, and Cancel on the request also discards
 it. Sage first re-checks the saved decision against the card, the session's identity and configuration, and the
-paused action; if any of them changed, nothing runs and the request closes with the reason. A card saved by a
+paused action; if any of them changed, nothing runs and the request closes with the reason. The same holds when
+the chat's mode or tool access no longer matches the card (for example, a later `/mode` change), and an approved
+action that still did not run after the restart ends its request as an error instead of a completion. A card saved by a
 Sage version from before this request state was kept is closed with a notice instead. Any other request is closed
 with a notice. The resumed request keeps its original tool and sub-agent cards, step budget and in-request
 denials, and ends normally. An approved action interrupted by the restart is never resent: your next message gets

@@ -70,6 +70,8 @@ from .restoration import (
     STOPPED_CLOSURE,
     LEGACY_MODE_NOTICE,
     LEGACY_PENDING_NOTICE,
+    MISMATCHED_CARD_CLOSURE,
+    MISMATCHED_CARD_NOTICE,
     RESTORED_NOTICE,
     REJECTED_CLAIM_CLOSURE,
     RETIRED_CARD_CLOSURE,
@@ -95,6 +97,7 @@ from .restoration import (
     stored_request_prompt,
     unproven_refusal,
     unreadable_refusal,
+    unrun_approved_action_error,
 )
 from .session import (
     CHANNEL_SESSION_ACTIVE,
@@ -311,6 +314,21 @@ def _build_request_contract(
         intent=RequestIntent.CONTINUE if has_input_response else None,
         parent_request_id=parent_request_id,
     )
+
+
+def _unrun_approved_tools(model: Any, event_ids: tuple[str, ...], call_ids: set[str]) -> list[str]:
+    """Tool names of approved calls whose tool event, open at the claim, is still open."""
+    ledger = getattr(model, "_request_event_ledger", None)
+    open_now = set(model._open_tool_lifecycle_ids())
+    names: list[str] = []
+    for event_id in event_ids:
+        if event_id not in open_now:
+            continue
+        opened = ledger.actual_events(event_id=event_id, kind="tool")
+        metadata = dict(opened[0].metadata) if opened else {}
+        if metadata.get("tool_call_id") in call_ids:
+            names.append(str(metadata.get("tool_name") or "unknown_tool"))
+    return names
 
 
 def _bloodhound_unavailable_message(reason: str | None = None) -> str:
@@ -1480,6 +1498,20 @@ class SageChat(Chat):
                     f"request state is unreadable: {type(exc).__name__}). It was not executed and "
                     "will not be resent."
                 ]
+            # The graph was compiled at initialize for the configured mode and default authority;
+            # resume against one built for the restored mode and contract, and only if it still
+            # has the paused step with the same actions.
+            model._refresh_graph_for_turn()
+            present, paused_calls = await model.restored_paused_tool_calls(
+                thread_id, str(context.get("action_digest") or "")
+            )
+            if not present:
+                # The restored request lifecycle stays installed so its cards close on this
+                # request's terminal, which carries the notice (the handler skips the claim).
+                await self._retire_into_new_generation(request, model, MISMATCHED_CARD_CLOSURE)
+                model._restored_refusal_notice = MISMATCHED_CARD_NOTICE
+                return []
+            model._restored_paused_calls = paused_calls
         else:
             model.install_request_contract(contract)
         self._restore_subgoal_state(model, contract, checkpoint_subgoal)
@@ -1890,6 +1922,10 @@ class SageChat(Chat):
             tool_discovery = (slash is not None and str(getattr(slash, "Name", "") or "").lower().lstrip("/") == "tools") or (
                 slash is None and looks_like_tool_inventory_prompt(prompt)
             )
+            # Set only when this request restored the session: a resume the restored graph refused,
+            # and the paused calls (fingerprint -> tool_call_id) it will resume.
+            restored_refusal = ""
+            restored_paused_calls: dict[str, str] | None = None
             if existing_at_entry is None and not read_only_state and not read_only_report and not tool_discovery and (
                 (not first_channel_claim and not slash_only_new_channel)
                 or (first_channel_claim and _channel_has_prior_context(request))
@@ -1915,6 +1951,10 @@ class SageChat(Chat):
                 # reuse (and overwrite) one of them.
                 saved_rows = getattr(restored_model, "_restored_emitter_rows", None)
                 restored_model._restored_emitter_rows = None
+                restored_refusal = str(getattr(restored_model, "_restored_refusal_notice", "") or "")
+                restored_model._restored_refusal_notice = ""
+                restored_paused_calls = getattr(restored_model, "_restored_paused_calls", None)
+                restored_model._restored_paused_calls = None
                 if saved_rows is not None:
                     restored_model._response_emitter.import_rows(saved_rows)
                 if restoration_notices:
@@ -2008,7 +2048,7 @@ class SageChat(Chat):
                 raise RuntimeError("Unable to verify fresh Sage HITL checkpoint state.")
 
             saved_decision, saved_notice, saved_continuation = "", "", None
-            if has_input_response and not hitl_probe_failed:
+            if has_input_response and not hitl_probe_failed and not restored_refusal:
                 saved_decision, saved_notice, saved_continuation = await self._resolve_saved_decision(
                     request, model
                 )
@@ -2231,6 +2271,7 @@ class SageChat(Chat):
                     has_input_response
                     and not hitl_probe_failed
                     and saved_decision != "stop"
+                    and not restored_refusal
                     and (controller_pending or hitl_pending)
                     and approval_response_matches(
                         request,
@@ -2271,6 +2312,7 @@ class SageChat(Chat):
                     approval_claimed = True
                 stale_approval_response = bool(
                     has_input_response and not approval_claimed and saved_decision != "stop"
+                    and not restored_refusal
                 )
                 approved_action_ids = (
                     approved_action_ids_for_request(
@@ -2358,6 +2400,9 @@ class SageChat(Chat):
                         model._pending_approval_context = None
                         await self._retire_into_new_generation(request, model, STOPPED_CLOSURE)
                         native_response_text = saved_notice
+                    elif restored_refusal:
+                        # The restore already retired the paused work; end the request the same way.
+                        native_response_text = restored_refusal
                     elif stale_approval_response:
                         await stream_emitter(
                             "That approval request is no longer active. No action was executed; "
@@ -2420,6 +2465,21 @@ class SageChat(Chat):
                     )
                     if saved_decision == "superseded" and saved_continuation is not None:
                         await self._retire_control_row(request, model, saved_continuation)
+                    if (
+                        restored_paused_calls
+                        and approval_decision == "approve"
+                        and not getattr(model, "_stop_requested", False)
+                    ):
+                        unrun = _unrun_approved_tools(
+                            model,
+                            claimed_open_tool_ids,
+                            {restored_paused_calls[a] for a in approved_action_ids
+                             if a in restored_paused_calls},
+                        )
+                        if unrun:
+                            # The claim is consumed, so nothing is resent; the error path closes
+                            # the lifecycles and reports it.
+                            raise RuntimeError(unrun_approved_action_error(unrun[0]))
                     # LangGraph does not emit a normal tool-end callback for a
                     # denied/unselected guarded call. Close only the tool events
                     # that remain open after resume; approved calls that already
