@@ -39,6 +39,15 @@ argument is still accepted and ignored. See `docs/development/TEST_TIERS.md`.
   It writes `set.json` (wire requests, outputs, usage, per-check verdict) and refuses a second set in the same
   directory. It is paid provider activity: run it only with the operator's authorization. It proves the final
   call's provider integration, not Mythic or range behaviour.
+- `check_openai_responses.py readiness|run|verify --run-file F` — the OpenAI Responses and Daybreak live check in
+  one fresh conversation channel. `readiness` (read-only) needs `--route-file R`: an owner-only file with
+  `API_ENDPOINT`, `model` and `SAGE_OPENAI_SAFETY_IDENTIFIER` and no API key (the deployment's `API_KEY` user secret
+  or container environment supplies it); it checks Mythic, the deployed source identity, adapter versions, the
+  offline Responses tests and a readable `--phoenix-db`. `run` (paid provider activity; operator authorization
+  required, `--authorized-by`) sends a deliberate Chat Completions request, corrects the channel to Responses + Red
+  and retries, then a read-only `list_callbacks` prompt and a no-tools recall, stopping at 16 provider calls,
+  1,048,576 tokens, 4,096 output tokens per call, 15 minutes or any target task. `verify` applies the pass rules
+  written in the script to Mythic's rows and the live Phoenix trace (read in place). One attempt per run file.
 - `check_bloodhound_ingest_contract.py --image <id> [--json out.json]` — checks a **built** Sage image's baked
   BloodHound MCP serves the ingest contract (byte upload plus exact-job `status`). It runs one throwaway container
   with `--network none`, the entrypoint bypassed, and only the checker mounted read-only; a loopback fake BloodHound
