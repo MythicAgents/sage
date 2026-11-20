@@ -1,0 +1,310 @@
+{
+  "provenance": {
+    "kind": "recorded model output (real provider, real adapter normalization)",
+    "description": "gpt-6-cyber on the OpenAI Responses API through Sage's deployed feature branch, 2026-11-20. Each message is the LangChain-serialized AIMessage the installed langchain-openai 1.4.2 adapter produced from the provider's Responses output, as Phoenix recorded it. Rows supervisor_tool_round_trip and plain_text_answer come from live attempt 2 (channel 29, requests 62-63); handoff_then_worker_text from live attempt 1 (channel 28, request 57).",
+    "substitutions": "Lab host and user names renamed to WORKSTATION-A and lab.user; provider ids, call ids, arguments and text otherwise unchanged.",
+    "gap": "No reasoning item occurred in either attempt (0 reasoning tokens), so encrypted-reasoning replay is covered only by synthetic tests."
+  },
+  "rows": [
+    {
+      "id": "supervisor_tool_round_trip",
+      "prompt": "For a read-only status check, use list_callbacks once, then tell me the label from the previous turn and summarize the returned callback list. Do not run tasks.",
+      "call": {
+        "lc": 1,
+        "type": "constructor",
+        "id": [
+          "langchain",
+          "schema",
+          "messages",
+          "AIMessage"
+        ],
+        "kwargs": {
+          "content": [
+            {
+              "arguments": "{}",
+              "call_id": "call_9234359ea7f64974b73820094b390867",
+              "name": "list_callbacks",
+              "type": "function_call",
+              "id": "fc_0b3902a9be52320d016b00de32f90c87d2b17ac4b805ae413d",
+              "status": "completed"
+            }
+          ],
+          "response_metadata": {
+            "id": "resp_0b3902a9be52320d016b00de3210e887d2b9566e7178dfaa36",
+            "created_at": 1795218994.0,
+            "metadata": {},
+            "model": "gpt-6-cyber",
+            "object": "response",
+            "service_tier": "default",
+            "status": "completed",
+            "model_provider": "openai",
+            "model_name": "gpt-6-cyber"
+          },
+          "type": "ai",
+          "name": "Supervisor",
+          "id": "resp_0b3902a9be52320d016b00de3210e887d2b9566e7178dfaa36",
+          "tool_calls": [
+            {
+              "name": "list_callbacks",
+              "args": {},
+              "id": "call_9234359ea7f64974b73820094b390867",
+              "type": "tool_call"
+            }
+          ],
+          "usage_metadata": {
+            "input_tokens": 11527,
+            "output_tokens": 14,
+            "total_tokens": 11541,
+            "input_token_details": {
+              "cache_creation": 11524,
+              "cache_read": 0
+            },
+            "output_token_details": {
+              "reasoning": 0
+            }
+          },
+          "invalid_tool_calls": []
+        }
+      },
+      "tool_result": "[{\"agent\": \"apollo\", \"host\": \"WORKSTATION-A\", \"id\": 2, \"integrity\": 2, \"secs_since_checkin\": 0.7295, \"status\": \"alive\", \"user\": \"lab.user\"}]",
+      "answer": {
+        "lc": 1,
+        "type": "constructor",
+        "id": [
+          "langchain",
+          "schema",
+          "messages",
+          "AIMessage"
+        ],
+        "kwargs": {
+          "content": [
+            {
+              "arguments": "{\"final_response\":\"The remembered label is **amber-seven**. The callback list contains **one callback**, reported alive.\\n\\n| ID | Agent | Host | Reported user | Integrity | Status | Seconds since check-in |\\n|---:|---|---|---|---:|---|---:|\\n| 2 | apollo | WORKSTATION-A | lab.user | 2 | alive | 0.7295 |\\n\\nCalled `list_callbacks` exactly once. No new task was run in this turn.\",\"reuse_latest_worker_answer\":false,\"outcome\":\"completed\"}",
+              "call_id": "call_309205727ea6481c806af8a2f9398109",
+              "name": "respond_to_user",
+              "type": "function_call",
+              "id": "fc_0b3902a9be52320d016b00de34546087d282baab644a1ff126",
+              "status": "completed"
+            }
+          ],
+          "response_metadata": {
+            "id": "resp_0b3902a9be52320d016b00de336d3887d293db545569b6fc36",
+            "created_at": 1795218995.0,
+            "metadata": {},
+            "model": "gpt-6-cyber",
+            "object": "response",
+            "service_tier": "default",
+            "status": "completed",
+            "model_provider": "openai",
+            "model_name": "gpt-6-cyber"
+          },
+          "type": "ai",
+          "name": "Supervisor",
+          "id": "resp_0b3902a9be52320d016b00de336d3887d293db545569b6fc36",
+          "tool_calls": [
+            {
+              "name": "respond_to_user",
+              "args": {
+                "final_response": "The remembered label is **amber-seven**. The callback list contains **one callback**, reported alive.\n\n| ID | Agent | Host | Reported user | Integrity | Status | Seconds since check-in |\n|---:|---|---|---|---:|---|---:|\n| 2 | apollo | WORKSTATION-A | lab.user | 2 | alive | 0.7295 |\n\nCalled `list_callbacks` exactly once. No new task was run in this turn.",
+                "reuse_latest_worker_answer": false,
+                "outcome": "completed"
+              },
+              "id": "call_309205727ea6481c806af8a2f9398109",
+              "type": "tool_call"
+            }
+          ],
+          "usage_metadata": {
+            "input_tokens": 11608,
+            "output_tokens": 138,
+            "total_tokens": 11746,
+            "input_token_details": {
+              "cache_creation": 911,
+              "cache_read": 10694
+            },
+            "output_token_details": {
+              "reasoning": 0
+            }
+          },
+          "invalid_tool_calls": []
+        }
+      },
+      "expected": {
+        "call_id": "call_9234359ea7f64974b73820094b390867",
+        "tool": "list_callbacks",
+        "answer_tool": "respond_to_user",
+        "answer_contains": "amber-seven"
+      }
+    },
+    {
+      "id": "handoff_then_worker_text",
+      "call": {
+        "lc": 1,
+        "type": "constructor",
+        "id": [
+          "langchain",
+          "schema",
+          "messages",
+          "AIMessage"
+        ],
+        "kwargs": {
+          "content": [
+            {
+              "arguments": "{\"handoff_instruction\":\"Acknowledge the label amber-seven and explain what an API endpoint is in one sentence.\",\"handoff_title\":\"Explain an API endpoint\"}",
+              "call_id": "call_c44f731a86cd4a0f94a496106268a349",
+              "name": "transfer_to_Generalist",
+              "type": "function_call",
+              "id": "fc_07f9facb63c2d03d016b00d2c70f2c87d2bf244be1cfaecb9a",
+              "status": "completed"
+            }
+          ],
+          "response_metadata": {
+            "id": "resp_07f9facb63c2d03d016b00d2c59b6887d29fa5448c999be61b",
+            "created_at": 1795216069.0,
+            "metadata": {},
+            "model": "gpt-6-cyber",
+            "object": "response",
+            "service_tier": "default",
+            "status": "completed",
+            "model_provider": "openai",
+            "model_name": "gpt-6-cyber"
+          },
+          "type": "ai",
+          "name": "Supervisor",
+          "id": "resp_07f9facb63c2d03d016b00d2c59b6887d29fa5448c999be61b",
+          "tool_calls": [
+            {
+              "name": "transfer_to_Generalist",
+              "args": {
+                "handoff_instruction": "Acknowledge the label amber-seven and explain what an API endpoint is in one sentence.",
+                "handoff_title": "Explain an API endpoint"
+              },
+              "id": "call_c44f731a86cd4a0f94a496106268a349",
+              "type": "tool_call"
+            }
+          ],
+          "usage_metadata": {
+            "input_tokens": 11443,
+            "output_tokens": 48,
+            "total_tokens": 11491,
+            "input_token_details": {
+              "cache_creation": 11440,
+              "cache_read": 0
+            },
+            "output_token_details": {
+              "reasoning": 0
+            }
+          },
+          "invalid_tool_calls": []
+        }
+      },
+      "worker": {
+        "lc": 1,
+        "type": "constructor",
+        "id": [
+          "langchain",
+          "schema",
+          "messages",
+          "AIMessage"
+        ],
+        "kwargs": {
+          "content": [
+            {
+              "type": "text",
+              "text": "Noted the label amber-seven; an API endpoint is a specific address where a client can send requests to access a service’s data or functionality.",
+              "annotations": [],
+              "id": "msg_0b8a22ff799163c3016b00d2c8d40487d2a0066e5b78fe68ee",
+              "phase": "final_answer"
+            }
+          ],
+          "response_metadata": {
+            "id": "resp_0b8a22ff799163c3016b00d2c80cd087d291b14e1d82662826",
+            "created_at": 1795216072.0,
+            "metadata": {},
+            "model": "gpt-6-cyber",
+            "object": "response",
+            "service_tier": "default",
+            "status": "completed",
+            "model_provider": "openai",
+            "model_name": "gpt-6-cyber"
+          },
+          "type": "ai",
+          "name": "Generalist",
+          "id": "resp_0b8a22ff799163c3016b00d2c80cd087d291b14e1d82662826",
+          "usage_metadata": {
+            "input_tokens": 649,
+            "output_tokens": 33,
+            "total_tokens": 682,
+            "input_token_details": {
+              "cache_creation": 0,
+              "cache_read": 0
+            },
+            "output_token_details": {
+              "reasoning": 0
+            }
+          },
+          "tool_calls": [],
+          "invalid_tool_calls": []
+        }
+      },
+      "expected": {
+        "tool": "transfer_to_Generalist",
+        "worker_text_contains": "amber-seven"
+      }
+    },
+    {
+      "id": "plain_text_answer",
+      "answer": {
+        "lc": 1,
+        "type": "constructor",
+        "id": [
+          "langchain",
+          "schema",
+          "messages",
+          "AIMessage"
+        ],
+        "kwargs": {
+          "content": [
+            {
+              "type": "text",
+              "text": "amber-seven",
+              "annotations": [],
+              "id": "msg_0ba21aaae1ee9d1d016b00de38147c87d2969945b3ae6965a8",
+              "phase": "final_answer"
+            }
+          ],
+          "response_metadata": {
+            "id": "resp_0ba21aaae1ee9d1d016b00de371a9887d2b4332309b75287a1",
+            "created_at": 1795218999.0,
+            "metadata": {},
+            "model": "gpt-6-cyber",
+            "object": "response",
+            "service_tier": "default",
+            "status": "completed",
+            "model_provider": "openai",
+            "model_name": "gpt-6-cyber"
+          },
+          "type": "ai",
+          "name": "Supervisor",
+          "id": "resp_0ba21aaae1ee9d1d016b00de371a9887d2b4332309b75287a1",
+          "usage_metadata": {
+            "input_tokens": 11638,
+            "output_tokens": 6,
+            "total_tokens": 11644,
+            "input_token_details": {
+              "cache_creation": 11635,
+              "cache_read": 0
+            },
+            "output_token_details": {
+              "reasoning": 0
+            }
+          },
+          "tool_calls": [],
+          "invalid_tool_calls": []
+        }
+      },
+      "expected": {
+        "text": "amber-seven"
+      }
+    }
+  ]
+}
