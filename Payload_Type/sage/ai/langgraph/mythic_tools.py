@@ -2561,6 +2561,22 @@ class MythicTools:
     def clear_approval_claim(self) -> None:
         self._active_approval_claim = None
 
+    def set_approval_receipt_sink(self, sink: Any) -> None:
+        """Bind the native chat's durable receipt writer for approved task issuance."""
+        self._approval_receipt_sink = sink if callable(sink) else None
+
+    async def _record_approval_receipt(self, receipt: dict[str, Any]) -> None:
+        sink = getattr(self, "_approval_receipt_sink", None)
+        if not callable(sink):
+            return
+        try:
+            result = sink(dict(receipt))
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            # A missing receipt only makes a later restart report the outcome as unknown.
+            logger.warning(f"Approved task receipt was not saved ({type(exc).__name__})")
+
     def _begin_private_collection_transaction(
         self,
         root_args: dict[str, Any],
@@ -7283,6 +7299,15 @@ class MythicTools:
                     # Task creation is the lineage boundary. Record before waiting so a timeout,
                     # subscription failure, or failed command cannot make an accepted Mythic task look manual.
                     self._record_current_request_task(tdid)
+                    if execution_approval_id:
+                        # The exact Mythic task an approved action produced, saved before waiting on
+                        # its output, so a restart can report that task instead of guessing.
+                        await self._record_approval_receipt({
+                            "approval_id": execution_approval_id,
+                            "task_display_id": tdid,
+                            "callback_display_id": callback_display_id,
+                            "command": command,
+                        })
                     procedure_tasks = _procedure_issued_tasks_context.get()
                     if isinstance(procedure_tasks, list):
                         procedure_tasks.append(

@@ -592,6 +592,58 @@ class RequestContract:
             "parent_request_id": self.parent_request_id,
         }
 
+    @classmethod
+    def from_payload(cls, payload: Any) -> "RequestContract":
+        """Rebuild a contract from ``to_payload()`` output; any other shape fails closed.
+
+        Used when a persisted paused request is restored after a process restart. The rebuilt
+        contract must reproduce the exact payload, so its digest equals the one the operator's
+        approval card was bound to.
+        """
+        if not isinstance(payload, Mapping):
+            raise ValueError("request contract payload must be an object")
+        expected_keys = {
+            "schema_version", "request_id", "revision", "lane", "intent", "scope",
+            "stop_condition", "requested_actions", "prohibited_actions", "parent_request_id",
+        }
+        if set(payload) != expected_keys:
+            raise ValueError("request contract payload has an invalid schema")
+        scope = payload["scope"]
+        stop = payload["stop_condition"]
+        requested = payload["requested_actions"]
+        prohibited = payload["prohibited_actions"]
+        if (
+            not isinstance(scope, Mapping)
+            or not isinstance(stop, Mapping)
+            or not isinstance(requested, list)
+            or not isinstance(prohibited, list)
+            or not all(isinstance(item, Mapping) for item in (*requested, *prohibited))
+        ):
+            raise ValueError("request contract payload has an invalid schema")
+        contract = cls(
+            request_id=payload["request_id"],
+            revision=payload["revision"],
+            lane=RequestLane(payload["lane"]),
+            intent=RequestIntent(payload["intent"]),
+            scope=ScopeSpec(
+                operation_id=scope.get("operation_id"),
+                channel_id=scope.get("channel_id"),
+                callback_ids=tuple(scope.get("callback_ids") or ()),
+                targets=tuple(scope.get("targets") or ()),
+            ),
+            stop_condition=StopCondition(
+                StopConditionKind(stop.get("kind")),
+                stop.get("value", ""),
+            ),
+            requested_actions=tuple(ActionSpec(**dict(item)) for item in requested),
+            prohibited_actions=tuple(ActionSelector(**dict(item)) for item in prohibited),
+            parent_request_id=payload["parent_request_id"],
+            schema_version=payload["schema_version"],
+        )
+        if _canonical_json(contract.to_payload()) != _canonical_json(payload):
+            raise ValueError("request contract payload does not round-trip")
+        return contract
+
     def amend(
         self,
         *,

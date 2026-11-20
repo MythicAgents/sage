@@ -20,6 +20,7 @@ requests`):
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 from typing import Any, Awaitable, Callable
 from uuid import uuid4
@@ -346,7 +347,7 @@ def make_card_emitter(
     request: ChatRequest,
     delegation_lookup: Callable[[], tuple[str, str] | None] | None = None,
     approval_context_lookup: Callable[[], dict[str, Any]] | None = None,
-    approval_context_store: Callable[[dict[str, Any]], None] | None = None,
+    approval_context_store: Callable[[dict[str, Any]], Any] | None = None,
     decision_context_lookup: Callable[[list[dict[str, Any]]], str] | None = None,
 ) -> Callable[[list[dict[str, Any]]], Awaitable[None]]:
     """Return an async `(action_requests) -> None` that raises the approval request for this turn.
@@ -416,7 +417,9 @@ def make_card_emitter(
             metadata=metadata or None,
         )
         if approval_context_store is not None:
-            approval_context_store(dict(approval_context))
+            stored = approval_context_store(dict(approval_context))
+            if inspect.isawaitable(stored):
+                await stored
     return _emit
 
 

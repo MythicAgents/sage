@@ -3868,6 +3868,13 @@ def test_delayed_approval_for_old_generation_cannot_approve_new_pending_action()
     _run(old_chat.chat(build_chat_request("old guarded action", channel_id=51, request_id=1)))
     old_context = dict(old_model._pending_approval_context)
 
+    # _HitlDriverChat stands in for _get_or_create_model, which saves each new generation's channel
+    # record; without that step the replacement's card write meets the old generation's record and
+    # fails closed by design. Clear it here as the production rotation would replace it.
+    import sqlite3
+    with sqlite3.connect(chat_session.channel_session_db_path()) as db:
+        db.execute("DELETE FROM sage_chat_channel_sessions WHERE channel_id=51")
+
     new_model = _HitlModel()
     new_chat = _HitlDriverChat(new_model)
     _run(new_chat.chat(build_chat_request("new guarded action", channel_id=51, request_id=2)))

@@ -6804,6 +6804,101 @@ class Model:
         self._pending_refinement_checkpoint_valid = True
         state["_pending_objective_refinement"] = marker
 
+    _RESTORED_MESSAGE_CHANNELS = (
+        "messages",
+        "supervisor_messages",
+        "generalist_messages",
+        "mythic_operator_messages",
+        "mythic_payload_messages",
+        "mcp_manager_messages",
+        "bloodhound_messages",
+        "sandbox_messages",
+        "autonomous_executor_messages",
+    )
+    _RESTORED_SCALARS = (
+        "count",
+        "_request_id",
+        "_request_lane",
+        "_request_stop_condition",
+        "_subgoal_state",
+        "_pending_objective_refinement",
+        "recursion_summary_requested",
+        "recursion_handback",
+    )
+
+    async def restore_session_state_from_checkpoint(self, thread_id: str) -> dict[str, Any]:
+        """Rebuild this fresh Model's local state from an existing channel generation.
+
+        A Model built after a restart seeds a new ``state`` and restarts ``_message_seq`` at 1. On an
+        existing generation that collides with the checkpoint's first message identities, and
+        ``invoke`` would drop the operator's new prompt from its delta. The checkpoint stays the
+        owner of history; this copies it into the Model's working state and advances the sequence
+        past every stored message. ``mode`` is left to the current effective configuration.
+        Returns the checkpoint values; raises ``LookupError`` when the generation has none.
+        """
+        snapshot = await self.graph.aget_state(self._graph_run_config(thread_id))
+        values = getattr(snapshot, "values", None)
+        if not isinstance(values, dict) or not values:
+            raise LookupError("the channel generation has no checkpoint")
+        highest = 0
+        for channel in self._RESTORED_MESSAGE_CHANNELS:
+            restored = list(values.get(channel) or [])
+            if channel == "supervisor_messages" and not restored:
+                restored = [self.system_message]
+            self.state[channel] = restored
+            for message in restored:
+                highest = max(highest, int(_get_seq(message) or 0))
+        for key in self._RESTORED_SCALARS:
+            if key in values:
+                self.state[key] = copy.deepcopy(values[key])
+        self.messages = self.state["messages"]
+        stored_seq = values.get("_message_seq")
+        stored_seq = int(stored_seq) if isinstance(stored_seq, int) and not isinstance(stored_seq, bool) else 0
+        self._message_seq = max(stored_seq, highest + 1, 1)
+        self.state["_message_seq"] = self._message_seq
+        self.state["mode"] = self.mode
+        return values
+
+    def retire_restored_generation(self, new_thread_id: str, closure_text: str) -> int:
+        """Move restored history to a new generation, closing each open tool call in code.
+
+        Used when a restored generation is paused on work Sage must not resume (an unconsumed
+        approval claim, an unrestorable card). The old checkpoint is left as it was. Each assistant
+        tool call without a result gets one code-written result naming why it was not run, so the
+        next request starts from valid history without a model call. Returns the closures added.
+        """
+        closed = 0
+        for channel in self._RESTORED_MESSAGE_CHANNELS:
+            messages = list(self.state.get(channel) or [])
+            answered = {
+                str(getattr(message, "tool_call_id", "") or "")
+                for message in messages
+                if isinstance(message, ToolMessage)
+            }
+            rebuilt: list[Any] = []
+            for message in messages:
+                rebuilt.append(message)
+                if not isinstance(message, AIMessage):
+                    continue
+                for tool_call in getattr(message, "tool_calls", None) or ():
+                    call_id = str(tool_call.get("id") or "")
+                    if not call_id or call_id in answered:
+                        continue
+                    answered.add(call_id)
+                    closure = ToolMessage(
+                        content=closure_text,
+                        tool_call_id=call_id,
+                        name=str(tool_call.get("name") or "unknown"),
+                        additional_kwargs={"_restoration_retired": True},
+                    )
+                    _tag_msg(closure, self._next_seq())
+                    rebuilt.append(closure)
+                    closed += 1
+            self.state[channel] = rebuilt
+        self.messages = self.state["messages"]
+        self._thread_id_override = new_thread_id
+        return closed
+
     async def _persist_pending_objective_refinement_checkpoint(self, thread_id: str) -> bool:
         """Write the current marker, including clears, before any early clarification return."""
         if not getattr(self, "_thread_id_override", None):

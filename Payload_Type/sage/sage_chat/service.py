@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+import copy
 import hashlib
 import json
 import os
@@ -26,6 +27,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import aiosqlite
 from mythic_container.ChatBase import (
     Chat,
     ChatRequest,
@@ -53,13 +55,40 @@ from .operation_memory_runtime import (
     render_findings_markdown,
 )
 from .operation_memory import WatcherOwnerConflict
+from .restoration import (
+    LEGACY_MODE_NOTICE,
+    OFFLINE_DECISION_NOTICE,
+    RESTORED_NOTICE,
+    REJECTED_CLAIM_CLOSURE,
+    RETIRED_CARD_CLOSURE,
+    RETIRED_REFUSAL,
+    UNKNOWN_OUTCOME_CLOSURE,
+    changed_refusal,
+    channel_generations,
+    describe_receipts,
+    input_response_from_card_row,
+    operator_prompt_for_request,
+    pending_record,
+    read_card_row,
+    request_number,
+    restored_pending_context,
+    stored_request_prompt,
+    unproven_refusal,
+    unreadable_refusal,
+)
 from .session import (
+    CHANNEL_SESSION_ACTIVE,
+    ChannelSessionRecordInvalid,
     bind_channel_thread_id,
+    channel_session_db_path,
     channel_session_key,
     claim_channel_marker,
     drop_channel_session,
     get_channel_session,
+    load_channel_session_record,
+    next_channel_thread_id,
     put_channel_session,
+    save_channel_session_record,
 )
 from .slash import handle_slash, looks_like_tool_inventory_prompt, render_tool_inventory
 from .streaming import ChatStreamEmitter
@@ -696,6 +725,12 @@ class SageChat(Chat):
                 await self._ensure_bloodhound_connected(request=request)
             return existing, True
 
+        model = await self._build_model(request, kwargs, config_signature)
+        await put_channel_session(request, model)
+        await self._save_session_record(request, model)
+        return model, False
+
+    async def _construct_model(self, kwargs: dict[str, Any]) -> Any:
         # Lazy import: keep the heavy LangGraph/LangChain import off the module load path so the pure
         # config/streaming/models modules (and their tests) don't pull it in.
         try:
@@ -703,7 +738,25 @@ class SageChat(Chat):
         except ImportError:  # pragma: no cover
             from ..ai.langgraph.model import Model  # type: ignore
 
-        model = Model(**kwargs)
+        return Model(**kwargs)
+
+    async def _initialize_model(self, model: Any) -> None:
+        await model.initialize()
+        # The chat container always runs at full detail — the collapsible tool cards ARE the "verbose"
+        # view, so there is no operator verbose toggle (removed). set_verbose(True) also enables the local
+        # tmux stream log; user-facing tool detail always renders as cards regardless of this flag.
+        model.set_verbose(True)
+
+    async def _build_model(
+        self,
+        request: ChatRequest,
+        kwargs: dict[str, Any],
+        config_signature: str,
+        *,
+        thread_id: str = "",
+    ) -> Any:
+        """Construct and initialize one channel Model; a restore passes its stored generation."""
+        model = await self._construct_model(kwargs)
         model._chat_request_config_signature = config_signature
         model._chat_request_base_autonomous_solve = bool(kwargs.get("autonomous_solve"))
         model._chat_mode_override = ""
@@ -713,6 +766,9 @@ class SageChat(Chat):
         # runtime checks see the same command identity as the legacy `chat` task path.
         model.command_name = "chat"
         model._native_chat_explicit_hitl = True
+        # A restored channel keeps its existing checkpoint generation, bound before initialize().
+        if thread_id:
+            model._thread_id_override = thread_id
         bind_channel_thread_id(request, model)
         # Auto-connect the BloodHound MCP BEFORE the graph is built — Model.initialize() wires the
         # BloodHound agent's tools from the currently-connected MCP servers, so a later connect
@@ -721,13 +777,404 @@ class SageChat(Chat):
             autonomous_required=bool(kwargs.get("autonomous_solve")), request=request
         )
         model._bloodhound_exact_admission_at_initialize = bool(admitted_at_initialize)
-        await model.initialize()
-        # The chat container always runs at full detail — the collapsible tool cards ARE the "verbose"
-        # view, so there is no operator verbose toggle (removed). set_verbose(True) also enables the local
-        # tmux stream log; user-facing tool detail always renders as cards regardless of this flag.
-        model.set_verbose(True)
+        await self._initialize_model(model)
+        return model
+
+    # ------------------------------------------------------------------------------------------
+    # Channel restoration after a process restart
+    # ------------------------------------------------------------------------------------------
+
+    @staticmethod
+    def _session_record_for(request: ChatRequest, model: Any) -> dict[str, Any]:
+        override_base = getattr(model, "_chat_mode_override_base_autonomous_solve", None)
+        return {
+            "operation_id": int(request.OperationID),
+            "channel_id": int(request.ChannelID),
+            "status": CHANNEL_SESSION_ACTIVE,
+            "retired_reason": "",
+            "thread_id": str(getattr(model, "_thread_id_override", "") or ""),
+            "apitoken_id": int(request.APITokenID),
+            "config_signature": str(getattr(model, "_chat_request_config_signature", "") or ""),
+            "base_autonomous_solve": bool(
+                getattr(model, "_chat_request_base_autonomous_solve", False)
+            ),
+            "mode_override": str(getattr(model, "_chat_mode_override", "") or ""),
+            "mode_override_base_signature": str(
+                getattr(model, "_chat_mode_override_base_signature", "") or ""
+            ),
+            "mode_override_base_autonomous_solve": (
+                None if override_base is None else bool(override_base)
+            ),
+            "engagement_uuid": getattr(model, "_report_engagement_uuid", None),
+            "pending": None,
+            "claim": None,
+        }
+
+    async def _save_session_record(self, request: ChatRequest, model: Any) -> None:
+        if not getattr(model, "_thread_id_override", None):
+            return
+        await save_channel_session_record(self._session_record_for(request, model))
+
+    async def _update_session_record(
+        self,
+        request: ChatRequest,
+        model: Any,
+        *,
+        required: bool,
+        **fields: Any,
+    ) -> None:
+        """Merge fields into this generation's record; ``required`` writes fail the turn."""
+        thread_id = str(getattr(model, "_thread_id_override", "") or "")
+        if not thread_id:
+            return
+        try:
+            record = await load_channel_session_record(
+                int(request.OperationID), int(request.ChannelID)
+            )
+            if record is None:
+                record = self._session_record_for(request, model)
+            elif record.get("thread_id") != thread_id:
+                if await get_channel_session(request) is model:
+                    # This process's registered Model is the channel's live session; a record
+                    # naming another generation is stale and is replaced by this one.
+                    record = self._session_record_for(request, model)
+                elif required:
+                    raise RuntimeError(
+                        "This channel's saved session no longer matches its active session."
+                    )
+                return
+            record.update(fields)
+            await save_channel_session_record(record)
+        except Exception:
+            if required:
+                raise
+            logger.warning("Channel session record update failed", exc_info=True)
+
+    async def _mark_claim_consumed(
+        self, request: ChatRequest, model: Any, approval_id: str
+    ) -> None:
+        """Record that a claimed decision's resume completed; a newer card's state is untouched."""
+        try:
+            record = await load_channel_session_record(
+                int(request.OperationID), int(request.ChannelID)
+            )
+            claim = (record or {}).get("claim")
+            if (
+                isinstance(claim, dict)
+                and claim.get("approval_id") == approval_id
+                and record.get("thread_id") == getattr(model, "_thread_id_override", None)
+            ):
+                record["claim"] = {**claim, "status": "consumed"}
+                await save_channel_session_record(record)
+        except Exception:
+            # Left "claimed", a restart checks the checkpoint: a finished resume counts as consumed.
+            logger.warning("Approval claim completion was not saved", exc_info=True)
+
+    async def _persist_session_settings(self, request: ChatRequest, model: Any) -> None:
+        """Save the runtime `/mode` override and engagement binding this restore must reapply."""
+        record = self._session_record_for(request, model)
+        await self._update_session_record(
+            request,
+            model,
+            required=False,
+            **{
+                key: record[key]
+                for key in (
+                    "mode_override",
+                    "mode_override_base_signature",
+                    "mode_override_base_autonomous_solve",
+                    "base_autonomous_solve",
+                    "engagement_uuid",
+                )
+            },
+        )
+
+    async def _mythic_read_client(self, request: ChatRequest, model: Any | None = None) -> Any:
+        """The channel token's Mythic client, for read-only restoration lookups."""
+        client = getattr(getattr(model, "mythic_client", None), "client", None)
+        if client is not None:
+            return client
+        from ai.langgraph.mythic_tools import MythicTools
+
+        auth = MythicTools(
+            operation_id=request.OperationID,
+            channel_id=request.ChannelID,
+            apitoken_id=request.APITokenID,
+        )
+        await auth.login()
+        return auth.client
+
+    @staticmethod
+    def _apply_saved_mode_override(model: Any, record: dict[str, Any], signature: str) -> None:
+        """Reapply a saved `/mode` override exactly as `/mode` set it, only on unchanged config."""
+        override = str(record.get("mode_override") or "")
+        override_base = record.get("mode_override_base_autonomous_solve")
+        if (
+            override not in {"conversation", "supervised", "auto"}
+            or str(record.get("mode_override_base_signature") or "") != signature
+            or not isinstance(override_base, bool)
+        ):
+            return
+        model.mode = override
+        model._autonomous_solve = (
+            True if override == "auto" else False if override == "conversation" else override_base
+        )
+        model._chat_mode_override = override
+        model._chat_mode_override_base_signature = signature
+        model._chat_mode_override_base_autonomous_solve = override_base
+
+    async def _retire_into_new_generation(
+        self,
+        request: ChatRequest,
+        model: Any,
+        closure_text: str,
+    ) -> None:
+        """Close the restored generation's open work in code and continue on a new generation."""
+        new_thread_id = next_channel_thread_id(request)
+        model.retire_restored_generation(new_thread_id, closure_text)
+        model._pending_approval_context = None
+        record = self._session_record_for(request, model)
+        await save_channel_session_record(record)
+
+    async def _restore_channel_session(
+        self,
+        request: ChatRequest,
+    ) -> tuple[Any | None, str, list[str]]:
+        """Rebuild this channel's Model after a restart: ``(model, refusal, notices)``.
+
+        The model is registered only on success. Authority is never carried from the old process:
+        the request's current config/identity must match what the session was saved under, and a
+        paused action resumes only through the same exact approval correlation as before.
+        """
+        operation_id, channel_id = int(request.OperationID), int(request.ChannelID)
+        try:
+            record = await load_channel_session_record(operation_id, channel_id)
+        except ChannelSessionRecordInvalid as exc:
+            return None, unreadable_refusal(str(exc)), []
+        kwargs = build_model_kwargs(request)
+        try:
+            bloodhound_env = build_bloodhound_env(request)
+        except Exception:  # pragma: no cover - resolution must never block a chat turn
+            bloodhound_env = {}
+        signature = _model_config_signature(kwargs, bloodhound_env)
+        if record is None:
+            return await self._adopt_legacy_session(request, kwargs, signature)
+        if record.get("status") != CHANNEL_SESSION_ACTIVE:
+            return None, RETIRED_REFUSAL, []
+        if record.get("apitoken_id") != int(request.APITokenID):
+            return None, changed_refusal("Mythic identity"), []
+        if record.get("config_signature") != signature:
+            return None, changed_refusal("configuration"), []
+        thread_id = str(record["thread_id"])
+        model = await self._build_model(request, kwargs, signature, thread_id=thread_id)
+        model._chat_request_base_autonomous_solve = bool(
+            record.get("base_autonomous_solve", kwargs.get("autonomous_solve"))
+        )
+        self._apply_saved_mode_override(model, record, signature)
+        if not _runtime_routing_matches(model, kwargs, config_signature=signature):
+            return None, changed_refusal("configuration"), []
+        engagement = record.get("engagement_uuid")
+        if isinstance(engagement, str) and engagement:
+            model._report_engagement_uuid = engagement
+        notices = [RESTORED_NOTICE]
+        try:
+            values = await model.restore_session_state_from_checkpoint(thread_id)
+        except LookupError:
+            values = None
+            notices = [
+                "Sage restarted and found no saved conversation for this channel, so earlier "
+                "messages are not part of its context. State the current scope and evidence "
+                "before continuing."
+            ]
+        except Exception as exc:
+            return None, unreadable_refusal(
+                f"its saved conversation is unreadable ({type(exc).__name__})"
+            ), []
         await put_channel_session(request, model)
-        return model, False
+        if values is not None:
+            notices.extend(await self._restore_pending_work(request, model, record, thread_id))
+        return model, "", notices
+
+    async def _restore_pending_work(
+        self,
+        request: ChatRequest,
+        model: Any,
+        record: dict[str, Any],
+        thread_id: str,
+    ) -> list[str]:
+        """Reattach a provably unconsumed card, or retire paused work that cannot resume."""
+        try:
+            from ai.langgraph.model import _collect_hitl_action_requests
+        except ImportError:  # pragma: no cover
+            from ..ai.langgraph.model import _collect_hitl_action_requests  # type: ignore
+        snapshot = await model.graph.aget_state(model._graph_run_config(thread_id))
+        action_requests = _collect_hitl_action_requests(snapshot)
+        claim = record.get("claim") if isinstance(record.get("claim"), dict) else None
+        if claim and claim.get("status") == "claimed":
+            if not action_requests:
+                # The approved resume finished and was checkpointed; its result is in history.
+                await self._update_session_record(
+                    request, model, required=True, claim={**claim, "status": "consumed"},
+                )
+                return []
+            if claim.get("decision") == "deny":
+                await self._retire_into_new_generation(request, model, REJECTED_CLAIM_CLOSURE)
+                return [
+                    "Sage restarted while applying your rejection of an action. The action was not "
+                    "executed and will not be resent."
+                ]
+            detail = await describe_receipts(
+                getattr(model, "mythic_client", None), list(claim.get("receipts") or [])
+            )
+            await self._retire_into_new_generation(
+                request, model, UNKNOWN_OUTCOME_CLOSURE.format(detail=detail)
+            )
+            return [
+                "An approved action was interrupted by the restart before its result was saved. "
+                f"Sage will not resend it. {detail}"
+            ]
+        if not action_requests:
+            if record.get("pending"):
+                await self._update_session_record(request, model, required=True, pending=None)
+                return [
+                    "The approval card raised before the restart can no longer be resumed. Its "
+                    "action was not executed."
+                ]
+            return []
+        context, contract, reason = restored_pending_context(
+            record.get("pending"), action_requests, thread_id
+        )
+        if context is None:
+            await self._retire_into_new_generation(request, model, RETIRED_CARD_CLOSURE)
+            return [
+                f"The action waiting for approval before the restart was not restored ({reason}). "
+                "It was not executed and will not be resent."
+            ]
+        checkpoint_subgoal = copy.deepcopy((getattr(model, "state", None) or {}).get("_subgoal_state"))
+        model.install_request_contract(contract)
+        self._restore_subgoal_state(model, contract, checkpoint_subgoal)
+        model._pending_approval_context = context
+        return []
+
+    async def _recover_offline_decision(self, request: ChatRequest, model: Any) -> Any | None:
+        """Return Mythic's stored decision on the restored card when it was never delivered.
+
+        Mythic writes a card decision before it checks that the chat container is running, so a
+        decision made while Sage was down stays on the card. Only a decision that validates against
+        the context Sage saved for that exact card is returned; anything else leaves the card as is.
+        """
+        context = getattr(model, "_pending_approval_context", None)
+        if not isinstance(context, dict) or not context.get("approval_id"):
+            return None
+        try:
+            client = await self._mythic_read_client(request, model)
+            row = await read_card_row(
+                client,
+                int(request.OperationID),
+                int(request.ChannelID),
+                str(context["approval_id"]),
+            )
+        except Exception:
+            logger.warning("Stored approval card could not be read", exc_info=True)
+            return None
+        response = input_response_from_card_row(row)
+        if response is None:
+            return None
+        probe = SimpleNamespace(InputResponse=response)
+        if not approval_response_matches(probe, context):
+            logger.warning("Stored approval decision did not match the restored card; ignored")
+            return None
+        return response
+
+    @staticmethod
+    def _restore_subgoal_state(model: Any, contract: Any, raw: Any) -> None:
+        """Keep the paused request's checkpointed subgoal progress after reinstalling its contract."""
+        if not isinstance(raw, dict) or not raw:
+            return
+        try:
+            from ai.langgraph.subgoal_state import SubgoalState
+        except ImportError:  # pragma: no cover
+            from ..ai.langgraph.subgoal_state import SubgoalState  # type: ignore
+        try:
+            subgoal = SubgoalState.from_dict(raw)
+        except ValueError:
+            return
+        if subgoal.request_id != contract.request_id:
+            return
+        lock = getattr(model, "_subgoal_authority_lock", None)
+        if lock is None:
+            model._subgoal_authority = subgoal
+        else:
+            with lock:
+                model._subgoal_authority = subgoal
+        state = getattr(model, "state", None)
+        if isinstance(state, dict):
+            state["_subgoal_state"] = subgoal.to_dict()
+
+    async def _adopt_legacy_session(
+        self,
+        request: ChatRequest,
+        kwargs: dict[str, Any],
+        signature: str,
+    ) -> tuple[Any | None, str, list[str]]:
+        """Adopt a pre-record channel only when Mythic's rows prove which generation it used."""
+        try:
+            from ai.langgraph.sqlite_checkpointer import SageAsyncSqliteSaver
+        except ImportError:  # pragma: no cover
+            from ..ai.langgraph.sqlite_checkpointer import SageAsyncSqliteSaver  # type: ignore
+        operation_id, channel_id = int(request.OperationID), int(request.ChannelID)
+        db_path = channel_session_db_path()
+        generations = await channel_generations(db_path, channel_id)
+        if not generations:
+            return None, unproven_refusal("no saved conversation was found"), []
+        latest: dict[str, tuple[int, str, dict[str, Any]]] = {}
+        async with aiosqlite.connect(db_path, timeout=5) as conn:
+            saver = SageAsyncSqliteSaver(conn)
+            for thread_id in generations:
+                saved = await saver.aget_tuple(
+                    {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+                )
+                values = (
+                    dict((saved.checkpoint or {}).get("channel_values") or {})
+                    if saved is not None else {}
+                )
+                request_id = str(values.get("_request_id") or "")
+                number = request_number(request_id, channel_id)
+                if number is not None:
+                    latest[thread_id] = (number, request_id, values)
+        if not latest:
+            return None, unproven_refusal("no saved request names this channel"), []
+        client = await self._mythic_read_client(request)
+        proven: list[tuple[int, str, dict[str, Any]]] = []
+        for thread_id, (number, request_id, values) in latest.items():
+            stored = await stored_request_prompt(client, operation_id, channel_id, number)
+            recorded = operator_prompt_for_request(values, request_id)
+            if stored is not None and recorded is not None and stored == recorded:
+                proven.append((number, thread_id, values))
+        if not proven:
+            return None, unproven_refusal("Mythic's records do not match a saved request"), []
+        highest = max(number for number, _, _ in proven)
+        owners = [entry for entry in proven if entry[0] == highest]
+        if len(owners) != 1:
+            return None, unproven_refusal("more than one saved conversation claims it"), []
+        _, thread_id, values = owners[0]
+        model = await self._build_model(request, kwargs, signature, thread_id=thread_id)
+        notices = [RESTORED_NOTICE]
+        saved_mode = str(values.get("mode") or "")
+        if saved_mode in {"conversation", "supervised", "auto"} and saved_mode != model.mode:
+            notices.append(LEGACY_MODE_NOTICE.format(mode=model.mode, previous=saved_mode))
+        try:
+            await model.restore_session_state_from_checkpoint(thread_id)
+        except Exception as exc:
+            return None, unreadable_refusal(
+                f"its saved conversation is unreadable ({type(exc).__name__})"
+            ), []
+        await put_channel_session(request, model)
+        await self._save_session_record(request, model)
+        # A legacy card's approval context lived only in the old process; it cannot be proven.
+        record = self._session_record_for(request, model)
+        notices.extend(await self._restore_pending_work(request, model, record, thread_id))
+        return model, "", notices
 
     async def _notify_bloodhound_degraded_once(self, model: Any, request: ChatRequest) -> None:
         """Tell the operator, in the chat, that the attack graph is unavailable. Once per session.
@@ -1047,18 +1494,37 @@ class SageChat(Chat):
                 (not first_channel_claim and not slash_only_new_channel)
                 or (first_channel_claim and _channel_has_prior_context(request))
             ) and recovery_state is None:
-                await self.send_complete(
-                    request,
-                    turn.response_key,
-                    content=(
-                        "Sage restarted or this channel's session was replaced. Its prior "
-                        "scope and evidence are not restored. Start a new Sage chat and "
-                        "state the current scope and evidence before continuing. No tools "
-                        "were used for this request."
-                    ),
-                    complete_request=True,
+                # This process has no Model for a channel it has seen before. Rebuild it from the
+                # channel record and its checkpoint, or explain specifically why that is unsafe.
+                restored_model, refusal, restoration_notices = await self._restore_channel_session(
+                    request
                 )
-                return None
+                if restored_model is None:
+                    await self.send_complete(
+                        request,
+                        turn.response_key,
+                        content=refusal,
+                        complete_request=True,
+                    )
+                    return None
+                # A restored Model has no emitter from an earlier turn. Bind this request's, so any
+                # lifecycle notice before the turn's own emitter (a set-aside card) reaches this
+                # channel instead of the legacy task RPC.
+                restored_model._response_emitter = ChatStreamEmitter(self, request)
+                if slash is None and getattr(request, "InputResponse", None) is None:
+                    recovered = await self._recover_offline_decision(request, restored_model)
+                    if recovered is not None:
+                        request.InputResponse = recovered
+                        restoration_notices.append(OFFLINE_DECISION_NOTICE)
+                if restoration_notices:
+                    await self.send_response(
+                        request,
+                        response_key=f"restoration:{request.RequestID}",
+                        content="\n\n".join(restoration_notices),
+                        status="complete",
+                        complete=False,
+                        metadata={},
+                    )
             if slash is None and tool_discovery:
                 existing = await self._rotate_auth_changed_session(request, existing_at_entry)
                 if existing is not None:
@@ -1081,6 +1547,9 @@ class SageChat(Chat):
                 if existing is not None:
                     await self._refresh_auth_context(existing, request)
                 if await handle_slash(self, request, existing, f"slash:{request.RequestID}"):
+                    if existing is not None:
+                        # `/mode` changes routing outside Mythic's stored config; keep it restorable.
+                        await self._persist_session_settings(request, existing)
                     if first_channel_claim and existing_at_entry is None:
                         _NEW_CHANNEL_WITHOUT_SESSION.add(channel_identity)
                     return None
@@ -1198,6 +1667,8 @@ class SageChat(Chat):
                 previous_engagement = getattr(model, "_report_engagement_uuid", None)
                 if previous_engagement is None:
                     model._report_engagement_uuid = current_engagement
+                    if current_engagement is not None:
+                        await self._persist_session_settings(request, model)
                 model._report_engagement_at_turn = (
                     current_engagement if current_engagement == model._report_engagement_uuid else None)
             # Reassert on reused sessions too; older in-memory sessions created before this field was wired
@@ -1245,14 +1716,47 @@ class SageChat(Chat):
                     "apitoken_id": str(request.APITokenID),
                 }
 
+            async def store_pending_approval(context: dict[str, Any]) -> None:
+                model._pending_approval_context = dict(context)
+                # Durable before the request releases: a restart can then reattach this exact card.
+                # A new card also ends any earlier claim, whose action is already checkpointed.
+                await self._update_session_record(
+                    request,
+                    model,
+                    required=True,
+                    pending=pending_record(context, getattr(model, "_request_contract", None)),
+                    claim=None,
+                )
+
+            async def record_approval_receipt(receipt: dict[str, Any]) -> None:
+                record = await load_channel_session_record(
+                    int(request.OperationID), int(request.ChannelID)
+                )
+                claim = (record or {}).get("claim")
+                if (
+                    not isinstance(claim, dict)
+                    or claim.get("status") != "claimed"
+                    or claim.get("approval_id") != receipt.get("approval_id")
+                    or record.get("thread_id") != getattr(model, "_thread_id_override", None)
+                ):
+                    return
+                receipts = [*list(claim.get("receipts") or []), {
+                    "task_display_id": receipt.get("task_display_id"),
+                    "callback_display_id": receipt.get("callback_display_id"),
+                    "command": str(receipt.get("command") or ""),
+                }]
+                record["claim"] = {**claim, "receipts": receipts}
+                await save_channel_session_record(record)
+
+            receipt_setter = getattr(getattr(model, "mythic_client", None), "set_approval_receipt_sink", None)
+            if callable(receipt_setter):
+                receipt_setter(record_approval_receipt)
             model._hitl_card_emitter = make_card_emitter(
                 self,
                 request,
                 delegation_lookup=getattr(model, "_single_active_delegation", None),
                 approval_context_lookup=approval_context,
-                approval_context_store=lambda context: setattr(
-                    model, "_pending_approval_context", dict(context)
-                ),
+                approval_context_store=store_pending_approval,
                 decision_context_lookup=getattr(model, "_hitl_decision_context", None),
             )
             model._hitl_card_pending = False
@@ -1303,6 +1807,26 @@ class SageChat(Chat):
                 ):
                     approval_claim_context = dict(model._pending_approval_context or {})
                     model._pending_approval_context = None
+                    # Durable claim before any resume await. After a crash an unconsumed claim is
+                    # never resumed again; its outcome is reconciled from exact task receipts.
+                    await self._update_session_record(
+                        request,
+                        model,
+                        required=True,
+                        pending=None,
+                        claim={
+                            "approval_id": str(approval_claim_context.get("approval_id") or ""),
+                            "request_id": str(approval_claim_context.get("request_id") or ""),
+                            "action_digest": str(approval_claim_context.get("action_digest") or ""),
+                            "decision": (
+                                "approve"
+                                if approved_action_ids_for_request(request, approval_claim_context)
+                                else "deny"
+                            ),
+                            "status": "claimed",
+                            "receipts": [],
+                        },
+                    )
                     approval_claimed = True
                 stale_approval_response = bool(has_input_response and not approval_claimed)
                 approved_action_ids = (
@@ -1442,6 +1966,9 @@ class SageChat(Chat):
                         if callable(clear_claim):
                             clear_claim()
                 if approval_claimed:
+                    await self._mark_claim_consumed(
+                        request, model, str(approval_claim_context.get("approval_id") or "")
+                    )
                     # LangGraph does not emit a normal tool-end callback for a
                     # denied/unselected guarded call. Close only the tool events
                     # that remain open after resume; approved calls that already
