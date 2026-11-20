@@ -84,3 +84,95 @@ def test_ceilings_stop_on_calls_tokens_or_output():
     assert check._over_ceiling([{"prompt_tokens": 1, "completion_tokens": 5000}],
                                check.time.monotonic()) == "output token ceiling"
     assert check._over_ceiling([span], check.time.monotonic() - 16 * 60) == "wall-time ceiling"
+
+
+# --------------------------------------------------------------------------------------------------
+# Revision 2: P3 grades the change's own effect; calling agent and cards are observations. P7 reads the
+# deployed controls from Mythic's stored model definition.
+# --------------------------------------------------------------------------------------------------
+
+def _span(produced=(), consumed=(), agent="Supervisor"):
+    return {"model": "gpt-6-cyber", "prompt_tokens": 1, "completion_tokens": 1, "produced_calls": list(produced),
+            "consumed_results": list(consumed), "calling_agents": [agent] if produced else []}
+
+
+def _row(text, **metadata):
+    return {"id": 1, "author_type": "ai", "message": text, "metadata": metadata}
+
+
+NOTICE = "⚠️ **BloodHound is not connected**, so attack-graph analysis is unavailable."
+FINAL = "📊 **Final Report** The label is amber-seven. One callback: CASTELBLACK."
+
+
+def test_p3_passes_on_a_round_trip_and_one_answer_row_with_no_card():
+    rows = {"status": "complete", "messages": [_row(NOTICE), _row(FINAL, turn_outcome="answered")]}
+    result = check.tool_step_result([_span(produced=["call_a"]), _span(consumed=["call_a"])], rows)
+    assert result["passed"] is True
+    assert result["calling_agents"] == ["Supervisor"] and result["card_rows"] == 0
+
+
+def test_p3_passes_with_worker_cards_and_records_them():
+    card = _row("", tool_use={"name": "list_callbacks", "status": "completed"})
+    rows = {"status": "complete", "messages": [card, _row(FINAL)]}
+    result = check.tool_step_result([_span(produced=["call_a"], agent="Mythic_Operator"),
+                                     _span(consumed=["call_a"])], rows)
+    assert result["passed"] is True
+    assert result["calling_agents"] == ["Mythic_Operator"] and result["card_rows"] == 1
+
+
+@pytest.mark.parametrize("case", ["unconsumed", "no_call", "duplicate_answer", "empty_answer", "not_complete"])
+def test_p3_fails_when_the_change_effect_is_missing(case):
+    spans = [_span(produced=["call_a"]), _span(consumed=["call_a"])]
+    messages = [_row(FINAL)]
+    status = "complete"
+    if case == "unconsumed":
+        spans = [_span(produced=["call_a"]), _span(consumed=["call_other"])]
+    elif case == "no_call":
+        spans = [_span(), _span()]
+    elif case == "duplicate_answer":
+        messages = [_row(FINAL), _row(FINAL)]
+    elif case == "empty_answer":
+        messages = [_row(NOTICE), _row("   ")]
+    else:
+        status = "error"
+    assert check.tool_step_result(spans, {"status": status, "messages": messages})["passed"] is False
+
+
+def _subscriptions(options):
+    sage = {"name": "Sage", "metadata": {"configuration_options": options}}
+    watcher = {"name": "Sage Watcher", "metadata": {"configuration_options": []}}
+    return [json.dumps(sage), json.dumps(watcher)]
+
+
+def _deployed_options():
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "Payload_Type" / "sage"))
+    from sage_chat.models import SAGE_MODELS
+
+    return [option.to_json() for option in SAGE_MODELS[0].Metadata.ConfigurationOptions]
+
+
+def test_p7_accepts_the_specified_controls_after_provider_and_model():
+    assert check.deployed_controls_error(_subscriptions(_deployed_options())) == ""
+
+
+@pytest.mark.parametrize("mutate", ["missing", "reordered", "relabelled", "value", "default", "moved"])
+def test_p7_rejects_a_changed_control(mutate):
+    options = _deployed_options()
+    index = {option["name"]: i for i, option in enumerate(options)}
+    daybreak = options[index["SAGE_OPENAI_ACCESS_PROGRAM"]]
+    if mutate == "missing":
+        options.pop(index["SAGE_OPENAI_SAFETY_IDENTIFIER"])
+    elif mutate == "reordered":
+        a, b = index["SAGE_OPENAI_API"], index["SAGE_OPENAI_ACCESS_PROGRAM"]
+        options[a], options[b] = options[b], options[a]
+    elif mutate == "relabelled":
+        daybreak["display_name"] = "Daybreak access"
+    elif mutate == "value":
+        daybreak["choices"][1]["value"] = "off"
+    elif mutate == "default":
+        daybreak["default_value"] = "standard"
+    else:
+        options.append(options.pop(index["SAGE_OPENAI_API"]))
+    assert check.deployed_controls_error(_subscriptions(options))

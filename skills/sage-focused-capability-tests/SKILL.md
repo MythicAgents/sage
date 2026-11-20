@@ -47,7 +47,9 @@ argument is still accepted and ignored. See `docs/development/TEST_TIERS.md`.
   required, `--authorized-by`) sends a deliberate Chat Completions request, corrects the channel to Responses + Red
   and retries, then a read-only `list_callbacks` prompt and a no-tools recall, stopping at 16 provider calls,
   1,048,576 tokens, 4,096 output tokens per call, 15 minutes or any target task. `verify` applies the pass rules
-  written in the script to Mythic's rows and the live Phoenix trace (read in place). One attempt per run file.
+  written in the script to Mythic's rows and the live Phoenix trace (read in place): the tool step passes on a
+  call produced and consumed plus one final-answer row (calling agent and cards are observations), and P7 reads
+  the deployed controls from Mythic's stored model definition. One attempt per run file.
 - `check_bloodhound_ingest_contract.py --image <id> [--json out.json]` — checks a **built** Sage image's baked
   BloodHound MCP serves the ingest contract (byte upload plus exact-job `status`). It runs one throwaway container
   with `--network none`, the entrypoint bypassed, and only the checker mounted read-only; a loopback fake BloodHound

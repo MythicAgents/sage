@@ -18,16 +18,20 @@ it creates one conversation channel, sends four prompts and edits that channel's
   verify --run-file F --phoenix-db P
       Applies the pass rules below once, reading Mythic's own rows and the live Phoenix trace.
 
-Pass rules (written before any run; each is read once):
+Pass rules (plan revision 2; written before the run; each is read once):
   P1 step 1 ends in one error terminal that names "set **OpenAI API** to **Responses**"; no replaced/restart
      refusal appears in the channel.
   P2 step 2 completes with real model text and the settings notice; no refusal.
-  P3 step 3 completes; Phoenix shows a model-produced function call whose call id is consumed by a later
-     model request in the same step as a tool result; Mythic shows the list_callbacks card once.
+  P3 step 3 completes; Phoenix shows a model-produced function call whose call id a later model request in the
+     same step consumes as a tool result; Mythic shows exactly one row carrying the step's final answer text.
   P4 step 4 completes and its answer contains the label (history preserved across the correction).
   P5 Phoenix model spans in steps 2-4 name the configured model; every request ends terminal.
   P6 zero target tasks created; provider calls, tokens and wall time stayed inside the ceilings.
-Observations, not pass criteria: wording, latency, callback count, reasoning tokens.
+  P7 the running Sage's model definition in Mythic (consuming_container.subscriptions) lists OpenAI API, Daybreak
+     and OpenAI Safety Identifier right after Provider and Model, with the specified labels, values and empty
+     defaults.
+Observations, not pass criteria: the tool step's calling agent and card rows (cards follow the model's routing
+the same way on both APIs), wording, latency, callback count, reasoning tokens, SDK retries (not visible here).
 """
 
 from __future__ import annotations
@@ -85,6 +89,22 @@ OFFLINE_TESTS = (
     "tests/test_openai_responses_consumers.py",
 )
 TERMINAL = {"complete", "error", "cancelled"}
+NOTICE_PREFIXES = ("⚠️ **BloodHound is not connected**", SETTINGS_NOTICE)
+# The native controls as the plan specifies them: (display name, [(label, value)] or None for a text field).
+EXPECTED_CONTROLS = (
+    ("SAGE_OPENAI_API", "OpenAI API",
+     [("Use configured default", ""), ("Chat Completions", "chat_completions"), ("Responses", "responses")]),
+    ("SAGE_OPENAI_ACCESS_PROGRAM", "Daybreak",
+     [("Use configured default", ""), ("Off", "standard"), ("Blue", "daybreak_blue"), ("Red", "daybreak_red")]),
+    ("SAGE_OPENAI_SAFETY_IDENTIFIER", "OpenAI Safety Identifier", None),
+)
+CONTAINER_QUERY = """
+query SageOpenAICheckContainer {
+  consuming_container(where: {name: {_eq: "sage"}, type: {_eq: "chat"}, deleted: {_eq: false}}, order_by: {id: desc}) {
+    id subscriptions
+  }
+}
+"""
 
 UPDATE_CHANNEL = """
 mutation SageOpenAICheckUpdate($channelId: Int!, $metadata: jsonb!) {
@@ -220,18 +240,80 @@ def model_spans(db: Path, after: int, until: int | None = None) -> list[dict[str
         except ValueError:
             attrs = {}
         llm = attrs.get("llm") if isinstance(attrs.get("llm"), dict) else {}
-        produced, consumed = set(), set()
+        produced, consumed, agents = set(), set(), set()
         for path, value in _walk(llm.get("output_messages") or []):
             if isinstance(value, str) and path.endswith("tool_call.id"):
                 produced.add(value)
+        if produced:
+            for message in llm.get("output_messages") or []:
+                body = message.get("message") if isinstance(message, dict) else None
+                name = (body or {}).get("name") if isinstance(body, dict) else None
+                if not name and isinstance(message, dict):
+                    name = message.get("message.name")
+                if isinstance(name, str) and name:
+                    agents.add(name)
         for path, value in _walk(llm.get("input_messages") or []):
             if isinstance(value, str) and path.endswith("tool_call_id"):
                 consumed.add(value)
         spans.append({"id": span_id, "model": str(llm.get("model_name") or ""),
                       "prompt_tokens": int(prompt), "completion_tokens": int(completion),
                       "produced_calls": sorted(produced), "consumed_results": sorted(consumed),
+                      "calling_agents": sorted(agents),
                       "invocation_parameters": str(llm.get("invocation_parameters") or "")[:2000]})
     return spans
+
+
+# --------------------------------------------------------------------------------------------------
+# Pure rules (tested offline)
+# --------------------------------------------------------------------------------------------------
+
+def tool_step_result(spans: list[dict[str, Any]], rows: dict[str, Any]) -> dict[str, Any]:
+    """P3: a call produced and consumed in the step, one row carrying the final answer, the request complete.
+
+    The calling agent and card rows are returned as observations: which agent runs the tool is the model's
+    routing choice, and cards follow it identically on Chat Completions and Responses.
+    """
+    produced = {call for span in spans for call in span.get("produced_calls", [])}
+    consumed = {call for span in spans for call in span.get("consumed_results", [])}
+    round_trip = sorted(produced & consumed)
+    texts = [str(m.get("message") or "").strip() for m in rows.get("messages", [])]
+    answers = [text for text in texts if text and not text.startswith(NOTICE_PREFIXES)]
+    final = answers[-1] if answers else ""
+    card_rows = sum(1 for m in rows.get("messages", []) if "tool_use" in (m.get("metadata") or {}))
+    agents = sorted({agent for span in spans if set(span.get("produced_calls", [])) & set(round_trip)
+                     for agent in span.get("calling_agents", [])})
+    passed = bool(rows.get("status") == "complete" and round_trip and final and texts.count(final) == 1)
+    return {"passed": passed, "round_trip_calls": round_trip, "final_answer_rows": texts.count(final) if final else 0,
+            "calling_agents": agents, "card_rows": card_rows}
+
+
+def deployed_controls_error(subscriptions: Any) -> str:
+    """P7: ``""`` when Mythic's stored Sage definition carries the specified controls, else the first problem."""
+    models = []
+    for item in subscriptions or []:
+        try:
+            models.append(json.loads(item) if isinstance(item, str) else item)
+        except ValueError:
+            continue
+    sage = next((m for m in models if isinstance(m, dict) and m.get("name") == "Sage"), None)
+    if sage is None:
+        return "no Sage model definition in Mythic"
+    options = list((sage.get("metadata") or {}).get("configuration_options") or [])
+    names = [str(option.get("name")) for option in options]
+    expected_names = ["provider", "model", *(name for name, _label, _choices in EXPECTED_CONTROLS)]
+    if names[:len(expected_names)] != expected_names:
+        return f"options do not start with {expected_names}: {names[:len(expected_names)]}"
+    for option, (name, label, choices) in zip(options[2:], EXPECTED_CONTROLS):
+        if option.get("display_name") != label:
+            return f"{name} is labelled {option.get('display_name')!r}"
+        if option.get("default_value") not in ("", None):
+            return f"{name} defaults to {option.get('default_value')!r}"
+        found = [(c.get("label"), c.get("value")) for c in option.get("choices") or []]
+        if choices is not None and found != choices:
+            return f"{name} choices are {found}"
+        if choices is None and found:
+            return f"{name} should be a text field"
+    return ""
 
 
 # --------------------------------------------------------------------------------------------------
@@ -246,6 +328,11 @@ async def _query(client: Any, query: str, **variables: Any) -> dict[str, Any]:
 async def _max_task(client: Any) -> int:
     rows = (await _query(client, MAX_TASK_QUERY)).get("task") or []
     return int(rows[0]["display_id"]) if rows else 0
+
+
+async def deployed_controls(client: Any) -> str:
+    rows = (await _query(client, CONTAINER_QUERY)).get("consuming_container") or []
+    return deployed_controls_error(rows[0].get("subscriptions") if rows else None)
 
 
 async def request_rows(client: Any, request_id: int) -> dict[str, Any]:
@@ -268,6 +355,7 @@ async def cmd_readiness(client: Any, run: dict[str, Any], args: argparse.Namespa
         "offline_tests": _offline_tests(),
         "phoenix_readable": bool(args.phoenix_db) and Path(args.phoenix_db).is_file(),
         "task_baseline": await _max_task(client),
+        "deployed_controls_error": await deployed_controls(client),
         "ceilings": CEILINGS,
     }
     if report["phoenix_readable"]:
@@ -276,7 +364,7 @@ async def cmd_readiness(client: Any, run: dict[str, Any], args: argparse.Namespa
         report["route"]["direct_openai"] and report["sage_container_running"] and not report["open_requests"]
         and report["deployment"]["returncode"] == 0 and not report["identity"]["dirty"]
         and report["adapter"] == EXPECTED_ADAPTER and report["offline_tests"]["returncode"] == 0
-        and report["phoenix_readable"]
+        and report["phoenix_readable"] and report["deployed_controls_error"] == ""
     )
     run["readiness"] = report
     return report
@@ -351,16 +439,13 @@ async def cmd_verify(client: Any, run: dict[str, Any], args: argparse.Namespace)
         return str(rows.get(step, {}).get("status") or "")
 
     first = "\n".join(_texts(rows.get("chat_completions", {"messages": []})))
-    tool_spans = spans.get("tool", [])
-    produced = {call for span in tool_spans for call in span["produced_calls"]}
-    consumed = {call for span in tool_spans for call in span["consumed_results"]}
-    tool_cards = [m for m in rows.get("tool", {"messages": []})["messages"]
-                  if "list_callbacks" in json.dumps(m.get("metadata") or {})]
+    tool = tool_step_result(spans.get("tool", []), rows.get("tool", {"status": "", "messages": []}))
+    controls_error = await deployed_controls(client)
     criteria = {
         "P1": status("chat_completions") == "error" and first.count(ACTION) >= 1 and no_refusal,
         "P2": status("corrected") == "complete" and SETTINGS_NOTICE in "\n".join(_texts(rows.get("corrected", {"messages": []})))
         and bool(spans.get("corrected")) and no_refusal,
-        "P3": status("tool") == "complete" and bool(produced & consumed) and bool(tool_cards),
+        "P3": tool["passed"],
         "P4": status("repeat") == "complete" and LABEL in "\n".join(_texts(rows.get("repeat", {"messages": []}))),
         "P5": all(s["model"].startswith(run.get("readiness", {}).get("route", {}).get("model", "?"))
                   for step in ("corrected", "tool", "repeat") for s in spans.get(step, []))
@@ -368,14 +453,16 @@ async def cmd_verify(client: Any, run: dict[str, Any], args: argparse.Namespace)
         "P6": not run.get("stopped") and all(info["tasks_after"] == run.get("task_baseline") for info in steps.values())
         and _over_ceiling(every, time.monotonic()) == ""  # calls and tokens; wall time is checked next
         and float(run.get("finished_at", 0)) - float(run.get("started_at", 0)) <= CEILINGS["minutes"] * 60,
+        "P7": controls_error == "",
     }
     observations = {
         "provider_calls": len(every),
         "total_tokens": sum(s["prompt_tokens"] + s["completion_tokens"] for s in every),
         "max_completion_tokens": max((s["completion_tokens"] for s in every), default=0),
         "wall_seconds": round(float(run.get("finished_at", 0)) - float(run.get("started_at", 0)), 1),
-        "tool_cards": len(tool_cards),
-        "call_ids_produced_and_consumed": sorted(produced & consumed),
+        "tool_step": tool,
+        "deployed_controls_error": controls_error,
+        "sdk_retries": "not observable client-side; the OpenAI SDK default allows up to 2",
         "invocation_parameters_sample": (spans.get("corrected") or [{}])[0].get("invocation_parameters", "")[:600],
     }
     verdict = "pass" if all(criteria.values()) else "fail"
