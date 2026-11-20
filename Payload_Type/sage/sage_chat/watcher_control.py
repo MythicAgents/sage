@@ -195,6 +195,10 @@ class WatcherControlPlane:
             ssl=_ssl_enabled(),
         )
 
+    async def login_onstart(self, token: str, *, server_name: str = "") -> Any:
+        """A Mythic client for Mythic's short-lived on-start token (bot identity, this operation)."""
+        return await self._login_token(str(token), server_name=server_name)
+
     async def client_for_request(self, request: ChatRequest) -> Any:
         provider = await ChatAPITokenProvider.from_request(request)
         return await self._login_token(await provider.get_token())

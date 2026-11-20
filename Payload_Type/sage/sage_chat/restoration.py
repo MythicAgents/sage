@@ -4,12 +4,13 @@ The LangGraph checkpoint owns the conversation; ``session.py`` owns the per-chan
 names its generation and binding. This module holds the read-only Mythic lookups and the pure
 shaping used by ``SageChat`` when a channel's Model is missing from this process:
 
-* the stored approval card row, to recover a decision made while Sage was down;
+* the stored approval card row, to tell a still-pending card from one decided while Sage was down;
 * the stored request rows, to prove which generation a pre-record (legacy) channel used;
+* this container's requests that a restart left open, for the on-start reconciliation;
 * exact task records for a receipt left by an interrupted approved action.
 
-Nothing here grants authority. A recovered decision still passes ``approval_response_matches``
-against the context Sage stored when it raised the card.
+Nothing here grants authority. A decision Mythic stored while Sage was down is never applied: the
+same exact action is asked again on a new card, and only the answer to that card can run it.
 """
 
 from __future__ import annotations
@@ -77,11 +78,29 @@ UNKNOWN_OUTCOME_CLOSURE = (
     "[Outcome unknown: Sage restarted after this action was approved and before its result was "
     "saved. Sage will not resend it. {detail}]"
 )
-OFFLINE_DECISION_NOTICE = (
-    "Sage restarted while your decision on the pending approval card was being delivered. That "
-    "decision was recovered and applied here; your new message was not processed. Send it again "
-    "if it is still needed."
+REASK_NOTICE = (
+    "Sage restarted while this action was waiting for approval. Your decision on the earlier card "
+    "reached Mythic while Sage was down and was not applied, so nothing ran. Decide on the new card "
+    "below; only an answer to it can run the action."
 )
+CLAIM_CLOSED_NOTICE = (
+    "Sage restarted while an approved action from this request was running, so this request could "
+    "not finish. Sage will not resend the action. Send your next message to see what Mythic recorded "
+    "for it."
+)
+TURN_CLOSED_NOTICE = (
+    "Sage restarted while this request was being handled, so it could not finish. Nothing from it "
+    "will be resent. Send your message again if it is still needed."
+)
+
+
+def card_closed_notice(reason: str) -> str:
+    return (
+        "Sage restarted while this request was waiting for approval, and the approval could not be "
+        f"asked again ({reason}). The action was not run and will not be resent. Send your request "
+        "again if it is still needed."
+    )
+
 
 _CARD_QUERY = (
     "query sageRestoredCard($op: Int!, $ch: Int!, $ctx: jsonb!) { "
@@ -92,6 +111,12 @@ _REQUEST_QUERY = (
     "query sageRestoredRequest($op: Int!, $ch: Int!, $id: Int!) { "
     "chat_request(where: {id: {_eq: $id}, operation_id: {_eq: $op}, channel_id: {_eq: $ch}}, "
     "limit: 2) { id channel_id operation_id request_message { id message } } }"
+)
+_OPEN_REQUESTS_QUERY = (
+    "query sageOpenRequests($op: Int!, $container: String!) { "
+    "chat_request(where: {operation_id: {_eq: $op}, status: {_in: [\"pending\", \"streaming\"]}, "
+    "chat_container: {name: {_eq: $container}}}, order_by: {id: asc}) { "
+    "id channel_id operation_id status } }"
 )
 _MYTHIC_TIMEOUT_SECONDS = 5.0
 
@@ -213,6 +238,78 @@ def input_response_from_card_row(row: Mapping[str, Any] | None) -> ChatInputResp
         resolved_by=str(response.get("resolved_by") or ""),
         resolved_at=str(response.get("resolved_at") or ""),
     )
+
+
+def card_row_state(row: Mapping[str, Any] | None) -> str:
+    """``pending``, ``decided`` (Mythic stored an answer) or ``unreadable`` for one card row."""
+    if input_response_from_card_row(row) is not None:
+        return "decided"
+    metadata = row.get("metadata") if isinstance(row, Mapping) else None
+    card = metadata.get("input_requested") if isinstance(metadata, Mapping) else None
+    if (
+        isinstance(card, Mapping)
+        and metadata.get("special_type") == "input_requested"
+        and type(row.get("id")) is int
+        and card.get("status") == "pending"
+    ):
+        return "pending"
+    return "unreadable"
+
+
+async def open_container_requests(
+    client: Any,
+    operation_id: int,
+    container_name: str,
+) -> list[dict[str, Any]]:
+    """This container's ``pending``/``streaming`` requests in exactly this operation."""
+    if client is None or not container_name:
+        return []
+    result = await asyncio.wait_for(
+        mythic.execute_custom_query(
+            client,
+            _OPEN_REQUESTS_QUERY,
+            variables={"op": int(operation_id), "container": str(container_name)},
+        ),
+        timeout=_MYTHIC_TIMEOUT_SECONDS,
+    )
+    rows = result.get("chat_request") if isinstance(result, Mapping) else None
+    if not isinstance(rows, list):
+        return []
+    return [
+        dict(row) for row in rows
+        if isinstance(row, Mapping)
+        and type(row.get("id")) is int and row["id"] > 0
+        and type(row.get("channel_id")) is int and row["channel_id"] > 0
+        and row.get("operation_id") == int(operation_id)
+        and row.get("status") in {"pending", "streaming"}
+    ]
+
+
+async def paused_action_requests(db_path: str, thread_id: str) -> list[Any]:
+    """The HITL action requests paused in a generation's latest checkpoint, read without a Model.
+
+    The parent checkpoint's pending ``__interrupt__`` writes are what ``graph.aget_state`` reports
+    as the snapshot's interrupts; the same collector counts them once.
+    """
+    try:
+        from ai.langgraph.model import _collect_hitl_action_requests
+        from ai.langgraph.sqlite_checkpointer import SageAsyncSqliteSaver
+    except ImportError:  # pragma: no cover
+        from ..ai.langgraph.model import _collect_hitl_action_requests  # type: ignore
+        from ..ai.langgraph.sqlite_checkpointer import SageAsyncSqliteSaver  # type: ignore
+    from types import SimpleNamespace
+
+    async with aiosqlite.connect(db_path, timeout=5) as conn:
+        saved = await SageAsyncSqliteSaver(conn).aget_tuple(
+            {"configurable": {"thread_id": str(thread_id), "checkpoint_ns": ""}}
+        )
+    if saved is None:
+        return []
+    interrupts: list[Any] = []
+    for _task_id, channel, value in saved.pending_writes or ():
+        if channel == "__interrupt__":
+            interrupts.extend(value if isinstance(value, (list, tuple)) else [value])
+    return _collect_hitl_action_requests(SimpleNamespace(interrupts=interrupts))
 
 
 async def stored_request_prompt(

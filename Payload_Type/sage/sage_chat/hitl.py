@@ -342,6 +342,42 @@ def build_approval_request(
     return result
 
 
+def approval_card(
+    action_requests: list[dict[str, Any]],
+    binding: dict[str, Any],
+    *,
+    decision_context: str = "",
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build one card's ``send_approval_request`` kwargs and its approval context.
+
+    ``binding`` carries the request correlation (thread, turn, request, contract digest, operation,
+    token). Every card gets a fresh random ``approval_id``, so an answer to an earlier card for the
+    same action never matches it. Used by the live emitter and by the restart re-ask.
+    """
+    kwargs = build_approval_request(action_requests, decision_context=decision_context)
+    approval_context: dict[str, Any] = dict(binding)
+    approval_context.pop("proposal_digest", None)
+    approval_context.update({
+        "approval_id": uuid4().hex,
+        "tool_name": kwargs["data"].get("tool_name", ""),
+        "actions": approval_claim_actions(action_requests),
+        "selection_mode": "single",
+        "action_digest": kwargs["data"]["action_digest"],
+        # The card's decision-context enrichment rides inside the protocol
+        # context, so echo validation rebuilds the same description without any
+        # lookup threading for callers of approval_response_matches.
+        "decision_context": decision_context,
+    })
+    contract_digest = str(approval_context.get("request_contract_digest") or "")
+    if contract_digest:
+        approval_context["proposal_digest"] = approval_proposal_digest(
+            contract_digest,
+            kwargs["data"]["action_digest"],
+        )
+    kwargs["data"]["sage_approval_context"] = approval_context
+    return kwargs, approval_context
+
+
 def make_card_emitter(
     chat: Any,
     request: ChatRequest,
@@ -370,33 +406,15 @@ def make_card_emitter(
             except Exception as e:
                 logger.debug(f"decision context lookup failed (non-fatal): {e}")
                 decision_context = ""
-        kwargs = build_approval_request(action_requests, decision_context=decision_context)
-        approval_context: dict[str, Any] = {}
+        binding: dict[str, Any] = {}
         if approval_context_lookup is not None:
             try:
-                approval_context.update(approval_context_lookup() or {})
+                binding.update(approval_context_lookup() or {})
             except Exception as e:
                 logger.debug(f"approval context lookup failed (non-fatal): {e}")
-        approval_context.update({
-            "approval_id": uuid4().hex,
-            "tool_name": kwargs["data"].get("tool_name", ""),
-            "actions": approval_claim_actions(action_requests),
-            "selection_mode": "single",
-            "action_digest": kwargs["data"]["action_digest"],
-            # The card's decision-context enrichment rides inside the protocol
-            # context, so echo validation rebuilds the same description without any
-            # lookup threading for callers of approval_response_matches.
-            "decision_context": decision_context,
-        })
-        contract_digest = str(
-            approval_context.get("request_contract_digest") or ""
+        kwargs, approval_context = approval_card(
+            action_requests, binding, decision_context=decision_context
         )
-        if contract_digest:
-            approval_context["proposal_digest"] = approval_proposal_digest(
-                contract_digest,
-                kwargs["data"]["action_digest"],
-            )
-        kwargs["data"]["sage_approval_context"] = approval_context
         metadata: dict[str, Any] = {}
         if delegation_lookup is not None:
             try:

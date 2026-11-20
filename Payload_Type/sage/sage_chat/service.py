@@ -28,6 +28,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import aiosqlite
+from mythic_container import ChatBase as _sdk_chat
 from mythic_container.ChatBase import (
     Chat,
     ChatRequest,
@@ -41,6 +42,7 @@ from _version import agent_version
 from .config import autonomous_solve_ignored, build_bloodhound_env, build_model_kwargs
 from .findings_watcher import FindingsWatcherManager, render_watcher_status
 from .hitl import (
+    approval_card,
     approved_action_ids_for_request,
     approval_response_matches,
     make_card_emitter,
@@ -56,18 +58,23 @@ from .operation_memory_runtime import (
 )
 from .operation_memory import WatcherOwnerConflict
 from .restoration import (
+    CLAIM_CLOSED_NOTICE,
     LEGACY_MODE_NOTICE,
-    OFFLINE_DECISION_NOTICE,
+    REASK_NOTICE,
     RESTORED_NOTICE,
     REJECTED_CLAIM_CLOSURE,
     RETIRED_CARD_CLOSURE,
     RETIRED_REFUSAL,
+    TURN_CLOSED_NOTICE,
     UNKNOWN_OUTCOME_CLOSURE,
+    card_closed_notice,
+    card_row_state,
     changed_refusal,
     channel_generations,
     describe_receipts,
-    input_response_from_card_row,
+    open_container_requests,
     operator_prompt_for_request,
+    paused_action_requests,
     pending_record,
     read_card_row,
     request_number,
@@ -89,6 +96,7 @@ from .session import (
     next_channel_thread_id,
     put_channel_session,
     save_channel_session_record,
+    update_channel_session_record,
 )
 from .slash import handle_slash, looks_like_tool_inventory_prompt, render_tool_inventory
 from .streaming import ChatStreamEmitter
@@ -100,6 +108,8 @@ _CHANNEL_METADATA_HEARTBEAT_SECONDS = 2.0
 # The terminal request statuses Mythic stores; it rewrites any other status sent with complete=True.
 _MYTHIC_TERMINAL_REQUEST_STATUSES = frozenset({"complete", "error", "cancelled"})
 _CHANNEL_TURN_LOCKS: dict[str, asyncio.Lock] = {}
+# Mythic may resend on-start for an operation (restarts, file sync, heartbeat gaps); one at a time.
+_ONSTART_RECONCILE_LOCKS: dict[int, asyncio.Lock] = {}
 _WATCHER_TURN_TASKS: dict[tuple[int, int], asyncio.Task[Any]] = {}
 # A new channel can receive /help or /mode before its first Model exists. This
 # process-local exception permits its first real prompt; a restart clears it.
@@ -406,6 +416,7 @@ class SageChat(Chat):
         self, message: ContainerOnStartMessage
     ) -> ContainerOnStartMessageResponse:
         watcher = self._findings_watcher()
+        watcher_error: Exception | None = None
         try:
             await watcher.restore_operation(
                 message.OperationID,
@@ -413,11 +424,19 @@ class SageChat(Chat):
                 bootstrap_token=message.APIToken,
             )
         except Exception as exc:
+            watcher_error = exc
+        # A restart leaves this container's open requests with no owner, and Mythic refuses every
+        # new prompt in their channels until they end. Never raises: the SDK requeues on an error.
+        try:
+            await self._reconcile_open_requests(message)
+        except Exception as exc:
+            logger.warning("Open-request reconciliation failed (%s)", type(exc).__name__)
+        if watcher_error is not None:
             return ContainerOnStartMessageResponse(
                 ContainerName=self.name,
                 EventLogErrorMessage=(
                     "Sage findings watcher startup failed before scheduling: "
-                    f"{type(exc).__name__}."
+                    f"{type(watcher_error).__name__}."
                 ),
             )
         return ContainerOnStartMessageResponse(
@@ -426,6 +445,172 @@ class SageChat(Chat):
                 "Sage Watcher startup profile reconciliation completed for operation "
                 f"{message.OperationID}; use /watcher status to inspect the exact state."
             ),
+        )
+
+    async def _onstart_client(self, message: ContainerOnStartMessage) -> Any:
+        """Mythic client for the on-start token, through the Watcher's existing login owner."""
+        return await self._findings_watcher().control_plane.login_onstart(
+            str(message.APIToken or ""), server_name=str(message.ServerName or "")
+        )
+
+    async def _reconcile_open_requests(self, message: ContainerOnStartMessage) -> None:
+        """End or re-ask each of this container's requests that a restart left without an owner."""
+        operation_id = int(message.OperationID)
+        if operation_id <= 0:
+            return
+        lock = _ONSTART_RECONCILE_LOCKS.setdefault(operation_id, asyncio.Lock())
+        async with lock:
+            client = await self._onstart_client(message)
+            rows = await open_container_requests(client, operation_id, self.name)
+            for row in rows:
+                try:
+                    outcome = await self._reconcile_open_request(
+                        client, operation_id, int(row["channel_id"]), int(row["id"])
+                    )
+                except Exception as exc:
+                    outcome = f"failed ({type(exc).__name__})"
+                logger.info(
+                    "On-start reconciliation: operation %s channel %s request %s: %s",
+                    operation_id, row["channel_id"], row["id"], outcome,
+                )
+
+    @staticmethod
+    def _request_task_live(request_id: int) -> bool:
+        task = _sdk_chat.chatRequestTasks.get(int(request_id))
+        return task is not None and not task.done()
+
+    async def _reconcile_open_request(
+        self,
+        client: Any,
+        operation_id: int,
+        channel_id: int,
+        request_id: int,
+    ) -> str:
+        target = ChatRequest(
+            container_name=self.name,
+            operation_id=operation_id,
+            channel_id=channel_id,
+            request_id=request_id,
+        )
+        # Fencing: never touch a request this process is serving.
+        if self._request_task_live(request_id):
+            return "fenced: request task live"
+        lock = _CHANNEL_TURN_LOCKS.setdefault(channel_session_key(target), asyncio.Lock())
+        if lock.locked():
+            return "fenced: channel turn in progress"
+        async with lock:
+            if self._request_task_live(request_id):
+                return "fenced: request task live"
+            if await get_channel_session(target) is not None:
+                return "fenced: channel session registered"
+            request_key = f"chat:{channel_id}:request:{request_id}"
+            try:
+                record = await load_channel_session_record(operation_id, channel_id)
+            except Exception:
+                record = None
+            if isinstance(record, dict) and record.get("status") == CHANNEL_SESSION_ACTIVE:
+                claim = record.get("claim")
+                if (
+                    isinstance(claim, dict)
+                    and claim.get("status") == "claimed"
+                    and claim.get("request_id") == request_key
+                ):
+                    # The next prompt's restore reports the exact task status; never resumed.
+                    await self._close_open_request(target, CLAIM_CLOSED_NOTICE)
+                    return "closed: unconsumed claim"
+                pending = record.get("pending")
+                context = pending.get("context") if isinstance(pending, dict) else None
+                if isinstance(context, dict) and context.get("request_id") == request_key:
+                    return await self._reask_or_close(client, target, record, context)
+            await self._close_open_request(target, TURN_CLOSED_NOTICE)
+            return "closed: no card"
+
+    async def _reask_or_close(
+        self,
+        client: Any,
+        target: ChatRequest,
+        record: dict[str, Any],
+        context: dict[str, Any],
+    ) -> str:
+        """Leave a still-pending card open; re-ask a decided one; close anything unprovable."""
+        operation_id, channel_id = int(target.OperationID), int(target.ChannelID)
+        thread_id = str(record.get("thread_id") or "")
+        try:
+            row = await read_card_row(
+                client, operation_id, channel_id, str(context.get("approval_id") or "")
+            )
+        except Exception:
+            row = None
+        state = card_row_state(row)
+        if state == "pending":
+            return "left open: card pending in Mythic"
+        if state != "decided":
+            return await self._close_card_request(
+                target, thread_id, "its card could not be read in Mythic"
+            )
+        try:
+            action_requests = await paused_action_requests(channel_session_db_path(), thread_id)
+        except Exception:
+            action_requests = []
+        restored, contract, reason = restored_pending_context(
+            record.get("pending"), action_requests, thread_id
+        )
+        if restored is None:
+            return await self._close_card_request(target, thread_id, reason)
+        kwargs, new_context = approval_card(
+            action_requests,
+            restored,
+            decision_context=str(restored.get("decision_context") or ""),
+        )
+        # Write-ahead: once saved, only the new card's id can match; a crash before the send
+        # leaves no card, which the next on-start closes.
+        saved = await update_channel_session_record(
+            operation_id,
+            channel_id,
+            expected_thread_id=thread_id,
+            pending=pending_record(new_context, contract),
+        )
+        if not saved:
+            return await self._close_card_request(
+                target, thread_id, "its saved session changed"
+            )
+        await self.send_response(
+            target,
+            response_key=f"restoration:{target.RequestID}:reask:{new_context['approval_id']}",
+            content=REASK_NOTICE,
+            status="complete",
+            complete=False,
+            metadata={},
+        )
+        await self.send_approval_request(
+            target,
+            title=kwargs["title"],
+            prompt=kwargs["prompt"],
+            description=kwargs["description"],
+            data=kwargs["data"],
+        )
+        return "re-asked"
+
+    async def _close_card_request(self, target: ChatRequest, thread_id: str, reason: str) -> str:
+        # Clearing the card lets the next prompt's restore retire the paused call with history kept.
+        try:
+            await update_channel_session_record(
+                int(target.OperationID),
+                int(target.ChannelID),
+                expected_thread_id=thread_id,
+                pending=None,
+            )
+        except Exception:
+            logger.warning("Pending card could not be cleared after reconciliation", exc_info=True)
+        await self._close_open_request(target, card_closed_notice(reason))
+        return f"closed: card not re-asked ({reason})"
+
+    async def _close_open_request(self, target: ChatRequest, notice: str) -> None:
+        await self.send_complete(
+            target,
+            f"restoration:{target.RequestID}:closed",
+            content=notice,
+            complete_request=True,
         )
 
     async def handle_finding_command(
@@ -1056,36 +1241,6 @@ class SageChat(Chat):
         model._pending_approval_context = context
         return []
 
-    async def _recover_offline_decision(self, request: ChatRequest, model: Any) -> Any | None:
-        """Return Mythic's stored decision on the restored card when it was never delivered.
-
-        Mythic writes a card decision before it checks that the chat container is running, so a
-        decision made while Sage was down stays on the card. Only a decision that validates against
-        the context Sage saved for that exact card is returned; anything else leaves the card as is.
-        """
-        context = getattr(model, "_pending_approval_context", None)
-        if not isinstance(context, dict) or not context.get("approval_id"):
-            return None
-        try:
-            client = await self._mythic_read_client(request, model)
-            row = await read_card_row(
-                client,
-                int(request.OperationID),
-                int(request.ChannelID),
-                str(context["approval_id"]),
-            )
-        except Exception:
-            logger.warning("Stored approval card could not be read", exc_info=True)
-            return None
-        response = input_response_from_card_row(row)
-        if response is None:
-            return None
-        probe = SimpleNamespace(InputResponse=response)
-        if not approval_response_matches(probe, context):
-            logger.warning("Stored approval decision did not match the restored card; ignored")
-            return None
-        return response
-
     @staticmethod
     def _restore_subgoal_state(model: Any, contract: Any, raw: Any) -> None:
         """Keep the paused request's checkpointed subgoal progress after reinstalling its contract."""
@@ -1511,11 +1666,6 @@ class SageChat(Chat):
                 # lifecycle notice before the turn's own emitter (a set-aside card) reaches this
                 # channel instead of the legacy task RPC.
                 restored_model._response_emitter = ChatStreamEmitter(self, request)
-                if slash is None and getattr(request, "InputResponse", None) is None:
-                    recovered = await self._recover_offline_decision(request, restored_model)
-                    if recovered is not None:
-                        request.InputResponse = recovered
-                        restoration_notices.append(OFFLINE_DECISION_NOTICE)
                 if restoration_notices:
                     await self.send_response(
                         request,

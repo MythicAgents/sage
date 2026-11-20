@@ -115,3 +115,124 @@ def test_recorded_catalog_target_shapes_card_their_candidate(monkeypatch, tmp_pa
     [card] = run.cards
     assert card["data"]["arguments"]["action"]["name"] == procedure
     assert run.terminals == []
+
+
+REASK = json.loads((FIXTURES / "approval_reask_cards.json").read_text())
+
+
+@pytest.mark.parametrize("row", REASK["rows"], ids=[row["id"] for row in REASK["rows"]])
+def test_recorded_card_decided_while_down_is_reasked_not_applied(monkeypatch, tmp_path, no_network, row):
+    """A recorded decided card reaches the real on-start reconciler, checkpoint reader and validator.
+
+    Expected outcome changed by plan r2 (operator product decision): the stored decision is never
+    applied; the same exact action is re-asked with a new approval id in the same request.
+    """
+    from types import SimpleNamespace
+
+    import aiosqlite
+    from langgraph.checkpoint.base import empty_checkpoint
+    from langgraph.types import Interrupt
+    from mythic_container.SharedClasses import ContainerOnStartMessage
+
+    import sage_chat.restoration as restoration
+    import sage_chat.service as service
+    from ai.langgraph.sqlite_checkpointer import SageAsyncSqliteSaver
+    from sage_chat import session as chat_session
+    from sage_chat.headless import HeadlessSageChat
+    from sage_chat.hitl import approval_response_matches
+
+    assert REASK["provenance"]["kind"] and row["expected"]["reason"]
+    db_path = str(tmp_path / "sage.db")
+    monkeypatch.setattr(chat_session, "_CHANNEL_MARKER_DB_PATH", db_path)
+    checkpoint = row["checkpoint"]
+    record = row["channel_record"]
+    operation, channel = record["operation_id"], record["channel_id"]
+    request_row = row["request_row"]
+
+    class Mythic:
+        queries: list[str] = []
+
+        async def execute(self, query, variables):
+            self.queries.append(query)
+            if "sageOpenRequests" in query:
+                assert variables["op"] == operation and variables["container"] == "sage"
+                return {"chat_request": [request_row]}
+            if "sageRestoredCard" in query:
+                wanted = variables["ctx"]["input_requested"]["data"]["sage_approval_context"]["approval_id"]
+                card = row["card_row"]
+                echoed = card["metadata"]["input_requested"]["data"]["sage_approval_context"]["approval_id"]
+                return {"chat_message": [card] if echoed == wanted else []}
+            raise AssertionError(query)
+
+    mythic = Mythic()
+
+    async def execute_custom_query(client, query, variables=None):
+        return await client.execute(query, dict(variables or {}))
+
+    monkeypatch.setattr(restoration.mythic, "execute_custom_query", execute_custom_query)
+
+    class Watcher:
+        async def restore_operation(self, *args, **kwargs):
+            return None
+
+    class Chat(HeadlessSageChat):
+        async def _onstart_client(self, message):
+            return mythic
+
+        async def _construct_model(self, kwargs):
+            raise AssertionError("reconciliation must not build a Model")
+
+    async def scenario():
+        async with aiosqlite.connect(db_path) as conn:
+            saver = SageAsyncSqliteSaver(conn)
+            config = await saver.aput(
+                {"configurable": {"thread_id": checkpoint["thread_id"], "checkpoint_ns": ""}},
+                empty_checkpoint(), {"source": "loop", "step": 1, "parents": {}}, {},
+            )
+            await saver.aput_writes(
+                config,
+                [("__interrupt__", [Interrupt(value=checkpoint["interrupt_value"], id=checkpoint["interrupt_id"])])],
+                checkpoint["task_id"],
+            )
+        await chat_session.save_channel_session_record(record)
+        chat = Chat()
+        chat._findings_watcher = lambda: Watcher()
+        response = await chat.on_container_start(ContainerOnStartMessage(
+            container_name="sage", operation_id=operation, server_name="mythic", apitoken="onstart-token"))
+        saved = await chat_session.load_channel_session_record(operation, channel)
+        return chat, response, saved
+
+    try:
+        chat, response, saved = asyncio.run(scenario())
+    finally:
+        service._CHANNEL_TURN_LOCKS.clear()
+
+    assert no_network == []
+    assert response.EventLogErrorMessage == ""
+    on_request = chat.emissions
+    assert not [e for e in on_request if e.get("complete_request")], on_request
+    cards = [e["metadata"]["input_requested"] for e in on_request
+             if isinstance(e.get("metadata"), dict) and e["metadata"].get("special_type") == "input_requested"]
+    assert len(cards) == 1
+    new = cards[0]["data"]["sage_approval_context"]
+    old = row["card_row"]["metadata"]["input_requested"]["data"]["sage_approval_context"]
+    assert new["approval_id"] != row["expected"]["old_approval_id"]
+    assert new["action_digest"] == row["expected"]["action_digest"]
+    assert new["proposal_digest"] == row["expected"]["proposal_digest"]
+    for key in ("thread_id", "turn_id", "request_id", "request_contract_digest", "operation_id", "apitoken_id"):
+        assert new[key] == old[key], key
+    assert any("not applied" in str(e.get("content") or "") for e in on_request)
+    assert saved["pending"]["context"]["approval_id"] == new["approval_id"]
+    assert saved["claim"] is None
+
+    # The decision turn rebuilds its expectation from the saved record and the checkpoint.
+    action_requests = checkpoint["interrupt_value"]["action_requests"]
+    expected, _contract, reason = restoration.restored_pending_context(
+        saved["pending"], action_requests, checkpoint["thread_id"])
+    assert expected is not None, reason
+    old_answer = restoration.input_response_from_card_row(row["card_row"])
+    assert old_answer is not None
+    assert not approval_response_matches(SimpleNamespace(InputResponse=old_answer), expected)
+    from tests.test_hitl_steer_current_intent import _input_response
+
+    assert approval_response_matches(SimpleNamespace(InputResponse=_input_response("accept", cards[0])), expected)

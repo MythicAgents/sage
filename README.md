@@ -895,11 +895,17 @@ context. When Sage restarts with its database retained, an existing channel cont
 Sage rebuilds the session from the channel's saved record and its checkpoint, with its conversation,
 `/mode` override and engagement binding, and says so in the channel. Nothing that grants authority is carried
 over: the request's current Mythic identity and configuration must match what the session was saved under,
-and secrets are resolved fresh. A pending approval card still resolves only by an exact decision on that card;
-a decision made in Mythic while Sage was down is applied on the next request after the same validation, and
-Sage says the new message was not processed. An approved action interrupted by the restart is never resent:
-Sage reports the exact Mythic task it produced, or that its outcome is unknown, and the chat continues.
-A restart never restarts autonomous work, and a controller-owned autonomous approval is not resumed.
+and secrets are resolved fresh. A pending approval card still resolves only by an exact decision on that card.
+
+A restart leaves the request Sage was answering open in Mythic, and Mythic accepts no new prompt in that channel
+until it ends. When Mythic sends the container's startup message, Sage settles each such request without a model
+call or a task: a card still waiting stays open for your decision; a card you decided while Sage was down is
+asked again in the same request (that decision is never applied, and only an answer to the new card runs the
+action); any other request is closed with a notice. An approved action interrupted by the restart is never
+resent: your next message gets the exact Mythic task it produced, or says its outcome is unknown, and the chat
+continues. Mythic sends the startup message only to an operation with an active bot account assigned to it;
+without one, use Cancel on the open request in Mythic to free the channel. A restart never restarts autonomous
+work, and a controller-owned autonomous approval is not resumed.
 
 A channel still needs a fresh chat when its session ended on purpose (stop, cancel, an error, or a changed
 configuration or token), when its saved state cannot be read, or when a chat from before restorable sessions
@@ -1036,7 +1042,8 @@ the admitted canonical view; it has no mode, policy, BloodHound, MCP, sandbox, a
 Background polling separately requires `SAGE_WATCHER_APITOKEN` for an active bot in the watched operation. Its
 effective scopes must exactly match the documented read/delivery set; wildcard, missing, and excess scopes fail
 closed. Mythic's short-lived onStart token may read the active channel profile and create or reuse
-`#sage-findings`, then is discarded. It never becomes scheduler, model, or delivery authority.
+`#sage-findings`, and may settle chat requests a restart left open (see the restart contract above), then is
+discarded. It never becomes scheduler, model, delivery or tasking authority.
 
 After Sage starts:
 

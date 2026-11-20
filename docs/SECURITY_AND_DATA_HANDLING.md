@@ -53,7 +53,9 @@ the owner reapplies it; UI/environment-backed profiles may auto-resume after exa
 
 Cadence defaults to 300 seconds, accepts 5 through 86,400, and persists with pause state in the applied profile.
 Only the exact active locked owner may apply, scan, pause, resume, or change cadence. `/watcher status` never creates
-a loop. The onStart token may read the channel profile and bootstrap `#sage-findings`, then is discarded. The
+a loop. The onStart token may read the channel profile and bootstrap `#sage-findings`, and may settle Sage's chat
+requests that a restart left open (read them and their approval cards, post a notice, close a request or ask a
+decided card again), then is discarded. It never runs a task or a model call. The
 persistent background bot must present the exact frozen read/delivery scopes; wildcard and excess scopes fail
 closed.
 

@@ -1,0 +1,226 @@
+{
+ "provenance": {
+  "kind": "recorded native supervised approval card decided while Sage was down (live attempt 1 of the chat-restoration line, down case)",
+  "description": "Mythic request 13 in channel 8 (operation 1) raised one approval card (message 382) for `pwd` on callback 2. Sage was stopped, the operator accepted the card, and Mythic stored the decision without delivering it; the request stayed streaming. The card row and request row were read from Mythic's GraphQL API; the channel record and the paused HITL interrupt (parent checkpoint pending write) were read from the deployed Sage runtime database through SQLite's backup API (WAL-aware).",
+  "substitutions": "None. No secrets are present; operator and token identifiers are Mythic row ids.",
+  "not_a_replay": "The checkpoint holds only the recorded interrupt write, not the conversation. Mythic transport and the on-start login are stand-ins; the reconciler, checkpoint reader, card builder and validator are the real code."
+ },
+ "rows": [
+  {
+   "id": "down-case-request-13",
+   "request_row": {
+    "id": 13,
+    "channel_id": 8,
+    "operation_id": 1,
+    "status": "streaming"
+   },
+   "card_row": {
+    "id": 382,
+    "channel_id": 8,
+    "operation_id": 1,
+    "chat_request_id": 13,
+    "metadata": {
+     "special_type": "input_requested",
+     "input_requested": {
+      "choices": [],
+      "data": {
+       "action_digest": "7b45e781e23097afe797e413f5cf1870239ffaee43f713f72d8134b0de343b71",
+       "actions": [
+        {
+         "arguments": {
+          "callback_display_id": 2,
+          "command": "pwd",
+          "parameters": "",
+          "timeout": 300,
+          "token_id": null,
+          "visibility_context": {
+           "_sage_prepared_action": true,
+           "_sage_prepared_binding": {
+            "file": null,
+            "group": null,
+            "schema_digest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+           }
+          }
+         },
+         "display_name": "issue_task_and_waitfor_task_output",
+         "tool_name": "issue_task_and_waitfor_task_output"
+        }
+       ],
+       "arguments": {
+        "callback_display_id": 2,
+        "command": "pwd",
+        "parameters": "",
+        "timeout": 300,
+        "token_id": null,
+        "visibility_context": {
+         "_sage_prepared_action": true,
+         "_sage_prepared_binding": {
+          "file": null,
+          "group": null,
+          "schema_digest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+         }
+        }
+       },
+       "display_name": "issue_task_and_waitfor_task_output",
+       "guarded_action_count": 1,
+       "sage_approval_context": {
+        "action_digest": "7b45e781e23097afe797e413f5cf1870239ffaee43f713f72d8134b0de343b71",
+        "actions": [
+         {
+          "args": {
+           "callback_display_id": 2,
+           "command": "pwd",
+           "parameters": "",
+           "timeout": 300,
+           "token_id": null,
+           "visibility_context": {
+            "_sage_prepared_action": true,
+            "_sage_prepared_binding": {
+             "file": null,
+             "group": null,
+             "schema_digest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+            }
+           }
+          },
+          "name": "issue_task_and_waitfor_task_output"
+         }
+        ],
+        "apitoken_id": "3",
+        "approval_id": "cface80532f5402494378841a39fdf51",
+        "decision_context": "",
+        "operation_id": "1",
+        "proposal_digest": "bef08991613c29f03991eeb7c6b24c347061ca838df849719d840b528ce8a3f4",
+        "request_contract_digest": "e50e3d278a49ab8716f175864ecb87fa5d32eb649894ef49ff78d781f0894837",
+        "request_id": "chat:8:request:13",
+        "selection_mode": "single",
+        "thread_id": "8:generation:fd31badd7120449aa59cdca64aea98d8",
+        "tool_name": "issue_task_and_waitfor_task_output",
+        "turn_id": "chat:8:request:13"
+       },
+       "tool_name": "issue_task_and_waitfor_task_output"
+      },
+      "description": "Action 1: issue_task_and_waitfor_task_output (tool: issue_task_and_waitfor_task_output)\n  \u2022 callback_display_id: 2\n  \u2022 command: pwd\n  \u2022 parameters: \n  \u2022 timeout: 300\n  \u2022 token_id: None",
+      "input_type": "approval",
+      "prompt": "Sage wants to run the guarded action issue_task_and_waitfor_task_output. Accept approves; Reject denies without any reply; Respond denies the action and sends your typed text to Sage as steering guidance.",
+      "resolved_at": "2026-11-20T02:25:45Z",
+      "resolved_by": "mythic_admin",
+      "resolved_by_operator_id": 1,
+      "response": {
+       "action": "accept",
+       "input_request_message_id": 382,
+       "resolved_at": "2026-11-20T02:25:45Z",
+       "resolved_by": "mythic_admin",
+       "resolved_by_operator_id": 1
+      },
+      "status": "accepted",
+      "title": "Approve: issue_task_and_waitfor_task_output"
+     }
+    }
+   },
+   "channel_record": {
+    "apitoken_id": 3,
+    "base_autonomous_solve": false,
+    "channel_id": 8,
+    "claim": null,
+    "config_signature": "1bd372cd28cc7960749c4a7536418b9ba90917690ecb5c1856c9ed9fcc48ec44",
+    "engagement_uuid": "0ac249b0-503c-49fb-8565-1bb6b89ad498",
+    "mode_override": "",
+    "mode_override_base_autonomous_solve": null,
+    "mode_override_base_signature": "",
+    "operation_id": 1,
+    "pending": {
+     "context": {
+      "action_digest": "7b45e781e23097afe797e413f5cf1870239ffaee43f713f72d8134b0de343b71",
+      "apitoken_id": "3",
+      "approval_id": "cface80532f5402494378841a39fdf51",
+      "decision_context": "",
+      "operation_id": "1",
+      "proposal_digest": "bef08991613c29f03991eeb7c6b24c347061ca838df849719d840b528ce8a3f4",
+      "request_contract_digest": "e50e3d278a49ab8716f175864ecb87fa5d32eb649894ef49ff78d781f0894837",
+      "request_id": "chat:8:request:13",
+      "selection_mode": "single",
+      "thread_id": "8:generation:fd31badd7120449aa59cdca64aea98d8",
+      "tool_name": "issue_task_and_waitfor_task_output",
+      "turn_id": "chat:8:request:13"
+     },
+     "contract": {
+      "intent": "amend",
+      "lane": "supervised_workflow",
+      "parent_request_id": "",
+      "prohibited_actions": [],
+      "request_id": "chat:8:request:13",
+      "requested_actions": [
+       {
+        "action_id": "bc7dbba3e2ab637fbf5a491646e78a816b5c955563757ea3df349e06e520e957",
+        "arguments_digest": "a860f4bf02beca6f90cac5e8de9ad0e05647af606264e4ab864923363641f2e0",
+        "callback_id": "2",
+        "kind": "model_tool",
+        "name": "issue_task_and_waitfor_task_output",
+        "target": ""
+       }
+      ],
+      "revision": 1,
+      "schema_version": 1,
+      "scope": {
+       "callback_ids": [],
+       "channel_id": "8",
+       "operation_id": "1",
+       "targets": []
+      },
+      "stop_condition": {
+       "kind": "actions_complete",
+       "value": ""
+      }
+     }
+    },
+    "retired_reason": "",
+    "schema_version": 1,
+    "status": "active",
+    "thread_id": "8:generation:fd31badd7120449aa59cdca64aea98d8"
+   },
+   "checkpoint": {
+    "thread_id": "8:generation:fd31badd7120449aa59cdca64aea98d8",
+    "task_id": "25dabda7-d4e8-0e2c-2f1b-6deecc98c64f",
+    "interrupt_id": "a3b413bab4f25d77e566e2fcd427e3fa",
+    "interrupt_value": {
+     "action_requests": [
+      {
+       "name": "issue_task_and_waitfor_task_output",
+       "args": {
+        "command": "pwd",
+        "parameters": "",
+        "callback_display_id": 2,
+        "timeout": 300,
+        "token_id": null,
+        "visibility_context": {
+         "_sage_prepared_action": true,
+         "_sage_prepared_binding": {
+          "schema_digest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "group": null,
+          "file": null
+         }
+        }
+       },
+       "description": "Sage supervised mode \u2014 approve or deny this guarded tool call\n\nTool: issue_task_and_waitfor_task_output\nArgs: {'command': 'pwd', 'parameters': '', 'callback_display_id': 2, 'timeout': 300, 'token_id': None, 'visibility_context': {'_sage_prepared_action': True, '_sage_prepared_binding': {'schema_digest': '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945', 'group': None, 'file': None}}}"
+      }
+     ],
+     "review_configs": [
+      {
+       "action_name": "issue_task_and_waitfor_task_output",
+       "allowed_decisions": [
+        "approve",
+        "reject"
+       ]
+      }
+     ]
+    }
+   },
+   "expected": {
+    "action_digest": "7b45e781e23097afe797e413f5cf1870239ffaee43f713f72d8134b0de343b71",
+    "proposal_digest": "bef08991613c29f03991eeb7c6b24c347061ca838df849719d840b528ce8a3f4",
+    "old_approval_id": "cface80532f5402494378841a39fdf51",
+    "reason": "Operator product decision (plan r2): a card decision stored while Sage was down is never applied; the same exact action is re-asked in the same request."
+   }
+  }
+ ]
+}
