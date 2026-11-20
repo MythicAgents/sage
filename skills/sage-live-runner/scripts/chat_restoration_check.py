@@ -18,8 +18,8 @@ Order (see the plan named in the run file):
   propose                         the restored feature chat is asked to run pwd once; its card is
                                   case `queued_accept` (the model seam after a restart)
   card --as queued_reject         a second supervised card
-  queued                          restart with both cards pending; accept/reject them as soon as Mythic
-                                  shows Sage running (before Sage consumes); wait for both requests
+  queued                          restart with both cards pending; once Mythic shows Sage running, accept
+                                  the first and wait for its request to end, then reject the second
   card --as down_accept / card --as down_reject
   down                            stop Sage; decide both cards while Mythic records it stopped; start and
                                   send nothing; select Continue on each Continue/Stop card
@@ -29,6 +29,9 @@ Order (see the plan named in the run file):
 
 Pass rules are written in `verify` before any run and read Mythic's own rows: request status,
 message text and card metadata, and the callback's task rows. Sage's SQLite is never the proof.
+Each case's tasks are the ones Mythic created between its own answer and its request's end, and
+its request's own rows must name them; cases are answered one at a time, and a `pwd` task that
+belongs to no case, or to more than one, fails the run.
 """
 
 from __future__ import annotations
@@ -76,8 +79,8 @@ CHANGED_FILES = (
     "Payload_Type/sage/ai/langgraph/mythic_tools.py",
     "Payload_Type/sage/ai/langgraph/request_contract.py",
 )
-BUDGET = {"minutes": 35, "approved_pwd_tasks": 3, "service_restarts": 8, "model_calls": 24,
-          "total_tokens": 480_000, "output_tokens_per_call": 4096, "retries": 0}
+BUDGET = {"minutes": 35, "approved_pwd_tasks": 3, "service_restarts": 8, "model_calls": 30,
+          "total_tokens": 560_000, "output_tokens_per_call": 4096, "retries": 0}
 TERMINAL = {"complete", "error", "cancelled"}
 
 CALLBACK_QUERY = """
@@ -352,6 +355,7 @@ async def _duplicate(client: Any, request_id: int) -> str:
 async def _finish(client: Any, case: dict[str, Any]) -> None:
     request_id = case["card_request"]["request_id"]
     ended = await _wait_status(client, request_id, lambda snap: snap["request"].get("status") in TERMINAL, 600)
+    case["tasks_at_terminal"] = await _max_task(client)
     case["request_status"] = ended["request"].get("status")
     case["duplicate"] = await _duplicate(client, request_id)
     case["tasks_after"] = await _max_task(client)
@@ -359,7 +363,7 @@ async def _finish(client: Any, case: dict[str, Any]) -> None:
 
 
 async def cmd_queued(client: Any, run: dict[str, Any], _args: argparse.Namespace) -> dict[str, Any]:
-    """Restart with both cards pending and decide them while Sage boots, before it consumes."""
+    """Restart with both cards pending; decide each once Mythic shows Sage running, one at a time."""
     _count_restart(run)
     cases = {name: run["cases"][name] for name in ("queued_accept", "queued_reject")}
     subprocess.run(["docker", "compose", "stop", "sage"], cwd=_mythic_dir(), check=True)
@@ -371,16 +375,18 @@ async def cmd_queued(client: Any, run: dict[str, Any], _args: argparse.Namespace
     for name, case in cases.items():
         request_id = case["card_request"]["request_id"]
         decide = nc.approve_pending_input_card if name == "queued_accept" else nc.reject_pending_input_card
+        case["tasks_at_answer"] = await _max_task(client)
         try:
             case["decision"] = await decide(client, request_id)
         except Exception as exc:
             case["decision"] = f"{type(exc).__name__}: {exc}"
         case["decided_at"] = time.time()
         case["mythic_saw_running"] = running
+        # The next case is answered only after this request ends, so each window is its own.
+        await _finish(client, case)
     case_returncode = starting.wait(timeout=600)
     for case in cases.values():
         case["start_returncode"] = case_returncode
-        await _finish(client, case)
     return cases
 
 
@@ -410,7 +416,7 @@ async def cmd_down(client: Any, run: dict[str, Any], _args: argparse.Namespace) 
             c["kind"] == "control" and c["status"] == "pending"
             for c in _input_cards(snap["messages"], request_id)))
         case["cards_at_offer"] = _input_cards(offered["messages"], request_id)
-        case["tasks_before_answer"] = await _max_task(client)
+        case["tasks_before_answer"] = case["tasks_at_answer"] = await _max_task(client)
         if any(c["kind"] == "control" and c["status"] == "pending" for c in case["cards_at_offer"]):
             case["continue"] = await _select_continue(client, request_id)
         await _finish(client, case)
@@ -421,6 +427,7 @@ async def cmd_crash(client: Any, run: dict[str, Any], args: argparse.Namespace) 
     case = run["cases"][args.as_]
     _count_restart(run)
     before = case["tasks_before"]
+    case["tasks_at_answer"] = await _max_task(client)
     await nc.approve_pending_input_card(client, case["card_request"]["request_id"])
     deadline = time.monotonic() + 120
     issued: list[dict[str, Any]] = []
@@ -436,6 +443,7 @@ async def cmd_crash(client: Any, run: dict[str, Any], args: argparse.Namespace) 
     ended = await _wait_status(client, case["card_request"]["request_id"],
                                lambda snap: snap["request"].get("status") in TERMINAL)
     case["request_status_after_start"] = ended["request"].get("status")
+    case["tasks_at_terminal"] = await _max_task(client)
     case["next_request"] = await _send(client, case["channel_id"], NEXT_PROMPT)
     case["tasks_after"] = await _max_task(client)
     return case
@@ -444,6 +452,50 @@ async def cmd_crash(client: Any, run: dict[str, Any], args: argparse.Namespace) 
 def _text(messages: list[dict[str, Any]], request_id: Any) -> str:
     return "\n".join(str(m.get("message") or "") for m in messages
                      if m.get("chat_request_id") == request_id)
+
+
+def _named_tasks(messages: list[dict[str, Any]], request_id: int, callback: Any) -> set[int]:
+    """Mythic task ids the request's own task cards name (`mythic-task:<callback>:<task>`)."""
+    prefix = f"mythic-task:{callback}:"
+    named = set()
+    for m in messages:
+        tool = (m.get("metadata") or {}).get("tool_use") or {}
+        call_id = str(tool.get("tool_call_id") or "")
+        if m.get("chat_request_id") == request_id and call_id.startswith(prefix):
+            try:
+                named.add(int(call_id[len(prefix):]))
+            except ValueError:
+                continue
+    return named
+
+
+def _decision_refused(decision: Any) -> bool:
+    """Mythic did not accept the queued decision (an exception, or a response other than success)."""
+    return not isinstance(decision, dict) or (decision.get("response") or {}).get("status") != "success"
+
+
+def _mode_source(run: dict[str, Any], case: dict[str, Any]) -> str:
+    feature = run["cases"].get("feature") or {}
+    if case.get("channel_id") == feature.get("channel_id"):
+        override = feature.get("mode_override")
+        return f"/mode {override}" if override else "configured conversation"
+    return "configured supervised"  # `card` creates a supervised-configured channel
+
+
+ATTRIBUTED = ("queued_accept", "queued_reject", "down_accept", "down_reject", "crash")
+MODE_SOURCES = {"queued_accept": "/mode supervised", "down_accept": "configured supervised"}
+
+
+def _attribution(pwd: list[dict[str, Any]], cases: dict[str, Any]) -> dict[int, list[str]]:
+    """Each pwd task's owners: the cases whose (answer, terminal] window contains it."""
+    windows = {}
+    for name in ATTRIBUTED:
+        case = cases.get(name) or {}
+        lower, upper = case.get("tasks_at_answer"), case.get("tasks_at_terminal")
+        if case.get("card_request") and lower is not None and upper is not None:
+            windows[name] = (int(lower), int(upper))
+    return {int(t["display_id"]): [name for name, (lower, upper) in windows.items()
+                                   if lower < int(t["display_id"]) <= upper] for t in pwd}
 
 
 def _tool_statuses(messages: list[dict[str, Any]], request_id: int) -> list[str]:
@@ -473,26 +525,39 @@ async def cmd_verify(client: Any, run: dict[str, Any], _args: argparse.Namespace
             "label_retained": LABEL in text,
         }
     verdicts["recall_created_no_task"] = not run.get("recall_tasks")
+    owners = _attribution(pwd, run["cases"])
     for name, expected in (("queued_accept", 1), ("queued_reject", 0), ("down_accept", 1),
                            ("down_reject", 0), ("crash", 1)):
         case = run["cases"].get(name)
         if not case or not case.get("card_request"):
             verdicts[name] = "not run"
             continue
-        upper = case.get("tasks_after")
-        own = [t for t in pwd if int(t["display_id"]) > int(case["tasks_before"])
-               and (upper is None or int(t["display_id"]) <= int(upper))]
+        own = [t for t in pwd if owners[int(t["display_id"])] == [name]]
         messages = await _messages(client, case["channel_id"])
-        detail: dict[str, Any] = {"pwd_tasks": len(own), "expected": expected}
+        detail: dict[str, Any] = {"pwd_tasks": len(own), "task_ids": [int(t["display_id"]) for t in own],
+                                  "expected": expected, "mode_source": _mode_source(run, case)}
         if name == "crash":
             detail.update(_verify_crash(case, own, messages, statuses))
         else:
             detail.update(_verify_resolved(name, case, own, expected, messages, statuses, callback))
+            if name in MODE_SOURCES:
+                detail["mode_source_ok"] = detail["mode_source"] == MODE_SOURCES[name]
+                if detail["pass"] is True and not detail["mode_source_ok"]:
+                    detail["pass"] = False
         verdicts[name] = detail
+    verdicts["unattributed_pwd_tasks"] = sorted(task for task, names in owners.items() if len(names) != 1)
     verdicts["approved_pwd_tasks"] = len(pwd)
     verdicts["within_task_budget"] = len(pwd) <= BUDGET["approved_pwd_tasks"]
     verdicts["restarts"] = run.get("restarts", 0)
     verdicts["within_restart_budget"] = int(run.get("restarts", 0)) <= BUDGET["service_restarts"]
+    # Any pwd task not assigned to exactly one case fails the run, whatever the cases say.
+    verdicts["pass"] = (
+        not verdicts["unattributed_pwd_tasks"]
+        and all(isinstance(verdicts[name], dict) and verdicts[name].get("pass") is True
+                for name in ("legacy", "feature", *ATTRIBUTED))
+        and verdicts["recall_created_no_task"] and verdicts["within_task_budget"]
+        and verdicts["within_restart_budget"]
+    )
     run["verify"] = verdicts
     return verdicts
 
@@ -516,8 +581,10 @@ def _verify_resolved(name: str, case: dict[str, Any], own: list[dict[str, Any]],
         "controls": [(c["message_id"], c["status"]) for c in controls],
         "next_request_status": statuses.get(int(next_request.get("request_id") or 0)),
         "duplicate": case.get("duplicate"),
+        "tasks_named_by_request": {int(t["display_id"]) for t in own} <= _named_tasks(messages, request_id, callback),
     }
-    common = (len(own) == expected and checks["request_status"] == "complete"
+    common = (len(own) == expected and checks["tasks_named_by_request"]
+              and checks["request_status"] == "complete"
               and not checks["lifecycle_error"] and not checks["pending_cards_left"]
               and checks["one_approval_card"] and checks["next_request_status"] == "complete"
               and not str(case.get("duplicate", "")).startswith("accepted"))
@@ -533,12 +600,16 @@ def _verify_resolved(name: str, case: dict[str, Any], own: list[dict[str, Any]],
                                          and args.get("callback_display_id") == callback)
         common = common and checks["seam_exact_proposal"]
     if name.startswith("queued"):
-        # Elicited only when on-start saw the decision before Sage consumed it: a control exists and
-        # the operator never answered it (the original delivery won and retired it).
-        checks["race_elicited"] = bool(controls)
+        # Either delivery order counts; the order is Mythic's and is recorded as an observation.
+        checks["delivery_order"] = "startup_offer_first" if controls else "original_first"
         checks["control_unanswered"] = all(c["status"] == "cancelled" for c in controls)
-        checks["pass"] = (common and checks["race_elicited"] and checks["control_unanswered"]
-                          and not checks["stale_notice"]) if checks["race_elicited"] else "not run"
+        if name == "queued_accept":
+            checks["task_output"] = len(own) == 1 and bool(own[0].get("completed"))
+            common = common and checks["task_output"]
+        checks["decision_refused"] = _decision_refused(case.get("decision"))
+        not_run = checks["decision_refused"] or case.get("mythic_saw_running") is False
+        checks["pass"] = "not run" if not_run else (
+            common and checks["control_unanswered"] and not checks["stale_notice"])
     else:
         before = case.get("tasks_before_answer")
         early = [t for t in own if before is not None and int(t["display_id"]) <= int(before)]
