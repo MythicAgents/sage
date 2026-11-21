@@ -198,6 +198,72 @@ def test_success_clears_the_cache(tmp_path: Path, spy: ConnectSpy, monkeypatch) 
     assert spy.calls == 3, "the cache survived a successful connect"
 
 
+# The spy's failure is the recorded failed-start shape (live attempt 1, 2026-11-21: Sage container log 15:41 UTC and
+# the chip tooltip in its run file), as the connect outcome reports it.
+RECORDED_FAILURE = "Failed to connect to BloodHound MCP: McpError: Connection closed"
+
+
+def _head(message: str) -> str:
+    """The outcome's first paragraph: what the chip, the guard and the turn state read."""
+    return message.split("\n\n", 1)[0]
+
+
+def test_a_skipped_connect_names_the_last_failure(tmp_path: Path, spy: ConnectSpy) -> None:
+    """Every turn after the first reads the skip. Without the cause it names no failure at all."""
+    _write_dir_env(tmp_path, FULL_CREDENTIALS)
+    _, first = _connect(tmp_path)
+    assert _head(first) == RECORDED_FAILURE, "precondition: the first outcome is the recorded shape"
+
+    for _ in range(2):
+        connected, message = _connect(tmp_path)
+        assert connected is False
+        assert _head(message).startswith("BloodHound MCP connect skipped: this exact credential set already failed")
+        assert _head(message).endswith(f"Last failure: {RECORDED_FAILURE}."), message
+
+    assert spy.calls == 1, "naming the failure must not retry it"
+
+
+def test_after_a_success_the_skip_names_the_newer_failure(
+    tmp_path: Path, spy: ConnectSpy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A success clears the stored failure; a later, different failure of the same set is the one named."""
+    _write_dir_env(tmp_path, FULL_CREDENTIALS)
+    _connect(tmp_path)
+    spy.succeed = True
+    _write_dir_env(tmp_path, {**FULL_CREDENTIALS, "BLOODHOUND_TOKEN_KEY": "corrected-key"})
+    assert _connect(tmp_path)[0] is True
+    # Pairing invariant: the signature and its outcome are written and cleared together, so after a success
+    # neither is held. Not otherwise observable, since a skip needs a new failure, which writes a new outcome.
+    assert getattr(bloodhound_config, "_failed_credential_outcome", None) is None
+
+    async def ce_silent(*_args, **_kwargs):
+        return False, "Nothing accepted a connection at that address."
+
+    monkeypatch.setattr(bloodhound_config, "probe_bloodhound_reachable", ce_silent)
+    connected, newer = _connect(tmp_path)
+    assert connected is False and spy.calls == 3
+    _, skipped = _connect(tmp_path)
+    assert spy.calls == 3
+    assert _head(skipped).endswith(f"Last failure: {_head(newer)}"), skipped
+    assert RECORDED_FAILURE not in skipped
+
+
+def test_only_the_skip_carries_the_last_failure(tmp_path: Path, spy: ConnectSpy) -> None:
+    """A changed credential set gets its own attempt and outcome; a forced reconnect reports only itself."""
+    _write_dir_env(tmp_path, FULL_CREDENTIALS)
+    _connect(tmp_path)
+    _connect(tmp_path)
+
+    _write_dir_env(tmp_path, {**FULL_CREDENTIALS, "BLOODHOUND_TOKEN_KEY": "corrected-key"})
+    _, changed = _connect(tmp_path)
+    assert spy.calls == 2
+    assert _head(changed) == RECORDED_FAILURE and "Last failure" not in changed
+
+    _, forced = _connect(tmp_path, force=True)
+    assert spy.calls == 3
+    assert _head(forced) == RECORDED_FAILURE and "Last failure" not in forced
+
+
 def test_force_bypasses_both_the_cache_and_the_preflight(tmp_path: Path, spy: ConnectSpy) -> None:
     """An explicit operator reconnect always gets a real attempt.
 

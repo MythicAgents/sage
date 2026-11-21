@@ -452,6 +452,40 @@ def test_the_guard_explains_a_configured_bloodhound_that_did_not_connect(monkeyp
     _no_secret(process.chat)
 
 
+def test_a_configured_connect_failure_is_named_on_every_turn(monkeypatch):
+    """Live attempt 1 (2026-11-21): turn 1 named the failed start; turns 2 and 3 hit the failed-credential skip, whose
+    outcome named no failure, so the chip and the guard stopped saying what failed. ``McpError: Connection closed`` is
+    the recorded failed-start shape (Sage container log, 15:41 UTC). Only the subprocess start is stubbed."""
+    wire = ProviderWire()
+    install_wire(monkeypatch, wire)
+    attempts = _connects(monkeypatch, None, error="McpError: Connection closed")
+
+    async def scenario():
+        process = _process()
+        chips = []
+        for request_id in (1, 2):
+            await process.chat.chat(request(PROMPT, request_id, _config(bloodhound=True)))
+            chips.append(_chip(process.chat))
+        wire.script[:] = [ROUTE, [text_item("Here is what BloodHound reported.", 2)]]
+        mark = len(process.chat.emissions)
+        await process.chat.chat(request(GRAPH_PROMPT, 3, _config(bloodhound=True)))
+        chips.append(_chip(process.chat))
+        return process, chips, "\n".join(texts(process.chat)[mark:])
+
+    process, chips, joined = asyncio.run(scenario())
+    assert len(attempts) == 1, "an unchanged failed credential set must still not be retried"
+    assert _rows(process.chat) == []
+    assert [chip["value"] for chip in chips] == ["unavailable"] * 3
+    for turn, chip in enumerate(chips, 1):
+        assert "Failed to connect to BloodHound MCP" in chip["tooltip"], (turn, chip["tooltip"])
+    assert "BloodHound is configured but not connected" in joined, joined
+    assert "did not read any graph data" in joined
+    assert "Failed to connect to BloodHound MCP" in joined, joined
+    assert "BloodHound is not configured" not in joined, "must not fall back to the setup text"
+    assert not _bloodhound_agent_ran(wire)
+    _no_secret(process.chat)
+
+
 def test_the_guard_fires_on_a_live_session_whose_ce_refuses(monkeypatch):
     server = OfflineBloodHound("down")
     _connects(monkeypatch, server)

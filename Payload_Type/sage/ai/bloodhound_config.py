@@ -449,6 +449,9 @@ def resolvable_credential_keys(
 #: hashed, never stored: this module must not hold a credential in memory any longer than the connect
 #: attempt itself, and a signature is only ever compared for equality.
 _failed_credential_signature: Optional[str] = None
+#: The first sentence of that failure's outcome, sanitized. Written and cleared together with the signature, so it
+#: always names the failure the signature stands for; the skip repeats it, because every later turn reads the skip.
+_failed_credential_outcome: Optional[str] = None
 
 
 def _credential_signature(
@@ -1040,8 +1043,16 @@ def bloodhound_lost_chat_notice(state: BloodHoundTurnState) -> str:
 
 def reset_bloodhound_connect_cache() -> None:
     """Forget the last failure so the next call attempts a real connect."""
-    global _failed_credential_signature
-    _failed_credential_signature = None
+    global _failed_credential_signature, _failed_credential_outcome
+    _failed_credential_signature = _failed_credential_outcome = None
+
+
+def _remember_failure(signature: str, message: str) -> str:
+    """Record a failed credential set with its outcome's first sentence; return the outcome unchanged."""
+    global _failed_credential_signature, _failed_credential_outcome
+    _failed_credential_signature = signature
+    _failed_credential_outcome = _first_paragraph(message)
+    return message
 
 
 async def ensure_bloodhound_connected(
@@ -1078,7 +1089,7 @@ async def ensure_bloodhound_connected(
         else ""
     )
 
-    global _failed_credential_signature
+    global _failed_credential_signature, _failed_credential_outcome
     signature = _credential_signature(directory, env)
     resolvable = resolvable_credential_keys(directory, env)
     missing = [k for k in BLOODHOUND_REQUIRED_CREDENTIAL_KEYS if k not in resolvable]
@@ -1097,39 +1108,44 @@ async def ensure_bloodhound_connected(
     # refusal blocks a connect that might have worked, and the operator has already accepted the cost
     # of one attempt by asking for it.
     if missing and not force:
-        _failed_credential_signature = signature
-        return False, (
+        return False, _remember_failure(signature, (
             "BloodHound MCP connect not attempted: required credentials are unset, so the server "
             f"would exit during startup.\n\n{credential_diagnostic(env)}{lost}"
-        )
+        ))
 
     # An unchanged credential set that already failed is not retried. Keyed on the exact inputs,
     # so correcting a token invalidates it immediately; a successful connect clears it outright.
+    # The skip names the failure it repeats: it is what every turn after the first reads, so without the
+    # cause the chip, the guard and the log would stop saying what failed.
     if not force and _failed_credential_signature == signature:
+        last = _failed_credential_outcome or ""
+        if last:
+            last = f" Last failure: {last}" + ("" if last.endswith((".", "!", "?")) else ".")
         return False, (
             "BloodHound MCP connect skipped: this exact credential set already failed and nothing "
-            "about it has changed. Update the configuration to trigger a fresh attempt.\n\n"
+            f"about it has changed. Update the configuration to trigger a fresh attempt.{last}\n\n"
             f"{credential_diagnostic(env)}{lost}"
         )
 
     try:
         success, err = await MCPManager.connect_server(config)
     except Exception as e:
-        _failed_credential_signature = signature
-        return False, f"BloodHound MCP connect raised: {e}\n\n{credential_diagnostic(env)}{lost}"
+        return False, _remember_failure(
+            signature, f"BloodHound MCP connect raised: {e}\n\n{credential_diagnostic(env)}{lost}"
+        )
     if success:
         # The handshake succeeded, which says the subprocess started. It does NOT say BloodHound
         # answered — so the claim is withheld until one real read proves it.
         reachable, probe_detail = await probe_bloodhound_reachable()
         if not reachable:
-            _failed_credential_signature = signature
-            return False, (
+            return False, _remember_failure(signature, (
                 "BloodHound MCP started, but BloodHound CE did not answer a read, so the connection "
                 f"is NOT usable.\n\n{probe_detail}{lost}"
-            )
-        _failed_credential_signature = None
+            ))
+        _failed_credential_signature = _failed_credential_outcome = None
         n = len(MCPManager.get_tools_by_server(BLOODHOUND_SERVER_NAME))
         verb = "Reconnected to" if replacing else "Connected to"
         return True, f"{verb} BloodHound MCP ({n} tools), verified by a live domain read."
-    _failed_credential_signature = signature
-    return False, f"Failed to connect to BloodHound MCP: {err}\n\n{credential_diagnostic(env)}{lost}"
+    return False, _remember_failure(
+        signature, f"Failed to connect to BloodHound MCP: {err}\n\n{credential_diagnostic(env)}{lost}"
+    )
