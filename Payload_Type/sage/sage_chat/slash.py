@@ -1063,9 +1063,9 @@ async def _handle_stop(request: ChatRequest, model: Any = None) -> str:
     except ImportError:  # pragma: no cover
         from sage_chat.session import drop_channel_session  # type: ignore
     try:
-        from ai.acp import ACP_MANAGER
+        from ai.acp_connections import ACP_MANAGER
     except ImportError:  # pragma: no cover
-        from ..ai.acp import ACP_MANAGER  # type: ignore
+        from ..ai.acp_connections import ACP_MANAGER  # type: ignore
     # Close this channel's coding-agent connection first: it needs no graph session and its saved selection
     # stays, so an explicit `/acp connect` restores it.
     acp_closed = await ACP_MANAGER.close_channel((int(request.OperationID), int(request.ChannelID)))
@@ -1080,9 +1080,9 @@ async def _handle_stop(request: ChatRequest, model: Any = None) -> str:
 async def _handle_acp(request: ChatRequest, arg: str) -> str:
     """Configure the channel's coding-agent connection. Never builds a Sage model or sends a prompt."""
     try:
-        from ai.acp import ACP_MANAGER, ACP_USAGE, PROFILES, AcpError, render_models, render_status
+        from ai.acp_connections import ACP_MANAGER, ACP_USAGE, PROFILES, AcpError, render_models, render_status
     except ImportError:  # pragma: no cover
-        from ..ai.acp import ACP_MANAGER, ACP_USAGE, PROFILES, AcpError, render_models, render_status  # type: ignore
+        from ..ai.acp_connections import ACP_MANAGER, ACP_USAGE, PROFILES, AcpError, render_models, render_status  # type: ignore
     try:
         from .session import delete_acp_binding, load_acp_binding, save_acp_binding
     except ImportError:  # pragma: no cover

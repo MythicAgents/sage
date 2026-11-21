@@ -22,7 +22,7 @@ import time
 import pytest
 from mythic_container.ChatBase import ChatSlashCommandInvocation
 
-import ai.acp as acp_module
+import ai.acp_connections as acp_module
 import sage_chat.service as service
 import sage_chat.session as chat_session
 from sage_chat.headless import HeadlessSageChat, build_chat_request
@@ -71,6 +71,7 @@ async def _send(chat, argument="", **kwargs):
     emitted = chat.terminal_emissions[before:]
     assert len(emitted) == 1, emitted
     assert emitted[0]["complete_request"] is True
+    assert emitted[0]["kind"] == "complete", emitted[0]   # an error terminal carries the exception text
     return emitted[0]["content"]
 
 
@@ -715,3 +716,13 @@ def test_grouped_select_options_flatten_to_exact_values():
         {"value": "a", "name": "A", "group": "Fast"}, {"value": "b", "name": "B", "group": ""}]
     recorded = acp_module.model_option(RECORDED["session_new"]["configOptions"])
     assert len(acp_module._flatten_select(recorded)) == 11
+
+
+def test_sage_modules_never_shadow_the_acp_sdk():
+    # Some tools and tests put Sage's `ai/` directory itself on sys.path; a module there named like the SDK's
+    # top-level package would then replace it ("'acp' is not a package"), failing every connect.
+    import importlib.machinery
+
+    ai_dir = str(Path(acp_module.__file__).resolve().parent)
+    assert importlib.machinery.PathFinder.find_spec("acp", [ai_dir]) is None
+    import acp.connection  # noqa: F401  (the SDK still resolves)

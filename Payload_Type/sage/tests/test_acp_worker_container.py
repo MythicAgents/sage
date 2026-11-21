@@ -25,7 +25,7 @@ import uuid
 import pytest
 from mythic_container.ChatBase import ChatSlashCommandInvocation
 
-import ai.acp as acp_module
+import ai.acp_connections as acp_module
 import sage_chat.session as chat_session
 from sage_chat.headless import HeadlessSageChat, build_chat_request
 
