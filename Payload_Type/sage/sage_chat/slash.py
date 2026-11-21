@@ -60,6 +60,10 @@ SAGE_SLASH_COMMANDS = [
         Name="mode",
         Description="Show or set the agent mode: /mode [conversation|supervised|auto].",
     ),
+    ChatSlashCommandDefinition(
+        Name="model",
+        Description="Show or change this chat's model: /model [name]. The conversation continues with the new model.",
+    ),
     _STOP_COMMAND,
     ChatSlashCommandDefinition(Name="mcp", Description="Manage MCP servers: /mcp list | /mcp tools [server] | /mcp call <server> <tool> <json-object> | /mcp connect <json> | /mcp disconnect <name>."),
     ChatSlashCommandDefinition(Name="bloodhound", Description="Connect the BloodHound MCP: /bloodhound [directory] | /bloodhound force [directory] to rebind an existing connection with current credentials."),
@@ -1069,6 +1073,8 @@ async def handle_slash(chat: Any, request: ChatRequest, model: Any, response_key
     arg = getattr(sc, "Argument", "") or ""
     if name == "mode":
         text = _handle_mode(model, arg)
+    elif name == "model":
+        text = await chat.handle_model_command(request, model, arg)
     elif name == "report":
         text = await _handle_report(chat, request, model, arg)
     elif name in {"finding", "findings"}:
@@ -1101,7 +1107,8 @@ async def handle_slash(chat: Any, request: ChatRequest, model: Any, response_key
     else:
         text = (
             "Unknown Sage slash command. Available commands: `/findings`, `/watcher`, `/state`, "
-            "`/report [identity]`, `/list`, `/tools`, `/mode`, `/stop`, `/mcp`, `/bloodhound`, and `/sandbox`."
+            "`/report [identity]`, `/list`, `/tools`, `/mode`, `/model`, `/stop`, `/mcp`, `/bloodhound`, and "
+            "`/sandbox`."
         )
     await chat.send_complete(request, response_key, content=text, complete_request=True)
     return True

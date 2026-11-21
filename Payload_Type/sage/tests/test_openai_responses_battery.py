@@ -90,3 +90,71 @@ def test_recorded_plain_text_answer_reads_as_its_text(reader):
     value = {"render": lambda: _render(answer), "text": lambda: _message_content_as_text(answer.content),
              "sole": lambda: _sole_provider_text(answer.content)}[reader]()
     assert value.strip() == row["expected"]["text"]
+
+
+def _history(row, call):
+    return [HumanMessage(row["prompt"]), call,
+            ToolMessage(content=row["tool_result"], tool_call_id=row["expected"]["call_id"])]
+
+
+def test_recorded_rows_replay_to_another_model_with_calls_results_and_text_intact():
+    """Cross-model replay of the recorded gpt-6-cyber rows (they hold no reasoning item; see provenance gap)."""
+    row = ROWS["supervisor_tool_round_trip"]
+    call = _message(row["call"])
+    history = _history(row, call)
+    same, same_changed = _sanitize_model_messages(history, configured_model="gpt-6-cyber")
+    other, other_changed = _sanitize_model_messages(history, configured_model="gpt-5.6-sol")
+    assert not same_changed and same[1] is call
+    assert not other_changed and other[1] is call
+    items = _construct_responses_api_input(other, store=False)
+    assert [item.get("type") for item in items] == ["message", "function_call", "function_call_output"]
+    assert items[1]["call_id"] == items[2]["call_id"] == row["expected"]["call_id"]
+    plain = _message(ROWS["plain_text_answer"]["answer"])
+    cleaned, changed = _sanitize_model_messages([HumanMessage("hi"), plain], configured_model="gpt-5.6-sol")
+    assert not changed and cleaned[1] is plain
+
+
+def _with_reasoning(call: AIMessage, *, stamp: str | None, provider_name: str) -> AIMessage:
+    """Synthetic: an encrypted reasoning item added before the recorded call, as the adapter lays it out."""
+    metadata = {**call.response_metadata, "model_name": provider_name}
+    if stamp is not None:
+        metadata["sage_model"] = stamp
+    reasoning = {"type": "reasoning", "id": "rs_synthetic", "summary": [], "encrypted_content": "opaque-synthetic"}
+    return call.model_copy(update={"content": [reasoning, *call.content], "response_metadata": metadata})
+
+
+@pytest.mark.parametrize("stamp,provider_name,configured,kept", [
+    ("gpt-6-cyber", "gpt-6-cyber-2026-11-01", "gpt-6-cyber", True),   # a dated provider name is not compared
+    ("gpt-6-cyber", "gpt-6-cyber", "gpt-5.6-sol", False),             # another model: reasoning dropped
+    (None, "gpt-6-cyber", "gpt-6-cyber", True),                       # unstamped, exact provider name
+    (None, "gpt-6-cyber-2026-11-01", "gpt-6-cyber", False),           # unstamped and unsure: safe direction
+    (None, "gpt-6-cyber", "gpt-6", False),                            # a prefix is not the same model
+])
+def test_reasoning_replays_only_to_the_model_sage_had_configured(stamp, provider_name, configured, kept):
+    row = ROWS["supervisor_tool_round_trip"]
+    call = _with_reasoning(_message(row["call"]), stamp=stamp, provider_name=provider_name)
+    cleaned, changed = _sanitize_model_messages(_history(row, call), configured_model=configured)
+    replayed = cleaned[1]
+    types = [block["type"] for block in replayed.content]
+    if kept:
+        assert not changed and replayed is call
+    else:
+        assert changed and types == ["function_call"] and replayed.tool_calls == call.tool_calls
+    items = _construct_responses_api_input(cleaned, store=False)
+    assert ("reasoning" in [item.get("type") for item in items]) is kept
+    assert [item.get("type") for item in items][-2:] == ["function_call", "function_call_output"]
+
+
+@pytest.mark.parametrize("block", [
+    {"type": "thinking", "thinking": "synthetic", "signature": "sig-synthetic"},
+    {"type": "redacted_thinking", "data": "synthetic"},
+    {"type": "reasoning_content", "reasoning_content": {"text": "synthetic", "signature": "sig"}},
+])
+def test_other_providers_signed_reasoning_is_not_sent_to_another_model(block):
+    """Synthetic Anthropic and Bedrock reasoning blocks: Sage does not enable them, so none is recorded."""
+    message = AIMessage(content=[block, {"type": "text", "text": "Answer text."}],
+                        response_metadata={"sage_model": "claude-sonnet-5"})
+    cleaned, changed = _sanitize_model_messages([HumanMessage("hi"), message], configured_model="claude-opus-5")
+    assert changed and cleaned[1].content == [{"type": "text", "text": "Answer text."}]
+    same, same_changed = _sanitize_model_messages([HumanMessage("hi"), message], configured_model="claude-sonnet-5")
+    assert not same_changed and same[1] is message

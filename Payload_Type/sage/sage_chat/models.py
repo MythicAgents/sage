@@ -71,9 +71,11 @@ _CONFIG_OPTIONS = [
     ChatModelConfigurationOption(
         Name="model",
         DisplayName="Model",
-        DisplayAsChip=True,
         Type=OptType.String,
-        Description="The model to use for inference from the selected provider, e.g. gpt-5.5-cyber-preview or claude-sonnet-5.",
+        Description=(
+            "The model to use for inference from the selected provider, e.g. gpt-5.5-cyber-preview or "
+            "claude-sonnet-5. Changing it (or running /model <name>) continues this chat with the new model."
+        ),
         Required=False,
     ),
     ChatModelConfigurationOption(

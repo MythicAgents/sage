@@ -2503,7 +2503,7 @@ def _slash_req(name, argument="", channel_id=5, request_id=1):
 
 
 def test_slash_commands_declared():
-    assert {c.Name for c in SLASH_COMMANDS} == {"findings", "watcher", "state", "list", "tools", "mode", "stop", "mcp", "bloodhound", "sandbox", "report"}
+    assert {c.Name for c in SLASH_COMMANDS} == {"findings", "watcher", "state", "list", "tools", "mode", "model", "stop", "mcp", "bloodhound", "sandbox", "report"}
 
 
 def test_slash_findings_is_canonical_with_hidden_singular_alias():
@@ -4618,14 +4618,16 @@ def test_provider_is_choice_dropdown_not_freeform_string():
     assert {c["value"] for c in pj["choices"]} == {"openai", "bedrock", "anthropic", "ollama"}
 
 
-def test_provider_and_model_are_adjacent_static_header_chips():
+def test_provider_is_a_static_chip_and_model_is_the_clickable_metadata_chip():
+    # Changed expectation (model-switch plan, operator addition 2): the Model setting chip has no click, so
+    # the header's Model chip is Sage's metadata chip that runs /model; one Model chip, as Mode has.
     opts = SAGE_MODELS[0].Metadata.ConfigurationOptions
     provider_index = next(i for i, option in enumerate(opts) if option.Name == "provider")
     model_index = next(i for i, option in enumerate(opts) if option.Name == "model")
 
     assert model_index == provider_index + 1
     assert opts[provider_index].DisplayAsChip is True
-    assert opts[model_index].DisplayAsChip is True
+    assert not opts[model_index].DisplayAsChip
 
 
 @pytest.mark.parametrize(
@@ -5904,7 +5906,8 @@ def test_build_channel_metadata_live_counts(monkeypatch):
     assert items["bloodhound"]["display_value"] == "connected"
     assert "mythic_tools" in items                       # scope-usable Mythic tool count present
     # Policy leads the operational controls; state-aware colors make the three controls distinguishable.
-    assert "cfg_model" not in items
+    # The Model chip shows the model this session invokes and runs /model (model-switch plan).
+    assert items["cfg_model"]["value"] == "claude-sonnet-5" and items["cfg_model"]["click"] == "/model"
     assert items["cfg_policy"]["value"] == "llm" and items["cfg_policy"]["color"] == "success"
     assert items["cfg_policy"]["order"] < items["cfg_mode"]["order"] < items["cfg_autonomous"]["order"]
     assert items["cfg_mode"]["value"] == "auto" and items["cfg_mode"]["color"] == "warning"

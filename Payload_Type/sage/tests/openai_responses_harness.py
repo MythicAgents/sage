@@ -33,6 +33,12 @@ REPORTED_404 = {"error": {
 CALLBACK_ROWS = [{"display_id": 5, "host": "WORKSTATION-5", "user": "offline", "active": True}]
 
 
+def model_not_found(model: str) -> dict:
+    """OpenAI's documented error body for an unknown model (synthetic: shape from OpenAI's API errors)."""
+    return {"error": {"message": f"The model `{model}` does not exist or you do not have access to it.",
+                      "type": "invalid_request_error", "param": None, "code": "model_not_found"}}
+
+
 def text_item(text: str, index: int = 0) -> dict:
     return {"id": f"msg_offline_{index}", "type": "message", "role": "assistant", "status": "completed",
             "content": [{"type": "output_text", "text": text, "annotations": []}]}
@@ -60,13 +66,17 @@ def responses_body(model: str, output: list[dict], index: int) -> dict:
 class ProviderWire:
     """Records every provider request; answers Responses requests from a script (synthetic)."""
 
-    def __init__(self, script: list[Callable[[dict], list[dict]] | list[dict]] | None = None):
+    def __init__(self, script: list[Callable[[dict], list[dict]] | list[dict]] | None = None,
+                 *, unknown_models: frozenset[str] = frozenset()):
         self.requests: list[tuple[str, dict]] = []
         self.script = list(script or [])
+        self.unknown_models = unknown_models
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         self.requests.append((request.url.path, body))
+        if body.get("model") in self.unknown_models:
+            return httpx.Response(404, json=model_not_found(body["model"]))
         if request.url.path.endswith("/chat/completions"):
             if body.get("model") == "gpt-6-cyber":
                 return httpx.Response(404, json=REPORTED_404)
@@ -147,6 +157,7 @@ class Process:
 
         sink.get_tools.side_effect = lambda names: [list_callbacks] if "list_callbacks" in names else []
         sink._recon_snapshot_cache = {}
+        sink._task_source_request_ids = {}  # MythicTools' record of the Mythic tasks this client issued
         sink._current_request_task_provenance_notice = lambda *a, **k: ""
         sink.client = None
         return sink

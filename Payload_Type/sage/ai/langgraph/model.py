@@ -776,6 +776,50 @@ def _strip_tool_call_payload(message: AIMessage) -> AIMessage | None:
     return repaired if _content_has_text(repaired.content) else None
 
 
+# Provider-opaque reasoning: OpenAI Responses encrypted reasoning items, Anthropic (signed and redacted) thinking,
+# Bedrock reasoning content. A provider accepts these only from the model that produced them.
+_PROVIDER_REASONING_TYPES = frozenset({"reasoning", "thinking", "redacted_thinking", "reasoning_content"})
+# The model Sage had configured when it captured an answer (set by `_MessageSanitizerMiddleware`).
+SAGE_MODEL_METADATA_KEY = "sage_model"
+
+
+def _produced_by(message: AIMessage, configured_model: str) -> bool:
+    """Whether ``message`` came from the model Sage is configured for now.
+
+    Keyed by Sage's own configured value at capture time, never by the provider's (possibly dated) model name.
+    An answer captured before that value was recorded counts only on an exact provider-name match, so an
+    uncertain case drops reasoning (always accepted) rather than sending it to another model (rejected).
+    """
+    metadata = getattr(message, "response_metadata", None) or {}
+    stamp = metadata.get(SAGE_MODEL_METADATA_KEY)
+    if stamp:
+        return stamp == configured_model
+    return str(metadata.get("model_name") or "") == configured_model
+
+
+def _strip_foreign_reasoning(message: AIMessage, configured_model: str) -> AIMessage:
+    """Drop another model's opaque reasoning; text, tool calls and every other block are kept unchanged."""
+    if _produced_by(message, configured_model):
+        return message
+    content = getattr(message, "content", None)
+    changed = False
+    if isinstance(content, list):
+        kept = [
+            block for block in content
+            if not (isinstance(block, dict) and block.get("type") in _PROVIDER_REASONING_TYPES)
+        ]
+        if len(kept) != len(content):
+            content, changed = kept, True
+    additional_kwargs = dict(getattr(message, "additional_kwargs", None) or {})
+    for key in ("reasoning", "reasoning_content"):
+        if key in additional_kwargs:
+            additional_kwargs.pop(key)
+            changed = True
+    if not changed:
+        return message
+    return message.model_copy(update={"content": content, "additional_kwargs": additional_kwargs})
+
+
 def _repair_tool_call_adjacency(msgs: list[AnyMessage]) -> tuple[list[AnyMessage], bool]:
     """Normalize invalid tool-call history so every kept tool call has immediate matching results.
 
@@ -837,19 +881,25 @@ def _repair_tool_call_adjacency(msgs: list[AnyMessage]) -> tuple[list[AnyMessage
     return cleaned, changed
 
 
-def _sanitize_model_messages(msgs: list) -> tuple[list, bool]:
+def _sanitize_model_messages(msgs: list, *, configured_model: str | None = None) -> tuple[list, bool]:
     """Normalize a message list before provider invocation. Returns ``(messages, changed)``.
 
     This shared boundary handles both malformed tool-call adjacency and blank-content cleanup: invalid historical
     tool calls are stripped before they can reach strict providers, orphan tool results are dropped, empty system
-    blocks are removed, and empty assistant text is backfilled. It is the provider-agnostic core shared by
-    `_MessageSanitizerMiddleware`, which reaches create_agent's internal react loop where `_sanitize_messages` and
-    the langchain_openai monkeypatch cannot.
+    blocks are removed, and empty assistant text is backfilled. With ``configured_model``, an earlier answer from
+    a different model loses its provider-opaque reasoning (after a model change). It is the provider-agnostic core
+    shared by `_MessageSanitizerMiddleware`, which reaches create_agent's internal react loop where
+    `_sanitize_messages` and the langchain_openai monkeypatch cannot.
     """
     normalized, sequence_changed = _repair_tool_call_adjacency(list(msgs))
     out: list = []
     changed = sequence_changed
     for m in normalized:
+        if configured_model and isinstance(m, AIMessage):
+            stripped_reasoning = _strip_foreign_reasoning(m, configured_model)
+            if stripped_reasoning is not m:
+                m = stripped_reasoning
+                changed = True
         content = getattr(m, "content", None)
         # Drop an empty/blank top-level system block (Bedrock: "system: text content blocks must be non-empty";
         # system is optional so dropping is valid).
@@ -2849,7 +2899,9 @@ class _MessageSanitizerMiddleware(AgentMiddleware):
                 overrides["system_prompt"] = _DEFAULT_SYSTEM_PROMPT
             msgs = getattr(request, "messages", None)
             if isinstance(msgs, list):
-                cleaned, mchanged = _sanitize_model_messages(msgs)
+                cleaned, mchanged = _sanitize_model_messages(
+                    msgs, configured_model=str(getattr(self._model, "model", "") or "")
+                )
                 if mchanged:
                     overrides["messages"] = cleaned
             if not overrides:
@@ -2858,11 +2910,24 @@ class _MessageSanitizerMiddleware(AgentMiddleware):
         except Exception:
             return request  # fail-open: never break a model call over sanitization
 
+    def _record_answer(self, response):
+        """Mark each answer with the model Sage had configured for it, and this Model as having answered."""
+        try:
+            configured = str(getattr(self._model, "model", "") or "")
+            messages = getattr(response, "result", None)
+            for message in (messages if isinstance(messages, list) else [response]):
+                if configured and isinstance(message, AIMessage):
+                    message.response_metadata[SAGE_MODEL_METADATA_KEY] = configured
+            self._model._model_call_completed = True
+        except Exception:
+            pass  # bookkeeping must never break a model call
+        return response
+
     def wrap_model_call(self, request, handler):
-        return handler(self._sanitize(request))
+        return self._record_answer(handler(self._sanitize(request)))
 
     async def awrap_model_call(self, request, handler):
-        return await handler(self._sanitize(request))
+        return self._record_answer(await handler(self._sanitize(request)))
 
 
 def _bound_call_id(request_id: str, delegation_seq: int) -> str:

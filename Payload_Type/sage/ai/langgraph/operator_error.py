@@ -105,28 +105,33 @@ def _endpoint_origin(endpoint: str) -> str:
 
 
 _KEEPS = (
-    "This chat is still usable and keeps its conversation: changing only OpenAI API, OpenAI Daybreak or OpenAI "
-    "Safety Identifier continues it."
+    "This chat is still usable and keeps its conversation: changing the model (**Model** or `/model <name>`), "
+    "OpenAI API, OpenAI Daybreak or OpenAI Safety Identifier continues it."
 )
 _NEW_CHAT = (
-    "Changing the API key, model, provider or API endpoint starts a new chat; this chat's conversation does not "
-    "carry over. Changing only OpenAI API, OpenAI Daybreak or OpenAI Safety Identifier keeps it."
+    "Changing the API key, provider or API endpoint starts a new chat; this chat's conversation does not "
+    "carry over. Changing the model (**Model** or `/model <name>`), OpenAI API, OpenAI Daybreak or OpenAI "
+    "Safety Identifier keeps it."
+)
+_MODEL_ACTION = (
+    "change **Model** to a model this API key can use (or run `/model <name>`), then send your request again; if "
+    "access to this model is granted at OpenAI instead, send your request again here"
 )
 
 
 def _configuration_action(status: int, code: str, param: str, message: str, api: str) -> tuple[str, bool]:
     """``(action, keeps_conversation)``: what to change, and whether that change continues this chat.
 
-    Only the OpenAI route settings (API, Daybreak, safety identifier) continue an idle chat in place. A new key,
-    model, provider or endpoint starts a new session (general switching belongs to a separate line), and a fix
-    made in the OpenAI project without touching Sage's settings is retried here as it is.
+    The model and the OpenAI route settings (API, Daybreak, safety identifier) continue an idle chat in place. A
+    new key, provider or endpoint starts a new session, and a fix made in the OpenAI project without touching
+    Sage's settings is retried here as it is.
     """
     if code == "invalid_access_program":
         return ("set **OpenAI Daybreak** to the value named in the error (Off, Blue or Red), or the "
                 "SAGE_OPENAI_ACCESS_PROGRAM user secret or environment value, then send your request again", True)
     if code == "unsupported_access_program":
-        return ("set **OpenAI Daybreak** to **Off** to keep this model and this chat, then send your request again; "
-                "a model that supports Daybreak needs a new chat", True)
+        return ("set **OpenAI Daybreak** to **Off** to keep this model, or change **Model** (or run `/model <name>`) "
+                "to one that supports this Daybreak program, then send your request again", True)
     if code == "access_program_not_enabled":
         return ("enable this Daybreak program for the API key's OpenAI project (for GPT-6 Cyber, also allowlist the "
                 "sending IP address), then send your request again here; using another project's API key "
@@ -143,9 +148,11 @@ def _configuration_action(status: int, code: str, param: str, message: str, api:
     if param == "safety_identifier":
         return ("set **OpenAI Safety Identifier** to a stable pseudonym for the person using this chat, then send "
                 "your request again", True)
+    if code == "model_not_found" or param == "model":
+        return (_MODEL_ACTION, True)
     return ("check that the API key's project has access to this model and that the model name and API Endpoint "
-            "are right; if access is granted at OpenAI, send your request again here; a different model or "
-            "endpoint starts a new chat", False)
+            "are right; change **Model** (or run `/model <name>`) to keep this chat; if access is granted at "
+            "OpenAI, send your request again here", False)
 
 
 def provider_configuration_notice(exc: BaseException, profile) -> str:
@@ -190,4 +197,47 @@ def provider_configuration_notice(exc: BaseException, profile) -> str:
         f"Route used: {route}.\n\n"
         f"To fix it, {action}. {_KEEPS if keeps else _NEW_CHAT} "
         "Sage did not change the model, provider or endpoint."
+    )
+
+
+def _provider_message(exc: BaseException) -> tuple[str, str]:
+    """``(status, message)`` from the first provider error in ``exc``'s cause chain that carries them."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        body = getattr(current, "body", None)
+        if isinstance(body, dict):
+            inner = body.get("error") if isinstance(body.get("error"), dict) else body
+            message = inner.get("message") if isinstance(inner, dict) else None
+            if isinstance(message, str) and message.strip():
+                status = getattr(current, "status_code", None)
+                return (f"HTTP {status}" if status else ""), message.strip()
+        current = current.__cause__ or current.__context__
+    status = getattr(exc, "status_code", None)
+    return (f"HTTP {status}" if status else ""), operator_error_text(exc)
+
+
+def unproven_model_notice(exc: BaseException, profile) -> str:
+    """Operator-facing text for a failure before this chat's Model ever answered or ran anything, any provider.
+
+    Names the provider, the model value and its source, the provider's message and the fix. Never includes the
+    API key or other credentials.
+    """
+    status, message = _provider_message(exc)
+
+    def value(name: str, default: str = "") -> str:
+        return str(getattr(profile, name, default) or default) if profile is not None else default
+
+    def source(name: str) -> str:
+        getter = getattr(profile, "source_for", None)
+        return str(getter(name)) if callable(getter) else "unknown"
+
+    details = f" ({status})" if status else ""
+    return (
+        f"The model provider rejected this chat's request before the model answered{details}: {message}\n\n"
+        f"Route used: provider {value('provider', 'unknown')} · model `{value('model')}` ({source('model')}) · "
+        f"endpoint {_endpoint_origin(value('api_endpoint'))}.\n\n"
+        "To fix it, change **Model** to a model this provider and key can use, or run `/model <name>`, then send "
+        "your request again. This chat is still usable and keeps its conversation; nothing was run."
     )

@@ -451,6 +451,7 @@ the token has no read scope for.
 | `/state remove <#>[,…] [--reason <text>]` · `/state restore <#>[,…]` · `/state invalidate <#>[,…]` | Retract a row, undo a retraction, or mark a row "no longer holds", by hop number (the `#` column) or hop id. Rows are kept and numbered; no command marks a row `achieved` without verified evidence |
 | `/state wipe` | Retract every row and every current graph fact; nothing is deleted or renumbered |
 | `/mode [conversation\|supervised\|auto]` | Show or switch the channel's mode |
+| `/model [name]` | Show this chat's model, or change it in the chat's Model setting; the conversation continues |
 | `/list` | List active Sage chat sessions |
 | `/tools` | List Sage's public Mythic tool functions, descriptions, and access requirements |
 | `/tools staged` | List the binaries in Sage's `tools/` drop zone: type, architecture, matching TTPs, and whether Mythic already holds them |
@@ -634,10 +635,19 @@ on a single user instead of the whole organization. Sage never derives one from 
 pseudonym for the same person. Invalid combinations (Daybreak without Responses, any of these with a non-OpenAI
 provider) fail before any request. When the provider rejects a route (for example a Responses-only model on Chat
 Completions, or a Daybreak access error), the error names the setting to change and says whether the chat continues.
-Changing only **OpenAI API**, **OpenAI Daybreak** or **OpenAI Safety Identifier** continues the same chat with its
-conversation, and a fix made in the OpenAI project without changing Sage's settings is retried in the same chat.
-Changing the API key, model, provider or API endpoint starts a new chat. Sage never switches the model, provider,
-endpoint or API on its own.
+Changing **Model** (or running `/model <name>`), **OpenAI API**, **OpenAI Daybreak** or **OpenAI Safety Identifier**
+continues the same chat with its conversation, and a fix made in the OpenAI project without changing Sage's settings
+is retried in the same chat. Changing the API key, provider or API endpoint starts a new chat. Sage never switches
+the model, provider, endpoint or API on its own.
+
+**Changing the model.** Edit the chat's **Model** setting, click the Model chip, or run `/model <name>` (`/model`
+alone shows the model and where its value comes from). `/model <name>` writes the chat's Model setting in Mythic, so
+Mythic's own rules apply: only the channel's creator or an operation lead/admin may change it, through the channel's
+API token. The next message continues the same conversation with the new model; its earlier messages, tool calls and
+results carry over, while the previous model's opaque reasoning is not sent to a different model. A model the
+provider rejects before it has answered leaves the chat as it was, with an error naming the model, the provider's
+message and the fix, so a wrong model name is corrected in place. A change made while an approval card is waiting
+does not apply until the card is answered or declined, by the model that raised it.
 
 **Policy.** `policy_mode` controls how the next capability is chosen. `hybrid` (default) has deterministic code
 constrain the admissible actions and lets the model pick among them — the intended production mode. `symbolic` is

@@ -111,10 +111,13 @@ from .session import (
     bind_channel_thread_id,
     channel_session_db_path,
     channel_session_key,
+    channel_without_session,
     claim_channel_marker,
+    clear_channel_without_session,
     drop_channel_session,
     get_channel_session,
     load_channel_session_record,
+    mark_channel_without_session,
     next_channel_thread_id,
     put_channel_session,
     save_channel_session_record,
@@ -133,9 +136,8 @@ _CHANNEL_TURN_LOCKS: dict[str, asyncio.Lock] = {}
 # Mythic may resend on-start for an operation (restarts, file sync, heartbeat gaps); one at a time.
 _ONSTART_RECONCILE_LOCKS: dict[int, asyncio.Lock] = {}
 _WATCHER_TURN_TASKS: dict[tuple[int, int], asyncio.Task[Any]] = {}
-# A new channel can receive /help or /mode before its first Model exists. This
-# process-local exception permits its first real prompt; a restart clears it.
-_NEW_CHANNEL_WITHOUT_SESSION: set[tuple[int, int]] = set()
+# Restoration outcome for a request it answered itself without a terminal (a held decision re-offered).
+_RESTORE_HANDLED = "\x00restore-handled"
 
 
 def _nonempty_native_response_text(value: Any) -> str:
@@ -181,6 +183,19 @@ def _provider_configuration_text(error: BaseException, request: ChatRequest) -> 
     except Exception:
         profile = None
     return provider_configuration_notice(error, profile)
+
+
+def _unproven_model_text(error: BaseException, request: ChatRequest) -> str:
+    """The fix for a failure before this chat's Model ever answered, for any provider."""
+    try:
+        from ai.langgraph.operator_error import unproven_model_notice
+    except ImportError:  # pragma: no cover - packaged import fallback
+        from ..ai.langgraph.operator_error import unproven_model_notice  # type: ignore
+    try:
+        profile = resolve_llm_profile(request)
+    except Exception:
+        profile = None
+    return unproven_model_notice(error, profile)
 
 
 def _resource_budget_notice(error: BaseException) -> str:
@@ -251,13 +266,14 @@ def _core_config_signature(
     kwargs: dict[str, Any],
     bloodhound_env: dict[str, str] | None = None,
 ) -> str:
-    """The session signature without the OpenAI route settings (API, Daybreak, safety identifier).
+    """The session signature without the model and the OpenAI route settings (API, Daybreak, safety identifier).
 
-    Two configurations with equal core signatures differ only in how this chat reaches the same model, so an
-    idle channel may apply the change on its existing conversation generation. Everything else (provider,
-    model, endpoint, key, mode, BloodHound) still rotates the session.
+    Two configurations with equal core signatures differ only in which model this chat uses or how it reaches
+    it, so an idle channel may apply the change on its existing conversation generation. Everything else
+    (provider, endpoint, key, mode, BloodHound) still rotates the session.
     """
     payload = dict(kwargs)
+    payload.pop("model", None)
     config = dict(payload.get("config") or {})
     configurable = {
         key: value
@@ -287,6 +303,46 @@ SETTINGS_CONTINUED_NOTICE = (
     "Identifier). The "
     "conversation continues with its earlier messages; the model, provider and endpoint are unchanged."
 )
+MODEL_CHANGED_NOTICE = (
+    "This chat now uses model `{current}` (was `{previous}`). The conversation continues with its earlier "
+    "messages; the provider and endpoint are unchanged."
+)
+HELD_CHANGE_NOTICE = (
+    "Sage has not applied this chat's changed model or OpenAI settings yet: an approval or step raised by "
+    "model `{model}` is still waiting. Answer or decline it first; `{model}` applies your decision, and the "
+    "change takes effect on your next message after that. Nothing was run for this message."
+)
+HELD_DECISION_NOTICE = (
+    "Your decision is applied by model `{model}`, which raised the approval. This chat's changed model or "
+    "OpenAI settings take effect on your next message."
+)
+HELD_AFTER_RESTART_NOTICE = (
+    "Sage restarted while an approval raised by model `{model}` was waiting, and this chat's model or OpenAI "
+    "settings have changed since. Sage cannot answer that approval under different settings, so nothing was "
+    "run. Set the changed setting back (Model `{model}`) and send your message or answer again; the change "
+    "can be made after the approval is settled."
+)
+HELD_OFFER_NOTICE = (
+    "Sage restarted while an approval raised by model `{model}` was waiting, and this chat's model or OpenAI "
+    "settings have changed since, so your decision was not applied. Set the changed setting back (Model "
+    "`{model}`), then choose Continue to apply your decision or Stop to discard it."
+)
+
+
+def _settings_notice(previous_model: str, current_model: str) -> str:
+    if previous_model != current_model:
+        return MODEL_CHANGED_NOTICE.format(previous=previous_model or "its previous model", current=current_model)
+    return SETTINGS_CONTINUED_NOTICE
+
+
+def _model_unproven(model: Any) -> bool:
+    """True when nothing has run on this Model: no model call completed, no Mythic task, no approval."""
+    if getattr(model, "_model_call_completed", False):
+        return False
+    issued = getattr(getattr(model, "mythic_client", None), "_task_source_request_ids", None)
+    if not isinstance(issued, dict) or issued:
+        return False
+    return not getattr(model, "_hitl_card_pending", False) and getattr(model, "_pending_approval_context", None) is None
 
 
 def _runtime_routing_matches(
@@ -922,6 +978,51 @@ class SageChat(Chat):
             complete_request=True,
         )
 
+    async def handle_model_command(self, request: ChatRequest, model: Any, argument: str) -> str:
+        """``/model``: show this chat's model, or write a new one to the chat's Model setting in Mythic."""
+        from .model_command import parse_model_argument, write_channel_model
+
+        value, usage = parse_model_argument(argument)
+        if usage:
+            return usage
+        try:
+            profile = resolve_llm_profile(request)
+            configured, source = profile.model, profile.source_for("model")
+        except Exception as exc:  # an invalid route still lets the operator see and fix the model
+            configured = str((getattr(request, "Config", None) or {}).get("model") or "")
+            source = f"settings not fully resolved: {exc}"
+        live = str(getattr(model, "model", "") or "") if model is not None else ""
+        if not value:
+            text = (
+                f"This chat's model is `{configured or '(not set)'}` ({source}). Change it with `/model <name>` "
+                "or the chat's **Model** setting; the conversation continues with the new model."
+            )
+            if live and live != configured:
+                text += f" This chat's session is still using `{live}` until your next message."
+            return text
+        try:
+            client = await self._mythic_read_client(request, model)
+            failure = await write_channel_model(client, int(request.OperationID), int(request.ChannelID), value)
+        except Exception as exc:
+            from ai.langgraph.operator_error import operator_error_text
+
+            failure = operator_error_text(exc)
+        if failure:
+            return (
+                f"Mythic did not change this chat's model: {failure}. The model is still "
+                f"`{configured or live or '(not set)'}`."
+            )
+        text = (
+            f"Model set to `{value}` in this chat's settings. It applies to your next message, and the "
+            "conversation continues."
+        )
+        if model is not None and (
+            getattr(model, "_hitl_card_pending", False)
+            or isinstance(getattr(model, "_controller_hitl_pending", None), dict)
+        ):
+            text += f" An approval raised by `{live}` is still waiting; `{live}` answers it first."
+        return text
+
     async def handle_finding_command(
         self,
         request: ChatRequest,
@@ -1182,16 +1283,18 @@ class SageChat(Chat):
                 request, existing, kwargs, config_signature,
                 _core_config_signature(kwargs, bloodhound_env),
             )
-            if continued is not None:
+            if continued is not None and continued is not existing:
                 return continued, True
-            await self._stop_and_close_request_lifecycles(
-                existing,
-                status="stopped",
-                reason="session_rotated",
-            )
-            await drop_channel_session(request, expected_model=existing)
-            logger.info("Rotated Sage channel session after ChatRequest configuration changed")
-            existing = None
+            if continued is None:
+                await self._stop_and_close_request_lifecycles(
+                    existing,
+                    status="stopped",
+                    reason="session_rotated",
+                )
+                await drop_channel_session(request, expected_model=existing)
+                logger.info("Rotated Sage channel session after ChatRequest configuration changed")
+                existing = None
+            # Otherwise the change is held: the existing Model keeps serving this request unchanged.
         if existing is not None:
             existing._native_chat_explicit_hitl = True
             await self._refresh_auth_context(existing, request)
@@ -1228,33 +1331,47 @@ class SageChat(Chat):
         model = await self._build_model(request, kwargs, config_signature)
         await put_channel_session(request, model)
         await self._save_session_record(request, model)
+        try:
+            await clear_channel_without_session(request)
+        except Exception:
+            logger.warning("New-channel mark was not cleared; the saved record takes precedence", exc_info=True)
         return model, False
 
-    async def _settings_change_is_idle(self, request: ChatRequest, model: Any) -> bool:
-        """True when nothing on this session could carry consent or work across a settings change."""
+    async def _mark_if_never_built(self, request: ChatRequest) -> None:
+        """Mark a channel with no saved record as new; a record always takes precedence."""
+        try:
+            if await load_channel_session_record(int(request.OperationID), int(request.ChannelID)) is None:
+                await mark_channel_without_session(request)
+        except Exception:
+            logger.warning("New-channel mark was not saved", exc_info=True)
+
+    async def _settings_change_state(self, request: ChatRequest, model: Any) -> str:
+        """``idle``, ``pending`` (consent or work is outstanding on this session) or ``unverified``."""
         if getattr(request, "InputResponse", None) is not None:
-            return False
+            return "pending"
         if getattr(model, "_hitl_card_pending", False) or isinstance(
             getattr(model, "_controller_hitl_pending", None), dict
         ):
-            return False
+            return "pending"
         thread_id = str(getattr(model, "_thread_id_override", "") or "")
         if not thread_id:
-            return False
+            return "unverified"
         try:
             if await model._hitl_interrupt_pending(thread_id):
-                return False
+                return "pending"
             record = await load_channel_session_record(int(request.OperationID), int(request.ChannelID))
         except Exception:
             logger.warning("Settings change could not verify an idle channel", exc_info=True)
-            return False
-        return (
-            record is not None
-            and record.get("status") == CHANNEL_SESSION_ACTIVE
-            and record.get("thread_id") == thread_id
-            and not record.get("pending")
-            and not _claim_outstanding(record)
-        )
+            return "unverified"
+        if (
+            record is None
+            or record.get("status") != CHANNEL_SESSION_ACTIVE
+            or record.get("thread_id") != thread_id
+        ):
+            return "unverified"
+        if record.get("pending") or _claim_outstanding(record):
+            return "pending"
+        return "idle"
 
     async def _continue_settings_change(
         self,
@@ -1264,20 +1381,25 @@ class SageChat(Chat):
         config_signature: str,
         core_signature: str,
     ) -> Any | None:
-        """Rebuild an idle session on its own generation when only the OpenAI route settings changed.
+        """Rebuild an idle session on its own generation when only the model or OpenAI route settings changed.
 
-        Returns the new registered Model, or ``None`` to keep today's rotation (any other change, an
-        outstanding approval or controller step, an approval response, or a record that cannot be verified).
-        The checkpoint stays the owner of history; the new Model restores from it exactly as a restart does.
+        Returns the new registered Model; the existing Model, marked held, when an approval, decision or
+        controller step is outstanding (consent never crosses a model change); or ``None`` to keep today's
+        rotation (any other change, or a record that cannot be verified). The replacement is built before
+        the existing Model is released, so a build failure leaves the channel exactly as it was. The
+        checkpoint stays the owner of history; the new Model restores from it exactly as a restart does.
         """
         stored_core = str(getattr(existing, "_chat_request_core_signature", "") or "")
         if not stored_core or stored_core != core_signature:
             return None
-        if not await self._settings_change_is_idle(request, existing):
+        state = await self._settings_change_state(request, existing)
+        if state == "unverified":
             return None
+        if state == "pending":
+            existing._held_change_model = str(getattr(existing, "model", "") or "")
+            return existing
         thread_id = str(existing._thread_id_override)
         old_signature = str(getattr(existing, "_chat_request_config_signature", "") or "")
-        await drop_channel_session(request, expected_model=existing, retire=False)
         model = await self._build_model(request, kwargs, config_signature, thread_id=thread_id)
         model._chat_request_base_autonomous_solve = bool(
             getattr(existing, "_chat_request_base_autonomous_solve", kwargs.get("autonomous_solve"))
@@ -1298,10 +1420,13 @@ class SageChat(Chat):
             await model.restore_session_state_from_checkpoint(thread_id)
         except LookupError:
             pass  # a generation whose only request failed before any checkpoint write
+        await drop_channel_session(request, expected_model=existing, retire=False)
         await put_channel_session(request, model)
         await self._save_session_record(request, model)
-        model._settings_continuation_notice = SETTINGS_CONTINUED_NOTICE
-        logger.info("Applied OpenAI route settings on the channel's existing generation")
+        model._settings_continuation_notice = _settings_notice(
+            str(getattr(existing, "model", "") or ""), str(getattr(model, "model", "") or "")
+        )
+        logger.info("Applied changed model or OpenAI route settings on the channel's existing generation")
         return model
 
     async def _construct_model(self, kwargs: dict[str, Any]) -> Any:
@@ -1373,6 +1498,7 @@ class SageChat(Chat):
             "apitoken_id": int(request.APITokenID),
             "config_signature": str(getattr(model, "_chat_request_config_signature", "") or ""),
             "core_signature": str(getattr(model, "_chat_request_core_signature", "") or ""),
+            "model": str(getattr(model, "model", "") or ""),
             "base_autonomous_solve": bool(
                 getattr(model, "_chat_request_base_autonomous_solve", False)
             ),
@@ -1468,7 +1594,7 @@ class SageChat(Chat):
         )
 
     async def _mythic_read_client(self, request: ChatRequest, model: Any | None = None) -> Any:
-        """The channel token's Mythic client, for read-only restoration lookups."""
+        """The channel token's Mythic client: restoration lookups and `/model`'s write of the Model setting."""
         client = getattr(getattr(model, "mythic_client", None), "client", None)
         if client is not None:
             return client
@@ -1523,12 +1649,15 @@ class SageChat(Chat):
         The model is registered only on success. Authority is never carried from the old process:
         the request's current config/identity must match what the session was saved under, and a
         paused action resumes only through the same exact approval correlation as before.
+        ``(None, "", [])`` means the channel never had a session: the caller builds it as a new channel.
         """
         operation_id, channel_id = int(request.OperationID), int(request.ChannelID)
         try:
             record = await load_channel_session_record(operation_id, channel_id)
         except ChannelSessionRecordInvalid as exc:
             return None, unreadable_refusal(str(exc)), []
+        if record is None and await channel_without_session(operation_id, channel_id):
+            return None, "", []
         kwargs = build_model_kwargs(request)
         bloodhound_env = _bloodhound_env_or_empty(request)
         signature = _model_config_signature(kwargs, bloodhound_env)
@@ -1540,16 +1669,17 @@ class SageChat(Chat):
             return None, changed_refusal("Mythic identity"), []
         settings_changed = False
         if record.get("config_signature") != signature:
-            # Only the OpenAI route settings changed, and nothing is pending: continue this generation.
+            # Only the model or OpenAI route settings changed: continue this generation when nothing is
+            # pending, and hold the change while an approval or decision is (nothing runs).
             core = str(record.get("core_signature") or "")
+            if not core or core != _core_config_signature(kwargs, bloodhound_env):
+                return None, changed_refusal("configuration"), []
             if (
-                not core
-                or core != _core_config_signature(kwargs, bloodhound_env)
-                or record.get("pending")
+                record.get("pending")
                 or _claim_outstanding(record)
                 or getattr(request, "InputResponse", None) is not None
             ):
-                return None, changed_refusal("configuration"), []
+                return await self._hold_restored_change(request, record)
             settings_changed = True
             old_signature = record.get("config_signature")
             record = dict(record)
@@ -1567,7 +1697,10 @@ class SageChat(Chat):
         engagement = record.get("engagement_uuid")
         if isinstance(engagement, str) and engagement:
             model._report_engagement_uuid = engagement
-        notices = [RESTORED_NOTICE] + ([SETTINGS_CONTINUED_NOTICE] if settings_changed else [])
+        notices = [RESTORED_NOTICE] + (
+            [_settings_notice(str(record.get("model") or ""), str(getattr(model, "model", "") or ""))]
+            if settings_changed else []
+        )
         if settings_changed:
             await save_channel_session_record({**record, **self._session_record_for(request, model),
                                                "pending": None, "claim": None})
@@ -1588,6 +1721,34 @@ class SageChat(Chat):
         if values is not None:
             notices.extend(await self._restore_pending_work(request, model, record, thread_id))
         return model, "", notices
+
+    async def _hold_restored_change(
+        self, request: ChatRequest, record: dict[str, Any]
+    ) -> tuple[Any | None, str, list[str]]:
+        """A changed model or OpenAI settings meet a waiting approval after a restart: nothing runs.
+
+        The old Model cannot be rebuilt (the record holds a signature, not the old settings), so the
+        operator sets the setting back. A decision delivered meanwhile is offered back through the same
+        Continue/Stop control on-start uses, so it is applied once, under the original settings, or not at all.
+        """
+        recorded_model = str(record.get("model") or "") or "the model that raised it"
+        pending = record.get("pending") if isinstance(record.get("pending"), dict) else {}
+        context = pending.get("context") if isinstance(pending.get("context"), dict) else None
+        if getattr(request, "InputResponse", None) is not None and context is not None:
+            client = await self._mythic_read_client(request)
+            await self.send_response(
+                request,
+                response_key=f"restoration:{request.RequestID}:held:{uuid4().hex}",
+                content=HELD_OFFER_NOTICE.format(model=recorded_model),
+                status="complete",
+                complete=False,
+                complete_request=False,
+                metadata={},
+            )
+            outcome = await self._offer_or_close(client, request, record, context)
+            logger.info(f"Held a decision sent with changed settings after a restart: {outcome}")
+            return None, _RESTORE_HANDLED, []
+        return None, HELD_AFTER_RESTART_NOTICE.format(model=recorded_model), []
 
     async def _restore_pending_work(
         self,
@@ -1995,7 +2156,6 @@ class SageChat(Chat):
             existing_at_entry = await get_channel_session(request)
             first_channel_claim = await claim_channel_marker(request)
             channel_identity = (int(request.OperationID), int(request.ChannelID))
-            slash_only_new_channel = channel_identity in _NEW_CHANNEL_WITHOUT_SESSION
             recovery_state = None
             if resume_request_id:
                 try:
@@ -2096,7 +2256,7 @@ class SageChat(Chat):
             restored_refusal = ""
             restored_paused_calls: dict[str, str] | None = None
             if existing_at_entry is None and not read_only_state and not read_only_report and not tool_discovery and (
-                (not first_channel_claim and not slash_only_new_channel)
+                not first_channel_claim
                 or (first_channel_claim and _channel_has_prior_context(request))
             ) and recovery_state is None:
                 # This process has no Model for a channel it has seen before. Rebuild it from the
@@ -2104,7 +2264,9 @@ class SageChat(Chat):
                 restored_model, refusal, restoration_notices = await self._restore_channel_session(
                     request
                 )
-                if restored_model is None:
+                if restored_model is None and refusal == _RESTORE_HANDLED:
+                    return None
+                if restored_model is None and refusal:
                     await self.send_complete(
                         request,
                         turn.response_key,
@@ -2112,29 +2274,30 @@ class SageChat(Chat):
                         complete_request=True,
                     )
                     return None
-                # A restored Model has no emitter from an earlier turn. Bind this request's, so any
-                # lifecycle notice before the turn's own emitter (a set-aside card) reaches this
-                # channel instead of the legacy task RPC.
-                restored_model._response_emitter = ChatStreamEmitter(self, request)
-                # Continue the rows this request created before the restart, so new blocks never
-                # reuse (and overwrite) one of them.
-                saved_rows = getattr(restored_model, "_restored_emitter_rows", None)
-                restored_model._restored_emitter_rows = None
-                restored_refusal = str(getattr(restored_model, "_restored_refusal_notice", "") or "")
-                restored_model._restored_refusal_notice = ""
-                restored_paused_calls = getattr(restored_model, "_restored_paused_calls", None)
-                restored_model._restored_paused_calls = None
-                if saved_rows is not None:
-                    restored_model._response_emitter.import_rows(saved_rows)
-                if restoration_notices:
-                    await self.send_response(
-                        request,
-                        response_key=f"restoration:{request.RequestID}",
-                        content="\n\n".join(restoration_notices),
-                        status="complete",
-                        complete=False,
-                        metadata={},
-                    )
+                if restored_model is not None:
+                    # A restored Model has no emitter from an earlier turn. Bind this request's, so any
+                    # lifecycle notice before the turn's own emitter (a set-aside card) reaches this
+                    # channel instead of the legacy task RPC.
+                    restored_model._response_emitter = ChatStreamEmitter(self, request)
+                    # Continue the rows this request created before the restart, so new blocks never
+                    # reuse (and overwrite) one of them.
+                    saved_rows = getattr(restored_model, "_restored_emitter_rows", None)
+                    restored_model._restored_emitter_rows = None
+                    restored_refusal = str(getattr(restored_model, "_restored_refusal_notice", "") or "")
+                    restored_model._restored_refusal_notice = ""
+                    restored_paused_calls = getattr(restored_model, "_restored_paused_calls", None)
+                    restored_model._restored_paused_calls = None
+                    if saved_rows is not None:
+                        restored_model._response_emitter.import_rows(saved_rows)
+                    if restoration_notices:
+                        await self.send_response(
+                            request,
+                            response_key=f"restoration:{request.RequestID}",
+                            content="\n\n".join(restoration_notices),
+                            status="complete",
+                            complete=False,
+                            metadata={},
+                        )
             if slash is None and tool_discovery:
                 existing = await self._rotate_auth_changed_session(request, existing_at_entry)
                 if existing is not None:
@@ -2145,7 +2308,7 @@ class SageChat(Chat):
                     complete_request=True,
                 )
                 if first_channel_claim and existing_at_entry is None:
-                    _NEW_CHANNEL_WITHOUT_SESSION.add(channel_identity)
+                    await self._mark_if_never_built(request)
                 return None
             # Slash commands dispatch first — they operate on the existing session (if any) and don't
             # need a fresh Model.initialize(). A handled command sends its own terminal → return None.
@@ -2161,11 +2324,37 @@ class SageChat(Chat):
                         # `/mode` changes routing outside Mythic's stored config; keep it restorable.
                         await self._persist_session_settings(request, existing)
                     if first_channel_claim and existing_at_entry is None:
-                        _NEW_CHANNEL_WITHOUT_SESSION.add(channel_identity)
+                        await self._mark_if_never_built(request)
                     return None
 
-            _NEW_CHANNEL_WITHOUT_SESSION.discard(channel_identity)
-            model, preexisted = await self._get_or_create_model(request)
+            try:
+                model, preexisted = await self._get_or_create_model(request)
+            except Exception:
+                # A first build that fails (an invalid model setting, for example) leaves this channel a
+                # new channel, here and after a restart, so the corrected setting can be retried in place.
+                if existing_at_entry is None:
+                    await self._mark_if_never_built(request)
+                raise
+            held_model = str(getattr(model, "_held_change_model", "") or "")
+            if held_model:
+                model._held_change_model = ""
+                if getattr(request, "InputResponse", None) is None:
+                    await self.send_complete(
+                        request,
+                        turn.response_key,
+                        content=HELD_CHANGE_NOTICE.format(model=held_model),
+                        complete_request=True,
+                    )
+                    return None
+                await self.send_response(
+                    request,
+                    response_key=f"settings:{request.RequestID}:held:{uuid4().hex}",
+                    content=HELD_DECISION_NOTICE.format(model=held_model),
+                    status="complete",
+                    complete=False,
+                    complete_request=False,
+                    metadata={},
+                )
             if existing_at_entry is not None and not preexisted:
                 # Config/auth rotation also loses the prior scope. A new Model may have
                 # initialized, but it must not consume this old channel's next prompt.
@@ -2708,12 +2897,14 @@ class SageChat(Chat):
                     status="error",
                     reason="runtime_error",  # a fault in Sage, not an operator action
                 )
-                configuration_rejected = (
-                    provider_configuration_rejection(error) is not None and not has_input_response
+                unproven = _model_unproven(model)
+                configuration_rejected = not has_input_response and (
+                    provider_configuration_rejection(error) is not None or unproven
                 )
                 if not configuration_rejected:
-                    # A provider refusal of this chat's route leaves the session and its history in
-                    # place: correcting the configuration and sending again continues this channel.
+                    # A provider refusal of this chat's route, or any failure before this Model has
+                    # answered or run anything, leaves the session and its history in place:
+                    # correcting the configuration and sending again continues this channel.
                     await drop_channel_session(request, expected_model=model)
                 record_terminal = getattr(model, "record_request_terminal", None)
                 record_final = getattr(model, "record_final_response", None)
@@ -2759,6 +2950,7 @@ class SageChat(Chat):
                         error_text = (
                             _resource_budget_notice(error)
                             or _provider_configuration_text(error, request)
+                            or (_unproven_model_text(error, request) if configuration_rejected else "")
                             or operator_error_text(error)
                             or "Sage request failed."
                         )

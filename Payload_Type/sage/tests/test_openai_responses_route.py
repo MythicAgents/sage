@@ -448,11 +448,19 @@ def test_responses_only_404_on_chat_completions_promises_continuation():
     (403, {"type": "invalid_request_error", "code": None, "param": None, "message": "Forbidden."}, "API key"),
     (403, {"type": "invalid_request_error", "code": "access_program_not_enabled", "param": None,
            "message": "Not enabled."}, "API key"),
-    (404, {"type": "invalid_request_error", "code": "model_not_found", "param": "model",
-           "message": "The model `gpt-6-cyber` does not exist or you do not have access to it."}, "model"),
 ])
-def test_key_project_or_model_fixes_say_a_change_starts_a_new_chat(status, error, names):
+def test_key_or_project_fixes_say_a_change_starts_a_new_chat(status, error, names):
     notice = _notice(status, error, **CYBER)
     assert KEEPS not in notice
     assert NEW_CHAT in notice and names in notice
     assert "send your request again here" in notice  # a fix made at OpenAI without changing Sage's settings
+
+
+def test_an_unknown_model_fix_promises_the_conversation_continues():
+    """Changed expectation (model-switch plan, required outcome 2): a model change no longer starts a new chat."""
+    notice = _notice(404, {"type": "invalid_request_error", "code": "model_not_found", "param": "model",
+                           "message": "The model `gpt-6-cyber` does not exist or you do not have access to it."},
+                     **CYBER)
+    assert KEEPS in notice and NEW_CHAT not in notice
+    assert "**Model**" in notice and "/model <name>" in notice
+    assert "send your request again here" in notice  # access granted at OpenAI is retried as it is

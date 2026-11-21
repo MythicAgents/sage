@@ -65,7 +65,6 @@ def _close_processes():
     asyncio.run(close())
     _PROCESSES.clear()
     service._CHANNEL_TURN_LOCKS.clear()
-    service._NEW_CHANNEL_WITHOUT_SESSION.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -232,7 +231,6 @@ async def _restart(process: _Process) -> None:
         if conn is not None:
             await conn.close()
     service._CHANNEL_TURN_LOCKS.clear()
-    service._NEW_CHANNEL_WITHOUT_SESSION.clear()
     await chat_session.remove_session(str(CHANNEL))
 
 
@@ -1347,3 +1345,103 @@ def test_recorded_mode_card_regenerates_its_checkpoint_and_resumes_once(row, ove
         assert row["expected"]["near_match_without_override"] == "refused"
         assert process.effects == [] and after["claim"] is None
         assert MODE_CHANGED_NOTICE in closings[0]["content"]
+
+
+# ------------------------------------------------------------------------------------------------
+# A model change while an approval card is outstanding is held: consent never crosses a model change.
+# The request's model setting changes; this harness's Models always run the scripted model, whose
+# configured name is gpt-4o-mini, so notices name that model.
+# ------------------------------------------------------------------------------------------------
+
+SWITCHED_MODEL = "gpt-switched-offline"
+REPLACED = "Sage replaced this channel's session"
+
+
+def _switched(prompt, request_id, *, mode="supervised"):
+    return build_chat_request(prompt, channel_id=CHANNEL, operation_id=OPERATION, request_id=request_id,
+                              config={"mode": mode, "model": SWITCHED_MODEL})
+
+
+def _switched_answer(response, request_id: int = 1):
+    request = _switched("", request_id)
+    request.InputResponse = response
+    return request
+
+
+def test_a_model_change_waits_while_a_card_is_pending_and_the_card_is_answered_by_its_own_model():
+    async def scenario():
+        first = _Process(_card_script() + _after_card_script() + [AIMessage(content="Noted.")])
+        await first.chat.chat(_request(SUPERVISED_PROMPT, 1, mode="supervised"))
+        (card,) = _cards(first.chat)
+        at_card = await load_channel_session_record(OPERATION, CHANNEL)
+        calls_at_card = len(first.fake.inputs)
+        mark = len(first.chat.emissions)
+        await first.chat.chat(_switched("Anything new?", 2))
+        held = first.chat.emissions[mark:]
+        held_state = (len(first.fake.inputs), len(first.models), first.models[0]._hitl_card_pending,
+                      await load_channel_session_record(OPERATION, CHANNEL))
+        mark = len(first.chat.emissions)
+        await first.chat.chat(_switched_answer(_input_response("accept", card)))
+        answered = (first.chat.emissions[mark:], list(first.effects), len(first.models))
+        await first.chat.chat(_switched("What happened?", 3))
+        return first, at_card, calls_at_card, held, held_state, answered
+
+    first, at_card, calls_at_card, held, held_state, answered = asyncio.run(scenario())
+    closings = [e for e in held if e.get("complete_request")]
+    assert len(closings) == 1 and closings[0]["kind"] == "complete", held
+    notice = " ".join(str(e.get("content") or "") for e in held)
+    assert "gpt-4o-mini" in notice and "approval" in notice.lower() and REPLACED not in notice
+    calls, models, card_pending, record = held_state
+    assert (calls, models, card_pending) == (calls_at_card, 1, True)
+    assert record == at_card
+    emissions, effects, models_after_answer = answered
+    assert len(effects) == 1 and models_after_answer == 1  # applied by the Model that raised the card
+    assert not _lifecycle_errors(first.chat)
+    assert len(first.models) == 2  # the change applies to the next message, on the same generation
+    assert first.models[1]._thread_id_override == first.models[0]._thread_id_override
+    assert not any(REPLACED in text or REFUSAL in text for text in _texts(first.chat))
+
+
+def test_after_a_restart_a_held_model_change_names_the_model_to_set_back_and_runs_nothing():
+    async def scenario():
+        _first, card = await _raise_card()
+        before = await load_channel_session_record(OPERATION, CHANNEL)
+        second = _Process(_after_card_script())
+        await second.chat.chat(_switched("Anything new?", 2))
+        held = list(second.chat.emissions)
+        after = await load_channel_session_record(OPERATION, CHANNEL)
+        built = len(second.models)
+        await second.chat.chat(_decided_answer("accept", card))
+        return second, before, held, after, built
+
+    second, before, held, after, built = asyncio.run(scenario())
+    closings = [e for e in held if e.get("complete_request")]
+    assert len(closings) == 1 and closings[0]["kind"] == "complete", held
+    notice = " ".join(str(e.get("content") or "") for e in held)
+    assert "gpt-4o-mini" in notice and "Start a new Sage chat" not in notice and REFUSAL not in notice
+    assert built == 0 and after == before
+    assert len(second.effects) == 1
+    assert not _lifecycle_errors(second.chat)
+
+
+def test_after_a_restart_a_decision_sent_with_a_model_change_is_offered_back_and_never_applied_early():
+    async def scenario():
+        _first, card = await _raise_card()
+        stored = _input_response("accept", card)
+        second = _Process(_after_card_script(), card_rows=[_card_row(card, stored)])
+        await second.chat.chat(_switched_answer(stored))
+        at_hold = (list(second.chat.emissions), list(second.effects), len(second.models))
+        control = _controls(second.chat)[0]
+        second.card_rows.append(_control_row(control, answer=_control_response(control, "continue")))
+        await second.chat.chat(_answer(_control_response(control, "continue")))
+        return second, at_hold
+
+    second, (emissions, effects, built) = asyncio.run(scenario())
+    assert not [e for e in emissions if e.get("complete_request")]
+    assert effects == [] and built == 0
+    notice = " ".join(str(e.get("content") or "") for e in emissions)
+    assert "gpt-4o-mini" in notice and "Continue" in notice
+    assert len(second.effects) == 1
+    closings = _closings(second.chat)
+    assert len(closings) == 1 and closings[0]["kind"] == "complete", closings
+    assert not _lifecycle_errors(second.chat)

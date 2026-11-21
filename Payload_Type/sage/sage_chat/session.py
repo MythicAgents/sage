@@ -57,6 +57,62 @@ async def claim_channel_marker(request: ChatRequest) -> bool:
         # This is the first sage.db access on a chat turn; name the file in the operator-facing error.
         raise DatabaseUnavailable(unavailable_message(path, exc)) from exc
 
+# A channel Sage has seen but never built a session for: it received only slash commands, or its first
+# Model failed to build (for example an invalid model setting). Durable, so a restart still treats it as a
+# new channel instead of refusing it. A saved channel record always takes precedence over this mark.
+async def _channels_without_session(db: aiosqlite.Connection) -> None:
+    await db.execute(
+        "CREATE TABLE IF NOT EXISTS sage_chat_channels_without_session ("
+        "operation_id INTEGER NOT NULL, channel_id INTEGER NOT NULL, "
+        "PRIMARY KEY (operation_id, channel_id))"
+    )
+
+
+async def mark_channel_without_session(request: ChatRequest) -> None:
+    path = channel_session_db_path()
+    try:
+        async with aiosqlite.connect(path, timeout=5) as db:
+            await _channels_without_session(db)
+            await db.execute(
+                "INSERT OR IGNORE INTO sage_chat_channels_without_session "
+                "(operation_id, channel_id) VALUES (?, ?)",
+                (int(request.OperationID), int(request.ChannelID)),
+            )
+            await db.commit()
+    except sqlite3.OperationalError as exc:
+        raise DatabaseUnavailable(unavailable_message(path, exc)) from exc
+
+
+async def channel_without_session(operation_id: int, channel_id: int) -> bool:
+    path = channel_session_db_path()
+    try:
+        async with aiosqlite.connect(path, timeout=5) as db:
+            await _channels_without_session(db)
+            cursor = await db.execute(
+                "SELECT 1 FROM sage_chat_channels_without_session WHERE operation_id=? AND channel_id=?",
+                (int(operation_id), int(channel_id)),
+            )
+            row = await cursor.fetchone()
+            await db.commit()
+    except sqlite3.OperationalError as exc:
+        raise DatabaseUnavailable(unavailable_message(path, exc)) from exc
+    return row is not None
+
+
+async def clear_channel_without_session(request: ChatRequest) -> None:
+    path = channel_session_db_path()
+    try:
+        async with aiosqlite.connect(path, timeout=5) as db:
+            await _channels_without_session(db)
+            await db.execute(
+                "DELETE FROM sage_chat_channels_without_session WHERE operation_id=? AND channel_id=?",
+                (int(request.OperationID), int(request.ChannelID)),
+            )
+            await db.commit()
+    except sqlite3.OperationalError as exc:
+        raise DatabaseUnavailable(unavailable_message(path, exc)) from exc
+
+
 # Versioned per-channel restoration record, kept beside the marker in the same runtime file.
 # The LangGraph checkpoint stays the owner of conversation history; this row holds only what the
 # checkpoint does not: which generation the channel uses, the identity/config it was bound to, the

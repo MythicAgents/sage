@@ -1,6 +1,6 @@
 """Live channel-metadata chips for the Mythic chat header.
 
-Static config chips (Provider / Model / Max Steps) are declared on the config options via
+Static config chips (Provider / Max Steps) are declared on the config options via
 ``DisplayAsChip=True`` (see ``models.py``). This module builds the DYNAMIC set — controls and counts that
 change during a session — which the chat handler publishes each turn via ``turn.update_channel_metadata``.
 
@@ -131,9 +131,9 @@ def build_channel_metadata(model: Any) -> dict[str, Any]:
     except Exception:
         bh_connected = False
 
-    # Config-value chips (Policy / Mode / Autonomous) — rendered as metadata chips (NOT via DisplayAsChip)
-    # so they can carry a color: Mythic locks config chips to neutral, but metadata chips honor `color`.
-    # Accent them so they stand out from the neutral config chips (Provider / Model / Max Steps) + counts.
+    # Config-value chips (Model / Policy / Mode / Autonomous) — rendered as metadata chips (NOT via DisplayAsChip)
+    # so they can carry a color or a click: Mythic locks config chips to neutral and gives them no click.
+    # Model shows the model this session actually invokes and runs /model, as Mode runs /mode.
     mode = str(getattr(model, "mode", "") or "conversation")
     autonomous = bool(getattr(model, "_autonomous_solve", False))
     policy_mode = str(getattr(model, "policy_mode", "") or "hybrid")
@@ -162,6 +162,10 @@ def build_channel_metadata(model: Any) -> dict[str, Any]:
          "tooltip": "Sage component currently processing this channel"},
         {"key": "cfg_policy", "label": "Policy", "value": policy_mode, "color": policy_color, "order": 2,
          "tooltip": "Semantic capability selection backend"},
+        {"key": "cfg_model", "label": "Model", "value": str(getattr(model, "model", "") or ""), "order": 3,
+         "color": "neutral", "click": "/model",
+         "click_confirmation_text": "Run /model to show or change this chat's model?",
+         "tooltip": "The model this chat is using — click to run /model"},
         {"key": "cfg_mode", "label": "Mode", "value": mode, "color": mode_color, "order": 3,
          "click": "/mode", "click_confirmation_text": "Run /mode to show or change Sage's mode?",
          "tooltip": "Supervised or autonomous — click to run /mode"},

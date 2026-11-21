@@ -21,6 +21,10 @@ class _NoModelChat(HeadlessSageChat):
     async def handle_watcher_command(self, request, argument):
         return "routed:watcher"
 
+    async def handle_model_command(self, request, model, argument):
+        assert model is None
+        return "routed:model"
+
 
 def _request(name, argument="", *, operation_id=7, channel_id=24, request_id=23):
     request = build_chat_request("", operation_id=operation_id, channel_id=channel_id,
@@ -49,6 +53,7 @@ _DECLARED_DISPATCH_SCENARIOS = [
     ("list", "_handle_list"),
     ("tools", "render_tool_inventory"),
     ("mode", "_handle_mode"),
+    ("model", None),
     ("stop", "_handle_stop"),
     ("mcp", "_handle_mcp"),
     ("bloodhound", "_handle_bloodhound"),
