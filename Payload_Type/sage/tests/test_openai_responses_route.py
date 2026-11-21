@@ -123,7 +123,7 @@ def test_native_controls_follow_provider_and_model_with_specified_choices():
     assert api.DefaultValue == ""
 
     daybreak = options["SAGE_OPENAI_ACCESS_PROGRAM"]
-    assert daybreak.DisplayName == "Daybreak"
+    assert daybreak.DisplayName == "OpenAI Daybreak"
     assert [(c.Label, c.Value) for c in daybreak.Choices] == [
         ("Use configured default", ""), ("Off", "standard"), ("Blue", "daybreak_blue"), ("Red", "daybreak_red")]
     assert daybreak.DefaultValue == ""
@@ -337,7 +337,7 @@ def test_daybreak_and_access_rejections_are_configuration_errors(status, error, 
         SAGE_OPENAI_SAFETY_IDENTIFIER=PSEUDONYM)))
     notice = provider_configuration_notice(exc, profile)
     assert f"HTTP {status}" in notice and action in notice
-    assert "Daybreak: Red" in notice and "Safety Identifier: configured" in notice
+    assert "OpenAI Daybreak: Red" in notice and "OpenAI Safety Identifier: configured" in notice
     assert PSEUDONYM not in notice and KEY not in notice
 
 
@@ -396,7 +396,7 @@ def test_shipped_env_template_names_the_settings_but_sets_none():
 
 # --------------------------------------------------------------------------------------------------
 # Cold review (2026-11-20): the notice promises the conversation survives only for fixes that keep it.
-# Changing OpenAI API, Daybreak or Safety Identifier continues the chat; a new API key, model, provider or
+# Changing OpenAI API, OpenAI Daybreak or OpenAI Safety Identifier continues the chat; a new API key, model, provider or
 # endpoint starts a new session (general switching is #220), so the notice must say so.
 # --------------------------------------------------------------------------------------------------
 
@@ -421,7 +421,7 @@ CYBER = {"SAGE_OPENAI_API": "responses", "SAGE_OPENAI_ACCESS_PROGRAM": "daybreak
 def test_route_setting_fixes_promise_the_conversation_continues(status, error):
     notice = _notice(status, error, **CYBER)
     assert KEEPS in notice
-    assert "OpenAI API, Daybreak or OpenAI Safety Identifier" in notice
+    assert "OpenAI API, OpenAI Daybreak or OpenAI Safety Identifier" in notice
 
 
 def test_responses_only_404_on_chat_completions_promises_continuation():

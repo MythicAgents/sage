@@ -27,7 +27,7 @@ Pass rules (plan revision 2; written before the run; each is read once):
   P4 step 4 completes and its answer contains the label (history preserved across the correction).
   P5 Phoenix model spans in steps 2-4 name the configured model; every request ends terminal.
   P6 zero target tasks created; provider calls, tokens and wall time stayed inside the ceilings.
-  P7 the running Sage's model definition in Mythic (consuming_container.subscriptions) lists OpenAI API, Daybreak
+  P7 the running Sage's model definition in Mythic (consuming_container.subscriptions) lists OpenAI API, OpenAI Daybreak
      and OpenAI Safety Identifier right after Provider and Model, with the specified labels, values and empty
      defaults.
 Observations, not pass criteria: the tool step's calling agent and card rows (cards follow the model's routing
@@ -94,7 +94,7 @@ NOTICE_PREFIXES = ("⚠️ **BloodHound is not connected**", SETTINGS_NOTICE)
 EXPECTED_CONTROLS = (
     ("SAGE_OPENAI_API", "OpenAI API",
      [("Use configured default", ""), ("Chat Completions", "chat_completions"), ("Responses", "responses")]),
-    ("SAGE_OPENAI_ACCESS_PROGRAM", "Daybreak",
+    ("SAGE_OPENAI_ACCESS_PROGRAM", "OpenAI Daybreak",
      [("Use configured default", ""), ("Off", "standard"), ("Blue", "daybreak_blue"), ("Red", "daybreak_red")]),
     ("SAGE_OPENAI_SAFETY_IDENTIFIER", "OpenAI Safety Identifier", None),
 )

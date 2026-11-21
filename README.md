@@ -605,7 +605,7 @@ Model settings resolve through the chain above. The main settings are:
 | `policy_mode` | `hybrid` (default), `symbolic`, or `llm` capability selection |
 | `max_steps` | Model-step ceiling per chat request; unset defaults to `200`, `0` means unlimited |
 | `SAGE_OPENAI_API` | **OpenAI API**: blank keeps the adapter's usual route; `chat_completions` or `responses` selects one (OpenAI provider only) |
-| `SAGE_OPENAI_ACCESS_PROGRAM` | **Daybreak**: `standard` (Off), `daybreak_blue` or `daybreak_red`; Responses only, and blank sends Off |
+| `SAGE_OPENAI_ACCESS_PROGRAM` | **OpenAI Daybreak**: `standard` (Off), `daybreak_blue` or `daybreak_red`; Responses only, and blank sends Off |
 | `SAGE_OPENAI_SAFETY_IDENTIFIER` | **OpenAI Safety Identifier**: a stable pseudonym for the person using the chat, sent as `safety_identifier` |
 
 **Providers.** The four above are the tested set. Sage builds the model through LangChain's `init_chat_model`, so
@@ -619,7 +619,8 @@ and gateways implement — so you can set `API_ENDPOINT` to any server that expo
 internal gateway, or a proxy. For example, run a [LiteLLM](https://docs.litellm.ai/docs/simple_proxy) proxy and
 point `API_ENDPOINT` at it to reach 100+ providers behind a single OpenAI-compatible endpoint.
 
-**OpenAI Responses and Daybreak.** Some OpenAI models are served only on the Responses API; GPT-6 Cyber is one.
+**OpenAI Responses and Daybreak.** Some OpenAI models are served only on the Responses API, including
+the -cyber models from GPT-5.6 Cyber on.
 Set **OpenAI API** to **Responses** and keep `API_ENDPOINT` as the base URL (`https://api.openai.com/v1`); Sage
 adds `/responses` itself. Responses requests are stateless (`store: false`): Sage keeps the conversation and sends
 it, with the model's encrypted reasoning, on each request. On Responses, Sage always names the Daybreak program and
@@ -631,7 +632,7 @@ Processing. Sage never derives a safety identifier from a Mythic username; use t
 person. Invalid combinations (Daybreak without Responses, any of these with a non-OpenAI provider) fail before any
 request. When the provider rejects a route (for example a Responses-only model on Chat Completions, or a Daybreak
 access error), the error names the setting to change and says whether the chat continues. Changing only
-**OpenAI API**, **Daybreak** or **OpenAI Safety Identifier** continues the same chat with its conversation, and a
+**OpenAI API**, **OpenAI Daybreak** or **OpenAI Safety Identifier** continues the same chat with its conversation, and a
 fix made in the OpenAI project without changing Sage's settings is retried in the same chat. Changing the API key,
 model, provider or API endpoint starts a new chat. Sage never switches the model, provider, endpoint or API on its own.
 

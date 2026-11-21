@@ -76,7 +76,7 @@ def validate_route(
         )
     if program and program not in ACCESS_PROGRAM_VALUES:
         raise ValueError(
-            f"{ACCESS_PROGRAM_ENV} must be standard, daybreak_blue or daybreak_red (Daybreak: Off, Blue or Red)."
+            f"{ACCESS_PROGRAM_ENV} must be standard, daybreak_blue or daybreak_red (OpenAI Daybreak: Off, Blue or Red)."
         )
     route = OpenAIRoute(api=api_value, access_program=program, safety_identifier=identifier)
     if route.configured and str(provider or "").strip().casefold() != "openai":
@@ -85,8 +85,8 @@ def validate_route(
         )
     if program and api_value != RESPONSES:
         raise ValueError(
-            f"Daybreak ({ACCESS_PROGRAM_ENV}={program}) requires OpenAI API = Responses. Set OpenAI API to "
-            "Responses or clear Daybreak; Sage does not change the API for you."
+            f"OpenAI Daybreak ({ACCESS_PROGRAM_ENV}={program}) requires OpenAI API = Responses. Set OpenAI API to "
+            "Responses or clear OpenAI Daybreak; Sage does not change the API for you."
         )
     if api_value == RESPONSES and str(model or "").strip() in SAFETY_IDENTIFIER_REQUIRED_MODELS and not identifier:
         raise ValueError(

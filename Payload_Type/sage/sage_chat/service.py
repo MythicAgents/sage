@@ -283,7 +283,8 @@ def _claim_outstanding(record: dict[str, Any]) -> bool:
 
 
 SETTINGS_CONTINUED_NOTICE = (
-    "Applied this chat's updated OpenAI settings (OpenAI API, Daybreak or Safety Identifier). The "
+    "Applied this chat's updated OpenAI settings (OpenAI API, OpenAI Daybreak or OpenAI Safety "
+    "Identifier). The "
     "conversation continues with its earlier messages; the model, provider and endpoint are unchanged."
 )
 

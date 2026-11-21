@@ -105,12 +105,12 @@ def _endpoint_origin(endpoint: str) -> str:
 
 
 _KEEPS = (
-    "This chat is still usable and keeps its conversation: changing only OpenAI API, Daybreak or OpenAI Safety "
-    "Identifier continues it."
+    "This chat is still usable and keeps its conversation: changing only OpenAI API, OpenAI Daybreak or OpenAI "
+    "Safety Identifier continues it."
 )
 _NEW_CHAT = (
     "Changing the API key, model, provider or API endpoint starts a new chat; this chat's conversation does not "
-    "carry over. Changing only OpenAI API, Daybreak or OpenAI Safety Identifier keeps it."
+    "carry over. Changing only OpenAI API, OpenAI Daybreak or OpenAI Safety Identifier keeps it."
 )
 
 
@@ -122,10 +122,10 @@ def _configuration_action(status: int, code: str, param: str, message: str, api:
     made in the OpenAI project without touching Sage's settings is retried here as it is.
     """
     if code == "invalid_access_program":
-        return ("set **Daybreak** to the value named in the error (Off, Blue or Red), or the "
+        return ("set **OpenAI Daybreak** to the value named in the error (Off, Blue or Red), or the "
                 "SAGE_OPENAI_ACCESS_PROGRAM user secret or environment value, then send your request again", True)
     if code == "unsupported_access_program":
-        return ("set **Daybreak** to **Off** to keep this model and this chat, then send your request again; "
+        return ("set **OpenAI Daybreak** to **Off** to keep this model and this chat, then send your request again; "
                 "a model that supports Daybreak needs a new chat", True)
     if code == "access_program_not_enabled":
         return ("enable this Daybreak program for the API key's OpenAI project (for GPT-6 Cyber, also allowlist the "
@@ -180,7 +180,7 @@ def provider_configuration_notice(exc: BaseException, profile) -> str:
     api_label = openai_api.API_LABELS.get(api, api) + (f" ({source('openai_api')})" if api else "")
     route = (
         f"provider {value('provider', 'openai')} · model `{value('model')}` · OpenAI API: {api_label} · "
-        f"Daybreak: {daybreak} · Safety Identifier: "
+        f"OpenAI Daybreak: {daybreak} · OpenAI Safety Identifier: "
         f"{'configured' if value('openai_safety_identifier') else 'not configured'} · "
         f"endpoint {_endpoint_origin(value('api_endpoint'))}"
     )

@@ -83,7 +83,8 @@ _CONFIG_OPTIONS = [
         Description=(
             "Which OpenAI API this chat calls; applies to the OpenAI provider. Use configured default falls back "
             "to the SAGE_OPENAI_API user secret, then the container environment; with neither, the adapter keeps "
-            "its usual route (Chat Completions for most models). GPT-6 Cyber needs Responses."
+            "its usual route (Chat Completions for most models). OpenAI's -cyber models (GPT-5.6 Cyber and later) "
+            "need Responses."
         ),
         Required=False,
         DefaultValue="",
@@ -100,14 +101,14 @@ _CONFIG_OPTIONS = [
     ),
     ChatModelConfigurationOption(
         Name="SAGE_OPENAI_ACCESS_PROGRAM",
-        DisplayName="Daybreak",
+        DisplayName="OpenAI Daybreak",
         Type=OptType.Choice,
         Description=(
             "OpenAI Daybreak access program for Responses requests; applies to the OpenAI provider. Off "
             "explicitly requests standard safeguards. Use configured default falls back to the "
             "SAGE_OPENAI_ACCESS_PROGRAM user secret, then the container environment; with neither, Sage sends "
             "Off, never a project's own default program. Blue or Red requires OpenAI API = Responses and an "
-            "approved project; GPT-6 Cyber uses Red."
+            "approved project; OpenAI's -cyber models use Red."
         ),
         Required=False,
         DefaultValue="",
