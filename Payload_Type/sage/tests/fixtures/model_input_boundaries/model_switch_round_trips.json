@@ -1,0 +1,282 @@
+{
+ "provenance": {
+  "kind": "recorded model output (real provider, real adapter normalization)",
+  "description": "Live attempt 1 of the in-place model switch check, 2026-11-21 UTC, Sage feature/chat-model-switch deployed in the Mythic container, direct OpenAI Responses. Each message is the LangChain-serialized AIMessage the installed langchain-openai 1.4.2 adapter produced, as Phoenix recorded it: the gpt-6-cyber function call and its tool result from step S5 (channel 30, request 69), the gpt-5.6-sol answer after the switch to model B (S6, request 70) and the gpt-6-cyber answer after the switch back (S8, request 74).",
+  "substitutions": "None; the rows hold no host, user, credential or safety identifier values.",
+  "gap": "No reasoning item occurred (0 reasoning tokens). Sage's Supervisor carried S5's tool exchange to S6 as its final answer text, so the live S6 request held text only; function-call items replayed to a different model are covered here by replaying the recorded S5 items through the consumer, not by a live provider request."
+ },
+ "rows": [
+  {
+   "id": "cross_model_tool_history",
+   "prompt": "For a read-only status check, use list_callbacks once, then tell me the label from the previous turn and summarize the returned callback list. Do not run tasks.",
+   "producer_model": "gpt-6-cyber",
+   "replayed_to": "gpt-5.6-sol",
+   "call": {
+    "lc": 1,
+    "type": "constructor",
+    "id": [
+     "langchain",
+     "schema",
+     "messages",
+     "AIMessage"
+    ],
+    "kwargs": {
+     "content": [
+      {
+       "arguments": "{}",
+       "call_id": "call_4c402365f4f947fba06b32a20b708b4e",
+       "name": "list_callbacks",
+       "type": "function_call",
+       "id": "fc_0cbe712d371bb8a0016b0119d6183c87d28b01f88c4417567a",
+       "status": "completed"
+      }
+     ],
+     "response_metadata": {
+      "id": "resp_0cbe712d371bb8a0016b0119d4eea887d291c1645eff0f0c0e",
+      "created_at": 1795234261.0,
+      "metadata": {},
+      "model": "gpt-6-cyber",
+      "object": "response",
+      "service_tier": "default",
+      "status": "completed",
+      "model_provider": "openai",
+      "model_name": "gpt-6-cyber"
+     },
+     "type": "ai",
+     "name": "Supervisor",
+     "id": "resp_0cbe712d371bb8a0016b0119d4eea887d291c1645eff0f0c0e",
+     "tool_calls": [
+      {
+       "name": "list_callbacks",
+       "args": {},
+       "id": "call_4c402365f4f947fba06b32a20b708b4e",
+       "type": "tool_call"
+      }
+     ],
+     "usage_metadata": {
+      "input_tokens": 11089,
+      "output_tokens": 14,
+      "total_tokens": 11103,
+      "input_token_details": {
+       "cache_creation": 11086,
+       "cache_read": 0
+      },
+      "output_token_details": {
+       "reasoning": 0
+      }
+     },
+     "invalid_tool_calls": []
+    }
+   },
+   "tool_result": "{\"error\": \"{'message': 'Authentication hook unauthorized this request', 'extensions': {'path': '$', 'code': 'access-denied'}}\", \"status\": \"error\"}",
+   "respond": {
+    "lc": 1,
+    "type": "constructor",
+    "id": [
+     "langchain",
+     "schema",
+     "messages",
+     "AIMessage"
+    ],
+    "kwargs": {
+     "content": [
+      {
+       "arguments": "{\"final_response\":\"**The callback status check was blocked:** `list_callbacks` returned `access-denied` with \u201cAuthentication hook unauthorized this request.\u201d Restore authorized Mythic access to make a future status check possible.\\n\\nThe label from the previous turn is **amber-seven**.\\n\\n| Callback-list result | Status |\\n|---|---|\\n| Returned callback records | None returned because the query failed |\\n| Callback count and liveness | Unknown |\\n\\nI called `list_callbacks` exactly once. No tasks were run.\",\"reuse_latest_worker_answer\":false,\"outcome\":\"blocked\"}",
+       "call_id": "call_4257d16404be4ae8a7c910a5686f604a",
+       "name": "respond_to_user",
+       "type": "function_call",
+       "id": "fc_0cbe712d371bb8a0016b0119d78efc87d28dc12ac4286cd18f",
+       "status": "completed"
+      }
+     ],
+     "response_metadata": {
+      "id": "resp_0cbe712d371bb8a0016b0119d691a887d2af51e5660a252989",
+      "created_at": 1795234262.0,
+      "metadata": {},
+      "model": "gpt-6-cyber",
+      "object": "response",
+      "service_tier": "default",
+      "status": "completed",
+      "model_provider": "openai",
+      "model_name": "gpt-6-cyber"
+     },
+     "type": "ai",
+     "name": "Supervisor",
+     "id": "resp_0cbe712d371bb8a0016b0119d691a887d2af51e5660a252989",
+     "tool_calls": [
+      {
+       "name": "respond_to_user",
+       "args": {
+        "final_response": "**The callback status check was blocked:** `list_callbacks` returned `access-denied` with \u201cAuthentication hook unauthorized this request.\u201d Restore authorized Mythic access to make a future status check possible.\n\nThe label from the previous turn is **amber-seven**.\n\n| Callback-list result | Status |\n|---|---|\n| Returned callback records | None returned because the query failed |\n| Callback count and liveness | Unknown |\n\nI called `list_callbacks` exactly once. No tasks were run.",
+        "reuse_latest_worker_answer": false,
+        "outcome": "blocked"
+       },
+       "id": "call_4257d16404be4ae8a7c910a5686f604a",
+       "type": "tool_call"
+      }
+     ],
+     "usage_metadata": {
+      "input_tokens": 11151,
+      "output_tokens": 137,
+      "total_tokens": 11288,
+      "input_token_details": {
+       "cache_creation": 462,
+       "cache_read": 10686
+      },
+      "output_token_details": {
+       "reasoning": 0
+      }
+     },
+     "invalid_tool_calls": []
+    }
+   },
+   "expected": {
+    "tool": "list_callbacks",
+    "call_id": "call_4c402365f4f947fba06b32a20b708b4e",
+    "answer_tool": "respond_to_user"
+   }
+  },
+  {
+   "id": "answer_after_switch_to_b",
+   "configured_model": "gpt-5.6-sol",
+   "previous_model": "gpt-6-cyber",
+   "prompt": "Repeat my label without tools.",
+   "seen_history_roles": [
+    "system",
+    "system",
+    "user",
+    "user",
+    "assistant",
+    "assistant",
+    "assistant",
+    "user",
+    "assistant",
+    "user",
+    "user"
+   ],
+   "answer": {
+    "lc": 1,
+    "type": "constructor",
+    "id": [
+     "langchain",
+     "schema",
+     "messages",
+     "AIMessage"
+    ],
+    "kwargs": {
+     "content": [
+      {
+       "arguments": "{\"final_response\":\"**amber-seven**\",\"reuse_latest_worker_answer\":false,\"outcome\":\"completed\"}",
+       "call_id": "call_6a36d5f6d1cf4fffbdcf77c6cb08ab19",
+       "name": "respond_to_user",
+       "type": "function_call",
+       "id": "fc_001ecde60a929768016b0119dad0a887d2b24760947b6bfaea",
+       "status": "completed"
+      }
+     ],
+     "response_metadata": {
+      "id": "resp_001ecde60a929768016b0119da3b5c87d28d4edbfbf097ab50",
+      "created_at": 1795234266.0,
+      "metadata": {},
+      "model": "gpt-5.6-sol",
+      "object": "response",
+      "service_tier": "default",
+      "status": "completed",
+      "model_provider": "openai",
+      "model_name": "gpt-5.6-sol"
+     },
+     "type": "ai",
+     "name": "Supervisor",
+     "id": "resp_001ecde60a929768016b0119da3b5c87d28d4edbfbf097ab50",
+     "tool_calls": [
+      {
+       "name": "respond_to_user",
+       "args": {
+        "final_response": "**amber-seven**",
+        "reuse_latest_worker_answer": false,
+        "outcome": "completed"
+       },
+       "id": "call_6a36d5f6d1cf4fffbdcf77c6cb08ab19",
+       "type": "tool_call"
+      }
+     ],
+     "usage_metadata": {
+      "input_tokens": 11209,
+      "output_tokens": 35,
+      "total_tokens": 11244,
+      "input_token_details": {
+       "cache_creation": 11206,
+       "cache_read": 0
+      },
+      "output_token_details": {
+       "reasoning": 0
+      }
+     },
+     "invalid_tool_calls": []
+    }
+   },
+   "expected": {
+    "answer_tool": "respond_to_user",
+    "answer_contains": "amber-seven"
+   }
+  },
+  {
+   "id": "answer_after_switch_back_to_a",
+   "configured_model": "gpt-6-cyber",
+   "previous_model": "nonexistent-model-b",
+   "prompt": "Repeat my label without tools.",
+   "answer": {
+    "lc": 1,
+    "type": "constructor",
+    "id": [
+     "langchain",
+     "schema",
+     "messages",
+     "AIMessage"
+    ],
+    "kwargs": {
+     "content": [
+      {
+       "type": "text",
+       "text": "amber-seven",
+       "annotations": [],
+       "id": "msg_0f1cb4380e4fd597016b0119ef5a0887d292ee4dbe93b76500",
+       "phase": "final_answer"
+      }
+     ],
+     "response_metadata": {
+      "id": "resp_0f1cb4380e4fd597016b0119ee8cfc87d2af93b374c326f65e",
+      "created_at": 1795234286.0,
+      "metadata": {},
+      "model": "gpt-6-cyber",
+      "object": "response",
+      "service_tier": "default",
+      "status": "completed",
+      "model_provider": "openai",
+      "model_name": "gpt-6-cyber"
+     },
+     "type": "ai",
+     "name": "Supervisor",
+     "id": "resp_0f1cb4380e4fd597016b0119ee8cfc87d2af93b374c326f65e",
+     "usage_metadata": {
+      "input_tokens": 11241,
+      "output_tokens": 6,
+      "total_tokens": 11247,
+      "input_token_details": {
+       "cache_creation": 11238,
+       "cache_read": 0
+      },
+      "output_token_details": {
+       "reasoning": 0
+      }
+     },
+     "tool_calls": [],
+     "invalid_tool_calls": []
+    }
+   },
+   "expected": {
+    "text": "amber-seven"
+   }
+  }
+ ]
+}

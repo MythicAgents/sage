@@ -158,3 +158,51 @@ def test_other_providers_signed_reasoning_is_not_sent_to_another_model(block):
     assert changed and cleaned[1].content == [{"type": "text", "text": "Answer text."}]
     same, same_changed = _sanitize_model_messages([HumanMessage("hi"), message], configured_model="claude-sonnet-5")
     assert not same_changed and same[1] is message
+
+
+SWITCH = json.loads((Path(__file__).parent / "fixtures/model_input_boundaries/model_switch_round_trips.json").read_text())
+SWITCH_ROWS = {row["id"]: row for row in SWITCH["rows"]}
+
+
+def test_model_switch_rows_record_their_provenance_and_gap():
+    assert SWITCH["provenance"]["kind"].startswith("recorded model output")
+    assert "text only" in SWITCH["provenance"]["gap"]
+    assert set(SWITCH_ROWS) == {"cross_model_tool_history", "answer_after_switch_to_b", "answer_after_switch_back_to_a"}
+
+
+def test_recorded_cyber_tool_exchange_replays_unchanged_to_the_second_model():
+    row = SWITCH_ROWS["cross_model_tool_history"]
+    call, respond = _message(row["call"]), _message(row["respond"])
+    assert call.response_metadata["model_name"] == row["producer_model"]
+    assert [(c["name"], c["id"]) for c in call.tool_calls] == [(row["expected"]["tool"], row["expected"]["call_id"])]
+    history = [HumanMessage(row["prompt"]), call,
+               ToolMessage(content=row["tool_result"], tool_call_id=row["expected"]["call_id"])]
+    cleaned, changed = _sanitize_model_messages(history, configured_model=row["replayed_to"])
+    assert not changed and cleaned[1] is call
+    items = _construct_responses_api_input(cleaned, store=False)
+    assert [item.get("type") for item in items] == ["message", "function_call", "function_call_output"]
+    assert items[1]["call_id"] == items[2]["call_id"] == row["expected"]["call_id"]
+    assert [c["name"] for c in respond.tool_calls] == [row["expected"]["answer_tool"]]
+    assert _tool_call_envelope_error(call) == "" and _tool_call_envelope_error(respond) == ""
+
+
+def test_recorded_answer_after_switching_to_the_second_model_carries_the_label():
+    row = SWITCH_ROWS["answer_after_switch_to_b"]
+    answer = _message(row["answer"])
+    assert answer.response_metadata["model_name"] == row["configured_model"]
+    (respond,) = answer.tool_calls
+    assert respond["name"] == row["expected"]["answer_tool"]
+    assert row["expected"]["answer_contains"] in respond["args"]["final_response"]
+    assert _tool_call_envelope_error(answer) == "" and _render(answer) == ""
+    # Nothing provider-opaque to drop if this answer is later replayed to another model.
+    assert [block["type"] for block in answer.content] == ["function_call"]
+
+
+@pytest.mark.parametrize("reader", ["render", "text", "sole"])
+def test_recorded_answer_after_switching_back_reads_as_its_text(reader):
+    row = SWITCH_ROWS["answer_after_switch_back_to_a"]
+    answer = _message(row["answer"])
+    assert answer.response_metadata["model_name"] == row["configured_model"]
+    value = {"render": lambda: _render(answer), "text": lambda: _message_content_as_text(answer.content),
+             "sole": lambda: _sole_provider_text(answer.content)}[reader]()
+    assert value.strip() == row["expected"]["text"]
