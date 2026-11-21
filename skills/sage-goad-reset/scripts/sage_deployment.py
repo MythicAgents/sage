@@ -120,6 +120,9 @@ _SYNC_EXCLUDES = (
     # `.sage_engagement_<stamp>`, and `--delete` would try to unlink those sealed files too, which
     # fails the sync just as hard as overwriting them.
     ".sage_engagement*",
+    # The optional coding-agent worker's live socket directory (`/acp`). The worker container bind-mounts
+    # it, so deleting it on a deploy would leave the worker listening on an unlinked directory.
+    ".sage_acp",
 )
 
 # One program, run on both sides, so the two digests cannot disagree through implementation drift.

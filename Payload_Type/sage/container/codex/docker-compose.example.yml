@@ -1,0 +1,38 @@
+# Example deployment of the optional Codex worker beside the Sage chat container on the same Docker host.
+#
+# Required environment (for example in a .env beside this file):
+#   SAGE_ACP_SOCKET_DIR      host path of the socket directory inside Sage's installed service directory,
+#                            e.g. <mythic>/InstalledServices/sage/.sage_acp (create it, mode 0700, owned by
+#                            the owner of the service directory)
+#   SAGE_CODEX_UID/GID       numeric owner of the Sage service directory (Sage drops to that identity)
+#   SAGE_CODEX_API_KEY_FILE  host path of a file containing only the API key, readable by that UID
+# Sage then needs SAGE_ACP_SOCKET=/Mythic/.sage_acp/acp.sock in its own environment (Payload_Type/sage/.env).
+#
+# Only the socket subdirectory is shared with Sage. No Docker socket, host port or privileged mode is used.
+services:
+  sage-codex:
+    build: .
+    image: sage-codex-acp:2.9.0
+    container_name: sage-codex
+    init: true                       # reaps the adapter's orphaned children
+    user: "${SAGE_CODEX_UID:?set SAGE_CODEX_UID}:${SAGE_CODEX_GID:?set SAGE_CODEX_GID}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 512
+    mem_limit: 2g
+    # Codex needs outbound access to its model provider. For a configuration-only check, use
+    # `network_mode: none` instead.
+    tmpfs:
+      - /state:mode=0700,uid=${SAGE_CODEX_UID},gid=${SAGE_CODEX_GID}
+      - /tmp:mode=1777
+    volumes:
+      - ${SAGE_ACP_SOCKET_DIR:?set SAGE_ACP_SOCKET_DIR}:/transport
+      - ./config.toml:/config/config.toml:ro
+    secrets:
+      - codex_api_key
+    restart: unless-stopped
+
+secrets:
+  codex_api_key:
+    file: ${SAGE_CODEX_API_KEY_FILE:?set SAGE_CODEX_API_KEY_FILE}

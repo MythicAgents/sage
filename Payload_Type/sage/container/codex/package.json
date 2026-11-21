@@ -1,0 +1,9 @@
+{
+  "name": "sage-codex-acp-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Codex ACP adapter behind a private Unix-socket bridge for Sage",
+  "dependencies": {
+    "@agentclientprotocol/codex-acp": "2.9.0"
+  }
+}

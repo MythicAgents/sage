@@ -4,6 +4,11 @@
 .npmrc
 package.json
 package-lock.json
+# The Codex worker image installs exactly this manifest and lock.
+!Payload_Type/sage/container/codex/package.json
+!Payload_Type/sage/container/codex/package-lock.json
+# Live socket directory shared with the optional coding-agent worker (`/acp`).
+.sage_acp/
 # CLAUDE.md is committed (it imports AGENTS.md and adds the Claude-specific subset).
 # Personal, machine-specific notes go in CLAUDE.local.md, which Claude Code loads right after it.
 CLAUDE.local.md

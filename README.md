@@ -460,6 +460,7 @@ the token has no read scope for.
 | `/bloodhound [force] [dir]` | Connect, report, or rebind the BloodHound MCP — see [BloodHound](#bloodhound) |
 | `/mcp <list\|tools\|call\|connect\|disconnect\|policy>` | Manage MCP servers — see [Connecting other MCP servers](#connecting-other-mcp-servers) |
 | `/sandbox [shell\|python] <code>` | Run an isolated local snippet (no network or host mounts; needs no Mythic scope) |
+| `/acp [status\|connect codex\|models\|model <id>\|disconnect]` | Connect this channel to an optional, separately deployed Codex worker and choose its model; configuration only, no prompt is sent — see [`container/codex/README.md`](Payload_Type/sage/container/codex/README.md) |
 
 `/state` is available in conversation, supervised and auto modes. Its ledger is shared across
 chats in the same operation engagement and persists once written. A new engagement can show an

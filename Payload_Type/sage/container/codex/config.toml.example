@@ -1,0 +1,9 @@
+# Codex configuration template for the Sage worker. Copy to config.toml beside docker-compose.example.yml and edit.
+# The worker mounts it read-only and copies it into each connection's fresh CODEX_HOME. It holds defaults only:
+# the API key comes from the mounted secret file, never from this file.
+#
+# Default model for new sessions. It must be one the adapter advertises (`/acp models` lists them); an operator can
+# still choose another advertised model per channel with `/acp model <id>`.
+# model = "gpt-6.2-sol"
+#
+# Provider or gateway settings, if any, follow the Codex configuration documentation for the pinned release.
