@@ -185,6 +185,12 @@ class DriverChat(HeadlessSageChat):
         await put_channel_session(request, self.model)
         return self.model, False
 
+    async def _observe_bloodhound_turn(self, model, request):
+        # This driver serves a pre-built Model and never runs the BloodHound connect path, so there is no turn
+        # state to observe. Without one, the BloodHound guard keeps its pinned-session rule, which the cases
+        # that need BloodHound stand in.
+        model._bloodhound_turn_state = None
+
 
 async def _run_case(*, decision: str, proposed_command: str) -> dict:
     started = perf_counter()

@@ -2,15 +2,6 @@
   "chat_emissions": {
     "C01-greeting": [
       {
-        "complete": "False",
-        "complete_request": "False",
-        "content": "\"\u26a0\ufe0f **BloodHound is not connected**, so attack-graph analysis and ingest are unavailable for this chat. Everything else works normally; only graph-dependent work is blocked, and an autonomous solve will refuse until it is connected.\\n\\nCredentials Sage resolved for this attempt: NONE\\nMissing (required): BLOODHOUND_URL, BLOODHOUND_TOKEN_ID, BLOODHOUND_TOKEN_KEY\\nTwo supported places, both editable without a shell: the chat configuration when you create the chat (per-chat), or Sage's own .env file, which you can open and edit from the Mythic UI on the installed-services page (shared by every chat in this container). Mythic user secrets work too. Full order, highest first: chat config \u2192 user secret \u2192 container env \u2192 .env.local \u2192 .env.\\nA third option exists and is the least durable: the BloodHound MCP server also reads its own .env from the directory SAGE_BLOODHOUND_MCP_DIR points at. In a Mythic install that is the image's baked /opt/bloodhound_mcp, which is NOT on the bind mount, so a file written there is lost on the next rebuild and cannot be edited from the UI.\"",
-        "kind": "'response'",
-        "metadata": "{}",
-        "response_key": "'bloodhound_degraded:41'",
-        "status": "'complete'"
-      },
-      {
         "content": "'case=C01-greeting terminal=complete'",
         "kind": "'text'",
         "metadata": "None",
@@ -25,15 +16,6 @@
       }
     ],
     "C02-information-question": [
-      {
-        "complete": "False",
-        "complete_request": "False",
-        "content": "\"\u26a0\ufe0f **BloodHound is not connected**, so attack-graph analysis and ingest are unavailable for this chat. Everything else works normally; only graph-dependent work is blocked, and an autonomous solve will refuse until it is connected.\\n\\nCredentials Sage resolved for this attempt: NONE\\nMissing (required): BLOODHOUND_URL, BLOODHOUND_TOKEN_ID, BLOODHOUND_TOKEN_KEY\\nTwo supported places, both editable without a shell: the chat configuration when you create the chat (per-chat), or Sage's own .env file, which you can open and edit from the Mythic UI on the installed-services page (shared by every chat in this container). Mythic user secrets work too. Full order, highest first: chat config \u2192 user secret \u2192 container env \u2192 .env.local \u2192 .env.\\nA third option exists and is the least durable: the BloodHound MCP server also reads its own .env from the directory SAGE_BLOODHOUND_MCP_DIR points at. In a Mythic install that is the image's baked /opt/bloodhound_mcp, which is NOT on the bind mount, so a file written there is lost on the next rebuild and cannot be edited from the UI.\"",
-        "kind": "'response'",
-        "metadata": "{}",
-        "response_key": "'bloodhound_degraded:41'",
-        "status": "'complete'"
-      },
       {
         "content": "'case=C02-information-question terminal=complete'",
         "kind": "'text'",
@@ -50,15 +32,6 @@
     ],
     "C03-control-plane-read": [
       {
-        "complete": "False",
-        "complete_request": "False",
-        "content": "\"\u26a0\ufe0f **BloodHound is not connected**, so attack-graph analysis and ingest are unavailable for this chat. Everything else works normally; only graph-dependent work is blocked, and an autonomous solve will refuse until it is connected.\\n\\nCredentials Sage resolved for this attempt: NONE\\nMissing (required): BLOODHOUND_URL, BLOODHOUND_TOKEN_ID, BLOODHOUND_TOKEN_KEY\\nTwo supported places, both editable without a shell: the chat configuration when you create the chat (per-chat), or Sage's own .env file, which you can open and edit from the Mythic UI on the installed-services page (shared by every chat in this container). Mythic user secrets work too. Full order, highest first: chat config \u2192 user secret \u2192 container env \u2192 .env.local \u2192 .env.\\nA third option exists and is the least durable: the BloodHound MCP server also reads its own .env from the directory SAGE_BLOODHOUND_MCP_DIR points at. In a Mythic install that is the image's baked /opt/bloodhound_mcp, which is NOT on the bind mount, so a file written there is lost on the next rebuild and cannot be edited from the UI.\"",
-        "kind": "'response'",
-        "metadata": "{}",
-        "response_key": "'bloodhound_degraded:41'",
-        "status": "'complete'"
-      },
-      {
         "content": "'case=C03-control-plane-read terminal=complete'",
         "kind": "'text'",
         "metadata": "None",
@@ -73,15 +46,6 @@
       }
     ],
     "C04-one-bounded-callback-action": [
-      {
-        "complete": "False",
-        "complete_request": "False",
-        "content": "\"\u26a0\ufe0f **BloodHound is not connected**, so attack-graph analysis and ingest are unavailable for this chat. Everything else works normally; only graph-dependent work is blocked, and an autonomous solve will refuse until it is connected.\\n\\nCredentials Sage resolved for this attempt: NONE\\nMissing (required): BLOODHOUND_URL, BLOODHOUND_TOKEN_ID, BLOODHOUND_TOKEN_KEY\\nTwo supported places, both editable without a shell: the chat configuration when you create the chat (per-chat), or Sage's own .env file, which you can open and edit from the Mythic UI on the installed-services page (shared by every chat in this container). Mythic user secrets work too. Full order, highest first: chat config \u2192 user secret \u2192 container env \u2192 .env.local \u2192 .env.\\nA third option exists and is the least durable: the BloodHound MCP server also reads its own .env from the directory SAGE_BLOODHOUND_MCP_DIR points at. In a Mythic install that is the image's baked /opt/bloodhound_mcp, which is NOT on the bind mount, so a file written there is lost on the next rebuild and cannot be edited from the UI.\"",
-        "kind": "'response'",
-        "metadata": "{}",
-        "response_key": "'bloodhound_degraded:41'",
-        "status": "'complete'"
-      },
       {
         "content": "'case=C04-one-bounded-callback-action terminal=awaiting_approval'",
         "kind": "'text'",
@@ -98,15 +62,6 @@
     ],
     "C05-positive-with-safety-suffix": [
       {
-        "complete": "False",
-        "complete_request": "False",
-        "content": "\"\u26a0\ufe0f **BloodHound is not connected**, so attack-graph analysis and ingest are unavailable for this chat. Everything else works normally; only graph-dependent work is blocked, and an autonomous solve will refuse until it is connected.\\n\\nCredentials Sage resolved for this attempt: NONE\\nMissing (required): BLOODHOUND_URL, BLOODHOUND_TOKEN_ID, BLOODHOUND_TOKEN_KEY\\nTwo supported places, both editable without a shell: the chat configuration when you create the chat (per-chat), or Sage's own .env file, which you can open and edit from the Mythic UI on the installed-services page (shared by every chat in this container). Mythic user secrets work too. Full order, highest first: chat config \u2192 user secret \u2192 container env \u2192 .env.local \u2192 .env.\\nA third option exists and is the least durable: the BloodHound MCP server also reads its own .env from the directory SAGE_BLOODHOUND_MCP_DIR points at. In a Mythic install that is the image's baked /opt/bloodhound_mcp, which is NOT on the bind mount, so a file written there is lost on the next rebuild and cannot be edited from the UI.\"",
-        "kind": "'response'",
-        "metadata": "{}",
-        "response_key": "'bloodhound_degraded:41'",
-        "status": "'complete'"
-      },
-      {
         "content": "'case=C05-positive-with-safety-suffix terminal=awaiting_approval'",
         "kind": "'text'",
         "metadata": "None",
@@ -121,15 +76,6 @@
       }
     ],
     "C06-two-actions-one-prohibited": [
-      {
-        "complete": "False",
-        "complete_request": "False",
-        "content": "\"\u26a0\ufe0f **BloodHound is not connected**, so attack-graph analysis and ingest are unavailable for this chat. Everything else works normally; only graph-dependent work is blocked, and an autonomous solve will refuse until it is connected.\\n\\nCredentials Sage resolved for this attempt: NONE\\nMissing (required): BLOODHOUND_URL, BLOODHOUND_TOKEN_ID, BLOODHOUND_TOKEN_KEY\\nTwo supported places, both editable without a shell: the chat configuration when you create the chat (per-chat), or Sage's own .env file, which you can open and edit from the Mythic UI on the installed-services page (shared by every chat in this container). Mythic user secrets work too. Full order, highest first: chat config \u2192 user secret \u2192 container env \u2192 .env.local \u2192 .env.\\nA third option exists and is the least durable: the BloodHound MCP server also reads its own .env from the directory SAGE_BLOODHOUND_MCP_DIR points at. In a Mythic install that is the image's baked /opt/bloodhound_mcp, which is NOT on the bind mount, so a file written there is lost on the next rebuild and cannot be edited from the UI.\"",
-        "kind": "'response'",
-        "metadata": "{}",
-        "response_key": "'bloodhound_degraded:41'",
-        "status": "'complete'"
-      },
       {
         "content": "'case=C06-two-actions-one-prohibited terminal=complete'",
         "kind": "'text'",
@@ -146,15 +92,6 @@
     ],
     "C07-stored-objective-information": [
       {
-        "complete": "False",
-        "complete_request": "False",
-        "content": "\"\u26a0\ufe0f **BloodHound is not connected**, so attack-graph analysis and ingest are unavailable for this chat. Everything else works normally; only graph-dependent work is blocked, and an autonomous solve will refuse until it is connected.\\n\\nCredentials Sage resolved for this attempt: NONE\\nMissing (required): BLOODHOUND_URL, BLOODHOUND_TOKEN_ID, BLOODHOUND_TOKEN_KEY\\nTwo supported places, both editable without a shell: the chat configuration when you create the chat (per-chat), or Sage's own .env file, which you can open and edit from the Mythic UI on the installed-services page (shared by every chat in this container). Mythic user secrets work too. Full order, highest first: chat config \u2192 user secret \u2192 container env \u2192 .env.local \u2192 .env.\\nA third option exists and is the least durable: the BloodHound MCP server also reads its own .env from the directory SAGE_BLOODHOUND_MCP_DIR points at. In a Mythic install that is the image's baked /opt/bloodhound_mcp, which is NOT on the bind mount, so a file written there is lost on the next rebuild and cannot be edited from the UI.\"",
-        "kind": "'response'",
-        "metadata": "{}",
-        "response_key": "'bloodhound_degraded:41'",
-        "status": "'complete'"
-      },
-      {
         "content": "'case=C07-stored-objective-information terminal=complete'",
         "kind": "'text'",
         "metadata": "None",
@@ -169,15 +106,6 @@
       }
     ],
     "C08-explicit-stored-objective-continuation": [
-      {
-        "complete": "False",
-        "complete_request": "False",
-        "content": "\"\u26a0\ufe0f **BloodHound is not connected**, so attack-graph analysis and ingest are unavailable for this chat. Everything else works normally; only graph-dependent work is blocked, and an autonomous solve will refuse until it is connected.\\n\\nCredentials Sage resolved for this attempt: NONE\\nMissing (required): BLOODHOUND_URL, BLOODHOUND_TOKEN_ID, BLOODHOUND_TOKEN_KEY\\nTwo supported places, both editable without a shell: the chat configuration when you create the chat (per-chat), or Sage's own .env file, which you can open and edit from the Mythic UI on the installed-services page (shared by every chat in this container). Mythic user secrets work too. Full order, highest first: chat config \u2192 user secret \u2192 container env \u2192 .env.local \u2192 .env.\\nA third option exists and is the least durable: the BloodHound MCP server also reads its own .env from the directory SAGE_BLOODHOUND_MCP_DIR points at. In a Mythic install that is the image's baked /opt/bloodhound_mcp, which is NOT on the bind mount, so a file written there is lost on the next rebuild and cannot be edited from the UI.\"",
-        "kind": "'response'",
-        "metadata": "{}",
-        "response_key": "'bloodhound_degraded:41'",
-        "status": "'complete'"
-      },
       {
         "content": "'case=C08-explicit-stored-objective-continuation terminal=complete'",
         "kind": "'text'",
@@ -194,15 +122,6 @@
     ],
     "C09-exact-callback-refinement": [
       {
-        "complete": "False",
-        "complete_request": "False",
-        "content": "\"\u26a0\ufe0f **BloodHound is not connected**, so attack-graph analysis and ingest are unavailable for this chat. Everything else works normally; only graph-dependent work is blocked, and an autonomous solve will refuse until it is connected.\\n\\nCredentials Sage resolved for this attempt: NONE\\nMissing (required): BLOODHOUND_URL, BLOODHOUND_TOKEN_ID, BLOODHOUND_TOKEN_KEY\\nTwo supported places, both editable without a shell: the chat configuration when you create the chat (per-chat), or Sage's own .env file, which you can open and edit from the Mythic UI on the installed-services page (shared by every chat in this container). Mythic user secrets work too. Full order, highest first: chat config \u2192 user secret \u2192 container env \u2192 .env.local \u2192 .env.\\nA third option exists and is the least durable: the BloodHound MCP server also reads its own .env from the directory SAGE_BLOODHOUND_MCP_DIR points at. In a Mythic install that is the image's baked /opt/bloodhound_mcp, which is NOT on the bind mount, so a file written there is lost on the next rebuild and cannot be edited from the UI.\"",
-        "kind": "'response'",
-        "metadata": "{}",
-        "response_key": "'bloodhound_degraded:41'",
-        "status": "'complete'"
-      },
-      {
         "content": "'case=C09-exact-callback-refinement terminal=complete'",
         "kind": "'text'",
         "metadata": "None",
@@ -217,15 +136,6 @@
       }
     ],
     "C10-proposal-awaiting-approval": [
-      {
-        "complete": "False",
-        "complete_request": "False",
-        "content": "\"\u26a0\ufe0f **BloodHound is not connected**, so attack-graph analysis and ingest are unavailable for this chat. Everything else works normally; only graph-dependent work is blocked, and an autonomous solve will refuse until it is connected.\\n\\nCredentials Sage resolved for this attempt: NONE\\nMissing (required): BLOODHOUND_URL, BLOODHOUND_TOKEN_ID, BLOODHOUND_TOKEN_KEY\\nTwo supported places, both editable without a shell: the chat configuration when you create the chat (per-chat), or Sage's own .env file, which you can open and edit from the Mythic UI on the installed-services page (shared by every chat in this container). Mythic user secrets work too. Full order, highest first: chat config \u2192 user secret \u2192 container env \u2192 .env.local \u2192 .env.\\nA third option exists and is the least durable: the BloodHound MCP server also reads its own .env from the directory SAGE_BLOODHOUND_MCP_DIR points at. In a Mythic install that is the image's baked /opt/bloodhound_mcp, which is NOT on the bind mount, so a file written there is lost on the next rebuild and cannot be edited from the UI.\"",
-        "kind": "'response'",
-        "metadata": "{}",
-        "response_key": "'bloodhound_degraded:41'",
-        "status": "'complete'"
-      },
       {
         "content": "'case=C10-proposal-awaiting-approval terminal=awaiting_approval'",
         "kind": "'text'",
@@ -242,15 +152,6 @@
     ],
     "C11-exact-approval": [
       {
-        "complete": "False",
-        "complete_request": "False",
-        "content": "\"\u26a0\ufe0f **BloodHound is not connected**, so attack-graph analysis and ingest are unavailable for this chat. Everything else works normally; only graph-dependent work is blocked, and an autonomous solve will refuse until it is connected.\\n\\nCredentials Sage resolved for this attempt: NONE\\nMissing (required): BLOODHOUND_URL, BLOODHOUND_TOKEN_ID, BLOODHOUND_TOKEN_KEY\\nTwo supported places, both editable without a shell: the chat configuration when you create the chat (per-chat), or Sage's own .env file, which you can open and edit from the Mythic UI on the installed-services page (shared by every chat in this container). Mythic user secrets work too. Full order, highest first: chat config \u2192 user secret \u2192 container env \u2192 .env.local \u2192 .env.\\nA third option exists and is the least durable: the BloodHound MCP server also reads its own .env from the directory SAGE_BLOODHOUND_MCP_DIR points at. In a Mythic install that is the image's baked /opt/bloodhound_mcp, which is NOT on the bind mount, so a file written there is lost on the next rebuild and cannot be edited from the UI.\"",
-        "kind": "'response'",
-        "metadata": "{}",
-        "response_key": "'bloodhound_degraded:41'",
-        "status": "'complete'"
-      },
-      {
         "content": "'case=C11-exact-approval terminal=complete'",
         "kind": "'text'",
         "metadata": "None",
@@ -265,15 +166,6 @@
       }
     ],
     "C12-reject-a-then-run-b": [
-      {
-        "complete": "False",
-        "complete_request": "False",
-        "content": "\"\u26a0\ufe0f **BloodHound is not connected**, so attack-graph analysis and ingest are unavailable for this chat. Everything else works normally; only graph-dependent work is blocked, and an autonomous solve will refuse until it is connected.\\n\\nCredentials Sage resolved for this attempt: NONE\\nMissing (required): BLOODHOUND_URL, BLOODHOUND_TOKEN_ID, BLOODHOUND_TOKEN_KEY\\nTwo supported places, both editable without a shell: the chat configuration when you create the chat (per-chat), or Sage's own .env file, which you can open and edit from the Mythic UI on the installed-services page (shared by every chat in this container). Mythic user secrets work too. Full order, highest first: chat config \u2192 user secret \u2192 container env \u2192 .env.local \u2192 .env.\\nA third option exists and is the least durable: the BloodHound MCP server also reads its own .env from the directory SAGE_BLOODHOUND_MCP_DIR points at. In a Mythic install that is the image's baked /opt/bloodhound_mcp, which is NOT on the bind mount, so a file written there is lost on the next rebuild and cannot be edited from the UI.\"",
-        "kind": "'response'",
-        "metadata": "{}",
-        "response_key": "'bloodhound_degraded:41'",
-        "status": "'complete'"
-      },
       {
         "content": "'case=C12-reject-a-then-run-b terminal=complete'",
         "kind": "'text'",
@@ -290,15 +182,6 @@
     ],
     "C13-stale-approval-after-amendment": [
       {
-        "complete": "False",
-        "complete_request": "False",
-        "content": "\"\u26a0\ufe0f **BloodHound is not connected**, so attack-graph analysis and ingest are unavailable for this chat. Everything else works normally; only graph-dependent work is blocked, and an autonomous solve will refuse until it is connected.\\n\\nCredentials Sage resolved for this attempt: NONE\\nMissing (required): BLOODHOUND_URL, BLOODHOUND_TOKEN_ID, BLOODHOUND_TOKEN_KEY\\nTwo supported places, both editable without a shell: the chat configuration when you create the chat (per-chat), or Sage's own .env file, which you can open and edit from the Mythic UI on the installed-services page (shared by every chat in this container). Mythic user secrets work too. Full order, highest first: chat config \u2192 user secret \u2192 container env \u2192 .env.local \u2192 .env.\\nA third option exists and is the least durable: the BloodHound MCP server also reads its own .env from the directory SAGE_BLOODHOUND_MCP_DIR points at. In a Mythic install that is the image's baked /opt/bloodhound_mcp, which is NOT on the bind mount, so a file written there is lost on the next rebuild and cannot be edited from the UI.\"",
-        "kind": "'response'",
-        "metadata": "{}",
-        "response_key": "'bloodhound_degraded:41'",
-        "status": "'complete'"
-      },
-      {
         "content": "'case=C13-stale-approval-after-amendment terminal=blocked'",
         "kind": "'text'",
         "metadata": "None",
@@ -313,15 +196,6 @@
       }
     ],
     "C14-worker-complete": [
-      {
-        "complete": "False",
-        "complete_request": "False",
-        "content": "\"\u26a0\ufe0f **BloodHound is not connected**, so attack-graph analysis and ingest are unavailable for this chat. Everything else works normally; only graph-dependent work is blocked, and an autonomous solve will refuse until it is connected.\\n\\nCredentials Sage resolved for this attempt: NONE\\nMissing (required): BLOODHOUND_URL, BLOODHOUND_TOKEN_ID, BLOODHOUND_TOKEN_KEY\\nTwo supported places, both editable without a shell: the chat configuration when you create the chat (per-chat), or Sage's own .env file, which you can open and edit from the Mythic UI on the installed-services page (shared by every chat in this container). Mythic user secrets work too. Full order, highest first: chat config \u2192 user secret \u2192 container env \u2192 .env.local \u2192 .env.\\nA third option exists and is the least durable: the BloodHound MCP server also reads its own .env from the directory SAGE_BLOODHOUND_MCP_DIR points at. In a Mythic install that is the image's baked /opt/bloodhound_mcp, which is NOT on the bind mount, so a file written there is lost on the next rebuild and cannot be edited from the UI.\"",
-        "kind": "'response'",
-        "metadata": "{}",
-        "response_key": "'bloodhound_degraded:41'",
-        "status": "'complete'"
-      },
       {
         "content": "'case=C14-worker-complete terminal=complete'",
         "kind": "'text'",
@@ -338,15 +212,6 @@
     ],
     "C15-worker-blocked-no-owner": [
       {
-        "complete": "False",
-        "complete_request": "False",
-        "content": "\"\u26a0\ufe0f **BloodHound is not connected**, so attack-graph analysis and ingest are unavailable for this chat. Everything else works normally; only graph-dependent work is blocked, and an autonomous solve will refuse until it is connected.\\n\\nCredentials Sage resolved for this attempt: NONE\\nMissing (required): BLOODHOUND_URL, BLOODHOUND_TOKEN_ID, BLOODHOUND_TOKEN_KEY\\nTwo supported places, both editable without a shell: the chat configuration when you create the chat (per-chat), or Sage's own .env file, which you can open and edit from the Mythic UI on the installed-services page (shared by every chat in this container). Mythic user secrets work too. Full order, highest first: chat config \u2192 user secret \u2192 container env \u2192 .env.local \u2192 .env.\\nA third option exists and is the least durable: the BloodHound MCP server also reads its own .env from the directory SAGE_BLOODHOUND_MCP_DIR points at. In a Mythic install that is the image's baked /opt/bloodhound_mcp, which is NOT on the bind mount, so a file written there is lost on the next rebuild and cannot be edited from the UI.\"",
-        "kind": "'response'",
-        "metadata": "{}",
-        "response_key": "'bloodhound_degraded:41'",
-        "status": "'complete'"
-      },
-      {
         "content": "'case=C15-worker-blocked-no-owner terminal=blocked'",
         "kind": "'text'",
         "metadata": "None",
@@ -361,15 +226,6 @@
       }
     ],
     "C16-worker-handoff": [
-      {
-        "complete": "False",
-        "complete_request": "False",
-        "content": "\"\u26a0\ufe0f **BloodHound is not connected**, so attack-graph analysis and ingest are unavailable for this chat. Everything else works normally; only graph-dependent work is blocked, and an autonomous solve will refuse until it is connected.\\n\\nCredentials Sage resolved for this attempt: NONE\\nMissing (required): BLOODHOUND_URL, BLOODHOUND_TOKEN_ID, BLOODHOUND_TOKEN_KEY\\nTwo supported places, both editable without a shell: the chat configuration when you create the chat (per-chat), or Sage's own .env file, which you can open and edit from the Mythic UI on the installed-services page (shared by every chat in this container). Mythic user secrets work too. Full order, highest first: chat config \u2192 user secret \u2192 container env \u2192 .env.local \u2192 .env.\\nA third option exists and is the least durable: the BloodHound MCP server also reads its own .env from the directory SAGE_BLOODHOUND_MCP_DIR points at. In a Mythic install that is the image's baked /opt/bloodhound_mcp, which is NOT on the bind mount, so a file written there is lost on the next rebuild and cannot be edited from the UI.\"",
-        "kind": "'response'",
-        "metadata": "{}",
-        "response_key": "'bloodhound_degraded:41'",
-        "status": "'complete'"
-      },
       {
         "content": "'case=C16-worker-handoff terminal=complete'",
         "kind": "'text'",
@@ -386,15 +242,6 @@
     ],
     "C17-repeated-handoff-same-state": [
       {
-        "complete": "False",
-        "complete_request": "False",
-        "content": "\"\u26a0\ufe0f **BloodHound is not connected**, so attack-graph analysis and ingest are unavailable for this chat. Everything else works normally; only graph-dependent work is blocked, and an autonomous solve will refuse until it is connected.\\n\\nCredentials Sage resolved for this attempt: NONE\\nMissing (required): BLOODHOUND_URL, BLOODHOUND_TOKEN_ID, BLOODHOUND_TOKEN_KEY\\nTwo supported places, both editable without a shell: the chat configuration when you create the chat (per-chat), or Sage's own .env file, which you can open and edit from the Mythic UI on the installed-services page (shared by every chat in this container). Mythic user secrets work too. Full order, highest first: chat config \u2192 user secret \u2192 container env \u2192 .env.local \u2192 .env.\\nA third option exists and is the least durable: the BloodHound MCP server also reads its own .env from the directory SAGE_BLOODHOUND_MCP_DIR points at. In a Mythic install that is the image's baked /opt/bloodhound_mcp, which is NOT on the bind mount, so a file written there is lost on the next rebuild and cannot be edited from the UI.\"",
-        "kind": "'response'",
-        "metadata": "{}",
-        "response_key": "'bloodhound_degraded:41'",
-        "status": "'complete'"
-      },
-      {
         "content": "'case=C17-repeated-handoff-same-state terminal=blocked'",
         "kind": "'text'",
         "metadata": "None",
@@ -409,15 +256,6 @@
       }
     ],
     "C18-retry-after-state-change": [
-      {
-        "complete": "False",
-        "complete_request": "False",
-        "content": "\"\u26a0\ufe0f **BloodHound is not connected**, so attack-graph analysis and ingest are unavailable for this chat. Everything else works normally; only graph-dependent work is blocked, and an autonomous solve will refuse until it is connected.\\n\\nCredentials Sage resolved for this attempt: NONE\\nMissing (required): BLOODHOUND_URL, BLOODHOUND_TOKEN_ID, BLOODHOUND_TOKEN_KEY\\nTwo supported places, both editable without a shell: the chat configuration when you create the chat (per-chat), or Sage's own .env file, which you can open and edit from the Mythic UI on the installed-services page (shared by every chat in this container). Mythic user secrets work too. Full order, highest first: chat config \u2192 user secret \u2192 container env \u2192 .env.local \u2192 .env.\\nA third option exists and is the least durable: the BloodHound MCP server also reads its own .env from the directory SAGE_BLOODHOUND_MCP_DIR points at. In a Mythic install that is the image's baked /opt/bloodhound_mcp, which is NOT on the bind mount, so a file written there is lost on the next rebuild and cannot be edited from the UI.\"",
-        "kind": "'response'",
-        "metadata": "{}",
-        "response_key": "'bloodhound_degraded:41'",
-        "status": "'complete'"
-      },
       {
         "content": "'case=C18-retry-after-state-change terminal=complete'",
         "kind": "'text'",
@@ -434,15 +272,6 @@
     ],
     "C19-stop-active-lifecycle": [
       {
-        "complete": "False",
-        "complete_request": "False",
-        "content": "\"\u26a0\ufe0f **BloodHound is not connected**, so attack-graph analysis and ingest are unavailable for this chat. Everything else works normally; only graph-dependent work is blocked, and an autonomous solve will refuse until it is connected.\\n\\nCredentials Sage resolved for this attempt: NONE\\nMissing (required): BLOODHOUND_URL, BLOODHOUND_TOKEN_ID, BLOODHOUND_TOKEN_KEY\\nTwo supported places, both editable without a shell: the chat configuration when you create the chat (per-chat), or Sage's own .env file, which you can open and edit from the Mythic UI on the installed-services page (shared by every chat in this container). Mythic user secrets work too. Full order, highest first: chat config \u2192 user secret \u2192 container env \u2192 .env.local \u2192 .env.\\nA third option exists and is the least durable: the BloodHound MCP server also reads its own .env from the directory SAGE_BLOODHOUND_MCP_DIR points at. In a Mythic install that is the image's baked /opt/bloodhound_mcp, which is NOT on the bind mount, so a file written there is lost on the next rebuild and cannot be edited from the UI.\"",
-        "kind": "'response'",
-        "metadata": "{}",
-        "response_key": "'bloodhound_degraded:41'",
-        "status": "'complete'"
-      },
-      {
         "content": "'case=C19-stop-active-lifecycle terminal=stopped'",
         "kind": "'text'",
         "metadata": "None",
@@ -457,15 +286,6 @@
       }
     ],
     "C20-mythic-bloodhound-single-ingest": [
-      {
-        "complete": "False",
-        "complete_request": "False",
-        "content": "\"\u26a0\ufe0f **BloodHound is not connected**, so attack-graph analysis and ingest are unavailable for this chat. Everything else works normally; only graph-dependent work is blocked, and an autonomous solve will refuse until it is connected.\\n\\nCredentials Sage resolved for this attempt: NONE\\nMissing (required): BLOODHOUND_URL, BLOODHOUND_TOKEN_ID, BLOODHOUND_TOKEN_KEY\\nTwo supported places, both editable without a shell: the chat configuration when you create the chat (per-chat), or Sage's own .env file, which you can open and edit from the Mythic UI on the installed-services page (shared by every chat in this container). Mythic user secrets work too. Full order, highest first: chat config \u2192 user secret \u2192 container env \u2192 .env.local \u2192 .env.\\nA third option exists and is the least durable: the BloodHound MCP server also reads its own .env from the directory SAGE_BLOODHOUND_MCP_DIR points at. In a Mythic install that is the image's baked /opt/bloodhound_mcp, which is NOT on the bind mount, so a file written there is lost on the next rebuild and cannot be edited from the UI.\"",
-        "kind": "'response'",
-        "metadata": "{}",
-        "response_key": "'bloodhound_degraded:41'",
-        "status": "'complete'"
-      },
       {
         "content": "'case=C20-mythic-bloodhound-single-ingest terminal=complete'",
         "kind": "'text'",

@@ -472,6 +472,11 @@ def _unrun_approved_tools(model: Any, event_ids: tuple[str, ...], call_ids: set[
     return names
 
 
+_BLOODHOUND_NOT_PINNED = (
+    "The connected BloodHound MCP is not the one SAGE_BLOODHOUND_MCP_DIR and the configured launcher point at."
+)
+
+
 def _bloodhound_unavailable_message(reason: str | None = None) -> str:
     """Compose the operator-facing autonomous refusal, with a fallback that still names BloodHound.
 
@@ -1101,6 +1106,39 @@ class SageChat(Chat):
             from ..ai.mcp import MCPManager  # type: ignore
         return bool(MCPManager.is_bloodhound_server(server))
 
+    def _bloodhound_admission(self, connected: bool) -> tuple[bool, str]:
+        """(admitted, why not): exact-tool admission of the one locally pinned BloodHound server.
+
+        The single admission rule for both the connect path and the per-turn state, so the chip, the guard
+        and the autonomous refusal cannot disagree about whether BloodHound is usable.
+        """
+        try:
+            from ai.bloodhound_config import bloodhound_tool_admission
+        except ImportError:  # pragma: no cover
+            from ..ai.bloodhound_config import bloodhound_tool_admission  # type: ignore
+        admission = bloodhound_tool_admission()
+        ready = bool(admission.get("ready"))
+        admitted = bool(connected and ready and self._bloodhound_connection_locally_pinned(admission.get("server")))
+        if admitted:
+            return True, ""
+        return False, (_BLOODHOUND_NOT_PINNED if connected and ready else str(admission.get("reason") or ""))
+
+    def _bloodhound_channel_records(self) -> tuple[dict, dict]:
+        """(last connect message, last observed state) per (operation, channel), for this process's lifetime.
+
+        On the service, not the Model: a Model is rebuilt on a settings change, a model switch or a restore,
+        and a flag kept there would forget that the channel was already told.
+        """
+        records = getattr(self, "_bloodhound_records", None)
+        if records is None:
+            records = ({}, {})
+            self._bloodhound_records = records
+        return records
+
+    @staticmethod
+    def _bloodhound_channel_key(request: Any) -> tuple[str, str]:
+        return (str(getattr(request, "OperationID", "")), str(getattr(request, "ChannelID", "")))
+
     async def _ensure_bloodhound_connected(
         self,
         *,
@@ -1120,17 +1158,9 @@ class SageChat(Chat):
         unless the canonical BloodHound server exposes the exact required tool names.
         """
         try:
-            from ai.bloodhound_config import (
-                bloodhound_tool_admission,
-                credential_diagnostic,
-                ensure_bloodhound_connected,
-            )
+            from ai.bloodhound_config import credential_diagnostic, ensure_bloodhound_connected
         except ImportError:  # pragma: no cover
-            from ..ai.bloodhound_config import (  # type: ignore
-                bloodhound_tool_admission,
-                credential_diagnostic,
-                ensure_bloodhound_connected,
-            )
+            from ..ai.bloodhound_config import credential_diagnostic, ensure_bloodhound_connected  # type: ignore
         bloodhound_env: dict[str, str] = {}
         if request is not None:
             try:
@@ -1143,6 +1173,10 @@ class SageChat(Chat):
                 logger.debug(f"BloodHound credential resolution skipped: {exc}")
         try:
             connected, message = await ensure_bloodhound_connected(env=bloodhound_env or None)
+            if request is not None:
+                # The channel's last connect outcome is the reason its turn state reads unavailable when no
+                # session is admitted. Kept per channel: the connection is process-global, its outcome is not.
+                self._bloodhound_channel_records()[0][self._bloodhound_channel_key(request)] = message
             summary = f"BloodHound auto-connect (chat): {message}" + (
                 f" [credentials supplied: {sorted(bloodhound_env)}]" if bloodhound_env else ""
             )
@@ -1155,26 +1189,16 @@ class SageChat(Chat):
                 # explanations, because the one line that named the missing variable was filtered
                 # out. Success stays at INFO — a working connect is not news.
                 logger.warning(f"{summary}\n{credential_diagnostic(bloodhound_env)}")
-            admission = bloodhound_tool_admission()
-            admitted = bool(
-                connected
-                and admission.get("ready")
-                and self._bloodhound_connection_locally_pinned(admission.get("server"))
-            )
+            admitted, not_admitted_reason = self._bloodhound_admission(connected)
             if autonomous_required and not admitted:
-                raise RuntimeError(
-                    _bloodhound_unavailable_message(
-                        (
-                            "The connected BloodHound MCP is not the one "
-                            "SAGE_BLOODHOUND_MCP_DIR and the configured launcher point at."
-                            if connected and admission.get("ready")
-                            else admission.get("reason")
-                        )
-                    )
-                )
+                raise RuntimeError(_bloodhound_unavailable_message(not_admitted_reason))
         except Exception as exc:
             if autonomous_required:
                 raise RuntimeError(_bloodhound_unavailable_message(str(exc))) from exc
+            if request is not None:
+                self._bloodhound_channel_records()[0][self._bloodhound_channel_key(request)] = (
+                    f"BloodHound auto-connect skipped: {exc}"
+                )
             # Same reasoning as the not-connected branch above: this path swallows the failure so
             # conversation chat stays fail-soft, and at DEBUG it swallowed the reason too.
             logger.warning(
@@ -2020,72 +2044,59 @@ class SageChat(Chat):
         notices.extend(await self._restore_pending_work(request, model, record, thread_id))
         return model, "", notices
 
-    async def _notify_bloodhound_degraded_once(self, model: Any, request: ChatRequest) -> None:
-        """Tell the operator, in the chat, that the attack graph is unavailable. Once per session.
+    async def _observe_bloodhound_turn(self, model: Any, request: ChatRequest) -> None:
+        """Record this turn's BloodHound state on the Model, and tell a channel once when it loses BloodHound.
 
-        The diagnostic logged at WARNING lands in the container log, which an operator has
-        to go and look for. This puts it where they already are. Once per session rather than per
-        turn: they saw it on the first degraded turn, and Mythic renders a live
-        BloodHound-connected chip at the top of the chat, so repeating it would be the third copy of
-        a fact already on screen.
+        The state drives the BloodHound chip and the BloodHound agent's guard. No availability notice is sent,
+        with one exception: a channel whose last observed state was connected and is now anything else gets
+        one loss notice, re-armed when it reads connected again. Kept per channel, so another channel's loss
+        is never hidden and a channel that never had BloodHound is never told it lost it.
 
-        The flag lives on the session model, so a NEW chat notifies again — which is right, because
-        a new chat is a new operator context and the connection is process-global, meaning the answer
-        may have changed since the last one.
-
-        Fail-soft in the strongest sense: any failure here is swallowed. A notice about a degraded
-        optional dependency must never be the thing that breaks a working turn.
+        Fail-soft: any failure leaves no state (the chip and the guard fall back to today's rule) and is
+        logged; observing an optional dependency must never break a working turn.
         """
-        if getattr(model, "_bloodhound_degraded_notice_sent", False):
-            return
+        model._bloodhound_turn_state = None
         try:
             try:
                 from ai.bloodhound_config import (
-                    bloodhound_tool_admission,
-                    degraded_chat_notice,
-                    ingest_degraded_chat_notice,
-                    probe_ingest_contract,
+                    BLOODHOUND_STATE_CONNECTED,
+                    bloodhound_connected,
+                    bloodhound_lost_chat_notice,
+                    observe_bloodhound_state,
                 )
+                from .config import build_bloodhound_env
             except ImportError:  # pragma: no cover
                 from ..ai.bloodhound_config import (  # type: ignore
-                    bloodhound_tool_admission,
-                    degraded_chat_notice,
-                    ingest_degraded_chat_notice,
-                    probe_ingest_contract,
+                    BLOODHOUND_STATE_CONNECTED,
+                    bloodhound_connected,
+                    bloodhound_lost_chat_notice,
+                    observe_bloodhound_state,
                 )
-            if bloodhound_tool_admission().get("ready"):
-                # Connected with the exact tools is not the same as able to ingest. One status read per turn
-                # until the operator has been told; a healthy server is re-read, never remembered as healthy.
-                if getattr(model, "_bloodhound_ingest_notice_sent", False):
-                    return
-                contract = await probe_ingest_contract()
-                if contract.ready:
-                    return
+                from config import build_bloodhound_env  # type: ignore
+            connect_messages, last_states = self._bloodhound_channel_records()
+            key = self._bloodhound_channel_key(request)
+            # The same session test the connect short-circuit returns on later turns, so a session left behind
+            # by a failed reachability probe reads the same on its first turn as on every later one.
+            connected = bloodhound_connected()
+            admitted, not_admitted_reason = self._bloodhound_admission(connected)
+            reason = not_admitted_reason if connected and not admitted else connect_messages.get(key)
+            state = await observe_bloodhound_state(
+                admitted=admitted, env=build_bloodhound_env(request), connect_message=reason
+            )
+            model._bloodhound_turn_state = state
+            previous = last_states.get(key)
+            last_states[key] = state.state
+            if previous == BLOODHOUND_STATE_CONNECTED and state.state != BLOODHOUND_STATE_CONNECTED:
                 await self.send_response(
                     request,
-                    response_key=f"bloodhound_ingest_degraded:{request.ChannelID}",
-                    content=ingest_degraded_chat_notice(contract),
+                    response_key=f"bloodhound_lost:{request.ChannelID}",
+                    content=bloodhound_lost_chat_notice(state),
                     status="complete",
                     complete=False,
                     metadata={},
                 )
-                model._bloodhound_ingest_notice_sent = True
-                return
-            try:
-                from .config import build_bloodhound_env
-            except ImportError:  # pragma: no cover
-                from config import build_bloodhound_env  # type: ignore
-            await self.send_response(
-                request,
-                response_key=f"bloodhound_degraded:{request.ChannelID}",
-                content=degraded_chat_notice(build_bloodhound_env(request)),
-                status="complete",
-                complete=False,
-                metadata={},
-            )
-            model._bloodhound_degraded_notice_sent = True
-        except Exception as exc:  # pragma: no cover - never break a turn over a notice
-            logger.warning(f"BloodHound degraded notice not delivered: {exc}")
+        except Exception as exc:  # pragma: no cover - never break a turn over an optional dependency
+            logger.warning(f"BloodHound state not observed: {exc}")
 
     async def _notify_autonomous_solve_ignored_once(self, model: Any, request: ChatRequest) -> None:
         """Tell the operator once per session that Conversation mode ignores Autonomous Solve.
@@ -2611,7 +2622,7 @@ class SageChat(Chat):
                     )
                     stream_emitter.note_created(f"provider_retry:{request.RequestID}")
                 retry_state.bind_async_event_sink(publish_retry_event, asyncio.get_running_loop())
-            await self._notify_bloodhound_degraded_once(model, request)
+            await self._observe_bloodhound_turn(model, request)
             await self._notify_autonomous_solve_ignored_once(model, request)
 
             def approval_context() -> dict[str, str]:

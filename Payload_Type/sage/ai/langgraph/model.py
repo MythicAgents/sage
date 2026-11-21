@@ -2658,46 +2658,52 @@ class _TurnAuthorityInjectionMiddleware(AgentMiddleware):
         return await handler(self._augment(request))
 
 
-_BLOODHOUND_CONNECT_STEPS = (
-    "BloodHound is NOT connected, so I can't ingest the collection or run attack-path analysis yet — and "
-    "BloodHound is central to Sage's graph features. To enable it (if you want graph-driven analysis):\n"
-    "1. Make sure BloodHound CE is running (web/API + neo4j) and reachable from the Sage host.\n"
-    "2. Create a BloodHound API token for a dedicated Power User account (BloodHound CE → Administration → "
-    "Manage Users → user menu → Generate / Revoke API Tokens) and put the Token ID and Token Key in the "
-    "BloodHound MCP server's .env.\n"
-    "3. Connect it with `mcp-connect` (name \"BloodHound\", a stdio command that runs the BloodHound MCP "
-    "server); verify with `mcp-list`.\n"
-    "Full steps are in the Sage payload documentation → \"Connecting BloodHound to Sage\". Re-run your "
-    "request once BloodHound is connected."
+#: The guard's text when no turn state was observed (a Model driven outside a chat turn, or a failed observation).
+_BLOODHOUND_UNAVAILABLE_TEXT = (
+    "BloodHound is not connected, so I did not read any graph data for this request. Run `/bloodhound` to see "
+    "its status and connect it, then re-run the request."
 )
 
 
 class _BloodHoundConnectionGuardMiddleware(AgentMiddleware):
-    """BloodHound agent only: if the BloodHound MCP is NOT connected, do not silently fail. Emit a Mythic
-    EventFeed WARNING with connect steps (once per run) and END the turn with a user-facing message, so the
-    Supervisor returns it to the operator — who can connect BloodHound if they wish, then re-run.
+    """BloodHound agent only: when BloodHound cannot answer reads, do not let its tools fail. Emit a Mythic
+    EventFeed WARNING (once per run) and END the agent with a code-owned explanation, so the Supervisor returns
+    it to the operator.
+
+    The turn's observed state decides: the guard fires when it is not configured or unavailable, including a
+    live session whose server just failed a read, and uses that state's text. Degraded (reads answer) and
+    connected reach the tools. Without a state, the pinned-session rule decides, with a generic text.
     """
     def __init__(self, model: "Model"):
         super().__init__()
         self._model = model
 
-    @hook_config(can_jump_to=["end"])
-    async def abefore_model(self, state, runtime):
+    def _guard_text(self) -> str:
+        from ai.bloodhound_config import BloodHoundTurnState
+
+        turn_state = getattr(self._model, "_bloodhound_turn_state", None)
+        if isinstance(turn_state, BloodHoundTurnState):
+            return turn_state.guard_text
         connected = any(
             self._model._bloodhound_server_is_locally_pinned(server)
             for server in MCPManager.get_connected_servers()
         )
-        if connected:
+        return "" if connected else _BLOODHOUND_UNAVAILABLE_TEXT
+
+    @hook_config(can_jump_to=["end"])
+    async def abefore_model(self, state, runtime):
+        guard_text = self._guard_text()
+        if not guard_text:
             return None
-        await self._model._notify_bloodhound_not_connected()
+        await self._model._notify_bloodhound_not_connected(guard_text)
         # create_agent drops a before_model-injected message from the node's returned channel when we jump
         # straight to "end" (no LLM call → the capture callback records nothing), which left the BloodHound
         # node returning 0 messages and the Supervisor re-delegating forever. Stash the message on the Model
         # so _ainvoke surfaces it as the node's result (seq-tagged + copied to the Supervisor channel) → the
         # operator sees the connect steps and the turn terminates instead of looping.
-        guard_msg = AIMessage(content=_BLOODHOUND_CONNECT_STEPS, name="BloodHound")
+        guard_msg = AIMessage(content=guard_text, name="BloodHound")
         self._model._pending_guard_message = guard_msg
-        logger.info("🩸 [bloodhound-guard] BloodHound MCP not connected → EventFeed notice + returning steps to user")
+        logger.info("🩸 [bloodhound-guard] BloodHound cannot answer reads → EventFeed notice + explanation to user")
         return {"jump_to": "end", "messages": [guard_msg]}
 
 
@@ -16674,9 +16680,9 @@ class Model:
         )
         return self._wrap_create_agent(agent, "mythic_payload_messages", name)
 
-    async def _notify_bloodhound_not_connected(self):
-        """Emit a ONE-TIME Mythic EventFeed WARNING (idempotent per run) telling the operator that
-        BloodHound is needed but not connected, and how to connect it. Fail-soft.
+    async def _notify_bloodhound_not_connected(self, message: str = _BLOODHOUND_UNAVAILABLE_TEXT):
+        """Emit a ONE-TIME Mythic EventFeed WARNING (idempotent per run) with the guard's explanation of why
+        BloodHound could not be used. Fail-soft.
         """
         if getattr(self, "_bh_notconnected_notified", False):
             return
@@ -16688,12 +16694,7 @@ class Model:
             from mythic import mythic as _mythic
             await _mythic.send_event_log_message(
                 client,
-                message=(
-                    "Sage needs BloodHound but its MCP server is NOT connected — attack-graph ingest and "
-                    "analysis are unavailable. Connect BloodHound CE via the `mcp-connect` command (see the "
-                    "Sage payload documentation: \"Connecting BloodHound to Sage\" for the exact parameters), "
-                    "then re-run the request."
-                ),
+                message=message,
                 level="warning",
                 source="sage_bloodhound",
             )

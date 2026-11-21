@@ -106,6 +106,42 @@ def _runtime_rounds(model: Any) -> int:
         return graph_calls + policy_calls
 
 
+#: Mythic reads `color` (not `status`). Unavailable and degraded share warning: both lose something the operator
+#: may need; the tooltip says which.
+_BLOODHOUND_CHIP_COLORS = {
+    "not_configured": "neutral",
+    "unavailable": "warning",
+    "degraded": "warning",
+    "connected": "success",
+}
+
+
+def _bloodhound_chip(model: Any, manager: Any) -> dict[str, Any]:
+    """The BloodHound chip from this turn's observed state, or today's process-global value without one."""
+    item = {"key": "bloodhound", "label": "BloodHound", "order": 5, "click": "/bloodhound",
+            "click_confirmation_text": "Run /bloodhound to (re)connect or show BloodHound status?"}
+    state = getattr(model, "_bloodhound_turn_state", None)
+    try:
+        try:
+            from ai.bloodhound_config import BloodHoundTurnState
+        except ImportError:  # pragma: no cover
+            from ..ai.bloodhound_config import BloodHoundTurnState  # type: ignore
+        observed = isinstance(state, BloodHoundTurnState)
+    except Exception:  # pragma: no cover - a header must never break a turn
+        observed = False
+    if observed:
+        return {**item, "value": state.state, "display_value": state.label,
+                "color": _BLOODHOUND_CHIP_COLORS.get(state.state, "neutral"),
+                "tooltip": f"BloodHound: {state.reason} Click to run /bloodhound."}
+    try:
+        connected = any(manager.is_bloodhound_server(s) for s in manager.get_connected_servers())
+    except Exception:
+        connected = False
+    return {**item, "value": connected, "display_value": "connected" if connected else "off",
+            "color": "success" if connected else "neutral",
+            "tooltip": "BloodHound MCP connection — click to run /bloodhound"}
+
+
 def build_channel_metadata(model: Any) -> dict[str, Any]:
     """Build the ``{"items": [...]}`` channel-metadata payload from the running model + MCP singleton.
 
@@ -126,10 +162,7 @@ def build_channel_metadata(model: Any) -> dict[str, Any]:
 
     rounds = _runtime_rounds(model)
 
-    try:
-        bh_connected = any(MCPManager.is_bloodhound_server(s) for s in MCPManager.get_connected_servers())
-    except Exception:
-        bh_connected = False
+    bloodhound_item = _bloodhound_chip(model, MCPManager)
 
     # Config-value chips (Model / Policy / Mode / Autonomous) — rendered as metadata chips (NOT via DisplayAsChip)
     # so they can carry a color or a click: Mythic locks config chips to neutral and gives them no click.
@@ -181,10 +214,6 @@ def build_channel_metadata(model: Any) -> dict[str, Any]:
          "tooltip": "Tools across connected MCP servers"},
         {"key": "rounds", "label": "Rounds", "value": rounds, "order": 30,
          "tooltip": "Model calls observed across graph-agent and controller execution"},
-        {"key": "bloodhound", "label": "BloodHound", "value": bh_connected,
-         "display_value": "connected" if bh_connected else "off",
-         "status": "success" if bh_connected else "neutral", "order": 5,
-         "click": "/bloodhound", "click_confirmation_text": "Run /bloodhound to (re)connect or show BloodHound status?",
-         "tooltip": "BloodHound MCP connection — click to run /bloodhound"},
+        bloodhound_item,
     ]
     return {"items": items}

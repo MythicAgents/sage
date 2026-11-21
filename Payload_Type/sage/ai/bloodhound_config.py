@@ -8,7 +8,7 @@ guess where an arbitrary user's BloodHound MCP server lives). So they are config
 Used by:
   - the `bloodhound-connect` command (operator-facing one-shot connect)
   - the lazy startup auto-connect on the first `query` (in the serving event loop)
-  - the BloodHound agent's not-connected EventFeed notice (the steps text)
+  - the per-turn availability state behind the BloodHound chip, the loss notice and the BloodHound agent's guard
 """
 import hashlib
 import json
@@ -117,26 +117,6 @@ BLOODHOUND_SETUP_STEPS = (
     "4. Then run the `/bloodhound` command to connect, or start a new chat to auto-connect. The "
     "connection is process-global: once it succeeds, every later chat in this container reuses it."
 )
-
-
-def degraded_chat_notice(env: Optional[dict] = None) -> str:
-    """The short, chat-surface version of "BloodHound is unavailable".
-
-    Deliberately NOT `BLOODHOUND_SETUP_STEPS`. That text is right for an autonomous refusal, which is
-    a wall the operator has just hit and must clear before anything proceeds. This fires on an
-    ordinary conversational turn that WORKED, so it has to inform without hijacking the chat: what is
-    unavailable, what still works, and where to fix it, in a few lines.
-
-    Shown once per session: the operator saw it on the first degraded turn and
-    does not need telling again, and Mythic already renders a live BloodHound-connected chip at the
-    top of the chat, so repetition would be a third copy of a fact that is already on screen.
-    """
-    return (
-        "⚠️ **BloodHound is not connected**, so attack-graph analysis and ingest are unavailable "
-        "for this chat. Everything else works normally; only graph-dependent work is blocked, and an "
-        "autonomous solve will refuse until it is connected.\n\n"
-        f"{credential_diagnostic(env)}"
-    )
 
 
 def autonomous_unavailable_message(reason: Optional[str] = None) -> str:
@@ -833,18 +813,24 @@ class IngestContract:
     tool: Any = None
     #: Corrective action for an incompatible server; empty for transient or configuration failures.
     remedy: str = ""
+    #: The status read hit its deadline. Not derivable from `kind`: a server's `Connection error` text is also
+    #: transient, and only a deadline means a second read would likely wait as long.
+    timed_out: bool = False
 
     def operator_text(self) -> str:
         return f"{self.reason} {self.remedy}".strip()
 
 
-def _contract_unavailable(kind: str, reason: str, server: Optional[str] = None) -> IngestContract:
+def _contract_unavailable(
+    kind: str, reason: str, server: Optional[str] = None, *, timed_out: bool = False
+) -> IngestContract:
     return IngestContract(
         ready=False,
         kind=kind,
         reason=sanitize_ingest_diagnostic(reason),
         server=server,
         remedy=INGEST_CONTRACT_REMEDY if kind == INGEST_ERROR_UNSUPPORTED else "",
+        timed_out=timed_out,
     )
 
 
@@ -898,7 +884,9 @@ async def probe_ingest_contract(timeout: Optional[float] = None) -> IngestContra
     try:
         response = await asyncio.wait_for(tool.ainvoke({"info_type": "status", "job_id": 0}), timeout=budget)
     except (asyncio.TimeoutError, TimeoutError):
-        return _contract_unavailable(INGEST_ERROR_TRANSIENT, "The ingest status read timed out.", server_name)
+        return _contract_unavailable(
+            INGEST_ERROR_TRANSIENT, "The ingest status read timed out.", server_name, timed_out=True
+        )
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 - an adapter failure is a failed probe, classified below
@@ -933,12 +921,120 @@ def autonomous_ingest_unavailable_message(contract: IngestContract) -> str:
     )
 
 
-def ingest_degraded_chat_notice(contract: IngestContract) -> str:
-    """The chat-surface notice for a connected BloodHound whose ingest contract is unusable."""
+# --- Per-turn availability ------------------------------------------------------------------------------------
+#
+# One observation per chat turn, from facts Sage already reads, so the chip, the loss notice and the BloodHound
+# agent's guard agree on what BloodHound can do right now. Healthy is observed, never remembered.
+
+BLOODHOUND_STATE_NOT_CONFIGURED = "not_configured"
+BLOODHOUND_STATE_UNAVAILABLE = "unavailable"
+BLOODHOUND_STATE_DEGRADED = "degraded"
+BLOODHOUND_STATE_CONNECTED = "connected"
+
+_NO_GRAPH_READ = "so I did not read any graph data for this request."
+
+
+@dataclass(frozen=True)
+class BloodHoundTurnState:
+    """What BloodHound can do on this turn. `guard_text` is empty when the BloodHound agent may run its tools."""
+
+    state: str
+    #: One line for the chip tooltip and the loss notice. Holds no credential value.
+    reason: str
+    guard_text: str = ""
+
+    @property
+    def label(self) -> str:
+        return self.state.replace("_", " ")
+
+
+def _not_configured_guard_text() -> str:
+    url, token_id, token_key = BLOODHOUND_OPERATOR_CONFIG_KEYS
     return (
-        "⚠️ **BloodHound is connected, but graph ingest is unavailable.** Graph reads work normally; Sage will "
-        "refuse to collect or ingest new graph data, because it could not verify the result.\n\n"
-        f"{contract.operator_text()}"
+        f"BloodHound is not configured for this chat, {_NO_GRAPH_READ} To use it, set {url}, {token_id} and "
+        f"{token_key} in this chat's configuration, or in Sage's .env (editable from the Mythic UI on the "
+        "installed-services page; restart the container after). Then run `/bloodhound` to connect, and re-run "
+        "the request."
+    )
+
+
+def _first_paragraph(text: Optional[str]) -> str:
+    return sanitize_ingest_diagnostic(str(text or "").strip().split("\n\n", 1)[0])
+
+
+def _session_unavailable(cause: str, detail: str = "") -> BloodHoundTurnState:
+    """A live session whose server did not answer a read: the guard explains instead of letting tools fail."""
+    text = f"BloodHound is connected, but BloodHound CE did not answer a read just now, {_NO_GRAPH_READ}\n\n{cause}"
+    if detail:
+        text += f"\n\nDetail: {detail}"
+    text += (
+        "\n\nIf the address or tokens are wrong, fix them and run `/bloodhound force`; if BloodHound CE was only "
+        "down, re-run the request once it is back."
+    )
+    return BloodHoundTurnState(
+        BLOODHOUND_STATE_UNAVAILABLE,
+        reason=sanitize_ingest_diagnostic(f"BloodHound CE did not answer a read. {cause}"),
+        guard_text=text,
+    )
+
+
+async def observe_bloodhound_state(
+    *,
+    admitted: bool,
+    env: Optional[dict[str, str]] = None,
+    connect_message: Optional[str] = None,
+) -> BloodHoundTurnState:
+    """Name this turn's BloodHound state from admission, credentials and at most two control-plane reads.
+
+    `admitted` is the caller's exact-tool, locally-pinned admission. `env` is the channel's resolved credentials,
+    tested exactly as the connect pre-flight tests them. `connect_message` is the channel's last connect outcome
+    (or why a live session is not admitted), used only when not admitted. Admitted: one ingest status read; when
+    it fails without timing out, one `domain_info` read decides between degraded (reads answer) and unavailable.
+    """
+    if not admitted:
+        if not resolvable_credential_keys(None, env):
+            return BloodHoundTurnState(
+                BLOODHOUND_STATE_NOT_CONFIGURED,
+                reason="No BloodHound URL or token is set for this chat.",
+                guard_text=_not_configured_guard_text(),
+            )
+        sentence = _first_paragraph(connect_message) or "No connect attempt was recorded for this chat."
+        return BloodHoundTurnState(
+            BLOODHOUND_STATE_UNAVAILABLE,
+            reason=sentence,
+            guard_text=(
+                f"BloodHound is configured but not connected, {_NO_GRAPH_READ}\n\n{sentence}\n\n"
+                f"{credential_diagnostic(env)}\n\nRun `/bloodhound` after fixing this, then re-run the request."
+            ),
+        )
+    contract = await probe_ingest_contract()
+    if contract.ready:
+        return BloodHoundTurnState(BLOODHOUND_STATE_CONNECTED, reason="Connected; the ingest status read answered.")
+    if contract.timed_out:
+        return _session_unavailable(contract.reason)
+    reachable, probe_detail = await probe_bloodhound_reachable(timeout=INGEST_CALL_TIMEOUT_SECONDS)
+    if reachable:
+        return BloodHoundTurnState(
+            BLOODHOUND_STATE_DEGRADED,
+            reason=sanitize_ingest_diagnostic(f"Graph reads work; ingest is unavailable. {contract.reason}"),
+        )
+    # `probe_bloodhound_reachable` appends its classification after a blank line; the classification is
+    # Sage-written, the rest is server text.
+    raw, _, cause = str(probe_detail or "").rpartition("\n\n")
+    return _session_unavailable(cause.strip(), sanitize_ingest_diagnostic(raw) if raw else "")
+
+
+def bloodhound_lost_chat_notice(state: BloodHoundTurnState) -> str:
+    """The one notice a channel gets when BloodHound, connected earlier in it, no longer is."""
+    scope = (
+        "Graph reads still work; ingest is unavailable."
+        if state.state == BLOODHOUND_STATE_DEGRADED
+        else "Graph-dependent work is unavailable until it recovers."
+    )
+    return (
+        "⚠️ **BloodHound is no longer available in this chat.** It was connected earlier and now reads "
+        f"{state.label}: {state.reason}\n\n{scope} Everything else works normally; the BloodHound chip shows the "
+        "current state."
     )
 
 

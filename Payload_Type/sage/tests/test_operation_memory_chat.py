@@ -534,7 +534,7 @@ class DriverChat(HeadlessSageChat):
         self._preexisted = True
         return result
 
-    async def _notify_bloodhound_degraded_once(self, _model, _request):
+    async def _observe_bloodhound_turn(self, _model, _request):
         return None
 
 
