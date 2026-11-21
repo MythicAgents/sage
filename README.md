@@ -630,8 +630,10 @@ a non-default project with access enabled, and an allowlisted sending IP; ZDR pr
 Processing. Sage never derives a safety identifier from a Mythic username; use the same pseudonym for the same
 person. Invalid combinations (Daybreak without Responses, any of these with a non-OpenAI provider) fail before any
 request. When the provider rejects a route (for example a Responses-only model on Chat Completions, or a Daybreak
-access error), the chat keeps its conversation: the error names the setting to change, and after you change it the
-next message continues the same chat. Sage never switches the model, provider, endpoint or API on its own.
+access error), the error names the setting to change and says whether the chat continues. Changing only
+**OpenAI API**, **Daybreak** or **OpenAI Safety Identifier** continues the same chat with its conversation, and a
+fix made in the OpenAI project without changing Sage's settings is retried in the same chat. Changing the API key,
+model, provider or API endpoint starts a new chat. Sage never switches the model, provider, endpoint or API on its own.
 
 **Policy.** `policy_mode` controls how the next capability is chosen. `hybrid` (default) has deterministic code
 constrain the admissible actions and lets the model pick among them — the intended production mode. `symbolic` is

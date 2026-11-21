@@ -104,25 +104,48 @@ def _endpoint_origin(endpoint: str) -> str:
     return f"{parts.scheme}://{host}{port}{parts.path}" if parts.scheme and host else "configured"
 
 
-def _configuration_action(status: int, code: str, param: str, message: str, api: str) -> str:
+_KEEPS = (
+    "This chat is still usable and keeps its conversation: changing only OpenAI API, Daybreak or OpenAI Safety "
+    "Identifier continues it."
+)
+_NEW_CHAT = (
+    "Changing the API key, model, provider or API endpoint starts a new chat; this chat's conversation does not "
+    "carry over. Changing only OpenAI API, Daybreak or OpenAI Safety Identifier keeps it."
+)
+
+
+def _configuration_action(status: int, code: str, param: str, message: str, api: str) -> tuple[str, bool]:
+    """``(action, keeps_conversation)``: what to change, and whether that change continues this chat.
+
+    Only the OpenAI route settings (API, Daybreak, safety identifier) continue an idle chat in place. A new key,
+    model, provider or endpoint starts a new session (general switching belongs to a separate line), and a fix
+    made in the OpenAI project without touching Sage's settings is retried here as it is.
+    """
     if code == "invalid_access_program":
         return ("set **Daybreak** to the value named in the error (Off, Blue or Red), or the "
-                "SAGE_OPENAI_ACCESS_PROGRAM user secret or environment value")
+                "SAGE_OPENAI_ACCESS_PROGRAM user secret or environment value, then send your request again", True)
     if code == "unsupported_access_program":
-        return "choose a model that supports Daybreak, or set **Daybreak** to **Off** to keep this model"
+        return ("set **Daybreak** to **Off** to keep this model and this chat, then send your request again; "
+                "a model that supports Daybreak needs a new chat", True)
     if code == "access_program_not_enabled":
-        return ("check that the API key belongs to an OpenAI project with this Daybreak program enabled "
-                "(and, for GPT-6 Cyber, that the sending IP address is allowlisted)")
+        return ("enable this Daybreak program for the API key's OpenAI project (for GPT-6 Cyber, also allowlist the "
+                "sending IP address), then send your request again here; using another project's API key "
+                "starts a new chat", False)
     if status == 401:
-        return "update the API key (the API_KEY field, user secret or environment value)"
+        return ("replace the API key (the API_KEY field, user secret or environment value); if the key itself is "
+                "fixed at OpenAI, send your request again here", False)
     if status == 403:
-        return "check the API key's project access for this model and Daybreak program"
+        return ("give the API key's OpenAI project access to this model and Daybreak program, then send your "
+                "request again here; a different API key starts a new chat", False)
     if status == 404 and param == "model" and "responses" in message.casefold() and api != "responses":
         return ("set **OpenAI API** to **Responses** in this chat's configuration (or the SAGE_OPENAI_API "
-                "user secret or environment value)")
+                "user secret or environment value), then send your request again", True)
     if param == "safety_identifier":
-        return "set **OpenAI Safety Identifier** to a stable pseudonym for the person using this chat"
-    return "check the model, OpenAI API and API Endpoint settings for this chat"
+        return ("set **OpenAI Safety Identifier** to a stable pseudonym for the person using this chat, then send "
+                "your request again", True)
+    return ("check that the API key's project has access to this model and that the model name and API Endpoint "
+            "are right; if access is granted at OpenAI, send your request again here; a different model or "
+            "endpoint starts a new chat", False)
 
 
 def provider_configuration_notice(exc: BaseException, profile) -> str:
@@ -161,10 +184,10 @@ def provider_configuration_notice(exc: BaseException, profile) -> str:
         f"{'configured' if value('openai_safety_identifier') else 'not configured'} · "
         f"endpoint {_endpoint_origin(value('api_endpoint'))}"
     )
-    action = _configuration_action(status, code, param, message, api)
+    action, keeps = _configuration_action(status, code, param, message, api)
     return (
         f"The model provider rejected this request ({details}): {message}\n\n"
         f"Route used: {route}.\n\n"
-        f"This chat is still usable and keeps its conversation. To fix it, {action}, then send your request "
-        "again. Sage did not change the model, provider or endpoint."
+        f"To fix it, {action}. {_KEEPS if keeps else _NEW_CHAT} "
+        "Sage did not change the model, provider or endpoint."
     )

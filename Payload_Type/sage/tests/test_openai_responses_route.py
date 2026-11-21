@@ -392,3 +392,57 @@ def test_shipped_env_template_names_the_settings_but_sets_none():
     for name in NEW_ENV:
         assert any(line.startswith(f"#{name}=") for line in template), name
         assert not any(line.startswith(f"{name}=") for line in template), name
+
+
+# --------------------------------------------------------------------------------------------------
+# Cold review (2026-11-20): the notice promises the conversation survives only for fixes that keep it.
+# Changing OpenAI API, Daybreak or Safety Identifier continues the chat; a new API key, model, provider or
+# endpoint starts a new session (general switching is #220), so the notice must say so.
+# --------------------------------------------------------------------------------------------------
+
+KEEPS = "keeps its conversation"
+NEW_CHAT = "starts a new chat"
+
+
+def _notice(status, error, **route):
+    exc = _rejection(status, error)
+    profile = resolve_llm_profile(build_chat_request("x", config=_config(model="gpt-6-cyber", **route)))
+    return provider_configuration_notice(exc, profile)
+
+
+CYBER = {"SAGE_OPENAI_API": "responses", "SAGE_OPENAI_ACCESS_PROGRAM": "daybreak_red",
+         "SAGE_OPENAI_SAFETY_IDENTIFIER": PSEUDONYM}
+
+
+@pytest.mark.parametrize(("status", "error"), [
+    (400, {"type": "invalid_request_error", "code": "invalid_access_program", "param": None, "message": "x"}),
+    (400, {"type": "invalid_request_error", "code": None, "param": "safety_identifier", "message": "x"}),
+])
+def test_route_setting_fixes_promise_the_conversation_continues(status, error):
+    notice = _notice(status, error, **CYBER)
+    assert KEEPS in notice
+    assert "OpenAI API, Daybreak or OpenAI Safety Identifier" in notice
+
+
+def test_responses_only_404_on_chat_completions_promises_continuation():
+    exc = RuntimeError("graph failed")
+    exc.__cause__ = _rejection(404, REPORTED_404["error"])
+    profile = resolve_llm_profile(build_chat_request(
+        "x", config=_config(model="gpt-6-cyber", SAGE_OPENAI_API="chat_completions")))
+    assert KEEPS in provider_configuration_notice(exc, profile)
+
+
+@pytest.mark.parametrize(("status", "error", "names"), [
+    (401, {"type": "invalid_request_error", "code": "invalid_api_key", "param": None,
+           "message": "Incorrect API key provided."}, "API key"),
+    (403, {"type": "invalid_request_error", "code": None, "param": None, "message": "Forbidden."}, "API key"),
+    (403, {"type": "invalid_request_error", "code": "access_program_not_enabled", "param": None,
+           "message": "Not enabled."}, "API key"),
+    (404, {"type": "invalid_request_error", "code": "model_not_found", "param": "model",
+           "message": "The model `gpt-6-cyber` does not exist or you do not have access to it."}, "model"),
+])
+def test_key_project_or_model_fixes_say_a_change_starts_a_new_chat(status, error, names):
+    notice = _notice(status, error, **CYBER)
+    assert KEEPS not in notice
+    assert NEW_CHAT in notice and names in notice
+    assert "send your request again here" in notice  # a fix made at OpenAI without changing Sage's settings

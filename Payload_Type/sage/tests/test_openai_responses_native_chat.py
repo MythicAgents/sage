@@ -302,3 +302,35 @@ def test_a_finished_approval_claim_does_not_block_a_settings_continuation(monkey
     continued, blocked = asyncio.run(scenario())
     assert not any(REPLACED in text for text in continued) and any("OpenAI settings" in t for t in continued)
     assert any(REPLACED in text for text in blocked), blocked
+
+
+def test_a_rejected_api_key_notice_matches_what_a_key_change_does(monkeypatch):
+    """Cold-review reproduction: a key change starts a new session (#220 owns general switching), so the 401
+    notice must say so rather than promise the conversation survives."""
+    import httpx
+
+    class KeyWire(ProviderWire):
+        def handle(self, request):
+            if request.headers.get("authorization") == "Bearer bad-key":
+                self.requests.append((request.url.path, {}))
+                return httpx.Response(401, json={"error": {"message": "Incorrect API key provided.",
+                                                           "type": "invalid_request_error", "param": None,
+                                                           "code": "invalid_api_key"}})
+            return super().handle(request)
+
+    wire = KeyWire([[text_item("Noted amber-seven.", 1)]])
+    install_wire(monkeypatch, wire)
+    good = route_config(**CYBER_RESPONSES)
+
+    async def scenario():
+        process = _process()
+        await process.chat.chat(request(LABEL_PROMPT, 1, {**good, "API_KEY": "bad-key"}))
+        mark = len(process.chat.emissions)
+        await process.chat.chat(request(LABEL_PROMPT, 2, good))
+        return process, mark
+
+    process, mark = asyncio.run(scenario())
+    notice = "\n".join(texts(process.chat)[:mark])
+    after = "\n".join(texts(process.chat)[mark:])
+    assert "HTTP 401" in notice and "starts a new chat" in notice and "keeps its conversation" not in notice
+    assert REPLACED in after  # what the notice told the operator to expect
