@@ -25,8 +25,8 @@ def _req(*messages: dict, status: str = "complete") -> dict:
     return {"status": status, "messages": list(messages)}
 
 
-def _sent(channel: str, chip: str) -> dict:
-    return {"channel": channel, "chip": {"value": chip}, "tasks_after": 5}
+def _sent(channel: str, chip: str, tooltip: str = "") -> dict:
+    return {"channel": channel, "chip": {"value": chip, "tooltip": tooltip}, "tasks_after": 5}
 
 
 NOT_CONFIGURED_GUARD = _msg("BloodHound is not configured for this chat, so I did not read any graph data for this "
@@ -34,6 +34,20 @@ NOT_CONFIGURED_GUARD = _msg("BloodHound is not configured for this chat, so I di
 REFUSED_GUARD = _msg("BloodHound is connected, but BloodHound CE did not answer a read just now, so I did not read any "
                      "graph data for this request.\n\nNothing accepted a connection at that address.",
                      "subagent_final:bloodhound:2", "BloodHound")
+# Live attempt 1 (2026-11-21), channel B, recorded in its run file: turn 1 named the failed start, turns 2 and 3 read
+# the failed-credential skip, which named no failure, and so did the guard row.
+FAILED_TOOLTIP = "BloodHound: Failed to connect to BloodHound MCP: McpError: Connection closed Click to run /bloodhound."
+SKIP_TOOLTIP = ("BloodHound: BloodHound MCP connect skipped: this exact credential set already failed and nothing about "
+                "it has changed. Update the configuration to trigger a fresh attempt. Click to run /bloodhound.")
+SKIP = ("BloodHound MCP connect skipped: this exact credential set already failed and nothing about it has changed. "
+        "Update the configuration to trigger a fresh attempt.")
+ATTEMPT_1_GUARD = _msg(f"BloodHound is configured but not connected, so I did not read any graph data for this "
+                       f"request.\n\n{SKIP}", "subagent_final:bloodhound:3", "BloodHound")
+# The same turns once the skip names its last failure (synthetic: the fixed outcome's text).
+LAST = "Last failure: Failed to connect to BloodHound MCP: McpError: Connection closed."
+NAMED_TOOLTIP = f"BloodHound: {SKIP} {LAST} Click to run /bloodhound."
+CONNECT_FAILED_GUARD = _msg(f"BloodHound is configured but not connected, so I did not read any graph data for this "
+                            f"request.\n\n{SKIP} {LAST}", "subagent_final:bloodhound:3", "BloodHound")
 LOST = _msg("BloodHound is no longer available in this chat.", f"bloodhound_lost:{C_ID}")
 
 
@@ -41,7 +55,7 @@ def _passing():
     run = {"task_baseline": 5, "channels": {"A": 59, "B": 60, "C": C_ID, "E": 62}, "steps": {
         "L1": {"requests": [_sent("A", "not_configured")] * 3},
         "L2": {"requests": [_sent("A", "not_configured")]},
-        "L3": {"requests": [_sent("B", "unavailable")] * 3},
+        "L3": {"requests": [_sent("B", "unavailable", FAILED_TOOLTIP)] + [_sent("B", "unavailable", NAMED_TOOLTIP)] * 2},
         "L4": {"requests": [_sent("C", "unavailable"), _sent("C", "connected")]},
         "L5": {"requests": [_sent("C", "unavailable"), _sent("C", "unavailable"), _sent("E", "unavailable"),
                             _sent("C", "unavailable")]},
@@ -50,7 +64,7 @@ def _passing():
     rows = {
         "L1": [_req(_msg("4"))] * 3,
         "L2": [_req(NOT_CONFIGURED_GUARD, _msg("BloodHound is not set up yet."))],
-        "L3": [_req(_msg("4")), _req(_msg("4")), _req(REFUSED_GUARD, _msg("It could not be reached."))],
+        "L3": [_req(_msg("4")), _req(_msg("4")), _req(CONNECT_FAILED_GUARD, _msg("It could not be reached."))],
         "L4": [_req(_msg("**Connection:** Reconnected to BloodHound MCP (13 tools), verified by a live domain read."
                          "\n\n**Ingest:** Ready. The connected BloodHound MCP answered.")), _req(_msg("4"))],
         "L5": [_req(LOST, _msg("4")), _req(_msg("4")), _req(_msg("4")), _req(REFUSED_GUARD, _msg("Down."))],
@@ -72,9 +86,17 @@ def test_the_rules_pass_on_the_expected_shape():
     (lambda run, rows, tools: tools.__setitem__("L2", [["respond_to_user"]]), "L2"),
     (lambda run, rows, tools: tools.__setitem__("L2", [["transfer_to_BloodHound", "domain_info"]]), "L2"),
     (lambda run, rows, tools: rows.__setitem__("L3", rows["L3"][:2] + [_req(NOT_CONFIGURED_GUARD)]), "L3"),
-    (lambda run, rows, tools: run["steps"]["L3"].__setitem__("requests", [_sent("B", "unavailable"),
-                                                                          _sent("B", "degraded"),
-                                                                          _sent("B", "unavailable")]), "L3"),
+    (lambda run, rows, tools: run["steps"]["L3"].__setitem__("requests", [_sent("B", "unavailable", FAILED_TOOLTIP),
+                                                                          _sent("B", "degraded", NAMED_TOOLTIP),
+                                                                          _sent("B", "unavailable", NAMED_TOOLTIP)]),
+     "L3"),
+    # Attempt 1's recorded shapes: the skip tooltip on turns 2 and 3, and its guard row.
+    (lambda run, rows, tools: run["steps"]["L3"].__setitem__("requests", [_sent("B", "unavailable", FAILED_TOOLTIP)]
+                                                             + [_sent("B", "unavailable", SKIP_TOOLTIP)] * 2), "L3"),
+    (lambda run, rows, tools: rows["L3"].__setitem__(2, _req(ATTEMPT_1_GUARD, _msg("It could not be reached."))),
+     "L3"),
+    # F1's shape, which the deployed server cannot produce from a configured URL, no longer passes L3.
+    (lambda run, rows, tools: rows["L3"].__setitem__(2, _req(REFUSED_GUARD, _msg("It could not be reached."))), "L3"),
     (lambda run, rows, tools: rows["L4"].__setitem__(0, _req(_msg("**Ingest:** NOT ready"))), "L4"),
     (lambda run, rows, tools: rows["L5"].__setitem__(1, _req(LOST)), "L5"),
     (lambda run, rows, tools: rows["L5"].__setitem__(2, _req(_msg("x", "bloodhound_lost:62"))), "L5"),

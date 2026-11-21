@@ -23,8 +23,10 @@ BloodHound in that request; "delegates" means a Phoenix LLM span in that request
      once more: no row with a ``bloodhound_`` response key; the chip reads not configured after each.
   L2 A: the graph prompt: the Supervisor delegates; the not-configured guard row; zero BloodHound tool calls.
   L3 Channel B, URL http://127.0.0.1:9 with placeholder tokens: two plain prompts, then the graph prompt: no
-     ``bloodhound_`` rows; the chip reads unavailable after each; the Supervisor delegates; the guard row names the
-     connection failure, not the setup text.
+     ``bloodhound_`` rows; the chip reads unavailable after each, and each tooltip names "Failed to connect to
+     BloodHound MCP"; the Supervisor delegates; the guard row contains "BloodHound is configured but not connected",
+     "did not read any graph data" and "Failed to connect to BloodHound MCP", and not the setup text. (The deployed
+     MCP checks its credentials at startup, so a wrong URL fails the server's start; readiness confirms that check.)
   L4 Channel C, real URL and tokens: ``/bloodhound force``, then a plain prompt: the reply reports a connection verified
      by a live domain read and ingest Ready; no ``bloodhound_`` row; the chip reads connected.
   L5 Stop the CE web container; C: two plain prompts; fresh channel E with C's settings: one plain prompt; C: the graph
@@ -81,7 +83,10 @@ NOT_SET_UP = "connect not attempted: required credentials are unset"
 GUARD_NOT_CONFIGURED = "BloodHound is not configured for this chat"
 GUARD_NO_READ = "did not read any graph data"
 CE_DID_NOT_ANSWER = "BloodHound CE did not answer"
-REFUSED_MARKERS = ("Nothing accepted a connection", "Connection refused")
+GUARD_CONFIGURED_NOT_CONNECTED = "BloodHound is configured but not connected"
+CONNECT_FAILED = "Failed to connect to BloodHound MCP"
+SAGE_CONTAINER = "sage"
+MCP_MAIN = "/opt/bloodhound_mcp/main.py"
 CHANGED_FILES = (
     "Payload_Type/sage/ai/bloodhound_config.py",
     "Payload_Type/sage/ai/langgraph/model.py",
@@ -151,6 +156,11 @@ def _identity() -> dict[str, Any]:
             "files": {path: hashlib.sha256((REPO_ROOT / path).read_bytes()).hexdigest() for path in CHANGED_FILES}}
 
 
+def _head_committed_at() -> str:
+    return subprocess.run(["git", "-C", str(REPO_ROOT), "log", "-1", "--format=%cI", "HEAD"], check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
 def _parity() -> dict[str, Any]:
     command = [str(REPO_ROOT / ".venv/bin/python"), str(REPO_ROOT / "skills/sage-goad-reset/scripts/sage_deployment.py"),
                "--mode", "container", "parity"]
@@ -166,6 +176,27 @@ def _offline_tests() -> dict[str, Any]:
 
 def _docker(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["docker", *args], capture_output=True, text=True)
+
+
+def mcp_startup_check() -> bool:
+    """The deployed BloodHound MCP validates its credentials before it serves, so L3's wrong URL fails its start."""
+    completed = _docker("exec", SAGE_CONTAINER, "grep", "-c", "validate_credentials", MCP_MAIN)
+    count = completed.stdout.strip()
+    return completed.returncode == 0 and count.isdigit() and int(count) >= 1
+
+
+def sage_restart(head_committed_at: str) -> dict[str, Any]:
+    """The Sage container started after HEAD was committed, so its process holds no earlier attempt's session or
+    failed-credential cache. Read-only: ``docker inspect``."""
+    from datetime import datetime
+
+    completed = _docker("inspect", "-f", "{{.State.StartedAt}}", SAGE_CONTAINER)
+    started_at = completed.stdout.strip() if completed.returncode == 0 else ""
+    try:
+        restarted = datetime.fromisoformat(started_at) > datetime.fromisoformat(head_committed_at)
+    except ValueError:
+        restarted = False
+    return {"sage_started_at": started_at, "head_committed_at": head_committed_at, "sage_restarted": restarted}
 
 
 def ce_running(name: str) -> bool:
@@ -265,6 +296,9 @@ def criteria_for(run: dict[str, Any], rows: dict[str, list[dict[str, Any]]],
     def chips(step: str, channel: str | None = None) -> list[Any]:
         return [r.get("chip", {}).get("value") for r in sent.get(step, []) if channel in (None, r.get("channel"))]
 
+    def tooltips(step: str) -> list[str]:
+        return [str(r.get("chip", {}).get("tooltip") or "") for r in sent.get(step, [])]
+
     def delegated(step: str, index: int) -> bool:
         per_request = tools.get(step) or []
         return -len(per_request) <= index < len(per_request) and "transfer_to_BloodHound" in per_request[index]
@@ -292,9 +326,10 @@ def criteria_for(run: dict[str, Any], rows: dict[str, list[dict[str, Any]]],
         "L2": delegated("L2", -1) and GUARD_NOT_CONFIGURED in l2_guard and GUARD_NO_READ in l2_guard
         and no_bloodhound_tool("L2", -1),
         "L3": len(rows.get("L3", [])) == 3 and not any(bloodhound_rows(r) for r in rows["L3"])
-        and chips("L3") == ["unavailable"] * 3 and delegated("L3", -1) and GUARD_NO_READ in l3_guard
-        and any(marker in l3_guard for marker in REFUSED_MARKERS) and GUARD_NOT_CONFIGURED not in l3_guard
-        and no_bloodhound_tool("L3", -1),
+        and chips("L3") == ["unavailable"] * 3 and len(tooltips("L3")) == 3
+        and all(CONNECT_FAILED in tooltip for tooltip in tooltips("L3")) and delegated("L3", -1)
+        and GUARD_CONFIGURED_NOT_CONNECTED in l3_guard and GUARD_NO_READ in l3_guard and CONNECT_FAILED in l3_guard
+        and GUARD_NOT_CONFIGURED not in l3_guard and no_bloodhound_tool("L3", -1),
         "L4": len(l4) == 2 and "verified by a live domain read" in text_of(l4[0]) and "**Ingest:** Ready" in text_of(l4[0])
         and not bloodhound_rows(l4[1]) and chips("L4")[-1:] == ["connected"],
         "L5": len(c_l5) == 3 and [m["chat_response_key"] for r in c_l5 for m in bloodhound_rows(r)]
@@ -382,13 +417,16 @@ async def cmd_readiness(client: Any, run: dict[str, Any], args: argparse.Namespa
         "ce_container_running": ce_running(args.ce_container), "ce_api_status": ce_api_answers(args.ce_api),
         "mcp_token_keys": sorted(tokens), "task_baseline": await cor._max_task(client),
         "creator_key": {"id": key["id"]} if key else {"create": sorted(REQUIRED_KEY_SCOPES)}, "ceilings": CEILINGS,
+        "mcp_startup_check": mcp_startup_check(),
     }
+    report.update(sage_restart(_head_committed_at()))
     ready_so_far = bool(
         report["route"]["direct_openai"] and report["sage_container_running"] and not report["open_requests"]
         and report["parity"]["returncode"] == 0 and not report["identity"]["dirty"]
         and report["identity"]["branch"] == BRANCH and report["offline_tests"]["returncode"] == 0
         and report["phoenix_readable"] and report["ce_container_running"] and report["ce_api_status"] in (200, 401)
         and report["mcp_token_keys"] == ["BLOODHOUND_TOKEN_ID", "BLOODHOUND_TOKEN_KEY"]
+        and report["mcp_startup_check"] and report["sage_restarted"]
     )
     if ready_so_far:
         key = await _key(client, create=True)
