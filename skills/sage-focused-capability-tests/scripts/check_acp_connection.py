@@ -31,8 +31,8 @@ Pass rules, written before the run and read once. "Reply" is the request's one A
      within five seconds); B is still connected with its default model.
   C6 Restart only the worker; B: status, connect. Status reads disconnected (no stale connected claim); connect
      reads connected and shows B's saved selection.
-  C7 Restart the Sage container; B: status, connect. Status reads disconnected with B's saved selection; connect
-     reads connected.
+  C7 Restart the Sage container; B: status, connect. The container's start time changes and Sage logs its RabbitMQ
+     connection after the restart; status reads disconnected with B's saved selection; connect reads connected.
   C8 B: stop, status. Stop keeps the existing no-session wording and adds the coding-agent closure; the worker
      cleans up B's connection within five seconds of the stop's reply; status reads disconnected with B's saved
      selection.
@@ -244,7 +244,9 @@ def _wait(predicate, seconds: float) -> bool:
 
 
 def restart_sage() -> dict[str, Any]:
-    since = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+    # A Unix timestamp names the same instant in every timezone; Docker reads a date-time without a zone as
+    # the client's local time.
+    since = f"{time.time() - 1:.3f}"
     restarted = _docker("restart", "-t", "30", SAGE_CONTAINER, timeout=180)
     ready = _wait(lambda: "Successfully connected to rabbitmq" in "".join(
         (lambda c: c.stdout + c.stderr)(_docker("logs", "--since", since, SAGE_CONTAINER))), 240)

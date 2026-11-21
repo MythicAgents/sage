@@ -7,6 +7,7 @@ worker events are synthetic and shaped like the ones `run` records.
 from __future__ import annotations
 
 import copy
+import re
 import importlib.util
 from pathlib import Path
 
@@ -213,3 +214,31 @@ def test_env_setting_reads_the_last_uncommented_value(tmp_path):
     assert check.env_setting(env, "SAGE_ACP_SOCKET") == check.SAGE_SOCKET
     env.write_text("#SAGE_ACP_SOCKET=/Mythic/.sage_acp/acp.sock\n")
     assert check.env_setting(env, "SAGE_ACP_SOCKET") == ""
+
+
+def test_sage_restart_reads_logs_from_a_timezone_independent_start(monkeypatch):
+    # Attempt 1 (2026-11-21) passed a UTC time without a zone; Docker reads such a value in the client's local
+    # timezone, so on a host behind UTC it pointed hours into the future and never saw Sage's connect line.
+    import time as real_time
+
+    calls = []
+
+    class Done:
+        def __init__(self, stdout=""):
+            self.returncode, self.stdout, self.stderr = 0, stdout, ""
+
+    def docker(*args, **_kwargs):
+        calls.append(args)
+        if args[0] == "logs":
+            return Done("CRITICAL ... [+] Successfully connected to rabbitmq")
+        return Done("2026-11-21T22:18:26.297625639Z")
+
+    monkeypatch.setattr(check, "_docker", docker)
+    monkeypatch.setattr(check, "_wait", lambda predicate, seconds: predicate())
+    before = real_time.time()
+    result = check.restart_sage()
+    since = next(args[args.index("--since") + 1] for args in calls if args[0] == "logs")
+    assert result["consuming"] is True
+    # A Unix timestamp (seconds since the epoch) means the same instant in every timezone.
+    assert re.fullmatch(r"\d+(\.\d+)?", since), since
+    assert before - 5 <= float(since) <= real_time.time()
