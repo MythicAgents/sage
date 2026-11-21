@@ -58,6 +58,7 @@ _DECLARED_DISPATCH_SCENARIOS = [
     ("mcp", "_handle_mcp"),
     ("bloodhound", "_handle_bloodhound"),
     ("sandbox", "_handle_sandbox"),
+    ("acp", "_handle_acp"),
 ]
 
 

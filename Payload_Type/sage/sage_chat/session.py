@@ -207,6 +207,70 @@ async def save_channel_session_record(record: dict) -> None:
         raise DatabaseUnavailable(unavailable_message(path, exc)) from exc
 
 
+# A channel's coding-agent selection (`/acp`): which deployment-provisioned profile it uses and the model it
+# selected. Independent of the LLM channel session above, so a slash-only channel keeps it too. It never holds
+# transport, session or process identity: after a restart the channel is disconnected until it reconnects.
+async def _ensure_acp_binding_table(db: aiosqlite.Connection) -> None:
+    await db.execute(
+        "CREATE TABLE IF NOT EXISTS sage_acp_channel_bindings ("
+        "operation_id INTEGER NOT NULL, channel_id INTEGER NOT NULL, "
+        "profile TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', "
+        "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+        "PRIMARY KEY (operation_id, channel_id))"
+    )
+
+
+async def load_acp_binding(operation_id: int, channel_id: int) -> dict[str, str] | None:
+    """Return ``{"profile", "model"}`` for the channel, or ``None`` when it has no selection."""
+    path = channel_session_db_path()
+    try:
+        async with aiosqlite.connect(path, timeout=5) as db:
+            await _ensure_acp_binding_table(db)
+            cursor = await db.execute(
+                "SELECT profile, model FROM sage_acp_channel_bindings WHERE operation_id=? AND channel_id=?",
+                (int(operation_id), int(channel_id)),
+            )
+            row = await cursor.fetchone()
+            await db.commit()
+    except sqlite3.OperationalError as exc:
+        raise DatabaseUnavailable(unavailable_message(path, exc)) from exc
+    if row is None:
+        return None
+    return {"profile": str(row[0]), "model": str(row[1] or "")}
+
+
+async def save_acp_binding(operation_id: int, channel_id: int, *, profile: str, model: str = "") -> None:
+    path = channel_session_db_path()
+    try:
+        async with aiosqlite.connect(path, timeout=5) as db:
+            await _ensure_acp_binding_table(db)
+            await db.execute(
+                "INSERT INTO sage_acp_channel_bindings (operation_id, channel_id, profile, model, updated_at) "
+                "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP) "
+                "ON CONFLICT(operation_id, channel_id) DO UPDATE SET "
+                "profile=excluded.profile, model=excluded.model, updated_at=excluded.updated_at",
+                (int(operation_id), int(channel_id), str(profile), str(model or "")),
+            )
+            await db.commit()
+    except sqlite3.OperationalError as exc:
+        raise DatabaseUnavailable(unavailable_message(path, exc)) from exc
+
+
+async def delete_acp_binding(operation_id: int, channel_id: int) -> bool:
+    path = channel_session_db_path()
+    try:
+        async with aiosqlite.connect(path, timeout=5) as db:
+            await _ensure_acp_binding_table(db)
+            cursor = await db.execute(
+                "DELETE FROM sage_acp_channel_bindings WHERE operation_id=? AND channel_id=?",
+                (int(operation_id), int(channel_id)),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+    except sqlite3.OperationalError as exc:
+        raise DatabaseUnavailable(unavailable_message(path, exc)) from exc
+
+
 async def update_channel_session_record(
     operation_id: int,
     channel_id: int,

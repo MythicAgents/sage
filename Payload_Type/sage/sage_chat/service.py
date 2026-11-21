@@ -2344,11 +2344,14 @@ class SageChat(Chat):
             tool_discovery = (slash is not None and str(getattr(slash, "Name", "") or "").lower().lstrip("/") == "tools") or (
                 slash is None and looks_like_tool_inventory_prompt(prompt)
             )
+            # `/acp` configures the channel's coding-agent connection, which is independent of the Sage model:
+            # it must never restore (and so build) one.
+            acp_control = slash is not None and str(getattr(slash, "Name", "") or "").lower().lstrip("/") == "acp"
             # Set only when this request restored the session: a resume the restored graph refused,
             # and the paused calls (fingerprint -> tool_call_id) it will resume.
             restored_refusal = ""
             restored_paused_calls: dict[str, str] | None = None
-            if existing_at_entry is None and not read_only_state and not read_only_report and not tool_discovery and (
+            if existing_at_entry is None and not read_only_state and not read_only_report and not tool_discovery and not acp_control and (
                 not first_channel_claim
                 or (first_channel_claim and _channel_has_prior_context(request))
             ) and recovery_state is None:

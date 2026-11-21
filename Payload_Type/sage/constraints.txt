@@ -46,6 +46,10 @@
 # 1.44.0 -> 1.45.1, -instrumentation and -semantic-conventions 0.65b0 -> 0.66b1, and 1.45 adds
 # opentelemetry-exporter-otlp-common and opentelemetry-exporter-http-transport (0.66b1). A dry-run resolve
 # confirmed no other package changes. Offline suite: 9154 passed, 0 failed.
+#
+# Updated 2026-11-21 in place: added agent-client-protocol 1.0.0 (the `/acp` coding-agent client). Its only
+# runtime dependencies are pydantic and pydantic-core, already pinned here; no other package changes.
+agent-client-protocol==1.0.0
 aio-pika==9.4.1
 aiofile==3.12.3
 aiohappyeyeballs==2.7.1

@@ -52,3 +52,6 @@ opentelemetry-api==1.45.1
 # Direct runtime import (`ai/langgraph/effect_observations.py` opens an enrollment task's PFX to bind its
 # certificate). It arrives transitively today; declared for the same reason as the entries above.
 cryptography==50.0.2
+# Direct runtime import (`ai/acp.py`): the official Agent Client Protocol SDK for `/acp` coding-agent
+# connections. It supplies JSON-RPC routing and the protocol's schema models; it negotiates ACP protocol 1.
+agent-client-protocol==1.0.0

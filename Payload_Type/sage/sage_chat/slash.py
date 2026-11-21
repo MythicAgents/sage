@@ -68,6 +68,13 @@ SAGE_SLASH_COMMANDS = [
     ChatSlashCommandDefinition(Name="mcp", Description="Manage MCP servers: /mcp list | /mcp tools [server] | /mcp call <server> <tool> <json-object> | /mcp connect <json> | /mcp disconnect <name>."),
     ChatSlashCommandDefinition(Name="bloodhound", Description="Connect the BloodHound MCP: /bloodhound [directory] | /bloodhound force [directory] to rebind an existing connection with current credentials."),
     ChatSlashCommandDefinition(Name="sandbox", Description="Run a local-only isolated snippet: /sandbox [shell|python] <code>."),
+    ChatSlashCommandDefinition(
+        Name="acp",
+        Description=(
+            "Configure this channel's coding-agent connection: /acp [status] | /acp connect codex | "
+            "/acp models | /acp model <id> | /acp disconnect."
+        ),
+    ),
 ]
 WATCHER_SLASH_COMMANDS = [_FINDINGS_COMMAND, _WATCHER_COMMAND, _STOP_COMMAND]
 SLASH_COMMANDS = SAGE_SLASH_COMMANDS
@@ -1055,9 +1062,75 @@ async def _handle_stop(request: ChatRequest, model: Any = None) -> str:
         from .session import drop_channel_session
     except ImportError:  # pragma: no cover
         from sage_chat.session import drop_channel_session  # type: ignore
+    try:
+        from ai.acp import ACP_MANAGER
+    except ImportError:  # pragma: no cover
+        from ..ai.acp import ACP_MANAGER  # type: ignore
+    # Close this channel's coding-agent connection first: it needs no graph session and its saved selection
+    # stays, so an explicit `/acp connect` restores it.
+    acp_closed = await ACP_MANAGER.close_channel((int(request.OperationID), int(request.ChannelID)))
     stopped = await request_stop_for_sessions(str(request.ChannelID))
     await drop_channel_session(request, expected_model=model if model is not None else None)
-    return f"Stop requested for {len(stopped)} session(s) on this channel." if stopped else "No running session to stop on this channel."
+    text = f"Stop requested for {len(stopped)} session(s) on this channel." if stopped else "No running session to stop on this channel."
+    if acp_closed:
+        text += " Closed this channel's coding-agent connection; its saved selection remains."
+    return text
+
+
+async def _handle_acp(request: ChatRequest, arg: str) -> str:
+    """Configure the channel's coding-agent connection. Never builds a Sage model or sends a prompt."""
+    try:
+        from ai.acp import ACP_MANAGER, ACP_USAGE, PROFILES, AcpError, render_models, render_status
+    except ImportError:  # pragma: no cover
+        from ..ai.acp import ACP_MANAGER, ACP_USAGE, PROFILES, AcpError, render_models, render_status  # type: ignore
+    try:
+        from .session import delete_acp_binding, load_acp_binding, save_acp_binding
+    except ImportError:  # pragma: no cover
+        from sage_chat.session import delete_acp_binding, load_acp_binding, save_acp_binding  # type: ignore
+
+    key = (int(request.OperationID), int(request.ChannelID))
+    parts = str(arg or "").split()
+    sub = parts[0].lower() if parts else "status"
+    rest = parts[1:]
+    binding = await load_acp_binding(*key)
+    profile = (binding or {}).get("profile") or "codex"
+
+    if sub == "status" and not rest:
+        return render_status(ACP_MANAGER.view(key, profile), binding)
+    if sub == "connect" and len(rest) == 1:
+        requested = rest[0]
+        if requested not in PROFILES:
+            available = ", ".join(f"`{name}`" for name in PROFILES)
+            return f"Unknown coding-agent profile `{requested}`. Available: {available}. Nothing was started."
+        saved_model = (binding or {}).get("model", "") if (binding or {}).get("profile") == requested else ""
+        try:
+            result = await ACP_MANAGER.connect(key, requested, saved_model)
+        except AcpError as exc:
+            return render_status(ACP_MANAGER.view(key, requested), binding, error=str(exc))
+        await save_acp_binding(*key, profile=requested, model=saved_model)
+        binding = {"profile": requested, "model": saved_model}
+        notes = ("Already connected.",) if result.already_connected else result.notes
+        return render_status(result.view, binding, notes=notes)
+    if sub == "models" and not rest:
+        return render_models(ACP_MANAGER.view(key, profile))
+    if sub == "model" and len(rest) == 1:
+        try:
+            effective = await ACP_MANAGER.set_model(key, rest[0])
+        except AcpError as exc:
+            return render_status(ACP_MANAGER.view(key, profile), binding, error=str(exc))
+        view = ACP_MANAGER.view(key, profile)
+        await save_acp_binding(*key, profile=view.profile or profile, model=effective)
+        return render_status(view, {"profile": view.profile or profile, "model": effective},
+                             notes=(f"Selected model `{effective}` for this channel.",))
+    if sub == "disconnect" and not rest:
+        closed = await ACP_MANAGER.disconnect(key)
+        cleared = await delete_acp_binding(*key)
+        if closed:
+            return "Disconnected this channel's coding agent and cleared its saved selection."
+        if cleared:
+            return "No live coding-agent connection on this channel; cleared its saved selection."
+        return "No coding-agent connection or saved selection on this channel."
+    return ACP_USAGE
 
 
 async def handle_slash(chat: Any, request: ChatRequest, model: Any, response_key: str) -> bool:
@@ -1104,11 +1177,13 @@ async def handle_slash(chat: Any, request: ChatRequest, model: Any, response_key
         text = await _handle_bloodhound(request, arg)
     elif name == "sandbox":
         text = await _handle_sandbox(model, request, arg)
+    elif name == "acp":
+        text = await _handle_acp(request, arg)
     else:
         text = (
             "Unknown Sage slash command. Available commands: `/findings`, `/watcher`, `/state`, "
-            "`/report [identity]`, `/list`, `/tools`, `/mode`, `/model`, `/stop`, `/mcp`, `/bloodhound`, and "
-            "`/sandbox`."
+            "`/report [identity]`, `/list`, `/tools`, `/mode`, `/model`, `/stop`, `/mcp`, `/bloodhound`, "
+            "`/sandbox`, and `/acp`."
         )
     await chat.send_complete(request, response_key, content=text, complete_request=True)
     return True
