@@ -12,7 +12,8 @@ Semantics:
 - On Responses, Sage always names the access program. Unset means **Off** (``standard``): Sage never inherits a
   project's default Daybreak program. ``access_programs`` is documented for Responses only, so it is never sent
   on Chat Completions.
-- The safety identifier is operator-supplied and sent only when configured. Sage never derives one.
+- The safety identifier is optional (OpenAI recommends it; no model requires it), operator-supplied and sent
+  only when configured. Sage never derives one.
 """
 
 from __future__ import annotations
@@ -32,9 +33,6 @@ API_LABELS = {"": "adapter default", CHAT_COMPLETIONS: "Chat Completions", RESPO
 STANDARD = "standard"
 ACCESS_PROGRAM_VALUES = (STANDARD, "daybreak_blue", "daybreak_red")
 ACCESS_PROGRAM_LABELS = {STANDARD: "Off", "daybreak_blue": "Blue", "daybreak_red": "Red"}
-
-# Models whose documented Responses configuration needs a pseudonymous per-user identifier.
-SAFETY_IDENTIFIER_REQUIRED_MODELS = frozenset({"gpt-6-cyber"})
 
 REASONING_INCLUDE = "reasoning.encrypted_content"
 
@@ -87,11 +85,6 @@ def validate_route(
         raise ValueError(
             f"OpenAI Daybreak ({ACCESS_PROGRAM_ENV}={program}) requires OpenAI API = Responses. Set OpenAI API to "
             "Responses or clear OpenAI Daybreak; Sage does not change the API for you."
-        )
-    if api_value == RESPONSES and str(model or "").strip() in SAFETY_IDENTIFIER_REQUIRED_MODELS and not identifier:
-        raise ValueError(
-            f"{str(model).strip()} on the Responses API requires an OpenAI Safety Identifier "
-            f"({SAFETY_IDENTIFIER_ENV}): set a stable pseudonymous identifier for the person using this chat."
         )
     return route
 

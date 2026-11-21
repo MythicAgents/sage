@@ -619,22 +619,25 @@ and gateways implement — so you can set `API_ENDPOINT` to any server that expo
 internal gateway, or a proxy. For example, run a [LiteLLM](https://docs.litellm.ai/docs/simple_proxy) proxy and
 point `API_ENDPOINT` at it to reach 100+ providers behind a single OpenAI-compatible endpoint.
 
-**OpenAI Responses and Daybreak.** Some OpenAI models are served only on the Responses API, including
-the -cyber models from GPT-5.6 Cyber on.
-Set **OpenAI API** to **Responses** and keep `API_ENDPOINT` as the base URL (`https://api.openai.com/v1`); Sage
-adds `/responses` itself. Responses requests are stateless (`store: false`): Sage keeps the conversation and sends
-it, with the model's encrypted reasoning, on each request. On Responses, Sage always names the Daybreak program and
-sends **Off** (`standard`, standard safeguards) unless you choose Blue or Red, so a project's own default program is
-never used implicitly. Blue or Red requires an OpenAI project approved for that program. GPT-6 Cyber uses
-**Responses + Red** plus an **OpenAI Safety Identifier**, and needs Daybreak Red approval, separate model approval,
-a non-default project with access enabled, and an allowlisted sending IP; ZDR projects also need Private Safety
-Processing. Sage never derives a safety identifier from a Mythic username; use the same pseudonym for the same
-person. Invalid combinations (Daybreak without Responses, any of these with a non-OpenAI provider) fail before any
-request. When the provider rejects a route (for example a Responses-only model on Chat Completions, or a Daybreak
-access error), the error names the setting to change and says whether the chat continues. Changing only
-**OpenAI API**, **OpenAI Daybreak** or **OpenAI Safety Identifier** continues the same chat with its conversation, and a
-fix made in the OpenAI project without changing Sage's settings is retried in the same chat. Changing the API key,
-model, provider or API endpoint starts a new chat. Sage never switches the model, provider, endpoint or API on its own.
+**OpenAI Responses and [Daybreak](https://developers.openai.com/api/docs/guides/daybreak).** Some OpenAI models are
+served only on the Responses API, including the -cyber models from GPT-5.6 Cyber on. Set **OpenAI API** to
+**Responses** and keep `API_ENDPOINT` as the base URL (`https://api.openai.com/v1`); Sage adds `/responses` itself.
+Responses requests are stateless (`store: false`): Sage keeps the conversation and sends it, with the model's
+encrypted reasoning, on each request. On Responses, Sage always names the Daybreak program and sends **Off**
+(`standard`, standard safeguards) unless you choose Blue or Red, so a project's own default program is never used
+implicitly. Blue or Red requires an OpenAI project approved for that program. GPT-6 Cyber uses **Responses + Red**
+and needs Daybreak Red approval, separate model approval, a non-default project with access enabled, and an
+allowlisted sending IP; ZDR projects also need Private Safety Processing. An **OpenAI Safety Identifier** is
+optional for every model; OpenAI [recommends
+one](https://developers.openai.com/api/docs/guides/safety-best-practices#implement-safety-identifiers) so it can act
+on a single user instead of the whole organization. Sage never derives one from a Mythic username; use the same
+pseudonym for the same person. Invalid combinations (Daybreak without Responses, any of these with a non-OpenAI
+provider) fail before any request. When the provider rejects a route (for example a Responses-only model on Chat
+Completions, or a Daybreak access error), the error names the setting to change and says whether the chat continues.
+Changing only **OpenAI API**, **OpenAI Daybreak** or **OpenAI Safety Identifier** continues the same chat with its
+conversation, and a fix made in the OpenAI project without changing Sage's settings is retried in the same chat.
+Changing the API key, model, provider or API endpoint starts a new chat. Sage never switches the model, provider,
+endpoint or API on its own.
 
 **Policy.** `policy_mode` controls how the next capability is chosen. `hybrid` (default) has deterministic code
 constrain the admissible actions and lets the model pick among them — the intended production mode. `symbolic` is

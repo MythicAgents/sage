@@ -207,6 +207,18 @@ def test_documented_gpt6_cyber_selection_sends_the_documented_responses_request(
     assert not body.get("stream")
 
 
+
+def test_safety_identifier_is_optional_even_for_gpt6_cyber(wire):
+    # Operator decision (2026-11-20): OpenAI documents the safety identifier as recommended, not required, so
+    # Sage sends gpt-6-cyber on Responses without one rather than refusing the chat.
+    message = _send(_config(model="gpt-6-cyber", SAGE_OPENAI_API="responses",
+                            SAGE_OPENAI_ACCESS_PROGRAM="daybreak_red"))
+    assert message.text == "READY"
+    ((path, body),) = wire.requests
+    assert path == "/v1/responses"
+    assert body["model"] == "gpt-6-cyber" and body["access_programs"] == {"cyber": "daybreak_red"}
+    assert "safety_identifier" not in body
+
 @pytest.mark.parametrize(("selected", "sent"), [
     (None, "standard"),          # operator decision: Sage's default is Off, never a project's Blue default
     ("standard", "standard"),
@@ -260,8 +272,6 @@ def test_profile_factory_uses_the_same_request_projection(wire):
      "requires OpenAI API = Responses"),
     ({"provider": "anthropic", "SAGE_OPENAI_API": "responses"}, "require the openai model provider"),
     ({"provider": "bedrock", "SAGE_OPENAI_SAFETY_IDENTIFIER": PSEUDONYM}, "require the openai model provider"),
-    ({"model": "gpt-6-cyber", "SAGE_OPENAI_API": "responses", "SAGE_OPENAI_ACCESS_PROGRAM": "daybreak_red"},
-     "SAGE_OPENAI_SAFETY_IDENTIFIER"),
 ])
 def test_invalid_combinations_fail_locally_with_the_configuration_action(wire, extra, expected):
     with pytest.raises(ValueError, match=expected) as raised:

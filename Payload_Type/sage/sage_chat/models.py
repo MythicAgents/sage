@@ -108,7 +108,7 @@ _CONFIG_OPTIONS = [
             "explicitly requests standard safeguards. Use configured default falls back to the "
             "SAGE_OPENAI_ACCESS_PROGRAM user secret, then the container environment; with neither, Sage sends "
             "Off, never a project's own default program. Blue or Red requires OpenAI API = Responses and an "
-            "approved project; OpenAI's -cyber models use Red."
+            "approved project; OpenAI's -cyber models use Red. Learn more: https://developers.openai.com/api/docs/guides/daybreak"
         ),
         Required=False,
         DefaultValue="",
@@ -129,7 +129,8 @@ _CONFIG_OPTIONS = [
         Type=OptType.String,
         Description=(
             "[OPTIONAL] A stable pseudonym for the person using this chat, sent to OpenAI as safety_identifier; "
-            "applies to the OpenAI provider and is required for GPT-6 Cyber on Responses."
+            "applies to the OpenAI provider. Recommended, not required: with one, OpenAI can act on a single "
+            "user instead of the whole organization. Learn more: https://developers.openai.com/api/docs/guides/safety-best-practices#implement-safety-identifiers"
         ),
         Required=False,
         HelpText=(
