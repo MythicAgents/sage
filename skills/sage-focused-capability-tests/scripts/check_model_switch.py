@@ -16,8 +16,7 @@ that key, sends the prompts and slash commands below and edits that channel's se
   verify --run-file F --phoenix-db P
       Applies the pass rules once, reading Mythic's own rows and the live Phoenix trace.
 
-Plan revision 2 (cairn agent-architecture/2026-11-20_plan_chat-model-switch-r2.md). Pass rules, written before the run
-and read once:
+Pass rules, written before the run and read once:
   S1 Model nonexistent-model-a, OpenAI API Chat Completions, Daybreak Red; label prompt: a configuration error naming
      the setting; zero provider calls; no replaced or restart refusal.
   S2 OpenAI API set to Responses in settings; same prompt: one error terminal naming the Model value, the provider's
