@@ -50,6 +50,15 @@ argument is still accepted and ignored. See `docs/development/TEST_TIERS.md`.
   written in the script to Mythic's rows and the live Phoenix trace (read in place): the tool step passes on a
   call produced and consumed plus one final-answer row (calling agent and cards are observations), and P7 reads
   the deployed controls from Mythic's stored model definition. One attempt per run file.
+- `check_model_switch.py readiness|run|verify --run-file F --phoenix-db P` — the in-place model switch live check
+  in one fresh conversation channel. Its route file adds `model_b` to the keys above. `readiness` (read-only) also
+  checks that Mythic's stored Sage definition declares `/model` and whether the logged-in operator owns an API key
+  the channel can use (`apitoken.write`, `chat-ai.write`, `callback.read`). `run` (paid provider activity and
+  Mythic writes; operator authorization required, `--authorized-by`) creates that key if missing, so the channel's
+  key owner is its creator (Mythic applies its settings rule to that owner), then runs a wrong first model, a
+  Responses correction, `/model`, a function-call step, a settings switch to model B, a wrong `/model` and a switch
+  back, stopping at 16 provider calls, 1,048,576 tokens, 4,096 output tokens per call, 20 minutes or any target
+  task. `verify` applies the per-step pass rules written in the script once. One attempt per run file.
 - `check_bloodhound_ingest_contract.py --image <id> [--json out.json]` — checks a **built** Sage image's baked
   BloodHound MCP serves the ingest contract (byte upload plus exact-job `status`). It runs one throwaway container
   with `--network none`, the entrypoint bypassed, and only the checker mounted read-only; a loopback fake BloodHound
