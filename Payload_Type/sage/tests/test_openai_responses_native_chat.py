@@ -862,3 +862,86 @@ def test_a_dated_provider_model_name_still_replays_the_models_own_reasoning(monk
     _no_strand(process.chat)
     replayed = [i for i in wire.responses()[1]["input"] if i.get("type") == "reasoning"]
     assert [item["encrypted_content"] for item in replayed] == ["opaque-offline-reasoning-1"]
+
+
+# ------------------------------------------------------------------------------------------------
+# Records saved before the model became continuable (cold-review reproduction). Such a record has no
+# "model" value and a core signature computed with the model included, as `dev` wrote it.
+# ------------------------------------------------------------------------------------------------
+
+def _dev_core_signature(item) -> str:
+    """The core signature as the earlier version computed it: drops only the OpenAI route fields."""
+    kwargs = service.build_model_kwargs(item)
+    payload = dict(kwargs)
+    config = dict(payload.get("config") or {})
+    configurable = {k: v for k, v in dict(config.get("configurable") or {}).items()
+                    if k not in service.OPENAI_ROUTE_FIELDS}
+    payload["config"] = {**config, "configurable": configurable}
+    return service._model_config_signature(payload, service._bloodhound_env_or_empty(item))
+
+
+def _restart_on_a_dev_record(monkeypatch, second_config, *, served_model_suffix: str = ""):
+    import httpx
+
+    class Wire(ProviderWire):
+        def handle(self, item):
+            response = super().handle(item)
+            body = response.json()
+            if served_model_suffix and response.status_code == 200 and "model" in body:
+                body["model"] = f"{body['model']}{served_model_suffix}"
+            return httpx.Response(response.status_code, json=body)
+
+    wire = Wire([[text_item(FIRST_ANSWER, 1)], [text_item(SECOND_ANSWER, 2)]])
+    install_wire(monkeypatch, wire)
+    first_config = route_config(**CYBER_RESPONSES)
+
+    async def scenario():
+        first = _process()
+        first_request = request(LABEL_PROMPT, 1, first_config)
+        await first.chat.chat(first_request)
+        record = await load_channel_session_record(OPERATION, CHANNEL)
+        legacy = {k: v for k, v in record.items() if k != "model"}
+        legacy["core_signature"] = _dev_core_signature(first_request)
+        await chat_session.save_channel_session_record(legacy)
+        second = await _restarted(first)
+        await second.chat.chat(request(REPEAT_PROMPT, 2, second_config))
+        return second, wire, await load_channel_session_record(OPERATION, CHANNEL), record["thread_id"]
+
+    return asyncio.run(scenario())
+
+
+def test_a_model_change_on_a_record_saved_before_this_version_continues_after_upgrade(monkeypatch):
+    second, wire, record, thread = _restart_on_a_dev_record(monkeypatch, route_config(**B_RESPONSES))
+    _no_strand(second.chat)
+    joined = "\n".join(texts(second.chat))
+    assert "Start a new Sage chat" not in joined and f"was `gpt-6-cyber`" in joined, joined
+    assert _terminal(second.chat)["kind"] == "complete"
+    assert _invoked(wire) == ["gpt-6-cyber", MODEL_B]
+    assert record["thread_id"] == thread and record["model"] == MODEL_B
+
+
+def test_a_route_only_change_on_a_record_saved_before_this_version_continues_after_upgrade(monkeypatch):
+    changed = route_config(**{**CYBER_RESPONSES, "SAGE_OPENAI_ACCESS_PROGRAM": "standard"})
+    second, wire, record, thread = _restart_on_a_dev_record(monkeypatch, changed)
+    _no_strand(second.chat)
+    joined = "\n".join(texts(second.chat))
+    assert "Start a new Sage chat" not in joined and "OpenAI settings" in joined, joined
+    assert _terminal(second.chat)["kind"] == "complete"
+    assert record["thread_id"] == thread and record["model"] == "gpt-6-cyber"
+
+
+def test_an_unproven_model_change_on_an_old_record_keeps_the_refusal(monkeypatch):
+    """Synthetic: the provider reported a dated name, so no recorded name rebuilds the old signature."""
+    second, wire, record, thread = _restart_on_a_dev_record(
+        monkeypatch, route_config(**B_RESPONSES), served_model_suffix="-2026-11-01")
+    assert any("Start a new Sage chat" in text for text in texts(second.chat))
+    assert _invoked(wire) == ["gpt-6-cyber"]  # nothing ran under the new model
+    assert "model" not in record and record["thread_id"] == thread
+
+
+def test_an_unchanged_restart_upgrades_an_old_record(monkeypatch):
+    second, wire, record, thread = _restart_on_a_dev_record(monkeypatch, route_config(**CYBER_RESPONSES))
+    _no_strand(second.chat)
+    assert _terminal(second.chat)["kind"] == "complete"
+    assert record["model"] == "gpt-6-cyber"
+    assert record["core_signature"] == second.models[0]._chat_request_core_signature

@@ -284,6 +284,22 @@ def _core_config_signature(
     return _model_config_signature(payload, bloodhound_env)
 
 
+def _route_only_core_signature(
+    kwargs: dict[str, Any],
+    bloodhound_env: dict[str, str] | None = None,
+) -> str:
+    """The core signature as records saved before the model became continuable store it (model included)."""
+    payload = dict(kwargs)
+    config = dict(payload.get("config") or {})
+    configurable = {
+        key: value
+        for key, value in dict(config.get("configurable") or {}).items()
+        if key not in OPENAI_ROUTE_FIELDS
+    }
+    payload["config"] = {**config, "configurable": configurable}
+    return _model_config_signature(payload, bloodhound_env)
+
+
 def _bloodhound_env_or_empty(request: ChatRequest) -> dict[str, str]:
     try:
         return build_bloodhound_env(request)
@@ -1668,12 +1684,15 @@ class SageChat(Chat):
         if record.get("apitoken_id") != int(request.APITokenID):
             return None, changed_refusal("Mythic identity"), []
         settings_changed = False
+        previous_model = str(record.get("model") or kwargs.get("model") or "")
         if record.get("config_signature") != signature:
             # Only the model or OpenAI route settings changed: continue this generation when nothing is
             # pending, and hold the change while an approval or decision is (nothing runs).
-            core = str(record.get("core_signature") or "")
-            if not core or core != _core_config_signature(kwargs, bloodhound_env):
+            continuable_from = await self._continuable_from(record, kwargs, bloodhound_env)
+            if continuable_from is None:
                 return None, changed_refusal("configuration"), []
+            previous_model = continuable_from
+            record = {**record, "model": continuable_from}
             if (
                 record.get("pending")
                 or _claim_outstanding(record)
@@ -1698,7 +1717,7 @@ class SageChat(Chat):
         if isinstance(engagement, str) and engagement:
             model._report_engagement_uuid = engagement
         notices = [RESTORED_NOTICE] + (
-            [_settings_notice(str(record.get("model") or ""), str(getattr(model, "model", "") or ""))]
+            [_settings_notice(previous_model, str(getattr(model, "model", "") or ""))]
             if settings_changed else []
         )
         if settings_changed:
@@ -1718,9 +1737,72 @@ class SageChat(Chat):
                 f"its saved conversation is unreadable ({type(exc).__name__})"
             ), []
         await put_channel_session(request, model)
+        if "model" not in record:
+            # Saved before the model joined the continuable settings: record it and the current core
+            # signature now, so later changes compare like with like.
+            try:
+                await update_channel_session_record(
+                    operation_id, channel_id, expected_thread_id=thread_id,
+                    core_signature=str(getattr(model, "_chat_request_core_signature", "") or ""),
+                    model=str(getattr(model, "model", "") or ""),
+                )
+            except Exception:
+                logger.warning("Channel record was not upgraded; it is checked again next restart", exc_info=True)
         if values is not None:
             notices.extend(await self._restore_pending_work(request, model, record, thread_id))
         return model, "", notices
+
+    async def _continuable_from(
+        self, record: dict[str, Any], kwargs: dict[str, Any], bloodhound_env: dict[str, str]
+    ) -> str | None:
+        """The model the record was saved with, when only the model or OpenAI route settings changed; else None.
+
+        A record saved before the model became continuable stores a core signature that includes the model
+        and no model value. A route-only change matches it directly; a model change is proven only when the
+        same signature, rebuilt with a model name this generation's own checkpoint recorded, matches it.
+        Anything else keeps the refusal.
+        """
+        core = str(record.get("core_signature") or "")
+        if not core:
+            return None
+        if "model" in record:
+            return str(record["model"]) if core == _core_config_signature(kwargs, bloodhound_env) else None
+        if core == _route_only_core_signature(kwargs, bloodhound_env):
+            return str(kwargs.get("model") or "")
+        for candidate in await self._checkpoint_model_names(str(record.get("thread_id") or "")):
+            if core == _route_only_core_signature({**kwargs, "model": candidate}, bloodhound_env):
+                return candidate
+        return None
+
+    @staticmethod
+    async def _checkpoint_model_names(thread_id: str) -> list[str]:
+        """Model names the provider reported on this generation's saved answers (read-only)."""
+        if not thread_id:
+            return []
+        try:
+            from ai.langgraph.sqlite_checkpointer import SageAsyncSqliteSaver
+        except ImportError:  # pragma: no cover
+            from ..ai.langgraph.sqlite_checkpointer import SageAsyncSqliteSaver  # type: ignore
+        names: list[str] = []
+        try:
+            async with aiosqlite.connect(channel_session_db_path(), timeout=5) as conn:
+                saved = await SageAsyncSqliteSaver(conn).aget_tuple(
+                    {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+                )
+        except Exception:
+            logger.warning("Saved conversation could not be read for its model names", exc_info=True)
+            return []
+        values = dict((saved.checkpoint or {}).get("channel_values") or {}) if saved is not None else {}
+        for value in values.values():
+            for message in value if isinstance(value, list) else ():
+                metadata = getattr(message, "response_metadata", None)
+                if not isinstance(metadata, dict):
+                    continue
+                for key in ("model_name", "model", "model_id"):
+                    name = metadata.get(key)
+                    if isinstance(name, str) and name and name not in names:
+                        names.append(name)
+        return names
 
     async def _hold_restored_change(
         self, request: ChatRequest, record: dict[str, Any]
