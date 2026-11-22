@@ -4736,6 +4736,18 @@ def _is_internal_human_message(msg: AnyMessage) -> bool:
     return isinstance(msg, HumanMessage) and bool(msg.additional_kwargs.get("_hide_from_stream"))
 
 
+def _invocation_delta(updated_channel: list, agent_input: list, initial_agent_input_length: int) -> list:
+    """What one agent invocation added to its channel, as persisted: every new message except internal nudges.
+
+    The one owner for both exits of an invocation: the wrapper's normal return and respond_to_user, which leaves
+    through the parent graph before that return runs.
+    """
+    return [
+        msg for msg in _messages_added_by_agent(updated_channel, agent_input, initial_agent_input_length)
+        if not _is_internal_human_message(msg)
+    ]
+
+
 def _message_content_as_text(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -5683,7 +5695,7 @@ def _previous_reply_context(supervisor_messages: list[AnyMessage], request_id: s
 
     The latest non-empty Supervisor reply without tool calls (a final report or a direct answer) recorded before this
     request's opening operator input. It is the message the Supervisor itself reads. The channel only appends, so
-    position orders it; sequence numbers do not, because a `respond_to_user` final report is stored without one. A
+    position orders it; sequence numbers are not relied on, because not every stored reply carries one. A
     steer keeps the same opening input, so it still carries the reply that preceded the request. A long reply keeps
     its end, where a menu or a question sits."""
     messages = list(supervisor_messages or [])
@@ -12023,6 +12035,10 @@ class Model:
                     execution_context_token = MCPManager.set_execution_context(
                         MCP_EXECUTION_CONTEXT_OFFENSIVE_RUNTIME
                     )
+                if node_name == "Supervisor":
+                    # respond_to_user leaves through the parent graph, past the append below; it reads this exact
+                    # input to persist what this invocation added (_invocation_delta), as the append would.
+                    self._supervisor_invocation_input = _agent_input
                 try:
                     result = await agent_runnable.ainvoke({"messages": _agent_input}, invoke_config)
                 except ParentCommand as bubble:
@@ -12033,6 +12049,8 @@ class Model:
                         logger.warning(f"[{node_name}] step close on handback failed ({type(exc).__name__})")
                     raise
                 finally:
+                    if node_name == "Supervisor":
+                        self._supervisor_invocation_input = None
                     if execution_context_token is not None:
                         MCPManager.reset_execution_context(execution_context_token)
                     if activity_token is not None:
@@ -12088,12 +12106,7 @@ class Model:
             # Hardening: identify what the agent added by message id, not by list position.
             # Identity beats arithmetic regardless of cause. This does NOT close the observed live
             # zero-return — that mechanism is unknown; see _messages_added_by_agent.
-            returned_messages = [
-                msg for msg in _messages_added_by_agent(
-                    updated_channel, _agent_input, initial_agent_input_length
-                )
-                if not _is_internal_human_message(msg)
-            ]
+            returned_messages = _invocation_delta(updated_channel, _agent_input, initial_agent_input_length)
 
             # LangGraph's returned sequence is the normal-path persistence authority.
             # Callback capture supplements it in exactly ONE case: SummarizationMiddleware
@@ -16927,7 +16940,7 @@ class Model:
             )
 
         # Completion tool - use when task is done
-        respond_to_user_tool = consultation_completion_tool or _create_respond_to_user_tool()
+        respond_to_user_tool = consultation_completion_tool or _create_respond_to_user_tool(source_model=self)
 
         # Recursion limit management tool
         request_continuation_tool = _create_recursion_summary_tool()
@@ -19425,10 +19438,17 @@ def _create_handback_to_supervisor_tool(mythic_client=None, *, autonomous: bool 
     return handback_to_supervisor
 
 
-def _create_respond_to_user_tool():
+_FINISH_ACKNOWLEDGEMENT = "Final report delivered to the operator."
+
+
+def _create_respond_to_user_tool(source_model: Model | None = None):
     """Create a tool that allows the Supervisor to explicitly indicate it's done
     delegating and wants to deliver a user-facing final report. It may synthesize
     findings or reuse one complete specialist answer verbatim.
+
+    With ``source_model``, the finish also keeps this Supervisor invocation's own calls and results (and their
+    reasoning items) in the Supervisor channel, so later turns replay them: the parent command bypasses the
+    wrapper's normal append.
     """
     def finish(runtime: ToolRuntime, final_response: str, outcome: str = "") -> Command:
         # Internal invariant, not a model-facing crash: respond_to_user delivers its
@@ -19458,9 +19478,27 @@ def _create_respond_to_user_tool():
             additional_kwargs=outcome_kwargs,
         )
 
+        persisted: list[AnyMessage] = [response_message]
+        invocation_input = getattr(source_model, "_supervisor_invocation_input", None)
+        if source_model is not None and invocation_input is not None:
+            # This invocation's provider messages and tool results, ending with the message that called this
+            # tool, then the result that answers that call (a call without one is stripped before any provider).
+            transcript = _invocation_delta(
+                list(runtime.state.get("messages") or []), invocation_input, len(invocation_input),
+            )
+            acknowledgement = ToolMessage(
+                content=_FINISH_ACKNOWLEDGEMENT, name="respond_to_user", tool_call_id=runtime.tool_call_id,
+            )
+            persisted = [*transcript, acknowledgement, response_message]
+            for message in persisted:
+                _tag_msg(message, source_model._next_seq())
+
         update_state = {**runtime.state}
-        update_state["messages"] = [response_message]
-        update_state["supervisor_messages"] = [response_message]
+        # Parent channels append (operator.add); only this invocation's new messages go in.
+        update_state["messages"] = persisted
+        update_state["supervisor_messages"] = persisted
+        if source_model is not None and invocation_input is not None:
+            update_state["_message_seq"] = source_model._message_seq
 
         return Command(
             goto="__end__",  # Explicitly end the graph

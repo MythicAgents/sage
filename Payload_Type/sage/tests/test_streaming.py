@@ -220,7 +220,12 @@ class TestMessageFormatting:
         assert "_hide_from_stream" in sanitize_src
         assert "_is_internal_human_message" in fmt_src
         assert "_is_internal_human_message" in render_src
-        assert "_is_internal_human_message" in wrapper_src
+        # The wrapper's persisted delta filters nudges through the one helper it shares with respond_to_user
+        # (moved there so both exits of a Supervisor invocation persist the same delta).
+        delta_node = next(node for node in MODEL_AST.body
+                          if isinstance(node, ast.FunctionDef) and node.name == "_invocation_delta")
+        assert "_invocation_delta" in wrapper_src
+        assert "_is_internal_human_message" in (ast.get_source_segment(MODEL_SOURCE, delta_node) or "")
         assert "autonomous_operator_continue" in wrapper_src
 
     def test_format_handles_list_content(self):

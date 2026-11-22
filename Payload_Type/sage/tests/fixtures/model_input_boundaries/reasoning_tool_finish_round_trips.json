@@ -1,0 +1,209 @@
+{
+ "provenance": {
+  "kind": "recorded model output (real provider Responses output items)",
+  "description": "gpt-5.6-sol (steps A1-A4) and gpt-6.1-sol (B1-B4) on the direct OpenAI Responses API through Sage's deployed feature branch, reasoning effort low, live attempt 1 of the reasoning-tool check, 2026-11-22. Each step lists the provider's raw `output` arrays in request order, the recorded rejection envelope for A2 (Chat Completions) and B2 (effort none), and the list_callbacks output each step's consuming request carried.",
+  "substitutions": "Lab host and user renamed to WORKSTATION-A and lab.user in tool output and answer text; each reasoning item's encrypted_content replaced by `opaque-recorded-substitute-N` (opaque provider data, never parsed by Sage); provider item ids, call ids, arguments and text otherwise unchanged. Response envelopes (ids, usage) are synthesized by the replay harness.",
+  "gap": "Opaque reasoning content is a substitute, so a provider's acceptance of replayed reasoning is not proven offline; only Sage's typed replay of it is.",
+  "builder": "private history: reasoning-tool-compatibility/r2-implementation/build_finish_fixture.py"
+ },
+ "steps": {
+  "A1": {
+   "outputs": [
+    [
+     {
+      "content": [],
+      "encrypted_content": "opaque-recorded-substitute-1",
+      "id": "rs_054d332832ab6984016b0344990f8887d19daa19cdedb99771",
+      "summary": [],
+      "type": "reasoning"
+     },
+     {
+      "arguments": "{}",
+      "call_id": "call_8f8a4fda9ab545f78afc851ca5a767cd",
+      "id": "fc_054d332832ab6984016b034499205487d18ef05f36732e7956",
+      "name": "list_callbacks",
+      "status": "completed",
+      "type": "function_call"
+     }
+    ],
+    [
+     {
+      "content": [],
+      "encrypted_content": "opaque-recorded-substitute-2",
+      "id": "rs_054d332832ab6984016b03449c2e9c87d1aca671d9e9323117",
+      "summary": [],
+      "type": "reasoning"
+     },
+     {
+      "arguments": "{\"final_response\":\"**Label:** `amber-seven`\\n\\n| Callback | Agent | Host | User | Integrity | Status | Last check-in |\\n|---:|---|---|---|---:|---|---:|\\n| 2 | apollo | WORKSTATION-A | lab.user | 2 | **dead** | ~89,794 seconds ago (~24h 57m) |\\n| 3 | apollo | WORKSTATION-A | lab.user | 3 | **alive** | ~0.93 seconds ago |\\n\\nThere are **2 callbacks**: one alive (**#3**) and one dead (**#2**), both on `WORKSTATION-A` as `lab.user`. This was a read-only status check; **no tasks were run**.\",\"reuse_latest_worker_answer\":false,\"outcome\":\"completed\"}",
+      "call_id": "call_e6bfdf44e8394c42a636f94b78d5d762",
+      "id": "fc_054d332832ab6984016b03449c310487d19d2f716129d8e80b",
+      "name": "respond_to_user",
+      "status": "completed",
+      "type": "function_call"
+     }
+    ]
+   ],
+   "tool_results": {
+    "call_8f8a4fda9ab545f78afc851ca5a767cd": "[{\"agent\": \"apollo\", \"host\": \"WORKSTATION-A\", \"id\": 2, \"integrity\": 2, \"secs_since_checkin\": 89793.915927, \"status\": \"dead\", \"user\": \"lab.user\"}, {\"agent\": \"apollo\", \"host\": \"WORKSTATION-A\", \"id\": 3, \"integrity\": 3, \"secs_since_checkin\": 0.934456, \"status\": \"alive\", \"user\": \"lab.user\"}]"
+   }
+  },
+  "A2": {
+   "outputs": [],
+   "tool_results": {},
+   "rejection": {
+    "status": 400,
+    "body": {
+     "error": {
+      "message": "Function tools with reasoning_effort are not supported for gpt-5.6-sol in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.",
+      "type": "invalid_request_error",
+      "param": "reasoning_effort",
+      "code": null
+     }
+    },
+    "request_path": "/v1/chat/completions"
+   }
+  },
+  "A3": {
+   "outputs": [
+    [
+     {
+      "arguments": "{}",
+      "call_id": "call_ee1ed00b85b14333817229a423fc3d88",
+      "id": "fc_09a37e1a25c7c113016b0344ab8c6c87d1877ccfb89d18fa4a",
+      "name": "list_callbacks",
+      "status": "completed",
+      "type": "function_call"
+     }
+    ],
+    [
+     {
+      "content": [],
+      "encrypted_content": "opaque-recorded-substitute-3",
+      "id": "rs_09a37e1a25c7c113016b0344afde8c87d19cc1b2308db5f364",
+      "summary": [],
+      "type": "reasoning"
+     },
+     {
+      "arguments": "{\"final_response\":\"**Label:** `amber-seven`\\n\\n| Callback | Agent | Host | User | Integrity | Status | Last check-in |\\n|---:|---|---|---|---:|---|---:|\\n| 2 | apollo | WORKSTATION-A | lab.user | 2 | **dead** | ~89,812 seconds ago (~24h 57m) |\\n| 3 | apollo | WORKSTATION-A | lab.user | 3 | **alive** | ~2.9 seconds ago |\\n\\n**Summary:** 2 callbacks were returned. Callback **#3** is alive; callback **#2** is dead. Both are Apollo callbacks on `WORKSTATION-A` under `lab.user`.\\n\\n`list_callbacks` was used once. No tasks were run.\",\"reuse_latest_worker_answer\":false,\"outcome\":\"completed\"}",
+      "call_id": "call_184e297f231344f7b290aad0a95e85e5",
+      "id": "fc_09a37e1a25c7c113016b0344afef9887d1bac7d47067459631",
+      "name": "respond_to_user",
+      "status": "completed",
+      "type": "function_call"
+     }
+    ]
+   ],
+   "tool_results": {
+    "call_ee1ed00b85b14333817229a423fc3d88": "[{\"agent\": \"apollo\", \"host\": \"WORKSTATION-A\", \"id\": 2, \"integrity\": 2, \"secs_since_checkin\": 89811.913835, \"status\": \"dead\", \"user\": \"lab.user\"}, {\"agent\": \"apollo\", \"host\": \"WORKSTATION-A\", \"id\": 3, \"integrity\": 3, \"secs_since_checkin\": 2.938112, \"status\": \"alive\", \"user\": \"lab.user\"}]"
+   }
+  },
+  "A4": {
+   "outputs": [
+    [
+     {
+      "arguments": "{\"final_response\":\"`amber-seven`\",\"reuse_latest_worker_answer\":false,\"outcome\":\"completed\"}",
+      "call_id": "call_6565fd75d4cf4265be2b5c9d31d87be7",
+      "id": "fc_07d91b029af1dbbf016b0344b8fd4887d1ac86d70f16d07083",
+      "name": "respond_to_user",
+      "status": "completed",
+      "type": "function_call"
+     }
+    ]
+   ],
+   "tool_results": {}
+  },
+  "B1": {
+   "outputs": [
+    [
+     {
+      "arguments": "{}",
+      "call_id": "call_31605a7c314b4b20b493202491b27811",
+      "id": "fc_070b274daa88504d016b0344c850b887d1ba19d246465b0060",
+      "name": "list_callbacks",
+      "status": "completed",
+      "type": "function_call"
+     }
+    ],
+    [
+     {
+      "arguments": "{\"final_response\":\"**Label: amber-seven**\\n\\n| Callback | Agent | Host | User | Integrity | Status | Last check-in |\\n|---|---|---|---|---|---|---|\\n| 2 | apollo | WORKSTATION-A | lab.user | 2 | Dead | ~25 hours ago |\\n| 3 | apollo | WORKSTATION-A | lab.user | 3 | Alive | ~1.6 seconds ago |\\n\\nTwo callbacks returned: **one alive, one dead**. Called `list_callbacks` once; no tasks were run.\",\"reuse_latest_worker_answer\":false,\"outcome\":\"completed\"}",
+      "call_id": "call_3d0f7aa77afc491bbdf03a8c4be4d40b",
+      "id": "fc_070b274daa88504d016b0344d50ef887d19c963c7359c8279a",
+      "name": "respond_to_user",
+      "status": "completed",
+      "type": "function_call"
+     }
+    ]
+   ],
+   "tool_results": {
+    "call_31605a7c314b4b20b493202491b27811": "[{\"agent\": \"apollo\", \"host\": \"WORKSTATION-A\", \"id\": 2, \"integrity\": 2, \"secs_since_checkin\": 89839.527961, \"status\": \"dead\", \"user\": \"lab.user\"}, {\"agent\": \"apollo\", \"host\": \"WORKSTATION-A\", \"id\": 3, \"integrity\": 3, \"secs_since_checkin\": 1.552663, \"status\": \"alive\", \"user\": \"lab.user\"}]"
+   }
+  },
+  "B2": {
+   "outputs": [],
+   "tool_results": {},
+   "rejection": {
+    "status": 400,
+    "body": {
+     "error": {
+      "code": "unsupported_value",
+      "message": "Unsupported value: 'none' is not supported with the 'gpt-6.1-sol' model. Supported values are: 'low', 'medium', 'high', 'xhigh', and 'max'.",
+      "param": "reasoning.effort",
+      "type": "invalid_request_error"
+     }
+    },
+    "request_path": "/v1/responses"
+   }
+  },
+  "B3": {
+   "outputs": [
+    [
+     {
+      "arguments": "{}",
+      "call_id": "call_4e81795ce89f46f0943c629083daf4cd",
+      "id": "fc_0174a41cc69d2c51016b0344e29dac87d1beb0a361d63eb18b",
+      "name": "list_callbacks",
+      "status": "completed",
+      "type": "function_call"
+     }
+    ],
+    [
+     {
+      "arguments": "{\"final_response\":\"**Label: amber-seven**\\n\\n| Callback | Agent | Host | User | Integrity | Status | Last check-in |\\n|---|---|---|---|---|---|---|\\n| 2 | apollo | WORKSTATION-A | lab.user | 2 | Dead | ~25 hours ago |\\n| 3 | apollo | WORKSTATION-A | lab.user | 3 | Alive | ~0.8 seconds ago |\\n\\nTwo callbacks returned: **one alive, one dead**. Called `list_callbacks` once; no tasks were run.\",\"reuse_latest_worker_answer\":false,\"outcome\":\"completed\"}",
+      "call_id": "call_acd112af3ad54c13971ec4447a63a6c5",
+      "id": "fc_0174a41cc69d2c51016b0344e4067c87d191a7dbb0b165d5ff",
+      "name": "respond_to_user",
+      "status": "completed",
+      "type": "function_call"
+     }
+    ]
+   ],
+   "tool_results": {
+    "call_4e81795ce89f46f0943c629083daf4cd": "[{\"agent\": \"apollo\", \"host\": \"WORKSTATION-A\", \"id\": 2, \"integrity\": 2, \"secs_since_checkin\": 89865.797362, \"status\": \"dead\", \"user\": \"lab.user\"}, {\"agent\": \"apollo\", \"host\": \"WORKSTATION-A\", \"id\": 3, \"integrity\": 3, \"secs_since_checkin\": 0.815049, \"status\": \"alive\", \"user\": \"lab.user\"}]"
+   }
+  },
+  "B4": {
+   "outputs": [
+    [
+     {
+      "content": [
+       {
+        "annotations": [],
+        "logprobs": [],
+        "text": "amber-seven",
+        "type": "output_text"
+       }
+      ],
+      "id": "msg_0d19fc34439ce826016b0344e6f47487d18b9b87c9d55c653a",
+      "phase": "final_answer",
+      "role": "assistant",
+      "status": "completed",
+      "type": "message"
+     }
+    ]
+   ],
+   "tool_results": {}
+  }
+ }
+}
