@@ -7,8 +7,12 @@ One run file (JSON, owner-only) carries every stage. ``readiness`` and ``verify`
   readiness --run-file F --route-file R --phoenix-db P
       Read-only. Container deployment, one consuming Sage, no open chat requests, feature source parity, the
       container's adapter versions, the native controls Mythic stores, Phoenix and the Mythic task baseline,
-      the direct endpoint's verified-TLS reachability (keyless; expects 401), where the API key comes from (never
-      its value), and the capture/metering state. Verdict: ``deployment_required`` (source parity fails),
+      the direct endpoint's verified-TLS reachability (keyless; expects 401), and the capture/metering state.
+      The credential, by name and status only: the container environment sets no key; the installed
+      ``.env.local`` holds the one active ``API_KEY`` (no competing provider block) and ``.env`` none; inside the
+      container, Sage's own dotenv and TLS bootstrap resolve that key and a keyed ``GET /models`` returns 200
+      listing both models; the run's Mythic operator has no ``API_KEY`` user secret to shadow it. The recorded
+      inputs the offline replay uses are present. Verdict: ``deployment_required`` (source parity fails),
       ``capture_required`` (deployed, not armed), ``ready_for_live`` or ``not_ready`` with blockers.
   arm --run-file F --authorized-by TEXT
       Starts the private wire receiver, writes the resource budget, adds a marked block to the installed Sage
@@ -20,7 +24,9 @@ One run file (JSON, owner-only) carries every stage. ``readiness`` and ``verify`
       Cancels this set's active requests, restores the installed ``.env`` byte for byte, recreates the container,
       stops the receiver and confirms no open requests. Safe to repeat.
   verify --run-file F --phoenix-db P
-      Applies the frozen pass rules once (criteria 1-5 of the check specification).
+      Applies the frozen pass rules once (criteria 1-5 of the check specification, as amended for r2: a valid
+      ``respond_to_user`` answer counts like provider text through its real consumer, and later turns must replay
+      the seed turn's typed read and finish pairs and their same-model reasoning items).
 
 The route file is KEY=VALUE, owner-only, with no API key: API_ENDPOINT, MODEL_A, MODEL_B, EFFORT.
 Daybreak is left at its blank default in every step: Sage sends Off on Responses, and an explicit Off would make
@@ -62,6 +68,15 @@ def _module(name: str, path: Path):
 _BASE_PATH = REPO_ROOT / "skills/sage-focused-capability-tests/scripts/check_openai_responses.py"
 _RECEIVER_PATH = REPO_ROOT / "skills/sage-eval-gauge/scripts/observation_receiver.py"
 _DEPLOYMENT_PATH = REPO_ROOT / "skills/sage-goad-reset/scripts/sage_deployment.py"
+_MODEL_SWITCH_PATH = REPO_ROOT / "skills/sage-focused-capability-tests/scripts/check_model_switch.py"
+_FIXTURES = RUNTIME / "tests/fixtures/model_input_boundaries"
+# Recorded inputs the offline replay of this check's seam reads (readiness requires them).
+RECORDED_INPUTS = {
+    "attempt1_finish_rows": _FIXTURES / "reasoning_tool_finish_round_trips.json",
+    "responses_battery": _FIXTURES / "responses_round_trips.json",
+    "model_switch_battery": _FIXTURES / "model_switch_round_trips.json",
+    "completion_regression": RUNTIME / "tests/test_finish_history_persistence.py",
+}
 
 LABEL = "amber-seven"
 SEED = ("Remember the label amber-seven. For a read-only status check, use list_callbacks once, then tell me the "
@@ -98,6 +113,13 @@ NOTICE_PREFIXES = ("⚠️ **BloodHound is not connected**", "Applied this chat'
                    "This chat now uses model")
 PARTIAL_WORK = "Partial Work Preserved"
 REASONING_ID = re.compile(r"\brs_[0-9a-f]{8,}")
+FINISH_TOOL = "respond_to_user"
+FINISH_OUTCOMES = {"", "completed", "blocked", "checkpoint"}
+# The one suffix the native renderer may add after a final report (model.py `_process_stream_event`).
+ENGAGEMENT_SUFFIX = re.compile(r"\n\n📊 (?:\*\*Engagement state\*\*|Engagement state )")
+CREDENTIAL_NAMES = ("API_KEY", "OPENAI_API_KEY")
+OPERATOR_SECRETS_QUERY = ("query SageReasoningCheckSecrets($operatorId: Int) { getOperatorSecrets(operator_id: "
+                          "$operatorId) { status error secrets } }")
 ENV_BEGIN = "# >>> reasoning-tool check (temporary; removed by cleanup)"
 ENV_END = "# <<< reasoning-tool check"
 CHANGED_FILES = (
@@ -360,6 +382,121 @@ def native_answers(rows: dict[str, Any]) -> list[str]:
     return [text for text in texts if text and not text.startswith(NOTICE_PREFIXES)]
 
 
+def _runtime(name: str) -> Any:
+    """A name from Sage's runtime (the consumer under test), so the check never keeps its own copy."""
+    sys.path.insert(0, str(RUNTIME))
+    from ai.langgraph import model as runtime_model
+
+    return getattr(runtime_model, name)
+
+
+def reply_answer(reply: dict[str, Any]) -> dict[str, Any]:
+    """What a provider response offers as the turn's answer: direct text, a finish call, or nothing.
+
+    A finish call counts only when it is the response's sole call and its arguments are valid for the real
+    finish tool: a complete ``final_response`` (reuse needs a worker chain this check never has) and a known
+    outcome. Anything else is ``invalid`` with the reason.
+    """
+    calls = [item for item in reply.get("output") or []
+             if isinstance(item, dict) and item.get("type") == "function_call"]
+    if not calls:
+        text = _reply_text(reply)
+        return {"kind": "text", "text": text} if text else {"kind": "none"}
+    if len(calls) != 1 or calls[0].get("name") != FINISH_TOOL:
+        return {"kind": "none"}
+    try:
+        arguments = json.loads(str(calls[0].get("arguments") or ""))
+    except ValueError:
+        return {"kind": "invalid", "reason": "finish arguments are not JSON"}
+    if not isinstance(arguments, dict):
+        return {"kind": "invalid", "reason": "finish arguments are not an object"}
+    final = arguments.get("final_response")
+    if arguments.get("reuse_latest_worker_answer") is True:
+        return {"kind": "invalid", "reason": "worker-answer reuse has no current worker answer in this check"}
+    if not isinstance(final, str) or not final.strip():
+        return {"kind": "invalid", "reason": "blank final_response"}
+    outcome = str(arguments.get("outcome") or "").strip()
+    if outcome not in FINISH_OUTCOMES:
+        return {"kind": "invalid", "reason": "unknown outcome"}
+    return {"kind": "finish", "call_id": str(calls[0].get("call_id") or ""), "final_response": final,
+            "outcome": outcome}
+
+
+def rendered_answer(answer: dict[str, Any]) -> str:
+    """The native renderer's text for an answer: banner line and complete report for a finish, the text otherwise."""
+    if answer.get("kind") == "finish":
+        banner = _runtime("_turn_end_banner")(answer["outcome"])
+        content = f"{banner}\n{answer['final_response']}" if banner else answer["final_response"]
+        return content.strip()
+    return str(answer.get("text") or "").strip()
+
+
+def native_matches(native: str, expected: str) -> bool:
+    """Whole-text equality, allowing only the renderer's engagement-state suffix after the answer."""
+    native, expected = native.strip(), expected.strip()
+    if not expected:
+        return False
+    if native == expected:
+        return True
+    return native.startswith(expected) and bool(ENGAGEMENT_SUFFIX.match(native[len(expected):]))
+
+
+def produced_calls(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Every call a step's provider responses produced, with the reasoning item emitted before it and the result
+    the step's own later request carried for it (a finish call's result is Sage's acknowledgement)."""
+    found = [item for item in items if item["status"] == 200]
+    calls = []
+    for index, item in enumerate(found):
+        output = [entry for entry in item["reply"].get("output") or [] if isinstance(entry, dict)]
+        thought = next((entry for entry in output if entry.get("type") == "reasoning"), None)
+        first = True
+        for entry in output:
+            if entry.get("type") != "function_call":
+                continue
+            call_id = str(entry.get("call_id") or "")
+            results = [_input_outputs(later["input"]).get(call_id) for later in found[index + 1:]]
+            calls.append({
+                "call_id": call_id, "name": str(entry.get("name") or ""),
+                "arguments": entry.get("arguments"),
+                "result": next((result for result in results if result), None),
+                "reasoning": ((thought.get("id"), thought.get("encrypted_content")) if thought and first else None),
+            })
+            first = False
+    return calls
+
+
+def replayed_calls(items: Any) -> dict[str, dict[str, Any]]:
+    """call_id -> the typed call a request input replays: name, arguments, its immediate result and the reasoning
+    item immediately before it, plus how many times the call and its result appear."""
+    items = items if isinstance(items, list) else []
+    found: dict[str, dict[str, Any]] = {}
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "function_call":
+            call_id = str(item.get("call_id") or "")
+            following = items[index + 1] if index + 1 < len(items) else {}
+            preceding = items[index - 1] if index else {}
+            entry = found.setdefault(call_id, {"calls": 0, "results": 0})
+            entry["calls"] += 1
+            entry.update(name=item.get("name"), arguments=item.get("arguments"),
+                         result=(following.get("output") if isinstance(following, dict)
+                                 and following.get("type") == "function_call_output"
+                                 and following.get("call_id") == call_id else None),
+                         reasoning=((preceding.get("id"), preceding.get("encrypted_content"))
+                                    if isinstance(preceding, dict) and preceding.get("type") == "reasoning" else None))
+        elif item.get("type") == "function_call_output":
+            found.setdefault(str(item.get("call_id") or ""), {"calls": 0, "results": 0})["results"] += 1
+    return found
+
+
+def _same_arguments(left: Any, right: Any) -> bool:
+    try:
+        return json.loads(str(left)) == json.loads(str(right))
+    except ValueError:
+        return False
+
+
 def evaluate(run: dict[str, Any], wire: dict[str, list[dict[str, Any]]], rows: dict[str, dict[str, Any]],
              totals: dict[str, Any]) -> dict[str, Any]:
     """Criteria 1-5 of the check specification, each with its counts, from captured wire and Mythic rows."""
@@ -407,42 +544,63 @@ def evaluate(run: dict[str, Any], wire: dict[str, list[dict[str, Any]]], rows: d
     detail["rejections"] = {"A2": a2, "B2": b2}
 
     def round_trip(step: str) -> tuple[bool, dict[str, Any]]:
+        """A real read, its result consumed by a later request, and the turn's one native answer from the
+        consuming response or a later one: provider text, or a valid finish call through the real consumer."""
         found = [item for item in wire.get(step, []) if item["status"] == 200]
         calls = [(index, call_id) for index, item in enumerate(found)
                  for call_id, name in _calls(item["reply"]) if name == "list_callbacks" and call_id]
-        consumed = [(index, call_id) for index, call_id in calls
-                    if any(call_id in _input_outputs(later["input"]) and _input_outputs(later["input"])[call_id]
-                           for later in found[index + 1:])]
-        final = _reply_text(found[-1]["reply"]) if found else ""
+        consumed = [(later, call_id) for index, call_id in calls
+                    for later in range(index + 1, len(found))
+                    if _input_outputs(found[later]["input"]).get(call_id)]
+        answer = reply_answer(found[-1]["reply"]) if found else {"kind": "none"}
         answers = native_answers(rows.get(step, {}))
-        ends_in_answer = bool(found) and not _calls(found[-1]["reply"]) and bool(final)
         same_identity = len({(item["model"], item["effort"]) for item in found}) == 1
-        native = bool(answers) and answers.count(answers[-1]) == 1
-        matches = bool(final) and bool(answers) and (final[:60] in answers[-1] or answers[-1][:60] in final)
         checks = {"call_produced": bool(calls), "result_consumed_later": bool(consumed),
-                  "answer_after_result": ends_in_answer and (not consumed or consumed[0][0] < len(found) - 1),
-                  "same_model_effort": same_identity, "one_native_answer": native, "answer_from_provider": matches,
+                  "answer_after_result": (answer["kind"] in {"text", "finish"} and bool(consumed)
+                                          and consumed[0][0] <= len(found) - 1),
+                  "same_model_effort": same_identity, "one_native_answer": len(answers) == 1,
+                  "answer_from_provider": len(answers) == 1 and native_matches(answers[0], rendered_answer(answer)),
                   "complete": rows.get(step, {}).get("status") == "complete"}
-        return all(checks.values()), checks
+        attribution = {"path": answer["kind"], "reason": answer.get("reason", ""),
+                       "consuming_response": consumed[0][0] if consumed else None,
+                       "answer_response": len(found) - 1 if found else None}
+        return all(checks.values()), {**checks, "attribution": attribution}
 
     trips = {step: round_trip(step) for step in ("A1", "A3", "B1", "B3")}
     detail["round_trips"] = {step: checks for step, (_ok, checks) in trips.items()}
+    acknowledgement = _runtime("_FINISH_ACKNOWLEDGEMENT")
 
     def continuity(step: str, earlier: str) -> tuple[bool, dict[str, Any]]:
+        """The step's first request replays the seed turn's typed read and finish pairs, each once, with the
+        reasoning item that preceded each call (same model), plus the label; one answer, no refusal or leak."""
         found = wire.get(step, [])
         first = found[0] if found else {"input": None}
         history = _input_text(first["input"])
-        earlier_calls = [call_id for item in wire.get(earlier, []) for call_id, _ in _calls(item["reply"])]
+        replayed = replayed_calls(first["input"])
+        expected = produced_calls(wire.get(earlier, []))
+        retained, retained_reasoning = 0, 0
+        for call in expected:
+            result = acknowledgement if call["name"] == FINISH_TOOL else call["result"]
+            seen = replayed.get(call["call_id"]) or {}
+            pair = (bool(call["call_id"]) and seen.get("calls") == 1 and seen.get("results") == 1
+                    and seen.get("name") == call["name"] and _same_arguments(seen.get("arguments"), call["arguments"])
+                    and bool(result) and seen.get("result") == result)
+            thought = call["reasoning"] is None or seen.get("reasoning") == call["reasoning"]
+            retained += int(pair and thought)
+            retained_reasoning += int(call["reasoning"] is not None and pair and thought)
         texts = "\n".join(str(m.get("message") or "") for m in rows.get(step, {}).get("messages", []))
         answers = native_answers(rows.get(step, {}))
         checks = {"label_in_history": LABEL in history,
-                  "earlier_call_and_result": bool(earlier_calls) and all(c in history for c in earlier_calls)
-                  and "function_call_output" in history,
+                  "earlier_calls_and_results": (any(c["name"] == "list_callbacks" for c in expected)
+                                                and retained == len(expected)),
                   "no_refusal": not any(refusal in texts for refusal in REFUSALS),
-                  "one_answer": len(answers) >= 1 and answers.count(answers[-1]) == 1,
+                  "one_answer": len(answers) == 1,
                   "no_reasoning_leak": "encrypted_content" not in texts and not REASONING_ID.search(texts),
                   "complete": rows.get(step, {}).get("status") == "complete"}
-        return all(checks.values()), checks
+        counts = {"expected_calls": len(expected), "retained_calls": retained,
+                  "expected_reasoning": sum(1 for c in expected if c["reasoning"] is not None),
+                  "retained_reasoning": retained_reasoning}
+        return all(checks.values()), {**checks, "counts": counts}
 
     continuity_checks = {"A3": continuity("A3", "A1"), "A4": continuity("A4", "A1"),
                          "B3": continuity("B3", "B1"), "B4": continuity("B4", "B1")}
@@ -568,21 +726,136 @@ def _endpoint_reachability(endpoint: str) -> dict[str, Any]:
         return {"error": type(error).__name__}
 
 
-def _credential_source(installed: Path) -> dict[str, Any]:
-    """Where the provider key comes from, by name only; no value is read into the result."""
-    names = ("API_KEY", "OPENAI_API_KEY")
-    in_file = []
-    for env_file in (installed / ".env.local", installed / ".env"):  # Sage's dotenv order; first set wins
-        if env_file.exists():
-            for line in env_file.read_text().splitlines():
-                key, _, value = line.partition("=")
-                if key.strip() in names and value.strip():
-                    in_file.append(f"{env_file.name}:{key.strip()}")
-    probe = subprocess.run(["docker", "exec", "sage", "sh", "-c",
-                            'for n in API_KEY OPENAI_API_KEY; do eval "v=\\${$n}"; [ -n "$v" ] && echo $n; done'],
-                           capture_output=True, text=True, timeout=30)
-    return {"installed_env": sorted(set(in_file)), "container_env": probe.stdout.split(),
-            "user_secret": "not inspected (a configured API_KEY user secret also qualifies)"}
+def installed_credentials(installed: Path) -> dict[str, Any]:
+    """Active credential and provider assignments in the installed dotenv files, by name and boolean only.
+
+    Each credential is reported with the comment header of the block it sits in (``""`` when the file has no
+    block headers). A competing provider block is an active ``provider`` other than openai or an active
+    ``API_ENDPOINT`` other than the direct endpoint.
+    """
+    report: dict[str, Any] = {}
+    for name in (".env.local", ".env"):  # Sage's dotenv order (dotenv_bootstrap.DOTENV_FILENAMES)
+        path = installed / name
+        credentials: list[dict[str, str]] = []
+        competing: list[str] = []
+        header = ""
+        if path.exists():
+            for line in path.read_text().splitlines():
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    text = stripped.lstrip("#").strip()
+                    if text and "=" not in text and len(text) <= 40:
+                        header = text
+                    continue
+                key, separator, value = line.partition("=")
+                key, value = key.strip(), value.strip()
+                if not separator or not value:
+                    continue
+                if key in CREDENTIAL_NAMES:
+                    credentials.append({"name": key, "block": header})
+                elif key == "provider" and value.casefold() != "openai":
+                    competing.append(key)
+                elif key == "API_ENDPOINT" and value.rstrip("/") != DIRECT_ENDPOINT:
+                    competing.append(key)
+        report[name] = {"present": path.exists(), "credentials": credentials, "competing_provider": competing}
+    return report
+
+
+# Runs inside the Sage container with Sage's own dotenv and TLS bootstrap; prints names, booleans and status only.
+_CONTAINER_KEY_PROBE = r"""
+import json, os, ssl, sys
+sys.path.insert(0, "/Mythic")
+from dotenv import dotenv_values
+import dotenv_bootstrap as boot
+out = {"container_env": sorted(n for n in ("API_KEY", "OPENAI_API_KEY") if os.environ.get(n)), "source": "",
+       "status": None, "models": {}}
+environ = dict(os.environ)
+if environ.get("API_KEY"):
+    out["source"] = "container-env:API_KEY"
+for path in boot.dotenv_paths("/Mythic"):
+    if "API_KEY" in boot.apply_dotenv(dotenv_values(path), environ) and not out["source"]:
+        out["source"] = os.path.basename(path) + ":API_KEY"
+key = environ.get("API_KEY", "")
+if key:
+    import httpx
+    from ssl_bootstrap import configure_sage_ssl_cert_file
+    bundle = configure_sage_ssl_cert_file()
+    context = ssl.create_default_context(cafile=bundle) if bundle else ssl.create_default_context()
+    try:
+        response = httpx.get(sys.argv[1].rstrip("/") + "/models", headers={"Authorization": "Bearer " + key},
+                             timeout=20, verify=context)
+        out["status"] = response.status_code
+        listed = {row.get("id") for row in (response.json().get("data") or [])} if response.status_code == 200 else set()
+        out["models"] = {model: model in listed for model in sys.argv[2:]}
+        out["tls_verified"], out["custom_bundle"] = True, bool(bundle)
+    except Exception as error:
+        out["error"] = type(error).__name__
+print(json.dumps(out))
+"""
+
+
+def _container_key_probe(route: dict[str, str]) -> dict[str, Any]:
+    """Keyed, non-inference ``GET /models`` from the deployed container with the key Sage itself would load."""
+    completed = subprocess.run(["docker", "exec", "-w", "/Mythic", "sage", "python3", "-c", _CONTAINER_KEY_PROBE,
+                                route["API_ENDPOINT"], route["MODEL_A"], route["MODEL_B"]],
+                               capture_output=True, text=True, timeout=90)
+    try:
+        return json.loads(completed.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {"error": "probe did not report", "returncode": completed.returncode}
+
+
+async def _operator_secret_names(client: Any) -> dict[str, Any]:
+    """The run's Mythic operator (the channel creator and requester) and its user-secret names; never values."""
+    try:
+        switch = _module("sage_reasoning_check_model_switch", _MODEL_SWITCH_PATH)
+        operator_id = await switch._operator_id(client)
+        result = (await _base()._query(client, OPERATOR_SECRETS_QUERY, operatorId=operator_id)).get(
+            "getOperatorSecrets") or {}
+    except (Exception, SystemExit) as error:
+        return {"resolved": False, "error": type(error).__name__}
+    if result.get("status") != "success" or not isinstance(result.get("secrets") or {}, dict):
+        return {"resolved": False, "operator": operator_id, "error": "secrets not readable"}
+    return {"resolved": True, "operator": operator_id, "names": sorted((result.get("secrets") or {}).keys())}
+
+
+def recorded_inputs() -> dict[str, Any]:
+    """The recorded replay inputs are present; the attempt 1 rows cover both models' read and finish steps."""
+    report: dict[str, Any] = {name: path.is_file() for name, path in RECORDED_INPUTS.items()}
+    if report["attempt1_finish_rows"]:
+        steps = json.loads(RECORDED_INPUTS["attempt1_finish_rows"].read_text()).get("steps") or {}
+        report["attempt1_steps"] = sorted(step for step, entry in steps.items()
+                                          if entry.get("outputs") or entry.get("rejection"))
+    return report
+
+
+def credential_blockers(report: dict[str, Any], route: dict[str, str]) -> list[str]:
+    """Readiness blockers for the live route's credential (pure; reads names, booleans and statuses only)."""
+    blockers = []
+    files = report.get("installed") or {}
+    local = files.get(".env.local") or {}
+    credentials = local.get("credentials") or []
+    if [c["name"] for c in credentials] != ["API_KEY"]:
+        blockers.append("installed .env.local must hold exactly one active API_KEY")
+    elif credentials[0]["block"] and not credentials[0]["block"].casefold().startswith("openai"):
+        blockers.append("the active API_KEY is not in the OpenAI block")
+    if local.get("competing_provider") or (files.get(".env") or {}).get("competing_provider"):
+        blockers.append("a competing provider block is active")
+    if (files.get(".env") or {}).get("credentials"):
+        blockers.append("installed .env sets a credential")
+    probe = report.get("container") or {}
+    if probe.get("container_env"):
+        blockers.append("the container environment sets a key")
+    if probe.get("source") != ".env.local:API_KEY":
+        blockers.append("Sage would not load the key from the installed .env.local")
+    if probe.get("status") != 200 or probe.get("models") != {route["MODEL_A"]: True, route["MODEL_B"]: True}:
+        blockers.append("keyed model listing did not return 200 with both models")
+    secrets = report.get("operator_secrets") or {}
+    if not secrets.get("resolved"):
+        blockers.append("the run operator's user secrets could not be resolved")
+    elif "API_KEY" in (secrets.get("names") or []):
+        blockers.append("an API_KEY user secret would shadow the installed key")
+    return blockers
 
 
 def _capture_state(run: dict[str, Any]) -> dict[str, Any]:
@@ -625,7 +898,15 @@ async def cmd_readiness(client: Any, run: dict[str, Any], args: argparse.Namespa
         "phoenix_readable": bool(args.phoenix_db) and Path(args.phoenix_db).is_file(),
         "task_baseline": await base._max_task(client),
         "endpoint": _endpoint_reachability(route["API_ENDPOINT"]),
-        "credential_source": _credential_source(installed),
+        "credential_source": {
+            "installed": installed_credentials(Path(installed)),
+            "container": _container_key_probe(route),
+            "operator_secrets": await _operator_secret_names(client),
+            "channel_config_sets_key": any("API_KEY" in channel_config(route, channel, api="responses",
+                                                                       effort="low")["config"]
+                                           for channel in ("A", "B")),
+        },
+        "recorded_inputs": recorded_inputs(),
         "capture": _capture_state(run),
         "ceilings": CEILINGS, "token_reservation": TOKEN_RESERVATION, "retry_policy": RETRY_POLICY,
         "check_sha256": _sha256(Path(__file__)),
@@ -647,8 +928,12 @@ async def cmd_readiness(client: Any, run: dict[str, Any], args: argparse.Namespa
         blockers.append("Phoenix unreadable")
     if report["endpoint"].get("status") != 401:
         blockers.append("endpoint reachability")
-    if not (report["credential_source"]["installed_env"] or report["credential_source"]["container_env"]):
-        report["credential_source"]["note"] = "no key in the installed .env or container env; a user secret must supply it"
+    blockers.extend(credential_blockers(report["credential_source"], route))
+    if report["credential_source"]["channel_config_sets_key"]:
+        blockers.append("the channel configuration sets a key")
+    missing_inputs = [name for name in RECORDED_INPUTS if not report["recorded_inputs"].get(name)]
+    if missing_inputs or report["recorded_inputs"].get("attempt1_steps") != [step for step, *_ in STEPS]:
+        blockers.append("recorded replay inputs missing: " + ", ".join(missing_inputs or ["attempt 1 steps"]))
     capture = report["capture"]
     if not report["parity"]["ready"]:
         verdict = "deployment_required"
