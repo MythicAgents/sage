@@ -3,8 +3,7 @@
   "kind": "recorded model output (real provider Responses output items)",
   "description": "gpt-5.6-sol (steps A1-A4) and gpt-6.1-sol (B1-B4) on the direct OpenAI Responses API through Sage's deployed feature branch, reasoning effort low, live attempt 1 of the reasoning-tool check, 2026-11-22. Each step lists the provider's raw `output` arrays in request order, the recorded rejection envelope for A2 (Chat Completions) and B2 (effort none), and the list_callbacks output each step's consuming request carried.",
   "substitutions": "Lab host and user renamed to WORKSTATION-A and lab.user in tool output and answer text; each reasoning item's encrypted_content replaced by `opaque-recorded-substitute-N` (opaque provider data, never parsed by Sage); provider item ids, call ids, arguments and text otherwise unchanged. Response envelopes (ids, usage) are synthesized by the replay harness.",
-  "gap": "Opaque reasoning content is a substitute, so a provider's acceptance of replayed reasoning is not proven offline; only Sage's typed replay of it is.",
-  "builder": "private history: reasoning-tool-compatibility/r2-implementation/build_finish_fixture.py"
+  "gap": "Opaque reasoning content is a substitute, so a provider's acceptance of replayed reasoning is not proven offline; only Sage's typed replay of it is."
  },
  "steps": {
   "A1": {

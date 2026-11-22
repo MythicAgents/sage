@@ -76,13 +76,19 @@ def _message(text):
     return {"type": "message", "content": [{"type": "output_text", "text": text}]}
 
 
+# The seed read's reasoning item. Sage replays a same-model reasoning item before its call on every later request
+# (the r2 amendment's criterion 4 requires it), so the correct set below carries it wherever the call is replayed.
+SEED_REASONING = {"type": "reasoning", "id": "rs_0011223344"}
+
+
 def _history(*parts):
     items = []
     for part in parts:
         if isinstance(part, str):
             items.append({"role": "user", "content": part})
         else:
-            items.extend([_call(part[0]), {"type": "function_call_output", "call_id": part[0], "output": CALLBACKS}])
+            items.extend([*part[1:], _call(part[0]),
+                          {"type": "function_call_output", "call_id": part[0], "output": CALLBACKS}])
     return items
 
 
@@ -105,22 +111,22 @@ def _passing():
         seed_answer, tool_answer = f"Label amber-seven. One callback {channel}.", f"Still amber-seven {channel}."
         step(f"{channel}1", lambda: (
             wire.exchange(api="responses", model=model, effort="low", items=_history(check.SEED),
-                          reply=_ok([{"type": "reasoning", "id": "rs_0011223344"}, _call(c1)])),
-            wire.exchange(api="responses", model=model, effort="low", items=_history(check.SEED, (c1,)),
+                          reply=_ok([SEED_REASONING, _call(c1)])),
+            wire.exchange(api="responses", model=model, effort="low", items=_history(check.SEED, (c1, SEED_REASONING)),
                           reply=_ok([_message(seed_answer)]))), "complete", [seed_answer])
         step(f"{channel}2", lambda: wire.exchange(
-            api=rejected_api, model=model, effort=rejected_effort, items=_history(check.SEED, (c1,), check.TOOL),
+            api=rejected_api, model=model, effort=rejected_effort, items=_history(check.SEED, (c1, SEED_REASONING), check.TOOL),
             status=400, reply={"error": error}), "error", [f"The model provider rejected this request. To fix it, {action}."])
         step(f"{channel}3", lambda: (
             wire.exchange(api="responses", model=model, effort="low",
-                          items=_history(check.SEED, (c1,), check.TOOL, check.TOOL), reply=_ok([_call(c3)])),
+                          items=_history(check.SEED, (c1, SEED_REASONING), check.TOOL, check.TOOL), reply=_ok([_call(c3)])),
             wire.exchange(api="responses", model=model, effort="low",
-                          items=_history(check.SEED, (c1,), check.TOOL, check.TOOL, (c3,)),
+                          items=_history(check.SEED, (c1, SEED_REASONING), check.TOOL, check.TOOL, (c3,)),
                           reply=_ok([_message(tool_answer)]))),
             "complete", ["Applied this chat's updated OpenAI settings (...)", tool_answer])
         step(f"{channel}4", lambda: wire.exchange(
             api="responses", model=model, effort="low",
-            items=_history(check.SEED, (c1,), check.TOOL, check.TOOL, (c3,), check.RECALL),
+            items=_history(check.SEED, (c1, SEED_REASONING), check.TOOL, check.TOOL, (c3,), check.RECALL),
             reply=_ok([_message("Your label is amber-seven.")])), "complete", ["Your label is amber-seven."])
     run = {"task_baseline": 9, "started_at": 0, "finished_at": 600,
            "steps": {name: {"tasks_after": 9} for name in marks}}
@@ -319,6 +325,17 @@ def test_a_refusal_or_lost_history_fails_continuity():
     body["input"] = [{"role": "user", "content": check.RECALL}]
     _set(record, body)
     assert not _evaluate(records, marks, rows, run)["detail"]["continuity"]["B4"]["label_in_history"]
+
+
+def test_a_later_request_without_the_seed_reasoning_item_fails_continuity():
+    records, marks, rows, run = _passing()
+    record, body = _request(records, marks, "A4", 0)
+    body["input"] = [item for item in body["input"] if item.get("type") != "reasoning"]
+    _set(record, body)
+    continuity = _evaluate(records, marks, rows, run)["detail"]["continuity"]["A4"]
+    assert not continuity["earlier_calls_and_results"]
+    assert continuity["counts"] == {"expected_calls": 1, "retained_calls": 0, "expected_reasoning": 1,
+                                    "retained_reasoning": 0}
 
 
 def test_a_visible_reasoning_id_fails_continuity():
