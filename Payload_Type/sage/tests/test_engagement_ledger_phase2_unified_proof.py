@@ -14,6 +14,7 @@ reconciliation and the ledger views are production code.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import sqlite3
 from datetime import datetime, timezone
@@ -533,15 +534,20 @@ def test_a_cited_later_task_does_not_hide_an_earlier_tasks_proof(session, monkey
 
 def test_two_credential_store_entries_of_one_task_are_two_observations(session, monkeypatch):
     tools = session()
+    # Each entry's text is a value its task printed, as an agent-reported entry's is: store proof needs that.
+    aes = "89abcdef" * 8
+    output = DCSYNC_OUTPUT + f"* Primary:Kerberos-Newer-Keys *\n      aes256_hmac       (4096) : {aes}\n"
     task = {"display_id": TASK, "operation_id": 1, "status": "success", "completed": True, **AGENT_PROCESSED,
-            "command_name": "dcsync", "original_params": json.dumps(DCSYNC_PARAMS), "callback": {"display_id": CALLBACK}}
+            "command_name": "dcsync", "original_params": json.dumps(DCSYNC_PARAMS),
+            "callback": {"display_id": CALLBACK},
+            "responses": [{"response_text": base64.b64encode(output.encode()).decode()}]}
     state = engagement_state.EngagementState(objective="", hops=list(tools._ledger_view().hops),
                                              engagement_id=tools._eng_key(), runtime_scope=True)
     before = list(state.hops)
-    for credential_id, kind in ((5, "hash"), (9, "key")):
+    for credential_id, kind, secret in ((5, "hash", NTLM), (9, "key", aes)):
         state, _identity, _effect, reason = tools._credential_hop(
             state, {"id": credential_id, "operation_id": 1, "account": ACCOUNT, "realm": REALM, "type": kind,
-                    "credential_text": "synthetic", "task": task}, _now(), source="operation_reconcile",
+                    "credential_text": secret, "task": task}, _now(), source="operation_reconcile",
             require_admitted=True)
         assert not reason
     assert tools._ledger_commit_hops(before, state.hops)

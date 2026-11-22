@@ -11,6 +11,7 @@ from __future__ import annotations
 from tests.esl_fixtures import AGENT_PROCESSED, seed_ledger  # noqa: E402
 
 import asyncio
+import base64
 import importlib.util
 import json
 from pathlib import Path
@@ -143,9 +144,12 @@ def test_a_callback_proof_is_admitted_only_with_its_callback_row_and_a_successfu
 
 def _credential(credential_id: int, task_id: int, callback: int | None = 1) -> dict:
     # A DCSync producing task: directory replication yields a working credential (a host dump would be material).
+    # Its output holds the plaintext, as an agent-reported entry's task does: store proof needs that.
+    output = f"  Username : jdoe\r\n  Domain   : CONTOSO\r\n  Password : {SECRET}\r\n"
     task = {"display_id": task_id, "status": "success", "completed": True, **AGENT_PROCESSED, "command_name": "dcsync",
             "original_params": json.dumps({"Domain": "contoso.local", "User": "jdoe"}),
-            "callback": {"display_id": callback} if callback is not None else None}
+            "callback": {"display_id": callback} if callback is not None else None,
+            "responses": [{"response_text": base64.b64encode(output.encode()).decode()}]}
     return {"id": credential_id, "account": "jdoe", "realm": "CONTOSO", "type": "plaintext",
             "credential_text": SECRET, "task": task}
 

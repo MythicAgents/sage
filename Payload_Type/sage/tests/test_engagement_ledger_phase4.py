@@ -13,6 +13,7 @@ Evidence these fixtures follow (shapes only; no range output, credential or hash
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import re
 import sqlite3
@@ -41,6 +42,9 @@ NORTH = "north.sevenkingdoms.local"
 NTLM = "0123456789abcdef0123456789abcdef"
 AES256 = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
 TGS_HASH = "$krb5tgs$23$*svc_fixture$" + DOMAIN.upper() + "$fixture/spn*$" + "ab" * 16 + "$" + "cd" * 40
+# Rubeus `kerberoast /nowrap` prints each hash on one line. An agent-reported entry's text is that hash, which store
+# proof needs to find in its task's output.
+ROAST_OUTPUT = f"[*] Hash                   : {TGS_HASH}\n"
 
 
 def _now() -> str:
@@ -254,6 +258,7 @@ def test_a_task_linked_hash_from_any_issuer_is_material_and_opens_no_working_cre
     tools = operation("channel-a", channel=3, request=1)
     roast = _task(30, "execute_assembly", params=KERBEROAST)
     mythic_records["tasks"] = [roast]
+    mythic_records["outputs"] = {30: ROAST_OUTPUT}
     mythic_records["credentials"] = [_store_credential(41, roast)]
     _turn_end(tools)
 
@@ -268,7 +273,7 @@ def test_cited_ids_reply_one_line_each_with_the_row_or_the_reason(operation, myt
     roast = _task(30, "execute_assembly", params=KERBEROAST)
     mythic_records["tasks"] = [_dcsync_task(17, callback=13) | {"operation_id": 1, "timestamp": ""}, roast,
                                _task(31, status="submitted"), _task(32, operation_id=2)]
-    mythic_records["outputs"] = {17: _dcsync_output()}
+    mythic_records["outputs"] = {17: _dcsync_output(), 30: ROAST_OUTPUT}
     mythic_records["credentials"] = [_store_credential(41, roast), _store_credential(42, None, account="hand")]
 
     lines = asyncio.run(tools._reconcile_operation(["17", "30", "31", "32", "99", "cred:42"]))
@@ -552,7 +557,9 @@ def test_a_dcsync_key_in_the_credential_store_stays_a_working_credential(operati
     tools = operation("channel-a", channel=3, request=1)
     _step_with_credential(tools, {
         "id": 42, "account": "eddard.stark", "realm": DOMAIN.upper(), "type": "hash", "credential_text": NTLM,
-        "task": _credential_task(31, "dcsync", {"Domain": DOMAIN, "User": "eddard.stark"}),
+        # Its task's output holds the key, as an agent-reported entry's does: store proof needs that.
+        "task": {**_credential_task(31, "dcsync", {"Domain": DOMAIN, "User": "eddard.stark"}),
+                 "responses": [{"response_text": base64.b64encode(_dcsync_output().encode()).decode()}]},
     })
 
     assert f"creds:eddard.stark@{DOMAIN}" in _achieved(tools)
@@ -920,6 +927,7 @@ def test_a_dcsync_krbtgt_entry_is_the_krbtgt_key_and_a_cleared_task_is_not_held(
     tools = operation("channel-a", channel=3, request=1)
     dcsync = _task(60, "dcsync", params=json.dumps({"Domain": DOMAIN, "User": "krbtgt"}))
     mythic_records["tasks"] = [dcsync, _task(61, status="cleared")]
+    mythic_records["outputs"] = {60: _dcsync_output()}  # the entry's key is in its task's output
     mythic_records["credentials"] = [_store_credential(70, dcsync, account="krbtgt", text=NTLM)]
     _turn_end(tools)
     assert [hop.effect for hop in _rows(tools, "krbtgt-hash:")] == [f"krbtgt-hash:{DOMAIN}"]

@@ -65,7 +65,7 @@ _TASK_FIELDS = """
 _CREDENTIAL_FIELDS = (
     "id operation_id account realm type credential_text comment timestamp "
     "task { display_id operation_id status completed status_timestamp_processing status_timestamp_processed "
-    "command_name original_params callback { display_id } }"
+    "command_name original_params responses(order_by: {id: asc}) { response_text } callback { display_id } }"
 )
 
 

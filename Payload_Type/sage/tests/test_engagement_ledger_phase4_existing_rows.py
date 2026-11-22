@@ -17,6 +17,7 @@ views are production code. Account, realm and key material are synthetic.
 from __future__ import annotations
 
 import asyncio
+import base64
 import itertools
 import json
 from types import SimpleNamespace
@@ -56,11 +57,14 @@ def _task_row(task_id: int = TASK, record: dict = SUCCESS, *, command: str = "dc
 
 def _entry(credential_id: int = CREDENTIAL, task_id: int = TASK, *, record: dict = SUCCESS, account: str = ACCOUNT,
            realm: str = REALM, kind: str = "hash", command: str = "dcsync", params: dict = DCSYNC_PARAMS) -> dict:
+    """An agent-reported entry as the credential readers select it. Its task carries the output that printed the
+    entry's text, because store proof needs the text to be a value its task produced."""
     return {"id": credential_id, "operation_id": 1, "account": account, "realm": realm.upper(), "type": kind,
             "credential_text": NTLM, "comment": "",
             "task": {"display_id": task_id, "operation_id": 1, "command_name": command,
                      "original_params": json.dumps(params), "callback": {"display_id": CALLBACK},
-                     **_record_fields(record)}}
+                     **_record_fields(record),
+                     "responses": [{"response_text": base64.b64encode(DCSYNC_OUTPUT.encode()).decode()}]}}
 
 
 @pytest.fixture

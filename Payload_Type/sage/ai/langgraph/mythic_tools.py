@@ -1310,6 +1310,83 @@ def _credential_source(task: Any) -> str:
     return ""
 
 
+def _task_response_text(responses: Any) -> str:
+    """The plain text of a task's Mythic response rows, in order. ``response_text`` arrives base64-encoded."""
+    chunks: list[str] = []
+    for item in responses if isinstance(responses, list) else [responses]:
+        if isinstance(item, bytes):
+            chunks.append(item.decode("utf-8", "replace"))
+            continue
+        if not isinstance(item, dict):
+            chunks.append("" if item is None else str(item).strip())
+            continue
+        raw = item.get("response_text") or item.get("response") or ""
+        if isinstance(raw, bytes):
+            chunks.append(raw.decode("utf-8", "replace"))
+            continue
+        text = str(raw).strip()
+        if text:
+            try:
+                chunks.append(base64.b64decode(text).decode("utf-8", "replace"))
+                continue
+            except Exception:
+                pass
+            chunks.append(text)
+    return "\n".join(chunk for chunk in chunks if chunk)
+
+
+_KEY_WIDTH_HEX = re.compile(r"[0-9a-fA-F]{32}|[0-9a-fA-F]{64}")
+
+
+def _json_string_values(text: Any) -> set[str]:
+    """Every string value in a JSON document, stripped; empty when it is not JSON."""
+    try:
+        document = json.loads(text) if isinstance(text, str) else text
+    except (TypeError, ValueError):
+        return set()
+    values: set[str] = set()
+    stack = [document]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+        elif isinstance(item, str) and item.strip():
+            values.add(item.strip())
+    return values
+
+
+def _credential_row_content_proved(credential: Any) -> bool:
+    """True when a task-linked credential row's current text is a value its source task produced or imported.
+
+    Mythic keeps a row's task link when an operator rewrites its text, so the link alone does not say where the text
+    came from. The text, stripped, must be one of: (A) a string value of the task's ``original_params`` (an import);
+    (B) for a 32- or 64-hex key or hash, a value the credential parser reads from the task's output; or (C) for other
+    text, a whole token of that output: it occurs with whitespace, a quote or the output's edge on each side. A value
+    may hold spaces, as agents' completion functions report a password split from a ``Password : <value>`` line.
+    """
+    task = credential.get("task") if isinstance(credential, dict) else None
+    if not isinstance(task, dict):
+        return False
+    value = str(credential.get("credential_text") or "").strip()
+    if not value:
+        return False
+    if value in _json_string_values(task.get("original_params")):
+        return True
+    output = _task_response_text(task.get("responses") or [])
+    if not output:
+        return False
+    if _KEY_WIDTH_HEX.fullmatch(value):
+        try:
+            from . import credential_artifacts
+        except ImportError:
+            import credential_artifacts
+        material = credential_artifacts.extract_credential_material(output)
+        return value.casefold() in {str(item.get("credential") or "").casefold() for item in material}
+    return re.search(r"(?<![^\s\"'])" + re.escape(value) + r"(?![^\s\"'])", output) is not None
+
+
 def _credential_material_kind(credential: Any) -> str:
     kind = str((credential or {}).get("type") or "").strip().casefold() if isinstance(credential, dict) else ""
     return kind if kind in _CREDENTIAL_MATERIAL_KINDS else "unknown"
@@ -8056,10 +8133,13 @@ class MythicTools:
         return task_evidence.envelope_terminal_status(classification, record)
 
     def _credential_store_proof_envelope(self, credential: dict, now: str) -> dict:
-        """Build proof for a Mythic credential row only when its source task lineage is complete."""
+        """Build proof for a Mythic credential row only when its source task lineage is complete and its current text
+        is a value that task produced or imported (see `_credential_row_content_proved`)."""
         if not isinstance(credential, dict):
             return {}
         task = credential.get("task") if isinstance(credential.get("task"), dict) else {}
+        if task and not _credential_row_content_proved(credential):
+            return {}
         callback = task.get("callback") if isinstance(task.get("callback"), dict) else {}
         task_id = task.get("display_id") or task.get("id")
         return self._runtime_credential_proof_envelope(
@@ -8112,12 +8192,16 @@ class MythicTools:
                 query = ("query SageReadCredentials($op: Int) { credential(where: {deleted: {_eq: false}, "
                          "operation_id: {_eq: $op}}, order_by: {id: desc}, limit: 200) "
                          "{ id account realm type credential_text comment timestamp "
-                         "task { display_id status completed status_timestamp_processing status_timestamp_processed command_name original_params callback { display_id } } } }")
+                         "task { display_id status completed status_timestamp_processing status_timestamp_processed "
+                         "command_name original_params responses(order_by: {id: asc}) { response_text } "
+                         "callback { display_id } } } }")
                 variables = {"op": op_id}
             else:
                 query = ("query SageReadCredentials { credential(where: {deleted: {_eq: false}}, "
                          "order_by: {id: desc}, limit: 200) { id account realm type credential_text comment timestamp "
-                         "task { display_id status completed status_timestamp_processing status_timestamp_processed command_name original_params callback { display_id } } } }")
+                         "task { display_id status completed status_timestamp_processing status_timestamp_processed "
+                         "command_name original_params responses(order_by: {id: asc}) { response_text } "
+                         "callback { display_id } } } }")
                 variables = None
             resp = await mythic.execute_custom_query(self.client, query, variables=variables)
             creds = (resp or {}).get("credential") or []
@@ -18246,27 +18330,7 @@ class MythicTools:
             resp = await mythic.get_all_task_output_by_id(mythic=self.client, task_display_id=int(task_id))
         except Exception:
             return ""
-        chunks: list[str] = []
-        for item in resp if isinstance(resp, list) else [resp]:
-            if isinstance(item, bytes):
-                chunks.append(item.decode("utf-8", "replace"))
-                continue
-            if not isinstance(item, dict):
-                chunks.append(self._capability_text(item))
-                continue
-            raw = item.get("response_text") or item.get("response") or ""
-            if isinstance(raw, bytes):
-                chunks.append(raw.decode("utf-8", "replace"))
-                continue
-            text = self._capability_text(raw)
-            if text:
-                try:
-                    chunks.append(base64.b64decode(text).decode("utf-8", "replace"))
-                    continue
-                except Exception:
-                    pass
-                chunks.append(text)
-        result = "\n".join(chunk for chunk in chunks if chunk)
+        result = _task_response_text(resp)
         if result:
             self._task_output_cache[int(task_id)] = result
         return result
@@ -21406,6 +21470,10 @@ class MythicTools:
         proof = self._credential_store_proof_envelope(credential, now)
         if not proof:
             if require_admitted:
+                if self._credential_task_terminal_success_status(task) and not _credential_row_content_proved(
+                        credential):
+                    return state, "", effect, ("no proven gain (the entry's current text is not a value its producing "
+                                               "task produced or imported)")
                 return state, "", effect, "no proven gain (the producing task's lineage is incomplete)"
             if held:
                 return state, "", effect, "already recorded"  # never downgrade a proven row

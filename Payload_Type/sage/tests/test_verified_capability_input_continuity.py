@@ -654,10 +654,12 @@ def test_a_krbtgt_row_typed_into_the_credential_store_is_not_proof(monkeypatch, 
 def test_a_krbtgt_row_an_agent_reported_from_a_completed_task_is_proof(monkeypatch, tmp_path):
     mt, store = _krbtgt_tools(monkeypatch, tmp_path)
     seed_ledger(mt, hops=[])
+    # The row carries its task's output, as Sage's credential reader selects it: store proof needs its key there.
     store["rows"].append({"id": 701, "account": "krbtgt", "realm": "lab.local", "type": "key",
                           "credential_text": KRBTGT_KEY, "comment": "reported by the agent",
                           "task": {"display_id": 24, "status": "completed", "completed": True, **AGENT_PROCESSED,
-                                   "command_name": "dcsync", "callback": {"display_id": 13}}})
+                                   "command_name": "dcsync", "callback": {"display_id": 13},
+                                   "responses": [{"response_text": base64.b64encode(DCSYNC_OK.encode()).decode()}]}})
 
     [call] = _ground_forge(mt).tool_calls
     inputs = call["args"]["inputs"]

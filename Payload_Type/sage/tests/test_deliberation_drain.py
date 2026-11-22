@@ -9,6 +9,7 @@ Run: cd Payload_Type/sage && python3 -m pytest tests/test_deliberation_drain.py 
 """
 from tests.esl_fixtures import AGENT_PROCESSED, seed_ledger  # noqa: E402
 import asyncio
+import base64
 import json
 import sys
 from contextlib import contextmanager
@@ -172,6 +173,8 @@ def test_runtime_corroboration_admits_only_task_linked_credential_rows():
                 **AGENT_PROCESSED,
                 "command_name": "dcsync",
                 "callback": {"display_id": 13},
+                # The row's text is in its task's output, as an agent-reported row's is: store proof needs that.
+                "responses": [{"response_text": base64.b64encode(b"  Password : deadbeef\r\n").decode()}],
             },
         },
         {

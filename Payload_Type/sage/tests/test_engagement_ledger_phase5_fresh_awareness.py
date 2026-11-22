@@ -978,7 +978,7 @@ def test_both_tools_are_offered_to_supervisor_and_operator_after_frontmatter(mon
 
 # --- typed source references: the shared projection names each source's kind -----------------------------------------
 
-from tests.test_engagement_ledger_phase4 import KERBEROAST, _store_credential  # noqa: E402
+from tests.test_engagement_ledger_phase4 import KERBEROAST, ROAST_OUTPUT, _store_credential  # noqa: E402
 from tests.test_engagement_ledger_phase4 import _task as _store_task  # noqa: E402
 from tests.test_engagement_ledger_phase4_citation_sources import (  # noqa: E402,F401
     DIR_LISTING, SECRET, TICKET_USE, citation_mythic,
@@ -1074,6 +1074,7 @@ def test_submission_result_types_a_credential_store_observation_row(session, sdk
     records = stub_mythic_operation(monkeypatch)
     harvest = _store_task(20, "execute_assembly", callback=2, params=KERBEROAST)
     records["tasks"], records["credentials"] = [harvest], [_store_credential(10, harvest)]
+    records["outputs"] = {20: ROAST_OUTPUT}
     applied = _recording_apply(monkeypatch)
     tools = session()
 
@@ -1199,6 +1200,7 @@ def _retained_operation(session, monkeypatch) -> mythic_tools.MythicTools:
     records = stub_mythic_operation(monkeypatch)
     harvest = _store_task(20, "execute_assembly", callback=2, params=KERBEROAST)
     records["tasks"], records["credentials"] = [harvest], [_store_credential(10, harvest)]
+    records["outputs"] = {20: ROAST_OUTPUT}
     records["callbacks"] = [_callback_row(2, "CASTELBLACK", "NORTH\\samwell.tarly", 2, "2026-11-05T09:00:00")]
     tools = session()
     _seed_two_rows(tools)

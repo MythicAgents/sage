@@ -254,8 +254,13 @@ def _seeded_reconcile(mt: MythicTools):
 
 # A credential-store row is proof only with a completed source task (an agent reported it). Rows typed into
 # Mythic carry no task and are never a forge's key.
+# The rows an agent reported from this task carry its output, as Sage's credential reader selects it: store proof
+# needs a row's text ("a" * 64 or "b" * 32 below) to be a value the task printed.
+_AGENT_REPORTED_OUTPUT = ("** SAM ACCOUNT **\nSAM Username         : krbtgt\nCredentials:\n"
+                          f"  Hash NTLM: {'b' * 32}\n      aes256_hmac       (4096) : {'a' * 64}\n")
 _AGENT_REPORTED_TASK = {"display_id": 77, "status": "completed", "completed": True, "command_name": "dcsync",
-                        **AGENT_PROCESSED, "callback": {"display_id": 2}}
+                        **AGENT_PROCESSED, "callback": {"display_id": 2},
+                        "responses": [{"response_text": base64.b64encode(_AGENT_REPORTED_OUTPUT.encode()).decode()}]}
 
 
 def _proof_hop(effect, task_id, callback_id="", technique="capability:seed", target=None, transaction_id=None):

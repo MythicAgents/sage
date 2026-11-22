@@ -16,6 +16,7 @@ every key is synthetic.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import sys
 from pathlib import Path
@@ -30,7 +31,8 @@ import capabilities  # noqa: E402
 from tests.esl_fixtures import AGENT_PROCESSED, seed_ledger  # noqa: E402
 from test_engagement_wiring import _proof_hop, _split_issue  # noqa: E402
 from test_verified_capability_input_continuity import (  # noqa: E402
-    BAD_DN, FORGE, KRBTGT_KEY, _forge_from, _ground_forge, _krbtgt_tools, _prove_krbtgt, _rubeus_issues, _run_dcsync,
+    BAD_DN, DCSYNC_OK, FORGE, KRBTGT_KEY, _forge_from, _ground_forge, _krbtgt_tools, _prove_krbtgt, _rubeus_issues,
+    _run_dcsync,
 )
 
 AES = KRBTGT_KEY            # row 500, ranks first
@@ -53,12 +55,26 @@ def _action(capability: str) -> dict:
     return {**FORGE, "capability": capability}
 
 
-def _reported(row_id, *, key, task_id, account="krbtgt", realm="lab.local", row_type="key", status="completed"):
-    """A store row an agent reported from a Mythic task (complete lineage unless the task did not succeed)."""
+def _dump_of(key: str) -> str:
+    """The dcsync output that holds `key`, as its task printed it."""
+    line = f"  aes256_hmac       (4096) : {key}\n" if len(key) == 64 else f"  Hash NTLM: {key}\n"
+    return (f"[DC] 'lab.local' will be the domain\n** SAM ACCOUNT **\nSAM Username         : krbtgt\n"
+            f"Credentials:\n{line}")
+
+
+def _reported(row_id, *, key, task_id, account="krbtgt", realm="lab.local", row_type="key", status="completed",
+              output=None):
+    """A store row an agent reported from a Mythic task (complete lineage unless the task did not succeed).
+
+    The row carries its task's output, as Sage's credential reader selects it: store proof needs the row's text to
+    be a value its task produced, as a real agent-reported row's is. `output` is the task's whole output when several
+    rows share one task; by default it is the dump that holds this row's key."""
+    text = _dump_of(key) if output is None else output
     return {"id": row_id, "account": account, "realm": realm, "type": row_type, "credential_text": key,
             "comment": "reported by the agent",
             "task": {"display_id": task_id, "status": status, "completed": True, **AGENT_PROCESSED,
-                     "command_name": "dcsync", "callback": {"display_id": 13}}}
+                     "command_name": "dcsync", "callback": {"display_id": 13},
+                     "responses": [{"response_text": base64.b64encode(text.encode()).decode()}]}}
 
 
 def _typed(row_id, *, key, account="krbtgt", realm="lab.local"):
@@ -74,7 +90,8 @@ def _two_row_tools(monkeypatch, tmp_path, route):
         _prove_krbtgt(mt, store)  # the production dcsync executor: an achieved hop for task 21, rows without lineage
     else:
         seed_ledger(mt, hops=[])
-        store["rows"] += [_reported(500, key=AES, task_id=21), _reported(501, key=NTLM, task_id=21, row_type="hash")]
+        store["rows"] += [_reported(500, key=AES, task_id=21, output=DCSYNC_OK),
+                          _reported(501, key=NTLM, task_id=21, row_type="hash", output=DCSYNC_OK)]
     rows = {row["id"]: row for row in store["rows"]}
     assert rows[500]["credential_text"] == AES and rows[501]["credential_text"] == NTLM, store["rows"]
     selected = asyncio.run(mt._select_krbtgt_credential("lab.local"))
@@ -94,8 +111,8 @@ def _two_task_tools(monkeypatch, tmp_path, route):
         assert store["rows"] == []  # task-only recovery: no store row names either key
     else:
         seed_ledger(mt, hops=[])
-        store["rows"] += [_reported(600, key=NTLM, task_id=21, row_type="hash"),
-                          _reported(601, key=NEWER_AES, task_id=30)]
+        store["rows"] += [_reported(600, key=NTLM, task_id=21, row_type="hash", output=NTLM_ONLY),
+                          _reported(601, key=NEWER_AES, task_id=30, output=AES_ONLY)]
     selected = asyncio.run(mt._select_krbtgt_credential("lab.local"))
     assert selected["credential"] == NEWER_AES and str(selected["proof_task_id"]) == "30"
     return mt, store

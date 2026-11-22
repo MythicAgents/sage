@@ -26,13 +26,22 @@ from sage_chat import slash
 from sage_chat.headless import build_chat_request
 from tests.esl_fixtures import AGENT_PROCESSED, stub_mythic_operation
 from tests.test_engagement_ledger_phase2_unified_proof import (  # noqa: F401 - fixtures used by name
-    CALLBACK, DCSYNC_OUTPUT, DCSYNC_PARAMS, NTLM, SUCCESS, TASK, TYPED, WORKING, session,
+    ACCOUNT, CALLBACK, DCSYNC_OUTPUT, DCSYNC_PARAMS, NTLM, SUCCESS, TASK, TYPED, WORKING, session,
 )
 from tests.test_engagement_ledger_phase4_existing_rows import _current_typed, _entry, _slots, _task_row
 
 SETTLING = {"completed": True, "status": task_evidence.MYTHIC_COMPLETION_FUNCTION_RUNNING, **AGENT_PROCESSED}
 AGENT_ERROR = {"completed": True, "status": "error", **AGENT_PROCESSED}
 STORE_SLOT = "credential_store:42"
+# Apollo's dcsync completion function stores a plaintext it split from its own output's `Password : <value>` line.
+# That output has no hash, so no task verifier credits it, and store proof finds the entry's text there.
+PASSWORD = "synthetic pass 18"
+PLAINTEXT_OUTPUT = f"  Username : {ACCOUNT}\r\n  Domain   : NORTH\r\n  Password : {PASSWORD}\r\n"
+
+
+def _plain_entry(*args, **kwargs) -> dict:
+    """The entry that completion function stores: plaintext, its text in its task's output."""
+    return {**_entry(*args, **kwargs), "type": "plaintext", "credential_text": PASSWORD}
 
 
 @pytest.fixture
@@ -40,7 +49,7 @@ def mythic(monkeypatch, mythic_task_records):
     """DCSync task 18 finished with no output a verifier credits and, so far, no credential-store entry."""
     records = stub_mythic_operation(monkeypatch)
     records["tasks"] = [_task_row()]
-    records["outputs"] = {TASK: ""}
+    records["outputs"] = {TASK: PLAINTEXT_OUTPUT}
     mythic_task_records[TASK] = SUCCESS
     return records
 
@@ -132,7 +141,7 @@ def test_a_late_credential_entry_is_recorded_by_a_later_pass_without_moving_the_
     assert join["source_kind"] == "task" and join["payload"]["values"]["task_classification"] == "terminal_success"
     assert join["payload"]["supporting"] == [f"task:{TASK}"]
 
-    mythic["credentials"] = [_entry()]  # Mythic stores the entry after the pass
+    mythic["credentials"] = [_plain_entry()]  # Mythic stores the entry after the pass
     _pass(tools)
 
     [row] = _current_typed(tools)
@@ -152,7 +161,7 @@ def test_a_join_survives_a_restart_and_the_new_process_resolves_it(session, myth
     _turn_end(tools)
     assert [join["join_state"] for join in _joins(tools)] == [effect_observations.JOIN_AWAITING]
 
-    mythic["credentials"] = [_entry()]
+    mythic["credentials"] = [_plain_entry()]
     fresh = _restarted(tools)
     _turn_end(fresh)
 
@@ -171,7 +180,7 @@ def test_a_citation_before_ordinary_reconciliation_records_the_join_and_keeps_th
 
     assert _pass(tools)[0].endswith(", 1 task(s) awaiting a credential-store entry.")  # one join, counted once
 
-    mythic["credentials"] = [_entry()]
+    mythic["credentials"] = [_plain_entry()]
     _pass(tools)  # the ordinary pass finds task 18's entry
 
     assert [row.payload["status"] for row in _current_typed(tools)] == ["achieved"]
@@ -183,8 +192,8 @@ def test_an_entry_from_another_task_does_not_resolve_the_join(session, mythic):
     tools = session()
     _pass(tools)
     mythic["tasks"].append(_task_row(19))
-    mythic["outputs"][19] = ""
-    mythic["credentials"] = [_entry(43, 19)]
+    mythic["outputs"][19] = PLAINTEXT_OUTPUT
+    mythic["credentials"] = [_plain_entry(43, 19)]
 
     _pass(tools)
 
@@ -211,7 +220,7 @@ def test_tasks_whose_entry_is_not_expected_leave_no_join(session, mythic, record
 def test_a_mythic_failure_leaves_the_join_and_cursor_and_a_later_pass_resolves_it(session, mythic):
     tools = session()
     _pass(tools)
-    mythic["credentials"] = [_entry()]
+    mythic["credentials"] = [_plain_entry()]
     mythic["fail"] = True
     _turn_end(tools)  # the turn end swallows the failed pass
     assert [join["join_state"] for join in _joins(tools)] == [effect_observations.JOIN_AWAITING]
@@ -225,7 +234,7 @@ def test_a_mythic_failure_leaves_the_join_and_cursor_and_a_later_pass_resolves_i
 def test_an_interrupted_store_write_commits_nothing_and_the_replay_converges(session, mythic, monkeypatch):
     tools = session()
     _pass(tools)
-    mythic["credentials"] = [_entry()]
+    mythic["credentials"] = [_plain_entry()]
     real = engagement_store._close_join
 
     def interrupted(*_args, **_kwargs):
@@ -257,7 +266,7 @@ def test_an_expired_join_stops_polling_but_a_citation_still_records_the_entry(se
         f"- {TASK}: not added, no proven gain; its credential-store entry did not appear within the window "
         "(cite cred:<id> once it exists).")  # re-citing the task does not promise a poll that will not happen
 
-    mythic["credentials"] = [_entry()]
+    mythic["credentials"] = [_plain_entry()]
     _pass(tools)
     assert tools._ledger_snapshot().hop_rows() == []  # an expired join is no longer polled
     assert asyncio.run(tools._reconcile_operation(["cred:42"]))[0] == "- cred:42: added row #1."
@@ -268,7 +277,7 @@ def test_no_secret_reaches_observations_events_notes_or_the_view(session, mythic
     mythic["tasks"] = [_task_row(params={**DCSYNC_PARAMS, "Password": NTLM})]  # a parameter can hold a secret
     tools = session()
     notes = _pass(tools)
-    mythic["credentials"] = [_entry()]
+    mythic["credentials"] = [_plain_entry()]
     notes += _pass(tools)
     assert _joins(tools) and _current_typed(tools)
     assert NTLM not in _database_text(tools)

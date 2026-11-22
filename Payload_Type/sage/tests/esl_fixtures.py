@@ -8,6 +8,7 @@ output, credential, hash or host evidence from the range is copied.
 
 from __future__ import annotations
 
+import base64
 import copy
 from datetime import datetime, timezone
 import json
@@ -227,7 +228,8 @@ def stub_mythic_operation(monkeypatch, *, operation_id: int = 1) -> dict:
 
     The readers serve an operation's recorded tasks, outputs, credential-store entries and callbacks with the same
     selection the real GraphQL queries make: operation scope, display IDs above the cursor plus held tasks in
-    ascending order, at most the pass limit, credentials by producing task. The store, reducers, proof boundary,
+    ascending order, at most the pass limit, credentials by producing task with that task's recorded output (store
+    proof needs an entry's text to be a value its task produced). The store, reducers, proof boundary,
     verifiers and request contract stay real. Set ``records["fail"]`` to make Mythic unreachable.
     """
     from ai.langgraph import mythic_tools as mythic_tools_module
@@ -260,10 +262,19 @@ def stub_mythic_operation(monkeypatch, *, operation_id: int = 1) -> dict:
         mine = [task for task in rows if in_operation(task)]
         return (mine[0], "") if mine else ({}, "not in this operation" if rows else "no such task")
 
+    def with_output(row: dict) -> dict:
+        """The entry as the credential readers select it: its task carries that task's recorded output."""
+        task = row.get("task")
+        if not isinstance(task, dict) or task.get("display_id") not in records["outputs"]:
+            return row
+        text = str(records["outputs"][task["display_id"]])
+        return {**row, "task": {**task, "responses": [
+            {"response_text": base64.b64encode(text.encode()).decode()}]}}
+
     async def task_credentials(client, op, task_ids):
         reachable()
         wanted = {int(item) for item in task_ids}
-        return [row for row in records["credentials"] if in_operation(row)
+        return [with_output(row) for row in records["credentials"] if in_operation(row)
                 and (row.get("task") or {}).get("display_id") in wanted
                 and in_operation(row.get("task") or {})]
 
@@ -271,7 +282,7 @@ def stub_mythic_operation(monkeypatch, *, operation_id: int = 1) -> dict:
         reachable()
         rows = [row for row in records["credentials"] if row["id"] == int(credential_id)]
         mine = [row for row in rows if in_operation(row)]
-        return (mine[0], "") if mine else ({}, "not in this operation" if rows else "no such credential")
+        return (with_output(mine[0]), "") if mine else ({}, "not in this operation" if rows else "no such credential")
 
     async def cited_file(client, op, file_id):
         reachable()

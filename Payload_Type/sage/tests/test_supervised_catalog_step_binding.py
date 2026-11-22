@@ -15,6 +15,7 @@ inert `_split_issue` seam). Scripted selections test code enforcement, not model
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from pathlib import Path
 import re
@@ -354,12 +355,24 @@ def test_a_cross_domain_candidate_cards_its_action_for_any_recorded_host_form(mo
 OTHER_AES, OTHER_RC4, TYPED = "b" * 64, "e" * 32, "f" * 64
 
 
-def _reported(row_id, key, task_id, *, account="krbtgt", realm="lab.local", row_type="key"):
-    """A store row an agent reported from a completed Mythic task: its own lineage proves it."""
+def _reported(row_id, key, task_id, *, account="krbtgt", realm="lab.local", row_type="key", output=None):
+    """A store row an agent reported from a completed Mythic task: its own lineage proves it.
+
+    The row carries its task's output, as Sage's credential reader selects it: store proof needs the row's text to be
+    a value its task produced. `output` is the task's whole output when rows share a task; by default, a dump of this
+    row's key."""
+    line = f"  aes256_hmac       (4096) : {key}\n" if len(key) == 64 else f"  Hash NTLM: {key}\n"
+    text = output if output is not None else (
+        f"** SAM ACCOUNT **\nSAM Username         : {account}\nCredentials:\n{line}")
     return {"id": row_id, "account": account, "realm": realm, "type": row_type, "credential_text": key,
             "comment": "reported by the agent", "timestamp": NOW,
             "task": {"display_id": task_id, "status": "completed", "completed": True, **AGENT_PROCESSED,
-                     "command_name": "dcsync", "callback": {"display_id": 13}}}
+                     "command_name": "dcsync", "callback": {"display_id": 13},
+                     "responses": [{"response_text": base64.b64encode(text.encode()).decode()}]}}
+
+
+TASK_30_OUTPUT = (f"** SAM ACCOUNT **\nSAM Username         : krbtgt\nCredentials:\n  Hash NTLM: {OTHER_RC4}\n"
+                  f"      aes256_hmac       (4096) : {OTHER_AES}\n")
 
 
 def _store_client(monkeypatch, tmp_path, *extra):
@@ -416,7 +429,8 @@ def test_several_key_rows_of_one_proved_krbtgt_bind_its_best_key(monkeypatch, tm
     ([{"id": 603, "account": "krbtgt", "realm": "lab.local", "type": "key", "credential_text": TYPED,
        "comment": "entered by hand", "timestamp": NOW, "task": None}], ["cred:500", "cred:603"], "credentials 500, 603"),
     ([_reported(604, OTHER_AES, 21, account="administrator")], ["cred:500", "cred:604"], "credentials 500, 604"),
-    ([_reported(601, OTHER_AES, 30), _reported(602, OTHER_RC4, 30, row_type="hash")],
+    ([_reported(601, OTHER_AES, 30, output=TASK_30_OUTPUT),
+      _reported(602, OTHER_RC4, 30, row_type="hash", output=TASK_30_OUTPUT)],
      ["cred:601", "cred:602", "task:21"], "proof task 21, credentials 601, 602"),
 ], ids=["other-realm", "other-proof", "unproved", "not-krbtgt", "conflicting-task"])
 def test_key_rows_that_are_not_one_proved_krbtgt_key_set_card_nothing(monkeypatch, tmp_path, extra, references,

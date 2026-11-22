@@ -402,7 +402,9 @@ def test_a_review_headline_keeps_the_rows_other_admitted_material(session, monke
     lsass = _history_task(plaintext_task, params={"command": "sekurlsa::logonpasswords"}, **success)
     lsass["command_name"] = "mimikatz"
     records["tasks"] = [_history_task(**_COMPLETION_ERROR_ROW), lsass]
-    records["outputs"] = {TASK: DCSYNC_OUTPUT, plaintext_task: "Authentication Id : 0 ; 999\n"}
+    # The plaintext is in its task's output, as an agent-reported entry's text is: store proof needs that.
+    records["outputs"] = {TASK: DCSYNC_OUTPUT,
+                          plaintext_task: "Authentication Id : 0 ; 999\n  * Password : synthetic\n"}
     records["credentials"] = [{"id": 7, "account": ACCOUNT, "realm": REALM, "type": "plaintext", "operation_id": 1,
                                "credential_text": "synthetic", "task": dict(lsass)}]
     asyncio.run(tools._reconcile_operation([str(TASK), str(plaintext_task)]))
