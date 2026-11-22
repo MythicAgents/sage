@@ -393,6 +393,12 @@ def test_the_budget_matches_the_frozen_ceilings_and_the_ledger_accepts_it(tmp_pa
     from ai.resource_budget import ResourceBudgetExceeded
     with pytest.raises(ResourceBudgetExceeded):
         ledger.reserve({"provider_requests": 1, "provider_tokens": 1}, "provider")
+    # Sage meters its Mythic control plane on the same ledger from startup; those calls must keep working.
+    for _ in range(50):
+        ledger.reserve({"control_requests": 1}, "control-rpc-application-request")
+    lines = (tmp_path / "ledger.jsonl").read_text().splitlines()
+    assert check.provider_reservations(lines) == check.CEILINGS["transport_requests"]
+    assert check.budget_config()["calendar_seconds"] > check.CEILINGS["active_seconds"] + check.CEILINGS["cleanup_seconds"]
 
 
 # --------------------------------------------------------------------------------------------------
@@ -400,6 +406,9 @@ def test_the_budget_matches_the_frozen_ceilings_and_the_ledger_accepts_it(tmp_pa
 # --------------------------------------------------------------------------------------------------
 
 def test_a_captured_400_reaches_the_sdk_typed_and_the_receiver_records_both_sides(tmp_path, monkeypatch):
+    from ai import observation_channel
+
+    observation_channel._reset_after_fork()  # a fresh producer for this receiver, whatever ran earlier
     parent = tmp_path / "capture"
     parent.mkdir(mode=0o700)
     record, ready = tmp_path / "wire.jsonl", tmp_path / "ready.json"
@@ -437,6 +446,7 @@ def test_a_captured_400_reaches_the_sdk_typed_and_the_receiver_records_both_side
     finally:
         (parent / "stop").write_text("")
         receiver.wait(timeout=15)
+        observation_channel._reset_after_fork()
     items = check.exchanges(check.read_wire(record))
     assert len(items) == 2
     assert items[0]["api"] == "chat_completions" and items[0]["effort"] == "low" and items[0]["status"] == 400

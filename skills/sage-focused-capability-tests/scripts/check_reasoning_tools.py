@@ -214,12 +214,34 @@ def insert_block(original: bytes, block: str) -> bytes:
     return prefix + block.encode()
 
 
+# With a ledger configured, Sage also meters its Mythic control plane (RabbitMQ RPC, GraphQL) as
+# `control_requests`, from the moment it starts. Those are not a protocol ceiling; the limit only has to be
+# out of reach. The ledger's calendar starts at its first event, which is Sage's startup, not the run, so it
+# spans the arm-to-run window; the run itself enforces the protocol's 20-minute active ceiling and verify checks it.
+LEDGER_CALENDAR_SECONDS = 4 * 3600
+CONTROL_REQUEST_LIMIT = 1_000_000
+
+
 def budget_config() -> dict[str, Any]:
     return {"schema": "sage-shared-resource-budget-v1",
             "resources": {"provider_requests": {"limit": CEILINGS["transport_requests"] + 1, "cleanup_reserve": 1},
-                          "provider_tokens": {"limit": CEILINGS["provider_tokens"] + 1, "cleanup_reserve": 1}},
-            "calendar_seconds": CEILINGS["active_seconds"] + CEILINGS["cleanup_seconds"],
+                          "provider_tokens": {"limit": CEILINGS["provider_tokens"] + 1, "cleanup_reserve": 1},
+                          "control_requests": {"limit": CONTROL_REQUEST_LIMIT, "cleanup_reserve": 1000}},
+            "calendar_seconds": LEDGER_CALENDAR_SECONDS,
             "cleanup_seconds": CEILINGS["cleanup_seconds"]}
+
+
+def provider_reservations(ledger_lines: list[str]) -> int:
+    """Provider reservations recorded in a ledger (control-plane reservations are not provider calls)."""
+    count = 0
+    for line in ledger_lines:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if event.get("type") == "reservation" and "provider_requests" in (event.get("amounts") or {}):
+            count += 1
+    return count
 
 
 # --------------------------------------------------------------------------------------------------
@@ -572,11 +594,12 @@ def _capture_state(run: dict[str, Any]) -> dict[str, Any]:
     started = [r for r in wire if r.get("kind") == "process_start"]
     after = [r for r in started if int((r.get("record") or {}).get("time_ns") or 0) >= int(capture["armed_ns"])]
     ledger = Path(capture["host_dir"]) / "ledger.jsonl"
+    lines = ledger.read_text().splitlines() if ledger.exists() else []
     return {"armed": True, "receiver_alive": _pid_alive(int(capture["receiver_pid"])),
             "receiver_failed": (parent / "receiver-failed").exists(),
             "process_start_after_arm": len(after), "events": len(wire),
             "budget_valid": (parent / "budget.json").exists(),
-            "ledger_events": len(ledger.read_text().splitlines()) if ledger.exists() else 0,
+            "ledger_events": len(lines), "provider_reservations": provider_reservations(lines),
             "env_block_present": ENV_BEGIN.encode() in (Path(capture["installed"]) / ".env").read_bytes()}
 
 
@@ -634,7 +657,8 @@ async def cmd_readiness(client: Any, run: dict[str, Any], args: argparse.Namespa
     elif not capture.get("armed"):
         verdict = "capture_required"
     elif not (capture["receiver_alive"] and not capture["receiver_failed"] and capture["process_start_after_arm"]
-              and capture["budget_valid"] and capture["env_block_present"] and capture["ledger_events"] == 0):
+              and capture["budget_valid"] and capture["env_block_present"]
+              and capture["provider_reservations"] == 0 and report["sage_container_running"]):
         verdict = "not_ready"
         blockers.append("capture or budget not live")
     else:

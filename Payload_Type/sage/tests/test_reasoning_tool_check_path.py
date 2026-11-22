@@ -47,10 +47,15 @@ def _isolation(monkeypatch):
         for channel in CHANNELS.values():
             await chat_session.remove_session(str(channel))
 
+    from ai import observation_channel
+
+    observation_channel._reset_after_fork()
     asyncio.run(clear())
     yield
     asyncio.run(clear())
     service._CHANNEL_TURN_LOCKS.clear()
+    # The channel's producer identity and sequence are process-wide; a later receiver expects a fresh producer.
+    observation_channel._reset_after_fork()
 
 
 def mythic_rows(window: list[dict]) -> list[dict]:
