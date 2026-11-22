@@ -580,7 +580,9 @@ def evaluate(run: dict[str, Any], wire: dict[str, list[dict[str, Any]]], rows: d
         expected = produced_calls(wire.get(earlier, []))
         retained, retained_reasoning = 0, 0
         for call in expected:
-            result = acknowledgement if call["name"] == FINISH_TOOL else call["result"]
+            # A finish call's result is Sage's acknowledgement when it ended the turn; one the finish tool answered
+            # with an argument review carries that review, as the step's next request did.
+            result = call["result"] or (acknowledgement if call["name"] == FINISH_TOOL else None)
             seen = replayed.get(call["call_id"]) or {}
             pair = (bool(call["call_id"]) and seen.get("calls") == 1 and seen.get("results") == 1
                     and seen.get("name") == call["name"] and _same_arguments(seen.get("arguments"), call["arguments"])

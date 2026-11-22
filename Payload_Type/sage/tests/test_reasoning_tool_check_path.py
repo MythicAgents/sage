@@ -317,3 +317,33 @@ def test_the_recorded_replay_inputs_are_present_for_every_step():
     report = check.recorded_inputs()
     assert all(report[name] for name in check.RECORDED_INPUTS)
     assert report["attempt1_steps"] == [step for step, *_ in check.STEPS]
+
+
+def test_a_seed_finish_that_failed_argument_review_keeps_its_real_result_and_passes(monkeypatch, tmp_path):
+    """Synthetic outputs: the seed turn's first finish has a blank report (the real tool answers it with an argument
+    review), the second is valid. The product keeps all three pairs with their actual results; the check accepts it."""
+    from tests.openai_responses_harness import call_item, reasoning_item
+
+    seed_finish = {"final_response": recovery.SEED_ANSWER, "outcome": "completed"}
+    wires = {
+        "A": recovery.SolWire([
+            [reasoning_item(1), call_item("list_callbacks", {}, "call_a1")],
+            [call_item("respond_to_user", {"final_response": ""}, "call_a1f_bad")],
+            [call_item("respond_to_user", seed_finish, "call_a1f")],
+            *recovery._tool_round_trip("call_a3", "Still amber-seven; WORKSTATION-5.", 3),
+            [recovery.text_item("Your label is amber-seven.", 5)],
+        ]),
+        "B": recovery.SolWire([
+            *recovery._tool_round_trip("call_b1", recovery.SEED_ANSWER, 1),
+            *recovery._tool_round_trip("call_b3", "Still amber-seven; WORKSTATION-5.", 3),
+            [recovery.text_item("Your label is amber-seven.", 5)],
+        ]),
+    }
+    run, wire, rows, totals = _run_sequence(monkeypatch, tmp_path, wires)
+    replayed = check.replayed_calls(wire["A3"][0]["input"])
+    assert replayed["call_a1f_bad"]["result"].startswith("[Argument review]")
+    assert replayed["call_a1f"]["result"] == check._runtime("_FINISH_ACKNOWLEDGEMENT")
+    result = check.evaluate(run, wire, rows, totals)
+    assert result["verdict"] == "pass", json.dumps(result["detail"], indent=1, default=str)
+    assert result["detail"]["continuity"]["A3"]["counts"] == {
+        "expected_calls": 3, "retained_calls": 3, "expected_reasoning": 1, "retained_reasoning": 1}
