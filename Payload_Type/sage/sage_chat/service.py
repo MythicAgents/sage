@@ -262,26 +262,52 @@ def _model_config_signature(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _core_config_signature(
-    kwargs: dict[str, Any],
-    bloodhound_env: dict[str, str] | None = None,
-) -> str:
-    """The session signature without the model and the OpenAI route settings (API, Daybreak, safety identifier).
+REASONING_EFFORT_FIELD = "reasoning_effort"
+# Every value a saved signature can hold for the effort ("" = not sent); validated at resolution.
+_REASONING_EFFORT_VALUES = ("", "none", "minimal", "low", "medium", "high", "xhigh", "max")
 
-    Two configurations with equal core signatures differ only in which model this chat uses or how it reaches
-    it, so an idle channel may apply the change on its existing conversation generation. Everything else
-    (provider, endpoint, key, mode, BloodHound) still rotates the session.
-    """
+
+def _signature_without(
+    kwargs: dict[str, Any],
+    bloodhound_env: dict[str, str] | None,
+    *,
+    model: bool,
+    effort: bool,
+) -> str:
+    """The session signature without the OpenAI route settings and, as asked, the model and reasoning effort."""
     payload = dict(kwargs)
-    payload.pop("model", None)
+    if model:
+        payload.pop("model", None)
+    dropped = set(OPENAI_ROUTE_FIELDS) | ({REASONING_EFFORT_FIELD} if effort else set())
     config = dict(payload.get("config") or {})
     configurable = {
         key: value
         for key, value in dict(config.get("configurable") or {}).items()
-        if key not in OPENAI_ROUTE_FIELDS
+        if key not in dropped
     }
     payload["config"] = {**config, "configurable": configurable}
     return _model_config_signature(payload, bloodhound_env)
+
+
+def _core_config_signature(
+    kwargs: dict[str, Any],
+    bloodhound_env: dict[str, str] | None = None,
+) -> str:
+    """The session signature without the model, the OpenAI route settings and the reasoning effort.
+
+    Two configurations with equal core signatures differ only in which model this chat uses, how it reaches
+    it or how much it reasons, so an idle channel may apply the change on its existing conversation
+    generation. Everything else (provider, endpoint, key, mode, BloodHound) still rotates the session.
+    """
+    return _signature_without(kwargs, bloodhound_env, model=True, effort=True)
+
+
+def _effort_bound_core_signature(
+    kwargs: dict[str, Any],
+    bloodhound_env: dict[str, str] | None = None,
+) -> str:
+    """The core signature as records saved before the reasoning effort became continuable store it."""
+    return _signature_without(kwargs, bloodhound_env, model=True, effort=False)
 
 
 def _route_only_core_signature(
@@ -289,15 +315,23 @@ def _route_only_core_signature(
     bloodhound_env: dict[str, str] | None = None,
 ) -> str:
     """The core signature as records saved before the model became continuable store it (model included)."""
-    payload = dict(kwargs)
-    config = dict(payload.get("config") or {})
-    configurable = {
-        key: value
-        for key, value in dict(config.get("configurable") or {}).items()
-        if key not in OPENAI_ROUTE_FIELDS
-    }
-    payload["config"] = {**config, "configurable": configurable}
-    return _model_config_signature(payload, bloodhound_env)
+    return _signature_without(kwargs, bloodhound_env, model=False, effort=False)
+
+
+def _with_reasoning_effort(kwargs: dict[str, Any], effort: str) -> dict[str, Any]:
+    """``kwargs`` as a request with this effort would resolve them (blank is not sent, so not present)."""
+    config = dict(kwargs.get("config") or {})
+    configurable = dict(config.get("configurable") or {})
+    configurable.pop(REASONING_EFFORT_FIELD, None)
+    if effort:
+        configurable[REASONING_EFFORT_FIELD] = effort
+    return {**kwargs, "config": {**config, "configurable": configurable}}
+
+
+def _reasoning_effort_of(model: Any) -> str:
+    config = getattr(model, "config", None)
+    configurable = (config or {}).get("configurable") if isinstance(config, dict) else None
+    return str((configurable or {}).get(REASONING_EFFORT_FIELD) or "")
 
 
 def _bloodhound_env_or_empty(request: ChatRequest) -> dict[str, str]:
@@ -315,8 +349,8 @@ def _claim_outstanding(record: dict[str, Any]) -> bool:
 
 
 SETTINGS_CONTINUED_NOTICE = (
-    "Applied this chat's updated OpenAI settings (OpenAI API, OpenAI Daybreak or OpenAI Safety "
-    "Identifier). The "
+    "Applied this chat's updated OpenAI settings (OpenAI API, OpenAI Daybreak, OpenAI Safety "
+    "Identifier or Reasoning Effort). The "
     "conversation continues with its earlier messages; the model, provider and endpoint are unchanged."
 )
 MODEL_CHANGED_NOTICE = (
@@ -1421,7 +1455,8 @@ class SageChat(Chat):
         config_signature: str,
         core_signature: str,
     ) -> Any | None:
-        """Rebuild an idle session on its own generation when only the model or OpenAI route settings changed.
+        """Rebuild an idle session on its own generation when only the model, OpenAI route settings or reasoning
+        effort changed.
 
         Returns the new registered Model; the existing Model, marked held, when an approval, decision or
         controller step is outstanding (consent never crosses a model change); or ``None`` to keep today's
@@ -1466,7 +1501,7 @@ class SageChat(Chat):
         model._settings_continuation_notice = _settings_notice(
             str(getattr(existing, "model", "") or ""), str(getattr(model, "model", "") or "")
         )
-        logger.info("Applied changed model or OpenAI route settings on the channel's existing generation")
+        logger.info("Applied changed model, OpenAI route or reasoning effort settings on the channel's existing generation")
         return model
 
     async def _construct_model(self, kwargs: dict[str, Any]) -> Any:
@@ -1539,6 +1574,7 @@ class SageChat(Chat):
             "config_signature": str(getattr(model, "_chat_request_config_signature", "") or ""),
             "core_signature": str(getattr(model, "_chat_request_core_signature", "") or ""),
             "model": str(getattr(model, "model", "") or ""),
+            REASONING_EFFORT_FIELD: _reasoning_effort_of(model),
             "base_autonomous_solve": bool(
                 getattr(model, "_chat_request_base_autonomous_solve", False)
             ),
@@ -1761,14 +1797,15 @@ class SageChat(Chat):
                 f"its saved conversation is unreadable ({type(exc).__name__})"
             ), []
         await put_channel_session(request, model)
-        if "model" not in record:
-            # Saved before the model joined the continuable settings: record it and the current core
-            # signature now, so later changes compare like with like.
+        if REASONING_EFFORT_FIELD not in record:
+            # Saved before the model or reasoning effort joined the continuable settings: record them and the
+            # current core signature now, so later changes compare like with like.
             try:
                 await update_channel_session_record(
                     operation_id, channel_id, expected_thread_id=thread_id,
                     core_signature=str(getattr(model, "_chat_request_core_signature", "") or ""),
                     model=str(getattr(model, "model", "") or ""),
+                    **{REASONING_EFFORT_FIELD: _reasoning_effort_of(model)},
                 )
             except Exception:
                 logger.warning("Channel record was not upgraded; it is checked again next restart", exc_info=True)
@@ -1779,22 +1816,31 @@ class SageChat(Chat):
     async def _continuable_from(
         self, record: dict[str, Any], kwargs: dict[str, Any], bloodhound_env: dict[str, str]
     ) -> str | None:
-        """The model the record was saved with, when only the model or OpenAI route settings changed; else None.
+        """The model the record was saved with, when only the model, OpenAI route settings or reasoning effort
+        changed; else None.
 
-        A record saved before the model became continuable stores a core signature that includes the model
-        and no model value. A route-only change matches it directly; a model change is proven only when the
-        same signature, rebuilt with a model name this generation's own checkpoint recorded, matches it.
+        A current record stores its reasoning effort and a core signature without it. A record saved before
+        the effort became continuable stores a core signature that includes the effort: a match rebuilt with
+        one of the effort's few possible values proves only the effort changed. A record saved before the
+        model became continuable also includes the model and stores no model value: a model change is proven
+        only when the signature, rebuilt with a model name this generation's own checkpoint recorded, matches.
         Anything else keeps the refusal.
         """
         core = str(record.get("core_signature") or "")
         if not core:
             return None
+        if REASONING_EFFORT_FIELD in record:
+            return str(record.get("model") or "") if core == _core_config_signature(kwargs, bloodhound_env) else None
+        efforts = [_with_reasoning_effort(kwargs, effort) for effort in _REASONING_EFFORT_VALUES]
         if "model" in record:
-            return str(record["model"]) if core == _core_config_signature(kwargs, bloodhound_env) else None
-        if core == _route_only_core_signature(kwargs, bloodhound_env):
+            if any(core == _effort_bound_core_signature(item, bloodhound_env) for item in efforts):
+                return str(record["model"])
+            return None
+        if any(core == _route_only_core_signature(item, bloodhound_env) for item in efforts):
             return str(kwargs.get("model") or "")
         for candidate in await self._checkpoint_model_names(str(record.get("thread_id") or "")):
-            if core == _route_only_core_signature({**kwargs, "model": candidate}, bloodhound_env):
+            if any(core == _route_only_core_signature({**item, "model": candidate}, bloodhound_env)
+                   for item in efforts):
                 return candidate
         return None
 

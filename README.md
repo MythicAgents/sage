@@ -609,6 +609,7 @@ Model settings resolve through the chain above. The main settings are:
 | `SAGE_OPENAI_API` | **OpenAI API**: blank keeps the adapter's usual route; `chat_completions` or `responses` selects one (OpenAI provider only) |
 | `SAGE_OPENAI_ACCESS_PROGRAM` | **OpenAI Daybreak**: `standard` (Off), `daybreak_blue` or `daybreak_red`; Responses only, and blank sends Off |
 | `SAGE_OPENAI_SAFETY_IDENTIFIER` | **OpenAI Safety Identifier**: a stable pseudonym for the person using the chat, sent as `safety_identifier` |
+| `SAGE_REASONING_EFFORT` | **Reasoning Effort**: blank sends no effort (the provider's default for the model); `none`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max` is sent as chosen (OpenAI provider only) |
 
 **Providers.** The four above are the tested set. Sage builds the model through LangChain's `init_chat_model`, so
 other providers it supports may work but are unverified. Bedrock is the only provider with dedicated AWS
@@ -636,10 +637,25 @@ on a single user instead of the whole organization. Sage never derives one from 
 pseudonym for the same person. Invalid combinations (Daybreak without Responses, any of these with a non-OpenAI
 provider) fail before any request. When the provider rejects a route (for example a Responses-only model on Chat
 Completions, or a Daybreak access error), the error names the setting to change and says whether the chat continues.
-Changing **Model** (or running `/model <name>`), **OpenAI API**, **OpenAI Daybreak** or **OpenAI Safety Identifier**
-continues the same chat with its conversation, and a fix made in the OpenAI project without changing Sage's settings
-is retried in the same chat. Changing the API key, provider or API endpoint starts a new chat. Sage never switches
-the model, provider, endpoint or API on its own.
+Changing **Model** (or running `/model <name>`), **OpenAI API**, **OpenAI Daybreak**, **OpenAI Safety Identifier** or
+**Reasoning Effort** continues the same chat with its conversation, and a fix made in the OpenAI project without
+changing Sage's settings is retried in the same chat. Changing the API key, provider or API endpoint starts a new
+chat. Sage never switches the model, provider, endpoint, API or reasoning effort on its own.
+
+**Reasoning effort and tools.** **Reasoning Effort** resolves like every other setting: the chat's field, then the
+`SAGE_REASONING_EFFORT` user secret, then the environment. Blank all the way through sends no effort, so the
+provider's default for the model applies; that is not the same as **None**, which Sage sends as an explicit value.
+Supported values depend on the model, so check its model page: for example, OpenAI documents that GPT-6.1 Sol does
+not accept None. Several OpenAI reasoning models accept function tools together with a reasoning effort only on the
+Responses API; on Chat Completions the provider answers `Function tools with reasoning_effort are not supported …`.
+Sage's tools are always offered, so for a reasoning model with tools set **OpenAI API** to **Responses** and choose an
+effort the model supports. The supported setup for GPT-5.6 Sol and GPT-6.1 Sol with tools is **OpenAI API = Responses**,
+**Reasoning Effort = Low** and **OpenAI Daybreak = Off**. When the provider refuses an API or effort combination, the
+error names the setting, the effort Sage sent and where that value came from, and the change to make; correcting it
+continues the same chat. Sage 0.3.0 cannot select the Responses API from a chat's settings: if the chat's model
+settings do not list **OpenAI API**, upgrade Sage first. Through an OpenAI-compatible proxy (`API_ENDPOINT`), the proxy
+decides which route and efforts reach the model; Sage sends what you selected and does not infer a proxy's
+capabilities from a model name.
 
 **Changing the model.** Edit the chat's **Model** setting, click the Model chip, or run `/model <name>` (`/model`
 alone shows the model and where its value comes from). `/model <name>` writes the chat's Model setting in Mythic, so

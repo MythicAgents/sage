@@ -145,11 +145,17 @@ _CONFIG_OPTIONS = [
         Name="SAGE_REASONING_EFFORT",
         DisplayName="Reasoning Effort",
         Type=OptType.Choice,
-        Description="Optional OpenAI-compatible setting. Blank uses SAGE_REASONING_EFFORT from the environment if set, otherwise the provider default. Select none to disable reasoning.",
+        Description=(
+            "Optional; applies to the OpenAI provider. Use configured default falls back to the "
+            "SAGE_REASONING_EFFORT user secret, then the container environment; with neither, Sage sends no "
+            "effort and the provider's default for the model applies. A value chosen here, None included, is "
+            "sent as chosen. Supported values depend on the model: some models reject None, and some accept "
+            "function tools with reasoning only when OpenAI API = Responses. Changing it continues this chat."
+        ),
         Required=False,
         DefaultValue="",
         Choices=[
-            ChatModelConfigurationOptionChoice(Label="Use environment/default", Value=""),
+            ChatModelConfigurationOptionChoice(Label="Use configured default", Value=""),
             ChatModelConfigurationOptionChoice(Label="None", Value="none"),
             ChatModelConfigurationOptionChoice(Label="Minimal", Value="minimal"),
             ChatModelConfigurationOptionChoice(Label="Low", Value="low"),
@@ -158,6 +164,10 @@ _CONFIG_OPTIONS = [
             ChatModelConfigurationOptionChoice(Label="Extra high", Value="xhigh"),
             ChatModelConfigurationOptionChoice(Label="Maximum", Value="max"),
         ],
+        HelpText=(
+            "Resolution order: this field → the SAGE_REASONING_EFFORT user secret → the container environment → "
+            "not sent (the provider's default for the model)."
+        ),
     ),
     ChatModelConfigurationOption(
         Name="SAGE_PROVIDER_RETRY_POLICY",

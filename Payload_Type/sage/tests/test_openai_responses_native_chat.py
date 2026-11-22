@@ -900,7 +900,8 @@ def _restart_on_a_dev_record(monkeypatch, second_config, *, served_model_suffix:
         first_request = request(LABEL_PROMPT, 1, first_config)
         await first.chat.chat(first_request)
         record = await load_channel_session_record(OPERATION, CHANNEL)
-        legacy = {k: v for k, v in record.items() if k != "model"}
+        # A record that version wrote had neither the model nor the later reasoning-effort field.
+        legacy = {k: v for k, v in record.items() if k not in {"model", "reasoning_effort"}}
         legacy["core_signature"] = _dev_core_signature(first_request)
         await chat_session.save_channel_session_record(legacy)
         second = await _restarted(first)

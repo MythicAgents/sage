@@ -431,7 +431,8 @@ CYBER = {"SAGE_OPENAI_API": "responses", "SAGE_OPENAI_ACCESS_PROGRAM": "daybreak
 def test_route_setting_fixes_promise_the_conversation_continues(status, error):
     notice = _notice(status, error, **CYBER)
     assert KEEPS in notice
-    assert "OpenAI API, OpenAI Daybreak or OpenAI Safety Identifier" in notice
+    # Changed expectation (reasoning-tool recovery plan, claim): Reasoning Effort now continues the chat too.
+    assert "OpenAI API, OpenAI Daybreak, OpenAI Safety Identifier or Reasoning Effort" in notice
 
 
 def test_responses_only_404_on_chat_completions_promises_continuation():

@@ -18,6 +18,10 @@ The main model settings are:
 | `autonomous_solve` | Enable objective-led solving in `supervised` mode; each guarded action still needs approval. `auto` always enables it. Ignored in `conversation`, which stays read-only; Sage says so once in the chat |
 | `policy_mode` | `hybrid` (default), `symbolic`, or `llm` capability selection |
 | `max_steps` | Model-step ceiling per chat request; unset defaults to `200`, `0` means unlimited |
+| `SAGE_OPENAI_API` | **OpenAI API**: blank keeps the adapter's usual route; `chat_completions` or `responses` selects one (OpenAI provider only) |
+| `SAGE_OPENAI_ACCESS_PROGRAM` | **OpenAI Daybreak**: `standard` (Off), `daybreak_blue` or `daybreak_red`; Responses only, and blank sends Off |
+| `SAGE_OPENAI_SAFETY_IDENTIFIER` | **OpenAI Safety Identifier**: optional stable pseudonym for the person using the chat |
+| `SAGE_REASONING_EFFORT` | **Reasoning Effort**: blank sends no effort; `none` through `max` is sent as chosen (OpenAI provider only) |
 
 ## Providers
 
@@ -33,6 +37,20 @@ Selecting `provider: openai` does not tie you to OpenAI. It speaks the
 and gateways implement — so you can set `API_ENDPOINT` to any server that exposes it: a self-hosted model, an
 internal gateway, or a proxy. For example, run a [LiteLLM](https://docs.litellm.ai/docs/simple_proxy) proxy and
 point `API_ENDPOINT` at it to reach 100+ providers behind a single OpenAI-compatible endpoint.
+
+## Reasoning effort and tools
+
+**Reasoning Effort** follows the same chain. Blank at every layer sends no effort, so the provider's default for
+the model applies; that differs from **None**, which Sage sends as an explicit value. Supported values depend on
+the model, so check its model page (OpenAI documents that GPT-6.1 Sol does not accept None). Several OpenAI
+reasoning models accept function tools with a reasoning effort only on the Responses API, and Sage always offers
+its tools, so for those models set **OpenAI API** to **Responses** and pick an effort the model supports. The
+supported setup for GPT-5.6 Sol and GPT-6.1 Sol with tools is **OpenAI API = Responses**, **Reasoning Effort =
+Low** and **OpenAI Daybreak = Off**. If the provider refuses an API or effort combination, the error names the
+setting, the effort sent and its source, and the change to make; changing **OpenAI API** or **Reasoning Effort**
+continues the same chat. Sage 0.3.0 cannot select the Responses API from a chat's settings: if the chat's model
+settings do not list **OpenAI API**, upgrade Sage first. Through a proxy, the proxy decides which route and efforts
+reach the model; Sage does not infer them from a model name.
 
 ## Policy
 
