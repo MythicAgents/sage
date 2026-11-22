@@ -4,16 +4,18 @@ imported.
 Mythic keeps a credential row's task link when an operator rewrites the row (`UpdateCredentialWebhook` never updates
 `task_id`), so the link alone does not say where the current text came from. Store proof therefore re-checks content
 at every use. The row's text must be one of three things: a string value of its task's `original_params` (an
-import); a key or hash that the credential parser reads from its task's output; or, for other text, a whole token of
+import) or of a JSON document one of its response rows holds (a value its completion function read from printed
+JSON); a key or hash that the credential parser reads from its task's output; or, for other text, a whole token of
 that output.
 
 Every consumer of store proof runs through Sage's real credential readers: forge binding at grounding and after
 Accept, the supervised step and operation-reconcile ledger writers, and the gate's corroboration probe. Only Mythic's
 GraphQL transport is faked. It serves the recorded shapes (`original_params` JSON, `task.responses[].response_text`
-base64) and returns exactly the fields a query selects. All values are synthetic. The ticket-import and dcsync-key
-shapes follow archived Mythic records (ticket rows linked to their import task; dcsync output whose keys the parser
-reads). No recorded task-linked hex or plaintext row exists, so those links are synthetic, and the whole-token
-plaintext form is synthetic throughout.
+base64) and returns exactly the fields a query selects. All values are synthetic. The ticket-import, ticket-extract
+and dcsync-key shapes follow archived Mythic records (ticket rows linked to their import task; a ticket row linked
+to the `ticket_cache_extract` task that printed it as JSON; dcsync output whose keys the parser reads). No recorded
+task-linked hex or plaintext row exists, so those links are synthetic, and the whole-token plaintext form is
+synthetic throughout.
 """
 
 from __future__ import annotations
@@ -50,10 +52,11 @@ SPACED = "rain on the wall 26"
 # same task's output (CRLF lines); the value may hold spaces.
 APOLLO_PASSWORD_OUTPUT = f"  Username : svc.backup\r\n  Domain   : LAB\r\n  Password : {SPACED}\r\n"
 TICKET = "doIFujCCBbag" + "AwIBBaEDAgEWooIEvzCCBLthggS3MIIEs6ADAgEFoQ8bDUxBQi5MT0NBTKIiMCCgAwIBAqEZ" * 30
-SECRETS = (AES, NTLM, SVC_NTLM, ROTATED, PLAIN, SPACED, TICKET)
+EXTRACTED = TICKET[:40] + "/+" + TICKET[40:200] + "/" + TICKET[200:]  # a real base64 ticket holds '/'
+SECRETS = (AES, NTLM, SVC_NTLM, ROTATED, PLAIN, SPACED, TICKET, EXTRACTED)
 CONTENT_REASON = "no proven gain (the entry's current text is not a value its producing task produced or imported)"
 
-DUMP_TASK, CLEARTEXT_TASK, FAILED_DUMP_TASK, IMPORT_TASK = 21, 22, 23, 40
+DUMP_TASK, CLEARTEXT_TASK, FAILED_DUMP_TASK, IMPORT_TASK, EXTRACT_TASK = 21, 22, 23, 40, 41
 
 
 def _dump_output(aes_line: str | None = None) -> str:
@@ -99,6 +102,24 @@ def _import_task(ticket_param: str = TICKET) -> dict:
                  "[*] Imported the ticket into the current logon session.\n")
 
 
+def _extract_task(*, escaped: bool = True) -> dict:
+    """Apollo's `ticket_cache_extract`, as recorded: the agent prints the ticket as JSON through .NET's
+    `DataContractJsonSerializer`, which writes '/' as '\\/'. Its completion function `json.loads` each response row,
+    registers the unescaped ticket linked to this task, and adds a response saying so."""
+    body = {"luid": "0x3e7", "client_fullname": "Administrator@LAB.LOCAL",
+            "service_fullname": "krbtgt/LAB.LOCAL@LAB.LOCAL", "ticket": EXTRACTED}
+    printed = json.dumps(body, separators=(",", ":"))
+    task = _task(EXTRACT_TASK, "ticket_cache_extract", {"service": "krbtgt"},
+                 printed.replace("/", "\\/") if escaped else printed)
+    added = "\nAdded credential to Mythic for Administrator@LAB.LOCAL"
+    task["responses"].append({"id": 9100 + EXTRACT_TASK, "response_text": base64.b64encode(added.encode()).decode()})
+    return task
+
+
+def _extracted_row(text: str = EXTRACTED, *, escaped: bool = True) -> dict:
+    return _row(610, "Administrator@LAB.LOCAL", "ticket", text, _extract_task(escaped=escaped), realm="LAB.LOCAL")
+
+
 def _failed_dump_task() -> dict:
     return _task(FAILED_DUMP_TASK, "execute_pe",
                  {"pe_name": "mimikatz.exe", "pe_arguments": '"lsadump::dcsync /domain:lab.local /user:krbtgt" exit'},
@@ -135,6 +156,8 @@ ACCEPTED = {
     "A-import": lambda: _ticket_row(),
     "A-row-whitespace": lambda: _ticket_row(f"  {TICKET}\n"),
     "A-param-whitespace": lambda: _ticket_row(task=_import_task(f"{TICKET}\n")),
+    "A-printed-json": lambda: _extracted_row(),
+    "A-printed-json-unescaped": lambda: _extracted_row(escaped=False),
     "B-aes-key": lambda: _key_row(),
     "B-ntlm-hash": lambda: _hash_row(),
     "B-uppercase": lambda: _key_row(AES.upper()),
@@ -152,6 +175,8 @@ NEAR_MATCHES = {
     "ticket-case": lambda: _ticket_row(TICKET.swapcase()),
     "ticket-truncated": lambda: _ticket_row(TICKET[:-12]),
     "param-substring": lambda: _row(800, "krbtgt", "plaintext", "krbtgt", _failed_dump_task()),
+    "printed-json-truncated": lambda: _extracted_row(EXTRACTED[:-12]),
+    "printed-json-substring": lambda: _extracted_row("LAB.LOCAL"),  # part of the printed client and service names
     "inside-longer-token": lambda: _plain_row(PLAIN[:-2]),
     "spaced-value-truncated": lambda: _plain_row(SPACED[:-1], task=_cleartext_task(APOLLO_PASSWORD_OUTPUT)),
 }

@@ -1311,7 +1311,12 @@ def _credential_source(task: Any) -> str:
 
 
 def _task_response_text(responses: Any) -> str:
-    """The plain text of a task's Mythic response rows, in order. ``response_text`` arrives base64-encoded."""
+    """The plain text of a task's Mythic response rows, in order, one row per line."""
+    return "\n".join(_task_response_chunks(responses))
+
+
+def _task_response_chunks(responses: Any) -> list[str]:
+    """The plain text of each of a task's Mythic response rows, in order. ``response_text`` arrives base64-encoded."""
     chunks: list[str] = []
     for item in responses if isinstance(responses, list) else [responses]:
         if isinstance(item, bytes):
@@ -1332,7 +1337,7 @@ def _task_response_text(responses: Any) -> str:
             except Exception:
                 pass
             chunks.append(text)
-    return "\n".join(chunk for chunk in chunks if chunk)
+    return [chunk for chunk in chunks if chunk]
 
 
 _KEY_WIDTH_HEX = re.compile(r"[0-9a-fA-F]{32}|[0-9a-fA-F]{64}")
@@ -1361,10 +1366,12 @@ def _credential_row_content_proved(credential: Any) -> bool:
     """True when a task-linked credential row's current text is a value its source task produced or imported.
 
     Mythic keeps a row's task link when an operator rewrites its text, so the link alone does not say where the text
-    came from. The text, stripped, must be one of: (A) a string value of the task's ``original_params`` (an import);
-    (B) for a 32- or 64-hex key or hash, a value the credential parser reads from the task's output; or (C) for other
-    text, a whole token of that output: it occurs with whitespace, a quote or the output's edge on each side. A value
-    may hold spaces, as agents' completion functions report a password split from a ``Password : <value>`` line.
+    came from. The text, stripped, must be one of: (A) a string value of the task's ``original_params`` (an import),
+    or of a JSON document one of its response rows holds (an agent's completion function reads the value from JSON
+    the task printed, so JSON escapes such as ``\\/`` do not change it); (B) for a 32- or 64-hex key or hash, a value
+    the credential parser reads from the task's output; or (C) for other text, a whole token of that output: it occurs
+    with whitespace, a quote or the output's edge on each side. A value may hold spaces, as agents' completion
+    functions report a password split from a ``Password : <value>`` line.
     """
     task = credential.get("task") if isinstance(credential, dict) else None
     if not isinstance(task, dict):
@@ -1374,7 +1381,10 @@ def _credential_row_content_proved(credential: Any) -> bool:
         return False
     if value in _json_string_values(task.get("original_params")):
         return True
-    output = _task_response_text(task.get("responses") or [])
+    chunks = _task_response_chunks(task.get("responses") or [])
+    if any(value in _json_string_values(chunk) for chunk in chunks):
+        return True
+    output = "\n".join(chunks)
     if not output:
         return False
     if _KEY_WIDTH_HEX.fullmatch(value):
