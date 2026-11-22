@@ -24,6 +24,11 @@ httpx==0.28.1
 # Typed synthetic tool schemas in the inert native-chat graph comparison runner.
 pydantic==2.13.4
 
+# `skills/sage-focused-capability-tests/tests/test_check_reasoning_tools.py` drives the OpenAI SDK client
+# directly to prove a captured provider 400 stays a typed SDK error. It arrives transitively through
+# langchain-openai; the pin matches constraints.txt.
+openai==2.54.0
+
 # Operator-skill dependency, not a runtime one. `skills/sage-goad-reset/scripts/sync_range_time.py`
 # imports `winrm` to set Windows guest clocks over WinRM after a range rollback — a step AGENTS.md
 # calls mandatory after *every* rollback. Undeclared, a clean checkout hits
