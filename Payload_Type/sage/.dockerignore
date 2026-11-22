@@ -10,6 +10,8 @@ __pycache__
 # Secrets and machine-local configuration
 .env
 .env.*
+# Nested env files too, such as the Codex worker's settings: an operator's key must never reach an image layer.
+**/.env
 certs/*.pem
 
 # Operator-supplied tool binaries. Sage ships none; a local build must not bake an operator's drop zone into an

@@ -301,3 +301,80 @@ def test_fifth_connection_gets_a_busy_error_and_oversize_lines_end_the_connectio
     assert any(e.get("event") == "cleanup" and e.get("reason") == "oversize message from client"
                for e in worker.events())
     assert worker.adapters() == [] and worker.state_entries() == []
+
+
+CODEX_DIR = Path(__file__).resolve().parents[1] / "container" / "codex"
+
+
+def test_shipped_compose_file_and_env_run_the_worker(runtime_db, worker_root, monkeypatch):
+    """The repository's docker-compose.yml and .env, as a Mythic user runs them, with test-only overrides.
+
+    The copy's `.env` keeps every shipped line and only fills in the key (the sentinel), a default model and
+    `SAGE_CODEX_NETWORK=none`, plus a unique container name and a short socket directory for this test.
+    """
+    copy = worker_root / "codex"
+    shutil.copytree(CODEX_DIR, copy)
+    sockets = worker_root / "sock"
+    sockets.mkdir(mode=0o700)
+    project = f"sage-codex-test-{uuid.uuid4().hex[:8]}"
+    shipped = (copy / ".env").read_text()
+    for line in ("CODEX_API_KEY=", "CODEX_MODEL=", "SAGE_CODEX_NETWORK=bridge"):
+        assert f"\n{line}\n" in f"\n{shipped}"
+    settings = (shipped.replace("\nCODEX_API_KEY=\n", f"\nCODEX_API_KEY={SENTINEL}\n")
+                .replace("\nCODEX_MODEL=\n", "\nCODEX_MODEL=gpt-6.2-astra\n")
+                .replace("\nSAGE_CODEX_NETWORK=bridge\n", "\nSAGE_CODEX_NETWORK=none\n"))
+    settings += (f"SAGE_CODEX_UID={os.getuid()}\nSAGE_CODEX_GID={os.getgid()}\n"
+                 f"SAGE_CODEX_CONTAINER={project}\nSAGE_ACP_SOCKET_DIR={sockets}\n")
+    (copy / ".env").write_text(settings)
+
+    def compose(*args, timeout=600):
+        return subprocess.run(["docker", "compose", "-p", project, *args], cwd=copy, capture_output=True,
+                              text=True, timeout=timeout)
+
+    try:
+        started = compose("up", "-d", "--build")
+        assert started.returncode == 0, started.stderr[-2000:]
+        deadline = time.monotonic() + 30
+        logs = ""
+        while time.monotonic() < deadline and '"event":"listening"' not in logs:
+            time.sleep(0.2)
+            logs = _docker("logs", project, check=False).stdout
+        listening = json.loads(next(line for line in logs.splitlines() if '"event":"listening"' in line))
+        assert listening["api_key_provisioned"] is True and listening["default_model"] == "gpt-6.2-astra"
+        assert listening["uid"] == os.getuid()
+        monkeypatch.setenv("SAGE_ACP_SOCKET", str(sockets / "acp.sock"))
+
+        async def scenario():
+            chat = _NoModelChat()
+            connected = await _send(chat, "connect codex", channel_id=9)
+            await _send(chat, "disconnect", channel_id=9)
+            return connected
+
+        connected = asyncio.run(scenario())
+        assert "| Transport | `connected` |" in connected
+        assert "| Authentication (observed) | `authenticated` |" in connected
+        assert "| Effective model | `gpt-6.2-astra` |" in connected     # the .env default, not Codex's own
+        inspect = json.loads(_docker("inspect", project).stdout)[0]
+        assert inspect["HostConfig"]["ReadonlyRootfs"] is True and inspect["HostConfig"]["NetworkMode"] == "none"
+        assert SENTINEL not in _docker("logs", project, check=False).stdout
+        assert SENTINEL not in connected
+    finally:
+        compose("down", timeout=120)
+
+
+def test_an_unsafe_default_model_is_refused(workers, worker_root):
+    root = worker_root / "bad"
+    root.mkdir()
+    worker = Worker(root, key=False)
+    uid, gid = os.getuid(), os.getgid()
+    _docker("run", "-d", "--name", worker.name, "--init", "--network", "none", "--read-only", "--user", f"{uid}:{gid}",
+            "--tmpfs", f"/state:mode=0700,uid={uid},gid={gid}", "-e", 'CODEX_MODEL=x"\nmodel = "y',
+            "-v", f"{root / 'transport'}:/transport", IMAGE)
+    try:
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and '"event":"listening"' not in worker.logs():
+            time.sleep(0.2)
+        listening = json.loads(next(line for line in worker.logs().splitlines() if '"event":"listening"' in line))
+        assert listening["default_model"] is None and listening["default_model_refused"] is True
+    finally:
+        worker.remove()

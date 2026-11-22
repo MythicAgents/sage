@@ -1,8 +1,9 @@
 // Private Unix-socket bridge from Sage to the Codex ACP adapter's stdio.
 //
 // Each accepted connection gets its own adapter process (own process group), working directory and
-// CODEX_HOME under /state, a copy of the read-only Codex configuration template, and the mounted API-key secret
-// in the child's environment when one is provisioned. ACP's newline-delimited JSON-RPC is relayed byte for byte;
+// CODEX_HOME under /state, a copy of the read-only Codex configuration template (or, without one, a configuration
+// holding only the default model from CODEX_MODEL), and the mounted API-key secret in the child's environment when
+// one is provisioned (a mounted secret file, or CODEX_API_KEY). ACP's newline-delimited JSON-RPC is relayed byte for byte;
 // the bridge reads only each message's method/id to log what crossed it, never its parameters. A line over 1 MiB
 // in either direction ends the connection. End of stream, error or shutdown closes the adapter's stdin, then
 // sends TERM and KILL to its process group within five seconds, and removes the connection's state directory.
@@ -17,6 +18,10 @@ const SOCKET = "/transport/acp.sock";
 const STATE_ROOT = "/state";
 const CONFIG_TEMPLATE = "/config/config.toml";
 const SECRET_FILE = "/run/secrets/codex_api_key";
+// A model ID only: written into TOML, so anything that could break out of the quoted string is refused.
+const MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,99}$/;
+const DEFAULT_MODEL = (process.env.CODEX_MODEL || "").trim();
+const DEFAULT_MODEL_OK = DEFAULT_MODEL !== "" && MODEL_PATTERN.test(DEFAULT_MODEL);
 const ADAPTER = [process.execPath, "/opt/codex-acp/node_modules/@agentclientprotocol/codex-acp/dist/index.js"];
 const MAX_CONNECTIONS = 4;
 const MAX_LINE_BYTES = 1024 * 1024;
@@ -37,12 +42,14 @@ function log(event) {
   process.stdout.write(`${JSON.stringify({ time: new Date().toISOString(), ...event })}\n`);
 }
 
+// The key comes from a mounted secret file when one is provided, otherwise from CODEX_API_KEY (the compose file's
+// `.env`). Only the adapter process receives it.
 function readSecret() {
   try {
-    return fs.readFileSync(SECRET_FILE, "utf8").trim();
-  } catch {
-    return "";
-  }
+    const value = fs.readFileSync(SECRET_FILE, "utf8").trim();
+    if (value) return value;
+  } catch {}
+  return (process.env.CODEX_API_KEY || "").trim();
 }
 
 function describe(line) {
@@ -136,6 +143,8 @@ function serve(socket) {
   if (fs.existsSync(CONFIG_TEMPLATE)) {
     fs.copyFileSync(CONFIG_TEMPLATE, path.join(codexHome, "config.toml"));
     fs.chmodSync(path.join(codexHome, "config.toml"), 0o600);
+  } else if (DEFAULT_MODEL_OK) {
+    fs.writeFileSync(path.join(codexHome, "config.toml"), `model = "${DEFAULT_MODEL}"\n`, { mode: 0o600 });
   }
   const secret = readSecret();
   const env = { PATH: "/usr/local/bin:/usr/bin:/bin", HOME: dir, CODEX_HOME: codexHome };
@@ -230,7 +239,8 @@ server.listen(SOCKET, () => {
   fs.chmodSync(SOCKET, 0o600);
   log({ event: "listening", socket: SOCKET, uid: process.getuid(), gid: process.getgid(),
         max_connections: MAX_CONNECTIONS, api_key_provisioned: Boolean(readSecret()),
-        config_template: fs.existsSync(CONFIG_TEMPLATE) });
+        config_template: fs.existsSync(CONFIG_TEMPLATE), default_model: DEFAULT_MODEL_OK ? DEFAULT_MODEL : null,
+        default_model_refused: DEFAULT_MODEL !== "" && !DEFAULT_MODEL_OK });
 });
 
 async function shutdown(signal) {

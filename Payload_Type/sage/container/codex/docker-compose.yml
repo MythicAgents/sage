@@ -1,0 +1,31 @@
+# Optional Codex worker for Sage's `/acp` command, on the same Docker host as the Sage container.
+# Settings come from `.env` beside this file. From this directory: docker compose up -d --build
+# See SETUP.md. No Docker socket, published port or privileged mode is used; only the socket directory is shared.
+name: sage-codex
+
+services:
+  sage-codex:
+    build: .
+    image: sage-codex-acp:2.9.0
+    container_name: ${SAGE_CODEX_CONTAINER:-sage-codex}
+    init: true                                  # reaps the adapter's child processes
+    user: "${SAGE_CODEX_UID:-1000}:${SAGE_CODEX_GID:-1000}"
+    network_mode: ${SAGE_CODEX_NETWORK:-bridge}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 512
+    mem_limit: 2g
+    environment:
+      # Compose cannot give a read-only service an environment-sourced secret, so the key is an environment
+      # variable; the bridge passes it only to the Codex adapter.
+      CODEX_API_KEY: ${CODEX_API_KEY:-}
+      CODEX_MODEL: ${CODEX_MODEL:-}
+    tmpfs:
+      - /state:mode=0700,uid=${SAGE_CODEX_UID:-1000},gid=${SAGE_CODEX_GID:-1000}
+      - /tmp:mode=1777
+    volumes:
+      # Sage's service directory holds this file at container/codex/, so ../../.sage_acp is the socket directory
+      # Sage sees as /Mythic/.sage_acp.
+      - ${SAGE_ACP_SOCKET_DIR:-../../.sage_acp}:/transport
+    restart: unless-stopped

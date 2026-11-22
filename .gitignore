@@ -60,6 +60,8 @@ Payload_Type/sage/sage*.db*
 # Your local edits to it will still show in `git status` — .gitignore does not apply to a tracked
 # file. Use `git update-index --skip-worktree Payload_Type/sage/.env` if you want them hidden.
 !Payload_Type/sage/.env
+# Same for the optional Codex worker's settings, edited in place from Mythic (container/codex/SETUP.md).
+!Payload_Type/sage/container/codex/.env
 # Local overrides beside it stay private — only the committed template is tracked.
 .env.*
 !.env.example

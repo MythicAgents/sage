@@ -295,10 +295,13 @@ def _seed_missing_env_files(source: Path, destination: Path) -> list:
     rather than merely unset. Seeding when absent keeps both properties, and never overwrites.
     """
     seeded = []
-    for name in (".env",):
+    # The Codex worker's settings (`container/codex/.env`) follow the same rule: the sync excludes every `.env`, so a
+    # first deploy needs the shipped, credential-free copy for a Mythic user to edit in place.
+    for name in (".env", "container/codex/.env"):
         src = source / name
         dst = destination / name
         if src.is_file() and not dst.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
             seeded.append(name)
     return seeded

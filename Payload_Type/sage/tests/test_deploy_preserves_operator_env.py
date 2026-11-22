@@ -85,3 +85,33 @@ def test_an_existing_env_is_never_overwritten(deployment, tmp_path: Path):
 
     assert seeded == []
     assert "bh.operator.example" in (destination / ".env").read_text(encoding="utf-8")
+
+
+WORKER_ENV = Path("container") / "codex" / ".env"
+
+
+def test_codex_worker_env_is_seeded_on_a_first_deploy_and_kept_after(deployment, tmp_path: Path):
+    """The Codex worker's settings are edited in place from Mythic, exactly like Sage's own `.env`."""
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    (source / WORKER_ENV.parent).mkdir(parents=True)
+    destination.mkdir()
+    (source / WORKER_ENV).write_text("CODEX_API_KEY=\n", encoding="utf-8")
+
+    assert deployment._seed_missing_env_files(source, destination) == [str(WORKER_ENV)]
+    assert (destination / WORKER_ENV).read_text(encoding="utf-8") == "CODEX_API_KEY=\n"
+
+    (destination / WORKER_ENV).write_text("CODEX_API_KEY=operator-value\n", encoding="utf-8")
+    assert deployment._seed_missing_env_files(source, destination) == []
+    assert "operator-value" in (destination / WORKER_ENV).read_text(encoding="utf-8")
+
+
+def test_shipped_codex_worker_env_is_credential_free_and_never_in_an_image():
+    shipped = (REPO_ROOT / "Payload_Type" / "sage" / WORKER_ENV).read_text(encoding="utf-8")
+    values = dict(line.split("=", 1) for line in shipped.splitlines() if line and not line.startswith("#"))
+    assert values["CODEX_API_KEY"].strip() == "", "the tracked worker .env must ship without a key"
+    assert {"CODEX_API_KEY", "CODEX_MODEL", "SAGE_CODEX_UID", "SAGE_CODEX_GID", "SAGE_CODEX_NETWORK"} <= set(values)
+    sage_ignore = (REPO_ROOT / "Payload_Type" / "sage" / ".dockerignore").read_text(encoding="utf-8").splitlines()
+    worker_ignore = (REPO_ROOT / "Payload_Type" / "sage" / "container" / "codex" / ".dockerignore").read_text(
+        encoding="utf-8").splitlines()
+    assert "**/.env" in sage_ignore and ".env" in worker_ignore
