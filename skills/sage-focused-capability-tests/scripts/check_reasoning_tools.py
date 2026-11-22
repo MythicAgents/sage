@@ -319,6 +319,19 @@ def rejection_kind(exchange: dict[str, Any]) -> str:
                              str(error.get("param") or ""), str(error.get("message") or ""))
 
 
+def independent_rejection(exchange: dict[str, Any], kind: str) -> bool:
+    """The check's own reading of the provider's 400, independent of the classifier under test."""
+    error = exchange["reply"].get("error") if isinstance(exchange["reply"].get("error"), dict) else {}
+    text = " ".join(str(error.get("message") or "").casefold().split())
+    names_effort = bool(re.search(r"reasoning[ _.]effort", text)) or str(error.get("param") or "") in {
+        "reasoning_effort", "reasoning.effort"}
+    if int(exchange.get("status") or 0) != 400 or not names_effort:
+        return False
+    if kind == "tools_with_effort":
+        return "tools" in text and "chat/completions" in text
+    return (bool(re.search(r"\bnone\b", text)) and "support" in text and "tools" not in text)
+
+
 def native_answers(rows: dict[str, Any]) -> list[str]:
     texts = [str(m.get("message") or "").strip() for m in rows.get("messages", [])
              if "tool_use" not in (m.get("metadata") or {})]
@@ -359,6 +372,7 @@ def evaluate(run: dict[str, Any], wire: dict[str, list[dict[str, Any]]], rows: d
         checks = {
             "provider_400": bool(refused) and len(refused) == len(found),
             "classified": bool(refused) and all(rejection_kind(item) == kind for item in refused),
+            "provider_said_so": bool(refused) and all(independent_rejection(item, kind) for item in refused),
             "error_terminal": rows.get(step, {}).get("status") == "error",
             "action": texts.count(action) == 1 and (extra in texts if extra else True),
             "no_partial_work": PARTIAL_WORK not in texts,

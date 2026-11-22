@@ -299,3 +299,28 @@ def test_inactive_launch_reaps_before_complete_redacted_projection(monkeypatch, 
     assert result["frames"] == [{"relative_path": "Payload_Type/sage/ai/phoenix_process_compat.py",
         "line": 1, "source_sha256": __import__("hashlib").sha256(source.read_bytes()).hexdigest()}]
     assert secret not in repr(result)
+
+
+def test_the_shim_imports_and_names_frames_in_the_container_layout(tmp_path):
+    """The Sage container installs the runtime at ``/Mythic`` (``/Mythic/ai/...``): only two levels above the shim.
+
+    Observed 2026-11-22: with capture configured, importing the shim there raised IndexError and Sage restarted in
+    a loop (reproduced in the running container with `docker exec -w /Mythic sage python3 -c "import
+    ai.phoenix_process_compat"`). A temporary directory is deeper than `/Mythic`, so this copy of the real module
+    cannot reproduce the IndexError itself; it checks what the fix must provide in that layout: the runtime root is
+    the directory holding `ai/`, and frames are named relative to it.
+    """
+    import importlib.util
+    import shutil
+
+    runtime = tmp_path / "Mythic"
+    (runtime / "ai").mkdir(parents=True)
+    source = Path(__file__).resolve().parents[1] / "ai" / "phoenix_process_compat.py"
+    installed = runtime / "ai" / "phoenix_process_compat.py"
+    shutil.copyfile(source, installed)
+    spec = importlib.util.spec_from_file_location("phoenix_process_compat_container_layout", installed)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    frame = module._source_frame(bytes(installed), b"1")
+    assert frame is not None and frame["relative_path"] == "ai/phoenix_process_compat.py"
+    assert module._source_frame(bytes(tmp_path / "elsewhere.py"), b"1") is None

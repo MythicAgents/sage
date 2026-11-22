@@ -25,8 +25,11 @@ class PhoenixProcessStartupError(RuntimeError):
 
 _EXPECTED_FLAGS = ("--database-url", "--host", "--port")
 _MAX_DIAGNOSTIC_BYTES = 64 * 1024
-_REPO_ROOT = Path(__file__).resolve().parents[3]
-_RUNTIME_SOURCE = _REPO_ROOT / "Payload_Type" / "sage"
+# The runtime root holds `ai/`: `Payload_Type/sage` in a checkout, `/Mythic` in the Sage container. Frames are
+# named relative to the checkout root when there is one, else to the runtime root.
+_RUNTIME_SOURCE = Path(__file__).resolve().parents[1]
+_REPO_ROOT = (_RUNTIME_SOURCE.parents[1] if _RUNTIME_SOURCE.parent.name == "Payload_Type"
+              and _RUNTIME_SOURCE.name == "sage" else _RUNTIME_SOURCE)
 _SITE_PACKAGES = Path(sysconfig.get_paths()["purelib"]).resolve()
 _DEPENDENCY_ROOTS = frozenset({
     "alembic", "anyio", "fastapi", "grpc", "opentelemetry", "phoenix",

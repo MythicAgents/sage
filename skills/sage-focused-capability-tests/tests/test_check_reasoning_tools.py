@@ -293,7 +293,20 @@ def test_an_unrelated_400_is_not_accepted_as_the_reported_rejection():
     body["error"] = {"message": "No tool output found for function call call_1.", "type": "invalid_request_error",
                      "param": "input", "code": None}
     _set(record, body)
-    assert not _evaluate(records, marks, rows, run)["detail"]["rejections"]["A2"]["classified"]
+    rejection = _evaluate(records, marks, rows, run)["detail"]["rejections"]["A2"]
+    assert not rejection["classified"] and not rejection["provider_said_so"]
+
+
+def test_the_independent_reading_rejects_the_other_case_and_a_wrong_status():
+    records, marks, rows, run = _passing()
+    record, body = _reply(records, marks, "B2", 0)
+    body["error"] = E1  # the tools-on-Chat-Completions error where an unsupported-None error belongs
+    _set(record, body)
+    assert not _evaluate(records, marks, rows, run)["detail"]["rejections"]["B2"]["provider_said_so"]
+    exchange = {"status": 404, "reply": {"error": E1}}
+    assert not check.independent_rejection(exchange, "tools_with_effort")
+    assert check.independent_rejection({"status": 400, "reply": {"error": E1}}, "tools_with_effort")
+    assert check.independent_rejection({"status": 400, "reply": {"error": E2}}, "effort_value")
 
 
 def test_a_refusal_or_lost_history_fails_continuity():

@@ -141,11 +141,17 @@ class _MeteredBase:
     def _settle(self, reservation: str, response: httpx.Response | None, body: bytes | None) -> None:
         if self.kind != "provider":
             return
-        actual = (
-            provider_usage_total(body)
-            if response is not None and 200 <= response.status_code < 300 and body is not None
-            else None
-        )
+        if response is None or body is None:
+            actual = None
+        elif 200 <= response.status_code < 300:
+            actual = provider_usage_total(body)
+        elif self.allow_non2xx:
+            # A retry policy hands error responses to the SDK (a typed error, or a retry). The provider reports no
+            # usage on an error response, so charge the full per-call reservation, a known upper bound, instead of
+            # unknown usage, which would refuse the retry and every later call.
+            actual = self.provider_token_reservation
+        else:
+            actual = None
         self.ledger.settle_provider(reservation, actual)
 
     def _capture_enabled(self) -> bool:

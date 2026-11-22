@@ -547,3 +547,65 @@ def test_unknown_settlement_blocks_later_dispatch_but_not_already_dispatched_cal
     with httpx.Client(transport=later) as client:
         with pytest.raises(resource_budget.ResourceBudgetExceeded, match="unknown provider"):
             client.get("https://unit.invalid/later")
+
+
+# A provider error under a retry policy (``allow_non2xx``) is charged at its reservation, not left unknown.
+# Reproduces the reasoning-tool live check's block: a deliberate 400 (transcribed provider message, synthetic
+# envelope) stopped every later provider call because unknown usage blocks later reservations.
+_REJECTED = {"error": {"message": "Function tools with reasoning_effort are not supported for gpt-5.6-sol in "
+                                  "/v1/chat/completions. To use function tools, use /v1/responses or set reasoning "
+                                  "effort to none", "type": "invalid_request_error", "param": None, "code": None}}
+_ANSWERED = {"id": "resp_unit", "object": "response", "output": [],
+             "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}}
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_a_provider_error_under_a_retry_policy_is_charged_at_its_reservation_and_later_calls_run(
+    tmp_path, asynchronous,
+):
+    import openai
+
+    ledger, _ = _ledger(tmp_path)
+    replies = iter([httpx.Response(400, json=_REJECTED), httpx.Response(200, json=_ANSWERED)])
+    stand_in = httpx.MockTransport(lambda _request: next(replies))
+
+    async def call_async():
+        transport = resource_http.MeteredAsyncHTTPTransport(
+            "provider", ledger=ledger, transport=stand_in, allow_non2xx=True)
+        client = openai.AsyncOpenAI(api_key="offline", base_url="https://unit.invalid/v1", max_retries=0,
+                                    http_client=httpx.AsyncClient(transport=transport))
+        with pytest.raises(openai.BadRequestError):
+            await client.chat.completions.create(model="m", messages=[{"role": "user", "content": "x"}],
+                                                 reasoning_effort="low")
+        return await client.responses.create(model="m", input="x", reasoning={"effort": "low"})
+
+    if asynchronous:
+        answered = asyncio.run(call_async())
+    else:
+        transport = resource_http.MeteredHTTPTransport(
+            "provider", ledger=ledger, transport=stand_in, allow_non2xx=True)
+        client = openai.OpenAI(api_key="offline", base_url="https://unit.invalid/v1", max_retries=0,
+                               http_client=httpx.Client(transport=transport))
+        with pytest.raises(openai.BadRequestError):
+            client.chat.completions.create(model="m", messages=[{"role": "user", "content": "x"}],
+                                           reasoning_effort="low")
+        answered = client.responses.create(model="m", input="x", reasoning={"effort": "low"})
+    assert answered.id == "resp_unit"
+    status = ledger.status()
+    assert status["unknown_provider_usage"] is False
+    assert status["effective_resource_charges"]["provider_requests"] == 2
+    assert status["effective_resource_charges"]["provider_tokens"] == 32768 + 15
+
+
+def test_a_network_error_under_a_retry_policy_still_settles_unknown(tmp_path):
+    ledger, _ = _ledger(tmp_path)
+
+    def handler(_request):
+        raise httpx.ConnectError("failed")
+
+    transport = resource_http.MeteredHTTPTransport(
+        "provider", ledger=ledger, transport=httpx.MockTransport(handler), allow_non2xx=True)
+    with httpx.Client(transport=transport) as client:
+        with pytest.raises(httpx.ConnectError):
+            client.get("https://unit.invalid")
+    assert ledger.status()["unknown_provider_usage"] is True
