@@ -328,3 +328,29 @@ def test_recorded_lifecycle_identities_reconcile_only_when_restored(row):
     lost = resume(fresh)
     assert not lost["ok"]
     assert any(row["expected"]["recorded_error"] in error for error in lost["errors"]), lost["errors"]
+
+
+APPROVED_ERRORS = json.loads((FIXTURES / "approved_call_errors.json").read_text())
+
+
+@pytest.mark.parametrize("row", APPROVED_ERRORS["rows"], ids=[row["id"] for row in APPROVED_ERRORS["rows"]])
+def test_recorded_approved_call_error_closes_its_own_card(no_network, row):
+    """The recorded accepted call that failed its schema after the resume, through the assembled native chat.
+
+    The recorded run (Mythic rows 58/61/62) projected a second, terminal-only `unknown_tool` card for the same call
+    id and delegation, and reconciliation failed the request. Replayed, the call's own card closes with the error.
+    """
+    from tests.test_resumed_tool_card_identity import _assembled_run, _assert_own_card_closed
+
+    recorded = row["recorded"]
+    started, terminal_only = recorded["started_card"], recorded["terminal_only_card"]
+    assert started["tool_call_id"] == terminal_only["tool_call_id"] == row["call"]["id"]
+    assert started["delegation_id"] == terminal_only["delegation_id"] == recorded["approval_card"]["delegation_id"]
+    assert (started["tool_name"], terminal_only["tool_name"]) == (row["call"]["name"], "unknown_tool")
+    assert started["response_key"] != terminal_only["response_key"]
+    assert terminal_only["result_preview_head"] == recorded["phoenix_span"]["status_message_head"]
+    assert row["call"]["args"]["c2_profiles"][0]["c2_profile_parameters"]["callback_host"].startswith("http://192.0.2.")
+    assert APPROVED_ERRORS["provenance"]["substitutions"]
+
+    run = asyncio.run(_assembled_run(row, restore_ledger=False))
+    _assert_own_card_closed(run, row)

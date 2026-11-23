@@ -6401,7 +6401,8 @@ class MessageCaptureCallback(AsyncCallbackHandler):
         try:
             # The output might be a ToolMessage or raw output
             if isinstance(output, ToolMessage):
-                output.name = output.name or self._tool_call_to_name.get(output.tool_call_id, "unknown_tool")
+                known_name = output.name or self._tool_call_to_name.get(output.tool_call_id, "")
+                output.name = known_name or "unknown_tool"
                 if (output.name == "get_all_task_output_by_task_id"
                         and self._observation_request_id
                         and output.tool_call_id in self._tool_call_to_name):
@@ -6451,7 +6452,8 @@ class MessageCaptureCallback(AsyncCallbackHandler):
                     try:
                         await self._tool_use_func(
                             tool_call_id=output.tool_call_id,
-                            tool_name=output.name,
+                            # Empty when unknown, so the card owner resolves it from the ledger.
+                            tool_name=known_name,
                             status="error" if errored else "completed",
                             complete=True,
                             arguments_present=bool(self._tool_call_to_args.get(output.tool_call_id)),
@@ -6495,7 +6497,8 @@ class MessageCaptureCallback(AsyncCallbackHandler):
         tool_call_id = str(kwargs.get("tool_call_id") or "").strip()
         if not tool_call_id or self._tool_use_func is None or self.agent_name == "Supervisor":
             return
-        tool_name = self._tool_call_to_name.get(tool_call_id, "unknown_tool")
+        # Empty when this callback never saw the call (a resume): the card owner resolves it from the ledger.
+        tool_name = self._tool_call_to_name.get(tool_call_id, "")
         if _is_control_tool(tool_name):
             return
         try:
@@ -10180,10 +10183,29 @@ class Model:
         `output`, when set, is the full raw result shipped lazily (Mythic's "View output").
         """
         try:
-            raw_name = tool_name or "unknown_tool"
-            source = tool_source or self._classify_tool_source(raw_name)
             ledger = getattr(self, "_request_event_ledger", None)
             event_id = str(lifecycle_event_id or "").strip()
+            if (
+                not tool_name
+                and not event_id
+                and status != "started"
+                and tool_call_id
+                and isinstance(ledger, RequestEventLedger)
+            ):
+                # A callback rebuilt by a resume reports a terminal without the call's name. The request's
+                # one open start for this call and delegation is that lifecycle; zero or several are left
+                # unmatched, so reconciliation still fails them.
+                starts = ledger.open_tool_starts(
+                    tool_call_id=str(tool_call_id),
+                    delegation_id=str(delegation_id or ""),
+                )
+                if len(starts) == 1:
+                    opened = dict(starts[0].metadata)
+                    event_id = starts[0].event_id
+                    tool_name = opened.get("tool_name", "")
+                    tool_source = opened.get("tool_source") or tool_source
+            raw_name = tool_name or "unknown_tool"
+            source = tool_source or self._classify_tool_source(raw_name)
             if isinstance(ledger, RequestEventLedger) and not event_id:
                 event_id = stable_event_id(
                     ledger.request_id,

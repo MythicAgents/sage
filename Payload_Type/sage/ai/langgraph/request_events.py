@@ -438,6 +438,17 @@ class RequestEventLedger:
                     opened.append((kind, event_id))
         return tuple(opened)
 
+    def open_tool_starts(self, *, tool_call_id: str, delegation_id: str) -> tuple[RequestEvent, ...]:
+        """The `started` events of open tool lifecycles recorded for this call id and delegation."""
+        open_ids = {event_id for kind, event_id in self.open_lifecycles() if kind == "tool"}
+        return tuple(
+            event
+            for event in self.actual_events(kind="tool", phase="started")
+            if event.event_id in open_ids
+            and dict(event.metadata).get("tool_call_id") == tool_call_id
+            and dict(event.metadata).get("delegation_id") == delegation_id
+        )
+
     def close_open(self, phase: str = "stopped") -> tuple[RequestEvent, ...]:
         if phase not in {"stopped", "cancelled", "error"}:
             raise ValueError("open lifecycle terminal phase is invalid")
