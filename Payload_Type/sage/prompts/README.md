@@ -1,8 +1,12 @@
 # Sage Agent Prompts — Operator Guide
 
-Each file in this directory is the **system prompt for one Sage agent**. Edit a file, restart
-Sage, and that agent's behavior changes — no Python edits, no rebuild. This is how you ship your
-own playbook with an engagement.
+Each file in this directory is the **system prompt for one Sage agent**. Edit a file, start a new
+chat, and that agent's behavior changes — no restart, no Python edits, no rebuild. This is how you
+ship your own playbook with an engagement.
+
+Under Mythic you can edit these files from the web UI: Installed Services → Chat → `sage` → View
+Files opens Sage's service directory, where this `prompts/` folder is at the top level. On the
+Mythic host the same folder is `InstalledServices/sage/prompts/`.
 
 | File | Agent | Role |
 |------|-------|------|

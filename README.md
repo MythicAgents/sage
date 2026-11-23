@@ -326,8 +326,10 @@ into the container: `sage.db` and `.phoenix/phoenix.db`. On macOS, Docker Deskto
 directory through a file-sharing layer that does not support SQLite's locking. SQLite then reports
 `unable to open database file`.
 
-Move both databases to a path inside the container. Add these lines to `InstalledServices/sage/.env`, either
-from the Mythic UI's container file browser or from your Mythic directory, then restart the Sage container:
+Move both databases to a path inside the container. Add two lines to Sage's `.env`, then restart the Sage
+container. In the Mythic UI's container file browser, `.env` is in the top folder (the browser opens inside
+Sage's service directory). On the Mythic host it is `InstalledServices/sage/.env`, and these commands, run from
+your Mythic directory, append the lines there:
 
 ```bash
 echo 'PHOENIX_WORKING_DIR=/opt/sage_data' | sudo tee -a InstalledServices/sage/.env
@@ -561,8 +563,10 @@ chain, first non-empty wins:
 
 `Payload_Type/sage/.env` is **committed on purpose**, which is unusual and deliberate. Most projects ship
 a `.env.example` you copy — under Mythic that would mean getting a shell inside the container. Shipping the
-real file means you open it from the **Mythic web UI**, browse the Sage chat container's files, edit, save,
-and restart the container. No shell, no `docker cp`, no `sudo`.
+real file means you edit it from the **Mythic web UI**: open the Sage chat container's files (Installed
+Services → Chat → `sage` → View Files), where `.env` is in the top folder, edit it, and save. Editing needs no
+shell, no `docker cp`, and no `sudo`. The change applies after a container restart, and Mythic's web UI has no
+restart control as of v4.0.8, so run `sudo ./mythic-cli restart sage` on the Mythic host.
 
 It ships with every line commented out, so cloning Sage sets nothing.
 
@@ -705,14 +709,16 @@ stdio MCP server.
 ### BloodHound credentials
 
 The MCP server needs to reach your BloodHound CE instance. These resolve through the standard load order, so there are two places an operator can
-set them without a shell:
+set them without a shell inside the container:
 
 1. **The Mythic chat configuration**, when you create the chat — per-chat, and the same place your
    model API key already lives. Mythic **user secrets** work too and keep the token out of plaintext
    channel config.
 2. **Sage's own `.env`**, which Mythic maps into the container. Open it from the Mythic
-   installed-services page, fill it in, save, restart the container. Shared by every chat in that
-   container, and no shell, `docker cp`, or sudo required. This is why that file ships tracked and
+   installed-services page (View Files on the `sage` row; `.env` is in the top folder), fill it in,
+   and save. Editing needs no shell, `docker cp`, or sudo. Then restart the container with
+   `sudo ./mythic-cli restart sage` on the Mythic host, since Mythic's web UI has no restart control
+   as of v4.0.8. Shared by every chat in that container. This is why that file ships tracked and
    fully commented out rather than as a `.env.example` you would need a shell to copy.
 
 Full order, highest first: chat config → user secret → container env → `.env.local` → `.env`.

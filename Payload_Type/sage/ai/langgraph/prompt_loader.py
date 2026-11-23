@@ -19,8 +19,10 @@ doubled (``{{`` / ``}}``) — exactly the same escaping a Python f-string uses, 
 bodies were lifted verbatim from the original f-strings in model.py.
 
 Design notes:
-- Files are read at agent-build time (each ``_*_agent()`` call), so editing a prompt file +
-  restarting Sage changes behavior with no code edit.
+- Files are read at agent-build time (each ``_*_agent()`` call). Every new chat session builds its
+  agents, and a running session rebuilds them only when its turn signature changes (mode,
+  authority, disabled tools), so an edited prompt file takes effect on the next new chat with no
+  restart and no code edit.
 - ``load_prompt`` renders the template and ``.strip()``s the result — this matches today's
   ``SystemMessage(content=prompt.strip())`` byte-for-byte; the only delta vs the old
   ``create_agent(system_prompt=prompt)`` sink is leading/trailing whitespace, which is inert.
