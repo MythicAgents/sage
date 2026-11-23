@@ -13070,6 +13070,28 @@ class MythicTools:
 
             after_effects = self._capability_achieved_effects()
             action_ok = self._capability_action_effects_achieved(action_obj)
+            # A re-verify of an already-proved account must prove itself: a task this run issued must now be
+            # attributed to the effect's ledger row. Otherwise the run only re-read the earlier proof, so it is
+            # partial, not achieved. Only dcsync-account under the refresh bit is gated.
+            refresh_unproven = False
+            if (
+                action_ok
+                and force_current_refresh
+                and self._capability_text(getattr(action_obj, "name", "")).casefold() == "dcsync-account"
+            ):
+                wanted_effects = {self._capability_text(item)
+                                  for item in list(getattr(action_obj, "effects", []) or [])
+                                  if self._capability_text(item)}
+                pre_achieved = any(
+                    item in before_effects or self._canonical_capability_effect(item) in before_effects
+                    for item in wanted_effects
+                )
+                if pre_achieved:
+                    issued_ids = {self._capability_text(item.get("task_id")).strip()
+                                  for item in all_issued if isinstance(item, dict)} - {""}
+                    if not any(self._capability_effect_task_ids(item) & issued_ids for item in wanted_effects):
+                        action_ok = False
+                        refresh_unproven = True
             final_payload = {
                 "ok": bool(action_ok),
                 "verdict": "achieved" if action_ok else "partial",
@@ -13077,6 +13099,8 @@ class MythicTools:
                 "reason": (
                     "capability effects are achieved in the ledger"
                     if action_ok else
+                    "re-verify issued a DCSync task but no fresh task proved the account; the earlier proof is unchanged"
+                    if refresh_unproven else
                     "capability command plan completed, but verifier did not record an achieved effect"
                 ),
                 "action": asdict(action_obj) if is_dataclass(action_obj) else {},
@@ -16647,6 +16671,9 @@ class MythicTools:
                     "technique": self._capability_text(getattr(hop, "technique", "")),
                     "target": self._capability_text(getattr(hop, "target", "")),
                 }
+                number = getattr(hop, "number", 0)
+                if isinstance(number, int) and number > 0:
+                    row["row"] = number
                 task_id = self._capability_hop_task_id(hop)
                 if task_id:
                     row["task_id"] = task_id
@@ -16680,6 +16707,32 @@ class MythicTools:
             if value:
                 return value
         return ""
+
+    def _capability_effect_task_ids(self, effect) -> set[str]:
+        """Every Mythic task id attributed to the ledger row that currently carries `effect` (its legacy evidence
+        task and each typed contribution). Used to tell a re-verify that proved the effect anew (a task this run
+        issued is now attributed) from one that only read an earlier proof."""
+        wanted = self._capability_text(effect).casefold()
+        if not wanted:
+            return set()
+        ids: set[str] = set()
+        for hop in list(getattr(self, "_engagement_hops", []) or []):
+            effects = {self._capability_text(item).casefold()
+                       for item in (list(getattr(hop, "satisfied_effects", []) or []) or [getattr(hop, "effect", "")])}
+            canonical = self._capability_text(getattr(hop, "canonical_effect", "")).casefold()
+            if canonical:
+                effects.add(canonical)
+            if wanted not in effects:
+                continue
+            task_id = self._capability_hop_task_id(hop)
+            if task_id:
+                ids.add(task_id)
+            for contribution in list(getattr(hop, "contributions", []) or []):
+                if isinstance(contribution, dict):
+                    value = self._capability_text(contribution.get("task_id")).strip()
+                    if value:
+                        ids.add(value)
+        return ids
 
     def _capability_executor_safe_parameters(self, parameters):
         opaque_secret_keys = {

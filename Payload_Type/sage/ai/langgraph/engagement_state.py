@@ -900,7 +900,6 @@ def _ledger_format():
 
 
 _OBJECTIVE_DOMAIN_RE = r"[a-z0-9][a-z0-9.-]*\.[a-z]{2,}"
-_OBJECTIVE_ACCOUNT_RE = r"[a-z0-9._-]+"
 _OBJECTIVE_HOST_RE = r"[a-z0-9][a-z0-9_.-]*"
 
 
@@ -926,16 +925,12 @@ def _objective_credential_targets(objective: Any) -> set[tuple[str, str]]:
     text = str(objective or "").casefold()
     if not re.search(r"\b(?:credential|credentials|creds|dcsync)\b", text):
         return set()
-    targets: set[tuple[str, str]] = set()
-    for match in re.finditer(
-        r"\b(" + _OBJECTIVE_ACCOUNT_RE + r")@(" + _OBJECTIVE_DOMAIN_RE + r")\b",
-        text,
-    ):
-        account = match.group(1).strip(" .'\"")
-        domain = match.group(2).strip(" .'\"")
-        if account and domain:
-            targets.add((account, domain))
-    return targets
+    try:
+        from . import capabilities
+    except ImportError:
+        import capabilities
+    # The one `account@domain` matcher, shared with the requested-account request parser.
+    return capabilities.qualified_account_targets(text)
 
 
 def _objective_remote_exec_targets(objective: Any) -> set[tuple[str, str]]:

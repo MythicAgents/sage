@@ -42,6 +42,8 @@ REFERENCE_PROCEDURES = frozenset({"forge-golden-ticket", "ensure-kerberos-contex
 PROOF_HOST_PROCEDURES = frozenset({"forge-golden-ticket", "ensure-kerberos-context"})
 PROOF_HOST_INPUTS = ("proof_host", "proof_resource_source")
 PROOF_HOST_SOURCE = "operator-named"
+# A re-verify request pins the refresh bit in the candidate; an approved call may not add or drop it.
+REFRESH_INPUTS = ("force_refresh", "force_revalidate", "refresh_current_context")
 _DOMAIN_KEYS = ("domain", "source_domain", "target_domain", "effect_domain", "forge_domain")
 _HOST_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*")
 _TITLE = "[Sage catalog candidates — supported by current evidence, for this model call]"
@@ -279,4 +281,10 @@ def call_matches(args: Mapping[str, Any], candidate: Candidate) -> str:
     changed = [key for key in inputs if key in candidate.inputs and not _same(inputs[key], candidate.inputs[key])]
     # Card-time augmentation may add a resolved proof target the candidate lacks; a pinned one must stay as bound.
     changed += [key for key in PROOF_HOST_INPUTS if key in candidate.inputs and key not in inputs]
+    # The refresh bit is pinned: the call may neither add nor drop it, so a re-verify cannot become an ordinary
+    # DCSync (which would read the old proof) and an ordinary DCSync cannot silently become a re-verify.
+    def refresh_bit(values: Mapping[str, Any]) -> bool:
+        return any(bool(values.get(key)) for key in REFRESH_INPUTS)
+    if refresh_bit(inputs) != refresh_bit(candidate.inputs):
+        return "the call changed the refresh bit"
     return f"the call changed bound inputs: {', '.join(sorted(changed))}" if changed else ""

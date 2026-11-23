@@ -125,7 +125,10 @@ def _worker_calls(inputs) -> int:
 
 
 async def _run(mt, split, script, *, decision="accept", mode="supervised", autonomous_solve=False,
-               before_decision=None, response="Explain the current state instead.") -> SimpleNamespace:
+               before_decision=None, response="Explain the current state instead.", prompt=None) -> SimpleNamespace:
+    # Read the module global at call time, so tests that monkeypatch PROMPT (e.g. _operator_says) are honored.
+    if prompt is None:
+        prompt = PROMPT
     model = model_module.Model(
         provider="openai", model="gpt-4o-mini", system_prompt="offline catalog binding",
         config={"configurable": {"api_key": "offline-only", "API_ENDPOINT": "http://127.0.0.1:9/v1"}},
@@ -144,7 +147,7 @@ async def _run(mt, split, script, *, decision="accept", mode="supervised", auton
     calls: dict = {}
     try:
         with split(lambda: "ok", calls, display_id=lambda: 30 + len(calls.get("issued", []))):
-            first = build_chat_request(PROMPT, channel_id=1, operation_id=1, request_id=1, config={"mode": mode})
+            first = build_chat_request(prompt, channel_id=1, operation_id=1, request_id=1, config={"mode": mode})
             bind_channel_thread_id(first, model)
             await chat.chat(first)
             cards = [card for card in _cards(chat) if card.get("status") not in {"accepted", "rejected", "responded"}]

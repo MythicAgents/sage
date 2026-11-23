@@ -2724,6 +2724,38 @@ def _ledger_lists(mythic_client) -> tuple[list, list, list]:
     )
 
 
+def _catalog_engagement_state(mythic_client, snapshot: Any, foothold_error: str):
+    """(EngagementState, "") from ONE ledger snapshot plus live footholds, account contexts and request attempts, or
+    (None, reason) when it cannot be read. Shared by the candidate producer and the Blocked-proof citation."""
+    if mythic_client is None:
+        return None, "no operation ledger is bound to this session"
+    if foothold_error:
+        return None, foothold_error
+    try:
+        try:
+            from . import engagement_state as _es
+        except ImportError:
+            import engagement_state as _es
+        if snapshot is None:
+            hops, facts, corrected = _ledger_lists(mythic_client)
+        else:
+            view = mythic_client._ledger_view(snapshot)
+            hops, facts, corrected = list(view.hops), list(view.graph_facts), list(view.corrected_hops)
+        try:
+            objective = mythic_client._engagement_objective()
+        except Exception:
+            objective = ""
+        engagement_id, runtime_scope = _runtime_engagement_scope(mythic_client)
+        return _es.EngagementState(
+            objective=objective, footholds=list(getattr(mythic_client, "_engagement_footholds", []) or []),
+            hops=hops, graph_facts=facts, corrected_hops=corrected, engagement_id=engagement_id,
+            runtime_scope=runtime_scope, current_account_contexts=_runtime_current_account_contexts(mythic_client),
+            request_attempts=_runtime_request_attempts(mythic_client),
+        ), ""
+    except Exception as exc:
+        return None, f"the engagement state could not be read ({type(exc).__name__})"
+
+
 def _runtime_engagement_scope(mythic_client) -> tuple[str, bool]:
     """Return strict runtime proof scope only for a real MythicTools-like client."""
     try:
@@ -7853,9 +7885,12 @@ class Model:
             self._consume_admitted_first_step(worker, admitted)
             return None if admitted == brief else admitted
         if binding_error:
+            proof = self._requested_account_proof_sentence(brief)
             return errors, True, (), (
                 f"I could not bind this catalog step to an action current evidence supports: {binding_error}. No "
-                "approval card was offered and no Mythic task was issued. That is not a finding that the objective is "
+                "approval card was offered and no Mythic task was issued."
+                + (f" {proof}" if proof else "")
+                + " That is not a finding that the objective is "
                 "impossible: graph collection, control-plane reads and explicit off-catalog steps remain available, "
                 "and a new request can supply evidence.")
         rejections = _handoff_brief.rejection_count(ledger.actual_events(kind="brief"))
@@ -13171,43 +13206,68 @@ class Model:
         client._engagement_footholds = list(footholds)
         self._catalog_foothold_error = ""
 
+    def _catalog_operator_request(self) -> str:
+        """The current operator input, read exactly as the brief check reads it; "" when absent."""
+        try:
+            return _current_assisted_operator_input(getattr(self, "state", {}) or {}) or ""
+        except RuntimeError:
+            return ""
+
     def _catalog_candidates(self, snapshot: Any = None) -> tuple[tuple | None, str]:
         """(candidates, "") from ONE ledger snapshot plus live footholds, account contexts and request attempts, or
         (None, reason) when they cannot be derived. A state without hops is kept: graph facts can support a step."""
-        client = getattr(self, "mythic_client", None)
-        if client is None:
-            return None, "no operation ledger is bound to this session"
-        if getattr(self, "_catalog_foothold_error", ""):
-            return None, self._catalog_foothold_error
+        state, reason = _catalog_engagement_state(
+            getattr(self, "mythic_client", None), snapshot, getattr(self, "_catalog_foothold_error", ""))
+        if state is None:
+            return None, reason
         try:
             from . import capabilities
-            from . import engagement_state as _es
 
-            if snapshot is None:
-                hops, facts, corrected = _ledger_lists(client)
-            else:
-                view = client._ledger_view(snapshot)
-                hops, facts, corrected = list(view.hops), list(view.graph_facts), list(view.corrected_hops)
-            try:
-                objective = client._engagement_objective()
-            except Exception:
-                objective = ""
-            engagement_id, runtime_scope = _runtime_engagement_scope(client)
-            state = _es.EngagementState(
-                objective=objective, footholds=list(getattr(client, "_engagement_footholds", []) or []),
-                hops=hops, graph_facts=facts, corrected_hops=corrected, engagement_id=engagement_id,
-                runtime_scope=runtime_scope, current_account_contexts=_runtime_current_account_contexts(client),
-                request_attempts=_runtime_request_attempts(client),
-            )
             # Only this producer (every caller is ordinary supervised) offers an account context from reviewed
-            # material; its card asks the operator, and the executor checks the lane again.
-            actions = capabilities.actions_from_state(state, reviewed_account_material=True)
+            # material; its card asks the operator, and the executor checks the lane again. The current operator
+            # request names account DCSync targets, read exactly as the brief check reads it.
+            try:
+                operator_request = _current_assisted_operator_input(getattr(self, "state", {}) or {}) or ""
+            except RuntimeError:
+                operator_request = ""
+            actions = capabilities.actions_from_state(
+                state, reviewed_account_material=True, operator_request=operator_request)
             pairs = [(_capability_action_payload(action), _autonomous_capability_inputs(action, state))
                      for action in actions]
         except Exception as exc:
             return None, f"the engagement state could not be read ({type(exc).__name__})"
         request_id = str(getattr(getattr(self, "_request_contract", None), "request_id", "") or "")
         return _catalog_binding.candidates(request_id, pairs), ""
+
+    def _requested_account_proof_sentence(self, brief: Any) -> str:
+        """A sentence citing the ledger proof of an already-proved account the current request named, for the Blocked
+        closing of an ordinary (non-refresh) catalog step that could not bind; "" when none applies."""
+        if "dcsync-account" not in tuple(getattr(brief, "allowed_capabilities", ()) or ()):
+            return ""
+        state, _reason = _catalog_engagement_state(
+            getattr(self, "mythic_client", None), None, getattr(self, "_catalog_foothold_error", ""))
+        if state is None:
+            return ""
+        try:
+            from . import capabilities
+            request = self._catalog_operator_request()
+            citations = capabilities.requested_account_proof_citations(state, request)
+            clarification = capabilities.requested_account_clarification(state, request)
+        except Exception:
+            return ""
+        parts: list[str] = []
+        for citation in citations:
+            where = []
+            if citation.get("row"):
+                where.append(f"ledger row #{citation['row']}")
+            if citation.get("task_id"):
+                where.append(f"Mythic task {citation['task_id']}")
+            parts.append(f"{citation['effect']} is already proved"
+                         + (f" by {', '.join(where)}" if where else "")
+                         + ". To gather it again, ask to re-verify the account.")
+        if clarification:
+            parts.append(clarification)
+        return " ".join(parts)
 
     def _current_engagement_state_snapshot(self, *, require_autonomous: bool = True):
         """Cheap in-memory EngagementState snapshot for terminal objective checks.
@@ -21084,6 +21144,12 @@ def _autonomous_capability_inputs(action: Any, engagement_snapshot: Any) -> dict
         and intent.get("force_revalidate") is True
     ):
         inputs["force_revalidate"] = True
+    if action_name == "dcsync-account":
+        # A re-verify request pins the refresh bit in the action intent; mirror it into inputs so the card and the
+        # pre-execution candidate check see it and the executor skips `already_achieved`.
+        for flag in ("force_refresh", "force_revalidate"):
+            if intent.get(flag) is True:
+                inputs[flag] = True
     if action_name in {"gpo-controlled-system-exec", "grant-directory-rights"}:
         inputs["gpo_wait_seconds"] = _autonomous_gpo_wait_seconds(action)
     return inputs

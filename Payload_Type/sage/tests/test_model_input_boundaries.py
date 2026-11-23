@@ -354,3 +354,21 @@ def test_recorded_approved_call_error_closes_its_own_card(no_network, row):
 
     run = asyncio.run(_assembled_run(row, restore_ledger=False))
     _assert_own_card_closed(run, row)
+
+
+# --- requested-account request parser ----------------------------------------------------------------
+# The operator-input -> requested-accounts boundary a new parser owns. Recorded operator forms plus labelled synthetic
+# cases for scope the archives did not record. Pure parser: no model, ledger or Mythic I/O.
+REQUESTED = json.loads((FIXTURES / "requested_account_requests.json").read_text())
+
+
+@pytest.mark.parametrize("row", REQUESTED["rows"], ids=[r["id"] for r in REQUESTED["rows"]])
+def test_requested_dcsync_accounts_parses_recorded_operator_forms(row):
+    from ai.langgraph import capabilities
+
+    result = capabilities.requested_dcsync_accounts(
+        row["input"], eligible_domains=row["eligible_domains"], netbios=row["netbios"])
+    got = sorted(f"{account}@{domain}" for domain, account in result.accounts)
+    assert got == sorted(row["expected_accounts"]), (row["id"], got)
+    assert result.refresh is row["expected_refresh"], (row["id"], result.refresh)
+    assert result.note == row["expected_note"], (row["id"], result.note)

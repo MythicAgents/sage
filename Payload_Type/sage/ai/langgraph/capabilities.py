@@ -12,7 +12,7 @@ import re
 import secrets
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 # Per-run salt for offensive-artifact passwords (forged cert PFX, exported CA PFX). Randomized ONCE per Sage
 # process so these passwords are NOT hardcoded source-visible constants an artifact recoverer could reuse,
@@ -358,7 +358,9 @@ def _current_account_context_keys(state: Any) -> set[tuple[str, str, str]]:
     return keys
 
 
-def actions_from_state(state: Any, *, reviewed_account_material: bool = False) -> list[CapabilityAction]:
+def actions_from_state(
+    state: Any, *, reviewed_account_material: bool = False, operator_request: str = "",
+) -> list[CapabilityAction]:
     """Return generic capability actions available from the observed state.
 
     `reviewed_account_material` (the ordinary supervised catalog only) also offers an account Kerberos context from a
@@ -458,6 +460,7 @@ def actions_from_state(state: Any, *, reviewed_account_material: bool = False) -
         and _objective_target_trusted_scope_pending(state)
     )
 
+    offered_account_targets: set[tuple[str, str]] = set()
     for domain, account, source_fact in _credential_target_accounts(
         facts,
         unavailable_effects,
@@ -485,9 +488,61 @@ def actions_from_state(state: Any, *, reviewed_account_material: bool = False) -
             if not context_callback:
                 continue
             actions.append(_dcsync_account_action(domain, account, context_callback_id=context_callback, source_fact=source_fact))
+            offered_account_targets.add((domain, account))
             continue
         if domain in explicit_replication_domains:
             actions.append(_dcsync_account_action(domain, account, source_fact=source_fact))
+            offered_account_targets.add((domain, account))
+
+    # Accounts the current authenticated operator request names. Unlike the graph/objective loop above,
+    # these are exempt from the satisfied-domain, downstream and restrict filters: the operator selects the target,
+    # not current evidence. Still gated by the same replication/admin domain, context and allowed-target checks; a
+    # request to re-verify an already-proved account re-offers it with the refresh bit pinned in the action.
+    requested = requested_dcsync_accounts(
+        operator_request,
+        eligible_domains=explicit_replication_domains | admin_domains,
+        netbios=_requested_account_netbios_map(state),
+    )
+    for domain, account in sorted(requested.accounts):
+        if (domain, account) in offered_account_targets:
+            continue
+        if domain not in (explicit_replication_domains | admin_domains):
+            continue
+        effect = f"creds:{account}@{domain}"
+        if effect in terminal_failed:
+            continue
+        achieved_effect = effect in achieved
+        if achieved_effect and not requested.refresh:
+            continue  # an ordinary request for a proved effect offers no candidate; the Blocked text cites the proof
+        if not requested.refresh and not _dcsync_account_target_allowed(account, domain, unavailable_effects):
+            continue
+        context_callback, context_actions, context_required = _admin_dcsync_context_gate(
+            domain,
+            state,
+            achieved,
+            live_callback_ids,
+            explicit_replication_domains,
+            admin_effects,
+            preferred_callback_id=preferred_callback_id,
+            terminal_failed=terminal_failed,
+        )
+        source_fact = f"operator-request:{account}@{domain}"
+        if context_required:
+            if context_actions:
+                actions.extend(context_actions)
+                continue
+            if not context_callback:
+                continue
+            action = _dcsync_account_action(domain, account, context_callback_id=context_callback, source_fact=source_fact)
+        elif domain in explicit_replication_domains:
+            action = _dcsync_account_action(domain, account, source_fact=source_fact)
+        else:
+            continue
+        if requested.refresh:
+            action.intent["force_revalidate"] = True
+            action.intent["force_refresh"] = True
+        actions.append(action)
+        offered_account_targets.add((domain, account))
 
     # An account's key input: a working credential, else (opt-in) reviewed material, pinned in the action.
     account_inputs: dict[tuple[str, str], dict | None] = dict.fromkeys(_credential_material_accounts(achieved))
@@ -6772,6 +6827,279 @@ def _dcsync_account_target_allowed(account: str, domain: str, achieved: set[str]
     if f"creds:{account}@{domain}" in achieved:
         return False
     return True
+
+
+# The one `account@domain` matcher, shared with engagement_state._objective_credential_targets.
+_QUALIFIED_ACCOUNT_RE = re.compile(r"\b([a-z0-9._-]+)@([a-z0-9][a-z0-9.-]*\.[a-z]{2,})\b", re.IGNORECASE)
+
+
+def qualified_account_targets(text: Any) -> set[tuple[str, str]]:
+    """Every `account@domain` pair in `text`, as `(account, domain)`, normalized. Pure; no state."""
+    targets: set[tuple[str, str]] = set()
+    for match in _QUALIFIED_ACCOUNT_RE.finditer(_text(text)):
+        account = _normalize(match.group(1))
+        domain = _normalize(match.group(2))
+        if account and domain:
+            targets.add((account, domain))
+    return targets
+
+
+@dataclass(frozen=True)
+class RequestedAccounts:
+    """Accounts an authenticated operator request names for DCSync, with the refresh bit and a clarification note.
+
+    `accounts` holds `(domain, account)` pairs. `refresh` is set when the request asks to re-verify an account.
+    `note` is "" when every named account resolved, else why none are offered: "ambiguous" (a bare name could belong
+    to more than one eligible domain) or "no_eligible_domain" (a bare name but no replication/admin domain is
+    established). A note means `accounts` is empty: the request is answered with a clarification, never a card.
+    """
+
+    accounts: frozenset[tuple[str, str]] = frozenset()
+    refresh: bool = False
+    note: str = ""
+
+
+# A request's account list follows one of these verbs used as a verb.
+_REQUEST_LIST_VERBS = frozenset({"dcsync", "re-verify", "reverify", "revalidate", "refresh"})
+# Any of these words (or `again`) asks to re-verify, not just read, an account.
+_REFRESH_WORDS = frozenset({"again", "re-verify", "reverify", "revalidate", "refresh"})
+# Words that precede a verb and still leave it a verb (a clause start also does).
+_VERB_ENABLERS = frozenset({"ok", "please", "and", "to", "can", "then"})
+# Words inside an account list that are not themselves accounts.
+_LIST_FILLERS = frozenset({"the", "a", "an", "account", "accounts", "user", "users", "of", "with"})
+_LIST_SEPARATORS = frozenset({"and", "&"})
+# Relative pronouns and copulas that open a description, not another name: they end the list.
+_LIST_STOP_WORDS = frozenset({"that", "which", "who", "whose", "is", "are", "was", "were", "be", "being", "been"})
+# Words that introduce a domain qualifier for the names that follow.
+_DOMAIN_QUALIFIERS = frozenset({"for", "in"})
+_REQUEST_TOKEN_RE = re.compile(r"([a-z0-9][a-z0-9._\\@-]*)|([,;])", re.IGNORECASE)
+_LOOKS_LIKE_DOMAIN_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$", re.IGNORECASE)
+
+
+def _resolve_netbios_domain(label: str, eligible: set[str], netbios: Mapping[str, str]) -> str:
+    """The FQDN a NetBIOS/short domain label maps to: the explicit map first, then an eligible domain's one first
+    label; "" when unmapped or ambiguous."""
+    label = _normalize(label)
+    if not label:
+        return ""
+    mapped = _normalize(netbios.get(label)) if isinstance(netbios, Mapping) else ""
+    if mapped:
+        return mapped
+    matches = {domain for domain in eligible if domain.split(".", 1)[0] == label}
+    return next(iter(matches)) if len(matches) == 1 else ""
+
+
+def requested_account_clarification(state: Any, operator_request: Any) -> str:
+    """When the request names accounts code cannot resolve, the clarification to return instead of a card;
+    "" when the names resolved or none were named. Ambiguous = a bare name could belong to more than one in-scope
+    domain; no eligible domain = no replication/admin domain is established yet."""
+    facts = _graph_fact_predicates(state)
+    achieved = _achieved_effects(state)
+    known_domains = {*_live_foothold_domains(state), *_replication_right_domains(achieved | facts)}
+    admin_effects = _admin_domain_effects(achieved, known_domains)
+    eligible = set(_replication_right_domains(achieved | facts)) | set(admin_effects)
+    requested = requested_dcsync_accounts(
+        operator_request, eligible_domains=eligible, netbios=_requested_account_netbios_map(state))
+    if requested.note == "ambiguous":
+        scope = ", ".join(sorted(eligible)) or "the domains in scope"
+        return (f"The account name(s) you gave could belong to more than one domain in scope ({scope}). "
+                "Re-send the request with each account qualified as account@domain.")
+    if requested.note == "no_eligible_domain":
+        return ("No domain with proven replication or admin rights is established yet, so a named account cannot be "
+                "a DCSync target. Prove replication rights (or Domain Admin) for its domain first.")
+    return ""
+
+
+def requested_account_proof_citations(state: Any, operator_request: Any) -> list[dict[str, Any]]:
+    """For each account the request names whose `creds:` effect is already proved, the proving ledger row and task.
+
+    Lets an ordinary (non-refresh) request for an already-proved account answer with the proof it blocks on
+   , rather than a bare "not supported by current evidence". `[]` when no named account is proved.
+    """
+    facts = _graph_fact_predicates(state)
+    achieved = _achieved_effects(state)
+    eligible = {domain for domain, _account in _credential_material_accounts(achieved)}
+    eligible |= set(_replication_right_domains(achieved | facts))
+    requested = requested_dcsync_accounts(
+        operator_request, eligible_domains=eligible, netbios=_requested_account_netbios_map(state))
+    if requested.refresh or not requested.accounts:
+        return []
+    citations: list[dict[str, Any]] = []
+    for domain, account in sorted(requested.accounts):
+        effect = f"creds:{account}@{domain}"
+        if effect not in achieved:
+            continue
+        citation: dict[str, Any] = {"effect": effect, "account": account, "domain": domain}
+        for hop in getattr(state, "hops", []) or []:
+            effects = {_normalize(item) for item in (list(getattr(hop, "satisfied_effects", []) or [])
+                                                     or [getattr(hop, "effect", "")])}
+            canonical = _normalize(getattr(hop, "canonical_effect", ""))
+            if canonical:
+                effects.add(canonical)
+            if effect not in effects:
+                continue
+            number = getattr(hop, "number", 0)
+            if isinstance(number, int) and number > 0:
+                citation["row"] = number
+            evidence = getattr(hop, "evidence", {}) or {}
+            if isinstance(evidence, dict):
+                for key in ("mythic_task_id", "task_id", "task", "display_id"):
+                    value = _text(evidence.get(key)).strip()
+                    if value:
+                        citation["task_id"] = value
+                        break
+            for contribution in list(getattr(hop, "contributions", []) or []):
+                if isinstance(contribution, dict) and _text(contribution.get("task_id")).strip():
+                    citation.setdefault("task_id", _text(contribution.get("task_id")).strip())
+            break
+        citations.append(citation)
+    return citations
+
+
+def _requested_account_netbios_map(state: Any) -> dict[str, str]:
+    """The engagement's own NetBIOS->FQDN evidence, for resolving a `DOMAIN\\account` request. Pure; never raises."""
+    try:
+        try:
+            from . import engagement_state as _es
+        except ImportError:
+            import engagement_state as _es
+        return _es.learned_netbios_map(state)
+    except Exception:
+        return {}
+
+
+def requested_dcsync_accounts(
+    text: Any,
+    eligible_domains: Iterable[str] = (),
+    netbios: Mapping[str, str] | None = None,
+) -> RequestedAccounts:
+    """Parse the accounts an authenticated operator request names for DCSync. See `RequestedAccounts`.
+
+    A request names no account unless it contains `dcsync`. The account list follows a list verb used as a verb
+    (text/clause start, or after ok/please/and/to/can/then; `the DCSync` only before `of`/`for`). The list accepts
+    `account@fqdn`, `DOMAIN\\account` (via `netbios` or an eligible domain's one first label) and bare names (resolved
+    to the one eligible domain, or to a `for`/`in <domain>` or bare-FQDN qualifier). krbtgt, machine accounts and a
+    domain in no eligible set are dropped. Any other word ends the list. This never reads the Supervisor's prose, the
+    stored objective or the graph.
+    """
+    raw = _text(text)
+    lowered = raw.casefold()
+    netbios = netbios or {}
+    eligible = {_normalize(domain) for domain in eligible_domains if _normalize(domain)}
+
+    tokens: list[tuple[str, bool]] = []  # (token, clause_break_after); a bare "," or ";" is ("", True)
+    for match in _REQUEST_TOKEN_RE.finditer(lowered):
+        word, punct = match.group(1), match.group(2)
+        if punct:
+            tokens.append(("", True))
+            continue
+        brk = word.endswith(".")
+        tokens.append((word.rstrip("."), brk))
+
+    words = [token for token, _ in tokens]
+    if "dcsync" not in words:
+        return RequestedAccounts()
+    refresh = any(word in _REFRESH_WORDS for word in words)
+
+    accounts: set[tuple[str, str]] = set()
+    bare: set[str] = set()  # bare account names awaiting an eligible-domain resolution
+    qualifier_domain = ""
+
+    def add_account(account: str, domain: str) -> None:
+        account = _normalize(account)
+        if "\\" in account:
+            account = _normalize(account.rsplit("\\", 1)[1])
+        domain = _normalize(domain)
+        if not account or account == "krbtgt" or account.endswith("$"):
+            return
+        if domain:
+            if domain in eligible:
+                accounts.add((domain, account))
+        else:
+            bare.add(account)
+
+    def is_verb(index: int) -> bool:
+        word = words[index]
+        if word not in _REQUEST_LIST_VERBS:
+            return False
+        if index == 0:
+            return True
+        prev_token, prev_break = tokens[index - 1]
+        if prev_break or prev_token == "":
+            return True
+        if prev_token in _VERB_ENABLERS:
+            return True
+        if prev_token == "the":
+            nxt = words[index + 1] if index + 1 < len(words) else ""
+            return nxt in ("of", "for")
+        return False
+
+    index = 0
+    while index < len(tokens):
+        if not is_verb(index):
+            index += 1
+            continue
+        qualifier_domain = ""
+        expect_separator = False  # after an account, the next account needs a separator between them
+        j = index + 1
+        while j < len(tokens):
+            token, brk = tokens[j]
+            if token == "":  # a comma separates list items
+                expect_separator = False
+                j += 1
+                continue
+            if token in _LIST_SEPARATORS:
+                expect_separator = False
+                j += 1
+                continue
+            if token in _LIST_FILLERS:
+                j += 1
+                continue
+            if token in _REQUEST_LIST_VERBS or token in _REFRESH_WORDS or token in _LIST_STOP_WORDS:
+                break  # a verb, a refresh word or a clause-opening word is not an account and ends the list
+            if token in _DOMAIN_QUALIFIERS:
+                nxt = words[j + 1] if j + 1 < len(words) else ""
+                if _LOOKS_LIKE_DOMAIN_RE.match(nxt):
+                    qualifier_domain = _normalize(nxt)
+                    j += 2
+                    continue
+                break
+            if "@" in token:
+                add_account(*token.partition("@")[::2])
+                expect_separator = True
+            elif "\\" in token:
+                label, _, account = token.partition("\\")
+                add_account(account, _resolve_netbios_domain(label, eligible, netbios))
+                expect_separator = True
+            elif _normalize(token) in eligible:
+                qualifier_domain = _normalize(token)  # an eligible FQDN names the domain for the names that follow
+            elif "." not in token and _resolve_netbios_domain(token, eligible, netbios):
+                qualifier_domain = _resolve_netbios_domain(token, eligible, netbios)  # a short domain label qualifies
+            elif re.fullmatch(r"[a-z0-9][a-z0-9._-]*", token):
+                if expect_separator:
+                    break  # a name with no separator before it is a following word, not a new list item
+                add_account(token, qualifier_domain)
+                expect_separator = True
+            else:
+                break
+            if brk:
+                break
+            j += 1
+        index = j if j > index else index + 1
+
+    note = ""
+    if bare:
+        if len(eligible) == 1:
+            domain = next(iter(eligible))
+            for account in bare:
+                add_account(account, domain)
+        elif len(eligible) > 1:
+            note = "ambiguous"
+            accounts.clear()
+        else:
+            note = "no_eligible_domain"
+            accounts.clear()
+    return RequestedAccounts(accounts=frozenset(accounts), refresh=refresh, note=note)
 
 
 _MANAGED_SECRET_READ_PREFIXES = (

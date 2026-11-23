@@ -10590,3 +10590,53 @@ def test_qualify_dcsync_params_noop_for_non_dcsync():
     mt = _make_tools()
     params = '{"Path":"C:\\\\Users","User":"bob"}'  # has User, but no Domain/DC and not a dcsync command
     assert mt._qualify_dcsync_params("ls", params) == params
+
+
+# --- a re-verify of an already-proved account must prove itself ----------------------------------------
+_ACCOUNT_DCSYNC_NO_KEY = (
+    "[DC] 'north.example.local' will be the domain\nreplication access was denied\n"
+)
+
+
+def _reverify_account_tools(monkeypatch, tmp_path):
+    """Admin-backed replication with a proven callback context AND an already-proved administrator account
+    (task 8). The account effect is achieved before the run, so only a fresh task may report it achieved again."""
+    mt = _short_name_admin_dcsync_tools(
+        monkeypatch, tmp_path,
+        _proof_hop("kerberos-context:north.example.local@callback:2", 15, callback_id="2"),
+        _proof_hop("creds:administrator@north.example.local", 8, callback_id="2",
+                   technique="capability:dcsync-account", target="domain=north.example.local;account=administrator"),
+    )
+    return mt
+
+
+_ACCOUNT_DCSYNC_ACTION = {
+    "capability": "dcsync-account", "domain": "north.example.local", "account": "administrator", "callback_id": 2,
+}
+_ACCOUNT_DCSYNC_OK = (
+    "[DC] 'north.example.local' will be the domain\n** SAM ACCOUNT **\nSAM Username         : administrator\n"
+    f"Credentials:\n  Hash NTLM: {'a' * 32}\n* Primary:Kerberos-Newer-Keys *\n  aes256_hmac       (4096) : {'b' * 64}\n"
+)
+
+
+def test_reverify_without_a_fresh_key_is_partial_not_the_old_proof(monkeypatch, tmp_path):
+    mt = _reverify_account_tools(monkeypatch, tmp_path)
+    calls: dict = {}
+    with _split_issue(lambda: _ACCOUNT_DCSYNC_NO_KEY, calls, display_id=40):
+        result = json.loads(asyncio.run(mt.execute_capability(
+            dict(_ACCOUNT_DCSYNC_ACTION), {"callback_id": 2, "timeout": 5, "force_refresh": True})))
+
+    assert result["verdict"] != "achieved", result
+    assert result["ok"] is False
+    assert calls.get("issued"), "a fresh DCSync task was still issued"
+
+
+def test_reverify_with_a_fresh_key_is_achieved(monkeypatch, tmp_path):
+    mt = _reverify_account_tools(monkeypatch, tmp_path)
+    calls: dict = {}
+    with _split_issue(lambda: _ACCOUNT_DCSYNC_OK, calls, display_id=41):
+        result = json.loads(asyncio.run(mt.execute_capability(
+            dict(_ACCOUNT_DCSYNC_ACTION), {"callback_id": 2, "timeout": 5, "force_refresh": True})))
+
+    assert result["verdict"] == "achieved", result
+    assert result["ok"] is True
