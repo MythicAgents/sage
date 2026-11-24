@@ -49,6 +49,18 @@
 #
 # Updated 2026-11-21 in place: added agent-client-protocol 1.0.0 (the `/acp` coding-agent client). Its only
 # runtime dependencies are pydantic and pydantic-core, already pinned here; no other package changes.
+#
+# Updated 2026-11-24 from a fresh Python 3.14.4 venv installed from requirements-dev.txt with every pin
+# above held except the packages below, which were left free to take the newest version the resolver
+# accepted. This clears three advisories: dnspython 2.9.0 -> 2.9.2; the OpenTelemetry family 1.45.1 ->
+# 1.45.2 (instrumentation, semantic conventions and exporter-http-transport/-otlp-common 0.66b1 ->
+# 0.66b2); and pydantic-ai-slim/pydantic-graph 2.31.1 -> 2.67.0, which needed the model SDKs to move:
+# openai 2.54.0 -> 3.58.0 (now on httpx2), anthropic 0.125.0 -> 2.13.0, langchain-core 1.5.3 -> 1.6.10,
+# langchain-openai 1.4.2 -> 1.7.2, langchain-anthropic 1.5.4 -> 1.7.7. No other package changed;
+# pytest-xdist and execnet (already in requirements-dev.txt) are now recorded. Three advisories remain,
+# each pinned upstream: dynaconf==3.2.5 and ujson==5.9.0 (mythic-container==0.7.0rc9) and
+# strawberry-graphql==0.320.4 (arize-phoenix 19.19.0; every Phoenix release with the fix needs mcp>=2,
+# which langchain-mcp-adapters forbids). Offline suite: 12493 passed, 0 failed, 6 skipped.
 agent-client-protocol==1.0.0
 aio-pika==9.4.1
 aiofile==3.12.3
@@ -61,7 +73,7 @@ aiosqlite==0.22.1
 alembic==1.20.0
 annotated-doc==0.0.5
 annotated-types==0.8.0
-anthropic==0.125.0
+anthropic==2.13.0
 anyio==4.15.1
 arize-phoenix==19.19.0
 arize-phoenix-client==3.5.0
@@ -87,12 +99,13 @@ cross-web==0.7.0
 cryptography==50.0.2
 cyclopts==5.2.0
 distro==1.9.0
-dnspython==2.9.0
+dnspython==2.9.2
 docker==7.2.0
 docstring_parser==0.18.0
 dynaconf==3.2.5
 email-validator==2.3.0
 exceptiongroup==1.3.1
+execnet==2.1.2
 fastapi==0.149.0
 fastmcp-slim==3.4.9
 frozenlist==1.8.0
@@ -137,13 +150,13 @@ jsonschema-path==0.5.0
 jsonschema-specifications==2025.9.1
 keyring==25.7.0
 langchain==1.3.14
-langchain-anthropic==1.5.4
+langchain-anthropic==1.7.7
 langchain-aws==1.7.0
-langchain-core==1.5.3
+langchain-core==1.6.10
 langchain-groq==1.1.3
 langchain-mcp-adapters==0.3.2
 langchain-ollama==1.1.0
-langchain-openai==1.4.2
+langchain-openai==1.7.2
 langchain-protocol==0.0.19
 langchain-xai==1.3.0
 langgraph==1.2.10
@@ -166,23 +179,23 @@ mythic_container==0.7.0rc9
 narwhals==2.27.1
 numpy==2.5.4
 ollama==0.6.3
-openai==2.54.0
+openai==3.58.0
 openapi-pydantic==0.6.0
 openinference-instrumentation==0.1.71
 openinference-instrumentation-langchain==0.1.70
 openinference-instrumentation-openai==0.1.65
 openinference-semantic-conventions==0.1.41
-opentelemetry-api==1.45.1
-opentelemetry-exporter-http-transport==0.66b1
-opentelemetry-exporter-otlp-common==0.66b1
-opentelemetry-exporter-otlp-proto-common==1.45.1
-opentelemetry-exporter-otlp-proto-grpc==1.45.1
-opentelemetry-exporter-otlp-proto-http==1.45.1
-opentelemetry-exporter-otlp==1.45.1
-opentelemetry-instrumentation==0.66b1
-opentelemetry-proto==1.45.1
-opentelemetry-sdk==1.45.1
-opentelemetry-semantic-conventions==0.66b1
+opentelemetry-api==1.45.2
+opentelemetry-exporter-http-transport==0.66b2
+opentelemetry-exporter-otlp==1.45.2
+opentelemetry-exporter-otlp-common==0.66b2
+opentelemetry-exporter-otlp-proto-common==1.45.2
+opentelemetry-exporter-otlp-proto-grpc==1.45.2
+opentelemetry-exporter-otlp-proto-http==1.45.2
+opentelemetry-instrumentation==0.66b2
+opentelemetry-proto==1.45.2
+opentelemetry-sdk==1.45.2
+opentelemetry-semantic-conventions==0.66b2
 orjson==3.13.0
 ormsgpack==1.13.0
 packaging==26.3
@@ -202,9 +215,9 @@ pyasn1_modules==0.4.2
 pycparser==3.11
 pycryptodome==4.1.0
 pydantic==2.13.4
-pydantic-ai-slim==2.31.1
+pydantic-ai-slim==2.67.0
 pydantic_core==2.46.4
-pydantic-graph==2.31.1
+pydantic-graph==2.67.0
 pydantic-monty==0.0.19
 pydantic-monty-runtime==0.0.19
 pydantic-settings==2.16.0
@@ -214,6 +227,7 @@ pyperclip==1.11.0
 pyspnego==0.12.4
 pystache==0.6.8
 pytest==9.1.1
+pytest-xdist==3.8.0
 python-dateutil==2.9.0.post0
 python-dotenv==1.2.2
 python-multipart==0.0.32

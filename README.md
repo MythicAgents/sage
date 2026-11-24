@@ -1179,12 +1179,12 @@ Sage 0.4 is deliberately narrow, and its live validation lags its code:
 - **Known issues.** See the [CHANGELOG](CHANGELOG.md) for each release's known issues. As of 0.4.0 these include
   SQLite locking on the bind-mounted service directory under macOS Docker Desktop and OrbStack (see [SQLite on macOS
   Docker Desktop / OrbStack](#sqlite-on-macos-docker-desktop--orbstack)), dependency advisories in six packages (three
-  pinned by upstream projects, three left for a later Sage upgrade), supervised closings that claim a result in plain
-  prose with no step behind it (only Sage's own report forms are withheld), repeated collection proposals and empty
-  delegations that end in the no-progress stop, request endings reported as "not terminal" or as errors when a task's
-  completion function failed or a delegation was interrupted, the internal delegation envelope appearing in the
-  transcript, a ledger that records only verifier-proven gains, and an experimental coding-agent connection whose
-  worker settings a Sage reinstall deletes.
+  pinned by upstream projects; the other three are cleared after 0.4.0, see the CHANGELOG's Unreleased section),
+  supervised closings that claim a result in plain prose with no step behind it (only Sage's own report forms are
+  withheld), repeated collection proposals and empty delegations that end in the no-progress stop, request endings
+  reported as "not terminal" or as errors when a task's completion function failed or a delegation was interrupted,
+  the internal delegation envelope appearing in the transcript, a ledger that records only verifier-proven gains, and
+  an experimental coding-agent connection whose worker settings a Sage reinstall deletes.
 - **Erasure.** Operation-memory erasure removes Sage-derived state for one operation but deliberately leaves
   authoritative Mythic records unchanged. It does not erase separate LangGraph checkpoints, Phoenix traces,
   LiteLLM/provider retention, native Mythic messages, or Slack workspace records; each owner must apply its own

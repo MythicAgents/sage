@@ -1,13 +1,13 @@
 langchain==1.3.14
-langchain-core==1.5.3
+langchain-core==1.6.10
 langchain-mcp-adapters==0.3.2
 # langchain-mcp-adapters 0.3.2 still imports `mcp.server.fastmcp` and declares `mcp<2.0.0,>=1.24.0`.
 # mcp 2.0.0 removed that module, so mcp must stay below 2.0 until adapters drops the fastmcp import.
 # Track: https://github.com/langchain-ai/langchain-mcp-adapters/issues/578
 mcp==1.30.0
-langchain-anthropic==1.5.4
+langchain-anthropic==1.7.7
 langchain-aws==1.7.0
-langchain-openai==1.4.2
+langchain-openai==1.7.2
 # mythic 0.3.0rc8 (Mythic v4) pulls gql 4.0.0 + websockets 15 + aiohttp 3.14 transitively.
 # langchain-google-genai stays disabled: google-genai caps websockets<15.1.0, which the v4 SDK line exceeds.
 #langchain-google-genai==4.1.3
@@ -48,7 +48,7 @@ python-dotenv==1.2.2
 # spans). It arrives transitively via arize-phoenix and openinference today;
 # same defect class as the two entries above, so it is declared rather than borrowed. The module
 # degrades to a null span if the import fails, but a shipped image should not rely on that path.
-opentelemetry-api==1.45.1
+opentelemetry-api==1.45.2
 # Direct runtime import (`ai/langgraph/effect_observations.py` opens an enrollment task's PFX to bind its
 # certificate). It arrives transitively today; declared for the same reason as the entries above.
 cryptography==50.0.2

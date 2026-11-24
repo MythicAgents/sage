@@ -27,7 +27,7 @@ pydantic==2.13.4
 # `skills/sage-focused-capability-tests/tests/test_check_reasoning_tools.py` drives the OpenAI SDK client
 # directly to prove a captured provider 400 stays a typed SDK error. It arrives transitively through
 # langchain-openai; the pin matches constraints.txt.
-openai==2.54.0
+openai==3.58.0
 
 # Operator-skill dependency, not a runtime one. `skills/sage-goad-reset/scripts/sync_range_time.py`
 # imports `winrm` to set Windows guest clocks over WinRM after a range rollback — a step AGENTS.md
@@ -45,4 +45,4 @@ pyasn1==0.6.5
 # `Payload_Type/sage/tests/test_kernel_tracing.py` build a real TracerProvider with an in-memory
 # exporter to assert spans are emitted and nested. That needs the SDK, not just the API that the
 # product imports; the SDK is a test-only dependency and belongs here rather than in requirements.txt.
-opentelemetry-sdk==1.45.1
+opentelemetry-sdk==1.45.2

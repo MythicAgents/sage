@@ -62,12 +62,24 @@ _DIAGNOSTIC_ERROR_TYPES = frozenset({
 })
 
 
+_PROVIDER_SDK_MODULES = frozenset({"openai", "anthropic"})
+
+
+def _diagnostic_error_type(exc: BaseException) -> str:
+    """The exception's bounded type name. LangChain's provider adapters raise their own subclasses of the provider
+    SDK's errors (``OpenAIRateLimitError`` is an ``openai.RateLimitError``), so those are named by the SDK class."""
+    error_type = type(exc).__name__
+    if error_type in _DIAGNOSTIC_ERROR_TYPES:
+        return error_type
+    for cls in type(exc).__mro__:
+        if cls.__module__.split(".")[0] in _PROVIDER_SDK_MODULES and cls.__name__ in _DIAGNOSTIC_ERROR_TYPES:
+            return cls.__name__
+    return "OtherError"
+
+
 def _request_error_diagnostic(exc: BaseException, provider_code: str | None) -> dict[str, object]:
     """Keep only bounded SDK metadata; provider prose and headers stay outside artifacts."""
-    error_type = type(exc).__name__
-    result: dict[str, object] = {
-        "error_type": error_type if error_type in _DIAGNOSTIC_ERROR_TYPES else "OtherError",
-    }
+    result: dict[str, object] = {"error_type": _diagnostic_error_type(exc)}
     if provider_code in _DIAGNOSTIC_PROVIDER_CODES:
         result["provider_code"] = provider_code
     status = getattr(exc, "status_code", None)

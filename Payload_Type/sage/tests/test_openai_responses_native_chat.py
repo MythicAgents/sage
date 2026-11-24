@@ -613,20 +613,20 @@ def test_reasoning_from_another_model_is_not_replayed_but_its_calls_and_answers_
 class _AnthropicWire:
     """Synthetic Anthropic Messages endpoint: unknown models get Anthropic's documented not-found error."""
 
-    def __init__(self, unknown: frozenset[str]):
+    def __init__(self, unknown: frozenset[str], library):
         self.unknown = unknown
+        self.library = library
         self.requests: list[dict] = []
 
     def handle(self, request):
-        import httpx
         import json as _json
 
         body = _json.loads(request.content)
         self.requests.append(body)
         if body.get("model") in self.unknown:
-            return httpx.Response(404, json={"type": "error", "error": {
+            return self.library.Response(404, json={"type": "error", "error": {
                 "type": "not_found_error", "message": f"model: {body['model']}"}})
-        return httpx.Response(200, json={
+        return self.library.Response(200, json={
             "id": f"msg_offline_{len(self.requests)}", "type": "message", "role": "assistant",
             "model": body["model"], "content": [{"type": "text", "text": SECOND_ANSWER}],
             "stop_reason": "end_turn", "stop_sequence": None,
@@ -634,17 +634,23 @@ class _AnthropicWire:
 
 
 def test_a_rejection_before_any_answer_keeps_the_channel_for_any_provider(monkeypatch):
-    """Synthetic provider: the real ChatAnthropic and Anthropic SDK over a mock transport."""
+    """Synthetic provider: the real ChatAnthropic and Anthropic SDK over a mock transport.
+
+    The stand-in client is built from the HTTP library the installed Anthropic SDK's default client uses (httpx2
+    from anthropic 1.0), the client Sage's Anthropic route gets: Sage injects no client on that route."""
+    import anthropic
     import httpx
+    import httpx2
     from langchain_anthropic import chat_models as anthropic_models
 
-    wire = _AnthropicWire(frozenset({"claude-nonexistent"}))
+    library = httpx2 if issubclass(anthropic.DefaultHttpxClient, httpx2.Client) else httpx
+    wire = _AnthropicWire(frozenset({"claude-nonexistent"}), library)
     monkeypatch.setattr(anthropic_models, "_get_default_async_httpx_client",
-                        lambda **kw: httpx.AsyncClient(base_url=kw["base_url"],
-                                                       transport=httpx.MockTransport(wire.handle)))
+                        lambda **kw: library.AsyncClient(base_url=kw["base_url"],
+                                                         transport=library.MockTransport(wire.handle)))
     monkeypatch.setattr(anthropic_models, "_get_default_httpx_client",
-                        lambda **kw: httpx.Client(base_url=kw["base_url"],
-                                                  transport=httpx.MockTransport(wire.handle)))
+                        lambda **kw: library.Client(base_url=kw["base_url"],
+                                                    transport=library.MockTransport(wire.handle)))
 
     def config(model: str) -> dict:
         return {"provider": "anthropic", "model": model, "API_KEY": KEY,

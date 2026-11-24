@@ -7,6 +7,32 @@ between minor releases.
 
 ## [Unreleased]
 
+### Changed
+
+- The OpenAI and Anthropic SDKs now connect to providers through httpx2. Provider TLS trust is unchanged when
+  Sage's `certs/bundle.pem` or `SSL_CERT_FILE` is set. With neither, the default provider connection trusts the
+  operating system's certificate store instead of the `certifi` bundle.
+- A provider error that Sage does not explain itself (it does for configuration rejections, an unusable model and a
+  context overflow) changes in two ways. For OpenAI it shows the status and the provider's message without the
+  error code and parameter, because the OpenAI SDK changed how it words its errors. For OpenAI and Anthropic its
+  title names LangChain's error class, for example `OpenAIInvalidRequestError` rather than `BadRequestError`.
+  Sage's own notices are unchanged.
+
+### Security
+
+- Three of the six dependency advisories listed under 0.4.0's known issues are cleared. `dnspython` moves from 2.9.0
+  to 2.9.2 and OpenTelemetry from 1.45.1 to 1.45.2 (instrumentation and semantic conventions to 0.66b2).
+  `pydantic-ai-slim`, which Phoenix uses, moves from 2.31.1 to 2.67.0; that needs the newer model SDKs, so `openai`
+  moves from 2.54.0 to 3.58.0, `anthropic` from 0.125.0 to 2.13.0, `langchain-core` from 1.5.3 to 1.6.10,
+  `langchain-openai` from 1.4.2 to 1.7.2 and `langchain-anthropic` from 1.5.4 to 1.7.7. No other dependency changed.
+
+### Known issues
+
+- **Dependency vulnerabilities.** `pip-audit` reports advisories in three shipped packages, each pinned by another
+  project. `dynaconf` and `ujson` are pinned by `mythic-container`. `strawberry-graphql` is pinned by
+  `arize-phoenix` 19.19.0; every Phoenix release with the fix requires MCP 2, which Sage's MCP adapter
+  (`langchain-mcp-adapters`) does not support.
+
 ## [0.4.0] - 2026-11-23
 
 Sage 0.4.0 keeps a chat going across a Sage restart, adds OpenAI's Responses API and Daybreak settings, switches a

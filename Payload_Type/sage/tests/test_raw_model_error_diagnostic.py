@@ -1,6 +1,7 @@
 """Provider failures remain diagnosable after raw checkpoint completion without leaking response text."""
 
 import json
+from pathlib import Path
 
 import httpx
 import langchain.chat_models
@@ -148,3 +149,24 @@ def test_bounded_provider_timeout_retains_local_type_only():
     ).run("offline objective")
     assert result.stopped == "error"
     assert result.model_error_diagnostic == {"error_type": "TimeoutError"}
+
+
+def test_an_adapter_error_is_named_by_the_provider_sdk_class_it_subclasses():
+    # A recorded 400 replayed through the real factory, SDK and adapter (tests/provider_wire_replay.py). Adapters
+    # from langchain-openai 1.7 raise their own subclass (OpenAIInvalidRequestError is an openai.BadRequestError).
+    from tests import provider_wire_replay as replay
+
+    fixture = json.loads((Path(__file__).parent / "fixtures/model_input_boundaries/provider_wire_round_trips.json")
+                         .read_text(encoding="utf-8"))
+    row = next(r for r in fixture["rows"] if "error" in r["expected"] and r["route"]["api"] == "responses")
+    llm, _client, _requests = replay.build_model(row, "default")
+    failure = replay.outcome(llm)
+
+    assert live_seams._request_error_diagnostic(failure, None)["error_type"] == "BadRequestError"
+
+
+def test_a_non_sdk_subclass_of_a_listed_builtin_is_not_widened():
+    class ResourceBudgetExceeded(ValueError):
+        pass
+
+    assert live_seams._request_error_diagnostic(ResourceBudgetExceeded("x"), None) == {"error_type": "OtherError"}

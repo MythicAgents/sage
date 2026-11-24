@@ -1,0 +1,1701 @@
+{
+ "provenance": {
+  "kind": "recorded provider output (real provider bodies; outputs frozen from the pre-upgrade adapter)",
+  "description": "OpenAI Responses and Chat Completions response bodies recorded by Sage's observation capture in two live checks on 2026-11-22 (24 responses), one row per distinct shape. Each row's expected values are what Sage's real model factory, the OpenAI SDK and langchain-openai produced from the redacted body, projected onto what Sage's consumers read, on both client paths (they agreed).",
+  "oracle_versions": {
+   "openai": "2.54.0",
+   "langchain-openai": "1.4.2",
+   "langchain-core": "1.5.3"
+  },
+  "substitutions": "Lab host and user names renamed to WORKSTATION-A and lab.user; the two model names renamed to recorded-model-a and recorded-model-b (also inside error messages); echoed request parameters (tools, instructions, metadata, safety_identifier, user, prompt_cache_key, prompt_cache_retention, access_programs, billing) removed from 200 bodies. Substitution happened before replay. Provider ids, call ids, arguments, text and encrypted reasoning are otherwise unchanged.",
+  "synthetic": "The replay prompt and the tool result in each history are synthetic placeholders.",
+  "gap": "No Chat Completions success body and no Anthropic Messages body was recorded; those routes are covered only by synthetic tests and the live check.",
+  "dedupe": "Rows keep the first response per (API, status, model, output item types, function names, error code, error param)."
+ },
+ "rows": [
+  {
+   "id": "r01_responses_200_a_reasoning_function_call_list_callbacks",
+   "source": "recorded live check 1 of 2 (2026-11-22), request seq 12396",
+   "model": "recorded-model-a",
+   "route": {
+    "api": "responses",
+    "reasoning_effort": "low"
+   },
+   "status": 200,
+   "body": {
+    "background": false,
+    "completed_at": 1795376282,
+    "created_at": 1795376280,
+    "error": null,
+    "frequency_penalty": 0.0,
+    "id": "resp_054d332832ab6984016b034497b89c87d19c95d96121603824",
+    "image": {
+     "context_compression": "disabled"
+    },
+    "incomplete_details": null,
+    "input_transformations": [],
+    "max_output_tokens": 4096,
+    "max_tool_calls": null,
+    "model": "recorded-model-a",
+    "moderation": null,
+    "object": "response",
+    "output": [
+     {
+      "content": [],
+      "encrypted_content": "gAAAAABrA0SZI66Qnqz_eSrvLdeAI9-cQvFjrbiUzHTMFYq1i-DW3XIsvL4XiV7QczxCQBAjE1e5c7mp2WjTomokhc8lUKrQnzXIpcMK6vNnxJoqYVl2saTcbokolHtAfoFSex1_Q9IHR6aj39bHAE1qi-e2ORKlXfPA2lOLTIlMJwBfaJs2AxxCcxNJ3hof-vkV3siT-x9X7fOHaYqqxt_4tx4JSUIoGdgMSdFiRee04aG4BNe8wtwb8fokNxWP6-WXn_6R4nxCbYHUh5O1w11x7yo0DgZwPzNNMS2_I5vBLRUDdIE_FEh_RkEsCzJUMGlSvMl_20DGIIAO8I2OJNpGeWy69Tjc8cNI1pttYTqPJgrTao-rqR4gK-ar_5O9GFCxvHw6WQecNduJw8tG8itQYJ8SnLyeJB0DvkaxGUQLD4fnnKzHs_fXadv_-Hl2VD4fMR_YuwL6EiieHjacyhAc5QTsw5nlGY_qJrRpHPc1kuZrgOz5BJvGH0XFnrq1Np7R7mun7-GL0yhw6HCmkk63DeipVg3TEolHceqX2E2wKGSy5THJF8thm-3Z8eD1gYM-n8JbeLoT-Zq89yhivw-fRCZ0HJog680oNZFjaX-qNfMnBmYGdRQjucXuoFIuB1EJ5kNF9-hP5l7gs2es0p0geSqmY-bn-hmbEwdCa1NZXRYoobMvnECmhziqGzH9YVpal5gfm9AX6Ektou99HS1ZWTVof3dfHBxsPSfvxrXxoSU6zHRzDctqP0AwTOzVUwpKKQdDEtR4ChhDCQgUF4YSKMb8_S1KzMJjr9bIQ8i41lYOGiksMhuiq-2bPdpSRjHc2oLDEPCNxtNZoorpE_FsB33clJXBSiGx1BZTM2hnpGLUfbekS0HmG14xnCoIQSYSXmB72EUPP_ZpY_DxGgQbmCRAB6jV8PAoJzMzolkab1TusvQlPed-Id_IhxyDuoYWuMd4_i1IexNNjBKpJWjV2AXClBbaXfd8PRQKLbzEeVD-jZeEj20kX02xiv0oV_9vW3ZTFODn3_UCoO5YYwQ-CZM_k-wsylwum0_1hfhi9timYevgX8w2pKfY-FWUhNWxCsx7GlSRpFrl1RpqcY4K9RqdP7A9VZSiPf0G54qb9xtGWenlLkL6Z4g-dsysEe2S4C0ZJsqXEFqOMG8PJ-5NEZ1Ulh_b76vlkcDKAIfjrXPoUgPEHYGnZaejsBLA5WSSU-hLH0gQbCd3pe1ggcToj6RPAEGmDh_Lca0tb86YNL16_n9jwpZb5I9fWT91w0Z0gpa9ZTA3qQd4VZgeaS7ND3spM5q5h3lqCD7C67Rz2fYl1EoibJJMJDM2caQJ7Bk8psmOBcDHrwnJacKo_NgMdQ8b7CC2Anwh32Dlh-qNGO0uCjVZHyU1l-IdsPWENWtbg2OdWMbq5OQbmMkIhR8FdNVnyYnuNTJFRpPKR581IDB17EFjUjEZG_7sjyjYn37Tqjoz3fVfLImMTLKZr67JYDMlNvrppC8Tspkds3vxSRYmrLjDucY4Y9n0Ivw_ijaB54CO2unYpOuiPlgnLftVq1bI9IVvYdwLIqKfulgOh5Wf9Y1__lGzSq9CDklpLfxhOAwDhNAJwjzELQJorBKydkj4vHZsFgpl4fP0KseHPabiGBhySFPic51XOsUuQkff30yERabWW2nPE_Ryt8evz0gJvHikpCKoehtXvkfTC0akmaAZr6E=",
+      "id": "rs_054d332832ab6984016b0344990f8887d19daa19cdedb99771",
+      "summary": [],
+      "type": "reasoning"
+     },
+     {
+      "arguments": "{}",
+      "call_id": "call_8f8a4fda9ab545f78afc851ca5a767cd",
+      "id": "fc_054d332832ab6984016b034499205487d18ef05f36732e7956",
+      "name": "list_callbacks",
+      "status": "completed",
+      "type": "function_call"
+     }
+    ],
+    "parallel_tool_calls": true,
+    "presence_penalty": 0.0,
+    "previous_response_id": null,
+    "reasoning": {
+     "context": "all_turns",
+     "effort": "low",
+     "mode": "standard",
+     "summary": null
+    },
+    "service_tier": "default",
+    "status": "completed",
+    "store": false,
+    "temperature": 1.0,
+    "text": {
+     "format": {
+      "type": "text"
+     },
+     "verbosity": "medium"
+    },
+    "tool_choice": "auto",
+    "tool_usage": {
+     "image_gen": {
+      "input_tokens": 0,
+      "input_tokens_details": {
+       "image_tokens": 0,
+       "text_tokens": 0
+      },
+      "output_tokens": 0,
+      "output_tokens_details": {
+       "image_tokens": 0,
+       "text_tokens": 0
+      },
+      "total_tokens": 0
+     },
+     "web_search": {
+      "num_requests": 0
+     }
+    },
+    "top_logprobs": 0,
+    "top_p": 0.98,
+    "truncation": "disabled",
+    "usage": {
+     "input_tokens": 11452,
+     "input_tokens_details": {
+      "cache_write_tokens": 11449,
+      "cache_write_tokens_details": {
+       "ttl_12h_tokens": 0,
+       "ttl_30m_tokens": 11449
+      },
+      "cached_tokens": 0
+     },
+     "output_tokens": 26,
+     "output_tokens_details": {
+      "reasoning_tokens": 10
+     },
+     "total_tokens": 11478
+    }
+   },
+   "expected": {
+    "message": {
+     "type": "AIMessage",
+     "id": "resp_054d332832ab6984016b034497b89c87d19c95d96121603824",
+     "name": null,
+     "tool_calls": [
+      {
+       "name": "list_callbacks",
+       "args": {},
+       "id": "call_8f8a4fda9ab545f78afc851ca5a767cd"
+      }
+     ],
+     "invalid_tool_calls": [],
+     "content_types": [
+      "reasoning",
+      "function_call"
+     ],
+     "text": "",
+     "sole_text": null,
+     "envelope_error": "",
+     "usage": {
+      "input_tokens": 11452,
+      "output_tokens": 26,
+      "total_tokens": 11478,
+      "reasoning_tokens": 10
+     },
+     "metadata": {
+      "model_name": "recorded-model-a",
+      "model": "recorded-model-a",
+      "status": "completed",
+      "id": "resp_054d332832ab6984016b034497b89c87d19c95d96121603824"
+     },
+     "rendered": ""
+    },
+    "history": {
+     "responses_input": [
+      {
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "role": "user",
+       "type": "message"
+      },
+      {
+       "id": "rs_054d332832ab6984016b0344990f8887d19daa19cdedb99771",
+       "summary": [],
+       "type": "reasoning",
+       "content": [],
+       "encrypted_content": "gAAAAABrA0SZI66Qnqz_eSrvLdeAI9-cQvFjrbiUzHTMFYq1i-DW3XIsvL4XiV7QczxCQBAjE1e5c7mp2WjTomokhc8lUKrQnzXIpcMK6vNnxJoqYVl2saTcbokolHtAfoFSex1_Q9IHR6aj39bHAE1qi-e2ORKlXfPA2lOLTIlMJwBfaJs2AxxCcxNJ3hof-vkV3siT-x9X7fOHaYqqxt_4tx4JSUIoGdgMSdFiRee04aG4BNe8wtwb8fokNxWP6-WXn_6R4nxCbYHUh5O1w11x7yo0DgZwPzNNMS2_I5vBLRUDdIE_FEh_RkEsCzJUMGlSvMl_20DGIIAO8I2OJNpGeWy69Tjc8cNI1pttYTqPJgrTao-rqR4gK-ar_5O9GFCxvHw6WQecNduJw8tG8itQYJ8SnLyeJB0DvkaxGUQLD4fnnKzHs_fXadv_-Hl2VD4fMR_YuwL6EiieHjacyhAc5QTsw5nlGY_qJrRpHPc1kuZrgOz5BJvGH0XFnrq1Np7R7mun7-GL0yhw6HCmkk63DeipVg3TEolHceqX2E2wKGSy5THJF8thm-3Z8eD1gYM-n8JbeLoT-Zq89yhivw-fRCZ0HJog680oNZFjaX-qNfMnBmYGdRQjucXuoFIuB1EJ5kNF9-hP5l7gs2es0p0geSqmY-bn-hmbEwdCa1NZXRYoobMvnECmhziqGzH9YVpal5gfm9AX6Ektou99HS1ZWTVof3dfHBxsPSfvxrXxoSU6zHRzDctqP0AwTOzVUwpKKQdDEtR4ChhDCQgUF4YSKMb8_S1KzMJjr9bIQ8i41lYOGiksMhuiq-2bPdpSRjHc2oLDEPCNxtNZoorpE_FsB33clJXBSiGx1BZTM2hnpGLUfbekS0HmG14xnCoIQSYSXmB72EUPP_ZpY_DxGgQbmCRAB6jV8PAoJzMzolkab1TusvQlPed-Id_IhxyDuoYWuMd4_i1IexNNjBKpJWjV2AXClBbaXfd8PRQKLbzEeVD-jZeEj20kX02xiv0oV_9vW3ZTFODn3_UCoO5YYwQ-CZM_k-wsylwum0_1hfhi9timYevgX8w2pKfY-FWUhNWxCsx7GlSRpFrl1RpqcY4K9RqdP7A9VZSiPf0G54qb9xtGWenlLkL6Z4g-dsysEe2S4C0ZJsqXEFqOMG8PJ-5NEZ1Ulh_b76vlkcDKAIfjrXPoUgPEHYGnZaejsBLA5WSSU-hLH0gQbCd3pe1ggcToj6RPAEGmDh_Lca0tb86YNL16_n9jwpZb5I9fWT91w0Z0gpa9ZTA3qQd4VZgeaS7ND3spM5q5h3lqCD7C67Rz2fYl1EoibJJMJDM2caQJ7Bk8psmOBcDHrwnJacKo_NgMdQ8b7CC2Anwh32Dlh-qNGO0uCjVZHyU1l-IdsPWENWtbg2OdWMbq5OQbmMkIhR8FdNVnyYnuNTJFRpPKR581IDB17EFjUjEZG_7sjyjYn37Tqjoz3fVfLImMTLKZr67JYDMlNvrppC8Tspkds3vxSRYmrLjDucY4Y9n0Ivw_ijaB54CO2unYpOuiPlgnLftVq1bI9IVvYdwLIqKfulgOh5Wf9Y1__lGzSq9CDklpLfxhOAwDhNAJwjzELQJorBKydkj4vHZsFgpl4fP0KseHPabiGBhySFPic51XOsUuQkff30yERabWW2nPE_Ryt8evz0gJvHikpCKoehtXvkfTC0akmaAZr6E="
+      },
+      {
+       "arguments": "{}",
+       "call_id": "call_8f8a4fda9ab545f78afc851ca5a767cd",
+       "name": "list_callbacks",
+       "type": "function_call",
+       "id": "fc_054d332832ab6984016b034499205487d18ef05f36732e7956",
+       "status": "completed"
+      },
+      {
+       "type": "function_call_output",
+       "output": "Synthetic tool result for the replay.",
+       "call_id": "call_8f8a4fda9ab545f78afc851ca5a767cd"
+      }
+     ],
+     "chat_completions": [
+      {
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "role": "user"
+      },
+      {
+       "content": [
+        {
+         "id": "rs_054d332832ab6984016b0344990f8887d19daa19cdedb99771",
+         "summary": [],
+         "type": "reasoning",
+         "content": [],
+         "encrypted_content": "gAAAAABrA0SZI66Qnqz_eSrvLdeAI9-cQvFjrbiUzHTMFYq1i-DW3XIsvL4XiV7QczxCQBAjE1e5c7mp2WjTomokhc8lUKrQnzXIpcMK6vNnxJoqYVl2saTcbokolHtAfoFSex1_Q9IHR6aj39bHAE1qi-e2ORKlXfPA2lOLTIlMJwBfaJs2AxxCcxNJ3hof-vkV3siT-x9X7fOHaYqqxt_4tx4JSUIoGdgMSdFiRee04aG4BNe8wtwb8fokNxWP6-WXn_6R4nxCbYHUh5O1w11x7yo0DgZwPzNNMS2_I5vBLRUDdIE_FEh_RkEsCzJUMGlSvMl_20DGIIAO8I2OJNpGeWy69Tjc8cNI1pttYTqPJgrTao-rqR4gK-ar_5O9GFCxvHw6WQecNduJw8tG8itQYJ8SnLyeJB0DvkaxGUQLD4fnnKzHs_fXadv_-Hl2VD4fMR_YuwL6EiieHjacyhAc5QTsw5nlGY_qJrRpHPc1kuZrgOz5BJvGH0XFnrq1Np7R7mun7-GL0yhw6HCmkk63DeipVg3TEolHceqX2E2wKGSy5THJF8thm-3Z8eD1gYM-n8JbeLoT-Zq89yhivw-fRCZ0HJog680oNZFjaX-qNfMnBmYGdRQjucXuoFIuB1EJ5kNF9-hP5l7gs2es0p0geSqmY-bn-hmbEwdCa1NZXRYoobMvnECmhziqGzH9YVpal5gfm9AX6Ektou99HS1ZWTVof3dfHBxsPSfvxrXxoSU6zHRzDctqP0AwTOzVUwpKKQdDEtR4ChhDCQgUF4YSKMb8_S1KzMJjr9bIQ8i41lYOGiksMhuiq-2bPdpSRjHc2oLDEPCNxtNZoorpE_FsB33clJXBSiGx1BZTM2hnpGLUfbekS0HmG14xnCoIQSYSXmB72EUPP_ZpY_DxGgQbmCRAB6jV8PAoJzMzolkab1TusvQlPed-Id_IhxyDuoYWuMd4_i1IexNNjBKpJWjV2AXClBbaXfd8PRQKLbzEeVD-jZeEj20kX02xiv0oV_9vW3ZTFODn3_UCoO5YYwQ-CZM_k-wsylwum0_1hfhi9timYevgX8w2pKfY-FWUhNWxCsx7GlSRpFrl1RpqcY4K9RqdP7A9VZSiPf0G54qb9xtGWenlLkL6Z4g-dsysEe2S4C0ZJsqXEFqOMG8PJ-5NEZ1Ulh_b76vlkcDKAIfjrXPoUgPEHYGnZaejsBLA5WSSU-hLH0gQbCd3pe1ggcToj6RPAEGmDh_Lca0tb86YNL16_n9jwpZb5I9fWT91w0Z0gpa9ZTA3qQd4VZgeaS7ND3spM5q5h3lqCD7C67Rz2fYl1EoibJJMJDM2caQJ7Bk8psmOBcDHrwnJacKo_NgMdQ8b7CC2Anwh32Dlh-qNGO0uCjVZHyU1l-IdsPWENWtbg2OdWMbq5OQbmMkIhR8FdNVnyYnuNTJFRpPKR581IDB17EFjUjEZG_7sjyjYn37Tqjoz3fVfLImMTLKZr67JYDMlNvrppC8Tspkds3vxSRYmrLjDucY4Y9n0Ivw_ijaB54CO2unYpOuiPlgnLftVq1bI9IVvYdwLIqKfulgOh5Wf9Y1__lGzSq9CDklpLfxhOAwDhNAJwjzELQJorBKydkj4vHZsFgpl4fP0KseHPabiGBhySFPic51XOsUuQkff30yERabWW2nPE_Ryt8evz0gJvHikpCKoehtXvkfTC0akmaAZr6E="
+        }
+       ],
+       "role": "assistant",
+       "tool_calls": [
+        {
+         "type": "function",
+         "id": "call_8f8a4fda9ab545f78afc851ca5a767cd",
+         "function": {
+          "name": "list_callbacks",
+          "arguments": "{}"
+         }
+        }
+       ]
+      },
+      {
+       "content": "Synthetic tool result for the replay.",
+       "role": "tool",
+       "tool_call_id": "call_8f8a4fda9ab545f78afc851ca5a767cd"
+      }
+     ],
+     "sanitized": [
+      {
+       "type": "HumanMessage",
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "tool_calls": [],
+       "tool_call_id": null
+      },
+      {
+       "type": "AIMessage",
+       "content": [
+        {
+         "id": "rs_054d332832ab6984016b0344990f8887d19daa19cdedb99771",
+         "summary": [],
+         "type": "reasoning",
+         "content": [],
+         "encrypted_content": "gAAAAABrA0SZI66Qnqz_eSrvLdeAI9-cQvFjrbiUzHTMFYq1i-DW3XIsvL4XiV7QczxCQBAjE1e5c7mp2WjTomokhc8lUKrQnzXIpcMK6vNnxJoqYVl2saTcbokolHtAfoFSex1_Q9IHR6aj39bHAE1qi-e2ORKlXfPA2lOLTIlMJwBfaJs2AxxCcxNJ3hof-vkV3siT-x9X7fOHaYqqxt_4tx4JSUIoGdgMSdFiRee04aG4BNe8wtwb8fokNxWP6-WXn_6R4nxCbYHUh5O1w11x7yo0DgZwPzNNMS2_I5vBLRUDdIE_FEh_RkEsCzJUMGlSvMl_20DGIIAO8I2OJNpGeWy69Tjc8cNI1pttYTqPJgrTao-rqR4gK-ar_5O9GFCxvHw6WQecNduJw8tG8itQYJ8SnLyeJB0DvkaxGUQLD4fnnKzHs_fXadv_-Hl2VD4fMR_YuwL6EiieHjacyhAc5QTsw5nlGY_qJrRpHPc1kuZrgOz5BJvGH0XFnrq1Np7R7mun7-GL0yhw6HCmkk63DeipVg3TEolHceqX2E2wKGSy5THJF8thm-3Z8eD1gYM-n8JbeLoT-Zq89yhivw-fRCZ0HJog680oNZFjaX-qNfMnBmYGdRQjucXuoFIuB1EJ5kNF9-hP5l7gs2es0p0geSqmY-bn-hmbEwdCa1NZXRYoobMvnECmhziqGzH9YVpal5gfm9AX6Ektou99HS1ZWTVof3dfHBxsPSfvxrXxoSU6zHRzDctqP0AwTOzVUwpKKQdDEtR4ChhDCQgUF4YSKMb8_S1KzMJjr9bIQ8i41lYOGiksMhuiq-2bPdpSRjHc2oLDEPCNxtNZoorpE_FsB33clJXBSiGx1BZTM2hnpGLUfbekS0HmG14xnCoIQSYSXmB72EUPP_ZpY_DxGgQbmCRAB6jV8PAoJzMzolkab1TusvQlPed-Id_IhxyDuoYWuMd4_i1IexNNjBKpJWjV2AXClBbaXfd8PRQKLbzEeVD-jZeEj20kX02xiv0oV_9vW3ZTFODn3_UCoO5YYwQ-CZM_k-wsylwum0_1hfhi9timYevgX8w2pKfY-FWUhNWxCsx7GlSRpFrl1RpqcY4K9RqdP7A9VZSiPf0G54qb9xtGWenlLkL6Z4g-dsysEe2S4C0ZJsqXEFqOMG8PJ-5NEZ1Ulh_b76vlkcDKAIfjrXPoUgPEHYGnZaejsBLA5WSSU-hLH0gQbCd3pe1ggcToj6RPAEGmDh_Lca0tb86YNL16_n9jwpZb5I9fWT91w0Z0gpa9ZTA3qQd4VZgeaS7ND3spM5q5h3lqCD7C67Rz2fYl1EoibJJMJDM2caQJ7Bk8psmOBcDHrwnJacKo_NgMdQ8b7CC2Anwh32Dlh-qNGO0uCjVZHyU1l-IdsPWENWtbg2OdWMbq5OQbmMkIhR8FdNVnyYnuNTJFRpPKR581IDB17EFjUjEZG_7sjyjYn37Tqjoz3fVfLImMTLKZr67JYDMlNvrppC8Tspkds3vxSRYmrLjDucY4Y9n0Ivw_ijaB54CO2unYpOuiPlgnLftVq1bI9IVvYdwLIqKfulgOh5Wf9Y1__lGzSq9CDklpLfxhOAwDhNAJwjzELQJorBKydkj4vHZsFgpl4fP0KseHPabiGBhySFPic51XOsUuQkff30yERabWW2nPE_Ryt8evz0gJvHikpCKoehtXvkfTC0akmaAZr6E="
+        },
+        {
+         "arguments": "{}",
+         "call_id": "call_8f8a4fda9ab545f78afc851ca5a767cd",
+         "name": "list_callbacks",
+         "type": "function_call",
+         "id": "fc_054d332832ab6984016b034499205487d18ef05f36732e7956",
+         "status": "completed"
+        }
+       ],
+       "tool_calls": [
+        {
+         "name": "list_callbacks",
+         "args": {},
+         "id": "call_8f8a4fda9ab545f78afc851ca5a767cd"
+        }
+       ],
+       "tool_call_id": null
+      },
+      {
+       "type": "ToolMessage",
+       "content": "Synthetic tool result for the replay.",
+       "tool_calls": [],
+       "tool_call_id": "call_8f8a4fda9ab545f78afc851ca5a767cd"
+      }
+     ],
+     "sanitized_changed": false
+    },
+    "checkpoint": {
+     "type": "msgpack",
+     "base64": "k8eyBZS9bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMuaHVtYW6sSHVtYW5NZXNzYWdlhqdjb250ZW502SxTeW50aGV0aWMgcmVwbGF5IHByb21wdDogbGlzdCB0aGUgY2FsbGJhY2tzLrFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWlaHVtYW6kbmFtZcCiaWTAs21vZGVsX3ZhbGlkYXRlX2pzb27ICmIFlLpsYW5nY2hhaW5fY29yZS5tZXNzYWdlcy5haalBSU1lc3NhZ2WJp2NvbnRlbnSShaJpZNk1cnNfMDU0ZDMzMjgzMmFiNjk4NDAxNmIwMzQ0OTkwZjg4ODdkMTlkYWExOWNkZWRiOTk3NzGnc3VtbWFyeZCkdHlwZalyZWFzb25pbmenY29udGVudJCxZW5jcnlwdGVkX2NvbnRlbnTaBrhnQUFBQUFCckEwU1pJNjZRbnF6X2VTcnZMZGVBSTktY1F2RmpyYmlVekhUTUZZcTFpLURXM1hJc3ZMNFhpVjdRY3p4Q1FCQWpFMWU1YzdtcDJXalRvbW9raGM4bFVLclFuelhJcGNNSzZ2Tm54Sm9xWVZsMnNhVGNib2tvbEh0QWZvRlNleDFfUTlJSFI2YWozOWJIQUUxcWktZTJPUktsWGZQQTJsT0xUSWxNSndCZmFKczJBeHhDY3hOSjNob2YtdmtWM3NpVC14OVg3Zk9IYVlxcXh0XzR0eDRKU1VJb0dkZ01TZEZpUmVlMDRhRzRCTmU4d3R3Yjhmb2tOeFdQNi1XWG5fNlI0bnhDYllIVWg1TzF3MTF4N3lvMERnWndQek5OTVMyX0k1dkJMUlVEZElFX0ZFaF9Sa0VzQ3pKVU1HbFN2TWxfMjBER0lJQU84STJPSk5wR2VXeTY5VGpjOGNOSTFwdHRZVHFQSmdyVGFvLXJxUjRnSy1hcl81TzlHRkN4dkh3NldRZWNOZHVKdzh0RzhpdFFZSjhTbkx5ZUpCMER2a2F4R1VRTEQ0Zm5uS3pIc19mWGFkdl8tSGwyVkQ0Zk1SX1l1d0w2RWlpZUhqYWN5aEFjNVFUc3c1bmxHWV9xSnJScEhQYzFrdVpyZ096NUJKdkdIMFhGbnJxMU5wN1I3bXVuNy1HTDB5aHc2SENta2s2M0RlaXBWZzNURW9sSGNlcVgyRTJ3S0dTeTVUSEpGOHRobS0zWjhlRDFnWU0tbjhKYmVMb1QtWnE4OXloaXZ3LWZSQ1owSEpvZzY4MG9OWkZqYVgtcU5mTW5CbVlHZFJRanVjWHVvRkl1QjFFSjVrTkY5LWhQNWw3Z3MyZXMwcDBnZVNxbVktYm4taG1iRXdkQ2ExTlpYUllvb2JNdm5FQ21oemlxR3pIOVlWcGFsNWdmbTlBWDZFa3RvdTk5SFMxWldUVm9mM2RmSEJ4c1BTZnZ4clh4b1NVNnpIUnpEY3RxUDBBd1RPelZVd3BLS1FkREV0UjRDaGhEQ1FnVUY0WVNLTWI4X1MxS3pNSmpyOWJJUThpNDFsWU9HaWtzTWh1aXEtMmJQZHBTUmpIYzJvTERFUENOeHROWm9vcnBFX0ZzQjMzY2xKWEJTaUd4MUJaVE0yaG5wR0xVZmJla1MwSG1HMTR4bkNvSVFTWVNYbUI3MkVVUFBfWnBZX0R4R2dRYm1DUkFCNmpWOFBBb0p6TXpvbGthYjFUdXN2UWxQZWQtSWRfSWh4eUR1b1lXdU1kNF9pMUlleE5OakJLcEpXalYyQVhDbEJiYVhmZDhQUlFLTGJ6RWVWRC1qWmVFajIwa1gwMnhpdjBvVl85dlczWlRGT0RuM19VQ29PNVlZd1EtQ1pNX2std3N5bHd1bTBfMWhmaGk5dGltWWV2Z1g4dzJwS2ZZLUZXVWhOV3hDc3g3R2xTUnBGcmwxUnBxY1k0SzlScWRQN0E5VlpTaVBmMEc1NHFiOXh0R1dlbmxMa0w2WjRnLWRzeXNFZTJTNEMwWkpzcVhFRnFPTUc4UEotNU5FWjFVbGhfYjc2dmxrY0RLQUlmanJYUG9VZ1BFSFlHblphZWpzQkxBNVdTU1UtaExIMGdRYkNkM3BlMWdnY1RvajZSUEFFR21EaF9MY2EwdGI4NllOTDE2X245andwWmI1STlmV1Q5MXcwWjBncGE5WlRBM3FRZDRWWmdlYVM3TkQzc3BNNXE1aDNscUNEN0M2N1J6MmZZbDFFb2liSkpNSkRNMmNhUUo3Qms4cHNtT0JjREhyd25KYWNLb19OZ01kUThiN0NDMkFud2gzMkRsaC1xTkdPMHVDalZaSHlVMWwtSWRzUFdFTld0YmcyT2RXTWJxNU9RYm1Na0loUjhGZE5WbnlZbnVOVEpGUnBQS1I1ODFJREIxN0VGalVqRVpHXzdzanlqWW4zN1Rxam96M2ZWZkxJbU1UTEtacjY3SllETWxOdnJwcEM4VHNwa2RzM3Z4U1JZbXJMakR1Y1k0WTluMEl2d19pamFCNTRDTzJ1bllwT3VpUGxnbkxmdFZxMWJJOUlWdllkd0xJcUtmdWxnT2g1V2Y5WTFfX2xHelNxOUNEa2xwTGZ4aE9Bd0RoTkFKd2p6RUxRSm9yQkt5ZGtqNHZIWnNGZ3BsNGZQMEtzZUhQYWJpR0JoeVNGUGljNTFYT3NVdVFrZmYzMHlFUmFiV1cyblBFX1J5dDhldnowZ0p2SGlrcENLb2VodFh2a2ZUQzBha21hQVpyNkU9hqlhcmd1bWVudHOie32nY2FsbF9pZNklY2FsbF84ZjhhNGZkYTlhYjU0NWY3OGFmYzg1MWNhNWE3NjdjZKRuYW1lrmxpc3RfY2FsbGJhY2tzpHR5cGWtZnVuY3Rpb25fY2FsbKJpZNk1ZmNfMDU0ZDMzMjgzMmFiNjk4NDAxNmIwMzQ0OTkyMDU0ODdkMThlZjA1ZjM2NzMyZTc5NTamc3RhdHVzqWNvbXBsZXRlZLFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGIomlk2TdyZXNwXzA1NGQzMzI4MzJhYjY5ODQwMTZiMDM0NDk3Yjg5Yzg3ZDE5Yzk1ZDk2MTIxNjAzODI0qmNyZWF0ZWRfYXTLQdrA0SYAAAClbW9kZWywcmVjb3JkZWQtbW9kZWwtYaZvYmplY3SocmVzcG9uc2Wsc2VydmljZV90aWVyp2RlZmF1bHSmc3RhdHVzqWNvbXBsZXRlZK5tb2RlbF9wcm92aWRlcqZvcGVuYWmqbW9kZWxfbmFtZbByZWNvcmRlZC1tb2RlbC1hpHR5cGWiYWmkbmFtZcCiaWTZN3Jlc3BfMDU0ZDMzMjgzMmFiNjk4NDAxNmIwMzQ0OTdiODljODdkMTljOTVkOTYxMjE2MDM4MjSqdG9vbF9jYWxsc5GEpG5hbWWubGlzdF9jYWxsYmFja3OkYXJnc4CiaWTZJWNhbGxfOGY4YTRmZGE5YWI1NDVmNzhhZmM4NTFjYTVhNzY3Y2SkdHlwZal0b29sX2NhbGyyaW52YWxpZF90b29sX2NhbGxzkK51c2FnZV9tZXRhZGF0YYWsaW5wdXRfdG9rZW5zzSy8rW91dHB1dF90b2tlbnMarHRvdGFsX3Rva2Vuc80s1rNpbnB1dF90b2tlbl9kZXRhaWxzgq5jYWNoZV9jcmVhdGlvbs0suapjYWNoZV9yZWFkALRvdXRwdXRfdG9rZW5fZGV0YWlsc4GpcmVhc29uaW5nCrNtb2RlbF92YWxpZGF0ZV9qc29ux/UFlLxsYW5nY2hhaW5fY29yZS5tZXNzYWdlcy50b29sq1Rvb2xNZXNzYWdliadjb250ZW502SVTeW50aGV0aWMgdG9vbCByZXN1bHQgZm9yIHRoZSByZXBsYXkusWFkZGl0aW9uYWxfa3dhcmdzgLFyZXNwb25zZV9tZXRhZGF0YYCkdHlwZaR0b29spG5hbWXAomlkwKx0b29sX2NhbGxfaWTZJWNhbGxfOGY4YTRmZGE5YWI1NDVmNzhhZmM4NTFjYTVhNzY3Y2SoYXJ0aWZhY3TApnN0YXR1c6dzdWNjZXNzs21vZGVsX3ZhbGlkYXRlX2pzb24="
+    }
+   }
+  },
+  {
+   "id": "r02_responses_200_a_reasoning_function_call_respond_to_user",
+   "source": "recorded live check 1 of 2 (2026-11-22), request seq 12471",
+   "model": "recorded-model-a",
+   "route": {
+    "api": "responses",
+    "reasoning_effort": "low"
+   },
+   "status": 200,
+   "body": {
+    "background": false,
+    "completed_at": 1795376286,
+    "created_at": 1795376283,
+    "error": null,
+    "frequency_penalty": 0.0,
+    "id": "resp_054d332832ab6984016b03449b391c87d1af924b8d917299bc",
+    "image": {
+     "context_compression": "disabled"
+    },
+    "incomplete_details": null,
+    "input_transformations": [],
+    "max_output_tokens": 4096,
+    "max_tool_calls": null,
+    "model": "recorded-model-a",
+    "moderation": null,
+    "object": "response",
+    "output": [
+     {
+      "content": [],
+      "encrypted_content": "gAAAAABrA0Sct11cZtsajcYYRITZRnzvfIEkOD4PoxStHxUIagjzBb3htncEvYGu6-IkV1FqyfV0bSnSUplzDZp9OdG6T9BvFwY64isW0YhrArfnU5VpEOLVpMp1UgnTRY2wB78qr5nSbg3TRexD2XHGlXZMg9ZiY_4vg0x59ja9p0WFwz_EQ_Mfo_uUKh2ki8KdPBzbKBLJEIBCtmgYSH3Da9b4kop5Ny-2W0Tgtv_N3dVqCbO9mVKTJWwQCszV_RBa4j1UUJvSijrxFS2G6mY2WS16vb4k9V-U_ymZouwyIxcdSEQIFNNa9WFc5q6zKPGWCzmauEgzlJdX1qvGsxSPaskWi9U9HLqfn6MKhFuzV9jBQsx36W9MxTW2ehsGkePcx8tQtZ5eg6rgbt8A9XRr7uq7qvZbcNS_zGEw2i2feA7e7ll0O-bAih7ayatl0q1PPqXrr1ZM7w7HgAEJGKdE4Ty4BEQaLtag4VzAM_GFqYKpPr2BC8trxI-eC1VgFCCZbngm7P_lL_zHSvHQw4MD0pUY0jAukNSu2hJug2DgYWtjL8326K96bgCLtdxSigBfKopgZIbmLTxT6z-SnP7MogXjaVzhEyYahDeXD7xKU-I-BqMZiR9aSGFUBI6l8SIDM3NhqKB9QOjAeNd7pOUAYi1CCND8VEYOqbVVM_FodN5THcCTbXqsNak15AnGtDFYIFg48PSUm06FRXnKDnNzKPoCqDZ4DhN0xfz73G4D-LXzDzSb9T8GE8E6C3Im5IWvaWUGHqyQJi1ItOWWlEqrIJRliBJrGLLMGbRJzI7lT6C197G0c6rEc3PmIBE181ejJVge5u7Ozp-tGVLUmcGaTMHxR-rqpV7ocWIkf5Uq4TjNW9FdI_Mk0vjUKk8YYEHXQCHCV6DwDa0X4IFA3Gnl0NF_EBG_YaL2bBtts_CdShCuSUWe5KyGm-cQaYUZGZfB2HApLB1nE0i3FN0tQCSZrtXJLSf2rEBYHmsseTMXPiHUb21rpFJD2FWtqKaqkbx7VWGPNgyZlOM7IPicAiUwUFYpXQ2pMF-aiyo9caKKHoCHGwpu19dLv_D2s5vXNyxlfnHTd4b_u4WMX94FTyh_RD7SH_b8D7n7Yh4qzQoDYq5Eit3ThcEjLwP6gc_nev8KZPM1BLas36JMcPpjSDltY_za_0BOo0SL9hdC0THsX8FLmLUAVbgKMcPMkPzxR3Ws0mmvwtClcr-gPl5P9WDsiEYiRvFrN3HJa8jaatu8QkKCQkiw5azuCmdwDNFX-hmdBTbQfguFPscUb1Q-jEboEtXkeecsra78z0u0waYdkZsrke-t7zoM8er1JpOi3UPzvrn8ErOa3tRsJENDry1-438zObCDmbCsRXjazHTBKE9StG_Dr9A70_erp1bM_wxNjZlm0dbaxR9OMxmm7KItcfWbA9ZtWnEaXlnUO-3_Y7VMbrvbkjxROcvC4B9E-lbv41AtrxW14XJSJD2eqpMuViq6bDyStw1Sj4dKE3y0H4pWLQrjsi5Sz7E04p4s1g24rifijxflXwDajwJAB6N1cO_YUVgymhb1URa295a5Nn77NGJrmxaWTYtxmKTsIAvrfdlIoS1NgXDwwecqFphMzUBlrr16FLf9iTXzINw5i6gzo4IKDvMHYxHgjap9MJADJ5HgzD8k2WJED75JN-Of1gMaoQCJsfoJBqlaiO4RbIa8OADAWrrDnEFdgC6GPDPEqWs639Goxo4MBFbmNBW6aE1fiwXxbDkWpLGcgKMB2gpNxUkamho7Lu-uDMs0XqlxIfIx2IOJ5CSN8qG4-5VmycnoqWTgow==",
+      "id": "rs_054d332832ab6984016b03449c2e9c87d1aca671d9e9323117",
+      "summary": [],
+      "type": "reasoning"
+     },
+     {
+      "arguments": "{\"final_response\":\"**Label:** `amber-seven`\\n\\n| Callback | Agent | Host | User | Integrity | Status | Last check-in |\\n|---:|---|---|---|---:|---|---:|\\n| 2 | apollo | WORKSTATION-A | lab.user | 2 | **dead** | ~89,794 seconds ago (~24h 57m) |\\n| 3 | apollo | WORKSTATION-A | lab.user | 3 | **alive** | ~0.93 seconds ago |\\n\\nThere are **2 callbacks**: one alive (**#3**) and one dead (**#2**), both on `WORKSTATION-A` as `lab.user`. This was a read-only status check; **no tasks were run**.\",\"reuse_latest_worker_answer\":false,\"outcome\":\"completed\"}",
+      "call_id": "call_e6bfdf44e8394c42a636f94b78d5d762",
+      "id": "fc_054d332832ab6984016b03449c310487d19d2f716129d8e80b",
+      "name": "respond_to_user",
+      "status": "completed",
+      "type": "function_call"
+     }
+    ],
+    "parallel_tool_calls": true,
+    "presence_penalty": 0.0,
+    "previous_response_id": null,
+    "reasoning": {
+     "context": "all_turns",
+     "effort": "low",
+     "mode": "standard",
+     "summary": null
+    },
+    "service_tier": "default",
+    "status": "completed",
+    "store": false,
+    "temperature": 1.0,
+    "text": {
+     "format": {
+      "type": "text"
+     },
+     "verbosity": "medium"
+    },
+    "tool_choice": "auto",
+    "tool_usage": {
+     "image_gen": {
+      "input_tokens": 0,
+      "input_tokens_details": {
+       "image_tokens": 0,
+       "text_tokens": 0
+      },
+      "output_tokens": 0,
+      "output_tokens_details": {
+       "image_tokens": 0,
+       "text_tokens": 0
+      },
+      "total_tokens": 0
+     },
+     "web_search": {
+      "num_requests": 0
+     }
+    },
+    "top_logprobs": 0,
+    "top_p": 0.98,
+    "truncation": "disabled",
+    "usage": {
+     "input_tokens": 11600,
+     "input_tokens_details": {
+      "cache_write_tokens": 901,
+      "cache_write_tokens_details": {
+       "ttl_12h_tokens": 0,
+       "ttl_30m_tokens": 901
+      },
+      "cached_tokens": 10696
+     },
+     "output_tokens": 215,
+     "output_tokens_details": {
+      "reasoning_tokens": 17
+     },
+     "total_tokens": 11815
+    }
+   },
+   "expected": {
+    "message": {
+     "type": "AIMessage",
+     "id": "resp_054d332832ab6984016b03449b391c87d1af924b8d917299bc",
+     "name": null,
+     "tool_calls": [
+      {
+       "name": "respond_to_user",
+       "args": {
+        "final_response": "**Label:** `amber-seven`\n\n| Callback | Agent | Host | User | Integrity | Status | Last check-in |\n|---:|---|---|---|---:|---|---:|\n| 2 | apollo | WORKSTATION-A | lab.user | 2 | **dead** | ~89,794 seconds ago (~24h 57m) |\n| 3 | apollo | WORKSTATION-A | lab.user | 3 | **alive** | ~0.93 seconds ago |\n\nThere are **2 callbacks**: one alive (**#3**) and one dead (**#2**), both on `WORKSTATION-A` as `lab.user`. This was a read-only status check; **no tasks were run**.",
+        "reuse_latest_worker_answer": false,
+        "outcome": "completed"
+       },
+       "id": "call_e6bfdf44e8394c42a636f94b78d5d762"
+      }
+     ],
+     "invalid_tool_calls": [],
+     "content_types": [
+      "reasoning",
+      "function_call"
+     ],
+     "text": "",
+     "sole_text": null,
+     "envelope_error": "",
+     "usage": {
+      "input_tokens": 11600,
+      "output_tokens": 215,
+      "total_tokens": 11815,
+      "reasoning_tokens": 17
+     },
+     "metadata": {
+      "model_name": "recorded-model-a",
+      "model": "recorded-model-a",
+      "status": "completed",
+      "id": "resp_054d332832ab6984016b03449b391c87d1af924b8d917299bc"
+     },
+     "rendered": ""
+    },
+    "history": {
+     "responses_input": [
+      {
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "role": "user",
+       "type": "message"
+      },
+      {
+       "id": "rs_054d332832ab6984016b03449c2e9c87d1aca671d9e9323117",
+       "summary": [],
+       "type": "reasoning",
+       "content": [],
+       "encrypted_content": "gAAAAABrA0Sct11cZtsajcYYRITZRnzvfIEkOD4PoxStHxUIagjzBb3htncEvYGu6-IkV1FqyfV0bSnSUplzDZp9OdG6T9BvFwY64isW0YhrArfnU5VpEOLVpMp1UgnTRY2wB78qr5nSbg3TRexD2XHGlXZMg9ZiY_4vg0x59ja9p0WFwz_EQ_Mfo_uUKh2ki8KdPBzbKBLJEIBCtmgYSH3Da9b4kop5Ny-2W0Tgtv_N3dVqCbO9mVKTJWwQCszV_RBa4j1UUJvSijrxFS2G6mY2WS16vb4k9V-U_ymZouwyIxcdSEQIFNNa9WFc5q6zKPGWCzmauEgzlJdX1qvGsxSPaskWi9U9HLqfn6MKhFuzV9jBQsx36W9MxTW2ehsGkePcx8tQtZ5eg6rgbt8A9XRr7uq7qvZbcNS_zGEw2i2feA7e7ll0O-bAih7ayatl0q1PPqXrr1ZM7w7HgAEJGKdE4Ty4BEQaLtag4VzAM_GFqYKpPr2BC8trxI-eC1VgFCCZbngm7P_lL_zHSvHQw4MD0pUY0jAukNSu2hJug2DgYWtjL8326K96bgCLtdxSigBfKopgZIbmLTxT6z-SnP7MogXjaVzhEyYahDeXD7xKU-I-BqMZiR9aSGFUBI6l8SIDM3NhqKB9QOjAeNd7pOUAYi1CCND8VEYOqbVVM_FodN5THcCTbXqsNak15AnGtDFYIFg48PSUm06FRXnKDnNzKPoCqDZ4DhN0xfz73G4D-LXzDzSb9T8GE8E6C3Im5IWvaWUGHqyQJi1ItOWWlEqrIJRliBJrGLLMGbRJzI7lT6C197G0c6rEc3PmIBE181ejJVge5u7Ozp-tGVLUmcGaTMHxR-rqpV7ocWIkf5Uq4TjNW9FdI_Mk0vjUKk8YYEHXQCHCV6DwDa0X4IFA3Gnl0NF_EBG_YaL2bBtts_CdShCuSUWe5KyGm-cQaYUZGZfB2HApLB1nE0i3FN0tQCSZrtXJLSf2rEBYHmsseTMXPiHUb21rpFJD2FWtqKaqkbx7VWGPNgyZlOM7IPicAiUwUFYpXQ2pMF-aiyo9caKKHoCHGwpu19dLv_D2s5vXNyxlfnHTd4b_u4WMX94FTyh_RD7SH_b8D7n7Yh4qzQoDYq5Eit3ThcEjLwP6gc_nev8KZPM1BLas36JMcPpjSDltY_za_0BOo0SL9hdC0THsX8FLmLUAVbgKMcPMkPzxR3Ws0mmvwtClcr-gPl5P9WDsiEYiRvFrN3HJa8jaatu8QkKCQkiw5azuCmdwDNFX-hmdBTbQfguFPscUb1Q-jEboEtXkeecsra78z0u0waYdkZsrke-t7zoM8er1JpOi3UPzvrn8ErOa3tRsJENDry1-438zObCDmbCsRXjazHTBKE9StG_Dr9A70_erp1bM_wxNjZlm0dbaxR9OMxmm7KItcfWbA9ZtWnEaXlnUO-3_Y7VMbrvbkjxROcvC4B9E-lbv41AtrxW14XJSJD2eqpMuViq6bDyStw1Sj4dKE3y0H4pWLQrjsi5Sz7E04p4s1g24rifijxflXwDajwJAB6N1cO_YUVgymhb1URa295a5Nn77NGJrmxaWTYtxmKTsIAvrfdlIoS1NgXDwwecqFphMzUBlrr16FLf9iTXzINw5i6gzo4IKDvMHYxHgjap9MJADJ5HgzD8k2WJED75JN-Of1gMaoQCJsfoJBqlaiO4RbIa8OADAWrrDnEFdgC6GPDPEqWs639Goxo4MBFbmNBW6aE1fiwXxbDkWpLGcgKMB2gpNxUkamho7Lu-uDMs0XqlxIfIx2IOJ5CSN8qG4-5VmycnoqWTgow=="
+      },
+      {
+       "arguments": "{\"final_response\":\"**Label:** `amber-seven`\\n\\n| Callback | Agent | Host | User | Integrity | Status | Last check-in |\\n|---:|---|---|---|---:|---|---:|\\n| 2 | apollo | WORKSTATION-A | lab.user | 2 | **dead** | ~89,794 seconds ago (~24h 57m) |\\n| 3 | apollo | WORKSTATION-A | lab.user | 3 | **alive** | ~0.93 seconds ago |\\n\\nThere are **2 callbacks**: one alive (**#3**) and one dead (**#2**), both on `WORKSTATION-A` as `lab.user`. This was a read-only status check; **no tasks were run**.\",\"reuse_latest_worker_answer\":false,\"outcome\":\"completed\"}",
+       "call_id": "call_e6bfdf44e8394c42a636f94b78d5d762",
+       "name": "respond_to_user",
+       "type": "function_call",
+       "id": "fc_054d332832ab6984016b03449c310487d19d2f716129d8e80b",
+       "status": "completed"
+      },
+      {
+       "type": "function_call_output",
+       "output": "Synthetic tool result for the replay.",
+       "call_id": "call_e6bfdf44e8394c42a636f94b78d5d762"
+      }
+     ],
+     "chat_completions": [
+      {
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "role": "user"
+      },
+      {
+       "content": [
+        {
+         "id": "rs_054d332832ab6984016b03449c2e9c87d1aca671d9e9323117",
+         "summary": [],
+         "type": "reasoning",
+         "content": [],
+         "encrypted_content": "gAAAAABrA0Sct11cZtsajcYYRITZRnzvfIEkOD4PoxStHxUIagjzBb3htncEvYGu6-IkV1FqyfV0bSnSUplzDZp9OdG6T9BvFwY64isW0YhrArfnU5VpEOLVpMp1UgnTRY2wB78qr5nSbg3TRexD2XHGlXZMg9ZiY_4vg0x59ja9p0WFwz_EQ_Mfo_uUKh2ki8KdPBzbKBLJEIBCtmgYSH3Da9b4kop5Ny-2W0Tgtv_N3dVqCbO9mVKTJWwQCszV_RBa4j1UUJvSijrxFS2G6mY2WS16vb4k9V-U_ymZouwyIxcdSEQIFNNa9WFc5q6zKPGWCzmauEgzlJdX1qvGsxSPaskWi9U9HLqfn6MKhFuzV9jBQsx36W9MxTW2ehsGkePcx8tQtZ5eg6rgbt8A9XRr7uq7qvZbcNS_zGEw2i2feA7e7ll0O-bAih7ayatl0q1PPqXrr1ZM7w7HgAEJGKdE4Ty4BEQaLtag4VzAM_GFqYKpPr2BC8trxI-eC1VgFCCZbngm7P_lL_zHSvHQw4MD0pUY0jAukNSu2hJug2DgYWtjL8326K96bgCLtdxSigBfKopgZIbmLTxT6z-SnP7MogXjaVzhEyYahDeXD7xKU-I-BqMZiR9aSGFUBI6l8SIDM3NhqKB9QOjAeNd7pOUAYi1CCND8VEYOqbVVM_FodN5THcCTbXqsNak15AnGtDFYIFg48PSUm06FRXnKDnNzKPoCqDZ4DhN0xfz73G4D-LXzDzSb9T8GE8E6C3Im5IWvaWUGHqyQJi1ItOWWlEqrIJRliBJrGLLMGbRJzI7lT6C197G0c6rEc3PmIBE181ejJVge5u7Ozp-tGVLUmcGaTMHxR-rqpV7ocWIkf5Uq4TjNW9FdI_Mk0vjUKk8YYEHXQCHCV6DwDa0X4IFA3Gnl0NF_EBG_YaL2bBtts_CdShCuSUWe5KyGm-cQaYUZGZfB2HApLB1nE0i3FN0tQCSZrtXJLSf2rEBYHmsseTMXPiHUb21rpFJD2FWtqKaqkbx7VWGPNgyZlOM7IPicAiUwUFYpXQ2pMF-aiyo9caKKHoCHGwpu19dLv_D2s5vXNyxlfnHTd4b_u4WMX94FTyh_RD7SH_b8D7n7Yh4qzQoDYq5Eit3ThcEjLwP6gc_nev8KZPM1BLas36JMcPpjSDltY_za_0BOo0SL9hdC0THsX8FLmLUAVbgKMcPMkPzxR3Ws0mmvwtClcr-gPl5P9WDsiEYiRvFrN3HJa8jaatu8QkKCQkiw5azuCmdwDNFX-hmdBTbQfguFPscUb1Q-jEboEtXkeecsra78z0u0waYdkZsrke-t7zoM8er1JpOi3UPzvrn8ErOa3tRsJENDry1-438zObCDmbCsRXjazHTBKE9StG_Dr9A70_erp1bM_wxNjZlm0dbaxR9OMxmm7KItcfWbA9ZtWnEaXlnUO-3_Y7VMbrvbkjxROcvC4B9E-lbv41AtrxW14XJSJD2eqpMuViq6bDyStw1Sj4dKE3y0H4pWLQrjsi5Sz7E04p4s1g24rifijxflXwDajwJAB6N1cO_YUVgymhb1URa295a5Nn77NGJrmxaWTYtxmKTsIAvrfdlIoS1NgXDwwecqFphMzUBlrr16FLf9iTXzINw5i6gzo4IKDvMHYxHgjap9MJADJ5HgzD8k2WJED75JN-Of1gMaoQCJsfoJBqlaiO4RbIa8OADAWrrDnEFdgC6GPDPEqWs639Goxo4MBFbmNBW6aE1fiwXxbDkWpLGcgKMB2gpNxUkamho7Lu-uDMs0XqlxIfIx2IOJ5CSN8qG4-5VmycnoqWTgow=="
+        }
+       ],
+       "role": "assistant",
+       "tool_calls": [
+        {
+         "type": "function",
+         "id": "call_e6bfdf44e8394c42a636f94b78d5d762",
+         "function": {
+          "name": "respond_to_user",
+          "arguments": "{\"final_response\": \"**Label:** `amber-seven`\\n\\n| Callback | Agent | Host | User | Integrity | Status | Last check-in |\\n|---:|---|---|---|---:|---|---:|\\n| 2 | apollo | WORKSTATION-A | lab.user | 2 | **dead** | ~89,794 seconds ago (~24h 57m) |\\n| 3 | apollo | WORKSTATION-A | lab.user | 3 | **alive** | ~0.93 seconds ago |\\n\\nThere are **2 callbacks**: one alive (**#3**) and one dead (**#2**), both on `WORKSTATION-A` as `lab.user`. This was a read-only status check; **no tasks were run**.\", \"reuse_latest_worker_answer\": false, \"outcome\": \"completed\"}"
+         }
+        }
+       ]
+      },
+      {
+       "content": "Synthetic tool result for the replay.",
+       "role": "tool",
+       "tool_call_id": "call_e6bfdf44e8394c42a636f94b78d5d762"
+      }
+     ],
+     "sanitized": [
+      {
+       "type": "HumanMessage",
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "tool_calls": [],
+       "tool_call_id": null
+      },
+      {
+       "type": "AIMessage",
+       "content": [
+        {
+         "id": "rs_054d332832ab6984016b03449c2e9c87d1aca671d9e9323117",
+         "summary": [],
+         "type": "reasoning",
+         "content": [],
+         "encrypted_content": "gAAAAABrA0Sct11cZtsajcYYRITZRnzvfIEkOD4PoxStHxUIagjzBb3htncEvYGu6-IkV1FqyfV0bSnSUplzDZp9OdG6T9BvFwY64isW0YhrArfnU5VpEOLVpMp1UgnTRY2wB78qr5nSbg3TRexD2XHGlXZMg9ZiY_4vg0x59ja9p0WFwz_EQ_Mfo_uUKh2ki8KdPBzbKBLJEIBCtmgYSH3Da9b4kop5Ny-2W0Tgtv_N3dVqCbO9mVKTJWwQCszV_RBa4j1UUJvSijrxFS2G6mY2WS16vb4k9V-U_ymZouwyIxcdSEQIFNNa9WFc5q6zKPGWCzmauEgzlJdX1qvGsxSPaskWi9U9HLqfn6MKhFuzV9jBQsx36W9MxTW2ehsGkePcx8tQtZ5eg6rgbt8A9XRr7uq7qvZbcNS_zGEw2i2feA7e7ll0O-bAih7ayatl0q1PPqXrr1ZM7w7HgAEJGKdE4Ty4BEQaLtag4VzAM_GFqYKpPr2BC8trxI-eC1VgFCCZbngm7P_lL_zHSvHQw4MD0pUY0jAukNSu2hJug2DgYWtjL8326K96bgCLtdxSigBfKopgZIbmLTxT6z-SnP7MogXjaVzhEyYahDeXD7xKU-I-BqMZiR9aSGFUBI6l8SIDM3NhqKB9QOjAeNd7pOUAYi1CCND8VEYOqbVVM_FodN5THcCTbXqsNak15AnGtDFYIFg48PSUm06FRXnKDnNzKPoCqDZ4DhN0xfz73G4D-LXzDzSb9T8GE8E6C3Im5IWvaWUGHqyQJi1ItOWWlEqrIJRliBJrGLLMGbRJzI7lT6C197G0c6rEc3PmIBE181ejJVge5u7Ozp-tGVLUmcGaTMHxR-rqpV7ocWIkf5Uq4TjNW9FdI_Mk0vjUKk8YYEHXQCHCV6DwDa0X4IFA3Gnl0NF_EBG_YaL2bBtts_CdShCuSUWe5KyGm-cQaYUZGZfB2HApLB1nE0i3FN0tQCSZrtXJLSf2rEBYHmsseTMXPiHUb21rpFJD2FWtqKaqkbx7VWGPNgyZlOM7IPicAiUwUFYpXQ2pMF-aiyo9caKKHoCHGwpu19dLv_D2s5vXNyxlfnHTd4b_u4WMX94FTyh_RD7SH_b8D7n7Yh4qzQoDYq5Eit3ThcEjLwP6gc_nev8KZPM1BLas36JMcPpjSDltY_za_0BOo0SL9hdC0THsX8FLmLUAVbgKMcPMkPzxR3Ws0mmvwtClcr-gPl5P9WDsiEYiRvFrN3HJa8jaatu8QkKCQkiw5azuCmdwDNFX-hmdBTbQfguFPscUb1Q-jEboEtXkeecsra78z0u0waYdkZsrke-t7zoM8er1JpOi3UPzvrn8ErOa3tRsJENDry1-438zObCDmbCsRXjazHTBKE9StG_Dr9A70_erp1bM_wxNjZlm0dbaxR9OMxmm7KItcfWbA9ZtWnEaXlnUO-3_Y7VMbrvbkjxROcvC4B9E-lbv41AtrxW14XJSJD2eqpMuViq6bDyStw1Sj4dKE3y0H4pWLQrjsi5Sz7E04p4s1g24rifijxflXwDajwJAB6N1cO_YUVgymhb1URa295a5Nn77NGJrmxaWTYtxmKTsIAvrfdlIoS1NgXDwwecqFphMzUBlrr16FLf9iTXzINw5i6gzo4IKDvMHYxHgjap9MJADJ5HgzD8k2WJED75JN-Of1gMaoQCJsfoJBqlaiO4RbIa8OADAWrrDnEFdgC6GPDPEqWs639Goxo4MBFbmNBW6aE1fiwXxbDkWpLGcgKMB2gpNxUkamho7Lu-uDMs0XqlxIfIx2IOJ5CSN8qG4-5VmycnoqWTgow=="
+        },
+        {
+         "arguments": "{\"final_response\":\"**Label:** `amber-seven`\\n\\n| Callback | Agent | Host | User | Integrity | Status | Last check-in |\\n|---:|---|---|---|---:|---|---:|\\n| 2 | apollo | WORKSTATION-A | lab.user | 2 | **dead** | ~89,794 seconds ago (~24h 57m) |\\n| 3 | apollo | WORKSTATION-A | lab.user | 3 | **alive** | ~0.93 seconds ago |\\n\\nThere are **2 callbacks**: one alive (**#3**) and one dead (**#2**), both on `WORKSTATION-A` as `lab.user`. This was a read-only status check; **no tasks were run**.\",\"reuse_latest_worker_answer\":false,\"outcome\":\"completed\"}",
+         "call_id": "call_e6bfdf44e8394c42a636f94b78d5d762",
+         "name": "respond_to_user",
+         "type": "function_call",
+         "id": "fc_054d332832ab6984016b03449c310487d19d2f716129d8e80b",
+         "status": "completed"
+        }
+       ],
+       "tool_calls": [
+        {
+         "name": "respond_to_user",
+         "args": {
+          "final_response": "**Label:** `amber-seven`\n\n| Callback | Agent | Host | User | Integrity | Status | Last check-in |\n|---:|---|---|---|---:|---|---:|\n| 2 | apollo | WORKSTATION-A | lab.user | 2 | **dead** | ~89,794 seconds ago (~24h 57m) |\n| 3 | apollo | WORKSTATION-A | lab.user | 3 | **alive** | ~0.93 seconds ago |\n\nThere are **2 callbacks**: one alive (**#3**) and one dead (**#2**), both on `WORKSTATION-A` as `lab.user`. This was a read-only status check; **no tasks were run**.",
+          "reuse_latest_worker_answer": false,
+          "outcome": "completed"
+         },
+         "id": "call_e6bfdf44e8394c42a636f94b78d5d762"
+        }
+       ],
+       "tool_call_id": null
+      },
+      {
+       "type": "ToolMessage",
+       "content": "Synthetic tool result for the replay.",
+       "tool_calls": [],
+       "tool_call_id": "call_e6bfdf44e8394c42a636f94b78d5d762"
+      }
+     ],
+     "sanitized_changed": false
+    },
+    "checkpoint": {
+     "type": "msgpack",
+     "base64": "k8eyBZS9bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMuaHVtYW6sSHVtYW5NZXNzYWdlhqdjb250ZW502SxTeW50aGV0aWMgcmVwbGF5IHByb21wdDogbGlzdCB0aGUgY2FsbGJhY2tzLrFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWlaHVtYW6kbmFtZcCiaWTAs21vZGVsX3ZhbGlkYXRlX2pzb27IDwoFlLpsYW5nY2hhaW5fY29yZS5tZXNzYWdlcy5haalBSU1lc3NhZ2WJp2NvbnRlbnSShaJpZNk1cnNfMDU0ZDMzMjgzMmFiNjk4NDAxNmIwMzQ0OWMyZTljODdkMWFjYTY3MWQ5ZTkzMjMxMTenc3VtbWFyeZCkdHlwZalyZWFzb25pbmenY29udGVudJCxZW5jcnlwdGVkX2NvbnRlbnTaByRnQUFBQUFCckEwU2N0MTFjWnRzYWpjWVlSSVRaUm56dmZJRWtPRDRQb3hTdEh4VUlhZ2p6QmIzaHRuY0V2WUd1Ni1Ja1YxRnF5ZlYwYlNuU1VwbHpEWnA5T2RHNlQ5QnZGd1k2NGlzVzBZaHJBcmZuVTVWcEVPTFZwTXAxVWduVFJZMndCNzhxcjVuU2JnM1RSZXhEMlhIR2xYWk1nOVppWV80dmcweDU5amE5cDBXRnd6X0VRX01mb191VUtoMmtpOEtkUEJ6YktCTEpFSUJDdG1nWVNIM0RhOWI0a29wNU55LTJXMFRndHZfTjNkVnFDYk85bVZLVEpXd1FDc3pWX1JCYTRqMVVVSnZTaWpyeEZTMkc2bVkyV1MxNnZiNGs5Vi1VX3ltWm91d3lJeGNkU0VRSUZOTmE5V0ZjNXE2ektQR1dDem1hdUVnemxKZFgxcXZHc3hTUGFza1dpOVU5SExxZm42TUtoRnV6VjlqQlFzeDM2VzlNeFRXMmVoc0drZVBjeDh0UXRaNWVnNnJnYnQ4QTlYUnI3dXE3cXZaYmNOU196R0V3MmkyZmVBN2U3bGwwTy1iQWloN2F5YXRsMHExUFBxWHJyMVpNN3c3SGdBRUpHS2RFNFR5NEJFUWFMdGFnNFZ6QU1fR0ZxWUtwUHIyQkM4dHJ4SS1lQzFWZ0ZDQ1pibmdtN1BfbExfekhTdkhRdzRNRDBwVVkwakF1a05TdTJoSnVnMkRnWVd0akw4MzI2Szk2YmdDTHRkeFNpZ0JmS29wZ1pJYm1MVHhUNnotU25QN01vZ1hqYVZ6aEV5WWFoRGVYRDd4S1UtSS1CcU1aaVI5YVNHRlVCSTZsOFNJRE0zTmhxS0I5UU9qQWVOZDdwT1VBWWkxQ0NORDhWRVlPcWJWVk1fRm9kTjVUSGNDVGJYcXNOYWsxNUFuR3RERllJRmc0OFBTVW0wNkZSWG5LRG5OektQb0NxRFo0RGhOMHhmejczRzRELUxYekR6U2I5VDhHRThFNkMzSW01SVd2YVdVR0hxeVFKaTFJdE9XV2xFcXJJSlJsaUJKckdMTE1HYlJKekk3bFQ2QzE5N0cwYzZyRWMzUG1JQkUxODFlakpWZ2U1dTdPenAtdEdWTFVtY0dhVE1IeFItcnFwVjdvY1dJa2Y1VXE0VGpOVzlGZElfTWswdmpVS2s4WVlFSFhRQ0hDVjZEd0RhMFg0SUZBM0dubDBORl9FQkdfWWFMMmJCdHRzX0NkU2hDdVNVV2U1S3lHbS1jUWFZVVpHWmZCMkhBcExCMW5FMGkzRk4wdFFDU1pydFhKTFNmMnJFQllIbXNzZVRNWFBpSFViMjFycEZKRDJGV3RxS2Fxa2J4N1ZXR1BOZ3labE9NN0lQaWNBaVV3VUZZcFhRMnBNRi1haXlvOWNhS0tIb0NIR3dwdTE5ZEx2X0QyczV2WE55eGxmbkhUZDRiX3U0V01YOTRGVHloX1JEN1NIX2I4RDduN1loNHF6UW9EWXE1RWl0M1RoY0VqTHdQNmdjX25ldjhLWlBNMUJMYXMzNkpNY1BwalNEbHRZX3phXzBCT28wU0w5aGRDMFRIc1g4RkxtTFVBVmJnS01jUE1rUHp4UjNXczBtbXZ3dENsY3ItZ1BsNVA5V0RzaUVZaVJ2RnJOM0hKYThqYWF0dThRa0tDUWtpdzVhenVDbWR3RE5GWC1obWRCVGJRZmd1RlBzY1ViMVEtakVib0V0WGtlZWNzcmE3OHowdTB3YVlka1pzcmtlLXQ3em9NOGVyMUpwT2kzVVB6dnJuOEVyT2EzdFJzSkVORHJ5MS00Mzh6T2JDRG1iQ3NSWGphekhUQktFOVN0R19EcjlBNzBfZXJwMWJNX3d4TmpabG0wZGJheFI5T014bW03S0l0Y2ZXYkE5WnRXbkVhWGxuVU8tM19ZN1ZNYnJ2YmtqeFJPY3ZDNEI5RS1sYnY0MUF0cnhXMTRYSlNKRDJlcXBNdVZpcTZiRHlTdHcxU2o0ZEtFM3kwSDRwV0xRcmpzaTVTejdFMDRwNHMxZzI0cmlmaWp4ZmxYd0RhandKQUI2TjFjT19ZVVZneW1oYjFVUmEyOTVhNU5uNzdOR0pybXhhV1RZdHhtS1RzSUF2cmZkbElvUzFOZ1hEd3dlY3FGcGhNelVCbHJyMTZGTGY5aVRYeklOdzVpNmd6bzRJS0R2TUhZeEhnamFwOU1KQURKNUhnekQ4azJXSkVENzVKTi1PZjFnTWFvUUNKc2ZvSkJxbGFpTzRSYklhOE9BREFXcnJEbkVGZGdDNkdQRFBFcVdzNjM5R294bzRNQkZibU5CVzZhRTFmaXdYeGJEa1dwTEdjZ0tNQjJncE54VWthbWhvN0x1LXVETXMwWHFseElmSXgySU9KNUNTTjhxRzQtNVZteWNub3FXVGdvdz09hqlhcmd1bWVudHPaAiZ7ImZpbmFsX3Jlc3BvbnNlIjoiKipMYWJlbDoqKiBgYW1iZXItc2V2ZW5gXG5cbnwgQ2FsbGJhY2sgfCBBZ2VudCB8IEhvc3QgfCBVc2VyIHwgSW50ZWdyaXR5IHwgU3RhdHVzIHwgTGFzdCBjaGVjay1pbiB8XG58LS0tOnwtLS18LS0tfC0tLXwtLS06fC0tLXwtLS06fFxufCAyIHwgYXBvbGxvIHwgV09SS1NUQVRJT04tQSB8IGxhYi51c2VyIHwgMiB8ICoqZGVhZCoqIHwgfjg5LDc5NCBzZWNvbmRzIGFnbyAofjI0aCA1N20pIHxcbnwgMyB8IGFwb2xsbyB8IFdPUktTVEFUSU9OLUEgfCBsYWIudXNlciB8IDMgfCAqKmFsaXZlKiogfCB+MC45MyBzZWNvbmRzIGFnbyB8XG5cblRoZXJlIGFyZSAqKjIgY2FsbGJhY2tzKio6IG9uZSBhbGl2ZSAoKiojMyoqKSBhbmQgb25lIGRlYWQgKCoqIzIqKiksIGJvdGggb24gYFdPUktTVEFUSU9OLUFgIGFzIGBsYWIudXNlcmAuIFRoaXMgd2FzIGEgcmVhZC1vbmx5IHN0YXR1cyBjaGVjazsgKipubyB0YXNrcyB3ZXJlIHJ1bioqLiIsInJldXNlX2xhdGVzdF93b3JrZXJfYW5zd2VyIjpmYWxzZSwib3V0Y29tZSI6ImNvbXBsZXRlZCJ9p2NhbGxfaWTZJWNhbGxfZTZiZmRmNDRlODM5NGM0MmE2MzZmOTRiNzhkNWQ3NjKkbmFtZa9yZXNwb25kX3RvX3VzZXKkdHlwZa1mdW5jdGlvbl9jYWxsomlk2TVmY18wNTRkMzMyODMyYWI2OTg0MDE2YjAzNDQ5YzMxMDQ4N2QxOWQyZjcxNjEyOWQ4ZTgwYqZzdGF0dXOpY29tcGxldGVksWFkZGl0aW9uYWxfa3dhcmdzgLFyZXNwb25zZV9tZXRhZGF0YYiiaWTZN3Jlc3BfMDU0ZDMzMjgzMmFiNjk4NDAxNmIwMzQ0OWIzOTFjODdkMWFmOTI0YjhkOTE3Mjk5YmOqY3JlYXRlZF9hdMtB2sDRJsAAAKVtb2RlbLByZWNvcmRlZC1tb2RlbC1hpm9iamVjdKhyZXNwb25zZaxzZXJ2aWNlX3RpZXKnZGVmYXVsdKZzdGF0dXOpY29tcGxldGVkrm1vZGVsX3Byb3ZpZGVypm9wZW5haaptb2RlbF9uYW1lsHJlY29yZGVkLW1vZGVsLWGkdHlwZaJhaaRuYW1lwKJpZNk3cmVzcF8wNTRkMzMyODMyYWI2OTg0MDE2YjAzNDQ5YjM5MWM4N2QxYWY5MjRiOGQ5MTcyOTliY6p0b29sX2NhbGxzkYSkbmFtZa9yZXNwb25kX3RvX3VzZXKkYXJnc4OuZmluYWxfcmVzcG9uc2XaAdEqKkxhYmVsOioqIGBhbWJlci1zZXZlbmAKCnwgQ2FsbGJhY2sgfCBBZ2VudCB8IEhvc3QgfCBVc2VyIHwgSW50ZWdyaXR5IHwgU3RhdHVzIHwgTGFzdCBjaGVjay1pbiB8CnwtLS06fC0tLXwtLS18LS0tfC0tLTp8LS0tfC0tLTp8CnwgMiB8IGFwb2xsbyB8IFdPUktTVEFUSU9OLUEgfCBsYWIudXNlciB8IDIgfCAqKmRlYWQqKiB8IH44OSw3OTQgc2Vjb25kcyBhZ28gKH4yNGggNTdtKSB8CnwgMyB8IGFwb2xsbyB8IFdPUktTVEFUSU9OLUEgfCBsYWIudXNlciB8IDMgfCAqKmFsaXZlKiogfCB+MC45MyBzZWNvbmRzIGFnbyB8CgpUaGVyZSBhcmUgKioyIGNhbGxiYWNrcyoqOiBvbmUgYWxpdmUgKCoqIzMqKikgYW5kIG9uZSBkZWFkICgqKiMyKiopLCBib3RoIG9uIGBXT1JLU1RBVElPTi1BYCBhcyBgbGFiLnVzZXJgLiBUaGlzIHdhcyBhIHJlYWQtb25seSBzdGF0dXMgY2hlY2s7ICoqbm8gdGFza3Mgd2VyZSBydW4qKi66cmV1c2VfbGF0ZXN0X3dvcmtlcl9hbnN3ZXLCp291dGNvbWWpY29tcGxldGVkomlk2SVjYWxsX2U2YmZkZjQ0ZTgzOTRjNDJhNjM2Zjk0Yjc4ZDVkNzYypHR5cGWpdG9vbF9jYWxssmludmFsaWRfdG9vbF9jYWxsc5CudXNhZ2VfbWV0YWRhdGGFrGlucHV0X3Rva2Vuc80tUK1vdXRwdXRfdG9rZW5zzNesdG90YWxfdG9rZW5zzS4ns2lucHV0X3Rva2VuX2RldGFpbHOCrmNhY2hlX2NyZWF0aW9uzQOFqmNhY2hlX3JlYWTNKci0b3V0cHV0X3Rva2VuX2RldGFpbHOBqXJlYXNvbmluZxGzbW9kZWxfdmFsaWRhdGVfanNvbsf1BZS8bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMudG9vbKtUb29sTWVzc2FnZYmnY29udGVudNklU3ludGhldGljIHRvb2wgcmVzdWx0IGZvciB0aGUgcmVwbGF5LrFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWkdG9vbKRuYW1lwKJpZMCsdG9vbF9jYWxsX2lk2SVjYWxsX2U2YmZkZjQ0ZTgzOTRjNDJhNjM2Zjk0Yjc4ZDVkNzYyqGFydGlmYWN0wKZzdGF0dXOnc3VjY2Vzc7Ntb2RlbF92YWxpZGF0ZV9qc29u"
+    }
+   }
+  },
+  {
+   "id": "r03_chat_completions_400_a_reasoning_effort",
+   "source": "recorded live check 1 of 2 (2026-11-22), request seq 12776",
+   "model": "recorded-model-a",
+   "route": {
+    "api": "chat_completions",
+    "reasoning_effort": "low"
+   },
+   "status": 400,
+   "body": {
+    "error": {
+     "message": "Function tools with reasoning_effort are not supported for recorded-model-a in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.",
+     "type": "invalid_request_error",
+     "param": "reasoning_effort",
+     "code": null
+    }
+   },
+   "expected": {
+    "error": {
+     "sdk_types": [
+      "BadRequestError",
+      "APIStatusError",
+      "APIError",
+      "OpenAIError"
+     ],
+     "status_code": 400,
+     "code": null,
+     "param": "reasoning_effort",
+     "message": "Error code: 400 - {'error': {'message': \"Function tools with reasoning_effort are not supported for recorded-model-a in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.\", 'type': 'invalid_request_error', 'param': 'reasoning_effort', 'code': None}}",
+     "body": {
+      "message": "Function tools with reasoning_effort are not supported for recorded-model-a in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.",
+      "type": "invalid_request_error",
+      "param": "reasoning_effort",
+      "code": null
+     },
+     "configuration_rejection": true,
+     "operator_text": "Error code: 400 - {'error': {'message': \"Function tools with reasoning_effort are not supported for recorded-model-a in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.\", 'type': 'invalid_request_error', 'param': 'reasoning_effort', 'code': None}}",
+     "configuration_notice": "The model provider rejected this request (HTTP 400, param `reasoning_effort`): Function tools with reasoning_effort are not supported for recorded-model-a in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.\n\nRoute used: provider openai · model `recorded-model-a` · OpenAI API: Chat Completions (chat configuration) · OpenAI Daybreak: not sent (Chat Completions or adapter route) · OpenAI Safety Identifier: not configured · Reasoning Effort: Low (chat configuration) · endpoint https://provider.invalid/v1.\n\nTo fix it, set **OpenAI API** to **Responses** in this chat's configuration (or the SAGE_OPENAI_API user secret or environment value), then send your request again; Responses keeps reasoning and tools. Setting **Reasoning Effort** to **None** also avoids this error, but only on models that accept None, and it turns reasoning off. This chat is still usable and keeps its conversation: changing the model (**Model** or `/model <name>`), OpenAI API, OpenAI Daybreak, OpenAI Safety Identifier or Reasoning Effort continues it. Sage did not change the model, provider or endpoint.",
+     "unproven_notice": "The model provider rejected this chat's request before the model answered (HTTP 400): Function tools with reasoning_effort are not supported for recorded-model-a in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.\n\nRoute used: provider openai · model `recorded-model-a` (chat configuration) · endpoint https://provider.invalid/v1.\n\nTo fix it, change **Model** to a model this provider and key can use, or run `/model <name>`, then send your request again. This chat is still usable and keeps its conversation; nothing was run."
+    }
+   },
+   "accepted_differences": {
+    "reason": "Operator decision 2026-11-24 (dependency advisories line): accept openai 3's error text. The SDK now renders 'Error code: <status> - <provider message>' instead of the error body's repr, so the error code and parameter no longer appear in the exception's text or in operator_error_text. Status, code, param, body, classification and both Sage notices are unchanged. Restoring code and parameter in Sage's error log is a separate follow-up.",
+    "versions": {
+     "openai": "3.58.0",
+     "langchain-openai": "1.7.2",
+     "langchain-core": "1.6.10"
+    },
+    "error": {
+     "message": "Error code: 400 - Function tools with reasoning_effort are not supported for recorded-model-a in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.",
+     "operator_text": "Error code: 400 - Function tools with reasoning_effort are not supported for recorded-model-a in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'."
+    }
+   }
+  },
+  {
+   "id": "r04_responses_200_a_function_call_list_callbacks",
+   "source": "recorded live check 1 of 2 (2026-11-22), request seq 12924",
+   "model": "recorded-model-a",
+   "route": {
+    "api": "responses",
+    "reasoning_effort": "low"
+   },
+   "status": 200,
+   "body": {
+    "background": false,
+    "completed_at": 1795376300,
+    "created_at": 1795376298,
+    "error": null,
+    "frequency_penalty": 0.0,
+    "id": "resp_09a37e1a25c7c113016b0344a9e16487d18ac6572028bc3f32",
+    "image": {
+     "context_compression": "disabled"
+    },
+    "incomplete_details": null,
+    "input_transformations": [],
+    "max_output_tokens": 4096,
+    "max_tool_calls": null,
+    "model": "recorded-model-a",
+    "moderation": null,
+    "object": "response",
+    "output": [
+     {
+      "arguments": "{}",
+      "call_id": "call_ee1ed00b85b14333817229a423fc3d88",
+      "id": "fc_09a37e1a25c7c113016b0344ab8c6c87d1877ccfb89d18fa4a",
+      "name": "list_callbacks",
+      "status": "completed",
+      "type": "function_call"
+     }
+    ],
+    "parallel_tool_calls": true,
+    "presence_penalty": 0.0,
+    "previous_response_id": null,
+    "reasoning": {
+     "context": "all_turns",
+     "effort": "low",
+     "mode": "standard",
+     "summary": null
+    },
+    "service_tier": "default",
+    "status": "completed",
+    "store": false,
+    "temperature": 1.0,
+    "text": {
+     "format": {
+      "type": "text"
+     },
+     "verbosity": "medium"
+    },
+    "tool_choice": "auto",
+    "tool_usage": {
+     "image_gen": {
+      "input_tokens": 0,
+      "input_tokens_details": {
+       "image_tokens": 0,
+       "text_tokens": 0
+      },
+      "output_tokens": 0,
+      "output_tokens_details": {
+       "image_tokens": 0,
+       "text_tokens": 0
+      },
+      "total_tokens": 0
+     },
+     "web_search": {
+      "num_requests": 0
+     }
+    },
+    "top_logprobs": 0,
+    "top_p": 0.98,
+    "truncation": "disabled",
+    "usage": {
+     "input_tokens": 11878,
+     "input_tokens_details": {
+      "cache_write_tokens": 11875,
+      "cache_write_tokens_details": {
+       "ttl_12h_tokens": 0,
+       "ttl_30m_tokens": 11875
+      },
+      "cached_tokens": 0
+     },
+     "output_tokens": 14,
+     "output_tokens_details": {
+      "reasoning_tokens": 0
+     },
+     "total_tokens": 11892
+    }
+   },
+   "expected": {
+    "message": {
+     "type": "AIMessage",
+     "id": "resp_09a37e1a25c7c113016b0344a9e16487d18ac6572028bc3f32",
+     "name": null,
+     "tool_calls": [
+      {
+       "name": "list_callbacks",
+       "args": {},
+       "id": "call_ee1ed00b85b14333817229a423fc3d88"
+      }
+     ],
+     "invalid_tool_calls": [],
+     "content_types": [
+      "function_call"
+     ],
+     "text": "",
+     "sole_text": null,
+     "envelope_error": "",
+     "usage": {
+      "input_tokens": 11878,
+      "output_tokens": 14,
+      "total_tokens": 11892,
+      "reasoning_tokens": 0
+     },
+     "metadata": {
+      "model_name": "recorded-model-a",
+      "model": "recorded-model-a",
+      "status": "completed",
+      "id": "resp_09a37e1a25c7c113016b0344a9e16487d18ac6572028bc3f32"
+     },
+     "rendered": ""
+    },
+    "history": {
+     "responses_input": [
+      {
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "role": "user",
+       "type": "message"
+      },
+      {
+       "arguments": "{}",
+       "call_id": "call_ee1ed00b85b14333817229a423fc3d88",
+       "name": "list_callbacks",
+       "type": "function_call",
+       "id": "fc_09a37e1a25c7c113016b0344ab8c6c87d1877ccfb89d18fa4a",
+       "status": "completed"
+      },
+      {
+       "type": "function_call_output",
+       "output": "Synthetic tool result for the replay.",
+       "call_id": "call_ee1ed00b85b14333817229a423fc3d88"
+      }
+     ],
+     "chat_completions": [
+      {
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "role": "user"
+      },
+      {
+       "content": ".",
+       "role": "assistant",
+       "tool_calls": [
+        {
+         "type": "function",
+         "id": "call_ee1ed00b85b14333817229a423fc3d88",
+         "function": {
+          "name": "list_callbacks",
+          "arguments": "{}"
+         }
+        }
+       ]
+      },
+      {
+       "content": "Synthetic tool result for the replay.",
+       "role": "tool",
+       "tool_call_id": "call_ee1ed00b85b14333817229a423fc3d88"
+      }
+     ],
+     "sanitized": [
+      {
+       "type": "HumanMessage",
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "tool_calls": [],
+       "tool_call_id": null
+      },
+      {
+       "type": "AIMessage",
+       "content": [
+        {
+         "arguments": "{}",
+         "call_id": "call_ee1ed00b85b14333817229a423fc3d88",
+         "name": "list_callbacks",
+         "type": "function_call",
+         "id": "fc_09a37e1a25c7c113016b0344ab8c6c87d1877ccfb89d18fa4a",
+         "status": "completed"
+        }
+       ],
+       "tool_calls": [
+        {
+         "name": "list_callbacks",
+         "args": {},
+         "id": "call_ee1ed00b85b14333817229a423fc3d88"
+        }
+       ],
+       "tool_call_id": null
+      },
+      {
+       "type": "ToolMessage",
+       "content": "Synthetic tool result for the replay.",
+       "tool_calls": [],
+       "tool_call_id": "call_ee1ed00b85b14333817229a423fc3d88"
+      }
+     ],
+     "sanitized_changed": false
+    },
+    "checkpoint": {
+     "type": "msgpack",
+     "base64": "k8eyBZS9bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMuaHVtYW6sSHVtYW5NZXNzYWdlhqdjb250ZW502SxTeW50aGV0aWMgcmVwbGF5IHByb21wdDogbGlzdCB0aGUgY2FsbGJhY2tzLrFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWlaHVtYW6kbmFtZcCiaWTAs21vZGVsX3ZhbGlkYXRlX2pzb27IAzkFlLpsYW5nY2hhaW5fY29yZS5tZXNzYWdlcy5haalBSU1lc3NhZ2WJp2NvbnRlbnSRhqlhcmd1bWVudHOie32nY2FsbF9pZNklY2FsbF9lZTFlZDAwYjg1YjE0MzMzODE3MjI5YTQyM2ZjM2Q4OKRuYW1lrmxpc3RfY2FsbGJhY2tzpHR5cGWtZnVuY3Rpb25fY2FsbKJpZNk1ZmNfMDlhMzdlMWEyNWM3YzExMzAxNmIwMzQ0YWI4YzZjODdkMTg3N2NjZmI4OWQxOGZhNGGmc3RhdHVzqWNvbXBsZXRlZLFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGIomlk2TdyZXNwXzA5YTM3ZTFhMjVjN2MxMTMwMTZiMDM0NGE5ZTE2NDg3ZDE4YWM2NTcyMDI4YmMzZjMyqmNyZWF0ZWRfYXTLQdrA0SqAAAClbW9kZWywcmVjb3JkZWQtbW9kZWwtYaZvYmplY3SocmVzcG9uc2Wsc2VydmljZV90aWVyp2RlZmF1bHSmc3RhdHVzqWNvbXBsZXRlZK5tb2RlbF9wcm92aWRlcqZvcGVuYWmqbW9kZWxfbmFtZbByZWNvcmRlZC1tb2RlbC1hpHR5cGWiYWmkbmFtZcCiaWTZN3Jlc3BfMDlhMzdlMWEyNWM3YzExMzAxNmIwMzQ0YTllMTY0ODdkMThhYzY1NzIwMjhiYzNmMzKqdG9vbF9jYWxsc5GEpG5hbWWubGlzdF9jYWxsYmFja3OkYXJnc4CiaWTZJWNhbGxfZWUxZWQwMGI4NWIxNDMzMzgxNzIyOWE0MjNmYzNkODikdHlwZal0b29sX2NhbGyyaW52YWxpZF90b29sX2NhbGxzkK51c2FnZV9tZXRhZGF0YYWsaW5wdXRfdG9rZW5zzS5mrW91dHB1dF90b2tlbnMOrHRvdGFsX3Rva2Vuc80udLNpbnB1dF90b2tlbl9kZXRhaWxzgq5jYWNoZV9jcmVhdGlvbs0uY6pjYWNoZV9yZWFkALRvdXRwdXRfdG9rZW5fZGV0YWlsc4GpcmVhc29uaW5nALNtb2RlbF92YWxpZGF0ZV9qc29ux/UFlLxsYW5nY2hhaW5fY29yZS5tZXNzYWdlcy50b29sq1Rvb2xNZXNzYWdliadjb250ZW502SVTeW50aGV0aWMgdG9vbCByZXN1bHQgZm9yIHRoZSByZXBsYXkusWFkZGl0aW9uYWxfa3dhcmdzgLFyZXNwb25zZV9tZXRhZGF0YYCkdHlwZaR0b29spG5hbWXAomlkwKx0b29sX2NhbGxfaWTZJWNhbGxfZWUxZWQwMGI4NWIxNDMzMzgxNzIyOWE0MjNmYzNkODioYXJ0aWZhY3TApnN0YXR1c6dzdWNjZXNzs21vZGVsX3ZhbGlkYXRlX2pzb24="
+    }
+   }
+  },
+  {
+   "id": "r05_responses_200_a_function_call_respond_to_user",
+   "source": "recorded live check 1 of 2 (2026-11-22), request seq 13169",
+   "model": "recorded-model-a",
+   "route": {
+    "api": "responses",
+    "reasoning_effort": "low"
+   },
+   "status": 200,
+   "body": {
+    "background": false,
+    "completed_at": 1795376313,
+    "created_at": 1795376312,
+    "error": null,
+    "frequency_penalty": 0.0,
+    "id": "resp_07d91b029af1dbbf016b0344b847c887d1ac138dccdea53f8c",
+    "image": {
+     "context_compression": "disabled"
+    },
+    "incomplete_details": null,
+    "input_transformations": [],
+    "max_output_tokens": 4096,
+    "max_tool_calls": null,
+    "model": "recorded-model-a",
+    "moderation": null,
+    "object": "response",
+    "output": [
+     {
+      "arguments": "{\"final_response\":\"`amber-seven`\",\"reuse_latest_worker_answer\":false,\"outcome\":\"completed\"}",
+      "call_id": "call_6565fd75d4cf4265be2b5c9d31d87be7",
+      "id": "fc_07d91b029af1dbbf016b0344b8fd4887d1ac86d70f16d07083",
+      "name": "respond_to_user",
+      "status": "completed",
+      "type": "function_call"
+     }
+    ],
+    "parallel_tool_calls": true,
+    "presence_penalty": 0.0,
+    "previous_response_id": null,
+    "reasoning": {
+     "context": "all_turns",
+     "effort": "low",
+     "mode": "standard",
+     "summary": null
+    },
+    "service_tier": "default",
+    "status": "completed",
+    "store": false,
+    "temperature": 1.0,
+    "text": {
+     "format": {
+      "type": "text"
+     },
+     "verbosity": "medium"
+    },
+    "tool_choice": "auto",
+    "tool_usage": {
+     "image_gen": {
+      "input_tokens": 0,
+      "input_tokens_details": {
+       "image_tokens": 0,
+       "text_tokens": 0
+      },
+      "output_tokens": 0,
+      "output_tokens_details": {
+       "image_tokens": 0,
+       "text_tokens": 0
+      },
+      "total_tokens": 0
+     },
+     "web_search": {
+      "num_requests": 0
+     }
+    },
+    "top_logprobs": 0,
+    "top_p": 0.98,
+    "truncation": "disabled",
+    "usage": {
+     "input_tokens": 12059,
+     "input_tokens_details": {
+      "cache_write_tokens": 12056,
+      "cache_write_tokens_details": {
+       "ttl_12h_tokens": 0,
+       "ttl_30m_tokens": 12056
+      },
+      "cached_tokens": 0
+     },
+     "output_tokens": 35,
+     "output_tokens_details": {
+      "reasoning_tokens": 0
+     },
+     "total_tokens": 12094
+    }
+   },
+   "expected": {
+    "message": {
+     "type": "AIMessage",
+     "id": "resp_07d91b029af1dbbf016b0344b847c887d1ac138dccdea53f8c",
+     "name": null,
+     "tool_calls": [
+      {
+       "name": "respond_to_user",
+       "args": {
+        "final_response": "`amber-seven`",
+        "reuse_latest_worker_answer": false,
+        "outcome": "completed"
+       },
+       "id": "call_6565fd75d4cf4265be2b5c9d31d87be7"
+      }
+     ],
+     "invalid_tool_calls": [],
+     "content_types": [
+      "function_call"
+     ],
+     "text": "",
+     "sole_text": null,
+     "envelope_error": "",
+     "usage": {
+      "input_tokens": 12059,
+      "output_tokens": 35,
+      "total_tokens": 12094,
+      "reasoning_tokens": 0
+     },
+     "metadata": {
+      "model_name": "recorded-model-a",
+      "model": "recorded-model-a",
+      "status": "completed",
+      "id": "resp_07d91b029af1dbbf016b0344b847c887d1ac138dccdea53f8c"
+     },
+     "rendered": ""
+    },
+    "history": {
+     "responses_input": [
+      {
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "role": "user",
+       "type": "message"
+      },
+      {
+       "arguments": "{\"final_response\":\"`amber-seven`\",\"reuse_latest_worker_answer\":false,\"outcome\":\"completed\"}",
+       "call_id": "call_6565fd75d4cf4265be2b5c9d31d87be7",
+       "name": "respond_to_user",
+       "type": "function_call",
+       "id": "fc_07d91b029af1dbbf016b0344b8fd4887d1ac86d70f16d07083",
+       "status": "completed"
+      },
+      {
+       "type": "function_call_output",
+       "output": "Synthetic tool result for the replay.",
+       "call_id": "call_6565fd75d4cf4265be2b5c9d31d87be7"
+      }
+     ],
+     "chat_completions": [
+      {
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "role": "user"
+      },
+      {
+       "content": ".",
+       "role": "assistant",
+       "tool_calls": [
+        {
+         "type": "function",
+         "id": "call_6565fd75d4cf4265be2b5c9d31d87be7",
+         "function": {
+          "name": "respond_to_user",
+          "arguments": "{\"final_response\": \"`amber-seven`\", \"reuse_latest_worker_answer\": false, \"outcome\": \"completed\"}"
+         }
+        }
+       ]
+      },
+      {
+       "content": "Synthetic tool result for the replay.",
+       "role": "tool",
+       "tool_call_id": "call_6565fd75d4cf4265be2b5c9d31d87be7"
+      }
+     ],
+     "sanitized": [
+      {
+       "type": "HumanMessage",
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "tool_calls": [],
+       "tool_call_id": null
+      },
+      {
+       "type": "AIMessage",
+       "content": [
+        {
+         "arguments": "{\"final_response\":\"`amber-seven`\",\"reuse_latest_worker_answer\":false,\"outcome\":\"completed\"}",
+         "call_id": "call_6565fd75d4cf4265be2b5c9d31d87be7",
+         "name": "respond_to_user",
+         "type": "function_call",
+         "id": "fc_07d91b029af1dbbf016b0344b8fd4887d1ac86d70f16d07083",
+         "status": "completed"
+        }
+       ],
+       "tool_calls": [
+        {
+         "name": "respond_to_user",
+         "args": {
+          "final_response": "`amber-seven`",
+          "reuse_latest_worker_answer": false,
+          "outcome": "completed"
+         },
+         "id": "call_6565fd75d4cf4265be2b5c9d31d87be7"
+        }
+       ],
+       "tool_call_id": null
+      },
+      {
+       "type": "ToolMessage",
+       "content": "Synthetic tool result for the replay.",
+       "tool_calls": [],
+       "tool_call_id": "call_6565fd75d4cf4265be2b5c9d31d87be7"
+      }
+     ],
+     "sanitized_changed": false
+    },
+    "checkpoint": {
+     "type": "msgpack",
+     "base64": "k8eyBZS9bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMuaHVtYW6sSHVtYW5NZXNzYWdlhqdjb250ZW502SxTeW50aGV0aWMgcmVwbGF5IHByb21wdDogbGlzdCB0aGUgY2FsbGJhY2tzLrFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWlaHVtYW6kbmFtZcCiaWTAs21vZGVsX3ZhbGlkYXRlX2pzb27IA+AFlLpsYW5nY2hhaW5fY29yZS5tZXNzYWdlcy5haalBSU1lc3NhZ2WJp2NvbnRlbnSRhqlhcmd1bWVudHPZW3siZmluYWxfcmVzcG9uc2UiOiJgYW1iZXItc2V2ZW5gIiwicmV1c2VfbGF0ZXN0X3dvcmtlcl9hbnN3ZXIiOmZhbHNlLCJvdXRjb21lIjoiY29tcGxldGVkIn2nY2FsbF9pZNklY2FsbF82NTY1ZmQ3NWQ0Y2Y0MjY1YmUyYjVjOWQzMWQ4N2JlN6RuYW1lr3Jlc3BvbmRfdG9fdXNlcqR0eXBlrWZ1bmN0aW9uX2NhbGyiaWTZNWZjXzA3ZDkxYjAyOWFmMWRiYmYwMTZiMDM0NGI4ZmQ0ODg3ZDFhYzg2ZDcwZjE2ZDA3MDgzpnN0YXR1c6ljb21wbGV0ZWSxYWRkaXRpb25hbF9rd2FyZ3OAsXJlc3BvbnNlX21ldGFkYXRhiKJpZNk3cmVzcF8wN2Q5MWIwMjlhZjFkYmJmMDE2YjAzNDRiODQ3Yzg4N2QxYWMxMzhkY2NkZWE1M2Y4Y6pjcmVhdGVkX2F0y0HawNEuAAAApW1vZGVssHJlY29yZGVkLW1vZGVsLWGmb2JqZWN0qHJlc3BvbnNlrHNlcnZpY2VfdGllcqdkZWZhdWx0pnN0YXR1c6ljb21wbGV0ZWSubW9kZWxfcHJvdmlkZXKmb3BlbmFpqm1vZGVsX25hbWWwcmVjb3JkZWQtbW9kZWwtYaR0eXBlomFppG5hbWXAomlk2TdyZXNwXzA3ZDkxYjAyOWFmMWRiYmYwMTZiMDM0NGI4NDdjODg3ZDFhYzEzOGRjY2RlYTUzZjhjqnRvb2xfY2FsbHORhKRuYW1lr3Jlc3BvbmRfdG9fdXNlcqRhcmdzg65maW5hbF9yZXNwb25zZa1gYW1iZXItc2V2ZW5gunJldXNlX2xhdGVzdF93b3JrZXJfYW5zd2VywqdvdXRjb21lqWNvbXBsZXRlZKJpZNklY2FsbF82NTY1ZmQ3NWQ0Y2Y0MjY1YmUyYjVjOWQzMWQ4N2JlN6R0eXBlqXRvb2xfY2FsbLJpbnZhbGlkX3Rvb2xfY2FsbHOQrnVzYWdlX21ldGFkYXRhhaxpbnB1dF90b2tlbnPNLxutb3V0cHV0X3Rva2VucyOsdG90YWxfdG9rZW5zzS8+s2lucHV0X3Rva2VuX2RldGFpbHOCrmNhY2hlX2NyZWF0aW9uzS8YqmNhY2hlX3JlYWQAtG91dHB1dF90b2tlbl9kZXRhaWxzgalyZWFzb25pbmcAs21vZGVsX3ZhbGlkYXRlX2pzb27H9QWUvGxhbmdjaGFpbl9jb3JlLm1lc3NhZ2VzLnRvb2yrVG9vbE1lc3NhZ2WJp2NvbnRlbnTZJVN5bnRoZXRpYyB0b29sIHJlc3VsdCBmb3IgdGhlIHJlcGxheS6xYWRkaXRpb25hbF9rd2FyZ3OAsXJlc3BvbnNlX21ldGFkYXRhgKR0eXBlpHRvb2ykbmFtZcCiaWTArHRvb2xfY2FsbF9pZNklY2FsbF82NTY1ZmQ3NWQ0Y2Y0MjY1YmUyYjVjOWQzMWQ4N2JlN6hhcnRpZmFjdMCmc3RhdHVzp3N1Y2Nlc3OzbW9kZWxfdmFsaWRhdGVfanNvbg=="
+    }
+   }
+  },
+  {
+   "id": "r06_responses_200_b_function_call_list_callbacks",
+   "source": "recorded live check 1 of 2 (2026-11-22), request seq 13367",
+   "model": "recorded-model-b",
+   "route": {
+    "api": "responses",
+    "reasoning_effort": "low"
+   },
+   "status": 200,
+   "body": {
+    "background": false,
+    "completed_at": 1795376328,
+    "created_at": 1795376318,
+    "error": null,
+    "frequency_penalty": 0.0,
+    "id": "resp_070b274daa88504d016b0344bebad487d1855bd01bee9113fa",
+    "image": {
+     "context_compression": "disabled"
+    },
+    "incomplete_details": null,
+    "input_transformations": [],
+    "max_output_tokens": 4096,
+    "max_tool_calls": null,
+    "model": "recorded-model-b",
+    "moderation": null,
+    "object": "response",
+    "output": [
+     {
+      "arguments": "{}",
+      "call_id": "call_31605a7c314b4b20b493202491b27811",
+      "id": "fc_070b274daa88504d016b0344c850b887d1ba19d246465b0060",
+      "name": "list_callbacks",
+      "status": "completed",
+      "type": "function_call"
+     }
+    ],
+    "parallel_tool_calls": true,
+    "presence_penalty": 0.0,
+    "previous_response_id": null,
+    "reasoning": {
+     "context": "all_turns",
+     "effort": "low",
+     "mode": "standard",
+     "summary": null
+    },
+    "service_tier": "default",
+    "status": "completed",
+    "store": false,
+    "temperature": 1.0,
+    "text": {
+     "format": {
+      "type": "text"
+     },
+     "verbosity": "medium"
+    },
+    "tool_choice": "auto",
+    "tool_usage": {
+     "image_gen": {
+      "input_tokens": 0,
+      "input_tokens_details": {
+       "image_tokens": 0,
+       "text_tokens": 0
+      },
+      "output_tokens": 0,
+      "output_tokens_details": {
+       "image_tokens": 0,
+       "text_tokens": 0
+      },
+      "total_tokens": 0
+     },
+     "web_search": {
+      "num_requests": 0
+     }
+    },
+    "top_logprobs": 0,
+    "top_p": 0.98,
+    "truncation": "disabled",
+    "usage": {
+     "input_tokens": 11635,
+     "input_tokens_details": {
+      "cache_write_tokens": 11632,
+      "cache_write_tokens_details": {
+       "ttl_12h_tokens": 0,
+       "ttl_30m_tokens": 11632
+      },
+      "cached_tokens": 0
+     },
+     "output_tokens": 14,
+     "output_tokens_details": {
+      "reasoning_tokens": 0
+     },
+     "total_tokens": 11649
+    }
+   },
+   "expected": {
+    "message": {
+     "type": "AIMessage",
+     "id": "resp_070b274daa88504d016b0344bebad487d1855bd01bee9113fa",
+     "name": null,
+     "tool_calls": [
+      {
+       "name": "list_callbacks",
+       "args": {},
+       "id": "call_31605a7c314b4b20b493202491b27811"
+      }
+     ],
+     "invalid_tool_calls": [],
+     "content_types": [
+      "function_call"
+     ],
+     "text": "",
+     "sole_text": null,
+     "envelope_error": "",
+     "usage": {
+      "input_tokens": 11635,
+      "output_tokens": 14,
+      "total_tokens": 11649,
+      "reasoning_tokens": 0
+     },
+     "metadata": {
+      "model_name": "recorded-model-b",
+      "model": "recorded-model-b",
+      "status": "completed",
+      "id": "resp_070b274daa88504d016b0344bebad487d1855bd01bee9113fa"
+     },
+     "rendered": ""
+    },
+    "history": {
+     "responses_input": [
+      {
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "role": "user",
+       "type": "message"
+      },
+      {
+       "arguments": "{}",
+       "call_id": "call_31605a7c314b4b20b493202491b27811",
+       "name": "list_callbacks",
+       "type": "function_call",
+       "id": "fc_070b274daa88504d016b0344c850b887d1ba19d246465b0060",
+       "status": "completed"
+      },
+      {
+       "type": "function_call_output",
+       "output": "Synthetic tool result for the replay.",
+       "call_id": "call_31605a7c314b4b20b493202491b27811"
+      }
+     ],
+     "chat_completions": [
+      {
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "role": "user"
+      },
+      {
+       "content": ".",
+       "role": "assistant",
+       "tool_calls": [
+        {
+         "type": "function",
+         "id": "call_31605a7c314b4b20b493202491b27811",
+         "function": {
+          "name": "list_callbacks",
+          "arguments": "{}"
+         }
+        }
+       ]
+      },
+      {
+       "content": "Synthetic tool result for the replay.",
+       "role": "tool",
+       "tool_call_id": "call_31605a7c314b4b20b493202491b27811"
+      }
+     ],
+     "sanitized": [
+      {
+       "type": "HumanMessage",
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "tool_calls": [],
+       "tool_call_id": null
+      },
+      {
+       "type": "AIMessage",
+       "content": [
+        {
+         "arguments": "{}",
+         "call_id": "call_31605a7c314b4b20b493202491b27811",
+         "name": "list_callbacks",
+         "type": "function_call",
+         "id": "fc_070b274daa88504d016b0344c850b887d1ba19d246465b0060",
+         "status": "completed"
+        }
+       ],
+       "tool_calls": [
+        {
+         "name": "list_callbacks",
+         "args": {},
+         "id": "call_31605a7c314b4b20b493202491b27811"
+        }
+       ],
+       "tool_call_id": null
+      },
+      {
+       "type": "ToolMessage",
+       "content": "Synthetic tool result for the replay.",
+       "tool_calls": [],
+       "tool_call_id": "call_31605a7c314b4b20b493202491b27811"
+      }
+     ],
+     "sanitized_changed": false
+    },
+    "checkpoint": {
+     "type": "msgpack",
+     "base64": "k8eyBZS9bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMuaHVtYW6sSHVtYW5NZXNzYWdlhqdjb250ZW502SxTeW50aGV0aWMgcmVwbGF5IHByb21wdDogbGlzdCB0aGUgY2FsbGJhY2tzLrFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWlaHVtYW6kbmFtZcCiaWTAs21vZGVsX3ZhbGlkYXRlX2pzb27IAzkFlLpsYW5nY2hhaW5fY29yZS5tZXNzYWdlcy5haalBSU1lc3NhZ2WJp2NvbnRlbnSRhqlhcmd1bWVudHOie32nY2FsbF9pZNklY2FsbF8zMTYwNWE3YzMxNGI0YjIwYjQ5MzIwMjQ5MWIyNzgxMaRuYW1lrmxpc3RfY2FsbGJhY2tzpHR5cGWtZnVuY3Rpb25fY2FsbKJpZNk1ZmNfMDcwYjI3NGRhYTg4NTA0ZDAxNmIwMzQ0Yzg1MGI4ODdkMWJhMTlkMjQ2NDY1YjAwNjCmc3RhdHVzqWNvbXBsZXRlZLFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGIomlk2TdyZXNwXzA3MGIyNzRkYWE4ODUwNGQwMTZiMDM0NGJlYmFkNDg3ZDE4NTViZDAxYmVlOTExM2ZhqmNyZWF0ZWRfYXTLQdrA0S+AAAClbW9kZWywcmVjb3JkZWQtbW9kZWwtYqZvYmplY3SocmVzcG9uc2Wsc2VydmljZV90aWVyp2RlZmF1bHSmc3RhdHVzqWNvbXBsZXRlZK5tb2RlbF9wcm92aWRlcqZvcGVuYWmqbW9kZWxfbmFtZbByZWNvcmRlZC1tb2RlbC1ipHR5cGWiYWmkbmFtZcCiaWTZN3Jlc3BfMDcwYjI3NGRhYTg4NTA0ZDAxNmIwMzQ0YmViYWQ0ODdkMTg1NWJkMDFiZWU5MTEzZmGqdG9vbF9jYWxsc5GEpG5hbWWubGlzdF9jYWxsYmFja3OkYXJnc4CiaWTZJWNhbGxfMzE2MDVhN2MzMTRiNGIyMGI0OTMyMDI0OTFiMjc4MTGkdHlwZal0b29sX2NhbGyyaW52YWxpZF90b29sX2NhbGxzkK51c2FnZV9tZXRhZGF0YYWsaW5wdXRfdG9rZW5zzS1zrW91dHB1dF90b2tlbnMOrHRvdGFsX3Rva2Vuc80tgbNpbnB1dF90b2tlbl9kZXRhaWxzgq5jYWNoZV9jcmVhdGlvbs0tcKpjYWNoZV9yZWFkALRvdXRwdXRfdG9rZW5fZGV0YWlsc4GpcmVhc29uaW5nALNtb2RlbF92YWxpZGF0ZV9qc29ux/UFlLxsYW5nY2hhaW5fY29yZS5tZXNzYWdlcy50b29sq1Rvb2xNZXNzYWdliadjb250ZW502SVTeW50aGV0aWMgdG9vbCByZXN1bHQgZm9yIHRoZSByZXBsYXkusWFkZGl0aW9uYWxfa3dhcmdzgLFyZXNwb25zZV9tZXRhZGF0YYCkdHlwZaR0b29spG5hbWXAomlkwKx0b29sX2NhbGxfaWTZJWNhbGxfMzE2MDVhN2MzMTRiNGIyMGI0OTMyMDI0OTFiMjc4MTGoYXJ0aWZhY3TApnN0YXR1c6dzdWNjZXNzs21vZGVsX3ZhbGlkYXRlX2pzb24="
+    }
+   }
+  },
+  {
+   "id": "r07_responses_200_b_function_call_respond_to_user",
+   "source": "recorded live check 1 of 2 (2026-11-22), request seq 13442",
+   "model": "recorded-model-b",
+   "route": {
+    "api": "responses",
+    "reasoning_effort": "low"
+   },
+   "status": 200,
+   "body": {
+    "background": false,
+    "completed_at": 1795376342,
+    "created_at": 1795376329,
+    "error": null,
+    "frequency_penalty": 0.0,
+    "id": "resp_070b274daa88504d016b0344c8d02087d1a0a4b461d7e48310",
+    "image": {
+     "context_compression": "disabled"
+    },
+    "incomplete_details": null,
+    "input_transformations": [],
+    "max_output_tokens": 4096,
+    "max_tool_calls": null,
+    "model": "recorded-model-b",
+    "moderation": null,
+    "object": "response",
+    "output": [
+     {
+      "arguments": "{\"final_response\":\"**Label: amber-seven**\\n\\n| Callback | Agent | Host | User | Integrity | Status | Last check-in |\\n|---|---|---|---|---|---|---|\\n| 2 | apollo | WORKSTATION-A | lab.user | 2 | Dead | ~25 hours ago |\\n| 3 | apollo | WORKSTATION-A | lab.user | 3 | Alive | ~1.6 seconds ago |\\n\\nTwo callbacks returned: **one alive, one dead**. Called `list_callbacks` once; no tasks were run.\",\"reuse_latest_worker_answer\":false,\"outcome\":\"completed\"}",
+      "call_id": "call_3d0f7aa77afc491bbdf03a8c4be4d40b",
+      "id": "fc_070b274daa88504d016b0344d50ef887d19c963c7359c8279a",
+      "name": "respond_to_user",
+      "status": "completed",
+      "type": "function_call"
+     }
+    ],
+    "parallel_tool_calls": true,
+    "presence_penalty": 0.0,
+    "previous_response_id": null,
+    "reasoning": {
+     "context": "all_turns",
+     "effort": "low",
+     "mode": "standard",
+     "summary": null
+    },
+    "service_tier": "default",
+    "status": "completed",
+    "store": false,
+    "temperature": 1.0,
+    "text": {
+     "format": {
+      "type": "text"
+     },
+     "verbosity": "medium"
+    },
+    "tool_choice": "auto",
+    "tool_usage": {
+     "image_gen": {
+      "input_tokens": 0,
+      "input_tokens_details": {
+       "image_tokens": 0,
+       "text_tokens": 0
+      },
+      "output_tokens": 0,
+      "output_tokens_details": {
+       "image_tokens": 0,
+       "text_tokens": 0
+      },
+      "total_tokens": 0
+     },
+     "web_search": {
+      "num_requests": 0
+     }
+    },
+    "top_logprobs": 0,
+    "top_p": 0.98,
+    "truncation": "disabled",
+    "usage": {
+     "input_tokens": 11771,
+     "input_tokens_details": {
+      "cache_write_tokens": 1084,
+      "cache_write_tokens_details": {
+       "ttl_12h_tokens": 0,
+       "ttl_30m_tokens": 1084
+      },
+      "cached_tokens": 10684
+     },
+     "output_tokens": 154,
+     "output_tokens_details": {
+      "reasoning_tokens": 0
+     },
+     "total_tokens": 11925
+    }
+   },
+   "expected": {
+    "message": {
+     "type": "AIMessage",
+     "id": "resp_070b274daa88504d016b0344c8d02087d1a0a4b461d7e48310",
+     "name": null,
+     "tool_calls": [
+      {
+       "name": "respond_to_user",
+       "args": {
+        "final_response": "**Label: amber-seven**\n\n| Callback | Agent | Host | User | Integrity | Status | Last check-in |\n|---|---|---|---|---|---|---|\n| 2 | apollo | WORKSTATION-A | lab.user | 2 | Dead | ~25 hours ago |\n| 3 | apollo | WORKSTATION-A | lab.user | 3 | Alive | ~1.6 seconds ago |\n\nTwo callbacks returned: **one alive, one dead**. Called `list_callbacks` once; no tasks were run.",
+        "reuse_latest_worker_answer": false,
+        "outcome": "completed"
+       },
+       "id": "call_3d0f7aa77afc491bbdf03a8c4be4d40b"
+      }
+     ],
+     "invalid_tool_calls": [],
+     "content_types": [
+      "function_call"
+     ],
+     "text": "",
+     "sole_text": null,
+     "envelope_error": "",
+     "usage": {
+      "input_tokens": 11771,
+      "output_tokens": 154,
+      "total_tokens": 11925,
+      "reasoning_tokens": 0
+     },
+     "metadata": {
+      "model_name": "recorded-model-b",
+      "model": "recorded-model-b",
+      "status": "completed",
+      "id": "resp_070b274daa88504d016b0344c8d02087d1a0a4b461d7e48310"
+     },
+     "rendered": ""
+    },
+    "history": {
+     "responses_input": [
+      {
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "role": "user",
+       "type": "message"
+      },
+      {
+       "arguments": "{\"final_response\":\"**Label: amber-seven**\\n\\n| Callback | Agent | Host | User | Integrity | Status | Last check-in |\\n|---|---|---|---|---|---|---|\\n| 2 | apollo | WORKSTATION-A | lab.user | 2 | Dead | ~25 hours ago |\\n| 3 | apollo | WORKSTATION-A | lab.user | 3 | Alive | ~1.6 seconds ago |\\n\\nTwo callbacks returned: **one alive, one dead**. Called `list_callbacks` once; no tasks were run.\",\"reuse_latest_worker_answer\":false,\"outcome\":\"completed\"}",
+       "call_id": "call_3d0f7aa77afc491bbdf03a8c4be4d40b",
+       "name": "respond_to_user",
+       "type": "function_call",
+       "id": "fc_070b274daa88504d016b0344d50ef887d19c963c7359c8279a",
+       "status": "completed"
+      },
+      {
+       "type": "function_call_output",
+       "output": "Synthetic tool result for the replay.",
+       "call_id": "call_3d0f7aa77afc491bbdf03a8c4be4d40b"
+      }
+     ],
+     "chat_completions": [
+      {
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "role": "user"
+      },
+      {
+       "content": ".",
+       "role": "assistant",
+       "tool_calls": [
+        {
+         "type": "function",
+         "id": "call_3d0f7aa77afc491bbdf03a8c4be4d40b",
+         "function": {
+          "name": "respond_to_user",
+          "arguments": "{\"final_response\": \"**Label: amber-seven**\\n\\n| Callback | Agent | Host | User | Integrity | Status | Last check-in |\\n|---|---|---|---|---|---|---|\\n| 2 | apollo | WORKSTATION-A | lab.user | 2 | Dead | ~25 hours ago |\\n| 3 | apollo | WORKSTATION-A | lab.user | 3 | Alive | ~1.6 seconds ago |\\n\\nTwo callbacks returned: **one alive, one dead**. Called `list_callbacks` once; no tasks were run.\", \"reuse_latest_worker_answer\": false, \"outcome\": \"completed\"}"
+         }
+        }
+       ]
+      },
+      {
+       "content": "Synthetic tool result for the replay.",
+       "role": "tool",
+       "tool_call_id": "call_3d0f7aa77afc491bbdf03a8c4be4d40b"
+      }
+     ],
+     "sanitized": [
+      {
+       "type": "HumanMessage",
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "tool_calls": [],
+       "tool_call_id": null
+      },
+      {
+       "type": "AIMessage",
+       "content": [
+        {
+         "arguments": "{\"final_response\":\"**Label: amber-seven**\\n\\n| Callback | Agent | Host | User | Integrity | Status | Last check-in |\\n|---|---|---|---|---|---|---|\\n| 2 | apollo | WORKSTATION-A | lab.user | 2 | Dead | ~25 hours ago |\\n| 3 | apollo | WORKSTATION-A | lab.user | 3 | Alive | ~1.6 seconds ago |\\n\\nTwo callbacks returned: **one alive, one dead**. Called `list_callbacks` once; no tasks were run.\",\"reuse_latest_worker_answer\":false,\"outcome\":\"completed\"}",
+         "call_id": "call_3d0f7aa77afc491bbdf03a8c4be4d40b",
+         "name": "respond_to_user",
+         "type": "function_call",
+         "id": "fc_070b274daa88504d016b0344d50ef887d19c963c7359c8279a",
+         "status": "completed"
+        }
+       ],
+       "tool_calls": [
+        {
+         "name": "respond_to_user",
+         "args": {
+          "final_response": "**Label: amber-seven**\n\n| Callback | Agent | Host | User | Integrity | Status | Last check-in |\n|---|---|---|---|---|---|---|\n| 2 | apollo | WORKSTATION-A | lab.user | 2 | Dead | ~25 hours ago |\n| 3 | apollo | WORKSTATION-A | lab.user | 3 | Alive | ~1.6 seconds ago |\n\nTwo callbacks returned: **one alive, one dead**. Called `list_callbacks` once; no tasks were run.",
+          "reuse_latest_worker_answer": false,
+          "outcome": "completed"
+         },
+         "id": "call_3d0f7aa77afc491bbdf03a8c4be4d40b"
+        }
+       ],
+       "tool_call_id": null
+      },
+      {
+       "type": "ToolMessage",
+       "content": "Synthetic tool result for the replay.",
+       "tool_calls": [],
+       "tool_call_id": "call_3d0f7aa77afc491bbdf03a8c4be4d40b"
+      }
+     ],
+     "sanitized_changed": false
+    },
+    "checkpoint": {
+     "type": "msgpack",
+     "base64": "k8eyBZS9bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMuaHVtYW6sSHVtYW5NZXNzYWdlhqdjb250ZW502SxTeW50aGV0aWMgcmVwbGF5IHByb21wdDogbGlzdCB0aGUgY2FsbGJhY2tzLrFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWlaHVtYW6kbmFtZcCiaWTAs21vZGVsX3ZhbGlkYXRlX2pzb27IBq8FlLpsYW5nY2hhaW5fY29yZS5tZXNzYWdlcy5haalBSU1lc3NhZ2WJp2NvbnRlbnSRhqlhcmd1bWVudHPaAcN7ImZpbmFsX3Jlc3BvbnNlIjoiKipMYWJlbDogYW1iZXItc2V2ZW4qKlxuXG58IENhbGxiYWNrIHwgQWdlbnQgfCBIb3N0IHwgVXNlciB8IEludGVncml0eSB8IFN0YXR1cyB8IExhc3QgY2hlY2staW4gfFxufC0tLXwtLS18LS0tfC0tLXwtLS18LS0tfC0tLXxcbnwgMiB8IGFwb2xsbyB8IFdPUktTVEFUSU9OLUEgfCBsYWIudXNlciB8IDIgfCBEZWFkIHwgfjI1IGhvdXJzIGFnbyB8XG58IDMgfCBhcG9sbG8gfCBXT1JLU1RBVElPTi1BIHwgbGFiLnVzZXIgfCAzIHwgQWxpdmUgfCB+MS42IHNlY29uZHMgYWdvIHxcblxuVHdvIGNhbGxiYWNrcyByZXR1cm5lZDogKipvbmUgYWxpdmUsIG9uZSBkZWFkKiouIENhbGxlZCBgbGlzdF9jYWxsYmFja3NgIG9uY2U7IG5vIHRhc2tzIHdlcmUgcnVuLiIsInJldXNlX2xhdGVzdF93b3JrZXJfYW5zd2VyIjpmYWxzZSwib3V0Y29tZSI6ImNvbXBsZXRlZCJ9p2NhbGxfaWTZJWNhbGxfM2QwZjdhYTc3YWZjNDkxYmJkZjAzYThjNGJlNGQ0MGKkbmFtZa9yZXNwb25kX3RvX3VzZXKkdHlwZa1mdW5jdGlvbl9jYWxsomlk2TVmY18wNzBiMjc0ZGFhODg1MDRkMDE2YjAzNDRkNTBlZjg4N2QxOWM5NjNjNzM1OWM4Mjc5YaZzdGF0dXOpY29tcGxldGVksWFkZGl0aW9uYWxfa3dhcmdzgLFyZXNwb25zZV9tZXRhZGF0YYiiaWTZN3Jlc3BfMDcwYjI3NGRhYTg4NTA0ZDAxNmIwMzQ0YzhkMDIwODdkMWEwYTRiNDYxZDdlNDgzMTCqY3JlYXRlZF9hdMtB2sDRMkAAAKVtb2RlbLByZWNvcmRlZC1tb2RlbC1ipm9iamVjdKhyZXNwb25zZaxzZXJ2aWNlX3RpZXKnZGVmYXVsdKZzdGF0dXOpY29tcGxldGVkrm1vZGVsX3Byb3ZpZGVypm9wZW5haaptb2RlbF9uYW1lsHJlY29yZGVkLW1vZGVsLWKkdHlwZaJhaaRuYW1lwKJpZNk3cmVzcF8wNzBiMjc0ZGFhODg1MDRkMDE2YjAzNDRjOGQwMjA4N2QxYTBhNGI0NjFkN2U0ODMxMKp0b29sX2NhbGxzkYSkbmFtZa9yZXNwb25kX3RvX3VzZXKkYXJnc4OuZmluYWxfcmVzcG9uc2XaAW4qKkxhYmVsOiBhbWJlci1zZXZlbioqCgp8IENhbGxiYWNrIHwgQWdlbnQgfCBIb3N0IHwgVXNlciB8IEludGVncml0eSB8IFN0YXR1cyB8IExhc3QgY2hlY2staW4gfAp8LS0tfC0tLXwtLS18LS0tfC0tLXwtLS18LS0tfAp8IDIgfCBhcG9sbG8gfCBXT1JLU1RBVElPTi1BIHwgbGFiLnVzZXIgfCAyIHwgRGVhZCB8IH4yNSBob3VycyBhZ28gfAp8IDMgfCBhcG9sbG8gfCBXT1JLU1RBVElPTi1BIHwgbGFiLnVzZXIgfCAzIHwgQWxpdmUgfCB+MS42IHNlY29uZHMgYWdvIHwKClR3byBjYWxsYmFja3MgcmV0dXJuZWQ6ICoqb25lIGFsaXZlLCBvbmUgZGVhZCoqLiBDYWxsZWQgYGxpc3RfY2FsbGJhY2tzYCBvbmNlOyBubyB0YXNrcyB3ZXJlIHJ1bi66cmV1c2VfbGF0ZXN0X3dvcmtlcl9hbnN3ZXLCp291dGNvbWWpY29tcGxldGVkomlk2SVjYWxsXzNkMGY3YWE3N2FmYzQ5MWJiZGYwM2E4YzRiZTRkNDBipHR5cGWpdG9vbF9jYWxssmludmFsaWRfdG9vbF9jYWxsc5CudXNhZ2VfbWV0YWRhdGGFrGlucHV0X3Rva2Vuc80t+61vdXRwdXRfdG9rZW5zzJqsdG90YWxfdG9rZW5zzS6Vs2lucHV0X3Rva2VuX2RldGFpbHOCrmNhY2hlX2NyZWF0aW9uzQQ8qmNhY2hlX3JlYWTNKby0b3V0cHV0X3Rva2VuX2RldGFpbHOBqXJlYXNvbmluZwCzbW9kZWxfdmFsaWRhdGVfanNvbsf1BZS8bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMudG9vbKtUb29sTWVzc2FnZYmnY29udGVudNklU3ludGhldGljIHRvb2wgcmVzdWx0IGZvciB0aGUgcmVwbGF5LrFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWkdG9vbKRuYW1lwKJpZMCsdG9vbF9jYWxsX2lk2SVjYWxsXzNkMGY3YWE3N2FmYzQ5MWJiZGYwM2E4YzRiZTRkNDBiqGFydGlmYWN0wKZzdGF0dXOnc3VjY2Vzc7Ntb2RlbF92YWxpZGF0ZV9qc29u"
+    }
+   }
+  },
+  {
+   "id": "r08_responses_400_b_unsupported_value_reasoning_effort",
+   "source": "recorded live check 1 of 2 (2026-11-22), request seq 13667",
+   "model": "recorded-model-b",
+   "route": {
+    "api": "responses",
+    "reasoning_effort": "none"
+   },
+   "status": 400,
+   "body": {
+    "error": {
+     "code": "unsupported_value",
+     "message": "Unsupported value: 'none' is not supported with the 'recorded-model-b' model. Supported values are: 'low', 'medium', 'high', 'xhigh', and 'max'.",
+     "param": "reasoning.effort",
+     "type": "invalid_request_error"
+    }
+   },
+   "expected": {
+    "error": {
+     "sdk_types": [
+      "BadRequestError",
+      "APIStatusError",
+      "APIError",
+      "OpenAIError"
+     ],
+     "status_code": 400,
+     "code": "unsupported_value",
+     "param": "reasoning.effort",
+     "message": "Error code: 400 - {'error': {'code': 'unsupported_value', 'message': \"Unsupported value: 'none' is not supported with the 'recorded-model-b' model. Supported values are: 'low', 'medium', 'high', 'xhigh', and 'max'.\", 'param': 'reasoning.effort', 'type': 'invalid_request_error'}}",
+     "body": {
+      "code": "unsupported_value",
+      "message": "Unsupported value: 'none' is not supported with the 'recorded-model-b' model. Supported values are: 'low', 'medium', 'high', 'xhigh', and 'max'.",
+      "param": "reasoning.effort",
+      "type": "invalid_request_error"
+     },
+     "configuration_rejection": true,
+     "operator_text": "Error code: 400 - {'error': {'code': 'unsupported_value', 'message': \"Unsupported value: 'none' is not supported with the 'recorded-model-b' model. Supported values are: 'low', 'medium', 'high', 'xhigh', and 'max'.\", 'param': 'reasoning.effort', 'type': 'invalid_request_error'}}",
+     "configuration_notice": "The model provider rejected this request (HTTP 400, code `unsupported_value`, param `reasoning.effort`): Unsupported value: 'none' is not supported with the 'recorded-model-b' model. Supported values are: 'low', 'medium', 'high', 'xhigh', and 'max'.\n\nRoute used: provider openai · model `recorded-model-b` · OpenAI API: Responses (chat configuration) · OpenAI Daybreak: Off (Sage default) · OpenAI Safety Identifier: not configured · Reasoning Effort: None (chat configuration) · endpoint https://provider.invalid/v1.\n\nTo fix it, set **Reasoning Effort** to a supported value in this chat's configuration (one of the values the provider lists: Low, Medium, High, Extra high or Maximum), then send your request again. Leaving the field blank inherits the SAGE_REASONING_EFFORT user secret, then the environment, then the provider's default for the model; it is not the same as **None**, which Sage sends as an explicit value. This chat is still usable and keeps its conversation: changing the model (**Model** or `/model <name>`), OpenAI API, OpenAI Daybreak, OpenAI Safety Identifier or Reasoning Effort continues it. Sage did not change the model, provider or endpoint.",
+     "unproven_notice": "The model provider rejected this chat's request before the model answered (HTTP 400): Unsupported value: 'none' is not supported with the 'recorded-model-b' model. Supported values are: 'low', 'medium', 'high', 'xhigh', and 'max'.\n\nRoute used: provider openai · model `recorded-model-b` (chat configuration) · endpoint https://provider.invalid/v1.\n\nTo fix it, change **Model** to a model this provider and key can use, or run `/model <name>`, then send your request again. This chat is still usable and keeps its conversation; nothing was run."
+    }
+   },
+   "accepted_differences": {
+    "reason": "Operator decision 2026-11-24 (dependency advisories line): accept openai 3's error text. The SDK now renders 'Error code: <status> - <provider message>' instead of the error body's repr, so the error code and parameter no longer appear in the exception's text or in operator_error_text. Status, code, param, body, classification and both Sage notices are unchanged. Restoring code and parameter in Sage's error log is a separate follow-up.",
+    "versions": {
+     "openai": "3.58.0",
+     "langchain-openai": "1.7.2",
+     "langchain-core": "1.6.10"
+    },
+    "error": {
+     "message": "Error code: 400 - Unsupported value: 'none' is not supported with the 'recorded-model-b' model. Supported values are: 'low', 'medium', 'high', 'xhigh', and 'max'.",
+     "operator_text": "Error code: 400 - Unsupported value: 'none' is not supported with the 'recorded-model-b' model. Supported values are: 'low', 'medium', 'high', 'xhigh', and 'max'."
+    }
+   }
+  },
+  {
+   "id": "r09_responses_200_b_message",
+   "source": "recorded live check 1 of 2 (2026-11-22), request seq 14053",
+   "model": "recorded-model-b",
+   "route": {
+    "api": "responses",
+    "reasoning_effort": "low"
+   },
+   "status": 200,
+   "body": {
+    "background": false,
+    "completed_at": 1795376359,
+    "created_at": 1795376358,
+    "error": null,
+    "frequency_penalty": 0.0,
+    "id": "resp_0d19fc34439ce826016b0344e5f07487d181d793ecc613dd03",
+    "image": {
+     "context_compression": "disabled"
+    },
+    "incomplete_details": null,
+    "input_transformations": [],
+    "max_output_tokens": 4096,
+    "max_tool_calls": null,
+    "model": "recorded-model-b",
+    "moderation": null,
+    "object": "response",
+    "output": [
+     {
+      "content": [
+       {
+        "annotations": [],
+        "logprobs": [],
+        "text": "amber-seven",
+        "type": "output_text"
+       }
+      ],
+      "id": "msg_0d19fc34439ce826016b0344e6f47487d18b9b87c9d55c653a",
+      "phase": "final_answer",
+      "role": "assistant",
+      "status": "completed",
+      "type": "message"
+     }
+    ],
+    "parallel_tool_calls": true,
+    "presence_penalty": 0.0,
+    "previous_response_id": null,
+    "reasoning": {
+     "context": "all_turns",
+     "effort": "low",
+     "mode": "standard",
+     "summary": null
+    },
+    "service_tier": "default",
+    "status": "completed",
+    "store": false,
+    "temperature": 1.0,
+    "text": {
+     "format": {
+      "type": "text"
+     },
+     "verbosity": "medium"
+    },
+    "tool_choice": "auto",
+    "tool_usage": {
+     "image_gen": {
+      "input_tokens": 0,
+      "input_tokens_details": {
+       "image_tokens": 0,
+       "text_tokens": 0
+      },
+      "output_tokens": 0,
+      "output_tokens_details": {
+       "image_tokens": 0,
+       "text_tokens": 0
+      },
+      "total_tokens": 0
+     },
+     "web_search": {
+      "num_requests": 0
+     }
+    },
+    "top_logprobs": 0,
+    "top_p": 0.98,
+    "truncation": "disabled",
+    "usage": {
+     "input_tokens": 11970,
+     "input_tokens_details": {
+      "cache_write_tokens": 11967,
+      "cache_write_tokens_details": {
+       "ttl_12h_tokens": 0,
+       "ttl_30m_tokens": 11967
+      },
+      "cached_tokens": 0
+     },
+     "output_tokens": 6,
+     "output_tokens_details": {
+      "reasoning_tokens": 0
+     },
+     "total_tokens": 11976
+    }
+   },
+   "expected": {
+    "message": {
+     "type": "AIMessage",
+     "id": "resp_0d19fc34439ce826016b0344e5f07487d181d793ecc613dd03",
+     "name": null,
+     "tool_calls": [],
+     "invalid_tool_calls": [],
+     "content_types": [
+      "text"
+     ],
+     "text": "amber-seven",
+     "sole_text": "amber-seven",
+     "envelope_error": "",
+     "usage": {
+      "input_tokens": 11970,
+      "output_tokens": 6,
+      "total_tokens": 11976,
+      "reasoning_tokens": 0
+     },
+     "metadata": {
+      "model_name": "recorded-model-b",
+      "model": "recorded-model-b",
+      "status": "completed",
+      "id": "resp_0d19fc34439ce826016b0344e5f07487d181d793ecc613dd03"
+     },
+     "rendered": "amber-seven\n"
+    },
+    "history": {
+     "responses_input": [
+      {
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "role": "user",
+       "type": "message"
+      },
+      {
+       "type": "message",
+       "content": [
+        {
+         "type": "output_text",
+         "text": "amber-seven",
+         "annotations": []
+        }
+       ],
+       "role": "assistant",
+       "phase": "final_answer"
+      }
+     ],
+     "chat_completions": [
+      {
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "role": "user"
+      },
+      {
+       "content": [
+        {
+         "type": "text",
+         "text": "amber-seven",
+         "annotations": [],
+         "id": "msg_0d19fc34439ce826016b0344e6f47487d18b9b87c9d55c653a",
+         "phase": "final_answer"
+        }
+       ],
+       "role": "assistant"
+      }
+     ],
+     "sanitized": [
+      {
+       "type": "HumanMessage",
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "tool_calls": [],
+       "tool_call_id": null
+      },
+      {
+       "type": "AIMessage",
+       "content": [
+        {
+         "type": "text",
+         "text": "amber-seven",
+         "annotations": [],
+         "id": "msg_0d19fc34439ce826016b0344e6f47487d18b9b87c9d55c653a",
+         "phase": "final_answer"
+        }
+       ],
+       "tool_calls": [],
+       "tool_call_id": null
+      }
+     ],
+     "sanitized_changed": false
+    },
+    "checkpoint": {
+     "type": "msgpack",
+     "base64": "kseyBZS9bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMuaHVtYW6sSHVtYW5NZXNzYWdlhqdjb250ZW502SxTeW50aGV0aWMgcmVwbGF5IHByb21wdDogbGlzdCB0aGUgY2FsbGJhY2tzLrFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWlaHVtYW6kbmFtZcCiaWTAs21vZGVsX3ZhbGlkYXRlX2pzb27IAq0FlLpsYW5nY2hhaW5fY29yZS5tZXNzYWdlcy5haalBSU1lc3NhZ2WJp2NvbnRlbnSRhaR0eXBlpHRleHSkdGV4dKthbWJlci1zZXZlbqthbm5vdGF0aW9uc5CiaWTZNm1zZ18wZDE5ZmMzNDQzOWNlODI2MDE2YjAzNDRlNmY0NzQ4N2QxOGI5Yjg3YzlkNTVjNjUzYaVwaGFzZaxmaW5hbF9hbnN3ZXKxYWRkaXRpb25hbF9rd2FyZ3OAsXJlc3BvbnNlX21ldGFkYXRhiKJpZNk3cmVzcF8wZDE5ZmMzNDQzOWNlODI2MDE2YjAzNDRlNWYwNzQ4N2QxODFkNzkzZWNjNjEzZGQwM6pjcmVhdGVkX2F0y0HawNE5gAAApW1vZGVssHJlY29yZGVkLW1vZGVsLWKmb2JqZWN0qHJlc3BvbnNlrHNlcnZpY2VfdGllcqdkZWZhdWx0pnN0YXR1c6ljb21wbGV0ZWSubW9kZWxfcHJvdmlkZXKmb3BlbmFpqm1vZGVsX25hbWWwcmVjb3JkZWQtbW9kZWwtYqR0eXBlomFppG5hbWXAomlk2TdyZXNwXzBkMTlmYzM0NDM5Y2U4MjYwMTZiMDM0NGU1ZjA3NDg3ZDE4MWQ3OTNlY2M2MTNkZDAzqnRvb2xfY2FsbHOQsmludmFsaWRfdG9vbF9jYWxsc5CudXNhZ2VfbWV0YWRhdGGFrGlucHV0X3Rva2Vuc80uwq1vdXRwdXRfdG9rZW5zBqx0b3RhbF90b2tlbnPNLsizaW5wdXRfdG9rZW5fZGV0YWlsc4KuY2FjaGVfY3JlYXRpb27NLr+qY2FjaGVfcmVhZAC0b3V0cHV0X3Rva2VuX2RldGFpbHOBqXJlYXNvbmluZwCzbW9kZWxfdmFsaWRhdGVfanNvbg=="
+    }
+   }
+  }
+ ]
+}
