@@ -229,8 +229,11 @@ chat's model in place, and binds each supervised catalog step to an action that 
   service directory there. Set `PHOENIX_WORKING_DIR` and `SAGE_DATABASE_PATH` as described in the README section
   "SQLite on macOS Docker Desktop / OrbStack"; with that setting the databases do not survive a container rebuild
   or reinstall.
-- **Dependency vulnerabilities.** Some reported vulnerabilities remain because `mythic-container` and
-  `arize-phoenix` pin the affected packages. They clear when those projects update their pins.
+- **Dependency vulnerabilities.** `pip-audit` reports advisories in six shipped packages. `dynaconf` and `ujson`
+  are pinned by `mythic-container`, and `strawberry-graphql` by `arize-phoenix`; they clear when those projects
+  update their pins. The fix for `pydantic-ai-slim` needs newer OpenAI and Anthropic SDKs than Sage's LangChain
+  integrations accept, so it waits for that upgrade. `dnspython` 2.9.2 and `opentelemetry-api` 1.45.2 fix the other
+  two and are deferred to after this release.
 - **Plain-prose claims are not withheld.** Sage withholds a supervised closing with no step behind it only when it
   carries one of Sage's own step-report forms. A closing that claims a result in plain prose still reaches you, so
   check the tasks in Mythic before relying on a reported result.
