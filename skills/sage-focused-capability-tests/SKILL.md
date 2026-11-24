@@ -69,6 +69,14 @@ argument is still accepted and ignored. See `docs/development/TEST_TIERS.md`.
   two Conversation prompts and one Supervised prompt, rejecting any approval card, and stops at 20 provider calls,
   300,000 tokens, 20 minutes or any target task. `verify` applies the pass rules written in the script once; a set
   with no provider tool call did not run. One attempt per run file.
+- `check_mcp_client_phoenix.py readiness|run|verify --run-file F --phoenix-db P` — the MCP client and Phoenix
+  upgrade live check, through native slash dispatch only (no provider call). `readiness` (read-only, `--channel-id`)
+  checks deployment parity, that the running container is the local `sage:latest` image with this branch's
+  `constraints.txt` (Strawberry 0.327.7, no `langchain-mcp-adapters`), that the channel is idle and carries the three
+  BloodHound settings (presence only), BloodHound CE's HTTP status, Phoenix and its `/healthz`, and the task
+  baseline. `run` (operator authorization required, `--authorized-by`, and `--plan` for `sage-line check-attempt`)
+  sends `/bloodhound`, then `/mcp tools BloodHound`, in that channel inside one five-minute budget, with no retry or
+  upload. `verify` applies the pass rules written in the script once. One attempt per run file.
 - `freeze_provider_wire.py --wire W [--wire W] --substitutions S` — writes the
   `provider_wire_round_trips.json` battery from recorded provider bodies, frozen with the SDK and adapter versions
   it names, and refuses to run on any other versions. Offline; the substitutions file is private.
