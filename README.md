@@ -37,12 +37,6 @@ services, and Sage-local attack artifacts are not admissible proof of an objecti
 > understood: an autonomous agent driving a C2 carries real risk of unintended impact on a live network. Weigh
 > production use very carefully, and prefer labs and authorized engagements until Sage has matured.
 
-> **Mythic target.** Native chat containers do not exist before Mythic v4. The 0.3.0 release qualification runs one
-> supervised GOAD objective on Mythic `v4.0.8`, and its GitHub release notes report the result. The last live
-> qualification recorded in this repository is 0.1.0-beta's, on tag `v4.0.0rc5` at commit
-> `a9add7f1f62f5b2098d1f0eb0306c4b15b8cd916`. Other Mythic v4 builds may work but have not been qualified. See
-> [Limitations](#limitations).
-
 ## Contents
 
 - [How Sage works](#how-sage-works)
@@ -250,10 +244,7 @@ strategy.
 
 ## Requirements
 
-- **Mythic v4.** The 0.3.0 release qualification runs on `v4.0.8`; its GitHub release notes report the result.
-  `v4.0.0rc5` at commit `a9add7f1f62f5b2098d1f0eb0306c4b15b8cd916` is the last live-qualified target recorded in
-  this repository (0.1.0-beta). Earlier Mythic versions have no native chat-container support; other Mythic v4
-  revisions have not been live-qualified.
+- Requires Mythic v4.
 - Python 3.14 and a repository virtual environment.
 - Model-provider credentials or an OpenAI-compatible endpoint.
 - For the live-qualified graph path, BloodHound CE 9.5.1 plus [BloodHound MCP](https://github.com/mwnickerson/bloodhound_mcp)
@@ -542,7 +533,7 @@ a payload's commands does not establish support for every automated capability o
 
 See [payload adapters and command discovery](docs/reference/TOOLS_AND_CAPABILITIES.md#payload-adapters-and-command-discovery)
 for the profile mappings and approval/alias boundary. An implemented profile is separate from live validation;
-the live-qualified payload remains Apollo in the 0.1.0-beta configuration described under [Limitations](#limitations).
+live qualification has used Apollo only (see [Limitations](#limitations)).
 
 The complete tool and capability reference is in
 [docs/reference/TOOLS_AND_CAPABILITIES.md](docs/reference/TOOLS_AND_CAPABILITIES.md). Because the exposed set is
@@ -1161,48 +1152,39 @@ a legacy override, an operator-configured channel ID that is never derived from 
 
 ## Limitations
 
-Sage 0.3 is deliberately narrow, and its live validation lags its code:
+Sage 0.4 is deliberately narrow, and its live validation lags its code:
 
-- **Live validation.** The most recent live-validated configuration recorded in this repository is the
-  [0.1.0-beta support matrix](docs/releases/v0.1.0-beta.md): Linux arm64 Sage Docker on Mythic `v4.0.0rc5`,
-  Apollo `v0.1.0-rc1`, BloodHound CE 9.5.1, BloodHound MCP `92a37dd`, and `sonnet-4-6` through an
-  OpenAI-compatible LiteLLM route. Releases from 0.2.0 on are validated by the offline suite, the
-  repository-boundary guards, the repo-hygiene checks, and scripted tests of the assembled chat path; 0.2.0 had
-  no live-range run. The 0.3.0 release qualification runs once, in supervised mode, on a locally built image of
-  the release source: one objective request to obtain Domain Admin of one GOAD domain from an Apollo foothold
-  (plus at most one `proceed` if it ends without proof), within fixed time, token, cost and approval-card limits,
-  with no other operator input than accepting or rejecting cards. 0.3.0 is published only after that run passes,
-  and its GitHub release notes report the image, architecture, Mythic version, model route and result. That result
-  covers that one configuration and objective. The published image is checked for installation, not requalified.
-  Individual fixes are spot-checked live on a GOAD lab during development; those checks are not a release
-  qualification.
+- **Live validation.** Each release is validated by the offline suite, the repository-boundary guards, the
+  repo-hygiene checks, and scripted tests of the assembled chat path. Any live run a release receives is reported in
+  that release's GitHub release notes, with its image, architecture, Mythic version, model route, objective and
+  result; that result covers that one configuration and objective. Individual fixes are spot-checked live on a GOAD
+  lab during development; those checks are not a release qualification.
 - **Supervised mode.** Live evidence for objective-led supervised mode comes only from GOAD with an Apollo
   foothold and one model route. Sage proposes and you approve each guarded action, but the quality of its
   proposals on another engagement is not established. The Supervisor does not yet plan bounded steps: it can hand
-  a specialist the whole objective, so a step runs until one of its limits or an error. When the Supervisor scopes
-  a step to the wrong catalog procedure, the request still ends rather than re-scoping; 0.3.0 recovers only when
-  the specialist names something that is not a catalog procedure.
-- **Auto mode** is experimental, was not run live on 0.3.0, and has been exercised only against GOAD on earlier
-  development builds. That does not establish reliability or generalization on another range or a production
-  network.
-- **Other configurations.** Other operating systems and architectures; other Mythic, Apollo, BloodHound CE, or
-  BloodHound MCP revisions; other model providers, routes, and models; and payload types other than Apollo are not
-  validated. Code paths that support them are not evidence that they work.
+  a specialist the whole objective, so a step runs until one of its limits or an error. A catalog step runs only an
+  action that current evidence supports; when the Supervisor selects one Sage cannot bind, the request ends blocked
+  before any card instead of re-scoping.
+- **Auto mode** is experimental and has been exercised only against GOAD; each release's GitHub release notes say
+  whether that release ran it live. That does not establish reliability or generalization on another range or a
+  production network.
+- **Other configurations.** Configurations no release's notes report are not validated: other operating systems
+  and architectures; other Mythic, Apollo, BloodHound CE, or BloodHound MCP revisions; other model providers, routes,
+  and models; and payload types other than Apollo. Code paths that support them are not evidence that they work.
 - **Findings acceptance.** The assisted operation-memory acceptance case joins one completed native Apollo
   `download` task to its exact current downloaded `.ps1` file record containing direct literal username/password
   assignments. One tool-free model call may propose `credential-material`; deterministic admission binds the
   operation, task, callback, and file identity before background delivery. It does not show that a consultant
   would have missed the finding, acted on it, or received independent value.
-- **Known issues.** See the [CHANGELOG](CHANGELOG.md) for each release's known issues. As of 0.3.0 these include
+- **Known issues.** See the [CHANGELOG](CHANGELOG.md) for each release's known issues. As of 0.4.0 these include
   SQLite locking on the bind-mounted service directory under macOS Docker Desktop and OrbStack (see
   [SQLite on macOS Docker Desktop / OrbStack](#sqlite-on-macos-docker-desktop--orbstack)), dependency
-  vulnerabilities that remain until `mythic-container` and `arize-phoenix` update their pins, an approved
-  supervised action that can be issued twice if Sage stops before it records the action's result, repeated
+  vulnerabilities that remain until `mythic-container` and `arize-phoenix` update their pins, supervised closings
+  that claim a result in plain prose with no step behind it (only Sage's own report forms are withheld), repeated
   collection proposals and empty delegations that end in the no-progress stop, request endings reported as "not
-  terminal" or as errors when a task's completion function failed or a delegation was interrupted, chat display
-  ordering, a ledger that records only verifier-proven gains, and two forge defects (a parent-domain forge from a
-  child-domain source can skip the parent's replication grant, and a krbtgt reference beyond the top-ranked key is
-  refused).
+  terminal" or as errors when a task's completion function failed or a delegation was interrupted, the internal
+  delegation envelope appearing in the transcript, a ledger that records only verifier-proven gains, and an
+  experimental coding-agent connection whose worker settings a Sage reinstall deletes.
 - **Erasure.** Operation-memory erasure removes Sage-derived state for one operation but deliberately leaves
   authoritative Mythic records unchanged. It does not erase separate LangGraph checkpoints, Phoenix traces,
   LiteLLM/provider retention, native Mythic messages, or Slack workspace records; each owner must apply its own
