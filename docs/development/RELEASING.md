@@ -47,7 +47,8 @@ Make one commit that changes exactly these:
 - `agent_capabilities.json`: `"agent_version" : "<version>"`
 - `config.json`: `"sage": "ghcr.io/mythicagents/sage:<version>"`
 - `CHANGELOG.md`: rename `## [Unreleased]` to `## [<version>] - <YYYY-MM-DD>` and add an empty `## [Unreleased]`
-  above it.
+  above it. At the bottom, point `[Unreleased]` at `compare/v<version>...HEAD` and add
+  `[<version>]: https://github.com/MythicAgents/sage/compare/v<previous>...v<version>`.
 
 Run the full offline suite, then push:
 

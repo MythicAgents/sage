@@ -7,6 +7,8 @@ between minor releases.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-23
+
 Sage 0.4.0 keeps a chat going across a Sage restart, adds OpenAI's Responses API and Daybreak settings, switches a
 chat's model in place, and binds each supervised catalog step to an action that current evidence supports.
 
@@ -834,7 +836,8 @@ First beta: a bounded assisted-mode capability with a background findings watche
 profile. See the [0.1.0-beta release notes](docs/releases/v0.1.0-beta.md) for the validated support matrix and
 limits.
 
-[Unreleased]: https://github.com/MythicAgents/sage/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/MythicAgents/sage/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/MythicAgents/sage/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/MythicAgents/sage/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/MythicAgents/sage/compare/v0.1.0-beta...v0.2.0
 [0.1.0-beta]: https://github.com/MythicAgents/sage/releases/tag/v0.1.0-beta
