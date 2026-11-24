@@ -1,8 +1,10 @@
 # Optional Codex coding-agent worker for Sage's `/acp` connection.
 #
 # The image carries the pinned Codex ACP adapter (and the Codex release it packages) behind a private Unix-socket
-# bridge. It holds no credential and no configuration: the deployer mounts the socket directory, a read-only Codex
-# configuration template and an API-key secret file at run time (see README.md and docker-compose.example.yml).
+# bridge. It holds no credential and no configuration. At run time the shipped docker-compose.yml mounts the socket
+# directory and passes the API key and default model from `.env` as environment variables. A deployer may instead
+# mount a read-only Codex configuration template at /config/config.toml and an API-key file at
+# /run/secrets/codex_api_key (see README.md).
 #
 #   docker build -t sage-codex-acp:2.9.0 Payload_Type/sage/container/codex
 

@@ -20,8 +20,9 @@ Sage container ── private Unix socket ──> worker: bridge ─ stdio ─> 
 | `Dockerfile`, `package.json`, `package-lock.json` | The image: digest-pinned Node base, adapter 2.9.0 and Codex 0.171.0 installed from the lock with integrity checks |
 | `bridge.mjs` | The socket bridge described below |
 
-The deploy sync never overwrites `.env` (a first deploy copies the shipped, credential-free one), and neither image
-build includes it.
+Restarting or rebuilding Sage keeps `.env`, and neither image build includes it. Reinstalling Sage with
+`mythic-cli install` replaces Sage's whole service directory, which deletes this `.env`, with its key, and the
+`.sage_acp` socket directory. Back the file up first ([SETUP.md](SETUP.md#before-you-reinstall-sage)).
 
 ## How it works
 

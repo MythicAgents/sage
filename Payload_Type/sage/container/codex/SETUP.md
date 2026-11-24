@@ -43,7 +43,8 @@ Then create the private directory the two containers share (replace `1000 1000` 
 sudo install -d -m 0700 -o 1000 -g 1000 <mythic>/InstalledServices/sage/.sage_acp
 ```
 
-A Sage redeploy keeps this directory.
+Restarting or rebuilding Sage keeps this directory and `container/codex/.env`. Reinstalling Sage deletes both: see
+[Before you reinstall Sage](#before-you-reinstall-sage).
 
 ## 4. Start the worker (host shell)
 
@@ -62,7 +63,7 @@ docker logs sage-codex
 Sage reads its `.env` only when it starts:
 
 ```
-docker restart sage
+cd <mythic> && sudo ./mythic-cli restart sage
 ```
 
 ## 6. Connect from a Sage chat
@@ -101,6 +102,14 @@ connections, with each message's method but never its content:
 ```
 docker logs -f sage-codex
 ```
+
+## Before you reinstall Sage
+
+`sudo ./mythic-cli install` replaces Sage's whole service directory. That deletes `container/codex/.env`, with
+your API key, the `.sage_acp` socket directory and Sage's own `.env`. Copy both `.env` files somewhere safe first.
+After the reinstall, put your settings back into the new files (or repeat steps 1 and 2), repeat step 3, recreate
+the worker with the command under "Change the key or model", restart Sage (step 5) and run `/acp connect codex` in
+each chat.
 
 ## Stop or remove the worker
 
