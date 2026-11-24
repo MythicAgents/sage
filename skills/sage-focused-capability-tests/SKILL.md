@@ -59,6 +59,19 @@ argument is still accepted and ignored. See `docs/development/TEST_TIERS.md`.
   Responses correction, `/model`, a function-call step, a settings switch to model B, a wrong `/model` and a switch
   back, stopping at 16 provider calls, 1,048,576 tokens, 4,096 output tokens per call, 20 minutes or any target
   task. `verify` applies the per-step pass rules written in the script once. One attempt per run file.
+- `check_dependency_advisories.py readiness|run|verify --run-file F --phoenix-db P` — the model-SDK upgrade live
+  check on the deployed container's default provider client (no capture, metering or retry policy). Its route file
+  is owner-only with `API_ENDPOINT` and `MODEL` and no API key. `readiness` (read-only) checks deployment parity,
+  that the container's packages equal this branch's `constraints.txt`, Phoenix and its `/healthz`, the task
+  baseline, and the credential by name and status (one active provider block in the installed `.env.local`, a
+  keyed verified-TLS `GET /models` from inside the container, no shadowing user secret). `run` (paid provider
+  activity; operator authorization required, `--authorized-by`, and `--plan` for `sage-line check-attempt`) sends
+  two Conversation prompts and one Supervised prompt, rejecting any approval card, and stops at 20 provider calls,
+  300,000 tokens, 20 minutes or any target task. `verify` applies the pass rules written in the script once; a set
+  with no provider tool call did not run. One attempt per run file.
+- `freeze_provider_wire.py --wire W [--wire W] --substitutions S` — writes the
+  `provider_wire_round_trips.json` battery from recorded provider bodies, frozen with the SDK and adapter versions
+  it names, and refuses to run on any other versions. Offline; the substitutions file is private.
 - `check_bloodhound_ingest_contract.py --image <id> [--json out.json]` — checks a **built** Sage image's baked
   BloodHound MCP serves the ingest contract (byte upload plus exact-job `status`). It runs one throwaway container
   with `--network none`, the entrypoint bypassed, and only the checker mounted read-only; a loopback fake BloodHound
