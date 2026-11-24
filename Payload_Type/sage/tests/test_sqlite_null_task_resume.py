@@ -1,6 +1,14 @@
-"""Nested HITL resume writes must not duplicate authenticated operator input."""
+"""Nested HITL resume writes must not duplicate authenticated operator input.
+
+LangGraph 1.2.16 stopped accumulating a resume's null-task writes, so a checkpoint written on a current LangGraph
+resumes correctly through either saver. A checkpoint paused before the upgrade still carries the accumulated writes:
+resumed through the installed saver it yields a second current operator input, and Sage's saver is what resumes it.
+"""
 
 import asyncio
+import base64
+import json
+from pathlib import Path
 
 import aiosqlite
 import pytest
@@ -15,6 +23,10 @@ from ai.langgraph.sqlite_checkpointer import SageAsyncSqliteSaver
 
 
 REQUEST_ID = "offline:nested-resume:1"
+CONFIG = {"configurable": {"thread_id": "nested-resume"}}
+# Rows of this scenario's checkpoint after the steer, written by LangGraph 1.2.10 (see the file's provenance).
+PAUSED_BEFORE_UPGRADE = (Path(__file__).resolve().parent / "fixtures" / "checkpoints"
+                         / "nested_resume_langgraph_1_2_10.json")
 
 
 def _operator_message(text: str, revision: int) -> HumanMessage:
@@ -38,53 +50,44 @@ def _current_count(values) -> int:
     )
 
 
+def _graph(saver, effects: list):
+    async def worker(state):
+        _current_assisted_operator_input(state)
+        interrupt({"card": 1})
+        interrupt({"card": 2})
+        interrupt({"card": 3})
+        effects.append("completed once")
+        return {}
+
+    child = (StateGraph(SageState).add_node("worker", worker)
+             .add_edge(START, "worker").add_edge("worker", END).compile())
+    return (StateGraph(SageState).add_node("child", child)
+            .add_edge(START, "child").add_edge("child", END)
+            .compile(checkpointer=saver))
+
+
 async def _nested_resume(db_path, saver_type):
     connection = await aiosqlite.connect(db_path)
-    saver = saver_type(connection)
     effects = []
     try:
-        async def worker(state):
-            _current_assisted_operator_input(state)
-            interrupt({"card": 1})
-            interrupt({"card": 2})
-            interrupt({"card": 3})
-            effects.append("completed once")
-            return {}
-
-        child = (StateGraph(SageState).add_node("worker", worker)
-                 .add_edge(START, "worker").add_edge("worker", END).compile())
-        graph = (StateGraph(SageState).add_node("child", child)
-                 .add_edge(START, "child").add_edge("child", END)
-                 .compile(checkpointer=saver))
-        config = {"configurable": {"thread_id": "nested-resume"}}
+        graph = _graph(saver_type(connection), effects)
         initial = {
             "messages": [],
             "supervisor_messages": [_operator_message("initial", 0)],
             "_request_id": REQUEST_ID,
             "_request_lane": "supervised_workflow",
         }
-        await graph.ainvoke(initial, config)
+        await graph.ainvoke(initial, CONFIG)
         await graph.ainvoke(Command(
             resume="respond",
             update={"supervisor_messages": [_operator_message("steer", 1)]},
-        ), config)
-        after_respond = await graph.aget_state(config)
+        ), CONFIG)
+        after_respond = await graph.aget_state(CONFIG)
         assert _current_count(after_respond.values) == 1
         assert _current_assisted_operator_input(after_respond.values) == "steer"
 
-        if saver_type is AsyncSqliteSaver:
-            # Installed saver is the red control: the first bare resume
-            # materializes a duplicate that Sage's parent-state selector rejects.
-            await graph.ainvoke(Command(resume="accept-1"), config)
-            failed = await graph.aget_state(config)
-            assert _current_count(failed.values) == 2
-            assert effects == []
-            with pytest.raises(RuntimeError, match="one exact current operator input"):
-                _current_assisted_operator_input(failed.values)
-            return
-
-        await graph.ainvoke(Command(resume="accept-1"), config)
-        after_first_accept = await graph.aget_state(config)
+        await graph.ainvoke(Command(resume="accept-1"), CONFIG)
+        after_first_accept = await graph.aget_state(CONFIG)
         assert _current_count(after_first_accept.values) == 1
         assert _current_assisted_operator_input(after_first_accept.values) == "steer"
         assert effects == []
@@ -98,16 +101,67 @@ async def _nested_resume(db_path, saver_type):
         assert (-4, "__resume__") in pending
         assert [idx for idx, channel in pending if channel == "supervisor_messages"] == [0]
 
-        await graph.ainvoke(Command(resume="accept-2"), config)
+        await graph.ainvoke(Command(resume="accept-2"), CONFIG)
         assert effects == ["completed once"]
-        assert (await graph.aget_state(config)).next == ()
+        assert (await graph.aget_state(CONFIG)).next == ()
     finally:
         await connection.close()
 
 
-def test_installed_saver_reproduces_duplicate_and_sage_saver_repairs_it(tmp_path):
-    asyncio.run(_nested_resume(tmp_path / "old.db", AsyncSqliteSaver))
-    asyncio.run(_nested_resume(tmp_path / "sage.db", SageAsyncSqliteSaver))
+async def _restore_paused_before_upgrade(db_path) -> None:
+    """A disposable database holding exactly the recorded rows, in the installed saver's schema."""
+    recorded = json.loads(PAUSED_BEFORE_UPGRADE.read_text())
+    async with aiosqlite.connect(db_path) as connection:
+        await AsyncSqliteSaver(connection).setup()
+        for table in ("checkpoints", "writes"):
+            columns = list(recorded[table][0])
+            await connection.executemany(
+                f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({', '.join('?' * len(columns))})",
+                [[base64.b64decode(value["base64"]) if isinstance(value, dict) else value
+                  for value in (row[column] for column in columns)] for row in recorded[table]],
+            )
+        await connection.commit()
+
+
+async def _resume_paused_before_upgrade(db_path, saver_type) -> list[tuple]:
+    """Accept the two remaining cards; after each, (current inputs, selected input or None, effects, finished)."""
+    await _restore_paused_before_upgrade(db_path)
+    connection = await aiosqlite.connect(db_path)
+    effects, observed = [], []
+    try:
+        graph = _graph(saver_type(connection), effects)
+        paused = await graph.aget_state(CONFIG)
+        assert paused.next and _current_count(paused.values) == 1
+        assert _current_assisted_operator_input(paused.values) == "steer"
+        for index in (1, 2):
+            await graph.ainvoke(Command(resume=f"accept-{index}"), CONFIG)
+            snapshot = await graph.aget_state(CONFIG)
+            try:
+                selected = _current_assisted_operator_input(snapshot.values)
+            except RuntimeError as exc:
+                if "one exact current operator input" not in str(exc):
+                    raise
+                selected = None
+            observed.append((_current_count(snapshot.values), selected, len(effects), not snapshot.next))
+            if selected is None:
+                break
+    finally:
+        await connection.close()
+    return observed
+
+
+@pytest.mark.parametrize("saver_type", [AsyncSqliteSaver, SageAsyncSqliteSaver], ids=["installed", "sage"])
+def test_a_fresh_nested_checkpoint_resumes_with_one_operator_input(tmp_path, saver_type):
+    asyncio.run(_nested_resume(tmp_path / "fresh.db", saver_type))
+
+
+@pytest.mark.parametrize("saver_type, observed", [
+    # The installed saver materializes a second current input on the first resume; the selector refuses it.
+    (AsyncSqliteSaver, [(2, None, 0, False)]),
+    (SageAsyncSqliteSaver, [(1, "steer", 0, False), (1, "steer", 1, True)]),
+], ids=["installed", "sage"])
+def test_a_checkpoint_paused_before_the_upgrade_needs_sages_saver(tmp_path, saver_type, observed):
+    assert asyncio.run(_resume_paused_before_upgrade(tmp_path / "paused.db", saver_type)) == observed
 
 
 def test_conflicting_same_revision_still_fails_closed():

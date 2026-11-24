@@ -149,11 +149,11 @@ def test_unclassified_mcp_server_is_denied_before_session_side_effect(monkeypatc
     manager = MCPServerManager()
     called = []
 
-    def _should_not_connect(_connection):
+    def _should_not_connect(_config):
         called.append(True)
         raise AssertionError("session creation must not happen")
 
-    monkeypatch.setattr(mcpmod, "create_session", _should_not_connect)
+    monkeypatch.setattr(mcpmod, "_open_client", _should_not_connect)
     config = mcpmod.create_stdio_config(
         name="unknown",
         command="python",
@@ -176,11 +176,11 @@ def test_target_facing_mcp_server_is_denied_before_session_side_effect(monkeypat
     manager = MCPServerManager()
     called = []
 
-    def _should_not_connect(_connection):
+    def _should_not_connect(_config):
         called.append(True)
         raise AssertionError("session creation must not happen")
 
-    monkeypatch.setattr(mcpmod, "create_session", _should_not_connect)
+    monkeypatch.setattr(mcpmod, "_open_client", _should_not_connect)
     config = mcpmod.create_stdio_config(
         name="ldap-sidecar",
         command="python",
@@ -400,25 +400,14 @@ def test_refresh_cannot_commit_stale_tools_across_same_name_connect(monkeypatch)
         def __init__(self, label):
             self.label = label
 
-        async def initialize(self):
+        async def close(self):
             return None
 
-    class _SessionContext:
-        def __init__(self, label):
-            self.session = _Session(label)
+    async def _open_client(config):
+        label = "A" if config.connection_type == mcpmod.ConnectionType.STDIO else "B"
+        return _Session(label), {"transport": config.connection_type.value}
 
-        async def __aenter__(self):
-            return self.session
-
-        async def __aexit__(self, *_args):
-            return None
-
-    def _create_session(connection):
-        label = "A" if connection.get("transport") == "stdio" else "B"
-        return _SessionContext(label)
-
-    async def _load_tools(session, *, connection):
-        del connection
+    async def _load_tools(session):
         if session.label == "B":
             started_refresh.set()
             await release_refresh.wait()
@@ -433,8 +422,8 @@ def test_refresh_cannot_commit_stale_tools_across_same_name_connect(monkeypatch)
             description=f"source-{session.label}",
         )]
 
-    monkeypatch.setattr(mcpmod, "create_session", _create_session)
-    monkeypatch.setattr(mcpmod, "load_mcp_tools", _load_tools)
+    monkeypatch.setattr(mcpmod, "_open_client", _open_client)
+    monkeypatch.setattr(mcpmod, "_discover_tools", _load_tools)
 
     async def _scenario():
         manager = MCPServerManager()
@@ -448,7 +437,7 @@ def test_refresh_cannot_commit_stale_tools_across_same_name_connect(monkeypatch)
         manager.configs["BloodHound"] = b_config
         manager.sessions["BloodHound"] = b_session
         manager.connections["BloodHound"] = b_connection
-        manager._session_contexts["BloodHound"] = _SessionContext("B")
+        manager._session_contexts["BloodHound"] = b_session
 
         original_wrap = manager._wrap_tool_for_visibility
 
@@ -502,11 +491,11 @@ def test_caller_mislabeled_bloodhound_server_is_denied_before_session_side_effec
     manager = MCPServerManager()
     called = []
 
-    def _should_not_connect(_connection):
+    def _should_not_connect(_config):
         called.append(True)
         raise AssertionError("session creation must not happen")
 
-    monkeypatch.setattr(mcpmod, "create_session", _should_not_connect)
+    monkeypatch.setattr(mcpmod, "_open_client", _should_not_connect)
     config = mcpmod.create_stdio_config(
         name="ldap-sidecar",
         command="uv",

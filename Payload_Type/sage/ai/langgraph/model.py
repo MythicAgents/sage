@@ -5799,8 +5799,9 @@ def _earlier_steps_context(supervisor_messages: list[AnyMessage], request_id: st
 
 def _handed_result(tool_message: ToolMessage, arguments: Mapping[str, Any]) -> dict[str, Any]:
     text = _message_content_as_text(tool_message.content).strip()
-    if text.startswith(_step_bounds.DENIED_PREFIX) or (
-            getattr(tool_message, "status", "") == "error" and "rejected the tool call" in text):
+    reason = _step_bounds.operator_reason(tool_message)
+    if reason.startswith(_step_bounds.DENIED_PREFIX) or (
+            getattr(tool_message, "status", "") == "error" and "rejected the tool call" in reason):
         status = "denied_by_operator"
     elif getattr(tool_message, "status", "") == "error":
         status = "error"

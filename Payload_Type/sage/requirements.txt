@@ -1,10 +1,13 @@
-langchain==1.3.14
+# The `mcp` extra brings `langchain.mcp`, the successor to the retired langchain-mcp-adapters. Sage's MCP
+# clients (`ai/mcp.py`, `ai/hillclimb/bare_bloodhound.py`, the reset readiness probe) convert tools with it.
+langchain[mcp]==1.4.6
 langchain-core==1.6.10
-langchain-mcp-adapters==0.3.2
-# langchain-mcp-adapters 0.3.2 still imports `mcp.server.fastmcp` and declares `mcp<2.0.0,>=1.24.0`.
-# mcp 2.0.0 removed that module, so mcp must stay below 2.0 until adapters drops the fastmcp import.
-# Track: https://github.com/langchain-ai/langchain-mcp-adapters/issues/578
-mcp==1.30.0
+# Direct runtime imports of the MCP client stack (`ai/mcp.py`): the protocol types and errors, FastMCP's
+# client and transports, and the httpx2 client the HTTP transports take. Declared rather than borrowed
+# from langchain[mcp], for the same reason as the direct-import entries further down.
+mcp==2.3.0
+fastmcp-slim[client]==4.1.8
+httpx2==2.15.1
 langchain-anthropic==1.7.7
 langchain-aws==1.7.0
 langchain-openai==1.7.2
@@ -14,7 +17,10 @@ langchain-openai==1.7.2
 langchain-groq==1.1.3
 langchain-ollama==1.1.0
 langchain-xai==1.3.0
-langgraph==1.2.10
+# langgraph-prebuilt stays at 1.1.0: 1.1.3 changed the state a tool sees for a separately dispatched tool call,
+# and a later delegated worker then received an earlier worker's transcript. langgraph 1.2.23 and later
+# require prebuilt>=1.1.3, so langgraph stops at 1.2.22 (langchain 1.4.6 needs >=1.2.12).
+langgraph==1.2.22
 langgraph-prebuilt==1.1.0
 langgraph-checkpoint-sqlite==3.1.1
 langsmith==0.10.16
@@ -31,9 +37,11 @@ gql==4.0.0
 websockets==15.0.1
 aiohttp==3.14.4
 aiosqlite==0.22.1
-arize-phoenix==19.19.0
-arize-phoenix-evals==3.3.0
-openinference-instrumentation-langchain==0.1.70
+# Phoenix 20.21.0 is the newest release whose graphql-core range (<3.3) the Mythic SDK's gql 4.0.0 allows; it
+# requires anthropic>=1,<2, which sets anthropic at 1.17.0.
+arize-phoenix==20.21.0
+arize-phoenix-evals==3.10.0
+openinference-instrumentation-langchain==0.1.90
 docker==7.2.0
 ldap3==2.9.1
 # Direct runtime import (`ai/langgraph/ttp_library.py`, `ai/langgraph/prompt_loader.py`). Otherwise

@@ -723,7 +723,13 @@ def _mcp_result_fence(result: Any) -> str:
 
 
 def _mcp_tool_has_explicit_write_contradiction(tool: Any) -> bool:
-    """Return True when server-supplied hints explicitly contradict read-only use."""
+    """Return True when server-supplied hints explicitly contradict read-only use.
+
+    The hints arrive in more than one place and spelling. `langchain.mcp` nests a tool's annotations under
+    `metadata["mcp"]["tool"]["annotations"]` with the MCP SDK's snake_case names (`read_only_hint`); older
+    converters put the protocol's camelCase names (`readOnlyHint`) at the top of `metadata` or under
+    `metadata["annotations"]`. Every location and both spellings are read, and any one contradiction denies.
+    """
     metadata = getattr(tool, "metadata", None)
     sources: list[dict[str, Any]] = []
     if isinstance(metadata, dict):
@@ -731,6 +737,11 @@ def _mcp_tool_has_explicit_write_contradiction(tool: Any) -> bool:
         nested = metadata.get("annotations")
         if isinstance(nested, dict):
             sources.append(nested)
+        mcp_metadata = metadata.get("mcp")
+        tool_metadata = mcp_metadata.get("tool") if isinstance(mcp_metadata, dict) else None
+        tool_annotations = tool_metadata.get("annotations") if isinstance(tool_metadata, dict) else None
+        if isinstance(tool_annotations, dict):
+            sources.append(tool_annotations)
     annotations = getattr(tool, "annotations", None)
     if isinstance(annotations, dict):
         sources.append(annotations)
@@ -742,14 +753,16 @@ def _mcp_tool_has_explicit_write_contradiction(tool: Any) -> bool:
                 sources.append(dumped)
         attr_view = {
             key: getattr(annotations, key)
-            for key in ("readOnlyHint", "destructiveHint")
+            for key in ("readOnlyHint", "destructiveHint", "read_only_hint", "destructive_hint")
             if hasattr(annotations, key)
         }
         if attr_view:
             sources.append(attr_view)
     return any(
         source.get("readOnlyHint") is False
+        or source.get("read_only_hint") is False
         or source.get("destructiveHint") is True
+        or source.get("destructive_hint") is True
         for source in sources
     )
 

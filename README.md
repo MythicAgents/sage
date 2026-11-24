@@ -1178,8 +1178,8 @@ Sage 0.4 is deliberately narrow, and its live validation lags its code:
   would have missed the finding, acted on it, or received independent value.
 - **Known issues.** See the [CHANGELOG](CHANGELOG.md) for each release's known issues. As of 0.4.0 these include
   SQLite locking on the bind-mounted service directory under macOS Docker Desktop and OrbStack (see [SQLite on macOS
-  Docker Desktop / OrbStack](#sqlite-on-macos-docker-desktop--orbstack)), dependency advisories in six packages (three
-  pinned by upstream projects; the other three are cleared after 0.4.0, see the CHANGELOG's Unreleased section),
+  Docker Desktop / OrbStack](#sqlite-on-macos-docker-desktop--orbstack)), dependency advisories in six packages (two
+  pinned by upstream projects; the other four are cleared after 0.4.0, see the CHANGELOG's Unreleased section),
   supervised closings that claim a result in plain prose with no step behind it (only Sage's own report forms are
   withheld), repeated collection proposals and empty delegations that end in the no-progress stop, request endings
   reported as "not terminal" or as errors when a task's completion function failed or a delegation was interrupted,

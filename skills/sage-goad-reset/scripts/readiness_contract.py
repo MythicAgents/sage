@@ -1075,21 +1075,21 @@ async def probe_bloodhound_mcp_tools(directory: str | Path | None = None) -> dic
     if path is None or not path.is_dir():
         return bloodhound_mcp_status(path, [])
     try:
-        from langchain_mcp_adapters.client import MultiServerMCPClient
+        from fastmcp.client import Client
+        from fastmcp.client.transports import StdioTransport
     except Exception:
         return bloodhound_mcp_status(path, [])
     command = os.environ.get("SAGE_BLOODHOUND_MCP_COMMAND", "uv")
-    client = MultiServerMCPClient({
-        "BloodHound": {
-            "transport": "stdio",
-            "command": command,
-            "args": ["--directory", str(path), "run", "main.py"],
-            "cwd": str(path),
-        }
-    })
+    # keep_alive=False ends the server process when the listing returns; the probe only reads tool names.
+    transport = StdioTransport(
+        command=command,
+        args=["--directory", str(path), "run", "main.py"],
+        cwd=str(path),
+        keep_alive=False,
+    )
     try:
-        tools = await client.get_tools(server_name="BloodHound")
-        names = [getattr(tool, "name", "") for tool in tools]
+        async with Client(transport) as client:
+            names = [getattr(tool, "name", "") for tool in await client.list_tools()]
     except Exception:
         names = []
     return bloodhound_mcp_status(path, names)

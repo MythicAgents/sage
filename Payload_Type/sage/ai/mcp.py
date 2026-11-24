@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import contextvars
 import inspect
 import json
@@ -12,11 +13,18 @@ from dataclasses import dataclass
 from enum import Enum
 
 import anyio
-import httpx
-from mcp import ClientSession
-from langchain_mcp_adapters.tools import load_mcp_tools, convert_mcp_tool_to_langchain_tool
-from langchain_mcp_adapters.sessions import Connection, StdioConnection, SSEConnection, StreamableHttpConnection, create_session
+import httpx2
+from fastmcp.client import Client as FastMCPClient
+from fastmcp.client.transports import ClientTransport, SSETransport, StdioTransport, StreamableHttpTransport
+from langchain_core._api import suppress_langchain_beta_warning
 from langchain_core.tools import BaseTool
+from mcp.shared.exceptions import MCPError
+from mcp.types import CONNECTION_CLOSED
+
+# `langchain.mcp` announces its beta status with a warning on first import; Sage pins the version, so the
+# notice is not actionable at runtime.
+with suppress_langchain_beta_warning():
+    from langchain.mcp import as_langchain_tool
 
 from mythic_container.logging import logger
 
@@ -145,8 +153,10 @@ for logger_name in [
     "mcp.client",
     "mcp.client.sse",
     "mcp.client.streamable_http",
-    "langchain_mcp_adapters",
+    "fastmcp",
+    "langchain.mcp",
     "httpx",
+    "httpx2",
     "httpx_sse",
     "httpcore",
     "anyio",
@@ -157,16 +167,133 @@ for logger_name in [
 warnings.filterwarnings("ignore", message=".*Unknown SSE event.*")
 
 
-def _create_insecure_httpx_client(**kwargs) -> httpx.AsyncClient:
-    """Create an httpx client that skips SSL verification (for development/testing only)"""
-    # Remove verify from kwargs if present, we're forcing it to False
-    kwargs.pop('verify', None)
-    return httpx.AsyncClient(verify=False, **kwargs)
+#: HTTP timeouts the MCP SDK applied by default: SSE connects with 5 seconds, Streamable HTTP with 30, and both wait
+#: up to 300 seconds between server events. A configured `timeout` / `sse_read_timeout` replaces them.
+_SSE_HTTP_TIMEOUT_SECONDS = 5.0
+_STREAMABLE_HTTP_TIMEOUT_SECONDS = 30.0
+_HTTP_READ_TIMEOUT_SECONDS = 300.0
+
+
+def _mcp_http_client_factory(config: "MCPConnectionConfig", default_timeout: float):
+    """Build the httpx2 client factory one SSE or Streamable HTTP transport uses.
+
+    The transport passes headers and auth; the timeout, redirect policy and TLS verification come from the
+    connection config so they do not depend on which transport calls the factory. Verified TLS uses httpx2's
+    defaults, which honor ``SSL_CERT_FILE`` (set by ``ssl_bootstrap``). ``ssl_verify=False`` disables
+    verification and, as before, does not follow redirects, so configured headers never follow a redirect
+    to a host whose certificate was not checked.
+    """
+    timeout = httpx2.Timeout(
+        config.timeout or default_timeout,
+        read=config.sse_read_timeout or _HTTP_READ_TIMEOUT_SECONDS,
+    )
+    insecure = config.ssl_verify is False
+
+    def factory(headers=None, auth=None, **_ignored) -> httpx2.AsyncClient:
+        kwargs: dict[str, Any] = {"headers": headers, "auth": auth, "timeout": timeout}
+        if insecure:
+            kwargs.update(verify=False, follow_redirects=False)
+        else:
+            kwargs["follow_redirects"] = True
+        return httpx2.AsyncClient(**kwargs)
+
+    return factory
+
+
+def _request_timeout_seconds(config: "MCPConnectionConfig") -> float | None:
+    """The per-request read timeout from ``session_kwargs``, the only session option Sage passes on.
+
+    The MCP SDK session used to take ``session_kwargs`` verbatim. The client now owns the session, so the one
+    option an operator can express in JSON, ``read_timeout_seconds``, becomes the client's request timeout. Any
+    other key is refused before connect rather than silently dropped.
+    """
+    session_kwargs = dict(config.session_kwargs or {})
+    value = session_kwargs.pop("read_timeout_seconds", None)
+    if session_kwargs:
+        raise ValueError(
+            f"unsupported session_kwargs for MCP server '{config.name}': {', '.join(sorted(map(str, session_kwargs)))}"
+        )
+    if value is None:
+        return None
+    if isinstance(value, timedelta):
+        value = value.total_seconds()
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not value > 0:
+        raise ValueError(f"session_kwargs.read_timeout_seconds for MCP server '{config.name}' must be a positive number")
+    return float(value)
+
+
+def _build_transport(config: "MCPConnectionConfig") -> ClientTransport:
+    """Translate one Sage connection config into the FastMCP transport that carries it."""
+    if config.connection_type == ConnectionType.STDIO:
+        if not config.command:
+            raise ValueError("STDIO connection requires 'command' parameter")
+        encoding = str(config.encoding or "utf-8").replace("_", "-").casefold()
+        if encoding not in {"utf-8", "utf8"}:
+            raise ValueError(f"MCP server '{config.name}': stdio encoding {config.encoding!r} is not supported (UTF-8 only)")
+        # The SDK merges `env` over its safe default environment, exactly as before. keep_alive=False ties the
+        # server process to the client's session, so closing the client ends the process.
+        return StdioTransport(
+            command=config.command,
+            args=list(config.args or []),
+            env=config.env,
+            cwd=config.cwd,
+            keep_alive=False,
+        )
+    if config.connection_type in (ConnectionType.SSE, ConnectionType.STREAMABLE_HTTP):
+        label = "SSE" if config.connection_type == ConnectionType.SSE else "Streamable HTTP"
+        if not config.url:
+            raise ValueError(f"{label} connection requires 'url' parameter")
+        if config.ssl_verify is False:
+            logger.warning(f"SSL verification disabled for MCP server '{config.name}' - NOT recommended for production")
+        if config.connection_type == ConnectionType.SSE:
+            return SSETransport(
+                config.url,
+                headers=config.headers,
+                sse_read_timeout=config.sse_read_timeout or _HTTP_READ_TIMEOUT_SECONDS,
+                httpx_client_factory=_mcp_http_client_factory(config, _SSE_HTTP_TIMEOUT_SECONDS),
+            )
+        if config.terminate_on_close is False:
+            raise ValueError(
+                f"MCP server '{config.name}': terminate_on_close=false is not supported; sessions are always terminated"
+            )
+        return StreamableHttpTransport(
+            config.url,
+            headers=config.headers,
+            httpx_client_factory=_mcp_http_client_factory(config, _STREAMABLE_HTTP_TIMEOUT_SECONDS),
+        )
+    raise ValueError(f"Unsupported connection type: {config.connection_type}")
+
+
+async def _open_client(config: "MCPConnectionConfig") -> tuple[FastMCPClient, ClientTransport]:
+    """Connect and initialize one MCP server; the caller owns the returned client's hold until ``close()``.
+
+    The client advertises no elicitation or sampling capability, as the previous adapter did not.
+    """
+    transport = _build_transport(config)
+    client = FastMCPClient(transport, timeout=_request_timeout_seconds(config))
+    try:
+        await client.__aenter__()
+    except BaseException:
+        with contextlib.suppress(Exception):
+            await client.close()
+        raise
+    return client, transport
+
+
+async def _discover_tools(client: FastMCPClient) -> List[BaseTool]:
+    """List every tool page from the server and convert each tool through ``langchain.mcp``."""
+    remote_tools = await client.list_tools(cache_mode="bypass")
+    return [await as_langchain_tool(tool, client) for tool in remote_tools]
 
 
 def _transport_is_closed(exc: BaseException) -> bool:
     """Return True when an MCP failure proves the underlying transport is already dead."""
     if isinstance(exc, (anyio.ClosedResourceError, anyio.BrokenResourceError, anyio.EndOfStream)):
+        return True
+    # The MCP SDK's own outcome for a request whose connection closed under it (the server process exited, the
+    # HTTP stream ended). Matched on its code and fixed message, so a server's own error with the generic
+    # JSON-RPC code is not mistaken for a dead transport.
+    if isinstance(exc, MCPError) and exc.code == CONNECTION_CLOSED and exc.message == "Connection closed":
         return True
     if isinstance(exc, BaseExceptionGroup):
         return any(_transport_is_closed(nested) for nested in exc.exceptions)
@@ -217,8 +344,10 @@ class MCPServerManager:
     """Manages multiple MCP server connections and their tools"""
     
     def __init__(self):
-        self.sessions: Dict[str, ClientSession] = {}
-        self.connections: Dict[str, Connection] = {}
+        # `sessions` holds each server's connected client and `connections` its transport. Together with `configs`
+        # they are the source identity every wrapped tool checks before an outbound call.
+        self.sessions: Dict[str, FastMCPClient] = {}
+        self.connections: Dict[str, ClientTransport] = {}
         self.tools: Dict[str, List[BaseTool]] = {}
         self.configs: Dict[str, MCPConnectionConfig] = {}
         self._session_contexts: Dict[str, Any] = {}
@@ -480,97 +609,15 @@ class MCPServerManager:
             if config.name in self.sessions:
                 logger.warning(f"Server '{config.name}' already connected. Disconnecting first.")
                 await self._disconnect_server_locked(config.name)
-            
-            # Create connection config as dictionary (TypedDict)
-            connection: Connection
-            
-            if config.connection_type == ConnectionType.STDIO:
-                if not config.command:
-                    raise ValueError("STDIO connection requires 'command' parameter")
-                
-                stdio_connection: StdioConnection = {
-                    "transport": "stdio",
-                    "command": config.command,
-                    "args": config.args or [],
-                    "env": config.env,
-                    "cwd": config.cwd,
-                    "encoding": config.encoding or "utf-8",
-                    "encoding_error_handler": "strict",
-                    "session_kwargs": config.session_kwargs
-                }
-                connection = stdio_connection
-                
-            elif config.connection_type == ConnectionType.SSE:
-                if not config.url:
-                    raise ValueError("SSE connection requires 'url' parameter")
 
-                # Use insecure client if SSL verification is disabled
-                client_factory = None
-                if config.ssl_verify is False:
-                    logger.warning(f"SSL verification disabled for MCP server '{config.name}' - NOT recommended for production")
-                    client_factory = _create_insecure_httpx_client
+            # Connect and initialize. The client stays entered until disconnect closes it.
+            session, connection = await _open_client(config)
 
-                sse_connection: SSEConnection = {
-                    "transport": "sse",
-                    "url": config.url,
-                    "headers": config.headers,
-                    "timeout": config.timeout or 5.0,
-                    "sse_read_timeout": config.sse_read_timeout or 300.0,
-                    "session_kwargs": config.session_kwargs,
-                    "httpx_client_factory": client_factory
-                }
-                connection = sse_connection
-
-            elif config.connection_type == ConnectionType.STREAMABLE_HTTP:
-                if not config.url:
-                    raise ValueError("Streamable HTTP connection requires 'url' parameter")
-
-                # Use insecure client if SSL verification is disabled
-                client_factory = None
-                if config.ssl_verify is False:
-                    logger.warning(f"SSL verification disabled for MCP server '{config.name}' - NOT recommended for production")
-                    client_factory = _create_insecure_httpx_client
-
-                streamable_connection: StreamableHttpConnection = {
-                    "transport": "streamable_http",
-                    "url": config.url,
-                    "headers": config.headers,
-                    "timeout": timedelta(seconds=config.timeout or 30),
-                    "sse_read_timeout": timedelta(seconds=config.sse_read_timeout or 300),
-                    "terminate_on_close": config.terminate_on_close if config.terminate_on_close is not None else True,
-                    "session_kwargs": config.session_kwargs,
-                    "httpx_client_factory": client_factory
-                }
-                connection = streamable_connection
-                
-            else:
-                raise ValueError(f"Unsupported connection type: {config.connection_type}")
-            
-            # Use the create_session context manager
-            session_context = create_session(connection)
-            try:
-                session = await session_context.__aenter__()
-            except BaseException as enter_exc:
-                logger.debug(f"Exception during __aenter__: {type(enter_exc).__name__}: {enter_exc}")
-                raise
-
-            # Initialize the session
-            try:
-                await session.initialize()
-            except BaseException as init_exc:
-                logger.debug(f"Exception during initialize: {type(init_exc).__name__}: {init_exc}")
-                # Try to clean up the session context
-                try:
-                    await session_context.__aexit__(type(init_exc), init_exc, init_exc.__traceback__)
-                except Exception:
-                    pass  # Ignore cleanup errors
-                raise init_exc
-            
             # Store the session and connection info
             self.sessions[config.name] = session
             self.connections[config.name] = connection
             self.configs[config.name] = config
-            self._session_contexts[config.name] = session_context
+            self._session_contexts[config.name] = session
             
             # Load and convert tools
             await self._load_tools_for_server(config.name)
@@ -612,20 +659,14 @@ class MCPServerManager:
         """
         try:
             if server_name in self.sessions:
-                # Try to gracefully exit the session context
-                # Note: This may fail if called from a different task than where it was created
-                # due to anyio's cancel scope restrictions
-                session_context = self._session_contexts.get(server_name)
-                if session_context:
-                    try:
-                        await session_context.__aexit__(None, None, None)
-                    except RuntimeError as e:
-                        if "cancel scope" in str(e).lower() or "different task" in str(e).lower():
-                            # This is expected when disconnecting from a different task
-                            # The session will be cleaned up when garbage collected
-                            logger.warning(f"Could not gracefully close session for '{server_name}' (cross-task context manager). Resources will be cleaned up on garbage collection.")
-                        else:
-                            raise
+                # Closing stops the session and its transport (for stdio, the server process). It is safe from
+                # any task. A failed close still drops the registry entry, so no wrapped tool can reach the
+                # half-closed client: a tool re-enters its client on each call and would otherwise reconnect.
+                client = self.sessions.get(server_name)
+                try:
+                    await client.close()
+                except Exception as e:
+                    logger.warning(f"Could not cleanly close MCP server '{server_name}': {type(e).__name__}: {e}")
 
                 # Clean up stored references regardless of context exit success.
                 self._forget_server(server_name)
@@ -656,8 +697,8 @@ class MCPServerManager:
                 self.tools[server_name] = []
                 return
 
-            # Use the langchain_mcp_adapters function to load and convert tools
-            langchain_tools = await load_mcp_tools(session, connection=connection)
+            # Discover every tool and convert it through langchain.mcp
+            langchain_tools = await _discover_tools(session)
             if (
                 self.configs.get(server_name) is not config
                 or self.sessions.get(server_name) is not session

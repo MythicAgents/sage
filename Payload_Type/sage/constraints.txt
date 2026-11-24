@@ -61,6 +61,23 @@
 # each pinned upstream: dynaconf==3.2.5 and ujson==5.9.0 (mythic-container==0.7.0rc9) and
 # strawberry-graphql==0.320.4 (arize-phoenix 19.19.0; every Phoenix release with the fix needs mcp>=2,
 # which langchain-mcp-adapters forbids). Offline suite: 12493 passed, 0 failed, 6 skipped.
+#
+# Updated 2026-11-24 from a fresh Python 3.14.4 venv installed from requirements-dev.txt with every pin above held
+# except the MCP client and Phoenix families. The MCP client moved from the retired langchain-mcp-adapters to
+# `langchain.mcp` (langchain 1.3.14 -> 1.4.6 with its mcp extra, mcp 1.30.0 -> 2.3.0, fastmcp-slim 3.4.9 -> 4.1.8,
+# plus fastmcp 4.1.8 and mcp-types 2.3.0), which lifts the mcp<2 cap that held Phoenix back. arize-phoenix 19.19.0
+# -> 20.21.0 (client 3.8.0, evals 3.10.0, otel 0.17.3, sqlean 0.2.2) clears both strawberry-graphql advisories
+# (0.320.4 -> 0.327.7). It moved alembic, authlib, fastapi, graphql-core (3.2.14, still <3.3 for gql 4.0.0),
+# jsonpath-ng, langgraph (1.2.10 -> 1.2.22), langchain-protocol, OpenInference (instrumentation 0.1.83, -langchain
+# 0.1.90, -openai 0.1.77, semantic conventions 0.1.47), pydantic-monty 1.0.0, sqlalchemy, sse-starlette and
+# starlette, and added pydantic-monty-client, snowballstemmer and sqlglot. Phoenix 20.21.0 requires anthropic>=1,<2,
+# so anthropic goes 2.13.0 -> 1.17.0 (the newest 1.x; langchain-anthropic 1.7.7 supports 0.x and 1.x). Packages only
+# the old Phoenix or the adapter pulled in are gone (scipy, scikit-learn, joblib, narwhals, keyring and its jaraco
+# and secretstorage helpers, httpx-sse). Phoenix 20.21.0 is the newest release whose graphql-core range the Mythic
+# SDK's gql 4.0.0 allows. langgraph-prebuilt stays at 1.1.0 (checkpoint 4.3.0, checkpoint-sqlite 3.1.1 and sdk 0.4.8
+# with it): prebuilt 1.1.3 lets a later delegated worker see an earlier worker's transcript, and langgraph 1.2.23
+# onward requires it, so langgraph stops at 1.2.22. Two advisories remain, both pinned by
+# mythic-container==0.7.0rc9: dynaconf==3.2.5 and ujson==5.9.0. Offline suite: SUITE_RESULT_PENDING.
 agent-client-protocol==1.0.0
 aio-pika==9.4.1
 aiofile==3.12.3
@@ -70,19 +87,19 @@ aioitertools==0.13.0
 aiormq==6.8.1
 aiosignal==1.4.0
 aiosqlite==0.22.1
-alembic==1.20.0
+alembic==1.20.1
 annotated-doc==0.0.5
 annotated-types==0.8.0
-anthropic==2.13.0
+anthropic==1.17.0
 anyio==4.15.1
-arize-phoenix==19.19.0
-arize-phoenix-client==3.5.0
-arize-phoenix-evals==3.3.0
-arize-phoenix-otel==0.17.1
-arize-phoenix-sqlean==0.2.1
+arize-phoenix==20.21.0
+arize-phoenix-client==3.8.0
+arize-phoenix-evals==3.10.0
+arize-phoenix-otel==0.17.3
+arize-phoenix-sqlean==0.2.2
 asyncio==4.0.0
 attrs==26.1.0
-Authlib==1.9.1
+Authlib==1.9.10
 backoff==2.2.1
 bashkit==0.19.0
 beartype==0.23.1
@@ -94,7 +111,6 @@ certifi==2026.10.19
 cffi==2.1.1
 charset-normalizer==3.5.2
 click==8.5.0
-cloudpickle==3.1.2
 cross-web==0.7.0
 cryptography==50.0.2
 cyclopts==5.2.0
@@ -106,15 +122,16 @@ dynaconf==3.2.5
 email-validator==2.3.0
 exceptiongroup==1.3.1
 execnet==2.1.2
-fastapi==0.149.0
-fastmcp-slim==3.4.9
+fastapi==0.165.0
+fastmcp==4.1.8
+fastmcp-slim==4.1.8
 frozenlist==1.8.0
 genai-prices==0.1.13
 google-auth==2.62.0
 google-genai==2.31.0
 googleapis-common-protos==1.75.5
 gql==4.0.0
-graphql-core==3.2.13
+graphql-core==3.2.14
 greenlet==3.5.6
 griffelib==2.4.0
 groq==0.37.1
@@ -127,39 +144,31 @@ hpack==4.2.0
 httpcore==1.0.9
 httpcore2==2.15.1
 httpx==0.28.1
-httpx-sse==0.4.3
 httpx2==2.15.1
 hyperframe==6.1.0
 idna==3.20
 iniconfig==2.3.1
-jaraco.classes==3.4.0
-jaraco.context==6.1.2
-jaraco.functools==4.6.0
-jeepney==0.9.0
 Jinja2==3.1.6
 jiter==0.17.0
 jmespath==1.1.0
-joblib==1.6.0
 joserfc==1.7.7
 jsonpatch==1.36
-jsonpath-ng==1.11.0
+jsonpath-ng==1.16.0
 jsonpointer==3.4
 jsonref==1.1.0
 jsonschema==4.26.0
 jsonschema-path==0.5.0
 jsonschema-specifications==2025.9.1
-keyring==25.7.0
-langchain==1.3.14
+langchain==1.4.6
 langchain-anthropic==1.7.7
 langchain-aws==1.7.0
 langchain-core==1.6.10
 langchain-groq==1.1.3
-langchain-mcp-adapters==0.3.2
 langchain-ollama==1.1.0
 langchain-openai==1.7.2
-langchain-protocol==0.0.19
+langchain-protocol==0.0.22
 langchain-xai==1.3.0
-langgraph==1.2.10
+langgraph==1.2.22
 langgraph-checkpoint==4.3.0
 langgraph-checkpoint-sqlite==3.1.1
 langgraph-prebuilt==1.1.0
@@ -170,21 +179,20 @@ logfire-api==5.2.0
 Mako==1.4.3
 markdown-it-py==4.2.0
 MarkupSafe==3.0.4
-mcp==1.30.0
+mcp==2.3.0
+mcp-types==2.3.0
 mdurl==0.1.2
-more-itertools==11.2.1
 multidict==6.9.1
 mythic==0.3.0rc8
 mythic_container==0.7.0rc9
-narwhals==2.27.1
 numpy==2.5.4
 ollama==0.6.3
 openai==3.58.0
 openapi-pydantic==0.6.0
-openinference-instrumentation==0.1.71
-openinference-instrumentation-langchain==0.1.70
-openinference-instrumentation-openai==0.1.65
-openinference-semantic-conventions==0.1.41
+openinference-instrumentation==0.1.83
+openinference-instrumentation-langchain==0.1.90
+openinference-instrumentation-openai==0.1.77
+openinference-semantic-conventions==0.1.47
 opentelemetry-api==1.45.2
 opentelemetry-exporter-http-transport==0.66b2
 opentelemetry-exporter-otlp==1.45.2
@@ -218,8 +226,9 @@ pydantic==2.13.4
 pydantic-ai-slim==2.67.0
 pydantic_core==2.46.4
 pydantic-graph==2.67.0
-pydantic-monty==0.0.19
-pydantic-monty-runtime==0.0.19
+pydantic-monty==1.0.0
+pydantic-monty-client==1.0.0
+pydantic-monty-runtime==1.0.0
 pydantic-settings==2.16.0
 Pygments==2.21.0
 PyJWT==2.15.1
@@ -242,18 +251,16 @@ rich==15.0.0
 rich-rst==2.2.0
 rpds-py==2026.9.1
 s3transfer==0.19.3
-scikit-learn==1.9.1
-scipy==1.18.1
-SecretStorage==3.5.0
 six==1.17.0
 sniffio==1.3.1
-SQLAlchemy==2.1.5
+snowballstemmer==3.1.1
+SQLAlchemy==2.1.9
+sqlglot==30.21.0
 sqlite-vec==0.1.9
-sse-starlette==3.5.0
-starlette==1.9.0
-strawberry-graphql==0.320.4
+sse-starlette==3.7.1
+starlette==1.10.0
+strawberry-graphql==0.327.7
 tenacity==9.1.4
-threadpoolctl==3.7.0
 tiktoken==0.14.0
 tqdm==4.70.1
 truststore==0.10.5

@@ -7,10 +7,10 @@ Sage's BloodHound *agent* — the
 orchestration — i.e. the harness value, not the tool.
 
 Connection reuses Sage's config contract (`ai/bloodhound_config.py`): the stdio MCP server started via
-`uv --directory $SAGE_BLOODHOUND_MCP_DIR run main.py`. We connect with `MultiServerMCPClient` in its
-stateless mode — each tool call opens its OWN stdio session (its docstring: "A new session will be
-created for each tool call"), which is loop-safe with the bare runner's asyncio.run-per-call dispatcher
-(a persistent session would be bound to one event loop and break across calls).
+`uv --directory $SAGE_BLOODHOUND_MCP_DIR run main.py`. Tools are converted with `langchain.mcp` over a FastMCP
+stdio transport with `keep_alive=False`, so each tool call opens its OWN server session and ends it when the
+call returns. That is loop-safe with the bare runner's asyncio.run-per-call dispatcher (a kept-alive server
+process is bound to the event loop that started it and breaks across calls).
 
 The MCP directory is supplied explicitly through `SAGE_BLOODHOUND_MCP_DIR`. Discovery returns an empty
 toolset when unavailable so offline callers can inspect the seam; the Gate 1P live runner rejects that
@@ -104,9 +104,21 @@ def _discover_bloodhound_tools() -> list[Any]:
     conns = _connections()
     if conns is None:
         return []
-    from langchain_mcp_adapters.client import MultiServerMCPClient
-    client = MultiServerMCPClient(conns)
-    return list(asyncio.run(client.get_tools(server_name=BLOODHOUND_SERVER)))
+    from fastmcp.client import Client
+    from fastmcp.client.transports import StdioTransport
+    from langchain_core._api import suppress_langchain_beta_warning
+
+    with suppress_langchain_beta_warning():
+        from langchain.mcp import as_langchain_tool
+
+    spec = conns[BLOODHOUND_SERVER]
+    client = Client(StdioTransport(command=spec["command"], args=list(spec["args"]), cwd=spec["cwd"], keep_alive=False))
+
+    async def discover() -> list[Any]:
+        async with client:
+            return [await as_langchain_tool(tool, client) for tool in await client.list_tools()]
+
+    return list(asyncio.run(discover()))
 
 
 def load_bloodhound_mcp_surface() -> tuple[list[dict], dict, Any | None]:

@@ -273,3 +273,38 @@ def test_missing_env_fails_closed_without_checkout_guess(monkeypatch):
 def test_dispatcher_falls_through_for_non_bloodhound_tool():
     # Returns None so a combined dispatcher can route Mythic/unknown tools elsewhere.
     assert bb.make_bloodhound_dispatcher({})({"tool": "issue_command", "args": {}}) is None
+
+
+def test_discovered_tools_answer_from_later_event_loops_through_a_real_server(tmp_path, monkeypatch):
+    """Discovery runs on one event loop; the bare runner then calls each tool under its own asyncio.run."""
+    server = Path(__file__).resolve().parent / "fixtures" / "mcp_servers" / "probe_server.py"
+    log = tmp_path / "calls.log"
+    launcher = tmp_path / "bloodhound-launcher"
+    launcher.write_text(f"#!/bin/sh\nPROBE_LOG='{log}' exec '{sys.executable}' '{server}' stdio bloodhound\n")
+    launcher.chmod(0o755)
+    directory = tmp_path / "bloodhound_mcp"
+    directory.mkdir()
+    monkeypatch.setenv("SAGE_BLOODHOUND_MCP_DIR", str(directory))
+    monkeypatch.setenv("SAGE_BLOODHOUND_MCP_COMMAND", str(launcher))
+
+    specs, registry, upload_tool = bb.load_bloodhound_mcp_surface()
+
+    # Exact shipping names only: cypher_query is withheld, file_upload stays the hidden ingest dependency.
+    assert [spec["function"]["name"] for spec in specs] == ["domain_info"]
+    assert set(registry) == {"domain_info"}
+    assert upload_tool is not None and upload_tool.name == "file_upload"
+    dispatch = bb.make_bloodhound_dispatcher(registry)
+    first = dispatch({"tool": "domain_info", "args": {"info_type": "list"}})
+    second = dispatch({"tool": "domain_info", "args": {"info_type": "list"}})
+    for answer in (first, second):
+        assert not answer.startswith("[bloodhound tool error]"), answer
+        assert "PROBE.LOCAL" in answer
+    ingest = asyncio.run(bb.make_collection_ingestor(upload_tool)("collection.zip", b"PK"))
+    assert ingest == {
+        "upload": {"info_type": "upload_bytes", "data": {"job_id": None, "status_message": "not_found"}},
+        "job_status": None,
+    }
+    entries = [line.split() for line in log.read_text().splitlines()]
+    assert [name for name, _ in entries if name != "start"] == ["domain_info", "domain_info", "file_upload"]
+    # Discovery and each call ran in their own server process, ended when the call returned.
+    assert len([name for name, _ in entries if name == "start"]) == 4

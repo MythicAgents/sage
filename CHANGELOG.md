@@ -23,21 +23,32 @@ between minor releases.
   error code and parameter, because the OpenAI SDK changed how it words its errors. For OpenAI and Anthropic its
   title names LangChain's error class, for example `OpenAIInvalidRequestError` rather than `BadRequestError`.
   Sage's own notices are unchanged.
+- Sage's MCP client moves from the retired `langchain-mcp-adapters` to `langchain.mcp` on MCP 2 and FastMCP, for
+  BloodHound and for servers added with `/mcp connect`. Tools, results and the BloodHound ingest-status read behave
+  as before. HTTP MCP servers now connect through httpx2 with the same TLS trust (`certs/bundle.pem` or
+  `SSL_CERT_FILE`). `/mcp connect` now refuses three settings the new client cannot honor, instead of accepting
+  them: `session_kwargs` other than `read_timeout_seconds`, a stdio `encoding` other than UTF-8, and
+  `terminate_on_close: false`.
+- In supervised mode, the result the agent receives for an action you reject now starts with LangChain's
+  ``User rejected the tool call for `<tool>` with reason:`` before Sage's own message, which is unchanged. Sage
+  still records the action as rejected, not executed, and ends the step. A conversation paused on an approval card
+  before this upgrade still resumes with your latest guidance once.
 
 ### Security
 
-- Three of the six dependency advisories listed under 0.4.0's known issues are cleared. `dnspython` moves from 2.9.0
+- Four of the six dependency advisories listed under 0.4.0's known issues are cleared. `dnspython` moves from 2.9.0
   to 2.9.2 and OpenTelemetry from 1.45.1 to 1.45.2 (instrumentation and semantic conventions to 0.66b2).
   `pydantic-ai-slim`, which Phoenix uses, moves from 2.31.1 to 2.67.0; that needs the newer model SDKs, so `openai`
-  moves from 2.54.0 to 3.58.0, `anthropic` from 0.125.0 to 2.13.0, `langchain-core` from 1.5.3 to 1.6.10,
-  `langchain-openai` from 1.4.2 to 1.7.2 and `langchain-anthropic` from 1.5.4 to 1.7.7. No other dependency changed.
+  moves from 2.54.0 to 3.58.0, `langchain-core` from 1.5.3 to 1.6.10, `langchain-openai` from 1.4.2 to 1.7.2 and
+  `langchain-anthropic` from 1.5.4 to 1.7.7.
+- `strawberry-graphql` moves from 0.320.4 to 0.327.7 through Phoenix 20.21.0 (from 19.19.0), which the new MCP
+  client makes possible. Phoenix 20.21.0 caps `anthropic` below 2, so `anthropic` moves from 0.125.0 to 1.17.0, the
+  newest 1.x release. LangChain moves to 1.4.6 and LangGraph to 1.2.22.
 
 ### Known issues
 
-- **Dependency vulnerabilities.** `pip-audit` reports advisories in three shipped packages, each pinned by another
-  project. `dynaconf` and `ujson` are pinned by `mythic-container`. `strawberry-graphql` is pinned by
-  `arize-phoenix` 19.19.0; every Phoenix release with the fix requires MCP 2, which Sage's MCP adapter
-  (`langchain-mcp-adapters`) does not support.
+- **Dependency vulnerabilities.** `pip-audit` reports advisories in two shipped packages, `dynaconf` and `ujson`,
+  both pinned by `mythic-container`.
 
 ## [0.4.0] - 2026-11-23
 

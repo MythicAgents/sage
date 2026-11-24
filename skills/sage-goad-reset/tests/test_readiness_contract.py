@@ -4,6 +4,8 @@ import asyncio
 import copy
 import importlib.util
 import json
+import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -906,3 +908,27 @@ def test_published_identity_keeps_the_image_evidence(tmp_path):
     assert status["ready"] is True
     assert (status["image"], status["image_id"], status["running_image_id"], status["image_digest"]) == (
         "ghcr.io/x/sage:1", "sha256:a", "sha256:a", "d")
+
+
+def test_bloodhound_mcp_probe_reads_tool_names_from_a_real_server(tmp_path, monkeypatch):
+    """The probe starts the configured launcher, lists its tools over stdio, and the process ends."""
+    server = Path(__file__).resolve().parents[3] / "Payload_Type" / "sage" / "tests" / "fixtures" / "mcp_servers" / "probe_server.py"
+    log = tmp_path / "calls.log"
+    launcher = tmp_path / "bloodhound-launcher"
+    launcher.write_text(f"#!/bin/sh\nPROBE_LOG='{log}' exec '{sys.executable}' '{server}' stdio bloodhound\n")
+    launcher.chmod(0o755)
+    directory = tmp_path / "bloodhound_mcp"
+    directory.mkdir()
+    monkeypatch.setenv("SAGE_BLOODHOUND_MCP_COMMAND", str(launcher))
+
+    status = asyncio.run(MODULE.probe_bloodhound_mcp_tools(directory))
+
+    assert status["ready"] is True, status
+    assert {"file_upload", "domain_info", "cypher_query"} <= set(status["tool_names"])
+    assert status["missing_tools"] == []
+    starts = [int(pid) for name, pid in (line.split() for line in log.read_text().splitlines()) if name == "start"]
+    assert len(starts) == 1
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and Path(f"/proc/{starts[0]}").exists():
+        time.sleep(0.1)
+    assert not Path(f"/proc/{starts[0]}").exists()

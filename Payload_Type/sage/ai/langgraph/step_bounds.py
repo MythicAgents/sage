@@ -47,6 +47,9 @@ RESERVED_RESULT_MARKERS = (
     TASK_OBSERVATIONS_OPEN, STEP_OUTCOME_MARKER, COMPLETED_TASK_MARKER, EXECUTOR_VERDICT_MARKER,
 )
 DENIED_PREFIX = "[DENIED by operator]"
+# From langchain 1.3.17 the approval middleware returns a reject decision's message inside this envelope, as an error
+# result for the rejected call's own tool, instead of returning the message itself.
+_REJECTION_ENVELOPE = "User rejected the tool call for `{tool}` with reason: "
 # Routing results that can appear in a worker's context; they are not work the step did.
 CONTROL_TOOLS = frozenset({"handback_to_supervisor", "summarize_and_handback", "request_continuation",
                            "respond_to_user"})
@@ -222,6 +225,23 @@ def _text(content: Any) -> str:
     return str(content or "")
 
 
+def operator_reason(message: Any) -> str:
+    """A tool result's text as Sage wrote it: the reject message inside the approval middleware's envelope for this
+    result's own tool, or the content itself. Only an error result is unwrapped; a tool's own error is also an error,
+    so the envelope and the tool name are what identify a rejection."""
+    text = _text(getattr(message, "content", "")).lstrip()
+    name = str(getattr(message, "name", "") or "")
+    envelope = _REJECTION_ENVELOPE.format(tool=name)
+    if name and getattr(message, "status", "") == "error" and text.startswith(envelope):
+        return text[len(envelope):]
+    return text
+
+
+def is_operator_denial(message: Any) -> bool:
+    """Whether a tool result is the operator's denial of that call, as Sage's reject message states it."""
+    return operator_reason(message).startswith(DENIED_PREFIX)
+
+
 def is_work_call(name: str) -> bool:
     """Whether a tool call is work the step's call bound counts, rather than routing."""
     return not (name.startswith("transfer_to_") or name in CONTROL_TOOLS)
@@ -239,7 +259,7 @@ def step_activity(messages: Iterable[Any], guarded: frozenset[str]) -> StepActiv
             continue  # a deferred proposal or a routing result, not work this step did
         tool_calls += 1
         if name in guarded:
-            results.append((name, text.startswith(DENIED_PREFIX)))
+            results.append((name, is_operator_denial(message)))
         streak = streak + 1 if getattr(message, "status", "") == "error" else 0
     return StepActivity(tool_calls=tool_calls, guarded=tuple(results), error_streak=streak)
 

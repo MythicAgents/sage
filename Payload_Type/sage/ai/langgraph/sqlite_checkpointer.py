@@ -1,8 +1,11 @@
 """SQLite checkpoint saver for nested HITL resumes.
 
-LangGraph passes accumulated null-task writes back to the saver after each
-resume. Their positional indexes can shift when a special resume write is
-removed, so the SQLite rows must be replaced as one snapshot.
+LangGraph before 1.2.16 passed accumulated null-task writes back to the saver
+after each resume. Their positional indexes can shift when a special resume
+write is removed, so the SQLite rows must be replaced as one snapshot.
+Checkpoints paused under those releases still carry the accumulated writes, so
+this saver stays in place for them; current releases resume correctly through
+either saver.
 """
 
 from collections.abc import Sequence
