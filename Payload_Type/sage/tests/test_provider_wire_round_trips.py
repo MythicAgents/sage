@@ -39,10 +39,16 @@ def _no_environment_proxy(monkeypatch):
 
 
 def _accepted(row: dict, view: str) -> dict:
-    """The frozen view with the differences an operator accepted for this row (each carries its reason)."""
+    """The frozen view, with the differences an operator accepted for this row (each carries its reason) applied
+    only on the versions they were accepted for. Any other versions are held to the frozen view."""
+    from importlib.metadata import version
+
     accepted = row.get("accepted_differences") or {}
-    if accepted:
-        assert accepted["reason"].startswith("Operator decision"), row["id"]
+    if not accepted:
+        return row["expected"][view]
+    assert accepted["reason"].startswith("Operator decision"), row["id"]
+    if {name: version(name) for name in accepted["versions"]} != accepted["versions"]:
+        return row["expected"][view]
     return {**row["expected"][view], **accepted.get(view, {})}
 
 

@@ -89,6 +89,12 @@ def test_no_provider_tool_call_means_the_check_did_not_run():
     ("P5", lambda run, windows, rows: run["phoenix_health"].append(None)),
     ("P5", lambda run, windows, rows: windows.update(S1=[])),
     ("P6", lambda run, windows, rows: run.update(stopped_for_task=True)),
+    # The check itself stopped S1 (timeout or approval-card limit): Mythic records it cancelled.
+    ("P4", lambda run, windows, rows: rows["S1"].update(status="cancelled")),
+    ("P4", lambda run, windows, rows: run.update(requests={"S1": {"timeout": "request timeout"}})),
+    ("P7", lambda run, windows, rows: run.update(requests={"S1": {"timeout": "approval card limit"}})),
+    ("P7", lambda run, windows, rows: run.update(stopped={"request": "C2", "reason": "provider call limit"})),
+    ("P7", lambda run, windows, rows: rows.pop("S1")),
 ])
 def test_each_falsifier_fails_its_criterion(criterion, mutate):
     run, windows, rows = copy.deepcopy(_passing())
@@ -96,6 +102,16 @@ def test_each_falsifier_fails_its_criterion(criterion, mutate):
     result = check.evaluate(run, windows, rows, 41)
     assert result["criteria"][criterion] is False
     assert result["verdict"] == "fail"
+
+
+def test_failed_provider_calls_without_a_tool_call_are_a_failed_attempt_not_a_check_that_did_not_run():
+    run, windows, rows = _passing()
+    for window in windows.values():
+        for span in window:
+            if span["kind"] == "LLM":
+                span.update(produced_calls=[], input_calls=[], consumed_results=[], status="ERROR",
+                            exceptions=["openai.APIConnectionError"])
+    assert check.evaluate(run, windows, rows, 41)["verdict"] == "fail"
 
 
 def test_a_created_task_fails_p6():

@@ -18,7 +18,8 @@ One run file (JSON, owner-only) carries every stage.
   run --run-file F --route-file R --phoenix-db P --plan PLAN --authorized-by TEXT [--phoenix-url U]
       Runs `sage-line check-attempt PLAN` first and refuses on failure. Then, each request terminal before the next:
       Conversation channel: C1 then C2. Supervised channel (Autonomous Solve off): S1, rejecting every approval card.
-      Stops (cancelling the open request) on a target task, a limit or a wrong model. No automatic retry.
+      Within a request the bounds are the channel's max_steps and a per-request timeout, on which the check cancels
+      that request. Between requests it stops on a target task, a limit or a wrong model. No automatic retry.
   verify --run-file F --phoenix-db P
       Applies the pass rules below once, reading Mythic's rows and the live Phoenix spans in place.
 
@@ -32,10 +33,12 @@ Pass rules (frozen with the plan's live check; read once):
   P2 At least one Conversation request has a provider tool call whose id a later provider request in the same
      request consumes as Sage's tool result, and the request completes with a native answer row.
   P3 C2's first LLM span carries a tool call and its tool result whose id C1's spans produced, and ends OK.
-  P4 S1 reaches a native terminal state without a provider or adapter error.
+  P4 S1 reaches a native terminal state (complete or error) by itself, without a provider or adapter error.
   P5 Every request has spans in Phoenix, and Phoenix /healthz answered 200 at every probe.
   P6 Zero Mythic tasks were created across the set.
-If no request made a provider tool call, the check did not run (verdict did_not_run): it is not an attempt.
+  P7 The set ran to its end inside its limits: the check stopped no request (no timeout, no limit, no card limit).
+If no request made a provider tool call and no provider call failed, the check did not run (verdict did_not_run): it
+is not an attempt. A set whose provider calls failed is a failed attempt.
 Observations, not pass criteria: token use, wall time, which tool the model chose and which agent called it, wording,
 approval cards seen and rejected, exception types outside P1's set, SDK retries (not observable client-side).
 """
@@ -71,7 +74,7 @@ MAX_STEPS = 6            # per request; three requests stay inside the provider-
 REQUEST_TIMEOUT = 300
 MAX_CARD_REJECTIONS = 3
 SETTLE_SECONDS = 3       # Sage exports each span synchronously; a short settle before the closing Phoenix mark
-TERMINAL = {"complete", "error", "cancelled"}
+NATIVE_TERMINAL = {"complete", "error"}  # "cancelled" here can only be the check's own stop
 NOTICE_PREFIXES = ("⚠️ **BloodHound is not connected**",)
 TRANSPORT_EXCEPTION = re.compile(
     r"(^|\.)(openai|anthropic|httpx2?|httpcore2?|ssl|langchain_openai|langchain_anthropic)\.|"
@@ -318,10 +321,13 @@ def evaluate(run: dict[str, Any], windows: dict[str, list[dict[str, Any]]], rows
         and str(run.get("container_openai") or "").startswith("3."),
         "P2": bool(p2_requests),
         "P3": bool(carried) and c2_first is not None and c2_first["status"] == "OK" and not c2_first["exceptions"],
-        "P4": rows.get("S1", {}).get("status") in TERMINAL and not s1_transport
+        "P4": rows.get("S1", {}).get("status") in NATIVE_TERMINAL and not s1_transport
+        and not (run.get("requests") or {}).get("S1", {}).get("timeout")
         and not any(text in s1_text for text in ADAPTER_ERROR_TEXT),
         "P5": all(windows.get(name) for name in PROMPTS) and bool(health) and all(code == 200 for code in health),
         "P6": tasks_after == run.get("task_baseline") and not run.get("stopped_for_task"),
+        "P7": not run.get("stopped") and not any(info.get("timeout") for info in (run.get("requests") or {}).values())
+        and set(rows) == set(PROMPTS),
     }
     observations = {
         "provider_calls": len(llm_all),
@@ -333,7 +339,8 @@ def evaluate(run: dict[str, Any], windows: dict[str, list[dict[str, Any]]], rows
         "all_exception_types": sorted({name for span in every for name in span["exceptions"]}),
         "stopped": run.get("stopped"), "sdk_retries": "not observable client-side",
     }
-    if not tool_calls_made:
+    provider_failed = any(span["status"] != "OK" or span["exceptions"] for span in llm_all) or bool(transport)
+    if not tool_calls_made and not provider_failed:
         verdict = "did_not_run"
     else:
         verdict = "pass" if all(criteria.values()) else "fail"
