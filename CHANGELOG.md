@@ -9,6 +9,12 @@ between minor releases.
 
 ### Changed
 
+- A blank **OpenAI API** now always means Chat Completions. It used to leave the choice to LangChain's OpenAI adapter,
+  which picks the Responses API on its own for some models (`-pro` and `codex` models, and from this release
+  `gpt-5.6-sol` and any `gpt-6` model with tools). Those requests carried none of Sage's Responses settings: no
+  `store: false`, no encrypted reasoning and no Daybreak program. Responses is now used only when you select it. A
+  model that needs Responses and has the setting blank is rejected by the provider, and Sage's notice names the
+  setting to change.
 - The OpenAI and Anthropic SDKs now connect to providers through httpx2. Provider TLS trust is unchanged when
   Sage's `certs/bundle.pem` or `SSL_CERT_FILE` is set. With neither, the default provider connection trusts the
   operating system's certificate store instead of the `certifi` bundle.

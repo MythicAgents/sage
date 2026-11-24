@@ -9860,7 +9860,8 @@ class Model:
                 model_kwargs["max_tokens"] = eval_max_output_tokens
             if eval_temperature is not None:
                 model_kwargs["temperature"] = eval_temperature
-            model_kwargs.update(openai_api.adapter_options(openai_route))
+            if self.provider.lower() == "openai":  # the route's options are ChatOpenAI's (as in sage_chat/config.py)
+                model_kwargs.update(openai_api.adapter_options(openai_route))
             if ledger is not None or retry_policy is not None:
                 sync_transport: httpx.BaseTransport = (
                     resource_http.MeteredHTTPTransport("provider", ledger=ledger, allow_non2xx=retry_policy is not None)

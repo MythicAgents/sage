@@ -31,7 +31,8 @@ def _model(provider, configurable):
         (
             "openai",
             {"api_key": "openai-key", "base_url": "http://openai.test/v1"},
-            {"api_key": "openai-key", "base_url": "http://openai.test/v1"},
+            # A blank OpenAI API pins Chat Completions (operator decision 2026-11-24): the adapter never chooses Responses.
+            {"api_key": "openai-key", "base_url": "http://openai.test/v1", "use_responses_api": False},
         ),
     ],
 )
@@ -92,6 +93,7 @@ def test_eval_max_output_tokens_is_applied_to_shipping_model(monkeypatch):
         "model_provider": "openai",
         "model": "test-model",
         "max_tokens": 8192,
+        "use_responses_api": False,  # blank OpenAI API pins Chat Completions (operator decision 2026-11-24)
     }]
 
 
@@ -114,7 +116,9 @@ def test_explicit_openai_reasoning_effort_reaches_model_constructor(monkeypatch,
     monkeypatch.setattr(model_module, "_patch_model_for_bedrock", lambda llm: llm)
 
     assert isinstance(_model("openai", {"reasoning_effort": effort})._get_base_chat_model(), _FakeLLM)
-    assert calls == [{"model_provider": "openai", "model": "test-model", "reasoning_effort": effort}]
+    # A blank OpenAI API pins Chat Completions (operator decision 2026-11-24): the adapter never chooses Responses.
+    assert calls == [{"model_provider": "openai", "model": "test-model", "reasoning_effort": effort,
+                      "use_responses_api": False}]
 
 
 @pytest.mark.parametrize("provider", ["anthropic", "bedrock", "ollama"])

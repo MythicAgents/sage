@@ -601,7 +601,7 @@ Model settings resolve through the chain above. The main settings are:
 | `autonomous_solve` | Enable objective-led controller execution; supervised mode still requires approval for each guarded action. Ignored in conversation mode, which stays read-only |
 | `policy_mode` | `hybrid` (default), `symbolic`, or `llm` capability selection |
 | `max_steps` | Model-step ceiling per chat request; unset defaults to `200`, `0` means unlimited |
-| `SAGE_OPENAI_API` | **OpenAI API**: blank keeps the adapter's usual route; `chat_completions` or `responses` selects one (OpenAI provider only) |
+| `SAGE_OPENAI_API` | **OpenAI API**: blank means Chat Completions; `chat_completions` or `responses` selects one (OpenAI provider only) |
 | `SAGE_OPENAI_ACCESS_PROGRAM` | **OpenAI Daybreak**: `standard` (Off), `daybreak_blue` or `daybreak_red`. Any value, Off included, requires `SAGE_OPENAI_API=responses`; blank sends Off on Responses |
 | `SAGE_OPENAI_SAFETY_IDENTIFIER` | **OpenAI Safety Identifier**: a stable pseudonym for the person using the chat, sent as `safety_identifier` |
 | `SAGE_REASONING_EFFORT` | **Reasoning Effort**: blank sends no effort (the provider's default for the model); `none`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max` is sent as chosen (OpenAI provider only) |

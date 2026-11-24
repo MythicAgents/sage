@@ -5,8 +5,11 @@ Both model factories (the ordinary ``Model._get_base_chat_model`` and the profil
 mean one request shape in a chat and another elsewhere.
 
 Semantics:
-- API unset keeps the adapter's own route (Chat Completions for ordinary model names), with no new request
-  fields, so existing OpenAI and OpenAI-compatible proxy configurations send exactly what they sent before.
+- API unset means Chat Completions, with no new request fields, so existing OpenAI and OpenAI-compatible proxy
+  configurations send what they sent before. The adapter is never left to choose: langchain-openai picks the
+  Responses API on its own for some model names (``-pro`` and ``codex`` models, ``gpt-5.6-sol``, and ``gpt-6*``
+  whenever tools are bound), and such a request would carry none of Sage's Responses settings below. Responses is
+  only ever the operator's selection.
 - ``chat_completions`` pins Chat Completions; ``responses`` selects the Responses API, stateless (``store=False``)
   with encrypted reasoning returned so it can be replayed with the history Sage already keeps.
 - On Responses, Sage always names the access program. Unset means **Off** (``standard``): Sage never inherits a
@@ -28,7 +31,7 @@ SAFETY_IDENTIFIER_ENV = "SAGE_OPENAI_SAFETY_IDENTIFIER"
 CHAT_COMPLETIONS = "chat_completions"
 RESPONSES = "responses"
 API_VALUES = (CHAT_COMPLETIONS, RESPONSES)
-API_LABELS = {"": "adapter default", CHAT_COMPLETIONS: "Chat Completions", RESPONSES: "Responses"}
+API_LABELS = {"": "Chat Completions (default)", CHAT_COMPLETIONS: "Chat Completions", RESPONSES: "Responses"}
 
 STANDARD = "standard"
 ACCESS_PROGRAM_VALUES = (STANDARD, "daybreak_blue", "daybreak_red")
@@ -90,10 +93,10 @@ def validate_route(
 
 
 def adapter_options(route: OpenAIRoute) -> dict[str, Any]:
-    """``ChatOpenAI`` keyword arguments for a validated route; empty for an unconfigured route."""
+    """``ChatOpenAI`` keyword arguments for a validated route. Every route pins the API: unset is Chat Completions."""
     options: dict[str, Any] = {}
     extra_body: dict[str, Any] = {}
-    if route.api == CHAT_COMPLETIONS:
+    if route.api in ("", CHAT_COMPLETIONS):
         options["use_responses_api"] = False
     elif route.api == RESPONSES:
         options.update(

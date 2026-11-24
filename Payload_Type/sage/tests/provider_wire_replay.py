@@ -85,8 +85,10 @@ def _library_for(client: Any):
     return httpx2 if isinstance(client, httpx2.Client | httpx2.AsyncClient) else httpx
 
 
-def build_model(row: dict, path: str, *, body: bytes | None = None, status: int | None = None):
-    """``(llm, sync_client, requests)`` for one row on one client path; ``requests`` records each request path."""
+def build_model(row: dict, path: str, *, body: bytes | None = None, status: int | None = None,
+                sent: list[dict] | None = None):
+    """``(llm, sync_client, requests)`` for one row on one client path; ``requests`` records each request path and
+    ``sent``, when given, each request's JSON body."""
     if path not in PATHS:
         raise ValueError(path)
     payload = body if body is not None else json.dumps(row["body"]).encode()
@@ -96,6 +98,8 @@ def build_model(row: dict, path: str, *, body: bytes | None = None, status: int 
     def handler(library) -> Callable[[Any], Any]:
         def answer(request):
             requests.append(request.url.path)
+            if sent is not None:
+                sent.append(json.loads(request.content))
             return library.Response(code, content=payload, headers={"content-type": "application/json"})
         return answer
 

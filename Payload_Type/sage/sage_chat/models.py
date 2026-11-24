@@ -84,9 +84,8 @@ _CONFIG_OPTIONS = [
         Type=OptType.Choice,
         Description=(
             "Which OpenAI API this chat calls; applies to the OpenAI provider. Use configured default falls back "
-            "to the SAGE_OPENAI_API user secret, then the container environment; with neither, the adapter keeps "
-            "its usual route (Chat Completions for most models). OpenAI's -cyber models (GPT-5.6 Cyber and later) "
-            "need Responses."
+            "to the SAGE_OPENAI_API user secret, then the container environment; with neither, Sage uses Chat "
+            "Completions. OpenAI's -cyber models (GPT-5.6 Cyber and later) need Responses."
         ),
         Required=False,
         DefaultValue="",
