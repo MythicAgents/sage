@@ -611,7 +611,7 @@ Model settings resolve through the chain above. The main settings are:
 | `policy_mode` | `hybrid` (default), `symbolic`, or `llm` capability selection |
 | `max_steps` | Model-step ceiling per chat request; unset defaults to `200`, `0` means unlimited |
 | `SAGE_OPENAI_API` | **OpenAI API**: blank keeps the adapter's usual route; `chat_completions` or `responses` selects one (OpenAI provider only) |
-| `SAGE_OPENAI_ACCESS_PROGRAM` | **OpenAI Daybreak**: `standard` (Off), `daybreak_blue` or `daybreak_red`; Responses only, and blank sends Off |
+| `SAGE_OPENAI_ACCESS_PROGRAM` | **OpenAI Daybreak**: `standard` (Off), `daybreak_blue` or `daybreak_red`. Any value, Off included, requires `SAGE_OPENAI_API=responses`; blank sends Off on Responses |
 | `SAGE_OPENAI_SAFETY_IDENTIFIER` | **OpenAI Safety Identifier**: a stable pseudonym for the person using the chat, sent as `safety_identifier` |
 | `SAGE_REASONING_EFFORT` | **Reasoning Effort**: blank sends no effort (the provider's default for the model); `none`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max` is sent as chosen (OpenAI provider only) |
 
@@ -638,9 +638,11 @@ allowlisted sending IP; ZDR projects also need Private Safety Processing. An **O
 optional for every model; OpenAI [recommends
 one](https://developers.openai.com/api/docs/guides/safety-best-practices#implement-safety-identifiers) so it can act
 on a single user instead of the whole organization. Sage never derives one from a Mythic username; use the same
-pseudonym for the same person. Invalid combinations (Daybreak without Responses, any of these with a non-OpenAI
-provider) fail before any request. When the provider rejects a route (for example a Responses-only model on Chat
-Completions, or a Daybreak access error), the error names the setting to change and says whether the chat continues.
+pseudonym for the same person. Invalid combinations fail before any request: any **OpenAI Daybreak** value, Off
+included, without **OpenAI API = Responses** (wherever the value comes from: the chat, a user secret or the
+environment), or any of these settings with a non-OpenAI provider. When the provider rejects a route (for example
+a Responses-only model on Chat Completions, or a Daybreak access error), the error names the setting to change and
+says whether the chat continues.
 Changing **Model** (or running `/model <name>`), **OpenAI API**, **OpenAI Daybreak**, **OpenAI Safety Identifier** or
 **Reasoning Effort** continues the same chat with its conversation, and a fix made in the OpenAI project without
 changing Sage's settings is retried in the same chat. Changing the API key, provider or API endpoint starts a new

@@ -19,6 +19,7 @@ import openai
 import pytest
 
 from ai.langgraph import model as model_module
+from ai.openai_api import validate_route
 from ai.langgraph.operator_error import (
     provider_configuration_notice,
     provider_configuration_rejection,
@@ -139,6 +140,16 @@ def test_native_controls_follow_provider_and_model_with_specified_choices():
     daybreak_help = f"{daybreak.Description} {daybreak.HelpText}"
     assert "Off" in daybreak_help and "standard safeguards" in daybreak_help
     assert "Responses" in daybreak_help
+    # Mythic shows only the Description. It must state the validator's rule: every explicit Daybreak choice,
+    # Off included, is refused without OpenAI API = Responses (blank stays valid on any API).
+    assert "Off included" in daybreak.Description and "requires OpenAI API = Responses" in daybreak.Description
+    for choice in daybreak.Choices:
+        for api in ("", "chat_completions"):
+            if choice.Value:
+                with pytest.raises(ValueError, match="requires OpenAI API = Responses"):
+                    validate_route(provider="openai", model="m", api=api, access_program=choice.Value)
+            else:
+                validate_route(provider="openai", model="m", api=api, access_program=choice.Value)
     assert "pseudonym" in f"{identifier.Description} {identifier.HelpText}"
 
     sage = next(model for model in chat_models.SAGE_MODELS if model.Name == "Sage")

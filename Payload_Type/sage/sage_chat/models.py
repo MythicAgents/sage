@@ -108,9 +108,10 @@ _CONFIG_OPTIONS = [
         Description=(
             "OpenAI Daybreak access program for Responses requests; applies to the OpenAI provider. Off "
             "explicitly requests standard safeguards. Use configured default falls back to the "
-            "SAGE_OPENAI_ACCESS_PROGRAM user secret, then the container environment; with neither, Sage sends "
-            "Off, never a project's own default program. Blue or Red requires OpenAI API = Responses and an "
-            "approved project; OpenAI's -cyber models use Red. Learn more: https://developers.openai.com/api/docs/guides/daybreak"
+            "SAGE_OPENAI_ACCESS_PROGRAM user secret, then the container environment; with neither, a Responses "
+            "request carries Off, never a project's own default program. Any value, Off included, whether chosen "
+            "here or inherited from the user secret or environment, requires OpenAI API = Responses. Blue or Red "
+            "also needs an approved project; OpenAI's -cyber models use Red. Learn more: https://developers.openai.com/api/docs/guides/daybreak"
         ),
         Required=False,
         DefaultValue="",
@@ -122,7 +123,8 @@ _CONFIG_OPTIONS = [
         ],
         HelpText=(
             "Resolution order: this field → the SAGE_OPENAI_ACCESS_PROGRAM user secret → the container "
-            "environment → Off (standard safeguards). Not sent on Chat Completions."
+            "environment → Off (standard safeguards) on Responses. A value from any of these layers, Off included, "
+            "requires OpenAI API = Responses; with none, nothing is sent on Chat Completions."
         ),
     ),
     ChatModelConfigurationOption(
@@ -432,6 +434,7 @@ SAGE_MODELS = [
                 "SAGE_OPENAI_API",
                 "SAGE_OPENAI_ACCESS_PROGRAM",
                 "SAGE_OPENAI_SAFETY_IDENTIFIER",
+                "SAGE_REASONING_EFFORT",
                 "AWS_ACCESS_KEY_ID",
                 "AWS_SECRET_ACCESS_KEY",
                 "AWS_SESSION_TOKEN",
