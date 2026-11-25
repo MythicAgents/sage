@@ -152,6 +152,25 @@ async def _graph_heartbeat(interval: int | None = None):
             await pump
         except (asyncio.CancelledError, Exception):
             pass
+
+
+def _issuer_control_exceptions() -> tuple[type[BaseException], ...]:
+    """The control exceptions the task issuer re-raises before its broad handlers.
+
+    These carry control authority (an interrupt, a parent-graph command, the operator stop), not a task failure, so
+    the issuer must never turn one into a task error or count it toward the failure breaker. The one list is
+    `model._COLLECTION_CONTROL_EXCEPTIONS`, the set the collector already re-raises. `model` imports this module at
+    load, so the list is read here at call time, when every process running a Sage graph has finished importing
+    `model`. Where `model` cannot be imported (this module loaded top-level by an operator script), none of its
+    control classes can exist; the empty tuple then matches nothing and every handler behaves as before.
+    """
+    try:
+        from . import model
+    except Exception:
+        return ()
+    return getattr(model, "_COLLECTION_CONTROL_EXCEPTIONS", ())
+
+
 _task_visibility_context: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "sage_mythic_task_visibility_context",
     default=None,
@@ -6828,6 +6847,8 @@ class MythicTools:
         # ("No mimikatz command given"); coerce it into the proven {domain, user:NETBIOS\\acct, dc} dict.
         try:
             parameters = await self._coerce_native_dcsync_to_working_form(command, parameters)
+        except _issuer_control_exceptions():
+            raise
         except Exception:
             pass  # fail-open
         try:
@@ -6836,6 +6857,8 @@ class MythicTools:
             pass  # fail-open: never block the issue path on SharpHound argument normalization
         try:
             _hook_result = await self._engagement_issue_hook(command, parameters, callback_display_id)
+        except _issuer_control_exceptions():
+            raise
         except Exception:
             _hook_result = None  # fail-open: any hook error => proceed normally
         if _hook_result is not None:
@@ -6888,6 +6911,8 @@ class MythicTools:
         try:
             command, parameters = self._rewrite_shell_like_run(command, parameters)
             parameters = await self._coerce_shell_parameters_from_schema(command, parameters, callback_display_id)
+        except _issuer_control_exceptions():
+            raise
         except Exception:
             pass
         try:
@@ -6897,6 +6922,8 @@ class MythicTools:
                 return self._missing_live_command_message(command, live_command.get("payload_type"), callback_display_id)
             if live_command.get("status") == "available" and live_command.get("command"):
                 command = live_command["command"]
+        except _issuer_control_exceptions():
+            raise
         except Exception:
             pass
         executable_binding = None
@@ -7003,6 +7030,8 @@ class MythicTools:
                             return self._note_effect_denial(
                                 "STOP — registered file identity changed after approval"
                             )
+            except _issuer_control_exceptions():
+                raise
             except Exception as exc:
                 return self._note_effect_denial(
                     f"STOP — prepared task binding could not be revalidated: {type(exc).__name__}"
@@ -7013,6 +7042,8 @@ class MythicTools:
                 parameters,
                 callback_display_id,
             )
+        except _issuer_control_exceptions():
+            raise
         except Exception as e:
             registered_file_blocker = (
                 f"{_REGISTERED_FILE_PREFLIGHT_PREFIX} could not verify registered-file prerequisites "
@@ -7114,6 +7145,8 @@ class MythicTools:
                                 resolved.repair,
                             )
                         return resolved.repair or f"Invalid parameters for command '{command}'."
+            except _issuer_control_exceptions():
+                raise
             except Exception as e:
                 try:
                     logger.info(f"🛡️ ARGRES failed_open command={command} reason=exception:{e}")
@@ -7274,6 +7307,8 @@ class MythicTools:
                     if isinstance(parameters, str) and not parameters.strip():
                         try:
                             _schema = await self._fetch_command_schema(command, callback_display_id)
+                        except _issuer_control_exceptions():
+                            raise
                         except Exception:
                             _schema = None
                         if isinstance(_schema, list) and _schema:
@@ -7312,6 +7347,8 @@ class MythicTools:
                                 schema=param_schema, file_identity=issue_inline_file,
                             ),
                         )  # token_id=token_id
+                    except _issuer_control_exceptions():
+                        raise
                     except Exception as exc:
                         if not self._is_mythic_credential_reference_rejection(exc):
                             raise
@@ -7742,6 +7779,8 @@ class MythicTools:
             except Exception:
                 pass  # fail-open: a downgrade must never break the issue path
             return results_str
+        except _issuer_control_exceptions():
+            raise
         except Exception as e:
             issuance_receipt = _task_issuance_receipt_context.get()
             issued_task_id = (
