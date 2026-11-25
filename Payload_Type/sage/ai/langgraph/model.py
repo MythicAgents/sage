@@ -15991,6 +15991,11 @@ class Model:
             progress["phase"] = stage
             receipt: dict[str, Any] = {}
             receipt_token = _mt._task_issuance_receipt_context.set(receipt)
+            # The listing loop below is a wait this collector owns (four listings, then `no_collection_artifact`),
+            # so only its listings take the issuer's private bounded-poll exception from the repeat guard.
+            visibility_token = _mt._task_visibility_context.set(
+                {**(_mt._task_visibility_context.get() or {}), "bounded_delayed_proof_poll": True}
+            ) if stage == "listing" else None
             try:
                 output = await self.mythic_client.issue_task_and_waitfor_task_output(
                     command, parameters, cb_int,
@@ -16001,6 +16006,8 @@ class Model:
                 stage_status = "task_failed" if receipt.get("task_id") else "task_issue_failed"
                 return None, outcome(False, stage_status, f"{stage}: {type(exc).__name__}: {exc}")
             finally:
+                if visibility_token is not None:
+                    _mt._task_visibility_context.reset(visibility_token)
                 _mt._task_issuance_receipt_context.reset(receipt_token)
             stage_status, detail = _mt._collection_task_receipt_failure(
                 receipt, cb_int, command, retrieval=retrieval,

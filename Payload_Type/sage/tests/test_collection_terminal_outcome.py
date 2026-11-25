@@ -18,13 +18,15 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.errors import GraphInterrupt
 
 from ai.langgraph import command_builder, model, mythic_tools as mt
-from ai.langgraph.turn_authority import compile_turn_authority
+from ai.langgraph.request_contract import action_spec_from_tool_call, build_request_contract
+from ai.langgraph.turn_authority import authority_from_request_contract, compile_turn_authority
 from tests.test_collection_capability import (
     ACTION, APPROVED_STEPS, _approve, _graph_hops, _real_recorder, _reloaded, _run, _streamed,
 )
 from tests.test_private_collection_transaction import (  # noqa: F401  (fixture)
     _collect, _install_apollo_alias_schema, collection,
 )
+from tests.test_request_contract import _approval_claim_for
 from tests.test_turn_authority import (
     _install_collection_issue_test_path, _load_turn_authority, _resolve_collection_authority,
 )
@@ -192,12 +194,14 @@ def test_the_eligibility_reads_only_the_bound_assembly_and_the_raw_final_record(
 
 
 def _artifact_fault(case, monkeypatch, fault):
-    if fault == "stale_zip":  # an unchanged listing: the existing loop guard refuses the fourth identical `ls`
+    if fault == "stale_zip":  # an unchanged listing holding another run's ZIP: all four listings run
         return {"ls": json.dumps({"files": [{"name": "20261003120000_bloodhound_0000000000000000.zip",
                                              "full_name": "C:\\Users\\Public\\20261003120000_bloodhound_0000000000000000.zip",
                                              "is_file": True}]})}
     if fault == "no_zip":  # a changing listing that never shows this run's ZIP: the four-listing bound holds
         return {"ls": lambda task_id: json.dumps({"files": [{"name": f"report{task_id}.txt", "is_file": True}]})}
+    if fault == "empty_dir":  # an unchanged empty listing
+        return {"ls": NO_FILES}
     original = case.client._latest_download_for_callback
     if fault == "no_filemeta":
         monkeypatch.setattr(case.client, "_latest_download_for_callback", AsyncMock(return_value=None))
@@ -223,7 +227,10 @@ def _artifact_fault(case, monkeypatch, fault):
 
 @pytest.mark.parametrize("fault, status, verdict, phase", [
     ("no_zip", "no_collection_artifact", "failed", "listing"),
-    ("stale_zip", "task_issue_failed", "failed", "listing"),
+    # Changed expectation: this row pinned the defect where the unproductive-repeat guard cut the collector's
+    # four-listing bound at three (`task_issue_failed`); the collector owns that bounded wait and its expiry outcome.
+    ("stale_zip", "no_collection_artifact", "failed", "listing"),
+    ("empty_dir", "no_collection_artifact", "failed", "listing"),
     ("no_filemeta", "no_fresh_collection", "failed", "artifact"),
     ("unbound_filename", "artifact_blocked", "blocked", "artifact"),
     ("other_callback", "blocked", "blocked", "ingest"),
@@ -237,19 +244,157 @@ def test_missing_or_unbound_artifacts_and_unfinished_ingest_never_record_an_achi
 ):
     case = collection
     _real_recorder(case, monkeypatch, tmp_path)
+    streamed = _streamed(case)
     _mythic(case, monkeypatch, outputs=_artifact_fault(case, monkeypatch, fault))
     _approve(case, ACTION)
 
     result = _run(case, ACTION)
 
-    listings = {"no_zip": 4, "stale_zip": 3}.get(fault, 1)
-    commands = [*RUNNER_STEPS, *["ls"] * listings] if phase == "listing" else APPROVED_STEPS
-    _assert_terminal(case, result, verdict, phase, commands)
+    commands = [*RUNNER_STEPS, *["ls"] * 4] if phase == "listing" else APPROVED_STEPS
+    report = _assert_terminal(case, result, verdict, phase, commands)
+    if phase == "listing":  # the collector's own bounded wait ends in its expiry outcome, never the loop guard
+        assert result["reason"] == "SharpHound produced no collection ZIP carrying this run's token"
+        assert "trajectory_repair" not in result
+        text = "\n".join([json.dumps(result), report, *streamed])
+        assert "unproductive" not in text.casefold() and "[SAGE LOOP-GUARD]" not in text
     assert (result["ok"], result["status"]) == (False, status), result
     assert result["collector_diagnostics"]["task_id"] == 3
     assert result["recorded_effects"] == [] and _graph_hops(_reloaded(case)[0]) == []
     if verdict == "partial":
         assert result["bloodhound_job_id"] == 41 and case.ingest_tool.uploads == 1
+
+
+def _context_at_issue(monkeypatch):
+    """Record, at the Mythic boundary, the ambient visibility context each task is created under."""
+    issue, seen = mt.mythic.issue_task, []
+
+    async def observed(**kwargs):
+        seen.append((kwargs["command_name"], dict(mt._task_visibility_context.get() or {})))
+        return await issue(**kwargs)
+
+    monkeypatch.setattr(mt.mythic, "issue_task", observed)
+    return seen
+
+
+def test_three_unchanged_listings_then_this_runs_zip_at_the_fourth_is_retrieved_once(collection, monkeypatch,
+                                                                                       tmp_path):
+    case = collection
+    _real_recorder(case, monkeypatch, tmp_path)
+    seen = _context_at_issue(monkeypatch)
+    stale = _artifact_fault(case, monkeypatch, "stale_zip")["ls"]
+    # Tasks 4-6 list the stale directory; task 7 (the fourth listing) falls through to the fixture's token ZIP.
+    _mythic(case, monkeypatch, outputs={"ls": lambda task_id: stale if task_id < 7 else None})
+    case.ingest_tool.statuses = [(2, "Complete")]
+    _approve(case, ACTION)
+
+    result = _run(case, ACTION)
+
+    commands = [*RUNNER_STEPS, *["ls"] * 4, "download"]
+    _assert_terminal(case, result, "achieved", "ingest", commands)
+    assert (result["ok"], result["status"], len(result["recorded_effects"])) == (True, "ingested", 1), result
+    hops = _graph_hops(_reloaded(case)[0])
+    assert len(hops) == 1 and hops[0].status == "achieved" and hops[0].proof_envelope["task_id"] == "8"
+    # The private exception is present only for the collector's own listings, beside the collection's provenance.
+    assert [(command, context.get("bounded_delayed_proof_poll") is True) for command, context in seen] == [
+        (command, command == "ls") for command in commands]
+    assert all(context["capability"] == "collect-graph" for _command, context in seen)
+    assert mt._task_visibility_context.get() is None
+
+
+def test_collector_listings_leave_the_guard_to_judge_other_repeats_and_the_envelope_still_bounds_them(
+    collection, monkeypatch,
+):
+    case = collection
+    client, ls_args = case.client, {"path": mt.SHARPHOUND_CANONICAL_OUTPUT_DIRECTORY}
+    _mythic(case, monkeypatch, outputs=_artifact_fault(case, monkeypatch, "stale_zip"))
+    _approve(case, ACTION)
+    result = _run(case, ACTION)
+    assert (result["status"], _commands(case)) == ("no_collection_artifact", [*RUNNER_STEPS, *["ls"] * 4]), result
+    # The collector's listings were neither counted nor flagged: the runner's diagnostic (non-success) output ended
+    # the streak, and the four identical listings did not start a new one.
+    assert client._unproductive_tripped == set() and client._last_action_sig is None
+
+    async def issue(context, timeout=300, **kwargs):
+        token = mt._task_visibility_context.set(context)
+        try:
+            return await client.issue_task_and_waitfor_task_output("ls", ls_args, 7, timeout=timeout, **kwargs)
+        finally:
+            mt._task_visibility_context.reset(token)
+
+    # A fifth listing under the collector's own exception is refused by the transaction envelope; no task.
+    fifth = asyncio.run(issue({"capability": "collect-graph", "bounded_delayed_proof_poll": True}))
+    assert fifth.startswith("STOP") and len(case.tasks) == 7, fifth
+    assert client._private_collection_transaction.reserve_child(
+        command="ls", parameters=ls_args, callback_display_id=7, token_id=None, timeout=300,
+        visibility_context={"capability": "collect-graph"},
+    ) == "collection child exceeded the bounded listing envelope"
+    # The model's own identical `ls`, each under its own supervised request and Accept (the guard is per client),
+    # trips the guard at the third, and the fourth is refused before a task.
+    root = {"name": "issue_task_and_waitfor_task_output",
+            "args": {"command": "ls", "parameters": ls_args, "callback_display_id": 7}}
+    outputs = []
+    for number in range(1, 5):
+        contract = build_request_contract(
+            request_id=f"request-model-ls-{number}", channel_id="channel-test", operation_id="operation-test",
+            mode="supervised", autonomous_solve=False, requested_actions=(action_spec_from_tool_call(root),))
+        client.set_request_contract(contract)
+        client.set_turn_authority(authority_from_request_contract(contract))
+        client.set_approval_claim(_approval_claim_for(contract, [root]))
+        outputs.append(asyncio.run(issue(None, timeout=None)))
+    assert ["[SAGE LOOP-GUARD]" in output for output in outputs[:3]] == [False, False, True], outputs
+    assert "already flagged as an unproductive loop" in outputs[3] and len(case.tasks) == 10, outputs[3]
+
+
+@pytest.mark.parametrize("control", [RuntimeError("subscription closed"), asyncio.CancelledError()],
+                         ids=["error", "cancel"])
+def test_the_listing_exception_is_removed_after_an_error_or_a_cancellation(collection, monkeypatch, control):
+    case = collection
+    seen = _context_at_issue(monkeypatch)
+    _mythic(case, monkeypatch, outputs={"ls": control})
+    ambient = {"capability": "collect-graph", "purpose": "controller collection"}
+
+    async def exercise():
+        token = mt._task_visibility_context.set(ambient)
+        try:
+            try:
+                result = await case.owner._controller_collect(case.state, request=case.request)
+            except asyncio.CancelledError:
+                result = None
+            return result, mt._task_visibility_context.get()
+        finally:
+            mt._task_visibility_context.reset(token)
+
+    result, after = asyncio.run(exercise())
+    assert after is ambient
+    assert seen[-1] == ("ls", {**ambient, "bounded_delayed_proof_poll": True}), seen
+    assert (result is None) is isinstance(control, asyncio.CancelledError)
+    if result is not None:
+        assert (result["ok"], result["phase"]) == (False, "listing"), result
+
+
+def test_the_controller_spends_its_collection_retry_budget_on_an_unchanged_listing(collection, monkeypatch):
+    from ai.langgraph import autonomous_controller as ac
+
+    case = collection
+    _mythic(case, monkeypatch, outputs=_artifact_fault(case, monkeypatch, "stale_zip"))
+    attempts = []
+
+    async def collect(_observed):  # each controller collection consumes its own Accept: a fresh claim per attempt
+        case.client.set_approval_claim({**case.claim, "approval_id": f"approved-collection-{len(attempts) + 1}"})
+        attempts.append(await _collect(case))
+        return attempts[-1]
+
+    controller = ac.AutonomousController(
+        observe=lambda: case.state, execute=lambda _action: {"ok": True}, frontier_fn=lambda _state: [],
+        needs_collection=lambda _state: {"collection_key": case.request.collection_key}, collect=collect,
+        config=ac.ControllerConfig(max_collection_attempts_per_request=2),  # Sage's own setting
+    )
+    result = asyncio.run(controller.run())
+
+    assert (result.status, result.reason) == (ac.STATUS_BLOCKED, "collection retry budget exhausted for one request")
+    assert result.blocker["reason"] == "baseline: no_collection_artifact" and "trajectory_repair" not in result.blocker
+    assert [attempt["status"] for attempt in attempts] == ["no_collection_artifact"] * 2
+    assert _commands(case) == [*RUNNER_STEPS, *["ls"] * 4] * 2
 
 
 @pytest.mark.parametrize("fault, verdict, phase, commands", [

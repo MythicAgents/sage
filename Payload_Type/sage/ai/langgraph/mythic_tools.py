@@ -7223,8 +7223,9 @@ class MythicTools:
         # not been cleared by intervening progress. Refuse to re-issue it (the failure breaker can't, because
         # the command SUCCEEDS) so a post-success loop (e.g. `shell klist`) cannot keep consuming the budget.
         _loop_action_key = self._unproductive_action_key(command, callback_display_id, parameters)
-        # Only the private capability executor can supply this per-call exception. Its delayed final
-        # verifier owns a bounded retry loop: unchanged successful reads can mean "not ready yet".
+        # Only two private callers supply this per-call exception: the capability executor's delayed final
+        # verifier and graph collection's listing step. Each owns a bounded retry loop with its own expiry
+        # outcome: unchanged successful reads can mean "not ready yet".
         # Read ambient context, never the public visibility_context argument; parameter normalization
         # above must not change the scope of the exception or require clearing unrelated guard state.
         bounded_delayed_proof_poll = (
