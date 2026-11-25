@@ -84,6 +84,13 @@
 # no other package, and pip-audit of the result reports no known vulnerabilities. rc11's channel-metadata update
 # carries no channel identity, so it needs a Mythic server at Mythic-v4.0.0 d8a94943 or later.
 # Offline suite: 12341 passed, 23 skipped (parallel) and 308 passed, 6 skipped (serial), 0 failed.
+#
+# Updated 2026-11-25 in place: langgraph 1.2.22 -> 1.2.24 and langgraph-prebuilt 1.1.0 -> 1.1.3, the current
+# releases. Their metadata accepts the held checkpoint 4.3.0, checkpoint-sqlite 3.1.1 and sdk 0.4.8, so nothing
+# else moves. Prebuilt 1.1.3 copies the state a tool-call wrapper overrides into the tool's ToolRuntime; Sage's
+# control-call binding now keeps the tool's own runtime, so supervised worker isolation is unchanged.
+# Offline suite: 12720 passed, 23 skipped (parallel) and 308 passed, 6 skipped (serial); the one failure is the
+# repo-hygiene check on the API-token fixture's copyright line, which fails on the unchanged base too.
 agent-client-protocol==1.0.0
 aio-pika==9.4.1
 aiofile==3.12.3
@@ -174,10 +181,10 @@ langchain-ollama==1.1.0
 langchain-openai==1.7.2
 langchain-protocol==0.0.22
 langchain-xai==1.3.0
-langgraph==1.2.22
+langgraph==1.2.24
 langgraph-checkpoint==4.3.0
 langgraph-checkpoint-sqlite==3.1.1
-langgraph-prebuilt==1.1.0
+langgraph-prebuilt==1.1.3
 langgraph-sdk==0.4.8
 langsmith==0.10.16
 ldap3==2.9.1

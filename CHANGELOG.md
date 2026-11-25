@@ -76,6 +76,9 @@ between minor releases.
   ``User rejected the tool call for `<tool>` with reason:`` before Sage's own message, which is unchanged. Sage
   still records the action as rejected, not executed, and ends the step. A conversation paused on an approval card
   before this upgrade still resumes with your latest guidance once.
+- LangGraph moves from 1.2.22 to 1.2.24 and `langgraph-prebuilt` from 1.1.0 to 1.1.3, the current releases. In
+  supervised mode, a step handed to the same specialist as the step before it still starts with only its own step
+  and your request, and the earlier step's result still reaches the Supervisor.
 
 ### Security
 

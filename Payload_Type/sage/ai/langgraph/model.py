@@ -1868,7 +1868,15 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
         override = getattr(request, "override", None)
         if not callable(override):
             return request, "managed control call cannot bind canonical subgoal state"
-        return override(state={**state, "_subgoal_state": projection}), ""
+        bound = override(state={**state, "_subgoal_state": projection})
+        # The binding is checked here and stays on the request. langgraph-prebuilt 1.1.3 also copies an overridden
+        # state into the tool's ToolRuntime, which earlier releases never did, so put back the runtime the tool
+        # node built: the handoff tool's subgoal scheduling would otherwise run for the first time and refuse a
+        # supervised step that follows another step on the same worker.
+        runtime = getattr(request, "runtime", None)
+        if getattr(bound, "runtime", runtime) is not runtime:
+            bound = bound.override(runtime=runtime)
+        return bound, ""
 
     @staticmethod
     def _post_arbitration_control_error(request: Any) -> str:

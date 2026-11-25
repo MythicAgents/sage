@@ -334,6 +334,59 @@ def test_a_later_delegation_never_sees_an_earlier_worker_transcript(probe, monke
     assert STEP_ONE_ANSWER in channel and "probe step 0 recorded" in channel
 
 
+def test_the_supervisor_keeps_the_earlier_steps_attributed_return_when_the_next_step_starts_fresh(probe, monkeypatch):
+    """Companion to the test above, on the Supervisor's side: the earlier step's return reaches the Supervisor's own
+    model calls as the worker's attributed report, when it chooses the next step and after that step returns, while
+    the next step's worker still runs with only its own step."""
+    from tests import test_step_bounds
+    from tests.test_hitl_steer_current_intent import _NativeScriptedModel
+
+    monkeypatch.setattr(test_step_bounds._harness, "_ScriptedModel", _NativeScriptedModel)
+    supervisor: list[list] = []
+    workers: list[list] = []
+
+    def supervisor_turn(reply: AIMessage):
+        def turn(messages):
+            supervisor.append(list(messages))
+            return reply
+        return turn
+
+    def worker(reply: str):
+        def turn(messages):
+            workers.append(list(messages))
+            return AIMessage(content=reply)
+        return turn
+
+    second_brief = {**READ_BRIEF, "handoff_title": "Second probe", "expected_result": "The second answer."}
+    script = [_handoff(READ_BRIEF, "h1"), _probe_step(0), worker(STEP_ONE_ANSWER),
+              supervisor_turn(_handoff(second_brief, "h2")), worker("Second step answer."),
+              supervisor_turn(AIMessage(content="final"))]
+    result = _run_probe(script, probe, sb.StepBounds())
+
+    def reports(messages):
+        """(worker, request, report) for each specialist report Sage put in front of the Supervisor."""
+        found = []
+        for message in messages:
+            answer = message.additional_kwargs.get("_worker_final_answer")
+            if isinstance(message, HumanMessage) and message.additional_kwargs.get("_sage_record") == "specialist report":
+                header, _, body = str(message.content).partition("\n")
+                assert f"· from {answer['worker']} · request {answer['request_id']}]" in header
+                found.append((answer["worker"], answer["request_id"], body))
+        return found
+
+    assert len(workers) == 2  # the next step reached its own worker
+    assert STEP_ONE_ANSWER not in "\n".join(str(m.content) for m in workers[1])
+    choosing, closing = supervisor
+    [(worker_name, request_id, body)] = reports(choosing)
+    assert (worker_name, body) == ("Mythic_Operator", STEP_ONE_ANSWER) and request_id
+    assert reports(closing) == [("Mythic_Operator", request_id, STEP_ONE_ANSWER),
+                                ("Mythic_Operator", request_id, "Second step answer.")]
+    # The Supervisor's channel keeps the worker's own return for the earlier step.
+    assert [m.content for m in result["supervisor_messages"]
+            if m.additional_kwargs.get("_worker_final_answer") and getattr(m, "name", "") == "Mythic_Operator"
+            ][:1] == [STEP_ONE_ANSWER]
+
+
 # --- guidance names Sage's own procedure, and identical reads stop -------------------------------------------------
 
 from ai.langgraph import ttp_library  # noqa: E402

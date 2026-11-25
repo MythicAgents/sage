@@ -17,11 +17,11 @@ langchain-openai==1.7.2
 langchain-groq==1.1.3
 langchain-ollama==1.1.0
 langchain-xai==1.3.0
-# langgraph-prebuilt stays at 1.1.0: 1.1.3 changed the state a tool sees for a separately dispatched tool call,
-# and a later delegated worker then received an earlier worker's transcript. langgraph 1.2.23 and later
-# require prebuilt>=1.1.3, so langgraph stops at 1.2.22 (langchain 1.4.6 needs >=1.2.12).
-langgraph==1.2.22
-langgraph-prebuilt==1.1.0
+# langgraph-prebuilt 1.1.3 copies the state a tool-call wrapper overrides into the tool's ToolRuntime. Sage's
+# control-call binding keeps the tool's own runtime (`_with_canonical_control_state`), so a later supervised step
+# on the same worker still runs with only its own input. langgraph 1.2.23 and later require prebuilt>=1.1.3.
+langgraph==1.2.24
+langgraph-prebuilt==1.1.3
 langgraph-checkpoint-sqlite==3.1.1
 langsmith==0.10.16
 mythic==0.3.0rc8
