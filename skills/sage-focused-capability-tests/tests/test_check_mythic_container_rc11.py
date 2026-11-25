@@ -30,12 +30,12 @@ CALLBACK = 2
 START = 1_795_600_000.0
 
 
-def _status(state="running", generation=1, owner=W, scans=1, error="-"):
+def _status(state="running", generation=1, owner=W, scans=1, error="-", pending=0):
     return render_watcher_status({
         "operation_id": "1", "status": state, "owner_channel_name": "rc11 live check (Sage Watcher)",
         "owner_channel_id": owner, "generation": generation, "provider": "openai", "model": "route-model",
         "bot_username": "sage_watcher_bot", "last_success_at": "2026-11-25T00:00:00Z", "active_findings": 0,
-        "pending_deliveries": 0, "interval_seconds": 300, "channel": "#sage-findings", "findings_channel_id": 12,
+        "pending_deliveries": pending, "interval_seconds": 300, "channel": "#sage-findings", "findings_channel_id": 12,
         "scan_count": scans, "last_error_code": error,
     })
 
@@ -96,8 +96,9 @@ def test_a_correct_set_passes():
 def test_parsers_read_sages_own_watcher_replies():
     assert check.parse_apply(_apply_text(7)) == 7
     assert check.parse_status(_status("stale-generation", 3, owner=W, scans=4, error="WatcherGenerationFence")) == {
-        "state": "stale-generation", "owner": str(W), "generation": 3, "scans": 4,
+        "state": "stale-generation", "owner": str(W), "generation": 3, "pending": 0, "scans": 4,
         "last_error": "WatcherGenerationFence"}
+    assert check.parse_status(_status("degraded", 2, pending=3, error="PendingFindingDelivery"))["pending"] == 3
     assert check.parse_apply("Watcher control denied: `WatcherOwnerConflict`.") is None
     assert check.parse_status("Watcher control denied: `WatcherOwnerConflict`.") is None
 
@@ -150,6 +151,11 @@ def _set(path, value):
     (_set(("obs", "rows", "L5_scan"), _rows(_status("running", 1, scans=2, error="WatcherConfigurationError"))), "L5"),
     (_set(("obs", "rows", "L5_scan"), _rows(_status("stale-generation", 1, scans=2, error="WatcherGenerationFence"))),
      "L5"),
+    (_set(("obs", "rows", "L5_scan"),
+          _rows(_status("degraded", 1, scans=2, error="FindingReasoningError", pending=1))), "L5"),
+    (_set(("obs", "rows", "L5_scan"),
+          _rows(_status("degraded", 1, scans=2, error="OperationMemoryResourceBound", pending=1))), "L5"),
+    (_set(("obs", "rows", "L5_scan"), _rows(_status("running", 1, scans=2, pending=2))), "L5"),
     (_set(("obs", "rows", "L5_scan"), _rows("Watcher control denied: `WatcherOwnerConflict`.")), "L5"),
     (_set(("obs", "llm_spans"), [{"prompt_tokens": 1, "completion_tokens": 1}] * 21), "L6"),
     (_set(("obs", "llm_spans"), [{"prompt_tokens": 200_000, "completion_tokens": 200_000}]), "L6"),
@@ -187,17 +193,22 @@ def test_watcher_entries_reads_only_items_keyed_watcher():
     assert check.watcher_entries({"items": {"watcher": 1}}) == []
 
 
-@pytest.mark.parametrize("error", sorted(check.REASONING_ERRORS))
-def test_a_scan_degraded_only_by_the_reasoning_call_still_completes(error):
+@pytest.mark.parametrize("error", sorted(check.COMPLETED_DEGRADED_CODES))
+def test_a_scan_degraded_only_after_it_completed_still_passes(error):
     run, observed = copy.deepcopy(_passing())
     observed["rows"]["L5_scan"] = _rows(_status("degraded", 1, scans=2, error=error))
     result = check.evaluate(run, observed)
     assert result["criteria"]["L5"] is True, result["criteria"]
 
 
-def test_l5_fails_on_sages_real_scan_of_a_bot_whose_scopes_do_not_match(tmp_path, monkeypatch):
-    """The cold review's reproduction: Sage's real manager and delivery, a whoami reporting one extra implied scope."""
+def _real_scan(tmp_path, monkeypatch, *, extra_effective_scope=None, over_bound_record=False):
+    """Sage's real Watcher manager, operation-memory store and findings delivery around one `/watcher scan`.
+
+    Synthetic around it: the owner channel row, a whoami answer, one existing #sage-findings channel, and a source
+    refresh that reports nothing new (the Mythic poll). These are the cold review's reproductions.
+    """
     import asyncio
+    from types import SimpleNamespace
 
     from sage_chat.findings_watcher import FindingsWatcherManager
     from sage_chat.headless import build_chat_request
@@ -206,7 +217,7 @@ def test_l5_fails_on_sages_real_scan_of_a_bot_whose_scopes_do_not_match(tmp_path
         REQUIRED_WATCHER_SCOPES,
         MythicFindingsDelivery,
     )
-    from sage_chat.operation_memory import OperationMemoryStore
+    from sage_chat.operation_memory import OperationMemoryStore, SourceRecord
     from sage_chat.watcher_control import WatcherChannel
 
     monkeypatch.setenv("SAGE_WATCHER_APITOKEN", "synthetic-token")
@@ -214,8 +225,9 @@ def test_l5_fails_on_sages_real_scan_of_a_bot_whose_scopes_do_not_match(tmp_path
     owner = WatcherChannel(channel_id=W, operation_id=1, name="rc11 live check (Sage Watcher)", model="Sage Watcher",
                            container="sage", locked=True, archived=False, backing_apitoken_id=9, config={},
                            channel_metadata={})
+    effective = set(REQUIRED_WATCHER_EFFECTIVE_SCOPES) | ({extra_effective_scope} if extra_effective_scope else set())
 
-    class Control:  # records the marker; the metadata contract itself is covered by test_watcher_marker_rc11.py
+    class Control:  # the metadata contract itself is covered by test_watcher_marker_rc11.py
         async def publish_profile_metadata(self, **_kwargs):
             return None
 
@@ -226,6 +238,14 @@ def test_l5_fails_on_sages_real_scan_of_a_bot_whose_scopes_do_not_match(tmp_path
         def __init__(self, path):
             self.store = OperationMemoryStore(path)
 
+        async def refresh(self, *_args, admission_guard=None, **_kwargs):
+            await admission_guard()
+            return SimpleNamespace(view=(), snapshot=await self.store.snapshot("1"), changed_source_count=0,
+                                   reasoning=None)
+
+        async def current_view(self, operation):
+            return (), await self.store.snapshot(operation)
+
         async def close(self):
             await self.store.close()
 
@@ -233,18 +253,26 @@ def test_l5_fails_on_sages_real_scan_of_a_bot_whose_scopes_do_not_match(tmp_path
         return object()
 
     async def execute(_client, query, _variables):
-        assert "whoami" in query
-        return {"whoami": {"status": "success", "user_id": 5, "username": "sage_watcher_bot", "account_type": "bot",
-                           "active": True, "deleted": False, "current_operation_id": 1,
-                           "scopes": sorted(REQUIRED_WATCHER_SCOPES),
-                           "effective_scopes": sorted(REQUIRED_WATCHER_EFFECTIVE_SCOPES | {"tag.read"})}}
+        if "whoami" in query:
+            return {"whoami": {"status": "success", "user_id": 5, "username": "sage_watcher_bot",
+                               "account_type": "bot", "active": True, "deleted": False, "current_operation_id": 1,
+                               "scopes": sorted(REQUIRED_WATCHER_SCOPES), "effective_scopes": sorted(effective)}}
+        if "SageFindingsChannels" in query:
+            return {"chat_channel": [{"id": 12, "name": "sage-findings"}]}
+        raise AssertionError(query[:60])
 
     class NoLoop(FindingsWatcherManager):
         async def _start_loop(self, operation):
             return None
 
     async def scenario():
-        manager = NoLoop(Runtime(tmp_path / "watcher.db"), delivery=MythicFindingsDelivery(login=login, execute=execute),
+        runtime = Runtime(tmp_path / "watcher.db")
+        if over_bound_record:
+            await runtime.store.initialize()
+            record = SourceRecord.build(operation_id="1", record_class="task_output", source_record_id="r1",
+                                        observed_at_utc="2026-11-24T00:00:00Z", content="x" * 70_000)
+            await runtime.store.ingest_batch("1", [record], stream_key="task_output", next_cursor="1")
+        manager = NoLoop(runtime, delivery=MythicFindingsDelivery(login=login, execute=execute),
                          control_plane=Control(), interval_seconds=300)
         try:
             request = build_chat_request("/watcher apply", model="Sage Watcher", operation_id=1, channel_id=W,
@@ -257,11 +285,28 @@ def test_l5_fails_on_sages_real_scan_of_a_bot_whose_scopes_do_not_match(tmp_path
         return before, after
 
     before, after = asyncio.run(scenario())
-    assert check.parse_status(after)["state"] == "unconfigured"
-    assert check.parse_status(after)["last_error"] == "WatcherConfigurationError"
     run, observed = copy.deepcopy(_passing())
     observed["rows"]["L4_status"] = _rows(before)
     observed["rows"]["L5_scan"] = _rows(after)
-    result = check.evaluate(run, observed)
+    return check.parse_status(after), check.evaluate(run, observed)
+
+
+def test_l5_fails_on_sages_real_scan_of_a_bot_whose_scopes_do_not_match(tmp_path, monkeypatch):
+    status, result = _real_scan(tmp_path, monkeypatch, extra_effective_scope="tag.read")
+    assert (status["state"], status["last_error"]) == ("unconfigured", "WatcherConfigurationError")
     assert result["criteria"]["L5"] is False
     assert result["verdict"] == "fail"
+
+
+def test_l5_passes_sages_real_completed_scan_of_an_operation_past_its_memory_bound(tmp_path, monkeypatch):
+    status, result = _real_scan(tmp_path, monkeypatch, over_bound_record=True)
+    assert (status["state"], status["last_error"], status["pending"]) == (
+        "degraded", "OperationMemoryResourceBound", 0)
+    assert result["criteria"]["L5"] is True, result["criteria"]
+    assert result["verdict"] == "pass"
+
+
+def test_l5_passes_sages_real_healthy_scan(tmp_path, monkeypatch):
+    status, result = _real_scan(tmp_path, monkeypatch)
+    assert (status["state"], status["last_error"], status["pending"]) == ("running", "-", 0)
+    assert result["criteria"]["L5"] is True, result["criteria"]
