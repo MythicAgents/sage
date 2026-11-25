@@ -42,8 +42,11 @@ Pass rules (frozen with the plan's live check; read once):
      `stale-generation`.
   L4 After the restart, `/watcher status` in W shows owner W and generation g, and a state that is neither
      `stale-generation` nor `controller-missing`.
-  L5 `/watcher scan` completes, its scan count is above L4's, and its reply has no denial and no scope or
-     authorization error.
+  L5 `/watcher scan` completes: its reply shows state `running`, or `degraded` only because the model's reasoning
+     call failed (`FindingReasoningError`, `FindingReasoningDeferred`; the scan itself polled Mythic and delivered,
+     and the reasoning call is an observation). Its scan count is above L4's and it is not a denial. Any other state
+     or error code (`unconfigured` with `WatcherConfigurationError` for a bot scope or identity mismatch, or
+     `degraded` for a delivery, GraphQL or transport failure) is a scope, authorization or delivery failure and fails.
   L6 The set stayed inside its limits: 3 channels, at most 20 provider calls and 300,000 tokens, 1 target task,
      30 minutes, one Sage restart, no stop by the check, no retry.
 If L1 was never sent, the check did not run (verdict did_not_run): it is not an attempt.
@@ -89,7 +92,7 @@ APPLY = re.compile(r"Watcher profile generation `(?P<generation>\d+)` applied fr
 STATUS_ROW = re.compile(
     r"^\| `(?P<state>[^`]*)` \| `[^`]*` \(`(?P<owner>[^`]*)`\) \| (?P<generation>\d+) \|", re.MULTILINE)
 SCANS = re.compile(r"· scans: (?P<scans>\d+) · last error: `(?P<error>[^`]*)`")
-AUTH_ERROR = re.compile(r"scope|authori[sz]|permission|forbidden|denied|unauthori[sz]ed", re.IGNORECASE)
+REASONING_ERRORS = {"FindingReasoningError", "FindingReasoningDeferred"}  # sage_chat/operation_reasoner.py
 
 CHANNEL_QUERY = "query SageRc11Channel($id: Int!) { chat_channel_by_pk(id: $id) { id chat_model locked ai_metadata } }"
 WATCHER_CHANNELS_QUERY = """
@@ -160,6 +163,12 @@ def parse_status(text: str) -> dict[str, Any] | None:
             "scans": int(scans["scans"]) if scans else None, "last_error": scans["error"] if scans else None}
 
 
+def scan_completed(status: dict[str, Any]) -> bool:
+    """A scan that ran to its end: healthy, or degraded only by the model's reasoning call."""
+    state, error = status.get("state"), str(status.get("last_error") or "-")
+    return (state == "running" and error in {"", "-"}) or (state == "degraded" and error in REASONING_ERRORS)
+
+
 def watcher_entries(channel_metadata: Any) -> list[Any]:
     items = channel_metadata.get("items") if isinstance(channel_metadata, dict) else None
     return [entry.get("value") for entry in (items if isinstance(items, list) else [])
@@ -221,10 +230,10 @@ def evaluate(run: dict[str, Any], observed: dict[str, Any]) -> dict[str, Any]:
     l5_text = "\n".join(_texts(rows.get("L5_scan") or {}))
     l5_status = parse_status(l5_text) or {}
     criteria["L5"] = ((rows.get("L5_scan") or {}).get("status") == "complete" and bool(l5_status)
+                      and scan_completed(l5_status)
                       and l5_status.get("scans") is not None and l4_status.get("scans") is not None
                       and l5_status["scans"] > l4_status["scans"]
-                      and "Watcher control denied" not in l5_text
-                      and not AUTH_ERROR.search(str(l5_status.get("last_error") or "")))
+                      and "Watcher control denied" not in l5_text)
 
     llm = observed.get("llm_spans") or []
     tokens = sum(int(s.get("prompt_tokens") or 0) + int(s.get("completion_tokens") or 0) for s in llm)
