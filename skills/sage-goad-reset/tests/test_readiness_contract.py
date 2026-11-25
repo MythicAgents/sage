@@ -932,3 +932,36 @@ def test_bloodhound_mcp_probe_reads_tool_names_from_a_real_server(tmp_path, monk
     while time.monotonic() < deadline and Path(f"/proc/{starts[0]}").exists():
         time.sleep(0.1)
     assert not Path(f"/proc/{starts[0]}").exists()
+
+
+# Stored scopes of the lab's channel token 31 and Sage Watcher token 47, read with a read-only query on
+# 2026-11-25 (Mythic-v4.0.0 d8a94943, which refuses "*" in an active token).
+LAB_TOKEN_31_SCOPES = [
+    "apitoken.read", "apitoken.write", "callback.read", "chat-ai.read", "chat-ai.write", "credential.read",
+    "credential.write", "eventlog.read", "eventlog.write", "file.read", "file.write", "operation.read",
+    "operator.read", "payload.read", "payload.write", "response.read", "task.read", "task.write",
+]
+LAB_TOKEN_47_SCOPES = [
+    "callback.read", "chat-ai.read", "chat.read", "chat.write", "credential.read", "eventlog.read",
+    "eventlog.write", "file.read", "operation.read", "payload.read", "response.read", "task.read",
+]
+RUNNING_CHAT = [{"id": 1, "container_running": True, "deleted": False}]
+
+
+def test_the_chat_check_accepts_the_operation_bots_scoped_token():
+    status = MODULE.mythic_chat_status(
+        RUNNING_CHAT, {"id": 31, "name": "Sage native chat", "operator_id": 2, "scopes": LAB_TOKEN_31_SCOPES})
+    assert status["ready"] is True
+    assert status["blockers"] == []
+    assert status["api_token"]["id"] == 31
+
+
+@pytest.mark.parametrize("scopes", [
+    LAB_TOKEN_47_SCOPES,
+    ["*"],
+    [scope for scope in LAB_TOKEN_31_SCOPES if scope != "task.write"],
+], ids=["watcher token", "wildcard only", "missing task.write"])
+def test_the_chat_check_refuses_a_token_without_sages_channel_scopes(scopes):
+    status = MODULE.mythic_chat_status(RUNNING_CHAT, {"id": 9, "operator_id": 2, "scopes": scopes})
+    assert status["ready"] is False
+    assert status["blockers"] == ["Mythic API token with Sage's channel scopes is unavailable"]

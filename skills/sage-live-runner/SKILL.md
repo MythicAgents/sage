@@ -52,7 +52,7 @@ applies.
 The first invocation after a full reset consumes the empty `Sage GOAD Ready` channel created by bootstrap.
 Later invocations create fresh locked channels and report `chat_channel_id`, `chat_request_id`, terminal status,
 and messages. A prepared channel is reused only when its stored configuration is actually `mode=auto` with
-`autonomous_solve=true` and its wildcard backing token belongs to the current operation's unique active bot;
+`autonomous_solve=true` and its backing token, with Sage's channel scopes, belongs to the current operation's own bot;
 otherwise the run creates a fresh correctly configured channel. Fresh channels remain locked by the invoking
 operator, while their backing token belongs to that bot so derived chat credentials and callback tasks are
 attributed to Sage. Use `--new-channel` to
@@ -107,8 +107,8 @@ It never submits an approval response.
 
 ## BHUSA Demo Helpers
 
-Create a locked BHUSA demo channel owned by the current operation's unique active bot account. The helper selects or creates
-that bot's wildcard API token, then fixes the channel metadata to supervised mode, `autonomous_solve=false`,
+Create a locked BHUSA demo channel owned by the current operation's own bot account. The helper selects or creates
+that bot's API token with Sage's channel scopes, then fixes the channel metadata to supervised mode, `autonomous_solve=false`,
 `policy_mode=hybrid`, `max_steps=200`, and metadata display `expanded; max=15`:
 
 ```bash
@@ -165,8 +165,9 @@ database is never the proof.
 The proof path requires:
 
 - a running `sage` consuming container of type `chat`
-- an active Mythic API token with wildcard scope; Mythic's chat token delegation inherits the backing token's
-  scopes, so the UI-minimum `apitoken.write` and `chat-ai.write` pair cannot drive autonomous operator tools
+- an active Mythic API token of the operation's own bot carrying Sage's channel scopes (`_CHANNEL_TOKEN_SCOPES`
+  in `sage_chat/models.py`); Mythic's chat token delegation inherits the backing token's scopes, so the UI-minimum
+  `apitoken.write` and `chat-ai.write` pair cannot drive autonomous operator tools, and Mythic refuses `*`
 - a live Apollo callback on CASTELBLACK as Samwell
 - archived Sage/Phoenix runtime databases followed by a clean Sage restart
 - a clean BloodHound database and reset GOAD range

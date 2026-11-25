@@ -819,6 +819,16 @@ def bloodhound_mcp_status(
     }
 
 
+def _channel_token_scopes() -> frozenset[str]:
+    """Sage's declared channel-token scopes, read from their one owner in the runtime."""
+    runtime = str(REPO_ROOT / "Payload_Type" / "sage")
+    if runtime not in sys.path:
+        sys.path.insert(0, runtime)
+    from sage_chat.models import _CHANNEL_TOKEN_SCOPES
+
+    return frozenset(_CHANNEL_TOKEN_SCOPES)
+
+
 def mythic_chat_status(
     chat_containers: list[dict[str, Any]] | None,
     api_token: dict[str, Any] | None,
@@ -833,12 +843,13 @@ def mythic_chat_status(
         for item in ((api_token or {}).get("scopes") or [])
         if str(item).strip()
     }
-    token_ready = bool(api_token) and "*" in scopes
+    # Mythic stores each write's read with it, so a usable token holds a superset of the declared set.
+    token_ready = bool(api_token) and _channel_token_scopes() <= scopes
     blockers = []
     if not live_chat:
         blockers.append("Sage chat container is not running")
     if not token_ready:
-        blockers.append("wildcard-scoped Mythic API token is unavailable")
+        blockers.append("Mythic API token with Sage's channel scopes is unavailable")
     return {
         "ready": not blockers,
         "chat_containers": live_chat,

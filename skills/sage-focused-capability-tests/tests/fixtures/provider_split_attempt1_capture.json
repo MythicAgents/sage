@@ -1,0 +1,518 @@
+{
+ "provenance": "Reduced from the provider split live attempt 1 capture (2026-11-25, Sage container at 0bdd7c6, Mythic d8a94943): real record kinds, capture indices, Sage-clock times, capture request ids, Mythic chat request ids and statuses. Bodies are dropped except each model request's model name and each chat_response's request id and status; the private gateway URL is replaced with gateway.example. Each step's sent_ns is the time of the last record before the runner's count at send (wire_after - 1); wire_after/wire_until are the record-count windows the check used then.",
+ "steps": {
+  "G1": {
+   "request_id": 35,
+   "phase": 2,
+   "sent_ns": 1795626716404910382,
+   "wire_after": 26930,
+   "wire_until": 27216
+  },
+  "L1": {
+   "request_id": 31,
+   "phase": 1,
+   "sent_ns": 1795626638097451506,
+   "wire_after": 12439,
+   "wire_until": 13316
+  },
+  "M1": {
+   "request_id": 32,
+   "phase": 1,
+   "sent_ns": 1795626657275059381,
+   "wire_after": 13316,
+   "wire_until": 13548
+  },
+  "O1": {
+   "request_id": 33,
+   "phase": 2,
+   "sent_ns": 1795626683171974245,
+   "wire_after": 15751,
+   "wire_until": 25917
+  },
+  "O2": {
+   "request_id": 34,
+   "phase": 2,
+   "sent_ns": 1795626703473251118,
+   "wire_after": 26149,
+   "wire_until": 26930
+  }
+ },
+ "records": [
+  {
+   "index": 0,
+   "kind": "process_start",
+   "seq": 1,
+   "record": {
+    "time_ns": 1795626617311158107,
+    "payload": {}
+   }
+  },
+  {
+   "index": 12362,
+   "kind": "control_request",
+   "seq": 12363,
+   "record": {
+    "time_ns": 1795626637972077227,
+    "payload": {
+     "transport": "amqp",
+     "routing_key": "consuming_container_sync",
+     "request_id": "81c57719315042908f62949c5a6d2097"
+    }
+   }
+  },
+  {
+   "index": 12433,
+   "kind": "control_request",
+   "seq": 12434,
+   "record": {
+    "time_ns": 1795626638094456442,
+    "payload": {
+     "transport": "amqp",
+     "routing_key": "container_on_start_response",
+     "request_id": "82c486c782294e2c97d442aa8496f1ce"
+    }
+   }
+  },
+  {
+   "index": 13113,
+   "kind": "model_request",
+   "seq": 13114,
+   "record": {
+    "time_ns": 1795626652938763017,
+    "payload": {
+     "request_id": "f9829bfa6d1c471abbff4ba7c988e207",
+     "method": "POST",
+     "url": "https://gateway.example/v1/chat/completions",
+     "body_base64": "eyJtb2RlbCI6ImJlZHJvY2stY2xhdWRlLTQtNi1zb25uZXQifQ=="
+    }
+   }
+  },
+  {
+   "index": 13123,
+   "kind": "model_response",
+   "seq": 13124,
+   "record": {
+    "time_ns": 1795626654063430484,
+    "payload": {
+     "request_id": "f9829bfa6d1c471abbff4ba7c988e207",
+     "status_code": 200,
+     "outcome": "returned"
+    }
+   }
+  },
+  {
+   "index": 13180,
+   "kind": "model_request",
+   "seq": 13181,
+   "record": {
+    "time_ns": 1795626654122112537,
+    "payload": {
+     "request_id": "b5bdd4316d1144108ffb92d78ed98273",
+     "method": "POST",
+     "url": "https://gateway.example/v1/chat/completions",
+     "body_base64": "eyJtb2RlbCI6ImJlZHJvY2stY2xhdWRlLTQtNi1zb25uZXQifQ=="
+    }
+   }
+  },
+  {
+   "index": 13195,
+   "kind": "model_response",
+   "seq": 13196,
+   "record": {
+    "time_ns": 1795626657086372241,
+    "payload": {
+     "request_id": "b5bdd4316d1144108ffb92d78ed98273",
+     "status_code": 200,
+     "outcome": "returned"
+    }
+   }
+  },
+  {
+   "index": 13286,
+   "kind": "control_request",
+   "seq": 13287,
+   "record": {
+    "time_ns": 1795626657252223703,
+    "payload": {
+     "transport": "amqp",
+     "routing_key": "chat_response",
+     "request_id": "a14682cbe3d84e19a8159462fc81ea05",
+     "body_base64": "eyJyZXF1ZXN0X2lkIjozMSwic3RhdHVzIjoic3RyZWFtaW5nIiwiY29tcGxldGUiOmZhbHNlfQ=="
+    }
+   }
+  },
+  {
+   "index": 13305,
+   "kind": "control_request",
+   "seq": 13306,
+   "record": {
+    "time_ns": 1795626657269461282,
+    "payload": {
+     "transport": "amqp",
+     "routing_key": "chat_response",
+     "request_id": "abc51255b1744ea383043d3361bde7f9",
+     "body_base64": "eyJyZXF1ZXN0X2lkIjozMSwic3RhdHVzIjoiY29tcGxldGUiLCJjb21wbGV0ZSI6dHJ1ZX0="
+    }
+   }
+  },
+  {
+   "index": 13405,
+   "kind": "model_request",
+   "seq": 13406,
+   "record": {
+    "time_ns": 1795626662252093506,
+    "payload": {
+     "request_id": "ac6e48ce882147f8a4b4556c290e85ae",
+     "method": "POST",
+     "url": "https://gateway.example/v1/chat/completions",
+     "body_base64": "eyJtb2RlbCI6ImJlZHJvY2stY2xhdWRlLTQtNi1zb25uZXQifQ=="
+    }
+   }
+  },
+  {
+   "index": 13415,
+   "kind": "model_response",
+   "seq": 13416,
+   "record": {
+    "time_ns": 1795626663335180957,
+    "payload": {
+     "request_id": "ac6e48ce882147f8a4b4556c290e85ae",
+     "status_code": 200,
+     "outcome": "returned"
+    }
+   }
+  },
+  {
+   "index": 13472,
+   "kind": "model_request",
+   "seq": 13473,
+   "record": {
+    "time_ns": 1795626663422482645,
+    "payload": {
+     "request_id": "320f06274471429c84bc88883396d3ae",
+     "method": "POST",
+     "url": "https://gateway.example/v1/chat/completions",
+     "body_base64": "eyJtb2RlbCI6ImJlZHJvY2stY2xhdWRlLTQtNi1zb25uZXQifQ=="
+    }
+   }
+  },
+  {
+   "index": 13487,
+   "kind": "model_response",
+   "seq": 13488,
+   "record": {
+    "time_ns": 1795626665605206003,
+    "payload": {
+     "request_id": "320f06274471429c84bc88883396d3ae",
+     "status_code": 200,
+     "outcome": "returned"
+    }
+   }
+  },
+  {
+   "index": 13518,
+   "kind": "control_request",
+   "seq": 13519,
+   "record": {
+    "time_ns": 1795626665661513711,
+    "payload": {
+     "transport": "amqp",
+     "routing_key": "chat_response",
+     "request_id": "52fd5bdb8ae24550a5e9d40794ec51ee",
+     "body_base64": "eyJyZXF1ZXN0X2lkIjozMiwic3RhdHVzIjoic3RyZWFtaW5nIiwiY29tcGxldGUiOmZhbHNlfQ=="
+    }
+   }
+  },
+  {
+   "index": 13537,
+   "kind": "control_request",
+   "seq": 13538,
+   "record": {
+    "time_ns": 1795626665678779879,
+    "payload": {
+     "transport": "amqp",
+     "routing_key": "chat_response",
+     "request_id": "9a1025e780aa4b9cb5fecf50f26c85a4",
+     "body_base64": "eyJyZXF1ZXN0X2lkIjozMiwic3RhdHVzIjoiY29tcGxldGUiLCJjb21wbGV0ZSI6dHJ1ZX0="
+    }
+   }
+  },
+  {
+   "index": 13548,
+   "kind": "process_start",
+   "seq": 1,
+   "record": {
+    "time_ns": 1795626679583720169,
+    "payload": {}
+   }
+  },
+  {
+   "index": 25810,
+   "kind": "control_request",
+   "seq": 12263,
+   "record": {
+    "time_ns": 1795626698976597514,
+    "payload": {
+     "transport": "amqp",
+     "routing_key": "consuming_container_sync",
+     "request_id": "2d3881d95c94440c9d5e09b991b02178"
+    }
+   }
+  },
+  {
+   "index": 25881,
+   "kind": "control_request",
+   "seq": 12334,
+   "record": {
+    "time_ns": 1795626699079608084,
+    "payload": {
+     "transport": "amqp",
+     "routing_key": "chat_response",
+     "request_id": "9ddaf5ab13d34eac8f08605cb49232bb",
+     "body_base64": "eyJyZXF1ZXN0X2lkIjozMywic3RhdHVzIjoiY29tcGxldGUiLCJjb21wbGV0ZSI6dHJ1ZX0="
+    }
+   }
+  },
+  {
+   "index": 25887,
+   "kind": "control_request",
+   "seq": 12340,
+   "record": {
+    "time_ns": 1795626699082989232,
+    "payload": {
+     "transport": "amqp",
+     "routing_key": "container_on_start_response",
+     "request_id": "14a5a3bf91c844f7b941b7dab1ecf898"
+    }
+   }
+  },
+  {
+   "index": 26580,
+   "kind": "model_request",
+   "seq": 13033,
+   "record": {
+    "time_ns": 1795626704783885070,
+    "payload": {
+     "request_id": "e9562aff2da54c64be89843ba184456a",
+     "method": "POST",
+     "url": "https://api.openai.com/v1/responses",
+     "body_base64": "eyJtb2RlbCI6ImdwdC01LjYtc29sIn0="
+    }
+   }
+  },
+  {
+   "index": 26598,
+   "kind": "model_response",
+   "seq": 13051,
+   "record": {
+    "time_ns": 1795626708756365978,
+    "payload": {
+     "request_id": "e9562aff2da54c64be89843ba184456a",
+     "status_code": 200,
+     "outcome": "returned"
+    }
+   }
+  },
+  {
+   "index": 26655,
+   "kind": "model_request",
+   "seq": 13108,
+   "record": {
+    "time_ns": 1795626708875568466,
+    "payload": {
+     "request_id": "14008ad4434148fa8fa0a9e5c4c8ca73",
+     "method": "POST",
+     "url": "https://api.openai.com/v1/responses",
+     "body_base64": "eyJtb2RlbCI6ImdwdC01LjYtc29sIn0="
+    }
+   }
+  },
+  {
+   "index": 26670,
+   "kind": "model_response",
+   "seq": 13123,
+   "record": {
+    "time_ns": 1795626712631364256,
+    "payload": {
+     "request_id": "14008ad4434148fa8fa0a9e5c4c8ca73",
+     "status_code": 200,
+     "outcome": "returned"
+    }
+   }
+  },
+  {
+   "index": 26761,
+   "kind": "control_request",
+   "seq": 13214,
+   "record": {
+    "time_ns": 1795626712794657118,
+    "payload": {
+     "transport": "amqp",
+     "routing_key": "chat_response",
+     "request_id": "a0a87bf534cb419493c61f9c1e9ed909",
+     "body_base64": "eyJyZXF1ZXN0X2lkIjozMywic3RhdHVzIjoic3RyZWFtaW5nIiwiY29tcGxldGUiOmZhbHNlfQ=="
+    }
+   }
+  },
+  {
+   "index": 26780,
+   "kind": "control_request",
+   "seq": 13233,
+   "record": {
+    "time_ns": 1795626712813095629,
+    "payload": {
+     "transport": "amqp",
+     "routing_key": "chat_response",
+     "request_id": "c705ee3f80df4e379ac3eb724557604f",
+     "body_base64": "eyJyZXF1ZXN0X2lkIjozMywic3RhdHVzIjoiY29tcGxldGUiLCJjb21wbGV0ZSI6dHJ1ZX0="
+    }
+   }
+  },
+  {
+   "index": 26824,
+   "kind": "model_request",
+   "seq": 13277,
+   "record": {
+    "time_ns": 1795626712868323875,
+    "payload": {
+     "request_id": "73ae33b40174429a8a972cee365930f2",
+     "method": "POST",
+     "url": "https://api.openai.com/v1/responses",
+     "body_base64": "eyJtb2RlbCI6ImdwdC01LjYtc29sIn0="
+    }
+   }
+  },
+  {
+   "index": 26832,
+   "kind": "model_response",
+   "seq": 13285,
+   "record": {
+    "time_ns": 1795626716275166333,
+    "payload": {
+     "request_id": "73ae33b40174429a8a972cee365930f2",
+     "status_code": 200,
+     "outcome": "returned"
+    }
+   }
+  },
+  {
+   "index": 26900,
+   "kind": "control_request",
+   "seq": 13353,
+   "record": {
+    "time_ns": 1795626716382059818,
+    "payload": {
+     "transport": "amqp",
+     "routing_key": "chat_response",
+     "request_id": "b8acd8684d964176b5105e7a15b6b5d8",
+     "body_base64": "eyJyZXF1ZXN0X2lkIjozNCwic3RhdHVzIjoic3RyZWFtaW5nIiwiY29tcGxldGUiOmZhbHNlfQ=="
+    }
+   }
+  },
+  {
+   "index": 26919,
+   "kind": "control_request",
+   "seq": 13372,
+   "record": {
+    "time_ns": 1795626716399578766,
+    "payload": {
+     "transport": "amqp",
+     "routing_key": "chat_response",
+     "request_id": "b10e8890b3cd494181f52df047b932a2",
+     "body_base64": "eyJyZXF1ZXN0X2lkIjozNCwic3RhdHVzIjoiY29tcGxldGUiLCJjb21wbGV0ZSI6dHJ1ZX0="
+    }
+   }
+  },
+  {
+   "index": 27019,
+   "kind": "model_request",
+   "seq": 13472,
+   "record": {
+    "time_ns": 1795626719607335747,
+    "payload": {
+     "request_id": "1dd7ea6e27d4488493ccdc68851c1736",
+     "method": "POST",
+     "url": "https://api.openai.com/v1/responses",
+     "body_base64": "eyJtb2RlbCI6ImdwdC00LjEifQ=="
+    }
+   }
+  },
+  {
+   "index": 27030,
+   "kind": "model_response",
+   "seq": 13483,
+   "record": {
+    "time_ns": 1795626720747294153,
+    "payload": {
+     "request_id": "1dd7ea6e27d4488493ccdc68851c1736",
+     "status_code": 200,
+     "outcome": "returned"
+    }
+   }
+  },
+  {
+   "index": 27087,
+   "kind": "model_request",
+   "seq": 13540,
+   "record": {
+    "time_ns": 1795626720834578783,
+    "payload": {
+     "request_id": "c2146942a50d41468d469e7cffded1d2",
+     "method": "POST",
+     "url": "https://api.openai.com/v1/responses",
+     "body_base64": "eyJtb2RlbCI6ImdwdC00LjEifQ=="
+    }
+   }
+  },
+  {
+   "index": 27102,
+   "kind": "model_response",
+   "seq": 13555,
+   "record": {
+    "time_ns": 1795626723102256954,
+    "payload": {
+     "request_id": "c2146942a50d41468d469e7cffded1d2",
+     "status_code": 200,
+     "outcome": "returned"
+    }
+   }
+  },
+  {
+   "index": 27186,
+   "kind": "control_request",
+   "seq": 13639,
+   "record": {
+    "time_ns": 1795626723219386459,
+    "payload": {
+     "transport": "amqp",
+     "routing_key": "chat_response",
+     "request_id": "164f0078b94e42bcb31dcdf082c431a3",
+     "body_base64": "eyJyZXF1ZXN0X2lkIjozNSwic3RhdHVzIjoic3RyZWFtaW5nIiwiY29tcGxldGUiOmZhbHNlfQ=="
+    }
+   }
+  },
+  {
+   "index": 27205,
+   "kind": "control_request",
+   "seq": 13658,
+   "record": {
+    "time_ns": 1795626723237014617,
+    "payload": {
+     "transport": "amqp",
+     "routing_key": "chat_response",
+     "request_id": "c8c6f6349a31489b9f508666a3a2c43e",
+     "body_base64": "eyJyZXF1ZXN0X2lkIjozNSwic3RhdHVzIjoiY29tcGxldGUiLCJjb21wbGV0ZSI6dHJ1ZX0="
+    }
+   }
+  },
+  {
+   "index": 27216,
+   "kind": "process_start",
+   "seq": 1,
+   "record": {
+    "time_ns": 1795626737059937914,
+    "payload": {}
+   }
+  }
+ ]
+}

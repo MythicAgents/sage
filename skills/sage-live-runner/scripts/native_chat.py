@@ -34,6 +34,7 @@ if str(SAGE_PYTHON_ROOT) not in sys.path:
     sys.path.insert(0, str(SAGE_PYTHON_ROOT))
 
 from ai.langgraph.request_events import control_transition_errors
+from sage_chat.models import _CHANNEL_TOKEN_SCOPES
 from dotenv_bootstrap import apply_dotenv, dotenv_paths
 from dotenv import dotenv_values
 
@@ -54,7 +55,12 @@ ARTIFACT_RETENTION_PATH = (
 TERMINAL_STATUSES = {"completed", "complete", "error", "failed", "cancelled", "canceled"}
 APPROVABLE_INPUT_REQUEST_STATUS = "streaming"
 REQUIRED_TOKEN_SCOPES = {"apitoken.write", "chat-ai.write"}
-AUTONOMOUS_TOKEN_SCOPES = {"*"}
+# The channel's backing token carries Sage's declared channel scopes. Mythic d8a94943+ refuses "*" in an
+# active token, and stores each write's read alongside it, so a usable token holds a superset of this set.
+CHANNEL_TOKEN_SCOPES = frozenset(_CHANNEL_TOKEN_SCOPES)
+EXPLICIT_BINDING_HINT = (
+    "Set SAGE_BACKING_APITOKEN_ID and SAGE_CHAT_CONTAINER_ID to bind the channel explicitly."
+)
 
 READINESS_QUERY = """
 query SageChatReadiness {
@@ -87,6 +93,7 @@ query SageChatReadiness {
     deleted
     scopes
     operator_id
+    operation_id
   }
 }
 """
@@ -189,6 +196,10 @@ mutation CreateSageChatToken($operatorId: Int, $name: String!, $scopes: [String!
 
 OPERATION_BOT_QUERY = """
 query SageOperationBot($operationId: Int!) {
+  operation_by_pk(id: $operationId) {
+    id
+    name
+  }
   operator(
     where: {
       account_type: {_eq: "bot"}
@@ -203,6 +214,7 @@ query SageOperationBot($operationId: Int!) {
     account_type
     active
     deleted
+    current_operation_id
   }
 }
 """
@@ -548,11 +560,25 @@ def _scopes(token: dict[str, Any]) -> set[str]:
     return {str(item).strip() for item in raw if str(item).strip()}
 
 
-def select_chat_resources(
-    readiness: dict[str, Any],
+def usable_bot_tokens(
+    tokens: list[dict[str, Any]],
     *,
-    api_token_id: int | None = None,
-) -> tuple[dict[str, Any], dict[str, Any]]:
+    operator_id: int,
+    operation_id: int,
+) -> list[dict[str, Any]]:
+    """Active tokens of this bot in this operation whose stored scopes include Sage's channel scopes."""
+    return [
+        row
+        for row in tokens
+        if row.get("active") is not False
+        and not row.get("deleted")
+        and row.get("operator_id") == operator_id
+        and row.get("operation_id") == operation_id
+        and CHANNEL_TOKEN_SCOPES.issubset(_scopes(row))
+    ]
+
+
+def select_chat_container(readiness: dict[str, Any]) -> dict[str, Any]:
     containers = [
         row
         for row in readiness.get("consuming_container", [])
@@ -560,22 +586,28 @@ def select_chat_resources(
     ]
     if not containers:
         raise RuntimeError("Sage chat container is not running in Mythic.")
+    return containers[0]
 
+
+def select_chat_resources(
+    readiness: dict[str, Any],
+    *,
+    operator_id: int,
+    operation_id: int,
+    api_token_id: int | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    container = select_chat_container(readiness)
     tokens = readiness.get("apitokens", [])
     if api_token_id is not None:
         tokens = [row for row in tokens if int(row.get("id", -1)) == int(api_token_id)]
         if not tokens:
             raise RuntimeError(f"Active Mythic API token {api_token_id} was not found.")
-    usable = [
-        row
-        for row in tokens
-        if AUTONOMOUS_TOKEN_SCOPES.issubset(_scopes(row))
-    ]
+    usable = usable_bot_tokens(tokens, operator_id=operator_id, operation_id=operation_id)
     if not usable:
         raise RuntimeError(
-            "No active Mythic API token has the wildcard scope required for autonomous Sage operations."
+            "No active Mythic API token of the current operation bot has Sage's channel scopes."
         )
-    return containers[0], usable[0]
+    return container, usable[0]
 
 
 async def inspect_readiness(
@@ -592,16 +624,36 @@ async def inspect_readiness(
     )
 
 
+def operation_bot_name(operation_name: str) -> str:
+    """The bot Mythic creates with an operation: its name lowercased, spaces as hyphens, plus "-bot"."""
+    return operation_name.lower().replace(" ", "-") + "-bot"
+
+
 def select_operation_bot(observed: dict[str, Any]) -> dict[str, Any]:
-    matches = [
+    operation = observed.get("operation_by_pk") or {}
+    operation_name = str(operation.get("name") or "")
+    operation_id = operation.get("id")
+    if not operation_name.strip() or type(operation_id) is not int:
+        raise RuntimeError(
+            "Mythic returned no name for the current operation, so its bot cannot be identified. "
+            + EXPLICIT_BINDING_HINT
+        )
+    expected = operation_bot_name(operation_name)
+    bots = [
         row
         for row in observed.get("operator", [])
         if row.get("account_type") == "bot"
         and row.get("active") is True
         and row.get("deleted") is False
+        and row.get("current_operation_id") == operation_id
     ]
+    matches = [row for row in bots if row.get("username") == expected]
     if len(matches) != 1:
-        raise RuntimeError("Expected exactly one active Mythic bot operator for the current operation.")
+        seen = ", ".join(sorted(str(row.get("username")) for row in bots)) or "none"
+        raise RuntimeError(
+            f"No single active Mythic bot named {expected!r} in the current operation "
+            f"(active bots seen: {seen}). " + EXPLICIT_BINDING_HINT
+        )
     _require_exact_int(matches[0].get("id"), "Current operation bot operator id")
     return matches[0]
 
@@ -629,6 +681,9 @@ async def ensure_api_token(
     operator_id: int | None = None,
     api_token_id: int | None = None,
 ) -> dict[str, Any]:
+    operation_id = _require_exact_int(
+        getattr(client, "current_operation_id", None), "Current Mythic operation id"
+    )
     if operator_id is None:
         operator_id = _require_exact_int(
             (await resolve_operation_bot(client)).get("id"),
@@ -636,21 +691,18 @@ async def ensure_api_token(
         )
     expected_operator_id = _require_exact_int(operator_id, "Requested API token operator id")
     observed = await mythic.execute_custom_query(client, READINESS_QUERY)
-    usable = [
-        row
-        for row in observed.get("apitokens", [])
-        if (
-            (expected_operator_id is None or row.get("operator_id") == expected_operator_id)
-            and AUTONOMOUS_TOKEN_SCOPES.issubset(_scopes(row))
-        )
-    ]
+    usable = usable_bot_tokens(
+        observed.get("apitokens", []),
+        operator_id=expected_operator_id,
+        operation_id=operation_id,
+    )
     if api_token_id is not None:
         selected_id = _require_exact_int(api_token_id, "Requested API token id")
         usable = [row for row in usable if row.get("id") == selected_id]
         if not usable:
             raise RuntimeError(
-                "Requested backing API token is not an active wildcard token owned by "
-                "the current operation bot."
+                "Requested backing API token is not an active token owned by the current operation bot "
+                "with Sage's channel scopes."
             )
     if usable:
         return {"created": False, "api_token": usable[0]}
@@ -660,11 +712,11 @@ async def ensure_api_token(
         variables={
             "operatorId": expected_operator_id,
             "name": name,
-            "scopes": sorted(AUTONOMOUS_TOKEN_SCOPES),
+            "scopes": sorted(CHANNEL_TOKEN_SCOPES),
         },
     )
     token = dict(_require_success("API token creation", result.get("createAPIToken") or {}))
-    if expected_operator_id is not None and token.get("operator_id") != expected_operator_id:
+    if token.get("operator_id") != expected_operator_id:
         raise RuntimeError("Mythic API token creation returned the wrong operator_id.")
     return {"created": True, "api_token": token}
 
@@ -685,7 +737,7 @@ async def create_locked_channel(
     metadata: dict[str, Any] | None = None,
     token_name: str = "Sage native chat",
 ) -> dict[str, Any]:
-    # Under a scoped driver token, the session cannot run the wildcard-token
+    # Under a scoped driver token, the session cannot run the backing-token
     # readiness query (it lacks apitoken.read). When SAGE_BACKING_APITOKEN_ID is set, bind the channel
     # directly to that tasking-capable backing token id, using SAGE_CHAT_CONTAINER_ID for the container
     # so no privileged read is needed. The kernel tasks via the backing token; the driver cannot.
@@ -702,8 +754,7 @@ async def create_locked_channel(
             api_token_id=api_token_id,
         )
         observed = await mythic.execute_custom_query(client, READINESS_QUERY)
-        container, _token = select_chat_resources(observed)
-        container_id = int(container["id"])
+        container_id = int(select_chat_container(observed)["id"])
         token_id = int(token_result["api_token"]["id"])
     channel_name = name or (
         f"sage-one-shot-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:8]}"

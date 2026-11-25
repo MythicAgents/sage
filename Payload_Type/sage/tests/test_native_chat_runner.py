@@ -19,230 +19,201 @@ assert RESTART_SPEC and RESTART_SPEC.loader
 RESTART_SPEC.loader.exec_module(restart_sage_process)
 
 
-def test_select_chat_resources_accepts_wildcard_token():
-    container, token = native_chat.select_chat_resources(
-        {
-            "consuming_container": [
-                {"id": 1, "container_running": True, "deleted": False}
-            ],
-            "apitokens": [
-                {"id": 3, "active": True, "deleted": False, "scopes": ["*"]}
-            ],
-        }
-    )
-
-    assert container["id"] == 1
-    assert token["id"] == 3
-
-
-def test_select_chat_resources_fails_without_required_scope():
-    with pytest.raises(RuntimeError, match="wildcard scope"):
-        native_chat.select_chat_resources(
-            {
-                "consuming_container": [
-                    {"id": 1, "container_running": True, "deleted": False}
-                ],
-                "apitokens": [
-                    {
-                        "id": 2,
-                        "active": True,
-                        "deleted": False,
-                        "scopes": ["apitoken.write", "chat-ai.write"],
-                    }
-                ],
-            }
-        )
+# Mythic rows read from the lab on 2026-11-25 (Mythic-v4.0.0 d8a94943, operation 1) with a read-only query:
+# ids, names and stored scope names only, no token values. Two active bots share the operation; token 31 is the
+# operation bot's token holding Sage's declared channel scopes plus the reads Mythic stores with each write;
+# token 47 is the same bot's Sage Watcher token, which lacks the channel scopes.
+LAB_OPERATION = {"id": 1, "name": "Operation Chimera"}
+LAB_BOTS = [
+    {"id": 2, "username": "operation-chimera-bot", "account_type": "bot", "active": True, "deleted": False,
+     "current_operation_id": 1},
+    {"id": 3, "username": "sage-bot", "account_type": "bot", "active": True, "deleted": False,
+     "current_operation_id": 1},
+]
+LAB_TOKEN_31 = {
+    "id": 31, "name": "Sage native chat (rc11 live check)", "operator_id": 2, "operation_id": 1,
+    "active": True, "deleted": False,
+    "scopes": ["apitoken.read", "apitoken.write", "callback.read", "chat-ai.read", "chat-ai.write",
+               "credential.read", "credential.write", "eventlog.read", "eventlog.write", "file.read",
+               "file.write", "operation.read", "operator.read", "payload.read", "payload.write",
+               "response.read", "task.read", "task.write"],
+}
+LAB_TOKEN_47 = {
+    "id": 47, "name": "Sage Watcher (rc11 live check r3)", "operator_id": 2, "operation_id": 1,
+    "active": True, "deleted": False,
+    "scopes": ["callback.read", "chat-ai.read", "chat.read", "chat.write", "credential.read", "eventlog.read",
+               "eventlog.write", "file.read", "operation.read", "payload.read", "response.read", "task.read"],
+}
+LAB_CONTAINER = {"id": 1, "name": "sage", "type": "chat", "container_running": True, "deleted": False}
+LAB_CLIENT = type("LabClient", (), {"current_operation_id": 1})()
 
 
-def test_ensure_api_token_creates_wildcard_for_autonomous_operations(monkeypatch):
+def _channel_scopes():
+    from sage_chat.models import _CHANNEL_TOKEN_SCOPES
+
+    return sorted(_CHANNEL_TOKEN_SCOPES)
+
+
+def _lab_bot_rows(bots=None, operation=None):
+    return {"operation_by_pk": dict(operation or LAB_OPERATION),
+            "operator": [dict(row) for row in (bots if bots is not None else LAB_BOTS)]}
+
+
+def _lab_graphql(monkeypatch, *, bots=None, tokens=None, created_id=80):
+    """A fake GraphQL endpoint answering the runner's real queries from the recorded lab rows."""
     calls = []
-
-    async def fake_query(client, query, variables=None):
-        calls.append(variables)
-        if variables is None:
-            return {
-                "consuming_container": [],
-                "apitokens": [
-                    {
-                        "id": 2,
-                        "active": True,
-                        "deleted": False,
-                        "scopes": ["apitoken.write", "chat-ai.write"],
-                    }
-                ],
-            }
-        return {
-            "createAPIToken": {
-                "id": 3,
-                "name": "Sage native chat",
-                "scopes": ["*"],
-                "status": "success",
-                "error": "",
-                "operator_id": 7,
-            }
-        }
-
-    monkeypatch.setattr(native_chat.mythic, "execute_custom_query", fake_query)
-
-    result = asyncio.run(native_chat.ensure_api_token(object(), operator_id=7))
-
-    assert result["created"] is True
-    assert calls[-1]["operatorId"] == 7
-    assert calls[-1]["scopes"] == ["*"]
-
-
-def test_select_operation_bot_requires_exact_unique_owner():
-    selected = native_chat.select_operation_bot({
-        "operator": [
-            {
-                "id": 7,
-                "username": "range-bot-alpha",
-                "account_type": "bot",
-                "active": True,
-                "deleted": False,
-            }
-        ]
-    })
-
-    assert selected["id"] == 7
-
-    with pytest.raises(RuntimeError, match="exactly one active Mythic bot operator"):
-        native_chat.select_operation_bot({"operator": []})
-
-    with pytest.raises(RuntimeError, match="exactly one active Mythic bot operator"):
-        native_chat.select_operation_bot({
-            "operator": [
-                {
-                    "id": 7,
-                    "username": "range-bot-alpha",
-                    "account_type": "bot",
-                    "active": True,
-                    "deleted": False,
-                },
-                {
-                    "id": 8,
-                    "username": "range-bot-beta",
-                    "account_type": "bot",
-                    "active": True,
-                    "deleted": False,
-                },
-            ]
-        })
-
-
-def test_resolve_operation_bot_binds_to_current_operation(monkeypatch):
-    observed = {}
-
-    class _Client:
-        current_operation_id = 12
-
-    async def fake_query(client, query, variables=None):
-        observed["query"] = query
-        observed["variables"] = variables
-        return {
-            "operator": [
-                {
-                    "id": 7,
-                    "username": "range-bot-alpha",
-                    "account_type": "bot",
-                    "active": True,
-                    "deleted": False,
-                }
-            ]
-        }
-
-    monkeypatch.setattr(native_chat.mythic, "execute_custom_query", fake_query)
-
-    result = asyncio.run(native_chat.resolve_operation_bot(_Client()))
-
-    assert observed["query"] == native_chat.OPERATION_BOT_QUERY
-    assert observed["variables"] == {"operationId": 12}
-    assert result["id"] == 7
-
-
-def test_ensure_api_token_creates_wildcard_for_exact_operation_bot_owner(monkeypatch):
-    calls = []
+    tokens = [dict(row) for row in (tokens if tokens is not None else [LAB_TOKEN_47, LAB_TOKEN_31])]
 
     async def fake_query(client, query, variables=None):
         calls.append((query, variables))
-        if query == native_chat.READINESS_QUERY:
-            return {
-                "apitokens": [
-                    {
-                        "id": 2,
-                        "operator_id": 99,
-                        "active": True,
-                        "deleted": False,
-                        "scopes": ["*"],
-                    }
-                ],
-            }
-        return {
-            "createAPIToken": {
-                "id": 3,
-                "name": "Sage BHUSA demo",
-                "scopes": ["*"],
-                "status": "success",
-                "error": "",
-                "operator_id": 7,
-            }
-        }
-
-    monkeypatch.setattr(native_chat.mythic, "execute_custom_query", fake_query)
-
-    result = asyncio.run(
-        native_chat.ensure_api_token(
-            object(),
-            name="Sage BHUSA demo",
-            operator_id=7,
-        )
-    )
-
-    assert result["created"] is True
-    assert calls[-1][1]["operatorId"] == 7
-    assert result["api_token"]["operator_id"] == 7
-
-
-def test_fresh_bot_token_backs_channel_while_human_remains_creator(monkeypatch):
-    admin_client = type("Client", (), {
-        "server_ip": "mythic.test", "server_port": 7443, "ssl": True,
-        "global_timeout": -1, "current_operation_id": 12,
-    })()
-    channel_creator = []
-    readiness_calls = 0
-
-    async def fake_query(client, query, variables=None):
-        nonlocal readiness_calls
         if query == native_chat.OPERATION_BOT_QUERY:
-            return {"operator": [{"id": 7, "account_type": "bot", "active": True, "deleted": False}]}
+            assert variables == {"operationId": 1}
+            return _lab_bot_rows(bots)
         if query == native_chat.READINESS_QUERY:
-            readiness_calls += 1
-            return {
-                "consuming_container": [{"id": 1, "container_running": True, "deleted": False}],
-                "apitokens": [{"id": 99, "operator_id": 1, "scopes": ["*"]}],
-            }
+            return {"consuming_container": [dict(LAB_CONTAINER)], "apitokens": tokens}
         if query == native_chat.CREATE_TOKEN_MUTATION:
-            return {"createAPIToken": {"id": 55, "operator_id": 7, "scopes": ["*"], "status": "success"}}
+            return {"createAPIToken": {"id": created_id, "name": variables["name"], "status": "success",
+                                       "error": "", "operator_id": variables["operatorId"],
+                                       "scopes": variables["scopes"], "token_type": "api"}}
         if query == native_chat.CREATE_CHANNEL_MUTATION:
-            channel_creator.append(client)
-            assert variables["tokenId"] == 55
-            return {"chatCreateChannel": {"status": "success", "channel_id": 88}}
+            return {"chatCreateChannel": {"status": "success", "error": "", "channel_id": 90}}
         raise AssertionError(query)
 
     monkeypatch.setattr(native_chat.mythic, "execute_custom_query", fake_query)
-    result = asyncio.run(native_chat.create_locked_channel(admin_client))
+    return calls
 
-    assert channel_creator == [admin_client]
+
+def _created(calls):
+    return [variables for query, variables in calls if query == native_chat.CREATE_TOKEN_MUTATION]
+
+
+def test_the_operations_own_bot_is_chosen_among_several_active_bots():
+    assert native_chat.select_operation_bot(_lab_bot_rows())["id"] == 2
+    assert native_chat.select_operation_bot(_lab_bot_rows(list(reversed(LAB_BOTS))))["id"] == 2
+
+
+def test_mythics_bot_name_rule_lowercases_and_hyphenates_the_operation_name():
+    assert native_chat.operation_bot_name("Operation Chimera") == "operation-chimera-bot"
+    assert native_chat.operation_bot_name("Red Team  Q4") == "red-team--q4-bot"
+
+
+@pytest.mark.parametrize("change", [
+    {"active": False}, {"deleted": True}, {"current_operation_id": 4}, {"account_type": "user"},
+    {"username": "operation-chimera"},
+])
+def test_a_near_match_of_the_operation_bot_fails_closed_naming_the_explicit_binding(change):
+    bots = [{**LAB_BOTS[0], **change}, LAB_BOTS[1]]
+    with pytest.raises(RuntimeError) as raised:
+        native_chat.select_operation_bot(_lab_bot_rows(bots))
+    message = str(raised.value)
+    assert "operation-chimera-bot" in message
+    assert "sage-bot" in message
+    assert "SAGE_BACKING_APITOKEN_ID" in message and "SAGE_CHAT_CONTAINER_ID" in message
+
+
+def test_an_operation_without_a_name_cannot_identify_its_bot():
+    with pytest.raises(RuntimeError, match="SAGE_BACKING_APITOKEN_ID"):
+        native_chat.select_operation_bot(_lab_bot_rows(operation={"id": 1, "name": ""}))
+
+
+def test_resolve_operation_bot_reads_the_operation_and_its_bots(monkeypatch):
+    calls = _lab_graphql(monkeypatch)
+    bot = asyncio.run(native_chat.resolve_operation_bot(LAB_CLIENT))
+    assert bot["id"] == 2
+    assert calls == [(native_chat.OPERATION_BOT_QUERY, {"operationId": 1})]
+
+
+def test_the_operation_bots_scoped_token_is_reused_not_recreated(monkeypatch):
+    calls = _lab_graphql(monkeypatch)
+    result = asyncio.run(native_chat.ensure_api_token(LAB_CLIENT))
+    assert result == {"created": False, "api_token": LAB_TOKEN_31}
+    assert _created(calls) == []
+
+
+def test_a_new_token_requests_exactly_sages_declared_channel_scopes(monkeypatch):
+    calls = _lab_graphql(monkeypatch, tokens=[LAB_TOKEN_47])
+    result = asyncio.run(native_chat.ensure_api_token(LAB_CLIENT, name="Sage native chat"))
+    assert result["created"] is True
+    assert _created(calls) == [{"operatorId": 2, "name": "Sage native chat", "scopes": _channel_scopes()}]
+    assert "*" not in _created(calls)[0]["scopes"]
+
+
+def _token_near_matches():
+    yield "another bot", {**LAB_TOKEN_31, "operator_id": 3}
+    yield "another operation", {**LAB_TOKEN_31, "operation_id": 4}
+    yield "wildcard only", {**LAB_TOKEN_31, "scopes": ["*"]}
+    for scope in _channel_scopes():
+        yield f"missing {scope}", {**LAB_TOKEN_31, "scopes": [s for s in LAB_TOKEN_31["scopes"] if s != scope]}
+
+
+@pytest.mark.parametrize("label,token", list(_token_near_matches()), ids=[label for label, _ in _token_near_matches()])
+def test_a_token_near_match_is_never_reused(monkeypatch, label, token):
+    calls = _lab_graphql(monkeypatch, tokens=[LAB_TOKEN_47, token])
+    result = asyncio.run(native_chat.ensure_api_token(LAB_CLIENT))
+    assert result["created"] is True, label
+    assert _created(calls)[0]["scopes"] == _channel_scopes()
+
+    _lab_graphql(monkeypatch, tokens=[LAB_TOKEN_47, token])
+    with pytest.raises(RuntimeError, match="owned by the current operation bot"):
+        asyncio.run(native_chat.ensure_api_token(LAB_CLIENT, api_token_id=31))
+
+
+def test_the_default_channel_path_binds_the_operation_bots_scoped_token(monkeypatch):
+    monkeypatch.delenv("SAGE_BACKING_APITOKEN_ID", raising=False)
+    monkeypatch.delenv("SAGE_CHAT_CONTAINER_ID", raising=False)
+    calls = _lab_graphql(monkeypatch)
+    result = asyncio.run(native_chat.create_locked_channel(LAB_CLIENT, name="Provider split live check L"))
+    channel = [variables for query, variables in calls if query == native_chat.CREATE_CHANNEL_MUTATION]
+    assert [(row["containerId"], row["tokenId"]) for row in channel] == [(1, 31)]
+    assert _created(calls) == []
+    assert result["chat_channel_id"] == 90
+
+
+def test_fresh_bot_token_backs_channel_while_human_remains_creator(monkeypatch):
+    monkeypatch.delenv("SAGE_BACKING_APITOKEN_ID", raising=False)
+    monkeypatch.delenv("SAGE_CHAT_CONTAINER_ID", raising=False)
+    calls = _lab_graphql(monkeypatch, tokens=[LAB_TOKEN_47], created_id=55)
+    clients = []
+    real = native_chat.mythic.execute_custom_query
+
+    async def recording(client, query, variables=None):
+        clients.append(client)
+        return await real(client, query, variables)
+
+    monkeypatch.setattr(native_chat.mythic, "execute_custom_query", recording)
+    result = asyncio.run(native_chat.create_locked_channel(LAB_CLIENT))
+    channel = [variables for query, variables in calls if query == native_chat.CREATE_CHANNEL_MUTATION]
+    assert [row["tokenId"] for row in channel] == [55]
+    assert _created(calls)[0]["operatorId"] == 2
+    assert set(clients) == {LAB_CLIENT}
     assert result["api_token_id"] == 55
     assert "token_value" not in native_chat.CREATE_TOKEN_MUTATION
 
 
+def test_the_explicit_binding_still_skips_every_read(monkeypatch):
+    monkeypatch.setenv("SAGE_BACKING_APITOKEN_ID", "31")
+    monkeypatch.setenv("SAGE_CHAT_CONTAINER_ID", "1")
+    calls = _lab_graphql(monkeypatch, bots=[])
+    asyncio.run(native_chat.create_locked_channel(LAB_CLIENT, name="Explicit binding"))
+    assert [query for query, _ in calls] == [native_chat.CREATE_CHANNEL_MUTATION]
+    assert calls[0][1]["tokenId"] == 31 and calls[0][1]["containerId"] == 1
+
+
+def test_readiness_selects_the_operation_bots_scoped_token():
+    container, token = native_chat.select_chat_resources(
+        {"consuming_container": [LAB_CONTAINER], "apitokens": [LAB_TOKEN_47, LAB_TOKEN_31]},
+        operator_id=2, operation_id=1)
+    assert (container["id"], token["id"]) == (1, 31)
+    for near in ({**LAB_TOKEN_31, "operator_id": 3}, {**LAB_TOKEN_31, "scopes": ["*"]}, LAB_TOKEN_47):
+        with pytest.raises(RuntimeError, match="channel scopes"):
+            native_chat.select_chat_resources(
+                {"consuming_container": [LAB_CONTAINER], "apitokens": [near]}, operator_id=2, operation_id=1)
+
+
 def test_existing_admin_token_cannot_be_selected_for_bot_channel(monkeypatch):
-    async def fake_query(_client, _query, variables=None):
-        return {"apitokens": [{"id": 99, "operator_id": 1, "scopes": ["*"]}]}
-    monkeypatch.setattr(native_chat.mythic, "execute_custom_query", fake_query)
+    _lab_graphql(monkeypatch, tokens=[{**LAB_TOKEN_31, "id": 99, "operator_id": 1}])
     with pytest.raises(RuntimeError, match="owned by the current operation bot"):
-        asyncio.run(native_chat.ensure_api_token(object(), operator_id=7, api_token_id=99))
+        asyncio.run(native_chat.ensure_api_token(LAB_CLIENT, operator_id=2, api_token_id=99))
 
 
 def test_default_ai_metadata_is_autonomous(monkeypatch, tmp_path):

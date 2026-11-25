@@ -1113,6 +1113,66 @@ def test_readiness_delegates_to_shared_contract(monkeypatch):
     assert captured["channel"]["chat_channel_id"] == 4
 
 
+def test_readiness_hands_the_contract_the_operation_bots_scoped_token(monkeypatch):
+    """The real runner selection over the lab's recorded rows (2026-11-25, Mythic d8a94943): two active
+    bots in operation 1; token 31 is the operation bot's token with Sage's channel scopes, token 47 is
+    the same bot's Sage Watcher token without them."""
+    scoped = ["apitoken.read", "apitoken.write", "callback.read", "chat-ai.read", "chat-ai.write",
+              "credential.read", "credential.write", "eventlog.read", "eventlog.write", "file.read",
+              "file.write", "operation.read", "operator.read", "payload.read", "payload.write",
+              "response.read", "task.read", "task.write"]
+    watcher = ["callback.read", "chat-ai.read", "chat.read", "chat.write", "credential.read",
+               "eventlog.read", "eventlog.write", "file.read", "operation.read", "payload.read",
+               "response.read", "task.read"]
+    native_chat = bootstrap_payloads.load_native_chat_module()
+    client = type("LabClient", (), {"current_operation_id": 1})()
+
+    async def fake_inspect(_client):
+        return {"callbacks": [], "chat_containers": [{"id": 1, "container_running": True, "deleted": False}]}
+
+    async def fake_query(_client, query, variables=None):
+        if query == native_chat.READINESS_QUERY:
+            return {
+                "consuming_container": [{"id": 1, "container_running": True, "deleted": False}],
+                "apitokens": [
+                    {"id": 47, "operator_id": 2, "operation_id": 1, "active": True, "deleted": False,
+                     "scopes": watcher},
+                    {"id": 31, "operator_id": 2, "operation_id": 1, "active": True, "deleted": False,
+                     "scopes": scoped},
+                ],
+            }
+        if query == native_chat.OPERATION_BOT_QUERY:
+            return {
+                "operation_by_pk": {"id": 1, "name": "Operation Chimera"},
+                "operator": [
+                    {"id": 2, "username": "operation-chimera-bot", "account_type": "bot", "active": True,
+                     "deleted": False, "current_operation_id": 1},
+                    {"id": 3, "username": "sage-bot", "account_type": "bot", "active": True,
+                     "deleted": False, "current_operation_id": 1},
+                ],
+            }
+        if query == native_chat.PREPARED_CHANNEL_QUERY:
+            return {"chat_channel": []}
+        raise AssertionError(query)
+
+    captured = {}
+
+    class _Contract:
+        @staticmethod
+        async def collect_operator_readiness(**kwargs):
+            captured.update(kwargs)
+            return {"ready": True, "blockers": []}
+
+    monkeypatch.setattr(bootstrap_payloads, "inspect", fake_inspect)
+    monkeypatch.setattr(bootstrap_payloads, "load_native_chat_module", lambda: native_chat)
+    monkeypatch.setattr(bootstrap_payloads, "load_readiness_contract_module", lambda: _Contract)
+    monkeypatch.setattr(native_chat.mythic, "execute_custom_query", fake_query)
+
+    asyncio.run(bootstrap_payloads.readiness(client, runtime_dbs_archived=True))
+
+    assert captured["api_token"]["id"] == 31
+
+
 def test_command_readiness_returns_nonzero_when_contract_not_ready(monkeypatch, capsys):
     async def fake_login(_args):
         return object()

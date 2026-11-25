@@ -17,8 +17,10 @@ need the operator's authorization.
       LiteLLM block's ``API_KEY`` and its ``API_ENDPOINT`` is the route file's gateway; inside the container Sage's
       own dotenv and TLS bootstrap load that key and a keyed ``GET /models`` lists the gateway model. The phase 2
       credential (the ``# OpenAI`` block's key in the repo ``.env.local``) is proved by a keyed, verified-TLS
-      ``GET /models`` from this host listing both OpenAI models. Names, booleans and status codes only.
-      Verdict: ``deployment_required``, ``capture_required``, ``ready_for_live`` or ``not_ready``.
+      ``GET /models`` from this host listing both OpenAI models. The runner's default channel path: neither
+      ``SAGE_BACKING_APITOKEN_ID`` nor ``SAGE_CHAT_CONTAINER_ID`` set, exactly one live operation, the operation's
+      own bot among the active bots, and the token it would bind (id and scope names). Names, booleans, ids and
+      status codes only. Verdict: ``deployment_required``, ``capture_required``, ``ready_for_live`` or ``not_ready``.
   arm --run-file F --authorized-by TEXT
       Starts the private wire receiver, writes the resource budget, saves the installed ``.env`` and ``.env.local``
       (owner-only), adds a marked capture block to the installed ``.env`` and recreates the Sage container.
@@ -27,14 +29,20 @@ need the operator's authorization.
       environment) M1. Phase 2: writes the OpenAI block's key into the installed ``.env.local`` as its only active
       provider block (no API_ENDPOINT anywhere), recreates the container and proves the key from inside it; channel
       O (gpt-5.6-sol, effort low) O1, O2; channel G (gpt-4.1) G1. Phase 3: restores the installed ``.env.local``
-      byte for byte, recreates the container, proves the gateway key; channel L L2. Each step is terminal before the
-      next. Stops on a target task, a wrong route, a limit or a failed phase proof; always restores and cleans up.
+      byte for byte, recreates the container, proves the gateway key; channel L L2. Channels come from the runner's
+      default path. Before each step (its channel and its message) the check waits until Mythic shows the Sage
+      container running and the capture shows Sage's answer to Mythic's on-start after its latest process start.
+      Each step is terminal before the next. Stops on a target task, a wrong route, a limit, a failed phase proof
+      or a container that never becomes ready; always restores and cleans up.
   cleanup --run-file F
       Cancels this set's open requests, restores the installed ``.env.local`` and ``.env`` byte for byte, recreates
       the container, stops the receiver and confirms no open requests. Safe to repeat.
   verify --run-file F --phoenix-db P
-      Applies the frozen pass rules P1-P8 once (``evaluate``). The check did not run (``not_run``, not an attempt)
-      when O1 or L1 made no tool call, or when a phase's credential proof failed before its first step.
+      Applies the frozen pass rules P1-P9 once (``evaluate``). Each captured provider request belongs to the step
+      in flight when Sage sent it: from the step's send until Sage's last captured complete answer to its Mythic
+      request (``attribute``). P9 reads each run channel's backing token from Mythic. The check did not run
+      (``not_run``, not an attempt) when O1 or L1 made no tool call, when a phase's credential proof failed before
+      its first step, or when the container never became ready for a step.
 
 The route file is KEY=VALUE, owner-only, with no credential: GATEWAY_ENDPOINT, GATEWAY_MODEL,
 OPENAI_REASONING_MODEL, OPENAI_PLAIN_MODEL. No channel ever carries a key or an API Endpoint.
@@ -48,9 +56,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import functools
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import signal
 import sqlite3
@@ -128,6 +138,26 @@ SHADOWING_SECRETS = ("API_KEY", "API_ENDPOINT", "provider", "model", "SAGE_OPENA
                      "SAGE_OPENAI_ACCESS_PROGRAM", "SAGE_REASONING_EFFORT")
 OPERATOR_SECRETS_QUERY = ("query SageProviderSplitSecrets($operatorId: Int) { getOperatorSecrets(operator_id: "
                           "$operatorId) { status error secrets } }")
+# Before each step the check waits until Mythic shows the Sage container running and the capture shows Sage's
+# answer to Mythic's on-start after its latest process start; Sage closes still-open requests during on-start.
+GATE_SECONDS = 180
+ON_START_RESPONSE = "container_on_start_response"
+CHAT_RESPONSE = "chat_response"
+EXPLICIT_BINDING = ("SAGE_BACKING_APITOKEN_ID", "SAGE_CHAT_CONTAINER_ID")
+LIVE_OPERATIONS_QUERY = "query SageProviderSplitOperations { operation(where: {deleted: {_eq: false}, complete: {_eq: false}}) { id } }"
+CHANNEL_BINDING_QUERY = """
+query SageProviderSplitBinding($id: Int!) {
+  chat_channel_by_pk(id: $id) { id apitokens_id }
+}
+"""
+TOKEN_ROW_QUERY = """
+query SageProviderSplitToken($id: Int!) {
+  apitokens_by_pk(id: $id) {
+    id operator_id operation_id active deleted token_type scopes operator { username account_type }
+  }
+}
+"""
+OPERATION_QUERY = "query SageProviderSplitOperation($id: Int!) { operation_by_pk(id: $id) { id name } }"
 ENV_BEGIN = "# >>> provider-split check (temporary; removed by cleanup)"
 ENV_END = "# <<< provider-split check"
 PHASE2_HEADER = "# OpenAI (provider-split check, phase 2; restored by the check)"
@@ -138,6 +168,9 @@ CHANGED_FILES = (
     "Payload_Type/sage/sage_chat/config.py",
     "Payload_Type/sage/sage_chat/models.py",
     "skills/sage-focused-capability-tests/scripts/check_provider_split.py",
+    "skills/sage-live-runner/scripts/native_chat.py",
+    "skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py",
+    "skills/sage-goad-reset/scripts/readiness_contract.py",
 )
 
 
@@ -419,11 +452,11 @@ def exchanges(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for record in records:
         payload = (record.get("record") or {}).get("payload") or {}
         if record.get("kind") == "model_request":
-            requests.append(payload)
+            requests.append((payload, int((record.get("record") or {}).get("time_ns") or 0)))
         elif record.get("kind") == "model_response":
             responses[payload.get("request_id")] = payload
     out = []
-    for payload in requests:
+    for payload, sent_ns in requests:
         body = _body(payload.get("body_base64")) or {}
         url = str(payload.get("url") or "")
         path = urlsplit(url).path.rstrip("/")
@@ -432,6 +465,7 @@ def exchanges(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         response = responses.get(payload.get("request_id")) or {}
         reply = _body(response.get("body_base64"))
         out.append({
+            "request_id": payload.get("request_id"), "time_ns": sent_ns,
             "url": url, "api": api, "model": body.get("model"), "fields": sorted(k for k in RESPONSES_FIELDS
                                                                               if k in body),
             "store": body.get("store"), "include": body.get("include"), "access_programs": body.get("access_programs"),
@@ -440,6 +474,114 @@ def exchanges(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "reply": reply if isinstance(reply, dict) else {},
         })
     return out
+
+
+def _control(record: dict[str, Any], routing_key: str) -> dict[str, Any] | None:
+    payload = (record.get("record") or {}).get("payload") or {}
+    if record.get("kind") == "control_request" and payload.get("routing_key") == routing_key:
+        return payload
+    return None
+
+
+def sage_answered_on_start(records: list[dict[str, Any]]) -> bool:
+    """Whether Sage answered Mythic's on-start after its latest process start (Sage's own clock and capture)."""
+    starts = [int(r["record"]["time_ns"]) for r in records if r.get("kind") == "process_start"]
+    if not starts:
+        return False
+    latest = max(starts)
+    return any(_control(r, ON_START_RESPONSE) is not None and int(r["record"]["time_ns"]) > latest for r in records)
+
+
+def step_completions(records: list[dict[str, Any]]) -> dict[int, int]:
+    """Mythic chat request id -> time of Sage's last captured complete chat_response for it."""
+    ends: dict[int, int] = {}
+    for record in records:
+        payload = _control(record, CHAT_RESPONSE)
+        body = _body(payload.get("body_base64")) if payload else None
+        if isinstance(body, dict) and body.get("status") == "complete" and type(body.get("request_id")) is int:
+            ends[body["request_id"]] = max(ends.get(body["request_id"], 0), int(record["record"]["time_ns"]))
+    return ends
+
+
+def attribute(records: list[dict[str, Any]], steps: dict[str, dict[str, Any]],
+              ) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    """Each captured model request goes to the step in flight when Sage sent it.
+
+    A step is in flight from its send until Sage's last captured complete answer to its Mythic request (or, with
+    none captured, until the next step's send). Sage answers a channel's requests in order, so a request sent while
+    two steps are in flight belongs to the earlier one.
+    """
+    ends = step_completions(records)
+    order = sorted(steps.items(), key=lambda kv: int(kv[1]["sent_ns"]))
+    windows = []
+    for index, (step, info) in enumerate(order):
+        end = ends.get(int(info["request_id"]))
+        if end is None:
+            end = int(order[index + 1][1]["sent_ns"]) - 1 if index + 1 < len(order) else math.inf
+        windows.append((step, int(info["sent_ns"]), end))
+    by_step: dict[str, list[dict[str, Any]]] = {step: [] for step in steps}
+    unattributed = []
+    for item in exchanges(records):
+        owner = next((step for step, start, end in windows if start <= item["time_ns"] <= end), None)
+        (by_step[owner] if owner is not None else unattributed).append(item)
+    return by_step, unattributed
+
+
+def binding_problems(binding: dict[str, Any] | None, operation: dict[str, Any]) -> list[str]:
+    """P9 for one channel: its backing token is the operation bot's, live, in this operation, with the scopes."""
+    token = (binding or {}).get("token") or {}
+    if not token:
+        return ["no binding row"]
+    owner = (token.get("operator") or {})
+    scopes = {str(scope) for scope in token.get("scopes") or []}
+    problems = []
+    if owner.get("username") != _runner().operation_bot_name(str(operation.get("name") or "")):
+        problems.append("owner is not the operation's bot")
+    if token.get("active") is not True or token.get("deleted") is not False:
+        problems.append("token not active")
+    if token.get("operation_id") != operation.get("id"):
+        problems.append("token in another operation")
+    if not _runner().CHANNEL_TOKEN_SCOPES <= scopes:
+        problems.append("missing channel scopes")
+    if "*" in scopes:
+        problems.append("wildcard scope")
+    return problems
+
+
+async def default_channel_path(client: Any) -> dict[str, Any]:
+    """What the runner's default channel path would bind, from Mythic rows (ids and scope names only)."""
+    nc = _runner()
+    explicit = [name for name in EXPLICIT_BINDING if os.environ.get(name)]
+    operations = (await nc.mythic.execute_custom_query(client, LIVE_OPERATIONS_QUERY)).get("operation") or []
+    observed = await nc.mythic.execute_custom_query(
+        client, nc.OPERATION_BOT_QUERY, variables={"operationId": int(client.current_operation_id)})
+    active = sorted(str(row.get("username")) for row in observed.get("operator") or []
+                    if row.get("account_type") == "bot" and row.get("active") is True and row.get("deleted") is False)
+    state = {"explicit_binding": explicit, "live_operations": len(operations), "active_bots": active,
+             "operation_bot": None, "token": None, "error": ""}
+    try:
+        bot = nc.select_operation_bot(observed)
+    except RuntimeError as error:
+        state["error"] = str(error)
+        return state
+    state["operation_bot"] = bot["username"]
+    tokens = (await nc.mythic.execute_custom_query(client, nc.READINESS_QUERY)).get("apitokens") or []
+    usable = nc.usable_bot_tokens(tokens, operator_id=int(bot["id"]), operation_id=int(client.current_operation_id))
+    state["token"] = ({"id": usable[0]["id"], "scopes": sorted(nc._scopes(usable[0]))} if usable
+                      else "created at the first channel")
+    return state
+
+
+def default_path_blockers(state: dict[str, Any]) -> list[str]:
+    blockers = []
+    if state.get("explicit_binding"):
+        blockers.append(f"an explicit channel binding is set ({', '.join(state['explicit_binding'])}); "
+                        "the check uses the default path")
+    if state.get("live_operations") != 1:
+        blockers.append(f"Mythic has {state.get('live_operations')} live operations; the send gate needs exactly one")
+    if not state.get("operation_bot"):
+        blockers.append("the default channel path cannot pick the operation bot")
+    return blockers
 
 
 def produced_calls(item: dict[str, Any]) -> list[dict[str, str]]:
@@ -552,14 +694,15 @@ def settings_error(subscriptions: Any) -> str:
 
 
 def evaluate(run: dict[str, Any], wire: dict[str, list[dict[str, Any]]], rows: dict[str, dict[str, Any]],
-             totals: dict[str, Any], route: dict[str, str], stored_provider: dict[str, str]) -> dict[str, Any]:
-    """P1-P8 of the plan, each with its numbers, from the captured wire, Mythic rows and run records."""
+             totals: dict[str, Any], route: dict[str, str], stored_provider: dict[str, str],
+             bindings: dict[str, dict[str, Any]], operation: dict[str, Any]) -> dict[str, Any]:
+    """P1-P9 of the plan, each with its numbers, from the captured wire, Mythic rows and run records."""
     steps = run.get("steps") or {}
     all_steps = [step for step, *_ in STEPS]
     detail: dict[str, Any] = {}
     stopped = str((run.get("stopped") or {}).get("reason") or "")
-    if stopped.startswith("phase ") and stopped.split(" ")[1] in ("2", "3"):
-        return {"verdict": "not_run", "reason": f"{stopped} (readiness at the phase switch)", "criteria": {},
+    if stopped.startswith("phase ") and stopped.split(" ")[1] in ("1", "2", "3"):
+        return {"verdict": "not_run", "reason": f"{stopped} (container readiness)", "criteria": {},
                 "detail": {"recreations": [{k: r.get(k) for k in ("phase", "returncode", "process_start",
                                                                  "blockers")} for r in run.get("recreations") or []]}}
     complete = [step for step in all_steps if step in steps] == all_steps
@@ -639,6 +782,10 @@ def evaluate(run: dict[str, Any], wire: dict[str, list[dict[str, Any]]], rows: d
     detail["P8_containment"] = p8
     detail["P7_settings"] = run.get("settings_error", "not recorded")
 
+    # P9 channel binding: each run channel's backing token, from Mythic's rows
+    p9 = {channel: binding_problems(bindings.get(channel), operation) or "ok" for channel in run.get("channels") or {}}
+    detail["P9_channel_binding"] = p9
+
     criteria = {
         "P1_route": complete and all(value == "ok" for value in p1.values()),
         "P2_round_trip": all(v["consumed"] and v["answered"] for v in p2.values()),
@@ -660,6 +807,7 @@ def evaluate(run: dict[str, Any], wire: dict[str, list[dict[str, Any]]], rows: d
                            and p8["active_seconds"] <= LIMITS["active_seconds"]
                            and p8["recreations"] == LIMITS["recreations"]
                            and p8["env_local_restored"] is True and p8["env_restored"] is True),
+        "P9_channel_binding": bool(p9) and all(value == "ok" for value in p9.values()),
     }
     return {"criteria": criteria, "detail": detail, "verdict": "pass" if all(criteria.values()) else "fail"}
 
@@ -714,6 +862,12 @@ def _process_started_after(record: Path, after_ns: int) -> bool:
 
 def _base():
     return _module("sage_provider_split_base", _BASE_PATH)
+
+
+@functools.lru_cache(maxsize=1)
+def _runner():
+    """The live runner module (one owner of the bot-name rule and the channel scope set)."""
+    return _base().nc
 
 
 def _deployment():
@@ -911,6 +1065,7 @@ async def cmd_readiness(client: Any, run: dict[str, Any], args: argparse.Namespa
                 for name in (*CREDENTIAL_NAMES, *ENDPOINT_NAMES, "SAGE_OPENAI_API")),
         },
         "capture": _capture_state(run),
+        "default_channel_path": await default_channel_path(client),
         "limits": LIMITS, "token_reservation": TOKEN_RESERVATION,
         "check_sha256": _sha256_bytes(Path(__file__).read_bytes()),
     }
@@ -944,6 +1099,7 @@ async def cmd_readiness(client: Any, run: dict[str, Any], args: argparse.Namespa
         blockers.append("a user secret would shadow the installed provider settings")
     if credentials["channel_config_sets_key_or_endpoint"]:
         blockers.append("a channel configuration sets a key, endpoint or OpenAI API")
+    blockers += default_path_blockers(report["default_channel_path"])
     capture = report["capture"]
     if not report["parity"]["ready"] or report["settings_error"]:
         verdict = "deployment_required"
@@ -1059,6 +1215,23 @@ async def _switch_phase(run: dict[str, Any], phase: int, route: dict[str, str]) 
     return f"phase {phase} credential: {'; '.join(blockers)}" if blockers else ""
 
 
+async def await_sage_ready(client: Any, base: Any, record: Path, *, phase: int, timeout: float = GATE_SECONDS,
+                           poll: float = 1.0) -> str:
+    """Hold a step until Mythic shows the Sage container running and Sage has answered Mythic's on-start."""
+    deadline = time.monotonic() + timeout
+    while True:
+        rows = (await base._query(client, base.nc.READINESS_QUERY)).get("consuming_container") or []
+        running = bool(rows and rows[0].get("container_running"))
+        answered = sage_answered_on_start(read_wire(record))
+        if running and answered:
+            return ""
+        if time.monotonic() >= deadline:
+            reason = ("Mythic does not show the Sage container running" if not running
+                      else "Sage has not answered Mythic's on-start")
+            return f"phase {phase} container not ready: {reason}"
+        await asyncio.sleep(poll)
+
+
 async def cmd_cleanup(client: Any, run: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     base = _base()
     actions: dict[str, Any] = {}
@@ -1124,21 +1297,26 @@ async def cmd_run(client: Any, run: dict[str, Any], args: argparse.Namespace) ->
                 if failure:
                     run["stopped"] = {"step": step, "reason": failure}
                     break
+            failure = await await_sage_ready(client, base, record, phase=step_phase)
+            if failure:
+                run["stopped"] = {"step": step, "reason": failure}
+                break
             if channel not in run["channels"]:
                 created = await base.nc.create_locked_channel(
                     client, name=f"Provider split live check {channel}",
                     description="Sage OpenAI provider split live check", metadata=channel_config(route, channel))
                 run["channels"][channel] = int(created["chat_channel_id"])
-            wire_before, mark = len(read_wire(record)), base.phoenix_mark(phoenix)
+            mark = base.phoenix_mark(phoenix)
+            sent_ns = time.time_ns()
             message = await base.nc.create_message(client, run["channels"][channel], prompt)
             request_id = int(message["chat_request_id"])
             await base.nc.wait_for_request(client, request_id, timeout_seconds=STEP_TIMEOUT)
-            run["steps"][step] = {"request_id": request_id, "phase": step_phase, "wire_after": wire_before,
-                                  "wire_until": len(read_wire(record)), "phoenix_after": mark,
-                                  "phoenix_until": base.phoenix_mark(phoenix),
+            run["steps"][step] = {"request_id": request_id, "phase": step_phase, "sent_ns": sent_ns,
+                                  "phoenix_after": mark, "phoenix_until": base.phoenix_mark(phoenix),
                                   "tasks_after": await base._max_task(client)}
-            items = exchanges(read_wire(record)[wire_before:run["steps"][step]["wire_until"]])
-            everything = exchanges(read_wire(record))
+            records = read_wire(record)
+            items = attribute(records, run["steps"])[0][step]
+            everything = exchanges(records)
             stop = ""
             if run["steps"][step]["tasks_after"] != run["task_baseline"]:
                 stop = "a target task was created"
@@ -1172,7 +1350,7 @@ async def cmd_verify(client: Any, run: dict[str, Any], args: argparse.Namespace)
     base = _base()
     capture = run.get("capture_released") or run.get("capture") or {}
     records = read_wire(Path(capture["record"]))
-    wire = {step: exchanges(records[info["wire_after"]:info["wire_until"]]) for step, info in run["steps"].items()}
+    wire, unattributed = attribute(records, run["steps"])
     rows = {step: await base.request_rows(client, int(info["request_id"])) for step, info in run["steps"].items()}
     all_items = exchanges(records)
     totals = {"provider_calls": len(all_items), "provider_tokens": sum(usage_tokens(i) for i in all_items),
@@ -1182,13 +1360,24 @@ async def cmd_verify(client: Any, run: dict[str, Any], args: argparse.Namespace)
     for channel, channel_id in (run.get("channels") or {}).items():
         data = (await base._query(client, base.CHANNEL_QUERY, id=int(channel_id))).get("chat_channel_by_pk") or {}
         stored[channel] = str(((data.get("ai_metadata") or {}).get("config") or {}).get("provider") or "")
-    result = evaluate(run, wire, rows, totals, run.get("route_summary") or {}, stored)
+    operation = (await base._query(client, OPERATION_QUERY, id=int(client.current_operation_id))
+                 ).get("operation_by_pk") or {}
+    bindings = {}
+    for channel, channel_id in (run.get("channels") or {}).items():
+        row = (await base._query(client, CHANNEL_BINDING_QUERY, id=int(channel_id))).get("chat_channel_by_pk") or {}
+        token = ((await base._query(client, TOKEN_ROW_QUERY, id=int(row["apitokens_id"]))).get("apitokens_by_pk")
+                 if row.get("apitokens_id") else None)
+        bindings[channel] = {"apitokens_id": row.get("apitokens_id"), "token": token or {}}
+    result = evaluate(run, wire, rows, totals, run.get("route_summary") or {}, stored, bindings, operation)
     phoenix = Path(args.phoenix_db)
     result["observations"] = {
         "provider_calls_by_step": {step: len(items) for step, items in wire.items()},
         "tokens_by_step": {step: sum(usage_tokens(i) for i in items) for step, items in wire.items()},
         "tools_called": {step: [c["name"] for i in items for c in produced_calls(i)] for step, items in wire.items()},
         "streamed_replies": sum(1 for i in all_items if i["reply"].get("streamed")),
+        "unattributed_calls": len(unattributed),
+        "bindings": {c: {"token": b["apitokens_id"], "owner": (b["token"].get("operator") or {}).get("username")}
+                     for c, b in bindings.items()},
         "phoenix_llm_spans": {step: len(base.model_spans(phoenix, info["phoenix_after"], info["phoenix_until"]))
                               for step, info in run["steps"].items()},
         "answers": {step: (native_answers(rows[step]) or [""])[-1][:300] for step in rows},

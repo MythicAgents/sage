@@ -27,8 +27,9 @@ Verify the Sage chat container and create a fresh Apollo payload:
 .venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py bootstrap-reset
 ```
 
-`bootstrap-reset` must report a running `sage_chat_container`, a wildcard-scoped API token owned by the current
-operation's unique active bot, and an empty locked prepared channel named
+`bootstrap-reset` must report a running `sage_chat_container`, an API token with Sage's channel scopes owned by
+the current operation's own bot (Mythic names it after the operation, for example `operation-chimera-bot`), and an
+empty locked prepared channel named
 `Sage GOAD Ready`, and `sage_payload_created: false`.
 
 The standalone command keeps that prepare-chat behavior for compatibility. When the operator will create the

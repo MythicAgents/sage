@@ -645,8 +645,11 @@ async def readiness(
     channel = None
     try:
         resources = await mythic.execute_custom_query(client, native_chat.READINESS_QUERY)
+        operation_bot = await native_chat.resolve_operation_bot(client)
         _container, api_token = native_chat.select_chat_resources(
             resources,
+            operator_id=int(operation_bot["id"]),
+            operation_id=int(client.current_operation_id),
             api_token_id=api_token_id,
         )
     except Exception:
