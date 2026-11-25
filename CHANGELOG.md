@@ -16,6 +16,11 @@ between minor releases.
 - The Sage Watcher records its applied profile as a **Watcher** chip in its owner channel, because Mythic now keeps
   only chip items from a metadata update. A Watcher applied before this upgrade keeps running after a restart, and
   the next `/watcher apply` moves it to the chip.
+- The Watcher's bot token check accepts the stored grants Mythic now writes. Mythic stores a token's implied reads
+  (`chat.read`, `eventlog.read`) with the scopes it was created with, and Sage used to require the stored grants to
+  equal the nine documented scopes, so every Watcher scan stopped as `unconfigured`. The stored grants must now hold
+  the nine and nothing beyond those two reads; the effective scopes must still equal all eleven exactly, so the
+  Watcher's authority is unchanged.
 - A blank **OpenAI API** now always means Chat Completions. It used to leave the choice to LangChain's OpenAI adapter,
   which picks the Responses API on its own for some models (`gpt-5-pro`, `gpt-5.2-pro`, `gpt-5.4-pro`, `gpt-5.5-pro`
   and `codex` models, and from this release `gpt-5.6-sol` and any `gpt-6` model with tools). Those requests carried

@@ -13,9 +13,9 @@ sudo ./mythic-cli install github https://github.com/MythicAgents/sage
 ```
 
 {{% notice info %}}
-Sage requires **Mythic v4.0.0 or later**. As of this writing that release lives on Mythic's `Mythic-v4.0.0`
-branch and has not been merged to the default branch, so you must install Mythic from that branch. Once it
-merges, a normal Mythic installation will satisfy this requirement.
+Sage requires Mythic's **`Mythic-v4.0.0` branch at commit `d8a94943` or later**. As of this writing that
+release has not been merged to the default branch, so you must install Mythic from that branch. Older Mythic v4
+servers are not supported, because they cannot save Sage's channel-metadata updates.
 {{% /notice %}}
 
 ## Create a Sage chat
@@ -44,7 +44,7 @@ and cannot claim or change the Watcher owner generation.
 | `SAGE_WATCHER_API_ENDPOINT` / `SAGE_WATCHER_API_KEY` | Optional Watcher-only endpoint and credential. Both may instead be identically named Mythic user secrets or environment values. |
 | `SAGE_WATCHER_AWS_ACCESS_KEY_ID` / `SAGE_WATCHER_AWS_SECRET_ACCESS_KEY` / `SAGE_WATCHER_AWS_SESSION_TOKEN` / `SAGE_WATCHER_AWS_DEFAULT_REGION` | Watcher-only Bedrock credentials and region. |
 | `SAGE_WATCHER_INTERVAL_SECONDS` | Applied cadence. Default: 300 seconds; accepted range: 5–86,400 integer seconds. |
-| `SAGE_WATCHER_APITOKEN` | Persistent API token for an active Mythic bot whose current operation is the watched operation. Its stored grants must be exactly `callback.read`, `chat-ai.read`, `chat.write`, `credential.read`, `eventlog.write`, `file.read`, `operation.read`, `response.read`, and `task.read`; wildcard and excess scopes fail closed. Mythic expands the two write grants with `chat.read` and `eventlog.read`, and Sage checks that effective closure exactly. |
+| `SAGE_WATCHER_APITOKEN` | Persistent API token for an active Mythic bot whose current operation is the watched operation. Create it with exactly `callback.read`, `chat-ai.read`, `chat.write`, `credential.read`, `eventlog.write`, `file.read`, `operation.read`, `response.read`, and `task.read`. Mythic adds the implied `chat.read` and `eventlog.read` to the token's stored grants, so the stored grants must hold those nine and may hold only those two reads besides; wildcard and other excess scopes fail closed. Sage checks the effective scopes against that closure of eleven exactly. |
 | `SAGE_FINDINGS_SLACK_WEBHOOK_URL` | Optional approved Slack destination. Sage sends only a fixed generic change notice; full findings remain in Mythic. Modern Slack app webhooks are bound to their installed channel, so use one URL per destination. |
 | `SAGE_FINDINGS_SLACK_CHANNEL_ID` | Optional C/G channel ID for a **legacy custom-integration** webhook. Modern Slack app incoming webhooks cannot override their installed channel. |
 

@@ -735,3 +735,139 @@ def test_bootstrap_reuses_legacy_description_and_duplicate_channels_fail_closed(
 
     with pytest.raises(Exception, match="multiple managed Sage findings channels"):
         asyncio.run(run(legacy + [{"id": 13, "name": FINDINGS_CHANNEL_NAME}]))
+
+
+# Mythic-v4.0.0 d8a94943 stores a token's implied reads at issuance (database/api_tokens.go) and checks stored
+# grants exactly (authorization/catalog.go), so whoami reports stored grants equal to the effective closure.
+# RECONSTRUCTED shape, not a recording: the live d8a94943 Watcher token requested with the nine documented scopes
+# showed stored 11 (excess chat.read and eventlog.read over the nine) and effective equal to the closure. Only that
+# scope diff was recorded; no token value is involved.
+def _d8a94943_whoami(**changes):
+    closure = sorted(REQUIRED_WATCHER_EFFECTIVE_SCOPES)
+    return _runtime_whoami(**{"scopes": closure, "effective_scopes": list(closure), **changes})
+
+
+def _connect_with(monkeypatch, whoami):
+    monkeypatch.setenv("SAGE_WATCHER_APITOKEN", "secret-not-logged")
+    monkeypatch.setenv("NGINX_HOST", "mythic")
+
+    async def login(**_kwargs):
+        return object()
+
+    async def execute(_client, _query, _variables):
+        return {"whoami": whoami}
+
+    return MythicFindingsDelivery(login=login, execute=execute).connect("7")
+
+
+def test_connect_accepts_a_d8a94943_token_whose_stored_grants_carry_the_implied_reads(monkeypatch):
+    session = asyncio.run(_connect_with(monkeypatch, _d8a94943_whoami()))
+    assert session.identity.username == "sage-bot"
+    assert session.identity.effective_scopes == tuple(sorted(REQUIRED_WATCHER_EFFECTIVE_SCOPES))
+
+
+def test_connect_accepts_stored_grants_between_the_documented_set_and_its_closure(monkeypatch):
+    stored = [*_runtime_whoami()["scopes"], "chat.read"]
+    session = asyncio.run(_connect_with(monkeypatch, _d8a94943_whoami(scopes=stored)))
+    assert set(session.identity.effective_scopes) == REQUIRED_WATCHER_EFFECTIVE_SCOPES
+
+
+_CLOSURE = sorted(REQUIRED_WATCHER_EFFECTIVE_SCOPES)
+
+
+@pytest.mark.parametrize(
+    ("changes", "match"),
+    [
+        ({"scopes": ["*"]}, "stored grants.*excess \\*"),
+        ({"scopes": [*_CLOSURE, "chat.*"]}, "stored grants.*excess chat\\.\\*"),
+        ({"scopes": [*_CLOSURE, "task.write"]}, "stored grants.*excess task\\.write"),
+        ({"scopes": [*_CLOSURE, "chat-ai.write"]}, "stored grants.*excess chat-ai\\.write"),
+        ({"scopes": [s for s in _CLOSURE if s != "eventlog.write"]}, "stored grants.*missing eventlog\\.write"),
+        ({"scopes": [s for s in _CLOSURE if s != "chat.write"]}, "stored grants.*missing chat\\.write"),
+        ({"effective_scopes": [s for s in _CLOSURE if s != "eventlog.read"]}, "effective scopes.*missing eventlog"),
+        (
+            {"scopes": _runtime_whoami()["scopes"], "effective_scopes": _runtime_whoami()["scopes"]},
+            "effective scopes.*missing chat\\.read, eventlog\\.read",
+        ),
+        ({"scopes": [*_CLOSURE, "CHAT.READ"]}, "malformed"),
+    ],
+)
+def test_connect_rejects_d8a94943_near_matches(monkeypatch, changes, match):
+    with pytest.raises(WatcherConfigurationError, match=match):
+        asyncio.run(_connect_with(monkeypatch, _d8a94943_whoami(**changes)))
+
+
+def test_watcher_scan_runs_on_a_d8a94943_token_through_the_real_connect(tmp_path, monkeypatch):
+    """Sage's real Watcher manager, operation-memory store and findings delivery around one `/watcher scan`.
+
+    Synthetic around them: login, the GraphQL execute (the reconstructed d8a94943 whoami above and one existing
+    #sage-findings channel), the owner channel, and a source refresh that reports nothing new.
+    """
+    from types import SimpleNamespace
+
+    from sage_chat.findings_watcher import FindingsWatcherManager
+    from sage_chat.headless import build_chat_request
+    from sage_chat.watcher_control import WatcherChannel
+
+    monkeypatch.setenv("SAGE_WATCHER_APITOKEN", "secret-not-logged")
+    monkeypatch.setenv("NGINX_HOST", "mythic")
+    owner = WatcherChannel(
+        channel_id=41, operation_id=7, name="watcher-owner", model="Sage Watcher", container="sage",
+        locked=True, archived=False, backing_apitoken_id=9, config={}, channel_metadata={},
+    )
+
+    class Control:
+        async def publish_profile_metadata(self, **_kwargs):
+            return None
+
+        async def inspect_channel(self, _client, *, channel_id, operation_id):
+            return owner
+
+    class Runtime:
+        def __init__(self, path):
+            self.store = OperationMemoryStore(path)
+
+        async def refresh(self, *_args, admission_guard=None, **_kwargs):
+            await admission_guard()
+            return SimpleNamespace(view=(), snapshot=await self.store.snapshot("7"), changed_source_count=0,
+                                   reasoning=None)
+
+        async def current_view(self, operation):
+            return (), await self.store.snapshot(operation)
+
+        async def close(self):
+            await self.store.close()
+
+    queries = []
+
+    async def login(**_kwargs):
+        return object()
+
+    async def execute(_client, query, _variables):
+        queries.append(query)
+        if "SageWatcherWhoami" in query:
+            return {"whoami": _d8a94943_whoami()}
+        if "SageFindingsChannels" in query:
+            return {"chat_channel": [{"id": 12, "name": FINDINGS_CHANNEL_NAME}]}
+        raise AssertionError(query[:60])
+
+    class NoLoop(FindingsWatcherManager):
+        async def _start_loop(self, operation):
+            return None
+
+    async def scenario():
+        manager = NoLoop(Runtime(tmp_path / "watcher.db"), delivery=MythicFindingsDelivery(login=login, execute=execute),
+                         control_plane=Control(), interval_seconds=300)
+        try:
+            request = build_chat_request("/watcher apply", model="Sage Watcher", operation_id=7, channel_id=41,
+                                         config={"SAGE_WATCHER_PROVIDER": "openai", "SAGE_WATCHER_MODEL": "route-model"})
+            await manager.apply_profile(request, owner)
+            return await manager.command("7", "scan", owner_channel_id=41)
+        finally:
+            await manager.close()
+
+    status = asyncio.run(scenario())
+    assert (status["status"], status["last_error_code"], status["pending_deliveries"]) == ("running", "", 0)
+    assert status["bot_username"] == "sage-bot"
+    assert status["findings_channel_id"] == 12
+    assert any("SageWatcherWhoami" in query for query in queries)

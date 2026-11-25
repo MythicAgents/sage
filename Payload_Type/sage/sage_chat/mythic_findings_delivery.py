@@ -221,11 +221,14 @@ class MythicFindingsDelivery:
         effective_scopes = _exact_scope_set(
             row.get("effective_scopes"), field="effective scopes"
         )
-        if granted_scopes != REQUIRED_WATCHER_SCOPES:
-            missing = REQUIRED_WATCHER_SCOPES - granted_scopes
-            excess = granted_scopes - REQUIRED_WATCHER_SCOPES
+        # Mythic may store a write grant's implied read with it (newer servers do so at issuance), so the
+        # stored grants hold every required scope and nothing outside the closure; authority stays bounded
+        # by the exact effective check below.
+        missing = REQUIRED_WATCHER_SCOPES - granted_scopes
+        excess = granted_scopes - REQUIRED_WATCHER_EFFECTIVE_SCOPES
+        if missing or excess:
             raise WatcherConfigurationError(
-                "watcher bot stored grants must exactly match the frozen runtime class"
+                "watcher bot stored grants must contain the frozen runtime class and stay within its Mythic closure"
                 + (": missing " + ", ".join(sorted(missing)) if missing else "")
                 + ("; excess " + ", ".join(sorted(excess)) if excess else "")
             )

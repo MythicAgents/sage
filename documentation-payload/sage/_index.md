@@ -20,7 +20,8 @@ and operates through your existing payloads, and never touches the target enviro
 Mythic **chat container** — it installs into a Mythic server and has no function outside one.
 
 {{% notice info %}}
-Sage requires **Mythic v4.0.0 or later**. Native chat containers do not exist before v4.0.0.
+Sage requires Mythic's **`Mythic-v4.0.0` branch at commit `d8a94943` or later**. Native chat containers do not
+exist before v4.0.0, and older v4 servers cannot save Sage's channel-metadata updates.
 {{% /notice %}}
 
 ### Highlighted Features
