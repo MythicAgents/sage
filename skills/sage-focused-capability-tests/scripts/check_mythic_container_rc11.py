@@ -16,7 +16,9 @@ deployed container and reads Mythic's own rows. One run file (JSON, owner-only) 
       the installed .env.local, a keyed verified-TLS GET /models from inside the container, no shadowing user
       secret. The Watcher route by name only: SAGE_WATCHER_PROVIDER, SAGE_WATCHER_MODEL, SAGE_WATCHER_API_ENDPOINT,
       SAGE_WATCHER_API_KEY and SAGE_WATCHER_APITOKEN active in the installed .env.local, provider openai, the route's
-      model and endpoint. Verdict: ready_for_live, deployment_required or not_ready with blockers.
+      model and endpoint. The Watcher credential: Sage's own `MythicFindingsDelivery.connect`, run inside the
+      container with the .env files loaded as Sage loads them, succeeds for the operation (booleans, the error class
+      and the bot username only). Verdict: ready_for_live, deployment_required or not_ready with blockers.
   run --run-file F --route-file R --phoenix-db P --callback N --plan PLAN --authorized-by TEXT --pip-audit BIN
       Runs `sage-line check-attempt PLAN` first and refuses on failure. Records A1 (the container's installed set,
       `pip check`, and pip-audit of that set). Then, each request terminal before the next:
@@ -322,6 +324,42 @@ def watcher_route(installed: Path, route: dict[str, str]) -> dict[str, Any]:
             == dep._normalized(route["API_ENDPOINT"])}
 
 
+# Sage's own Watcher connect inside the deployed container, with the token Sage itself would load (main.py's loader).
+# Prints booleans, the error class and the bot username; never a token or key value.
+_WATCHER_CONNECT_PROBE = r"""
+import asyncio, json, os, sys
+sys.path.insert(0, "/Mythic")
+from dotenv_bootstrap import load_sage_dotenv
+load_sage_dotenv("/Mythic")
+out = {"token_present": bool(os.environ.get("SAGE_WATCHER_APITOKEN", "").strip()), "connected": False,
+       "effective_equals_closure": False, "bot_username": None, "error": None}
+try:
+    from sage_chat.mythic_findings_delivery import REQUIRED_WATCHER_EFFECTIVE_SCOPES, MythicFindingsDelivery
+    identity = asyncio.run(MythicFindingsDelivery().connect(sys.argv[1])).identity
+    out.update(connected=True, bot_username=identity.username,
+               effective_equals_closure=set(identity.effective_scopes) == set(REQUIRED_WATCHER_EFFECTIVE_SCOPES))
+except Exception as error:
+    out["error"] = type(error).__name__
+print(json.dumps(out))
+"""
+
+
+def watcher_connect(operation_id: Any) -> dict[str, Any]:
+    """Readiness for the Watcher credential: Sage's own connect, in the container, for this operation."""
+    completed = subprocess.run(["docker", "exec", "-w", "/Mythic", "sage", "python3", "-c", _WATCHER_CONNECT_PROBE,
+                                str(operation_id)], capture_output=True, text=True, timeout=90)
+    try:
+        return json.loads(completed.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {"connected": False, "error": "probe did not report", "returncode": completed.returncode}
+
+
+def watcher_connect_blockers(report: dict[str, Any]) -> list[str]:
+    if report.get("connected") is True and report.get("effective_equals_closure") is True:
+        return []
+    return [f"Sage's own Watcher connect fails in the container ({report.get('error') or 'scope mismatch'})"]
+
+
 async def cmd_readiness(client: Any, run: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     base, dep, reasoning = _base(), _dep(), _reasoning()
     route = dep.read_route(Path(args.route_file))
@@ -361,6 +399,7 @@ async def cmd_readiness(client: Any, run: dict[str, Any], args: argparse.Namespa
             "channel_config_sets_key": False,
         },
         "watcher_route": watcher_route(installed, route),
+        "watcher_connect": watcher_connect(client.current_operation_id),
         "limits": LIMITS,
     }
     blockers = []
@@ -387,6 +426,7 @@ async def cmd_readiness(client: Any, run: dict[str, Any], args: argparse.Namespa
     if not all(wr["present"].values()) or not (wr["provider_openai"] and wr["model_matches_route"]
                                                and wr["endpoint_matches_route"]):
         blockers.append("the installed .env.local does not set the Watcher route and bot token for this route")
+    blockers.extend(watcher_connect_blockers(report["watcher_connect"]))
     verdict = "deployment_required" if not report["parity"]["ready"] else ("not_ready" if blockers else "ready_for_live")
     report["blockers"], report["verdict"] = blockers, verdict
     run.setdefault("readiness_history", []).append({"at": time.time(), "verdict": verdict, "blockers": blockers})

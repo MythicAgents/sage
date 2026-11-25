@@ -201,11 +201,12 @@ def test_a_scan_degraded_only_after_it_completed_still_passes(error):
     assert result["criteria"]["L5"] is True, result["criteria"]
 
 
-def _real_scan(tmp_path, monkeypatch, *, extra_effective_scope=None, over_bound_record=False):
+def _real_scan(tmp_path, monkeypatch, *, extra_effective_scope=None, over_bound_record=False, stored_scopes=None):
     """Sage's real Watcher manager, operation-memory store and findings delivery around one `/watcher scan`.
 
     Synthetic around it: the owner channel row, a whoami answer, one existing #sage-findings channel, and a source
     refresh that reports nothing new (the Mythic poll). These are the cold review's reproductions.
+    `stored_scopes` replaces whoami's stored grants (default: the nine documented scopes).
     """
     import asyncio
     from types import SimpleNamespace
@@ -226,6 +227,7 @@ def _real_scan(tmp_path, monkeypatch, *, extra_effective_scope=None, over_bound_
                            container="sage", locked=True, archived=False, backing_apitoken_id=9, config={},
                            channel_metadata={})
     effective = set(REQUIRED_WATCHER_EFFECTIVE_SCOPES) | ({extra_effective_scope} if extra_effective_scope else set())
+    stored = sorted(REQUIRED_WATCHER_SCOPES if stored_scopes is None else stored_scopes)
 
     class Control:  # the metadata contract itself is covered by test_watcher_marker_rc11.py
         async def publish_profile_metadata(self, **_kwargs):
@@ -256,7 +258,7 @@ def _real_scan(tmp_path, monkeypatch, *, extra_effective_scope=None, over_bound_
         if "whoami" in query:
             return {"whoami": {"status": "success", "user_id": 5, "username": "sage_watcher_bot",
                                "account_type": "bot", "active": True, "deleted": False, "current_operation_id": 1,
-                               "scopes": sorted(REQUIRED_WATCHER_SCOPES), "effective_scopes": sorted(effective)}}
+                               "scopes": stored, "effective_scopes": sorted(effective)}}
         if "SageFindingsChannels" in query:
             return {"chat_channel": [{"id": 12, "name": "sage-findings"}]}
         raise AssertionError(query[:60])
@@ -310,3 +312,67 @@ def test_l5_passes_sages_real_healthy_scan(tmp_path, monkeypatch):
     status, result = _real_scan(tmp_path, monkeypatch)
     assert (status["state"], status["last_error"], status["pending"]) == ("running", "-", 0)
     assert result["criteria"]["L5"] is True, result["criteria"]
+
+
+def test_l5_passes_sages_real_scan_of_a_d8a94943_watcher_token(tmp_path, monkeypatch):
+    # RECONSTRUCTED d8a94943 whoami: the server stores the implied chat.read and eventlog.read at issuance, so the
+    # stored grants equal the effective closure (recorded scope diff of the live Watcher token; no token value).
+    from sage_chat.mythic_findings_delivery import REQUIRED_WATCHER_EFFECTIVE_SCOPES
+
+    status, result = _real_scan(tmp_path, monkeypatch, stored_scopes=REQUIRED_WATCHER_EFFECTIVE_SCOPES)
+    assert (status["state"], status["last_error"], status["pending"]) == ("running", "-", 0)
+    assert result["criteria"]["L5"] is True, result["criteria"]
+    assert result["verdict"] == "pass"
+
+
+def _run_watcher_probe(tmp_path, env_local: str):
+    """The readiness probe's own text, run locally: a scratch directory stands in for the container's /Mythic.
+
+    It holds Sage's real dotenv loader and sage_chat package (symlinked) and a synthetic .env.local. NGINX points at a
+    closed local port, so a configured token fails at login without leaving the host.
+    """
+    import json
+    import os
+    import subprocess
+
+    runtime = ROOT / "Payload_Type/sage"
+    mythic = tmp_path / "Mythic"
+    mythic.mkdir()
+    for name in ("dotenv_bootstrap.py", "sage_chat"):
+        (mythic / name).symlink_to(runtime / name)
+    (mythic / ".env.local").write_text(env_local)
+    probe = check._WATCHER_CONNECT_PROBE.replace('"/Mythic"', repr(str(mythic)))
+    env = {key: value for key, value in os.environ.items() if not key.startswith(("SAGE_", "NGINX_"))}
+    env.update(PYTHONPATH=str(runtime), NGINX_HOST="127.0.0.1", NGINX_PORT="9", NGINX_SSL="false")
+    completed = subprocess.run([sys.executable, "-c", probe, "7"], capture_output=True, text=True, timeout=60,
+                               cwd=tmp_path, env=env)
+    return json.loads(completed.stdout.strip().splitlines()[-1]), completed.stdout + completed.stderr
+
+
+def test_watcher_connect_probe_reports_a_missing_token_as_a_blocker(tmp_path):
+    report, _output = _run_watcher_probe(tmp_path, "SAGE_WATCHER_PROVIDER=openai\n")
+    assert report == {"token_present": False, "connected": False, "effective_equals_closure": False,
+                      "bot_username": None, "error": "WatcherConfigurationError"}
+    assert check.watcher_connect_blockers(report) == [
+        "Sage's own Watcher connect fails in the container (WatcherConfigurationError)"]
+
+
+def test_watcher_connect_probe_loads_the_token_as_sage_does_and_never_prints_it(tmp_path):
+    report, output = _run_watcher_probe(tmp_path, "SAGE_WATCHER_APITOKEN=probe-token-not-printed\n")
+    assert report["token_present"] is True
+    assert (report["connected"], report["error"]) == (False, "WatcherConfigurationError")
+    assert "probe-token-not-printed" not in output
+    assert check.watcher_connect_blockers(report)
+
+
+@pytest.mark.parametrize(
+    ("report", "blocked"),
+    [
+        ({"connected": True, "effective_equals_closure": True, "bot_username": "bot", "error": None}, False),
+        ({"connected": True, "effective_equals_closure": False, "bot_username": "bot", "error": None}, True),
+        ({"connected": False, "error": "probe did not report", "returncode": 1}, True),
+        ({}, True),
+    ],
+)
+def test_watcher_connect_blocks_unless_sages_connect_succeeds_on_the_closure(report, blocked):
+    assert bool(check.watcher_connect_blockers(report)) is blocked
