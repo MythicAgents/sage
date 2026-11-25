@@ -181,8 +181,8 @@ mutation CreateSageChannel(
 """
 
 CREATE_TOKEN_MUTATION = """
-mutation CreateSageChatToken($operatorId: Int, $name: String!, $scopes: [String!]) {
-  createAPIToken(operator_id: $operatorId, name: $name, scopes: $scopes) {
+mutation CreateSageChatToken($operationId: Int!, $operatorId: Int, $name: String!, $scopes: [String!]!) {
+  createAPIToken(operation_id: $operationId, operator_id: $operatorId, name: $name, scopes: $scopes) {
     id
     name
     scopes
@@ -190,6 +190,7 @@ mutation CreateSageChatToken($operatorId: Int, $name: String!, $scopes: [String!
     status
     error
     operator_id
+    operation_id
   }
 }
 """
@@ -710,6 +711,7 @@ async def ensure_api_token(
         client,
         CREATE_TOKEN_MUTATION,
         variables={
+            "operationId": operation_id,
             "operatorId": expected_operator_id,
             "name": name,
             "scopes": sorted(CHANNEL_TOKEN_SCOPES),
@@ -718,6 +720,8 @@ async def ensure_api_token(
     token = dict(_require_success("API token creation", result.get("createAPIToken") or {}))
     if token.get("operator_id") != expected_operator_id:
         raise RuntimeError("Mythic API token creation returned the wrong operator_id.")
+    if token.get("operation_id") != operation_id:
+        raise RuntimeError("Mythic API token creation returned a token in the wrong operation.")
     return {"created": True, "api_token": token}
 
 

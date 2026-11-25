@@ -48,6 +48,27 @@ LAB_CONTAINER = {"id": 1, "name": "sage", "type": "chat", "container_running": T
 LAB_CLIENT = type("LabClient", (), {"current_operation_id": 1})()
 
 
+CREATE_TOKEN_ACTION = Path(__file__).parent / "fixtures" / "mythic_create_api_token_action.graphql"
+
+
+def _mythic_create_token(query, variables, created_id):
+    """Run the runner's token mutation through Mythic's recorded createAPIToken signature, as Hasura would."""
+    from graphql import build_schema, graphql_sync
+
+    class _Root:
+        @staticmethod
+        def createAPIToken(_info, **args):
+            return {"id": created_id, "name": args.get("name"), "status": "success", "error": "",
+                    "operator_id": args.get("operator_id"), "operation_id": args["operation_id"],
+                    "scopes": args["scopes"], "token_type": "api", "creation_time": "2026-11-25T00:00:00"}
+
+    result = graphql_sync(build_schema(CREATE_TOKEN_ACTION.read_text()), query, root_value=_Root(),
+                          variable_values=variables)
+    if result.errors:
+        raise RuntimeError(f"Mythic refused the mutation: {[error.message for error in result.errors]}")
+    return result.data
+
+
 def _channel_scopes():
     from sage_chat.models import _CHANNEL_TOKEN_SCOPES
 
@@ -72,9 +93,7 @@ def _lab_graphql(monkeypatch, *, bots=None, tokens=None, created_id=80):
         if query == native_chat.READINESS_QUERY:
             return {"consuming_container": [dict(LAB_CONTAINER)], "apitokens": tokens}
         if query == native_chat.CREATE_TOKEN_MUTATION:
-            return {"createAPIToken": {"id": created_id, "name": variables["name"], "status": "success",
-                                       "error": "", "operator_id": variables["operatorId"],
-                                       "scopes": variables["scopes"], "token_type": "api"}}
+            return _mythic_create_token(query, variables, created_id)
         if query == native_chat.CREATE_CHANNEL_MUTATION:
             return {"chatCreateChannel": {"status": "success", "error": "", "channel_id": 90}}
         raise AssertionError(query)
@@ -134,8 +153,26 @@ def test_a_new_token_requests_exactly_sages_declared_channel_scopes(monkeypatch)
     calls = _lab_graphql(monkeypatch, tokens=[LAB_TOKEN_47])
     result = asyncio.run(native_chat.ensure_api_token(LAB_CLIENT, name="Sage native chat"))
     assert result["created"] is True
-    assert _created(calls) == [{"operatorId": 2, "name": "Sage native chat", "scopes": _channel_scopes()}]
+    assert _created(calls) == [{"operationId": 1, "operatorId": 2, "name": "Sage native chat",
+                                "scopes": _channel_scopes()}]
     assert "*" not in _created(calls)[0]["scopes"]
+    assert (result["api_token"]["operation_id"], result["api_token"]["operator_id"]) == (1, 2)
+    assert "token_value" not in result["api_token"]
+
+
+def test_a_created_token_in_another_operation_is_refused(monkeypatch):
+    _lab_graphql(monkeypatch, tokens=[LAB_TOKEN_47])
+    real = native_chat.mythic.execute_custom_query
+
+    async def wrong_operation(client, query, variables=None):
+        result = await real(client, query, variables)
+        if query == native_chat.CREATE_TOKEN_MUTATION:
+            result["createAPIToken"]["operation_id"] = 4
+        return result
+
+    monkeypatch.setattr(native_chat.mythic, "execute_custom_query", wrong_operation)
+    with pytest.raises(RuntimeError, match="wrong operation"):
+        asyncio.run(native_chat.ensure_api_token(LAB_CLIENT))
 
 
 def _token_near_matches():

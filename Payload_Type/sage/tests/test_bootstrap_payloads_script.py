@@ -1066,10 +1066,15 @@ def test_readiness_delegates_to_shared_contract(monkeypatch):
         READINESS_QUERY = "query readiness"
 
         @staticmethod
-        def select_chat_resources(_resources, api_token_id=None):
+        async def resolve_operation_bot(_client):
+            return {"id": 7, "username": "range-operation-bot"}
+
+        @staticmethod
+        def select_chat_resources(_resources, *, operator_id, operation_id, api_token_id=None):
+            assert (operator_id, operation_id, api_token_id) == (7, 12, None)
             return (
                 {"id": 1, "container_running": True, "deleted": False},
-                {"id": 3, "name": "token", "scopes": ["*"]},
+                {"id": 3, "name": "token", "operator_id": 7, "scopes": ["chat-ai.write"]},
             )
 
         @staticmethod
@@ -1099,7 +1104,7 @@ def test_readiness_delegates_to_shared_contract(monkeypatch):
 
     result = asyncio.run(
         bootstrap_payloads.readiness(
-            object(),
+            type("Client", (), {"current_operation_id": 12})(),
             runtime_dbs_archived=True,
             ludus_observation={"ready": True},
             clock_observation={"ready": True},
@@ -1111,6 +1116,7 @@ def test_readiness_delegates_to_shared_contract(monkeypatch):
     assert result["ready"] is True
     assert captured["callback_summary"]["selected_foothold_cb"] == 9
     assert captured["channel"]["chat_channel_id"] == 4
+    assert captured["api_token"]["id"] == 3
 
 
 def test_readiness_hands_the_contract_the_operation_bots_scoped_token(monkeypatch):

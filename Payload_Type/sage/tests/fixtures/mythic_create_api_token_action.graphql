@@ -1,0 +1,27 @@
+# Mythic's createAPIToken action signature, cut verbatim from Mythic-v4.0.0 d8a94943
+# hasura-docker/metadata/actions.graphql (the Mutation entry and its response type; BSD 3-Clause,
+# Copyright (c) 2018, Cody Thomas). The Query root is added only because GraphQL requires one.
+type Query { _unused: Int }
+
+type Mutation {
+  createAPIToken(
+    operation_id: Int!
+    operator_id: Int
+    name: String
+    scopes: [String!]!
+  ): createAPITokenResponse!
+}
+
+type createAPITokenResponse {
+  operation_id: Int!
+  token_value: String
+  status: String!
+  error: String
+  id: Int
+  operator_id: Int
+  name: String
+  created_by: Int
+  token_type: String
+  scopes: [String!]
+  creation_time: String!
+}

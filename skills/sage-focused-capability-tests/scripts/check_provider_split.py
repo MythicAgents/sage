@@ -140,7 +140,7 @@ OPERATOR_SECRETS_QUERY = ("query SageProviderSplitSecrets($operatorId: Int) { ge
                           "$operatorId) { status error secrets } }")
 # Before each step the check waits until Mythic shows the Sage container running and the capture shows Sage's
 # answer to Mythic's on-start after its latest process start; Sage closes still-open requests during on-start.
-GATE_SECONDS = 180
+GATE_SECONDS = 120
 ON_START_RESPONSE = "container_on_start_response"
 CHAT_RESPONSE = "chat_response"
 EXPLICIT_BINDING = ("SAGE_BACKING_APITOKEN_ID", "SAGE_CHAT_CONTAINER_ID")
