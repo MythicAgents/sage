@@ -80,15 +80,22 @@ argument is still accepted and ignored. See `docs/development/TEST_TIERS.md`.
 - `check_mythic_container_rc11.py readiness|run|verify --run-file F --phoenix-db P` — the mythic-container 0.7.0rc11
   live check against a Mythic server at `Mythic-v4.0.0` `d8a94943` or later. `readiness` (read-only, `--route-file`,
   `--callback`) checks deployment parity, that the container's packages equal this branch's `constraints.txt`, that
-  the lab Mythic checkout contains that commit and its running server image was built after it, that no
-  `Sage Watcher` channel exists yet, that the callback is active, Phoenix, the task baseline, the route credential
-  by name and status, and the Watcher route and bot token by name. `run` (paid provider activity, one target task
+  the lab Mythic checkout contains that commit and its running server image was built after it, that no active
+  `Sage Watcher` channel exists and Sage's stored Watcher profile is absent or `controller-missing`, that the
+  callback is active, Phoenix, the task baseline, the route credential by name and status, the Watcher route and bot
+  token by name, and, in the container, Sage's own Watcher connect and every read a Watcher scan sends. `run` (paid provider activity, one target task
   and one `docker restart sage`; operator authorization required, `--authorized-by`, `--plan` for
   `sage-line check-attempt`, and `--pip-audit`) records the container's audit, then runs a Conversation prompt, a
   Supervised `whoami` whose first approval card it accepts, and in a new locked `Sage Watcher` channel `/watcher
   apply`, `/watcher status`, the restart, `/watcher status` and `/watcher scan`. It stops at 20 provider calls,
   300,000 tokens, 30 minutes or a second target task. `verify` applies the pass rules written in the script once,
   reading the channels' stored metadata from Mythic. One attempt per run file.
+- `probe_watcher_scope_preflight.py [--drop-scope SCOPE]` — offline: runs every GraphQL document a Sage Watcher scan
+  sends through Mythic's own API-token preflight (`authorization.Authorize`), from the Mythic checkout named by
+  `MYTHIC_CLI`, in a scratch copy of its Go module (`go test`, `GOPROXY=off`), with the scopes Mythic stores for a
+  token issued with Sage's documented set. Nothing in the checkout changes and no server is contacted. Exit 0 when
+  every document is allowed and Mythic's closure equals Sage's, 1 otherwise, 2 when it cannot run (no `go`, no
+  checkout).
 - `freeze_provider_wire.py --wire W [--wire W] --substitutions S` — writes the
   `provider_wire_round_trips.json` battery from recorded provider bodies, frozen with the SDK and adapter versions
   it names, and refuses to run on any other versions. Offline; the substitutions file is private.

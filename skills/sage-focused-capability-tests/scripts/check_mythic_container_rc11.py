@@ -10,15 +10,19 @@ deployed container and reads Mythic's own rows. One run file (JSON, owner-only) 
       Read-only. Deployment parity with this branch; Sage consuming; no open chat requests; the container's installed
       packages equal this branch's constraints.txt (mythic-container 0.7.0rc11, dynaconf 3.2.13, ujson 5.13.0); the
       lab Mythic checkout contains d8a94943, builds mythic_server from its build context, and the running
-      mythic_server image is newer than the checkout's HEAD commit; no `Sage Watcher` channel exists in the
-      operation; callback N is active; Phoenix readable and answering /healthz; the Mythic task baseline. The route
+      mythic_server image is newer than the checkout's HEAD commit; no active `Sage Watcher` channel exists in the
+      operation (archived ones are history), and Sage's stored Watcher profile for the operation, read in place in
+      the container (SQLite read-only), is absent or `controller-missing`; callback N is active; Phoenix readable and answering /healthz; the Mythic task baseline. The route
       credential, by name and status only (as the dependency-advisories check): exactly one active provider block in
       the installed .env.local, a keyed verified-TLS GET /models from inside the container, no shadowing user
       secret. The Watcher route by name only: SAGE_WATCHER_PROVIDER, SAGE_WATCHER_MODEL, SAGE_WATCHER_API_ENDPOINT,
       SAGE_WATCHER_API_KEY and SAGE_WATCHER_APITOKEN active in the installed .env.local, provider openai, the route's
       model and endpoint. The Watcher credential: Sage's own `MythicFindingsDelivery.connect`, run inside the
       container with the .env files loaded as Sage loads them, succeeds for the operation (booleans, the error class
-      and the bot username only). Verdict: ready_for_live, deployment_required or not_ready with blockers.
+      and the bot username only). The Watcher's reads: on that session, Sage's own operation-memory `fetch_page`
+      (limit 1) for each of the five streams and its findings-channel query all succeed (read-only; a boolean and
+      the error class each). Observed, not gating: the operation's task, response, credential and file counts.
+      Verdict: ready_for_live, deployment_required or not_ready with blockers.
   run --run-file F --route-file R --phoenix-db P --callback N --plan PLAN --authorized-by TEXT --pip-audit BIN
       Runs `sage-line check-attempt PLAN` first and refuses on failure. Records A1 (the container's installed set,
       `pip check`, and pip-audit of that set). Then, each request terminal before the next:
@@ -108,6 +112,14 @@ query SageRc11WatcherChannels { chat_channel(where: {chat_model: {_eq: "Sage Wat
 CALLBACK_QUERY = """
 query SageRc11Callback($cb: Int!) {
   callback(where: {display_id: {_eq: $cb}}) { display_id active payload { payloadtype { name } } }
+}
+"""
+COUNTS_QUERY = """
+query SageRc11Counts($op: Int!) {
+  task_aggregate(where: {operation_id: {_eq: $op}}) { aggregate { count } }
+  response_aggregate(where: {operation_id: {_eq: $op}}) { aggregate { count } }
+  credential_aggregate(where: {operation_id: {_eq: $op}}) { aggregate { count } }
+  filemeta_aggregate(where: {operation_id: {_eq: $op}}) { aggregate { count } }
 }
 """
 TASKS_AFTER_QUERY = """
@@ -324,40 +336,126 @@ def watcher_route(installed: Path, route: dict[str, str]) -> dict[str, Any]:
             == dep._normalized(route["API_ENDPOINT"])}
 
 
-# Sage's own Watcher connect inside the deployed container, with the token Sage itself would load (main.py's loader).
-# Prints booleans, the error class and the bot username; never a token or key value.
+# Sage's own Watcher connect inside the deployed container, with the token Sage itself would load (main.py's loader),
+# then the reads a Watcher scan sends on that session: each operation-memory stream page (limit 1) and the
+# findings-channel query, all read-only. Prints booleans, error classes and the bot username; never a token or key.
 _WATCHER_CONNECT_PROBE = r"""
 import asyncio, json, os, sys
 sys.path.insert(0, "/Mythic")
 from dotenv_bootstrap import load_sage_dotenv
 load_sage_dotenv("/Mythic")
 out = {"token_present": bool(os.environ.get("SAGE_WATCHER_APITOKEN", "").strip()), "connected": False,
-       "effective_equals_closure": False, "bot_username": None, "error": None}
-try:
+       "effective_equals_closure": False, "bot_username": None, "error": None, "reads": {}}
+
+
+async def reads(client, operation):
+    from sage_chat import mythic_findings_delivery as delivery
+    from sage_chat.operation_memory import OperationMemoryLimits
+    from sage_chat.operation_memory_source import STREAM_KEYS, MythicOperationMemorySource
+    source = MythicOperationMemorySource(client, max_inline_text_bytes=OperationMemoryLimits.from_env().max_inline_text_bytes)
+    calls = {stream: (lambda stream=stream: source.fetch_page(operation, stream, limit=1)) for stream in STREAM_KEYS}
+    calls["findings_channel"] = lambda: delivery._execute(
+        client, delivery._FINDINGS_CHANNEL_QUERY, {"name": delivery.FINDINGS_CHANNEL_NAME})
+    for name, call in calls.items():
+        try:
+            await call()
+            out["reads"][name] = {"ok": True, "error": None}
+        except Exception as error:
+            out["reads"][name] = {"ok": False, "error": type(error).__name__}
+
+
+async def main(operation):
     from sage_chat.mythic_findings_delivery import REQUIRED_WATCHER_EFFECTIVE_SCOPES, MythicFindingsDelivery
-    identity = asyncio.run(MythicFindingsDelivery().connect(sys.argv[1])).identity
-    out.update(connected=True, bot_username=identity.username,
-               effective_equals_closure=set(identity.effective_scopes) == set(REQUIRED_WATCHER_EFFECTIVE_SCOPES))
+    session = await MythicFindingsDelivery().connect(operation)
+    out.update(connected=True, bot_username=session.identity.username,
+               effective_equals_closure=set(session.identity.effective_scopes) == set(REQUIRED_WATCHER_EFFECTIVE_SCOPES))
+    await reads(session.client, session.identity.operation_id)
+
+
+try:
+    asyncio.run(main(sys.argv[1]))
 except Exception as error:
     out["error"] = type(error).__name__
 print(json.dumps(out))
 """
 
+# Sage's stored Watcher profile for the operation, read in place in the container's own database (SQLite read-only,
+# WAL-aware; never a copy). Prints the lifecycle state only.
+_WATCHER_PROFILE_PROBE = r"""
+import json, sqlite3, sys
+sys.path.insert(0, "/Mythic")
+from dotenv_bootstrap import load_sage_dotenv
+load_sage_dotenv("/Mythic")
+out = {"db_present": False, "profile_present": None, "lifecycle_state": None, "error": None}
+try:
+    from runtime_db import database_path
+    path = database_path()
+    out["db_present"] = path.is_file()
+    if not out["db_present"]:
+        out["profile_present"] = False
+    else:
+        with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as db:
+            tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            rows = db.execute("SELECT lifecycle_state FROM watcher_profiles WHERE operation_id = ?",
+                              (sys.argv[1],)).fetchall() if "watcher_profiles" in tables else []
+        out.update(profile_present=bool(rows), lifecycle_state=rows[0][0] if rows else None)
+except Exception as error:
+    out["error"] = type(error).__name__
+print(json.dumps(out))
+"""
+WATCHER_READS = ("callbacks", "tasks", "responses", "credentials", "files", "findings_channel")
 
-def watcher_connect(operation_id: Any) -> dict[str, Any]:
-    """Readiness for the Watcher credential: Sage's own connect, in the container, for this operation."""
-    completed = subprocess.run(["docker", "exec", "-w", "/Mythic", "sage", "python3", "-c", _WATCHER_CONNECT_PROBE,
-                                str(operation_id)], capture_output=True, text=True, timeout=90)
+
+def _container_probe(probe: str, operation_id: Any, timeout: int) -> dict[str, Any]:
+    completed = subprocess.run(["docker", "exec", "-w", "/Mythic", "sage", "python3", "-c", probe, str(operation_id)],
+                               capture_output=True, text=True, timeout=timeout)
     try:
         return json.loads(completed.stdout.strip().splitlines()[-1])
     except (ValueError, IndexError):
-        return {"connected": False, "error": "probe did not report", "returncode": completed.returncode}
+        return {"error": "probe did not report", "returncode": completed.returncode}
+
+
+def watcher_connect(operation_id: Any) -> dict[str, Any]:
+    """Readiness for the Watcher credential and its reads: Sage's own connect and scan reads, in the container."""
+    return {"connected": False, **_container_probe(_WATCHER_CONNECT_PROBE, operation_id, 180)}
 
 
 def watcher_connect_blockers(report: dict[str, Any]) -> list[str]:
     if report.get("connected") is True and report.get("effective_equals_closure") is True:
         return []
     return [f"Sage's own Watcher connect fails in the container ({report.get('error') or 'scope mismatch'})"]
+
+
+def watcher_reads_blockers(reads: Any) -> list[str]:
+    reads = reads if isinstance(reads, dict) else {}
+    failed = [f"{name} ({(reads.get(name) or {}).get('error') or 'not run'})" for name in WATCHER_READS
+              if (reads.get(name) or {}).get("ok") is not True]
+    return [f"the Watcher's own reads fail in the container: {', '.join(failed)}"] if failed else []
+
+
+def watcher_profile(operation_id: Any) -> dict[str, Any]:
+    """Sage's stored Watcher profile for the operation, read in place in the container (read-only)."""
+    return _container_probe(_WATCHER_PROFILE_PROBE, operation_id, 60)
+
+
+def start_state_blockers(watchers: list[dict[str, Any]], profile: dict[str, Any]) -> list[str]:
+    """A new `/watcher apply` needs no active Watcher channel and a stored owner that is absent or controller-missing.
+
+    Archived Watcher channels are history to Sage's owner selection; Mythic cannot delete a channel.
+    """
+    blockers = []
+    if any(not row.get("archived") for row in watchers):
+        blockers.append("an active Sage Watcher channel exists in the operation")
+    if profile.get("error") or not (profile.get("profile_present") is False
+                                    or profile.get("lifecycle_state") == "controller-missing"):
+        state = profile.get("error") or profile.get("lifecycle_state")
+        blockers.append(f"Sage's stored Watcher profile is not absent or controller-missing ({state})")
+    return blockers
+
+
+def _count(rows: dict[str, Any], table: str) -> int | None:
+    value = ((rows.get(f"{table}_aggregate") or {}).get("aggregate") or {}).get("count")
+    return value if isinstance(value, int) else None
 
 
 async def cmd_readiness(client: Any, run: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
@@ -372,6 +470,9 @@ async def cmd_readiness(client: Any, run: dict[str, Any], args: argparse.Namespa
     watchers = (await base._query(client, WATCHER_CHANNELS_QUERY)).get("chat_channel") or []
     baseline = await base._max_task(client)
     shape = (await base._query(client, TASKS_AFTER_QUERY, after=max(0, baseline - 1))).get("task")
+    counts = await base._query(client, COUNTS_QUERY, op=int(client.current_operation_id))
+    probe = watcher_connect(client.current_operation_id)
+    reads = probe.pop("reads", {})
     packages = dep.container_packages()
     installed_now = installed_packages()
     phoenix = Path(args.phoenix_db)
@@ -384,7 +485,8 @@ async def cmd_readiness(client: Any, run: dict[str, Any], args: argparse.Namespa
         "container_packages": {"differing_from_constraints": packages["differing_from_constraints"],
                                **{name: installed_now.get(name) for name in EXPECTED_PACKAGES}},
         "mythic_server": mythic_server_identity(),
-        "watcher_channels": len(watchers),
+        "watcher_channels": {"total": len(watchers), "active": sum(1 for row in watchers if not row.get("archived"))},
+        "watcher_profile": watcher_profile(client.current_operation_id),
         "callback": {"found": len(callback) == 1, "active": bool(callback and callback[0].get("active")),
                      "payload_type": ((callback[0].get("payload") or {}).get("payloadtype") or {}).get("name")
                      if callback else None},
@@ -392,6 +494,7 @@ async def cmd_readiness(client: Any, run: dict[str, Any], args: argparse.Namespa
         "phoenix_readable": phoenix.is_file(),
         "phoenix_health": dep.phoenix_health(args.phoenix_url),
         "task_baseline": baseline,
+        "operation_counts": {table: _count(counts, table) for table in ("task", "response", "credential", "filemeta")},
         "credential_source": {
             "installed": dep.installed_credentials(installed, route["API_ENDPOINT"]),
             "container": dep._container_key_probe(route),
@@ -399,7 +502,8 @@ async def cmd_readiness(client: Any, run: dict[str, Any], args: argparse.Namespa
             "channel_config_sets_key": False,
         },
         "watcher_route": watcher_route(installed, route),
-        "watcher_connect": watcher_connect(client.current_operation_id),
+        "watcher_connect": probe,
+        "watcher_reads": reads,
         "limits": LIMITS,
     }
     blockers = []
@@ -413,8 +517,7 @@ async def cmd_readiness(client: Any, run: dict[str, Any], args: argparse.Namespa
     server = report["mythic_server"]
     if not (server["contains_min_commit"] and server["server_build_context"] and server["server_image_newer_than_head"]):
         blockers.append(f"Mythic server is not built from a checkout containing {MIN_MYTHIC_COMMIT}")
-    if report["watcher_channels"]:
-        blockers.append("a Sage Watcher channel already exists in the operation")
+    blockers.extend(start_state_blockers(watchers, report["watcher_profile"]))
     if not report["callback"]["active"]:
         blockers.append("the callback is not active")
     if not report["task_query_shape_ok"]:
@@ -427,6 +530,7 @@ async def cmd_readiness(client: Any, run: dict[str, Any], args: argparse.Namespa
                                                and wr["endpoint_matches_route"]):
         blockers.append("the installed .env.local does not set the Watcher route and bot token for this route")
     blockers.extend(watcher_connect_blockers(report["watcher_connect"]))
+    blockers.extend(watcher_reads_blockers(report["watcher_reads"]))
     verdict = "deployment_required" if not report["parity"]["ready"] else ("not_ready" if blockers else "ready_for_live")
     report["blockers"], report["verdict"] = blockers, verdict
     run.setdefault("readiness_history", []).append({"at": time.time(), "verdict": verdict, "blockers": blockers})

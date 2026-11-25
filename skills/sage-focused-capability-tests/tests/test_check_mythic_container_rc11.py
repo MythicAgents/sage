@@ -206,7 +206,7 @@ def _real_scan(tmp_path, monkeypatch, *, extra_effective_scope=None, over_bound_
 
     Synthetic around it: the owner channel row, a whoami answer, one existing #sage-findings channel, and a source
     refresh that reports nothing new (the Mythic poll). These are the cold review's reproductions.
-    `stored_scopes` replaces whoami's stored grants (default: the nine documented scopes).
+    `stored_scopes` replaces whoami's stored grants (default: the ten documented scopes).
     """
     import asyncio
     from types import SimpleNamespace
@@ -352,7 +352,7 @@ def _run_watcher_probe(tmp_path, env_local: str):
 def test_watcher_connect_probe_reports_a_missing_token_as_a_blocker(tmp_path):
     report, _output = _run_watcher_probe(tmp_path, "SAGE_WATCHER_PROVIDER=openai\n")
     assert report == {"token_present": False, "connected": False, "effective_equals_closure": False,
-                      "bot_username": None, "error": "WatcherConfigurationError"}
+                      "bot_username": None, "error": "WatcherConfigurationError", "reads": {}}
     assert check.watcher_connect_blockers(report) == [
         "Sage's own Watcher connect fails in the container (WatcherConfigurationError)"]
 
@@ -376,3 +376,159 @@ def test_watcher_connect_probe_loads_the_token_as_sage_does_and_never_prints_it(
 )
 def test_watcher_connect_blocks_unless_sages_connect_succeeds_on_the_closure(report, blocked):
     assert bool(check.watcher_connect_blockers(report)) is blocked
+
+
+# The reads half of the same probe, run locally against Sage's real operation-memory source and findings delivery.
+# SYNTHETIC: a sitecustomize replaces Sage's connect (returns a session) and the mythic package's GraphQL call; the
+# callbacks page raises gql's TransportQueryError as Mythic's access-denied reaches Sage on d8a94943.
+_READS_STUB = """
+from types import SimpleNamespace
+from gql.transport.exceptions import TransportQueryError
+from mythic import mythic
+from sage_chat import mythic_findings_delivery as delivery
+
+DENY = {deny!r}
+sent = []
+
+
+async def connect(self, operation, **_kwargs):
+    return SimpleNamespace(client=object(), identity=SimpleNamespace(
+        username="sage_watcher_bot", operation_id=str(operation),
+        effective_scopes=tuple(sorted(delivery.REQUIRED_WATCHER_EFFECTIVE_SCOPES))))
+
+
+async def execute_custom_query(_client, query, variables=None):
+    name = query.split("query ", 1)[1].split("(", 1)[0].strip()
+    sent.append(name)
+    if name in DENY:
+        raise TransportQueryError("access-denied")
+    for table in ("callback", "task", "response", "credential", "filemeta", "chat_channel"):
+        if f" {{table}}(" in query:
+            return {{table: []}}
+    raise AssertionError(name)
+
+
+delivery.MythicFindingsDelivery.connect = connect
+mythic.execute_custom_query = execute_custom_query
+"""
+
+
+def _run_reads_probe(tmp_path, deny=()):
+    import json
+    import os
+    import subprocess
+
+    runtime = ROOT / "Payload_Type/sage"
+    mythic = tmp_path / "Mythic"
+    mythic.mkdir()
+    for name in ("dotenv_bootstrap.py", "sage_chat"):
+        (mythic / name).symlink_to(runtime / name)
+    (mythic / ".env.local").write_text("SAGE_WATCHER_APITOKEN=probe-token-not-printed\n")
+    site = tmp_path / "site"
+    site.mkdir()
+    (site / "sitecustomize.py").write_text(_READS_STUB.format(deny=set(deny)))
+    probe = check._WATCHER_CONNECT_PROBE.replace('"/Mythic"', repr(str(mythic)))
+    env = {key: value for key, value in os.environ.items() if not key.startswith(("SAGE_", "NGINX_"))}
+    env.update(PYTHONPATH=os.pathsep.join([str(site), str(runtime)]))
+    completed = subprocess.run([sys.executable, "-c", probe, "7"], capture_output=True, text=True, timeout=60,
+                               cwd=tmp_path, env=env)
+    return json.loads(completed.stdout.strip().splitlines()[-1]), completed.stdout + completed.stderr
+
+
+def test_watcher_reads_run_every_scan_read_on_sages_own_session(tmp_path):
+    report, output = _run_reads_probe(tmp_path)
+    assert (report["connected"], report["effective_equals_closure"], report["error"]) == (True, True, None)
+    assert set(report["reads"]) == set(check.WATCHER_READS)
+    assert all(row == {"ok": True, "error": None} for row in report["reads"].values())
+    assert check.watcher_reads_blockers(report["reads"]) == []
+    assert "probe-token-not-printed" not in output
+
+
+def test_watcher_reads_block_naming_the_denied_stream(tmp_path):
+    report, _output = _run_reads_probe(tmp_path, deny={"SageMemoryCallbacks"})
+    assert report["reads"]["callbacks"] == {"ok": False, "error": "TransportQueryError"}
+    assert all(report["reads"][name]["ok"] for name in check.WATCHER_READS if name != "callbacks")
+    assert check.watcher_reads_blockers(report["reads"]) == [
+        "the Watcher's own reads fail in the container: callbacks (TransportQueryError)"]
+
+
+@pytest.mark.parametrize(
+    ("reads", "blocked"),
+    [
+        ({name: {"ok": True, "error": None} for name in check.WATCHER_READS}, False),
+        ({name: {"ok": True, "error": None} for name in check.WATCHER_READS if name != "findings_channel"}, True),
+        ({}, True),
+        (None, True),
+    ],
+)
+def test_watcher_reads_block_unless_every_read_succeeded(reads, blocked):
+    assert bool(check.watcher_reads_blockers(reads)) is blocked
+
+
+def _run_profile_probe(tmp_path, state=None):
+    """The stored-profile probe's own text, run locally on a database Sage's real store wrote (synthetic profile)."""
+    import asyncio
+    import json
+    import os
+    import subprocess
+
+    from sage_chat.operation_memory import OperationMemoryStore
+
+    runtime = ROOT / "Payload_Type/sage"
+    mythic = tmp_path / "Mythic"
+    mythic.mkdir()
+    for name in ("dotenv_bootstrap.py", "runtime_db.py"):
+        (mythic / name).symlink_to(runtime / name)
+    database = tmp_path / "sage.db"
+
+    async def seed():
+        store = OperationMemoryStore(database)
+        record = await store.apply_watcher_profile(
+            "1", owner_channel_id=8, owner_channel_name="old (Sage Watcher)", provider="openai", model="m",
+            config_sources={}, interval_seconds=300)
+        if state is not None:
+            await store.update_watcher_profile_state("1", expected_generation=record.generation, lifecycle_state=state)
+        await store.close()
+
+    if state != "absent":
+        asyncio.run(seed())
+    probe = check._WATCHER_PROFILE_PROBE.replace('"/Mythic"', repr(str(mythic)))
+    env = {key: value for key, value in os.environ.items() if not key.startswith("SAGE_")}
+    env.update(PYTHONPATH=str(runtime), SAGE_DATABASE_PATH=str(database))
+    completed = subprocess.run([sys.executable, "-c", probe, "1"], capture_output=True, text=True, timeout=60,
+                               cwd=tmp_path, env=env)
+    return json.loads(completed.stdout.strip().splitlines()[-1])
+
+
+@pytest.mark.parametrize(
+    ("state", "present", "lifecycle", "blocked"),
+    [
+        ("absent", False, None, False),
+        ("controller-missing", True, "controller-missing", False),
+        (None, True, "starting", True),
+        ("stale-generation", True, "stale-generation", True),
+    ],
+)
+def test_start_state_reads_sages_stored_profile_in_place(tmp_path, state, present, lifecycle, blocked):
+    profile = _run_profile_probe(tmp_path, state)
+    assert (profile["profile_present"], profile["lifecycle_state"], profile["error"]) == (present, lifecycle, None)
+    archived = [{"id": 8, "archived": True}]
+    assert bool(check.start_state_blockers(archived, profile)) is blocked
+
+
+@pytest.mark.parametrize(
+    ("watchers", "profile", "blocked"),
+    [
+        ([], {"profile_present": False, "lifecycle_state": None, "error": None}, False),
+        ([{"id": 8, "archived": True}], {"profile_present": True, "lifecycle_state": "controller-missing",
+                                         "error": None}, False),
+        ([{"id": 9, "archived": False}], {"profile_present": False, "lifecycle_state": None, "error": None}, True),
+        ([{"id": 8, "archived": True}, {"id": 9, "archived": False}],
+         {"profile_present": True, "lifecycle_state": "controller-missing", "error": None}, True),
+        ([], {"profile_present": True, "lifecycle_state": "running", "error": None}, True),
+        ([], {"profile_present": True, "lifecycle_state": "paused", "error": None}, True),
+        ([], {"error": "probe did not report", "returncode": 1}, True),
+    ],
+)
+def test_start_state_needs_no_active_watcher_and_a_free_stored_owner(watchers, profile, blocked):
+    assert bool(check.start_state_blockers(watchers, profile)) is blocked
