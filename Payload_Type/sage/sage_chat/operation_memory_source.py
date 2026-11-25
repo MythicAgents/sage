@@ -90,7 +90,6 @@ _QUERIES = {
           ) {
             id operation_id display_id agent_task_id timestamp command_name params original_params
             display_params status completed stdout stderr comment opsec_pre_blocked opsec_post_blocked
-            operator { username }
             callback { display_id }
           }
         }

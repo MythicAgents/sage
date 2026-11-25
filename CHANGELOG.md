@@ -21,6 +21,12 @@ between minor releases.
   equal the nine documented scopes, so every Watcher scan stopped as `unconfigured`. The stored grants must now hold
   the nine and nothing beyond those two reads; the effective scopes must still equal all eleven exactly, so the
   Watcher's authority is unchanged.
+- **Reissue the Watcher's bot token with `payload.read` added.** Mythic now checks every table a token's request
+  reads, and the Watcher's scan reads each callback's payload type, so a token without `payload.read` stopped every
+  scan as `degraded` with a transport error. Sage now names the missing scope and stops the scan as `unconfigured`
+  instead. The scan no longer reads the operator who issued each task (that would need `operator.read`, which is not
+  limited to the operation); task records stored earlier keep it. The token is created with ten scopes and its
+  effective scopes must equal all twelve exactly.
 - A blank **OpenAI API** now always means Chat Completions. It used to leave the choice to LangChain's OpenAI adapter,
   which picks the Responses API on its own for some models (`gpt-5-pro`, `gpt-5.2-pro`, `gpt-5.4-pro`, `gpt-5.5-pro`
   and `codex` models, and from this release `gpt-5.6-sol` and any `gpt-6` model with tools). Those requests carried

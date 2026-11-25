@@ -38,6 +38,7 @@ REQUIRED_WATCHER_SCOPES = frozenset(
         "eventlog.write",
         "file.read",
         "operation.read",
+        "payload.read",
         "response.read",
         "task.read",
     }

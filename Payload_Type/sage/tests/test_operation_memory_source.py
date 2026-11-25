@@ -244,6 +244,59 @@ def test_updated_existing_callback_is_seen_by_last_checkin_with_stable_timestamp
     asyncio.run(scenario())
 
 
+def test_watcher_reads_select_only_fields_its_scope_class_covers():
+    """The tasks page has no operator selection (Mythic's operator table needs operator.read and has no operation
+    path); the callbacks page keeps the payload type name that gates Apollo native-output binding."""
+    from sage_chat.operation_memory_source import _QUERIES
+
+    assert "operator" not in _QUERIES["tasks"]
+    assert "callback { display_id }" in _QUERIES["tasks"]
+    assert "payload { payloadtype { name } }" in _QUERIES["callbacks"]
+
+
+def test_task_rows_without_operator_ingest_beside_stored_rows_that_carry_it(tmp_path):
+    """Records stored before the operator selection was dropped keep it; a re-read or new task row maps without it.
+
+    Synthetic Mythic rows: the first page carries `operator` as the earlier tasks document returned it; after the
+    task's timestamp moves (a status change or a new response), Mythic returns it in the current shape.
+    """
+    import sqlite3
+
+    async def scenario():
+        old_shape = _row(2, display_id=8, callback={"display_id": 4}, command_name="ps", status="submitted",
+                         operator={"username": "operator-a"})
+        fake = FakeMythic(rows={"callback": [], "task": [old_shape], "response": [], "credential": [], "filemeta": []})
+        store = OperationMemoryStore(tmp_path / "memory.db")
+        await store.initialize()
+        first = await MythicOperationMemoryIngestor(_source(fake), store).sync_operation(7)
+        assert first["tasks"].ingest.inserted == 1
+
+        fake.rows["task"] = [
+            {**_row(2, display_id=8, callback={"display_id": 4}, command_name="ps", status="completed"),
+             "timestamp": "2026-08-01T00:01:00Z"},
+            {**_row(3, display_id=9, callback={"display_id": 4}, command_name="whoami", status="completed"),
+             "timestamp": "2026-08-01T00:01:01Z"},
+        ]
+        second = await MythicOperationMemoryIngestor(_source(fake), store).sync_operation(7)
+        assert (second["tasks"].ingest.revised, second["tasks"].ingest.inserted) == (1, 1)
+        heads = {row["source_record_id"]: row for row in await store.list_unanalyzed_records(
+            "7", record_classes=("task",))}
+        assert set(heads) == {"2", "3"}
+        assert all("operator" not in row["metadata"] for row in heads.values())
+        assert heads["2"]["task_display_id"] == "8" and heads["2"]["callback_display_id"] == "4"
+        assert heads["3"]["metadata"]["status"] == "completed"
+        await store.close()
+
+        with sqlite3.connect(tmp_path / "memory.db") as db:
+            revisions = db.execute(
+                "SELECT metadata_json FROM source_records WHERE record_class = 'task' AND source_record_id = '2'"
+            ).fetchall()
+        assert len(revisions) == 2
+        assert sum('"operator"' in metadata for (metadata,) in revisions) == 1
+
+    asyncio.run(scenario())
+
+
 def test_actual_oversize_unknown_and_error_downloads_preserve_metadata():
     async def scenario():
         rows = [

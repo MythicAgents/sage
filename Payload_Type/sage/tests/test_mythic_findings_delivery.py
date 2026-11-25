@@ -76,8 +76,8 @@ async def _seed(store: OperationMemoryStore):
 def _runtime_whoami(**changes):
     grants = [
         "callback.read", "chat-ai.read", "chat.write", "credential.read",
-        "eventlog.write", "file.read", "operation.read", "response.read",
-        "task.read",
+        "eventlog.write", "file.read", "operation.read", "payload.read",
+        "response.read", "task.read",
     ]
     row = {
         "status": "success",
@@ -103,11 +103,14 @@ def test_runtime_scope_class_reads_ai_owner_without_redundant_standard_read_gran
         "eventlog.write",
         "file.read",
         "operation.read",
+        "payload.read",
         "response.read",
         "task.read",
     }
     assert "chat.read" not in REQUIRED_WATCHER_SCOPES
     assert "chat-ai.write" not in REQUIRED_WATCHER_SCOPES
+    # The memory callbacks page reads payload { payloadtype { name } }; the tasks page reads no operator.
+    assert not {"payload.write", "operator.read"} & REQUIRED_WATCHER_EFFECTIVE_SCOPES
     assert REQUIRED_WATCHER_EFFECTIVE_SCOPES == {
         *REQUIRED_WATCHER_SCOPES,
         "chat.read",
@@ -739,9 +742,10 @@ def test_bootstrap_reuses_legacy_description_and_duplicate_channels_fail_closed(
 
 # Mythic-v4.0.0 d8a94943 stores a token's implied reads at issuance (database/api_tokens.go) and checks stored
 # grants exactly (authorization/catalog.go), so whoami reports stored grants equal to the effective closure.
-# RECONSTRUCTED shape, not a recording: the live d8a94943 Watcher token requested with the nine documented scopes
-# showed stored 11 (excess chat.read and eventlog.read over the nine) and effective equal to the closure. Only that
-# scope diff was recorded; no token value is involved.
+# RECONSTRUCTED shape, not a recording: the live d8a94943 Watcher token requested with the then-documented nine
+# scopes showed stored 11 (excess chat.read and eventlog.read over the nine) and effective equal to the closure. Only
+# that scope diff was recorded; no token value is involved. The class now has ten (payload.read added), so the same
+# issuance stores the twelve-scope closure.
 def _d8a94943_whoami(**changes):
     closure = sorted(REQUIRED_WATCHER_EFFECTIVE_SCOPES)
     return _runtime_whoami(**{"scopes": closure, "effective_scopes": list(closure), **changes})
@@ -773,6 +777,8 @@ def test_connect_accepts_stored_grants_between_the_documented_set_and_its_closur
 
 
 _CLOSURE = sorted(REQUIRED_WATCHER_EFFECTIVE_SCOPES)
+_NINE = sorted(REQUIRED_WATCHER_SCOPES - {"payload.read"})
+_NINE_CLOSURE = sorted(REQUIRED_WATCHER_EFFECTIVE_SCOPES - {"payload.read"})
 
 
 @pytest.mark.parametrize(
@@ -790,6 +796,15 @@ _CLOSURE = sorted(REQUIRED_WATCHER_EFFECTIVE_SCOPES)
             "effective scopes.*missing chat\\.read, eventlog\\.read",
         ),
         ({"scopes": [*_CLOSURE, "CHAT.READ"]}, "malformed"),
+        # A token issued with the earlier nine-scope class: d8a94943 stores its eleven-scope closure; older servers
+        # store the nine and report the eleven as effective. Either way connect fails closed naming payload.read,
+        # instead of the scan's memory callbacks page failing later as a transport error.
+        ({"scopes": _NINE_CLOSURE, "effective_scopes": _NINE_CLOSURE}, "stored grants.*missing payload\\.read"),
+        ({"scopes": _NINE, "effective_scopes": _NINE_CLOSURE}, "stored grants.*missing payload\\.read"),
+        ({"effective_scopes": [s for s in _CLOSURE if s != "payload.read"]}, "effective scopes.*missing payload\\.read"),
+        ({"scopes": [*_CLOSURE, "payload.write"]}, "stored grants.*excess payload\\.write"),
+        ({"scopes": [*_CLOSURE, "operator.read"]}, "stored grants.*excess operator\\.read"),
+        ({"effective_scopes": [*_CLOSURE, "operator.read"]}, "effective scopes.*excess operator\\.read"),
     ],
 )
 def test_connect_rejects_d8a94943_near_matches(monkeypatch, changes, match):
