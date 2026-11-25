@@ -247,8 +247,12 @@ def provider_configuration_notice(exc: BaseException, profile) -> str:
 
     from ai import openai_api
 
-    api = value("openai_api")
-    program = value("openai_access_program")
+    # The API this request used: the selection, or the provider's default for its endpoint.
+    default, reason = openai_api.default_api(value("provider", "openai"), value("api_endpoint"))
+    route = openai_api.OpenAIRoute(api=value("openai_api"), access_program=value("openai_access_program"),
+                                   default=default, default_reason=reason)
+    api = route.effective_api
+    program = route.access_program
     if api == openai_api.RESPONSES:
         daybreak = (openai_api.ACCESS_PROGRAM_LABELS.get(program, program) + f" ({source('openai_access_program')})"
                     if program else "Off (Sage default)")
@@ -256,7 +260,7 @@ def provider_configuration_notice(exc: BaseException, profile) -> str:
         daybreak = "not sent (Chat Completions or adapter route)"
     details = ", ".join(part for part in (f"HTTP {status}", f"code `{code}`" if code else "",
                                            f"param `{param}`" if param else "") if part)
-    api_label = openai_api.API_LABELS.get(api, api) + (f" ({source('openai_api')})" if api else "")
+    api_label = openai_api.api_label(route, source("openai_api"))
     effort_value = value("reasoning_effort")
     effort = (f"{_EFFORT_LABELS.get(effort_value, effort_value)} ({source('reasoning_effort')})"
               if effort_value else "not sent (provider default)")

@@ -1,4 +1,5 @@
-"""A blank OpenAI API means Chat Completions, through the real model factory, the OpenAI SDK and the adapter.
+"""A blank OpenAI API on an endpoint other than OpenAI's means Chat Completions, through the real model factory, the
+OpenAI SDK and the adapter (on OpenAI's own endpoint it means Responses; see test_openai_provider_split.py).
 
 langchain-openai picks the Responses API on its own for some model names (``gpt-5.6-sol``; ``gpt-6*`` with tools
 bound), and such a request would carry none of Sage's Responses settings (``store: false``, encrypted reasoning,

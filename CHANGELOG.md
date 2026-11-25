@@ -7,7 +7,38 @@ between minor releases.
 
 ## [Unreleased]
 
+### Breaking changes
+
+- **The OpenAI provider now uses the Responses API by default on OpenAI's own API.** With **OpenAI API** blank in the
+  chat, the `SAGE_OPENAI_API` user secret and the environment, a chat whose provider is **OpenAI** and whose endpoint
+  is OpenAI's own (`https` on `api.openai.com` or one of its subdomains, such as a data-residency host) now sends
+  Responses: stateless (`store: false`), with encrypted reasoning replayed from Sage's history and the Daybreak
+  program named (**Off** unless you choose Blue or Red). It used to send Chat Completions. The endpoint is
+  **API Endpoint**, else `OPENAI_API_BASE`, else an enabled `LANGSMITH_GATEWAY`, else `OPENAI_BASE_URL`, else
+  `https://api.openai.com/v1`. An existing chat keeps its conversation and continues on Responses. **To keep Chat
+  Completions, set OpenAI API to Chat Completions** (in the chat, the `SAGE_OPENAI_API` user secret or the
+  environment). A chat with provider OpenAI and any other endpoint (a proxy, a gateway or another server) is
+  unchanged and stays on Chat Completions. An explicit **OpenAI API** always wins, and Sage still never leaves the
+  choice to LangChain's OpenAI adapter, which picks Responses on its own for some models (`-pro` and `codex` models,
+  `gpt-5.6-sol`, and any `gpt-6` model with tools) and would send none of Sage's Responses settings.
+
+### Added
+
+- **LiteLLM Gateway** and **Custom (OpenAI-compatible)** providers, for Sage and the Sage Watcher. Choose LiteLLM
+  Gateway for a LiteLLM gateway (**API Endpoint** is the gateway URL, **API Key** the gateway key, **Model** the
+  gateway's model alias) and Custom for any other OpenAI-compatible server. Both use the same OpenAI-compatible
+  adapter as OpenAI and default to Chat Completions; **OpenAI API** can still select Responses, though not every
+  gateway or server supports every Responses field. Both need **API Endpoint**: without it Sage refuses the chat
+  before any request, so a gateway key is never sent to OpenAI. Reasoning Effort, Provider Retry Policy, OpenAI API,
+  OpenAI Daybreak, OpenAI Safety Identifier, resource metering and the strict task-tool schema apply to all three
+  providers. Existing `provider: openai` chats that point at a gateway keep working unchanged; switching one to
+  LiteLLM Gateway starts a new chat.
+
 ### Changed
+
+- Provider-rejection notices and the model debug log name the API a request used and where it came from, for example
+  `Responses (default) for OpenAI's API` or `Chat Completions (default) for LiteLLM Gateway`. A request that was already
+  on Responses is never advised to set OpenAI API to Responses.
 
 - **Sage now requires Mythic's `Mythic-v4.0.0` branch at commit `d8a94943` or later.** Sage moves to
   mythic-container 0.7.0rc11, which leaves the channel out of a channel-metadata update; Mythic takes it from the
@@ -27,12 +58,6 @@ between minor releases.
   instead. The scan no longer reads the operator who issued each task (that would need `operator.read`, which is not
   limited to the operation); task records stored earlier keep it. The token is created with ten scopes and its
   effective scopes must equal all twelve exactly.
-- A blank **OpenAI API** now always means Chat Completions. It used to leave the choice to LangChain's OpenAI adapter,
-  which picks the Responses API on its own for some models (`gpt-5-pro`, `gpt-5.2-pro`, `gpt-5.4-pro`, `gpt-5.5-pro`
-  and `codex` models, and from this release `gpt-5.6-sol` and any `gpt-6` model with tools). Those requests carried
-  none of Sage's Responses settings: no `store: false`, no encrypted reasoning and no Daybreak program. Responses is
-  now used only when you select it. A model that needs Responses and has the setting blank is rejected by the
-  provider, and Sage's notice names the setting to change.
 - The OpenAI and Anthropic SDKs now connect to providers through httpx2. Provider TLS trust is unchanged when
   Sage's `certs/bundle.pem` or `SSL_CERT_FILE` is set. With neither, the default provider connection trusts the
   operating system's certificate store instead of the `certifi` bundle.

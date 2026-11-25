@@ -58,11 +58,19 @@ _CONFIG_OPTIONS = [
         DisplayName="Provider",
         DisplayAsChip=True,
         Type=OptType.Choice,
-        Description="The model provider to interact with. Bedrock uses the AWS quad below; the others use API Key / API Endpoint.",
+        Description=(
+            "The model provider. OpenAI calls OpenAI's API (API Endpoint optional). LiteLLM Gateway calls your "
+            "LiteLLM gateway: put the gateway URL in API Endpoint, the gateway key in API Key and the gateway's model "
+            "alias in Model. Custom (OpenAI-compatible) calls any other OpenAI-compatible server the same way. "
+            "Both need API Endpoint. AWS Bedrock uses the AWS values below; Anthropic and Ollama use API Key and API "
+            "Endpoint. Changing the provider starts a new chat."
+        ),
         Required=False,
         DefaultValue="openai",
         Choices=[
             ChatModelConfigurationOptionChoice(Label="OpenAI", Value="openai"),
+            ChatModelConfigurationOptionChoice(Label="LiteLLM Gateway", Value="litellm"),
+            ChatModelConfigurationOptionChoice(Label="Custom (OpenAI-compatible)", Value="openai_compatible"),
             ChatModelConfigurationOptionChoice(Label="AWS Bedrock", Value="bedrock"),
             ChatModelConfigurationOptionChoice(Label="Anthropic", Value="anthropic"),
             ChatModelConfigurationOptionChoice(Label="Ollama", Value="ollama"),
@@ -74,7 +82,8 @@ _CONFIG_OPTIONS = [
         Type=OptType.String,
         Description=(
             "The model to use for inference from the selected provider, e.g. gpt-5.5-cyber-preview or "
-            "claude-sonnet-5. Changing it (or running /model <name>) continues this chat with the new model."
+            "claude-sonnet-5; for LiteLLM Gateway, the gateway's model alias. Changing it (or running "
+            "/model <name>) continues this chat with the new model."
         ),
         Required=False,
     ),
@@ -83,9 +92,11 @@ _CONFIG_OPTIONS = [
         DisplayName="OpenAI API",
         Type=OptType.Choice,
         Description=(
-            "Which OpenAI API this chat calls; applies to the OpenAI provider. Use configured default falls back "
-            "to the SAGE_OPENAI_API user secret, then the container environment; with neither, Sage uses Chat "
-            "Completions. OpenAI's -cyber models (GPT-5.6 Cyber and later) need Responses."
+            "Which OpenAI API this chat calls; applies to OpenAI, LiteLLM Gateway and Custom. Use configured "
+            "default falls back to the SAGE_OPENAI_API user secret, then the container environment; with neither, "
+            "OpenAI's own API (api.openai.com) uses Responses, and a gateway, a custom server or OpenAI pointed at "
+            "any other endpoint uses Chat Completions. OpenAI's -cyber models (GPT-5.6 Cyber and later) need "
+            "Responses. Not every gateway or server supports every Responses field."
         ),
         Required=False,
         DefaultValue="",
@@ -105,11 +116,12 @@ _CONFIG_OPTIONS = [
         DisplayName="OpenAI Daybreak",
         Type=OptType.Choice,
         Description=(
-            "OpenAI Daybreak access program for Responses requests; applies to the OpenAI provider. Off "
-            "explicitly requests standard safeguards. Use configured default falls back to the "
+            "OpenAI Daybreak access program for Responses requests; applies to OpenAI, LiteLLM Gateway and Custom. "
+            "Off explicitly requests standard safeguards. Use configured default falls back to the "
             "SAGE_OPENAI_ACCESS_PROGRAM user secret, then the container environment; with neither, a Responses "
             "request carries Off, never a project's own default program. Any value, Off included, whether chosen "
-            "here or inherited from the user secret or environment, requires OpenAI API = Responses. Blue or Red "
+            "here or inherited from the user secret or environment, requires the Responses API (OpenAI API = "
+            "Responses, or Use configured default on OpenAI's own API). Blue or Red "
             "also needs an approved project; OpenAI's -cyber models use Red. Learn more: https://developers.openai.com/api/docs/guides/daybreak"
         ),
         Required=False,
@@ -132,7 +144,7 @@ _CONFIG_OPTIONS = [
         Type=OptType.String,
         Description=(
             "[OPTIONAL] A stable pseudonym for the person using this chat, sent to OpenAI as safety_identifier; "
-            "applies to the OpenAI provider. Recommended, not required: with one, OpenAI can act on a single "
+            "applies to OpenAI, LiteLLM Gateway and Custom. Recommended, not required: with one, OpenAI can act on a single "
             "user instead of the whole organization. Learn more: https://developers.openai.com/api/docs/guides/safety-best-practices#implement-safety-identifiers"
         ),
         Required=False,
@@ -147,11 +159,12 @@ _CONFIG_OPTIONS = [
         DisplayName="Reasoning Effort",
         Type=OptType.Choice,
         Description=(
-            "Optional; applies to the OpenAI provider. Use configured default falls back to the "
+            "Optional; applies to OpenAI, LiteLLM Gateway and Custom. Use configured default falls back to the "
             "SAGE_REASONING_EFFORT user secret, then the container environment; with neither, Sage sends no "
             "effort and the provider's default for the model applies. A value chosen here, None included, is "
             "sent as chosen. Supported values depend on the model: some models reject None, and some accept "
-            "function tools with reasoning only when OpenAI API = Responses. Changing it continues this chat."
+            "function tools with reasoning only on the Responses API (OpenAI API = Responses, the default on "
+            "OpenAI's own API). Changing it continues this chat."
         ),
         Required=False,
         DefaultValue="",
@@ -174,7 +187,7 @@ _CONFIG_OPTIONS = [
         Name="SAGE_PROVIDER_RETRY_POLICY",
         DisplayName="Provider Retry Policy",
         Type=OptType.Choice,
-        Description="Optional OpenAI-compatible provider retry preset. Blank uses SAGE_PROVIDER_RETRY_POLICY from the environment if set. Off uses the provider SDK defaults. Transient v1 retries confirmed temporary 429 and 503 responses with bounded waits.",
+        Description="Optional retry preset for OpenAI, LiteLLM Gateway and Custom. Blank uses SAGE_PROVIDER_RETRY_POLICY from the environment if set. Off uses the provider SDK defaults. Transient v1 retries confirmed temporary 429 and 503 responses with bounded waits.",
         Required=False,
         DefaultValue="",
         Choices=[
@@ -252,7 +265,10 @@ _CONFIG_OPTIONS = [
         Name="API_ENDPOINT",
         DisplayName="API Endpoint",
         Type=OptType.String,
-        Description="[OPTIONAL] The API endpoint to use for the selected provider.",
+        Description=(
+            "The base URL for the selected provider. Required for LiteLLM Gateway (the gateway URL) and Custom "
+            "(the server URL); optional for OpenAI, where blank means https://api.openai.com/v1."
+        ),
         Required=False,
         HelpText="Resolution order: this field → the API_ENDPOINT user secret → the container's API_ENDPOINT env var.",
     ),
@@ -260,7 +276,10 @@ _CONFIG_OPTIONS = [
         Name="API_KEY",
         DisplayName="API Key",
         Type=OptType.String,
-        Description="[OPTIONAL] The API key to use for the selected provider.",
+        Description=(
+            "[OPTIONAL] The API key for the selected provider; for LiteLLM Gateway, the gateway key, not an "
+            "upstream vendor key."
+        ),
         Required=False,
         HelpText=(
             "Stored in plaintext channel config. To keep it hidden, leave this blank and set the API_KEY "
@@ -354,6 +373,8 @@ _WATCHER_CONFIG_OPTIONS = [
         DefaultValue="openai",
         Choices=[
             ChatModelConfigurationOptionChoice(Label="OpenAI", Value="openai"),
+            ChatModelConfigurationOptionChoice(Label="LiteLLM Gateway", Value="litellm"),
+            ChatModelConfigurationOptionChoice(Label="Custom (OpenAI-compatible)", Value="openai_compatible"),
             ChatModelConfigurationOptionChoice(Label="AWS Bedrock", Value="bedrock"),
             ChatModelConfigurationOptionChoice(Label="Anthropic", Value="anthropic"),
             ChatModelConfigurationOptionChoice(Label="Ollama", Value="ollama"),
@@ -371,7 +392,10 @@ _WATCHER_CONFIG_OPTIONS = [
         Name="SAGE_WATCHER_API_ENDPOINT",
         DisplayName="API Endpoint",
         Type=OptType.String,
-        Description="[OPTIONAL] The endpoint used only by Sage Watcher.",
+        Description=(
+            "The base URL used only by Sage Watcher. Required for LiteLLM Gateway and Custom (OpenAI-compatible); "
+            "optional for OpenAI, where blank means https://api.openai.com/v1 and the Responses API."
+        ),
         Required=False,
         HelpText=(
             "Resolution order: this field → SAGE_WATCHER_API_ENDPOINT user secret → "

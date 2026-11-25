@@ -182,11 +182,14 @@ class ResolvedLLMProfile:
             api=self.openai_api,
             access_program=self.openai_access_program,
             safety_identifier=self.openai_safety_identifier,
+            endpoint=self.api_endpoint,
         )
 
     def init_chat_model_kwargs(self) -> dict[str, str]:
+        from ai.openai_api import adapter_provider
+
         return {
-            "model_provider": self.provider,
+            "model_provider": adapter_provider(self.provider),
             "model": self.model,
             **self.configurable(),
         }
@@ -210,19 +213,27 @@ def _normalized_llm_profile(
     normalized["provider"] = normalized["provider"].strip().casefold() or "openai"
     normalized["model"] = normalized["model"].strip()
     normalized["api_endpoint"] = normalized["api_endpoint"].strip()
+    from ai.openai_api import is_family
+
     effort = normalized.get("reasoning_effort", "").strip()
     if validate_reasoning_effort:
         if effort and effort not in {"none", "minimal", "low", "medium", "high", "xhigh", "max"}:
             raise ValueError("SAGE_REASONING_EFFORT must be one of none, minimal, low, medium, high, xhigh, max")
-        if effort and normalized["provider"] != "openai":
-            raise ValueError("SAGE_REASONING_EFFORT requires the openai model provider")
+        if effort and not is_family(normalized["provider"]):
+            raise ValueError(
+                "SAGE_REASONING_EFFORT requires the OpenAI, LiteLLM Gateway or Custom (OpenAI-compatible) model "
+                "provider"
+            )
     normalized["reasoning_effort"] = effort
     retry_policy = normalized.get("provider_retry_policy", "").strip()
     if retry_policy and retry_policy != "off":
         from ai.provider_retry import parse_policy
         parse_policy(retry_policy)
-        if normalized["provider"] != "openai":
-            raise ValueError("SAGE_PROVIDER_RETRY_POLICY requires the openai model provider")
+        if not is_family(normalized["provider"]):
+            raise ValueError(
+                "SAGE_PROVIDER_RETRY_POLICY requires the OpenAI, LiteLLM Gateway or Custom (OpenAI-compatible) "
+                "model provider"
+            )
     normalized["provider_retry_policy"] = retry_policy
     for field in OPENAI_ROUTE_FIELDS:
         normalized[field] = str(normalized.get(field, "") or "").strip()
@@ -236,6 +247,7 @@ def _normalized_llm_profile(
             api=normalized["openai_api"],
             access_program=normalized["openai_access_program"],
             safety_identifier=normalized["openai_safety_identifier"],
+            endpoint=normalized["api_endpoint"],
         )
     return ResolvedLLMProfile(**normalized, sources=tuple(sources))
 
@@ -346,9 +358,9 @@ def init_chat_model_from_profile(profile: ResolvedLLMProfile) -> Any:
     kwargs = profile.init_chat_model_kwargs()
     for field in OPENAI_ROUTE_FIELDS:
         kwargs.pop(field, None)
-    if profile.provider == "openai":
-        from ai.openai_api import adapter_options
+    from ai.openai_api import adapter_options, is_family
 
+    if is_family(profile.provider):
         kwargs.update(adapter_options(profile.openai_route()))
     if profile.provider == "bedrock":
         missing = tuple(

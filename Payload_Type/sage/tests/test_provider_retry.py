@@ -43,7 +43,7 @@ def test_native_config_explicit_off_suppresses_ambient_preset(monkeypatch):
         "provider": "openai", "model": "offline-model"
     }))
     assert enabled["config"]["configurable"]["provider_retry_policy"] == "transient-v1"
-    with pytest.raises(ValueError, match="requires the openai"):
+    with pytest.raises(ValueError, match="requires the OpenAI, LiteLLM Gateway or Custom"):
         build_model_kwargs(build_chat_request("Offline", config={
             "provider": "bedrock", "model": "offline-model",
             "SAGE_PROVIDER_RETRY_POLICY": "transient-v1",

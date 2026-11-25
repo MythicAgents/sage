@@ -136,20 +136,27 @@ def test_native_controls_follow_provider_and_model_with_specified_choices():
     for option in (api, daybreak, identifier):
         help_text = f"{option.Description} {option.HelpText}"
         assert "user secret" in help_text and "environment" in help_text
-        assert "OpenAI provider" in help_text
+        # The route settings apply to every OpenAI-family provider (the provider split).
+        assert "OpenAI, LiteLLM Gateway and Custom" in option.Description
     daybreak_help = f"{daybreak.Description} {daybreak.HelpText}"
     assert "Off" in daybreak_help and "standard safeguards" in daybreak_help
     assert "Responses" in daybreak_help
     # Mythic shows only the Description. It must state the validator's rule: every explicit Daybreak choice,
-    # Off included, is refused without OpenAI API = Responses (blank stays valid on any API).
-    assert "Off included" in daybreak.Description and "requires OpenAI API = Responses" in daybreak.Description
+    # Off included, is refused unless the route is Responses, which a blank OpenAI API means only on OpenAI's own
+    # API (the provider split's default); blank Daybreak stays valid on any API.
+    assert "Off included" in daybreak.Description and "requires the Responses API" in daybreak.Description
     for choice in daybreak.Choices:
-        for api in ("", "chat_completions"):
+        for api, endpoint in (("", ENDPOINT), ("chat_completions", ENDPOINT), ("chat_completions", "")):
             if choice.Value:
                 with pytest.raises(ValueError, match="requires OpenAI API = Responses"):
-                    validate_route(provider="openai", model="m", api=api, access_program=choice.Value)
+                    validate_route(provider="openai", model="m", api=api, access_program=choice.Value,
+                                   endpoint=endpoint)
             else:
-                validate_route(provider="openai", model="m", api=api, access_program=choice.Value)
+                validate_route(provider="openai", model="m", api=api, access_program=choice.Value,
+                               endpoint=endpoint)
+        route = validate_route(provider="openai", model="m", api="", access_program=choice.Value, endpoint="",
+                               environ={})
+        assert route.effective_access_program == (choice.Value or "standard")
     assert "pseudonym" in f"{identifier.Description} {identifier.HelpText}"
 
     sage = next(model for model in chat_models.SAGE_MODELS if model.Name == "Sage")
@@ -281,8 +288,9 @@ def test_profile_factory_uses_the_same_request_projection(wire):
     ({"SAGE_OPENAI_ACCESS_PROGRAM": "daybreak_red"}, "requires OpenAI API = Responses"),
     ({"SAGE_OPENAI_API": "chat_completions", "SAGE_OPENAI_ACCESS_PROGRAM": "standard"},
      "requires OpenAI API = Responses"),
-    ({"provider": "anthropic", "SAGE_OPENAI_API": "responses"}, "require the openai model provider"),
-    ({"provider": "bedrock", "SAGE_OPENAI_SAFETY_IDENTIFIER": PSEUDONYM}, "require the openai model provider"),
+    ({"provider": "anthropic", "SAGE_OPENAI_API": "responses"}, "require the OpenAI, LiteLLM Gateway or Custom"),
+    ({"provider": "bedrock", "SAGE_OPENAI_SAFETY_IDENTIFIER": PSEUDONYM},
+     "require the OpenAI, LiteLLM Gateway or Custom"),
 ])
 def test_invalid_combinations_fail_locally_with_the_configuration_action(wire, extra, expected):
     with pytest.raises(ValueError, match=expected) as raised:

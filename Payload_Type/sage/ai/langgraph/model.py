@@ -4485,10 +4485,11 @@ class _EnrolledExecutableSchemaMiddleware(AgentMiddleware):
                 else getattr(tool, "description", "")
             )
             provider = str(getattr(self._model, "provider", "")).casefold()
+            openai_family = openai_api.is_family(provider)
             model_schema = copy.deepcopy(schema)
             if provider == "bedrock":
                 self._bedrock_optional_properties(model_schema)
-            elif provider == "openai":
+            elif openai_family:
                 self._omit_unsupported_bedrock_constraints(model_schema)
             definition = {
                 "name": self._ISSUE_TOOL,
@@ -4496,7 +4497,7 @@ class _EnrolledExecutableSchemaMiddleware(AgentMiddleware):
                 "parameters": model_schema,
             }
             # The OpenAI adapter preserves this provider-compatible nested strict schema.
-            if provider == "openai":
+            if openai_family:
                 definition["strict"] = True
             bound_tools.append({"type": "function", "function": definition})
             replaced = True
@@ -9793,9 +9794,13 @@ class Model:
             return None
         reasoning_effort = str(cfg.get("reasoning_effort") or "").strip()
         retry_policy = provider_retry.parse_policy(cfg.get("provider_retry_policy"))
+        openai_family = openai_api.is_family(self.provider)
         if retry_policy is not None:
-            if self.provider.lower() != "openai":
-                raise ValueError("SAGE_PROVIDER_RETRY_POLICY requires the openai model provider")
+            if not openai_family:
+                raise ValueError(
+                    "SAGE_PROVIDER_RETRY_POLICY requires the OpenAI, LiteLLM Gateway or Custom (OpenAI-compatible) "
+                    "model provider"
+                )
             if getattr(self, "_provider_retry_state", None) is None:
                 self._provider_retry_state = provider_retry.RetryState(
                     retry_policy, event_sink=self._on_provider_retry_event
@@ -9807,10 +9812,13 @@ class Model:
         if reasoning_effort:
             if reasoning_effort not in {"none", "minimal", "low", "medium", "high", "xhigh", "max"}:
                 raise ValueError("SAGE_REASONING_EFFORT must be one of none, minimal, low, medium, high, xhigh, max")
-            if self.provider.lower() != "openai":
-                raise ValueError("SAGE_REASONING_EFFORT requires the openai model provider")
-        # One validator and one request projection for the OpenAI API, Daybreak program and safety
-        # identifier, shared with the profile-based factory (ai/openai_api.py).
+            if not openai_family:
+                raise ValueError(
+                    "SAGE_REASONING_EFFORT requires the OpenAI, LiteLLM Gateway or Custom (OpenAI-compatible) model "
+                    "provider"
+                )
+        # One validator and one request projection for the OpenAI-family providers, the effective OpenAI API,
+        # Daybreak program and safety identifier, shared with the profile-based factory (ai/openai_api.py).
         openai_route = openai_api.route_from_configurable(self.provider, self.model, cfg)
 
         llm = None
@@ -9821,7 +9829,7 @@ class Model:
             eval_max_output_tokens = 0
         eval_temperature = _eval_temperature()
         ledger = resource_budget.configured_ledger()
-        if ledger is not None and self.provider.lower() != "openai":
+        if ledger is not None and not openai_family:
             raise resource_http.ResourceHTTPError(
                 "native resource metering supports only the OpenAI-compatible provider"
             )
@@ -9861,7 +9869,7 @@ class Model:
                 model_kwargs["max_tokens"] = eval_max_output_tokens
             if eval_temperature is not None:
                 model_kwargs["temperature"] = eval_temperature
-            if self.provider.lower() == "openai":  # the route's options are ChatOpenAI's (as in sage_chat/config.py)
+            if openai_family:  # the route's options are ChatOpenAI's (as in sage_chat/config.py)
                 model_kwargs.update(openai_api.adapter_options(openai_route))
             if ledger is not None or retry_policy is not None:
                 sync_transport: httpx.BaseTransport = (
@@ -9889,12 +9897,12 @@ class Model:
                 f"Initializing model with provider={self.provider}, model={self.model}, "
                 f"api_key={'configured' if 'api_key' in model_kwargs else 'provider default'}, "
                 f"base_url={model_kwargs.get('base_url', 'provider default')}, "
-                f"openai_api={openai_api.API_LABELS.get(openai_route.api, openai_route.api)}, "
+                f"openai_api={openai_api.api_label(openai_route, 'configured')}, "
                 f"access_program={openai_route.effective_access_program or 'none'}, "
                 f"safety_identifier={'configured' if openai_route.safety_identifier else 'none'}"
             )
             llm = init_chat_model(
-                model_provider=self.provider,
+                model_provider=openai_api.adapter_provider(self.provider),
                 model=self.model,
                 **model_kwargs,
             )

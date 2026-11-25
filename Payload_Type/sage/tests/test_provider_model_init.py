@@ -9,6 +9,23 @@ class _FakeLLM:
     pass
 
 
+# What a blank OpenAI API means on OpenAI's own endpoint (the provider split): Responses with Sage's projection.
+DIRECT_OPENAI_RESPONSES = {
+    "use_responses_api": True,
+    "output_version": "responses/v1",
+    "store": False,
+    "include": ["reasoning.encrypted_content"],
+    "extra_body": {"access_programs": {"cyber": "standard"}},
+}
+
+
+@pytest.fixture(autouse=True)
+def _no_adapter_endpoint(monkeypatch):
+    # The adapter's own endpoint variables decide what a blank API Endpoint means; keep these rows hermetic.
+    for name in ("OPENAI_API_BASE", "OPENAI_BASE_URL", "LANGSMITH_GATEWAY"):
+        monkeypatch.delenv(name, raising=False)
+
+
 def _model(provider, configurable):
     instance = model_module.Model.__new__(model_module.Model)
     instance.provider = provider
@@ -89,11 +106,12 @@ def test_eval_max_output_tokens_is_applied_to_shipping_model(monkeypatch):
     monkeypatch.setattr(model_module, "_patch_model_for_bedrock", lambda llm: llm)
 
     assert isinstance(_model("openai", {})._get_base_chat_model(), _FakeLLM)
+    # Changed expectation (provider split): no endpoint is OpenAI's own, where a blank OpenAI API means Responses.
     assert calls == [{
         "model_provider": "openai",
         "model": "test-model",
         "max_tokens": 8192,
-        "use_responses_api": False,  # blank OpenAI API pins Chat Completions (operator decision 2026-11-24)
+        **DIRECT_OPENAI_RESPONSES,
     }]
 
 
@@ -116,9 +134,10 @@ def test_explicit_openai_reasoning_effort_reaches_model_constructor(monkeypatch,
     monkeypatch.setattr(model_module, "_patch_model_for_bedrock", lambda llm: llm)
 
     assert isinstance(_model("openai", {"reasoning_effort": effort})._get_base_chat_model(), _FakeLLM)
-    # A blank OpenAI API pins Chat Completions (operator decision 2026-11-24): the adapter never chooses Responses.
+    # Changed expectation (provider split): no endpoint is OpenAI's own, where a blank OpenAI API means Responses.
+    # The adapter still never chooses the API itself.
     assert calls == [{"model_provider": "openai", "model": "test-model", "reasoning_effort": effort,
-                      "use_responses_api": False}]
+                      **DIRECT_OPENAI_RESPONSES}]
 
 
 @pytest.mark.parametrize("provider", ["anthropic", "bedrock", "ollama"])

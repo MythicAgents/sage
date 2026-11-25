@@ -4608,14 +4608,24 @@ def test_provider_is_choice_dropdown_not_freeform_string():
     prov = opts["provider"]
     assert str(prov.Type) == "choice"
     assert prov.DefaultValue == "openai"
-    values = {c.Value for c in prov.Choices}
-    assert values == {"openai", "bedrock", "anthropic", "ollama"}
+    # Changed expectation (provider split): LiteLLM Gateway and Custom (OpenAI-compatible) join OpenAI; all three
+    # build ChatOpenAI. The Watcher offers the same list.
+    expected = [("OpenAI", "openai"), ("LiteLLM Gateway", "litellm"),
+                ("Custom (OpenAI-compatible)", "openai_compatible"), ("AWS Bedrock", "bedrock"),
+                ("Anthropic", "anthropic"), ("Ollama", "ollama")]
+    assert [(c.Label, c.Value) for c in prov.Choices] == expected
+    watcher = {o.Name: o for o in SAGE_MODELS[1].Metadata.ConfigurationOptions}["SAGE_WATCHER_PROVIDER"]
+    assert [(c.Label, c.Value) for c in watcher.Choices] == expected
     # "bedrock" must be exactly this string so config.py's `if provider == "bedrock"` AWS-quad branch fires
-    assert "bedrock" in values
+    assert "bedrock" in {c.Value for c in prov.Choices}
     # round-trips through to_json (what actually syncs to Mythic) with choices intact
     pj = [o for o in SAGE_MODELS[0].to_json()["metadata"]["configuration_options"] if o["name"] == "provider"][0]
     assert pj["type"] == "choice"
-    assert {c["value"] for c in pj["choices"]} == {"openai", "bedrock", "anthropic", "ollama"}
+    assert [(c["label"], c["value"]) for c in pj["choices"]] == expected
+    # The OpenAI API choices are unchanged by the split.
+    api = opts["SAGE_OPENAI_API"]
+    assert [(c.Label, c.Value) for c in api.Choices] == [
+        ("Use configured default", ""), ("Chat Completions", "chat_completions"), ("Responses", "responses")]
 
 
 def test_provider_is_a_static_chip_and_model_is_the_clickable_metadata_chip():

@@ -594,33 +594,50 @@ Model settings resolve through the chain above. The main settings are:
 
 | Setting | Purpose |
 |---|---|
-| `provider` | `openai` (default), `bedrock`, `anthropic`, or `ollama` |
+| `provider` | `openai` (OpenAI, the default), `litellm` (LiteLLM Gateway), `openai_compatible` (Custom (OpenAI-compatible)), `bedrock`, `anthropic`, or `ollama` |
 | `model` | Provider model identifier |
-| `API_ENDPOINT` | Optional endpoint override — point `openai` at any OpenAI-compatible server (see below) |
-| `API_KEY` | Provider API key when required |
+| `API_ENDPOINT` | Base URL. Required for `litellm` (the gateway URL) and `openai_compatible`; optional for `openai`, where blank means `https://api.openai.com/v1` |
+| `API_KEY` | Provider API key when required; for `litellm`, the gateway key |
 | `mode` | `conversation` (default), `supervised`, or `auto` — see [Modes](#modes) |
 | `autonomous_solve` | Enable objective-led controller execution; supervised mode still requires approval for each guarded action. Ignored in conversation mode, which stays read-only |
 | `policy_mode` | `hybrid` (default), `symbolic`, or `llm` capability selection |
 | `max_steps` | Model-step ceiling per chat request; unset defaults to `200`, `0` means unlimited |
-| `SAGE_OPENAI_API` | **OpenAI API**: blank means Chat Completions; `chat_completions` or `responses` selects one (OpenAI provider only) |
-| `SAGE_OPENAI_ACCESS_PROGRAM` | **OpenAI Daybreak**: `standard` (Off), `daybreak_blue` or `daybreak_red`. Any value, Off included, requires `SAGE_OPENAI_API=responses`; blank sends Off on Responses |
+| `SAGE_OPENAI_API` | **OpenAI API**: `chat_completions` or `responses` selects one; blank means Responses on OpenAI's own API and Chat Completions everywhere else (OpenAI, LiteLLM Gateway and Custom) |
+| `SAGE_OPENAI_ACCESS_PROGRAM` | **OpenAI Daybreak**: `standard` (Off), `daybreak_blue` or `daybreak_red`. Any value, Off included, requires the Responses API; blank sends Off on Responses |
 | `SAGE_OPENAI_SAFETY_IDENTIFIER` | **OpenAI Safety Identifier**: a stable pseudonym for the person using the chat, sent as `safety_identifier` |
-| `SAGE_REASONING_EFFORT` | **Reasoning Effort**: blank sends no effort (the provider's default for the model); `none`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max` is sent as chosen (OpenAI provider only) |
+| `SAGE_REASONING_EFFORT` | **Reasoning Effort**: blank sends no effort (the provider's default for the model); `none`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max` is sent as chosen (OpenAI, LiteLLM Gateway and Custom) |
 
-**Providers.** The four above are the tested set. Sage builds the model through LangChain's `init_chat_model`, so
+**Providers.** OpenAI, LiteLLM Gateway, Bedrock, Anthropic and Ollama are the tested set. OpenAI, LiteLLM Gateway
+and Custom (OpenAI-compatible) all use LangChain's OpenAI adapter; Custom is for any other server that speaks the
+OpenAI API, and individual servers are unverified. Sage builds the model through LangChain's `init_chat_model`, so
 other providers it supports may work but are unverified. Bedrock is the only provider with dedicated AWS
 credential and region handling exposed in the channel configuration. Never infer the effective backend from the
 model name alone; record the provider and route for live runs.
 
-**OpenAI-compatible endpoints.** Selecting `provider: openai` does not tie you to OpenAI. It speaks the
-[OpenAI API](https://developers.openai.com/api/reference/overview) — the de-facto standard most inference servers
-and gateways implement — so you can set `API_ENDPOINT` to any server that exposes it: a self-hosted model, an
-internal gateway, or a proxy. For example, run a [LiteLLM](https://docs.litellm.ai/docs/simple_proxy) proxy and
-point `API_ENDPOINT` at it to reach 100+ providers behind a single OpenAI-compatible endpoint.
+**LiteLLM Gateway and other OpenAI-compatible servers.** Choose **LiteLLM Gateway** for a
+[LiteLLM](https://docs.litellm.ai/docs/simple_proxy) gateway: set **API Endpoint** to the gateway URL, **API Key** to
+the gateway key (not an upstream vendor key) and **Model** to the gateway's model alias. Choose **Custom
+(OpenAI-compatible)** for any other server that speaks the [OpenAI
+API](https://developers.openai.com/api/reference/overview), such as a self-hosted model or an internal gateway. Both
+need **API Endpoint**: without it Sage refuses the chat before any request, so a gateway key is never sent to
+OpenAI. Both use Chat Completions unless **OpenAI API** says otherwise. Responses can be selected, but not every
+gateway or server supports every Responses field (`store`, `include`, `access_programs`), and Sage makes no claim
+that a gateway replays encrypted reasoning. Existing chats configured as `provider: openai` with an `API_ENDPOINT`
+that points at a gateway or another server keep sending exactly what they sent before (Chat Completions, unless
+**OpenAI API** says otherwise); switching them to **LiteLLM Gateway** starts a new chat.
+
+**Which API a chat uses.** An explicit **OpenAI API** always wins. With it blank in the chat, the user secret and the
+environment, **OpenAI** on OpenAI's own API uses **Responses**, and everything else (LiteLLM Gateway, Custom, or
+OpenAI pointed at any other endpoint) uses **Chat Completions**. OpenAI's own API means the endpoint the adapter
+calls — **API Endpoint**, else `OPENAI_API_BASE`, else an enabled `LANGSMITH_GATEWAY`, else `OPENAI_BASE_URL`, else
+`https://api.openai.com/v1` — is `https` on `api.openai.com` or one of its subdomains (data-residency and Private
+Link hosts). To stay on Chat Completions with OpenAI's API, set **OpenAI API** to **Chat Completions**. The debug log
+and any provider-rejection notice name the API a request used and where that came from.
 
 **OpenAI Responses and [Daybreak](https://developers.openai.com/api/docs/guides/daybreak).** Some OpenAI models are
-served only on the Responses API, including the -cyber models from GPT-5.6 Cyber on. Set **OpenAI API** to
-**Responses** and keep `API_ENDPOINT` as the base URL (`https://api.openai.com/v1`); Sage adds `/responses` itself.
+served only on the Responses API, including the -cyber models from GPT-5.6 Cyber on. On OpenAI's own API that is
+the default; elsewhere set **OpenAI API** to **Responses**. `API_ENDPOINT` stays the base URL (for example
+`https://api.openai.com/v1`); Sage adds `/responses` itself.
 Responses requests are stateless (`store: false`): Sage keeps the conversation and sends it, with the model's
 encrypted reasoning, on each request. On Responses, Sage always names the Daybreak program and sends **Off**
 (`standard`, standard safeguards) unless you choose Blue or Red, so a project's own default program is never used
@@ -631,8 +648,9 @@ optional for every model; OpenAI [recommends
 one](https://developers.openai.com/api/docs/guides/safety-best-practices#implement-safety-identifiers) so it can act
 on a single user instead of the whole organization. Sage never derives one from a Mythic username; use the same
 pseudonym for the same person. Invalid combinations fail before any request: any **OpenAI Daybreak** value, Off
-included, without **OpenAI API = Responses** (wherever the value comes from: the chat, a user secret or the
-environment), or any of these settings with a non-OpenAI provider. When the provider rejects a route (for example
+included, on a Chat Completions route (wherever the value comes from: the chat, a user secret or the environment),
+any of these settings with a provider other than OpenAI, LiteLLM Gateway or Custom, or LiteLLM Gateway or Custom
+without **API Endpoint**. When the provider rejects a route (for example
 a Responses-only model on Chat Completions, or a Daybreak access error), the error names the setting to change and
 says whether the chat continues.
 Changing **Model** (or running `/model <name>`), **OpenAI API**, **OpenAI Daybreak**, **OpenAI Safety Identifier** or
@@ -646,12 +664,12 @@ provider's default for the model applies; that is not the same as **None**, whic
 Supported values depend on the model, so check its model page: for example, OpenAI documents that GPT-6.1 Sol does
 not accept None. Several OpenAI reasoning models accept function tools together with a reasoning effort only on the
 Responses API; on Chat Completions the provider answers `Function tools with reasoning_effort are not supported …`.
-Sage's tools are always offered, so for a reasoning model with tools set **OpenAI API** to **Responses** and choose an
-effort the model supports. The supported setup for GPT-5.6 Sol and GPT-6.1 Sol with tools is **OpenAI API = Responses**,
-**Reasoning Effort = Low** and **OpenAI Daybreak = Off**. When the provider refuses an API or effort combination, the
+Sage's tools are always offered, so a reasoning model with tools needs the Responses API (the default on OpenAI's
+own API; elsewhere set **OpenAI API** to **Responses**) and an effort the model supports. The supported setup for
+GPT-5.6 Sol and GPT-6.1 Sol with tools is the Responses API, **Reasoning Effort = Low** and **OpenAI Daybreak = Off**. When the provider refuses an API or effort combination, the
 error names the setting, the effort Sage sent and where that value came from, and the change to make; correcting it
 continues the same chat. Sage 0.3.0 cannot select the Responses API from a chat's settings: if the chat's model
-settings do not list **OpenAI API**, upgrade Sage first. Through an OpenAI-compatible proxy (`API_ENDPOINT`), the proxy
+settings do not list **OpenAI API**, upgrade Sage first. Through a gateway or another OpenAI-compatible server, it
 decides which route and efforts reach the model; Sage sends what you selected and does not infer a proxy's
 capabilities from a model name.
 

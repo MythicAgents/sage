@@ -162,7 +162,8 @@ async def _model(harness, mode: str, autonomous_solve: bool, request_id: str = "
     harness.agents.clear()
     model = mm.Model(
         provider="openai", model="inert-wire", system_prompt="conversation tool-surface regression",
-        config={"configurable": {"api_key": "sk-inert"}}, task_id=0,
+        # The endpoint the inert wire stands in for (inert_init above), so Sage decides the route for it.
+        config={"configurable": {"api_key": "sk-inert", "base_url": "http://provider.invalid/v1"}}, task_id=0,
         agent_task_id="conversation-tool-surface", mode=mode,
     )
     model.mythic_client = MythicTools()
