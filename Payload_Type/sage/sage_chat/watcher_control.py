@@ -53,6 +53,9 @@ query SageWatcherActiveProfiles($operation_id: Int!) {
 """
 
 
+_MARKER_KEY = "watcher"
+
+
 class WatcherControlBoundaryError(RuntimeError):
     pass
 
@@ -81,15 +84,35 @@ class WatcherChannel:
             and not self.archived
         )
 
+    def _marker_value(self) -> tuple[bool, Any]:
+        """(marked, raw marker): the Watcher-owned ``items`` entry, else the legacy ``watcher`` key.
+
+        Mythic stores only ``items`` (and ``default_display``) from a channel-metadata update and keeps every other
+        stored key, so the marker travels as one ``items`` entry keyed ``watcher``. A channel applied on an older
+        server still holds the legacy ``channel_metadata.watcher`` object; it counts only when no ``items`` entry
+        does. Two entries, or a bad entry, are a marked channel with no usable marker.
+        """
+        items = self.channel_metadata.get("items")
+        entries = (
+            [entry for entry in items if isinstance(entry, Mapping) and entry.get("key") == _MARKER_KEY]
+            if isinstance(items, list)
+            else []
+        )
+        if entries:
+            return True, entries[0].get("value") if len(entries) == 1 else None
+        if _MARKER_KEY in self.channel_metadata:
+            return True, self.channel_metadata.get(_MARKER_KEY)
+        return False, None
+
     @property
     def has_applied_marker(self) -> bool:
-        return "watcher" in self.channel_metadata
+        return self._marker_value()[0]
 
     @property
     def applied_marker(self) -> Mapping[str, Any] | None:
-        if not self.has_applied_marker:
+        marked, marker = self._marker_value()
+        if not marked:
             return None
-        marker = self.channel_metadata.get("watcher")
         if not isinstance(marker, Mapping):
             return None
         generation = marker.get("generation")
@@ -274,22 +297,32 @@ class WatcherControlPlane:
         interval_seconds: int,
         paused: bool,
     ) -> None:
+        # Mythic routes this update to the channel whose request is being served (the RPC's auth context), never to
+        # an id in the body. Both callers run inside the owner channel's own request, which is that channel.
+        marker = {
+            "generation": int(generation),
+            "state": str(lifecycle_state),
+            "provider": str(provider),
+            "model": str(model),
+            "config_sources": dict(config_sources),
+            "profile_binding_sha256": str(profile_binding_sha256),
+            "interval_seconds": int(interval_seconds),
+            "paused": bool(paused),
+        }
         response = await self._metadata_update(
             MythicRPCChatChannelMetadataUpdateMessage(
-                OperationID=int(operation_id),
-                ChannelID=int(channel_id),
-                ContainerName="sage",
                 ChannelMetadata={
-                    "watcher": {
-                        "generation": int(generation),
-                        "state": str(lifecycle_state),
-                        "provider": str(provider),
-                        "model": str(model),
-                        "config_sources": dict(config_sources),
-                        "profile_binding_sha256": str(profile_binding_sha256),
-                        "interval_seconds": int(interval_seconds),
-                        "paused": bool(paused),
-                    }
+                    "items": [
+                        {
+                            "key": _MARKER_KEY,
+                            "label": "Watcher",
+                            "value": marker,
+                            "display_value": f"gen {int(generation)} · {lifecycle_state}",
+                            "color": "neutral",
+                            "order": 0,
+                            "tooltip": "Applied Sage Watcher profile generation and state",
+                        }
+                    ]
                 },
             )
         )

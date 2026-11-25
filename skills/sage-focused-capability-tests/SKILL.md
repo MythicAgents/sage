@@ -77,6 +77,18 @@ argument is still accepted and ignored. See `docs/development/TEST_TIERS.md`.
   baseline. `run` (operator authorization required, `--authorized-by`, and `--plan` for `sage-line check-attempt`)
   sends `/bloodhound`, then `/mcp tools BloodHound`, in that channel inside one five-minute budget, with no retry or
   upload. `verify` applies the pass rules written in the script once. One attempt per run file.
+- `check_mythic_container_rc11.py readiness|run|verify --run-file F --phoenix-db P` — the mythic-container 0.7.0rc11
+  live check against a Mythic server at `Mythic-v4.0.0` `d8a94943` or later. `readiness` (read-only, `--route-file`,
+  `--callback`) checks deployment parity, that the container's packages equal this branch's `constraints.txt`, that
+  the lab Mythic checkout contains that commit and its running server image was built after it, that no
+  `Sage Watcher` channel exists yet, that the callback is active, Phoenix, the task baseline, the route credential
+  by name and status, and the Watcher route and bot token by name. `run` (paid provider activity, one target task
+  and one `docker restart sage`; operator authorization required, `--authorized-by`, `--plan` for
+  `sage-line check-attempt`, and `--pip-audit`) records the container's audit, then runs a Conversation prompt, a
+  Supervised `whoami` whose first approval card it accepts, and in a new locked `Sage Watcher` channel `/watcher
+  apply`, `/watcher status`, the restart, `/watcher status` and `/watcher scan`. It stops at 20 provider calls,
+  300,000 tokens, 30 minutes or a second target task. `verify` applies the pass rules written in the script once,
+  reading the channels' stored metadata from Mythic. One attempt per run file.
 - `freeze_provider_wire.py --wire W [--wire W] --substitutions S` — writes the
   `provider_wire_round_trips.json` battery from recorded provider bodies, frozen with the SDK and adapter versions
   it names, and refuses to run on any other versions. Offline; the substitutions file is private.

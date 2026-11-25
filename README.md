@@ -244,7 +244,8 @@ strategy.
 
 ## Requirements
 
-- Requires Mythic v4.
+- Requires Mythic v4: the `Mythic-v4.0.0` branch at commit `d8a94943` or later. Older Mythic v4 servers are not
+  supported, because they cannot save Sage's channel-metadata updates.
 - Python 3.14 and a repository virtual environment.
 - Model-provider credentials or an OpenAI-compatible endpoint.
 - For the live-qualified graph path, BloodHound CE 9.5.1 plus [BloodHound MCP](https://github.com/mwnickerson/bloodhound_mcp)

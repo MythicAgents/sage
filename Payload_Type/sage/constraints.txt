@@ -77,7 +77,13 @@
 # SDK's gql 4.0.0 allows. langgraph-prebuilt stays at 1.1.0 (checkpoint 4.3.0, checkpoint-sqlite 3.1.1 and sdk 0.4.8
 # with it): prebuilt 1.1.3 lets a later delegated worker see an earlier worker's transcript, and langgraph 1.2.23
 # onward requires it, so langgraph stops at 1.2.22. Two advisories remain, both pinned by
-# mythic-container==0.7.0rc9: dynaconf==3.2.5 and ujson==5.9.0. Offline suite: SUITE_RESULT_PENDING.
+# mythic-container==0.7.0rc9: dynaconf==3.2.5 and ujson==5.9.0. Offline suite: 12243 passed, 0 failed, 23 skipped.
+#
+# Updated 2026-11-24 in place: mythic-container 0.7.0rc9 -> 0.7.0rc11, which pins the fixed dynaconf 3.2.13 (from
+# 3.2.5) and ujson 5.13.0 (from 5.9.0). A dry-run resolve of requirements.txt with every other pin held changed
+# no other package, and pip-audit of the result reports no known vulnerabilities. rc11's channel-metadata update
+# carries no channel identity, so it needs a Mythic server at Mythic-v4.0.0 d8a94943 or later.
+# Offline suite: 12341 passed, 23 skipped (parallel) and 308 passed, 6 skipped (serial), 0 failed.
 agent-client-protocol==1.0.0
 aio-pika==9.4.1
 aiofile==3.12.3
@@ -118,7 +124,7 @@ distro==1.9.0
 dnspython==2.9.2
 docker==7.2.0
 docstring_parser==0.18.0
-dynaconf==3.2.5
+dynaconf==3.2.13
 email-validator==2.3.0
 exceptiongroup==1.3.1
 execnet==2.1.2
@@ -184,7 +190,7 @@ mcp-types==2.3.0
 mdurl==0.1.2
 multidict==6.9.1
 mythic==0.3.0rc8
-mythic_container==0.7.0rc9
+mythic_container==0.7.0rc11
 numpy==2.5.4
 ollama==0.6.3
 openai==3.58.0
@@ -266,7 +272,7 @@ tqdm==4.70.1
 truststore==0.10.5
 typing_extensions==4.16.0
 typing-inspection==0.4.4
-ujson==5.9.0
+ujson==5.13.0
 uncalled-for==0.4.1
 urllib3==2.8.0
 uuid_utils==0.18.0

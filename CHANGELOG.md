@@ -9,6 +9,13 @@ between minor releases.
 
 ### Changed
 
+- **Sage now requires Mythic's `Mythic-v4.0.0` branch at commit `d8a94943` or later.** Sage moves to
+  mythic-container 0.7.0rc11, which leaves the channel out of a channel-metadata update; Mythic takes it from the
+  request being answered. An older Mythic server cannot place those updates, so Sage's channel chips and the Sage
+  Watcher's applied profile would not be saved. This minimum stands until a Mythic release tag contains that commit.
+- The Sage Watcher records its applied profile as a **Watcher** chip in its owner channel, because Mythic now keeps
+  only chip items from a metadata update. A Watcher applied before this upgrade keeps running after a restart, and
+  the next `/watcher apply` moves it to the chip.
 - A blank **OpenAI API** now always means Chat Completions. It used to leave the choice to LangChain's OpenAI adapter,
   which picks the Responses API on its own for some models (`gpt-5-pro`, `gpt-5.2-pro`, `gpt-5.4-pro`, `gpt-5.5-pro`
   and `codex` models, and from this release `gpt-5.6-sol` and any `gpt-6` model with tools). Those requests carried
@@ -44,11 +51,8 @@ between minor releases.
 - `strawberry-graphql` moves from 0.320.4 to 0.327.7 through Phoenix 20.21.0 (from 19.19.0), which the new MCP
   client makes possible. Phoenix 20.21.0 caps `anthropic` below 2, so `anthropic` moves from 0.125.0 to 1.17.0, the
   newest 1.x release. LangChain moves to 1.4.6 and LangGraph to 1.2.22.
-
-### Known issues
-
-- **Dependency vulnerabilities.** `pip-audit` reports advisories in two shipped packages, `dynaconf` and `ujson`,
-  both pinned by `mythic-container`.
+- The last two advisories are cleared: `dynaconf` moves from 3.2.5 to 3.2.13 and `ujson` from 5.9.0 to 5.13.0,
+  through mythic-container 0.7.0rc11 (from 0.7.0rc9).
 
 ## [0.4.0] - 2026-11-23
 
