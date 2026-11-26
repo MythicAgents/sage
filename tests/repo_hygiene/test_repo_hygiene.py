@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tomllib
 
@@ -306,6 +308,16 @@ _PRIVATE_CONTEXT_EXEMPT = {
     # Fixture for the review-lease contract, which still carries criterion IDs as data.
     "skills/sage-architecture-governor/tests/test_review_lease.py",
 }
+# Upstream notices a license requires us to keep verbatim, which one rule would otherwise flag.
+# Each entry accepts one exact line, at one exact path, for one rule, once per file. The same line
+# at another path, any text added to it, a repeat of it, and every other rule still report.
+_REQUIRED_ATTRIBUTION = {
+    # Mythic's BSD 3-Clause copyright line in its recorded createAPIToken action signature.
+    (
+        "Payload_Type/sage/tests/fixtures/mythic_create_api_token_action.graphql",
+        "person or private reviewer",
+    ): "# Copyright (c) 2018, Cody Thomas). The Query root is added only because GraphQL requires one.",
+}
 
 
 def _private_context_offenders(relative_path: str, text: str) -> list[str]:
@@ -313,7 +325,11 @@ def _private_context_offenders(relative_path: str, text: str) -> list[str]:
     for label, (pattern, exempt_prefixes) in _PRIVATE_CONTEXT_RULES.items():
         if relative_path.startswith(exempt_prefixes):
             continue
+        attribution = _REQUIRED_ATTRIBUTION.get((relative_path, label))
         for number, line in enumerate(text.splitlines(), 1):
+            if line == attribution:
+                attribution = None
+                continue
             if pattern.search(line):
                 found.append(f"{relative_path}:{number} ({label}): {line.strip()[:120]}")
     return found
@@ -349,12 +365,78 @@ def test_private_context_patterns_catch_leaks_and_spare_near_misses():
     ), "the eval subsystem keeps its protocol names"
 
 
-def test_no_private_context_in_tracked_files():
-    """No tracked file names the private tracker, a person, a private reviewer, a private plan
-    identifier, or a private plan document. Comments, docstrings, messages, and docs all count:
-    a public reader can resolve none of them."""
+_ATTRIBUTION_FIXTURE = "Payload_Type/sage/tests/fixtures/mythic_create_api_token_action.graphql"
+_PERSON_RULE = "person or private reviewer"
+
+
+def _attribution_fixture_text() -> str:
+    return (REPO_ROOT / _ATTRIBUTION_FIXTURE).read_text(encoding="utf-8")
+
+
+def _notice_line(text: str) -> str:
+    [notice] = [line for line in text.splitlines() if "Copyright (c) 2018" in line]
+    return notice
+
+
+def _report(path: str, number: int, label: str, line: str) -> str:
+    return f"{path}:{number} ({label}): {line.strip()[:120]}"
+
+
+def test_required_upstream_attribution_passes_the_person_rule():
+    """Mythic's BSD 3-Clause notice in the recorded createAPIToken fixture must stay verbatim, so
+    the scan accepts that exact line at that exact path, wherever it sits in the file and whatever
+    the line ends."""
+    text = _attribution_fixture_text()
+    notice = _notice_line(text)
+    assert _PRIVATE_CONTEXT_RULES[_PERSON_RULE][0].search(notice), (
+        "the notice must trip the person rule, or this test proves nothing"
+    )
+    assert _private_context_offenders(_ATTRIBUTION_FIXTURE, text) == []
+
+    moved = "\n".join([notice, *(line for line in text.splitlines() if line != notice)]) + "\n"
+    crlf = text.replace("\n", "\r\n")
+    for variant in (moved, crlf):
+        assert _private_context_offenders(_ATTRIBUTION_FIXTURE, variant) == []
+
+
+def test_required_attribution_spares_nothing_else():
+    """The exception binds content, path and rule: every near-match still reports, with its rule
+    and line."""
+    text = _attribution_fixture_text()
+    notice = _notice_line(text)
+    lines = text.splitlines()
+    at_notice, at_end = lines.index(notice) + 1, len(lines) + 1
+
+    elsewhere = "Payload_Type/sage/tests/fixtures/other_action.graphql"
+    assert _private_context_offenders(elsewhere, text) == [
+        _report(elsewhere, at_notice, _PERSON_RULE, notice)
+    ]
+
+    padded = notice + " Reviewed by Silas."
+    assert _private_context_offenders(_ATTRIBUTION_FIXTURE, text.replace(notice, padded)) == [
+        _report(_ATTRIBUTION_FIXTURE, at_notice, _PERSON_RULE, padded)
+    ]
+
+    for second in ("# Ask Cody about the response type", notice):
+        assert _private_context_offenders(_ATTRIBUTION_FIXTURE, text + second + "\n") == [
+            _report(_ATTRIBUTION_FIXTURE, at_end, _PERSON_RULE, second)
+        ], f"second author-name occurrence not reported: {second}"
+
+    for label, leak in (
+        ("private issue tracker", "# tracked in cairn #12"),
+        (_PERSON_RULE, "# raised in Advisor review"),
+        ("private plan identifier", "# ISC-4 contract"),
+        ("pointer to a private plan document", "# see Plans/SAGE_EVAL_GAUGE_PHASE0_ISA.md"),
+    ):
+        assert _private_context_offenders(_ATTRIBUTION_FIXTURE, text + leak + "\n") == [
+            _report(_ATTRIBUTION_FIXTURE, at_end, label, leak)
+        ], f"leak beside the notice not reported: {leak}"
+
+
+def _tracked_private_context_offenders(root: Path) -> list[str]:
+    """Private-context offenders in every path `git ls-files` tracks in the checkout at `root`."""
     listing = subprocess.run(
-        ["git", "ls-files"], cwd=REPO_ROOT, capture_output=True, text=True
+        ["git", "ls-files"], cwd=root, capture_output=True, text=True
     )
     tracked = listing.stdout.split() if listing.returncode == 0 else []
     assert len(tracked) >= 300, (
@@ -366,7 +448,7 @@ def test_no_private_context_in_tracked_files():
     for relative_path in tracked:
         if relative_path in _PRIVATE_CONTEXT_EXEMPT:
             continue
-        path = REPO_ROOT / relative_path
+        path = root / relative_path
         if not path.is_file():
             continue
         try:
@@ -374,4 +456,55 @@ def test_no_private_context_in_tracked_files():
         except (UnicodeDecodeError, OSError):
             continue
         offenders.extend(_private_context_offenders(relative_path, text))
+    return offenders
+
+
+def test_no_private_context_in_tracked_files():
+    """No tracked file names the private tracker, a person, a private reviewer, a private plan
+    identifier, or a private plan document. Comments, docstrings, messages, and docs all count:
+    a public reader can resolve none of them."""
+    offenders = _tracked_private_context_offenders(REPO_ROOT)
     assert not offenders, "private context in tracked files:\n" + "\n".join(offenders)
+
+
+def _tracked_copy(destination: Path) -> Path:
+    """A separate Git checkout tracking the working-tree contents of every path this one tracks."""
+    listing = subprocess.run(
+        ["git", "ls-files", "-z"], cwd=REPO_ROOT, capture_output=True, text=True, check=True
+    )
+    subprocess.run(["git", "init", "-q", str(destination)], check=True)
+    for relative_path in filter(None, listing.stdout.split("\0")):
+        source, target = REPO_ROOT / relative_path, destination / relative_path
+        if not os.path.lexists(source):
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_symlink():
+            target.symlink_to(os.readlink(source))
+        else:
+            shutil.copyfile(source, target)
+    subprocess.run(["git", "add", "--force", "--all"], cwd=destination, check=True)
+    return destination
+
+
+def test_tracked_scan_keeps_the_notice_and_catches_a_leak_beside_it(tmp_path):
+    """Through the real tracked-file scan: the recorded fixture passes as it is, and a leak added
+    to it is still reported, so the fixture is never exempted as a whole."""
+    checkout = _tracked_copy(tmp_path / "checkout")
+    fixture = checkout / _ATTRIBUTION_FIXTURE
+    assert fixture.read_bytes() == (REPO_ROOT / _ATTRIBUTION_FIXTURE).read_bytes()
+
+    def fixture_offenders() -> list[str]:
+        return [
+            offender for offender in _tracked_private_context_offenders(checkout)
+            if offender.startswith(f"{_ATTRIBUTION_FIXTURE}:")
+        ]
+
+    assert fixture_offenders() == []
+
+    text = fixture.read_text(encoding="utf-8")
+    leak = "# Follow-up for Cato"
+    fixture.write_text(text + leak + "\n", encoding="utf-8")
+    subprocess.run(["git", "add", "--", _ATTRIBUTION_FIXTURE], cwd=checkout, check=True)
+    assert fixture_offenders() == [
+        _report(_ATTRIBUTION_FIXTURE, len(text.splitlines()) + 1, _PERSON_RULE, leak)
+    ]
