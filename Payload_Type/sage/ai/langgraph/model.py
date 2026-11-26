@@ -922,6 +922,26 @@ def _sanitize_model_messages(msgs: list, *, configured_model: str | None = None)
     return out, changed
 
 
+def _is_sage_metadata_key(key: Any) -> bool:
+    """Sage's own `additional_kwargs` keys have one leading underscore (`_step_outcome`, `_request_id`, `_seq`, ...).
+    Provider adapters own the rest, including double-underscore keys such as langchain-openai's `__openai_role__`."""
+    return isinstance(key, str) and key.startswith("_") and not key.startswith("__")
+
+
+def _provider_message(message: Any) -> Any:
+    """``message`` as the Converse serializer receives it: a copy without Sage's metadata (its `_x` kwargs and the
+    `sage_model` answer stamp), or the message itself when it carries none. Content, name, id, tool calls and
+    provider-owned fields are kept; the caller's message keeps its metadata."""
+    kwargs = getattr(message, "additional_kwargs", None) or {}
+    metadata = getattr(message, "response_metadata", None) or {}
+    update: dict[str, Any] = {}
+    if any(_is_sage_metadata_key(key) for key in kwargs):
+        update["additional_kwargs"] = {key: value for key, value in kwargs.items() if not _is_sage_metadata_key(key)}
+    if SAGE_MODEL_METADATA_KEY in metadata:
+        update["response_metadata"] = {key: value for key, value in metadata.items() if key != SAGE_MODEL_METADATA_KEY}
+    return message.model_copy(update=update) if update else message
+
+
 _AUTONOMOUS_UNBOUNDED_GRAPH_RECURSION_LIMIT = _env_positive_int(
     "SAGE_AUTONOMOUS_UNBOUNDED_GRAPH_RECURSION_LIMIT",
     100000,
@@ -1434,18 +1454,45 @@ def _eval_temperature() -> float | None:
     return value
 
 
+def _apply_converse_metadata_patch() -> None:
+    """Hand langchain-aws's Converse serializer messages without Sage's metadata.
+
+    `_messages_to_bedrock` merges consecutive same-role messages with `merge_message_runs`, which merges their
+    `additional_kwargs`; two differing non-string values (two step outcomes' `active_seconds`) raise a TypeError.
+    The wrapper copies each message with `_provider_message` just before that merge, after every Sage reader has run,
+    so callbacks, traces and the stored history keep the originals. Like `_apply_bedrock_patch`, it replaces the
+    module attribute that `ChatBedrockConverse` (and `ChatBedrock` when it selects Converse) calls. Idempotent.
+    """
+    try:
+        from langchain_aws.chat_models import bedrock_converse
+        original = bedrock_converse._messages_to_bedrock
+    except (ImportError, AttributeError):
+        return
+    if getattr(original, "_sage_metadata_removed", False):
+        return
+
+    def _messages_to_bedrock(messages, *args, **kwargs):
+        return original([_provider_message(message) for message in messages], *args, **kwargs)
+
+    _messages_to_bedrock.__wrapped__ = original
+    _messages_to_bedrock._sage_metadata_removed = True
+    bedrock_converse._messages_to_bedrock = _messages_to_bedrock
+
+
 def _patch_model_for_bedrock(model: BaseChatModel) -> BaseChatModel:
-    """Apply the langchain_openai empty-content monkeypatch and return the model unchanged.
+    """Apply the adapter monkeypatches and return the model unchanged.
 
     IMPORTANT — scope: `_apply_bedrock_patch` only patches `langchain_openai.chat_models.base.
     _convert_message_to_dict`, so it takes effect ONLY when the live model is `ChatOpenAI` (provider
     "openai" or an OpenAI-compatible / LiteLLM proxy that fronts Bedrock). For the NATIVE Bedrock provider —
-    `init_chat_model(model_provider="bedrock")` → langchain-aws `ChatBedrock`/`ChatBedrockConverse` — this
+    `init_chat_model(model_provider="bedrock")` → langchain-aws `ChatBedrock`/`ChatBedrockConverse` — that
     patch is a NO-OP (that path never imports langchain_openai). The authoritative, provider-agnostic
     empty-`system`/blank-block guard for the native path is `_sanitize_messages` plus the `_nonempty_system`
-    construction-site default; do not rely on this monkeypatch for the langchain-aws provider.
+    construction-site default; do not rely on that monkeypatch for the langchain-aws provider.
+    `_apply_converse_metadata_patch` keeps Sage's metadata out of the Converse serializer's run merge.
     """
     _apply_bedrock_patch()
+    _apply_converse_metadata_patch()
     return model
 
 

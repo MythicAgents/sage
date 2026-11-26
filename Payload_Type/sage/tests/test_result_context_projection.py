@@ -24,6 +24,7 @@ from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain.agents.middleware.types import ModelRequest
 from langchain_openai.chat_models.base import _convert_message_to_dict
+from langchain_aws.chat_models import bedrock_converse
 from langchain_aws.chat_models.bedrock_converse import _messages_to_bedrock
 
 from langchain_aws.chat_models.bedrock import _format_anthropic_messages
@@ -432,3 +433,162 @@ def test_a_later_requests_fresh_worker_gets_the_previous_reply_as_a_record(monke
     assert not _assistant_reports(worker_call)
     later = "\n".join(str(e.get("content") or "") for e in run.emissions[run.marks[0]:])
     assert "Both callbacks are live." in later
+
+
+# --- (g) Bedrock Converse serializes the same history: Sage's metadata stays out of its run merge ----------------
+#
+# Converse (`_messages_to_bedrock`) merges consecutive same-role messages with `merge_message_runs`, which merges their
+# `additional_kwargs`; two recorded step outcomes (`active_seconds` 0.0 and 25.1) in one run raised a TypeError there.
+# Sage's adapter patch (`_apply_converse_metadata_patch`, applied with every model Sage builds) hands that serializer
+# copies without Sage's metadata; the outgoing request, callbacks and the stored messages keep it.
+
+OUTCOME_ROWS = [row for row in SEGMENTS["request-13-history"]["messages"]
+                if (row.get("additional_kwargs") or {}).get("_step_outcome")]
+OPERATOR_ROWS = [row for row in SEGMENTS["request-13-history"]["messages"]
+                 if (row.get("additional_kwargs") or {}).get("_operator_input")]
+SAGE_KEY = re.compile(r"_(?!_)")          # Sage's metadata keys: one leading underscore (providers own `__x__`)
+
+
+def _sage_keys(message) -> list[str]:
+    keys = [key for key in (message.additional_kwargs or {}) if SAGE_KEY.match(key)]
+    return keys + (["sage_model"] if "sage_model" in (message.response_metadata or {}) else [])
+
+
+def _converse(outgoing, monkeypatch) -> tuple[list, list[dict]]:
+    """The messages Converse's run merge receives, and the Converse messages it produces, through the serializer as
+    `ChatBedrockConverse` calls it once Sage has built a model (the patched module attribute)."""
+    model_module._apply_converse_metadata_patch()
+    seen: list[list] = []
+    real = bedrock_converse.merge_message_runs
+
+    def spy(messages, *args, **kwargs):
+        seen.append(list(messages))
+        return real(messages, *args, **kwargs)
+
+    monkeypatch.setattr(bedrock_converse, "merge_message_runs", spy)
+    wire, _system = bedrock_converse._messages_to_bedrock(list(outgoing.messages), None)
+    return seen[-1], wire
+
+
+def _history(shape: str) -> list:
+    first, second = (_message(row) for row in OUTCOME_ROWS)
+    opening, later = (_message(row) for row in OPERATOR_ROWS)
+    return [opening, first, second] if shape == "adjacent" else [opening, first, later, second]
+
+
+def _in_order(wire: list[dict], texts: list[tuple[str, str]]) -> None:
+    """Each (role, text) appears in a Converse message of that role, after the previous one."""
+    position = (-1, -1)
+    for role, text in texts:
+        found = next(((index, offset) for index, message in enumerate(wire)
+                      for offset in [_bedrock_text(message).find(text)]
+                      if offset >= 0 and message["role"] == role and (index, offset) > position), None)
+        assert found, (role, text[:80])
+        position = found
+
+
+def test_the_serializer_patch_is_applied_with_every_model_sage_builds():
+    """`_get_base_chat_model` passes every model through `_patch_model_for_bedrock`; that installs the wrapper once."""
+    model_module._patch_model_for_bedrock(FakeListChatModel(responses=["unused"]))
+    first = bedrock_converse._messages_to_bedrock
+    model_module._patch_model_for_bedrock(FakeListChatModel(responses=["unused"]))
+    assert getattr(first, "_sage_metadata_removed", False) and bedrock_converse._messages_to_bedrock is first
+    assert not getattr(first.__wrapped__, "_sage_metadata_removed", False)
+
+
+@pytest.mark.parametrize("mode", ["conversation", "supervised"])
+@pytest.mark.parametrize("shape", ["adjacent", "operator-separated"])
+def test_converse_serializes_recorded_step_outcomes(monkeypatch, shape, mode):
+    """The recorded pair: adjacent outcomes form one assistant run (conversation) or one projected user run
+    (supervised); separated by an operator turn they stay apart unprojected and form one user run when projected.
+    Both outcomes and the operator turns arrive in order, in their roles, and the stored messages are unchanged."""
+    assert [row["additional_kwargs"]["_step_outcome"]["active_seconds"] for row in OUTCOME_ROWS] == [0.0, 25.1]
+    model = _model("chat:3:request:13", mode=mode)
+    stored = model._sanitize_messages(_history(shape))
+    snapshot = copy.deepcopy(stored)
+    injection = _TurnAuthorityInjectionMiddleware(model, agent_name="Supervisor")
+    request = ModelRequest(model=FakeListChatModel(responses=["unused"]), messages=stored,
+                           system_message=SystemMessage(content="Trusted supervised instructions"))
+    outgoing = _MessageSanitizerMiddleware(model)._sanitize(injection._augment(request))
+    merged_input, wire = _converse(outgoing, monkeypatch)
+
+    assert not [key for message in merged_input for key in _sage_keys(message)]
+    # Only the serializer's input is a copy: the request the model and its callbacks receive keeps Sage's metadata.
+    assert sum("_step_outcome" in message.additional_kwargs for message in outgoing.messages) == 2
+    report_role = "user" if mode == "supervised" else "assistant"
+    expected = [("user", OPERATOR_ROWS[0]["content"]), (report_role, OUTCOME_ROWS[0]["content"])]
+    if shape == "operator-separated":
+        expected.append(("user", OPERATOR_ROWS[1]["content"]))
+    expected.append((report_role, OUTCOME_ROWS[1]["content"]))
+    _in_order(wire, expected)
+    if mode == "supervised":
+        assert all(RECORD_HEADER in _bedrock_text(message) for message in wire
+                   if OUTCOME_ROWS[0]["content"] in _bedrock_text(message)
+                   or OUTCOME_ROWS[1]["content"] in _bedrock_text(message))
+    assert stored == snapshot and stored[1].additional_kwargs["_step_outcome"]["active_seconds"] == 0.0
+
+
+def test_converse_serializes_a_second_incompatible_sage_field(monkeypatch):
+    """Synthetic control: `_deferred_task_reconciled` is written as `True` (the pending summary) and as a dict (the
+    recorded reconciliation); in one assistant run the two types collide in the merge. Not only `active_seconds`."""
+    recorded = _message(next(row for row in SEGMENTS["request-13-history"]["messages"]
+                             if isinstance((row.get("additional_kwargs") or {}).get("_deferred_task_reconciled"), dict)))
+    pending = AIMessage(content="Synthetic pending summary.", name="Supervisor",
+                        additional_kwargs={"_deferred_task_reconciled": True, "_request_id": "chat:3:request:9"})
+    operator = _message(OPERATOR_ROWS[0])
+    stored = [operator, pending, recorded]
+    snapshot = copy.deepcopy(stored)
+    merged_input, wire = _converse(_outgoing(stored, mode="conversation"), monkeypatch)
+    assert not [key for message in merged_input for key in _sage_keys(message)]
+    _in_order(wire, [("user", operator.content), ("assistant", pending.content), ("assistant", recorded.content)])
+    assert stored == snapshot
+
+
+def test_the_serializer_copy_keeps_content_provider_fields_reasoning_and_tool_ids(monkeypatch):
+    """What the copy must keep, at each consumer: text blocks, the trusted attribution header, provider-owned kwargs
+    (`refusal`, `__openai_role__`), same-model reasoning, and tool-call/result IDs. A message without Sage metadata
+    reaches the merge as the same object. Synthetic shapes beside the recorded rows."""
+    model = _model("chat:3:request:13")
+    model.model = "anthropic.claude-test"
+    outcome = _message(OUTCOME_ROWS[0])
+    blocks = AIMessage(content=[{"type": "text", "text": outcome.content}], name="Sage",
+                       additional_kwargs=copy.deepcopy(outcome.additional_kwargs))
+    reply = _message(next(row for row in SEGMENTS["request-13-history"]["messages"] if "refusal" in row["additional_kwargs"]))
+    reasoning = AIMessage(
+        content=[{"type": "reasoning_content", "reasoning_content": {"text": "same-model thought", "signature": "sig"}},
+                 {"type": "text", "text": "Checking callbacks."}],
+        tool_calls=[{"name": "list_callbacks", "args": {}, "id": "call-1"}],
+        additional_kwargs={"_seq": 7, "_request_id": "chat:3:request:13"},
+        response_metadata={"sage_model": "anthropic.claude-test", "model_name": "anthropic.claude-test"})
+    result = ToolMessage(content="callbacks 13 and 14", tool_call_id="call-1", name="list_callbacks",
+                         additional_kwargs={"_seq": 8, "_task_output_collection_request_id": "chat:3:request:13"})
+    operator = _message(OPERATOR_ROWS[1])
+    developer = SystemMessage(content="Developer note.", additional_kwargs={"__openai_role__": "developer"})
+    stored = [developer, operator, blocks, reply, reasoning, result]
+    snapshot = copy.deepcopy(stored)
+    outgoing = _outgoing(stored, model=model)
+    sent = outgoing.messages
+    merged, wire = _converse(outgoing, monkeypatch)
+
+    assert not [key for message in merged for key in _sage_keys(message)]
+    assert merged[0] is developer and _convert_message_to_dict(sent[0])["role"] == "developer"
+    record = next(message for message in merged if isinstance(message, HumanMessage)
+                  and RECORD_HEADER in _message_content_as_text(message.content))
+    assert record.content[0]["text"].startswith(f"[Sage record {_header_token(record)} · step outcome")
+    assert f"[Sage record {_header_token(record)} ·" in _system_text(outgoing.system_message)
+    assert [block for block in record.content if block.get("text") == outcome.content] == blocks.content
+    assert any(message is reply for message in merged) and reply.additional_kwargs == {"refusal": None}
+    [kept_reasoning] = [message for message in merged if isinstance(message, AIMessage) and message.tool_calls]
+    assert kept_reasoning.content == reasoning.content and kept_reasoning.tool_calls == reasoning.tool_calls
+    assert kept_reasoning.response_metadata == {"model_name": "anthropic.claude-test"}
+
+    blocks_out = [block for message in wire for block in message["content"]]
+    assert any("reasoningContent" in block for block in blocks_out)
+    assert [block["toolUse"]["toolUseId"] for block in blocks_out if "toolUse" in block] == ["call-1"]
+    assert [block["toolResult"]["toolUseId"] for block in blocks_out if "toolResult" in block] == ["call-1"]
+    openai = [_convert_message_to_dict(message) for message in sent]
+    assert [call["id"] for item in openai for call in item.get("tool_calls", [])] == ["call-1"]
+    assert [item["tool_call_id"] for item in openai if item["role"] == "tool"] == ["call-1"]
+    assert stored == snapshot
+    assert stored[4].response_metadata["sage_model"] == "anthropic.claude-test"
+    assert stored[5].additional_kwargs["_task_output_collection_request_id"] == "chat:3:request:13"
