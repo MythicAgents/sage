@@ -4,8 +4,9 @@ Each row in ``fixtures/model_input_boundaries/provider_wire_round_trips.json`` i
 recorded on 2026-11-22 together with what the pre-upgrade SDK and adapter (``provenance.oracle_versions``) made of
 it, projected onto what Sage's consumers read (``tests/provider_wire_replay.py``). The installed SDK and adapter must
 produce the same projections on both client paths Sage uses, and a checkpoint saved under the oracle versions must
-restore to the same history. Stand-ins, labelled: the network transport (answers with the recorded body), the replay
-prompt and the tool result.
+restore to the same history. Rows added later (``added_by``, with ``provenance.additions``) name the versions they were
+frozen under; a rebuilt row says what it was rebuilt from and why its expectation is the folded message. Stand-ins,
+labelled: the network transport (answers with the recorded body), the replay prompt and the tool result.
 """
 
 from __future__ import annotations
@@ -60,9 +61,20 @@ def test_provenance_names_its_oracle_substitutions_and_gaps():
     provenance = FIXTURE["provenance"]
     assert provenance["kind"].startswith("recorded provider output")
     assert set(provenance["oracle_versions"]) == {"openai", "langchain-openai", "langchain-core"}
-    assert "Chat Completions success" in provenance["gap"] and "Anthropic" in provenance["gap"]
+    assert "Anthropic" in provenance["gap"]
     shapes = {(row["route"]["api"], row["status"]) for row in ROWS}
-    assert {("responses", 200), ("responses", 400), ("chat_completions", 400)} <= shapes
+    assert {("responses", 200), ("responses", 400), ("chat_completions", 400), ("chat_completions", 200)} <= shapes
+    # Rows added after the pre-upgrade freeze name their script and versions; a rebuilt row says so and carries the
+    # reason its expectation differs from what the adapter alone makes of its body.
+    additions = provenance["additions"]
+    assert additions["rows"] == [row["id"] for row in ROWS if row.get("added_by") == additions["added_by"]]
+    for row in ROWS:
+        if row.get("added_by"):
+            assert set(row["oracle_versions"]) == set(provenance["oracle_versions"]), row["id"]
+        if row.get("rebuilt"):
+            assert row["source"].startswith("rebuilt from Phoenix LLM span"), row["id"]
+            assert row["expectation_reason"] == "this plan: one reply split by the gateway", row["id"]
+            assert len(row["body"]["choices"]) > 1, row["id"]
     assert any("reasoning" in row["expected"]["message"]["content_types"] for row in ANSWERED)
     assert any(row["expected"]["message"]["content_types"] == ["text"] for row in ANSWERED)
     # An accepted difference may only replace the SDK's own error text, never what Sage's consumers decide on.

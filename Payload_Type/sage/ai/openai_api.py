@@ -24,16 +24,24 @@ Semantics:
   on Chat Completions.
 - The safety identifier is optional (OpenAI recommends it; no model requires it), operator-supplied and sent
   only when configured. Sage never derives one.
+- Sage never asks for more than one completion, so a Chat Completions response with several assistant choices is
+  one reply a gateway split (one choice per output item). ``install_choice_fold`` folds it into one choice before
+  LangChain keeps the first: every text and tool call in choice order, as a fixed gateway sends it. Any other shape
+  reaches LangChain unchanged; an unrecognized multi-choice shape is logged without its content.
 """
 
 from __future__ import annotations
 
+import functools
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 API_ENV = "SAGE_OPENAI_API"
 ACCESS_PROGRAM_ENV = "SAGE_OPENAI_ACCESS_PROGRAM"
@@ -243,3 +251,126 @@ def route_from_configurable(provider: str, model: str, configurable: dict[str, A
         safety_identifier=configurable.get("openai_safety_identifier"),
         endpoint=configurable.get("base_url"),
     )
+
+
+# One reply split across Chat Completions choices.
+
+_FOLD_MARK = "_sage_split_choice_fold"
+_FOLDABLE_FINISH = (None, "stop", "tool_calls")
+
+
+def _unfoldable(choices: list, n: int | None) -> str:
+    """Why these choices are not one split reply, or "" when they are. Never names their content."""
+    if n is not None and n > 1:
+        return "more than one completion was requested"
+    seen: set = set()
+    calls = 0
+    for choice in choices:
+        message = choice.get("message") if isinstance(choice, dict) else None
+        if not isinstance(message, dict):
+            return "a choice has no message"
+        if message.get("role") != "assistant":
+            return "a choice is not from the assistant"
+        if message.get("parsed") is not None:
+            return "a choice carries parsed output"
+        if message.get("refusal") is not None:
+            return "a choice carries a refusal"
+        if choice.get("finish_reason") not in _FOLDABLE_FINISH:
+            return "a choice did not finish normally"
+        if message.get("function_call") is not None or message.get("audio") is not None:
+            return "a choice carries a legacy function call or audio"
+        if message.get("content") is not None and not isinstance(message.get("content"), str):
+            return "a choice's content is not text"
+        tool_calls = message.get("tool_calls") or []
+        if not isinstance(tool_calls, list):
+            return "a choice's tool calls are not a list"
+        for call in tool_calls:
+            call_id = call.get("id") if isinstance(call, dict) else None
+            if call_id in seen:
+                return "a tool-call id repeats"
+            seen.add(call_id)
+        calls += len(tool_calls)
+    return "" if calls else "no choice carries a tool call"
+
+
+def _joined(values: list) -> str | None:
+    texts = [value for value in values if isinstance(value, str) and value.strip()]
+    return "\n\n".join(texts) if texts else None
+
+
+def _fold(data: dict) -> dict:
+    positions = list(enumerate(data["choices"]))
+    ordered = [choice for _position, choice in sorted(positions, key=lambda item: (
+        item[1].get("index") if isinstance(item[1].get("index"), int) and not isinstance(item[1].get("index"), bool)
+        else item[0], item[0]))]
+    messages = [choice["message"] for choice in ordered]
+    message = {**messages[0], "role": "assistant", "refusal": None,
+               "content": _joined([m.get("content") for m in messages]),
+               "tool_calls": [call for m in messages for call in m.get("tool_calls") or []]}
+    reasoning = _joined([m.get("reasoning_content") for m in messages])
+    if reasoning is not None:
+        message["reasoning_content"] = reasoning
+    annotations = [m["annotations"] for m in messages if isinstance(m.get("annotations"), list)]
+    if annotations:
+        message["annotations"] = [item for group in annotations for item in group]
+    return {**data, "choices": [{**ordered[0], "index": 0, "finish_reason": "tool_calls", "message": message}]}
+
+
+def fold_split_choices(response: Any, *, n: int | None) -> Any:
+    """``response`` with one reply split across choices folded into ``choices[0]``; otherwise ``response`` itself.
+
+    The fold follows LiteLLM's own fix for its Responses-to-Chat bridge: texts joined in choice order, every tool
+    call in choice order, reasoning and annotations kept, ``finish_reason`` ``tool_calls``. A response with fewer
+    than two choices, or with an ``error``, is returned untouched for LangChain to read (or reject) as before.
+    """
+    choices = response.get("choices") if isinstance(response, dict) else getattr(response, "choices", None)
+    if not isinstance(choices, list) or len(choices) < 2:
+        return response
+    if isinstance(response, dict):
+        if response.get("error"):
+            return response
+        data = response
+    elif any(getattr(getattr(choice, "message", None), "parsed", None) is not None for choice in choices):
+        logger.warning("Sage kept the first of %d choices in a provider reply unfolded: %s.", len(choices),
+                       "a choice carries parsed output")
+        return response
+    else:
+        try:
+            data = response.model_dump(warnings=False)
+        except Exception:  # noqa: BLE001 - an unreadable SDK object is left for LangChain to read as before
+            logger.warning("Sage kept the first of %d choices in a provider reply unfolded: %s.", len(choices),
+                           "the response could not be read")
+            return response
+    reason = _unfoldable(data.get("choices") or [], n)
+    if reason:
+        logger.warning("Sage kept the first of %d choices in a provider reply unfolded: %s.", len(choices), reason)
+        return response
+    folded = _fold(data)
+    if isinstance(response, dict):
+        return folded
+    try:
+        # The same SDK type, so LangChain copies choices[0]'s refusal as it does for a single-choice reply.
+        return type(response).model_validate(folded)
+    except Exception:  # noqa: BLE001 - LangChain reads the folded dict as well
+        return folded
+
+
+def install_choice_fold() -> None:
+    """Fold a split reply before ``ChatOpenAI`` makes one generation per choice. Idempotent; once per process.
+
+    LangChain's ``invoke`` keeps only the first generation, so without this a tool call the gateway put in a later
+    choice never reaches Sage. Wraps ``BaseChatOpenAI._create_chat_result`` (its Chat Completions parser, which
+    ``AzureChatOpenAI`` also reaches through ``super()``); the Responses API never reaches it.
+    """
+    from langchain_openai.chat_models.base import BaseChatOpenAI
+
+    parse = BaseChatOpenAI._create_chat_result
+    if getattr(parse, _FOLD_MARK, False):
+        return
+
+    @functools.wraps(parse)
+    def _create_chat_result(self, response, generation_info=None):
+        return parse(self, fold_split_choices(response, n=getattr(self, "n", None)), generation_info)
+
+    setattr(_create_chat_result, _FOLD_MARK, True)
+    BaseChatOpenAI._create_chat_result = _create_chat_result

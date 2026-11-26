@@ -9971,6 +9971,7 @@ class Model:
                 model_kwargs["temperature"] = eval_temperature
             if openai_family:  # the route's options are ChatOpenAI's (as in sage_chat/config.py)
                 model_kwargs.update(openai_api.adapter_options(openai_route))
+                openai_api.install_choice_fold()
             if ledger is not None or retry_policy is not None:
                 sync_transport: httpx.BaseTransport = (
                     resource_http.MeteredHTTPTransport("provider", ledger=ledger, allow_non2xx=retry_policy is not None)

@@ -43,6 +43,7 @@ REPLAY_PROMPT = "Synthetic replay prompt: list the callbacks."
 TOOL_RESULT = "Synthetic tool result for the replay."
 API_KEY = "offline-placeholder-key"
 PATHS = ("default", "injected")
+RUN_ID = "lc_run--<run id>"
 
 # response_metadata keys Sage's consumers read (model.py model-name check, finish/stop reason checks,
 # sage_chat/service.py model identity on restore).
@@ -65,10 +66,10 @@ def configurable(row: dict, path: str, *, endpoint: str | None = None) -> dict[s
     return cfg
 
 
-def model_instance(row: dict, path: str, *, endpoint: str | None = None) -> Model:
+def model_instance(row: dict, path: str, *, endpoint: str | None = None, provider: str = "openai") -> Model:
     """A ``Model`` carrying only what ``_get_base_chat_model`` reads, for ``row``'s route on ``path``."""
     instance = Model.__new__(Model)
-    instance.provider = "openai"
+    instance.provider = provider
     instance.model = row["model"]
     instance.config = {"configurable": configurable(row, path, endpoint=endpoint)}
     instance._eval_arm_deadline_epoch = None
@@ -86,7 +87,7 @@ def _library_for(client: Any):
 
 
 def build_model(row: dict, path: str, *, body: bytes | None = None, status: int | None = None,
-                sent: list[dict] | None = None):
+                sent: list[dict] | None = None, provider: str = "openai"):
     """``(llm, sync_client, requests)`` for one row on one client path; ``requests`` records each request path and
     ``sent``, when given, each request's JSON body."""
     if path not in PATHS:
@@ -103,7 +104,7 @@ def build_model(row: dict, path: str, *, body: bytes | None = None, status: int 
             return library.Response(code, content=payload, headers={"content-type": "application/json"})
         return answer
 
-    llm = model_instance(row, path)._get_base_chat_model()
+    llm = model_instance(row, path, provider=provider)._get_base_chat_model()
     sync_client = llm.root_client._client
     async_client = llm.root_async_client._client
     if path == "default":
@@ -133,7 +134,8 @@ def message_view(message: AIMessage) -> dict[str, Any]:
     usage = message.usage_metadata or {}
     return {
         "type": type(message).__name__,
-        "id": message.id,
+        # LangChain names a message with no provider id after its run, which differs on every replay.
+        "id": RUN_ID if str(message.id or "").startswith("lc_run--") else message.id,
         "name": message.name,
         "tool_calls": [{"name": c["name"], "args": c["args"], "id": c["id"]} for c in message.tool_calls],
         "invalid_tool_calls": [{"name": c.get("name"), "args": c.get("args"), "id": c.get("id")}

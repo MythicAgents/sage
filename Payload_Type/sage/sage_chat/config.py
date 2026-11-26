@@ -358,10 +358,11 @@ def init_chat_model_from_profile(profile: ResolvedLLMProfile) -> Any:
     kwargs = profile.init_chat_model_kwargs()
     for field in OPENAI_ROUTE_FIELDS:
         kwargs.pop(field, None)
-    from ai.openai_api import adapter_options, is_family
+    from ai.openai_api import adapter_options, install_choice_fold, is_family
 
     if is_family(profile.provider):
         kwargs.update(adapter_options(profile.openai_route()))
+        install_choice_fold()
     if profile.provider == "bedrock":
         missing = tuple(
             field

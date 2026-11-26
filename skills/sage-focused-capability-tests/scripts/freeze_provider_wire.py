@@ -96,6 +96,9 @@ def main(argv: list[str] | None = None) -> int:
     # Differences an operator accepted against an earlier freeze stay with their rows.
     previous = json.loads(args.out.read_text(encoding="utf-8")) if args.out.is_file() else {"rows": []}
     accepted = {row["id"]: row["accepted_differences"] for row in previous["rows"] if row.get("accepted_differences")}
+    # Rows another script added (``added_by``) and their provenance stay as they are.
+    added = [row for row in previous["rows"] if row.get("added_by")]
+    additions = previous.get("provenance", {}).get("additions")
     rows: list[dict] = []
     seen: set[tuple] = set()
     for number, wire in enumerate(args.wire, start=1):
@@ -157,8 +160,11 @@ def main(argv: list[str] | None = None) -> int:
             "dedupe": "Rows keep the first response per (API, status, model, output item types, function names, "
                       "error code, error param).",
         },
-        "rows": rows,
+        "rows": rows + added,
     }
+    if additions:
+        fixture["provenance"]["gap"] = previous["provenance"]["gap"]
+        fixture["provenance"]["additions"] = additions
     args.out.write_text(json.dumps(fixture, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
     print(f"wrote {len(rows)} rows to {args.out.relative_to(ROOT) if args.out.is_relative_to(ROOT) else args.out}")
     return 0

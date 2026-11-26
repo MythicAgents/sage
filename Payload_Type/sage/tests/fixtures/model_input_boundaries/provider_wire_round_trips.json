@@ -9,8 +9,23 @@
   },
   "substitutions": "Lab host and user names renamed to WORKSTATION-A and lab.user; the two model names renamed to recorded-model-a and recorded-model-b (also inside error messages); echoed request parameters (tools, instructions, metadata, safety_identifier, user, prompt_cache_key, prompt_cache_retention, access_programs, billing) removed from 200 bodies. Substitution happened before replay. Provider ids, call ids, arguments, text and encrypted reasoning are otherwise unchanged.",
   "synthetic": "The replay prompt and the tool result in each history are synthetic placeholders.",
-  "gap": "No Chat Completions success body and no Anthropic Messages body was recorded; those routes are covered only by synthetic tests and the live check.",
-  "dedupe": "Rows keep the first response per (API, status, model, output item types, function names, error code, error param)."
+  "gap": "No Anthropic Messages body was recorded; that route is covered only by synthetic tests and the live check. Chat Completions success rows are listed under additions.",
+  "dedupe": "Rows keep the first response per (API, status, model, output item types, function names, error code, error param).",
+  "additions": {
+   "added_by": "freeze_split_choice_rows.py",
+   "rows": [
+    "r10_chat_completions_200_c_single_choice_list_callbacks",
+    "r11_chat_completions_200_c_single_choice_respond_to_user",
+    "r12_chat_completions_200_d_single_choice_list_callbacks",
+    "r13_chat_completions_200_d_single_choice_respond_to_user",
+    "r14_chat_completions_200_c_split_text_then_get_task_history_for_callback",
+    "r15_chat_completions_200_c_split_text_then_get_ttp_guidance_get_task_history_for_callback_get_all_command_args_for_payloadtype",
+    "r16_chat_completions_200_c_split_text_then_get_ttp_guidance",
+    "r17_chat_completions_200_c_split_text_then_issue_task_and_waitfor_task_output"
+   ],
+   "description": "Chat Completions 200 rows recorded on 2026-11-26. Single-choice rows are recorded bodies from an OpenAI-compatible gateway and from OpenAI, frozen with today's projection. Split rows are rebuilt from Phoenix spans where the gateway sent a reply's text and tool call as separate choices; each expects the projection of the same reply in one choice. Each row names the versions it was frozen under.",
+   "substitutions": "Lab host and user names renamed to WORKSTATION-A and lab.user; the gateway and OpenAI model names renamed to recorded-model-c and recorded-model-d; echoed request parameters removed. Substitution happened before replay."
+  }
  },
  "rows": [
   {
@@ -1694,6 +1709,1627 @@
     "checkpoint": {
      "type": "msgpack",
      "base64": "kseyBZS9bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMuaHVtYW6sSHVtYW5NZXNzYWdlhqdjb250ZW502SxTeW50aGV0aWMgcmVwbGF5IHByb21wdDogbGlzdCB0aGUgY2FsbGJhY2tzLrFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWlaHVtYW6kbmFtZcCiaWTAs21vZGVsX3ZhbGlkYXRlX2pzb27IAq0FlLpsYW5nY2hhaW5fY29yZS5tZXNzYWdlcy5haalBSU1lc3NhZ2WJp2NvbnRlbnSRhaR0eXBlpHRleHSkdGV4dKthbWJlci1zZXZlbqthbm5vdGF0aW9uc5CiaWTZNm1zZ18wZDE5ZmMzNDQzOWNlODI2MDE2YjAzNDRlNmY0NzQ4N2QxOGI5Yjg3YzlkNTVjNjUzYaVwaGFzZaxmaW5hbF9hbnN3ZXKxYWRkaXRpb25hbF9rd2FyZ3OAsXJlc3BvbnNlX21ldGFkYXRhiKJpZNk3cmVzcF8wZDE5ZmMzNDQzOWNlODI2MDE2YjAzNDRlNWYwNzQ4N2QxODFkNzkzZWNjNjEzZGQwM6pjcmVhdGVkX2F0y0HawNE5gAAApW1vZGVssHJlY29yZGVkLW1vZGVsLWKmb2JqZWN0qHJlc3BvbnNlrHNlcnZpY2VfdGllcqdkZWZhdWx0pnN0YXR1c6ljb21wbGV0ZWSubW9kZWxfcHJvdmlkZXKmb3BlbmFpqm1vZGVsX25hbWWwcmVjb3JkZWQtbW9kZWwtYqR0eXBlomFppG5hbWXAomlk2TdyZXNwXzBkMTlmYzM0NDM5Y2U4MjYwMTZiMDM0NGU1ZjA3NDg3ZDE4MWQ3OTNlY2M2MTNkZDAzqnRvb2xfY2FsbHOQsmludmFsaWRfdG9vbF9jYWxsc5CudXNhZ2VfbWV0YWRhdGGFrGlucHV0X3Rva2Vuc80uwq1vdXRwdXRfdG9rZW5zBqx0b3RhbF90b2tlbnPNLsizaW5wdXRfdG9rZW5fZGV0YWlsc4KuY2FjaGVfY3JlYXRpb27NLr+qY2FjaGVfcmVhZAC0b3V0cHV0X3Rva2VuX2RldGFpbHOBqXJlYXNvbmluZwCzbW9kZWxfdmFsaWRhdGVfanNvbg=="
+    }
+   }
+  },
+  {
+   "id": "r10_chat_completions_200_c_single_choice_list_callbacks",
+   "source": "recorded live check 1 of 2 (2026-11-26), request seq 13069",
+   "model": "recorded-model-c",
+   "route": {
+    "api": "chat_completions",
+    "reasoning_effort": ""
+   },
+   "status": 200,
+   "body": {
+    "id": "resp_irvefolohrpnz7vqrbnbqxypkc5s4zb7nl3pmw6wcwz2cdwe4lda",
+    "created": 1795656981,
+    "model": "recorded-model-c",
+    "object": "chat.completion",
+    "choices": [
+     {
+      "finish_reason": "tool_calls",
+      "index": 0,
+      "message": {
+       "role": "assistant",
+       "tool_calls": [
+        {
+         "index": 0,
+         "function": {
+          "arguments": "{}",
+          "name": "list_callbacks"
+         },
+         "id": "call_d662935edfc850aeb66f6ae12d45e6bf",
+         "type": "function"
+        }
+       ],
+       "content": null
+      }
+     }
+    ],
+    "usage": {
+     "completion_tokens": 14,
+     "prompt_tokens": 11479,
+     "total_tokens": 11493,
+     "completion_tokens_details": {
+      "reasoning_tokens": 0
+     },
+     "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 11477,
+      "cache_creation_tokens": 11477
+     }
+    },
+    "frequency_penalty": 0.0,
+    "presence_penalty": 0.0,
+    "service_tier": "default"
+   },
+   "added_by": "freeze_split_choice_rows.py",
+   "oracle_versions": {
+    "openai": "3.58.0",
+    "langchain-openai": "1.7.2",
+    "langchain-core": "1.6.10"
+   },
+   "expected": {
+    "message": {
+     "type": "AIMessage",
+     "id": "lc_run--<run id>",
+     "name": null,
+     "tool_calls": [
+      {
+       "name": "list_callbacks",
+       "args": {},
+       "id": "call_d662935edfc850aeb66f6ae12d45e6bf"
+      }
+     ],
+     "invalid_tool_calls": [],
+     "content_types": "str",
+     "text": "",
+     "sole_text": "",
+     "envelope_error": "",
+     "usage": {
+      "input_tokens": 11479,
+      "output_tokens": 14,
+      "total_tokens": 11493,
+      "reasoning_tokens": 0
+     },
+     "metadata": {
+      "model_name": "recorded-model-c",
+      "finish_reason": "tool_calls",
+      "id": "resp_irvefolohrpnz7vqrbnbqxypkc5s4zb7nl3pmw6wcwz2cdwe4lda"
+     },
+     "rendered": ""
+    },
+    "history": {
+     "responses_input": [
+      {
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "role": "user",
+       "type": "message"
+      },
+      {
+       "type": "message",
+       "role": "assistant",
+       "content": [
+        {
+         "type": "output_text",
+         "text": ".",
+         "annotations": []
+        }
+       ]
+      },
+      {
+       "type": "function_call",
+       "name": "list_callbacks",
+       "arguments": "{}",
+       "call_id": "call_d662935edfc850aeb66f6ae12d45e6bf"
+      },
+      {
+       "type": "function_call_output",
+       "output": "Synthetic tool result for the replay.",
+       "call_id": "call_d662935edfc850aeb66f6ae12d45e6bf"
+      }
+     ],
+     "chat_completions": [
+      {
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "role": "user"
+      },
+      {
+       "content": ".",
+       "role": "assistant",
+       "tool_calls": [
+        {
+         "type": "function",
+         "id": "call_d662935edfc850aeb66f6ae12d45e6bf",
+         "function": {
+          "name": "list_callbacks",
+          "arguments": "{}"
+         }
+        }
+       ]
+      },
+      {
+       "content": "Synthetic tool result for the replay.",
+       "role": "tool",
+       "tool_call_id": "call_d662935edfc850aeb66f6ae12d45e6bf"
+      }
+     ],
+     "sanitized": [
+      {
+       "type": "HumanMessage",
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "tool_calls": [],
+       "tool_call_id": null
+      },
+      {
+       "type": "AIMessage",
+       "content": ".",
+       "tool_calls": [
+        {
+         "name": "list_callbacks",
+         "args": {},
+         "id": "call_d662935edfc850aeb66f6ae12d45e6bf"
+        }
+       ],
+       "tool_call_id": null
+      },
+      {
+       "type": "ToolMessage",
+       "content": "Synthetic tool result for the replay.",
+       "tool_calls": [],
+       "tool_call_id": "call_d662935edfc850aeb66f6ae12d45e6bf"
+      }
+     ],
+     "sanitized_changed": true
+    },
+    "checkpoint": {
+     "type": "msgpack",
+     "base64": "k8eyBZS9bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMuaHVtYW6sSHVtYW5NZXNzYWdlhqdjb250ZW502SxTeW50aGV0aWMgcmVwbGF5IHByb21wdDogbGlzdCB0aGUgY2FsbGJhY2tzLrFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWlaHVtYW6kbmFtZcCiaWTAs21vZGVsX3ZhbGlkYXRlX2pzb27IA7YFlLpsYW5nY2hhaW5fY29yZS5tZXNzYWdlcy5haalBSU1lc3NhZ2WJp2NvbnRlbnSgsWFkZGl0aW9uYWxfa3dhcmdzgadyZWZ1c2FswLFyZXNwb25zZV9tZXRhZGF0YYirdG9rZW5fdXNhZ2WFsWNvbXBsZXRpb25fdG9rZW5zDq1wcm9tcHRfdG9rZW5zzSzXrHRvdGFsX3Rva2Vuc80s5bljb21wbGV0aW9uX3Rva2Vuc19kZXRhaWxzhbphY2NlcHRlZF9wcmVkaWN0aW9uX3Rva2Vuc8CsYXVkaW9fdG9rZW5zwLByZWFzb25pbmdfdG9rZW5zALpyZWplY3RlZF9wcmVkaWN0aW9uX3Rva2Vuc8CrdGV4dF90b2tlbnPAtXByb21wdF90b2tlbnNfZGV0YWlsc4asYXVkaW9fdG9rZW5zwLJjYWNoZV93cml0ZV90b2tlbnPNLNWtY2FjaGVkX3Rva2VucwCsaW1hZ2VfdG9rZW5zwKt0ZXh0X3Rva2Vuc8C1Y2FjaGVfY3JlYXRpb25fdG9rZW5zzSzVrm1vZGVsX3Byb3ZpZGVypm9wZW5haaptb2RlbF9uYW1lsHJlY29yZGVkLW1vZGVsLWOyc3lzdGVtX2ZpbmdlcnByaW50wKJpZNk5cmVzcF9pcnZlZm9sb2hycG56N3ZxcmJuYnF4eXBrYzVzNHpiN25sM3BtdzZ3Y3d6MmNkd2U0bGRhrHNlcnZpY2VfdGllcqdkZWZhdWx0rWZpbmlzaF9yZWFzb26qdG9vbF9jYWxsc6hsb2dwcm9ic8CkdHlwZaJhaaRuYW1lwKJpZNkubGNfcnVuLS0wMWEyMThlOS05MjkzLTc1YjgtYmVkMC1jYmUzMzNkMDJiMDYtMKp0b29sX2NhbGxzkYSkbmFtZa5saXN0X2NhbGxiYWNrc6RhcmdzgKJpZNklY2FsbF9kNjYyOTM1ZWRmYzg1MGFlYjY2ZjZhZTEyZDQ1ZTZiZqR0eXBlqXRvb2xfY2FsbLJpbnZhbGlkX3Rvb2xfY2FsbHOQrnVzYWdlX21ldGFkYXRhhaxpbnB1dF90b2tlbnPNLNetb3V0cHV0X3Rva2Vucw6sdG90YWxfdG9rZW5zzSzls2lucHV0X3Rva2VuX2RldGFpbHOCqmNhY2hlX3JlYWQArmNhY2hlX2NyZWF0aW9uzSzVtG91dHB1dF90b2tlbl9kZXRhaWxzgalyZWFzb25pbmcAs21vZGVsX3ZhbGlkYXRlX2pzb27H9QWUvGxhbmdjaGFpbl9jb3JlLm1lc3NhZ2VzLnRvb2yrVG9vbE1lc3NhZ2WJp2NvbnRlbnTZJVN5bnRoZXRpYyB0b29sIHJlc3VsdCBmb3IgdGhlIHJlcGxheS6xYWRkaXRpb25hbF9rd2FyZ3OAsXJlc3BvbnNlX21ldGFkYXRhgKR0eXBlpHRvb2ykbmFtZcCiaWTArHRvb2xfY2FsbF9pZNklY2FsbF9kNjYyOTM1ZWRmYzg1MGFlYjY2ZjZhZTEyZDQ1ZTZiZqhhcnRpZmFjdMCmc3RhdHVzp3N1Y2Nlc3OzbW9kZWxfdmFsaWRhdGVfanNvbg=="
+    }
+   }
+  },
+  {
+   "id": "r11_chat_completions_200_c_single_choice_respond_to_user",
+   "source": "recorded live check 1 of 2 (2026-11-26), request seq 13136",
+   "model": "recorded-model-c",
+   "route": {
+    "api": "chat_completions",
+    "reasoning_effort": ""
+   },
+   "status": 200,
+   "body": {
+    "id": "resp_qvqxpomw3hyxhokdplsyye62wpidocv7i6azltb6k3ppamqcd5oa",
+    "created": 1795656982,
+    "model": "recorded-model-c",
+    "object": "chat.completion",
+    "choices": [
+     {
+      "finish_reason": "tool_calls",
+      "index": 0,
+      "message": {
+       "role": "assistant",
+       "tool_calls": [
+        {
+         "index": 0,
+         "function": {
+          "arguments": "{\"final_response\":\"| ID | Agent | Host | User | Status |\\n|---:|---|---|---|---|\\n| 2 | apollo | WORKSTATION-A | lab.user | alive |\",\"outcome\":\"completed\"}",
+          "name": "respond_to_user"
+         },
+         "id": "call_fc2a7dd5be4e5b1fad16aa5a856e566e",
+         "type": "function"
+        }
+       ],
+       "reasoning_content": "",
+       "reasoning_items": [
+        {
+         "type": "reasoning",
+         "id": "rs_e1c6ca796e34591bb72d62a4dccbe1dc",
+         "encrypted_content": "rsn_eyJhbGciOiJFUzI1NiIsInR5cCI6ImFyY2grandzIiwicHJvZmlsZSI6ImFyY2gtMSIsImlzcyI6ImF3cyIsImtpZCI6IjdMVmJrTXMxaS01ODNvbmlGWDhlbXE0Njh4QVVuOFp4UTBJWDAwMkppY1UiLCJjZXJ0aWZpY2F0ZSI6ImV5SmhiR2NpT2lKRlV6STFOaUlzSW5SNWNDSTZJbUZ5WTJndGMybG5ibVZ5SzJwM2N5SXNJbkJ5YjJacGJHVWlPaUpoY21Ob0xURWlMQ0pwYzNNaU9pSmhkM01pTENKcmFXUWlPaUl5VG5OSGVuWm9hMnRXZFdkMFgwVnJOVmhoVmpOTVF6SXlWekU1TVdjNWFVWXpURXB3Vm1abmRtSm5JbjAuZXlKcWQyc2lPbnNpYTNSNUlqb2lSVU1pTENKamNuWWlPaUpRTFRJMU5pSXNJbmdpT2lKbk4wZENVSHBNYm5KUU5uSlZZVFkyYVhsSGREbEhiMU5FU1RCcFprcEljSFp2UkdaMFNrdFhNVEZSSWl3aWVTSTZJbEJSZUZobGIzcE5UVW95Tm5sR1RtWk9jV2xFY3pGclNGbElOM2hNZUZkWFNUY3dkWEE1U0dKSldEQWlMQ0oxYzJVaU9pSnphV2NpTENKaGJHY2lPaUpGVXpJMU5pSXNJbXRwWkNJNklqZE1WbUpyVFhNeGFTMDFPRE52Ym1sR1dEaGxiWEUwTmpoNFFWVnVPRnA0VVRCSldEQXdNa3BwWTFVaWZTd2ljSEp2ZG1sa1pYSnpJanBiSW05aGFTSmRMQ0ozY21sMFpWOW1jbTl0SWpveE56azFOalF4TlRZMUxDSjNjbWwwWlY5MWJuUnBiQ0k2TVRjNU5UY3lOemsyTlN3aWNtVmhaRjkxYm5ScGJDSTZNVGc1TURrMU1EUXdNSDAuazlWZEVvR0otakZOcjNvRWhIcFhjT3N5VTE2cGxnclE0enRVY1ExN0VpT2I0S3BhU0U2WklGWC1yZTgtenJkOWtKLUFGa2U2cnZ0T01pZXZYMzJvTFEiLCJpc3NfbWV0YSI6eyJyb3V0aW5nIjoiQ01IMSJ9fQ.eyJwcm90ZWN0ZWQiOiJleUppY21GdVkyaGZhV1FpT2lKWVRYTnlkV0ZOYUZCSmVqUXdNRjlIVlhWM1RqQm5JaXdpYzJGc2RDSTZJblowT0hwVFNrMUtNMFJPVmxBMGJXaG1ORlZXWDJoV1JscERTbXgyU0hOWldYUndjbEozVG1wd2RFVWlMQ0pqYjI1MFpXNTBYMjV2Ym1ObElqb2lXRnBNYlZoU01uUnFTVlJSTm1GSldDSXNJbkpsWTJsd2FXVnVkSE1pT2x0N0luQnNZWFJtYjNKdElqb2lZWGR6SWl3aWEybGtJam9pV1VOaWRuUjROVU5uT0hCS1VTMU9MWGxNUkVSbGIzcGxOamRSVjB4bE5Fa3RURE5ZU0VwVFJXOXlSU0lzSW1WdVkzSjVjSFJsWkY5aWNtRnVZMmdpT2lKNVpFUnRSMTlPYTFFeVV5MVJUVzE2TWsxMGFUWlZaWEpRWVZSV1FtbE9jRWREZFhkQ2FWbGZXWGx5WlhkS2VuQmlPSEF0YTNsc1JsVjJXR3RPTm1wU1owVjRiR1ZoWXkxUFdrbzJlbU5wWTJaTlpXRlpkemx5YUdZd1VXWXhjMlJYVjA1cmJVRk5Oall6ZUdWYVdqVndaR1kxT0hkeFJGaEZVRmR5TjFweGNHTTVVbUY1ZWxSdWJteHlhMDF5ZFhaek16azVaMDFpVkVST1owZzBOM0l0VEZvMVVGWkJVVXQ2U1VGeE56RnNWVlp4WW1wQk1qbGpiR2hCT0dKMVlreFJaVXh3UjNZM2NqSmljR05xVUc5SWMyeGpZWE01VUhjeFlXZFBhbEJLV2xvdGIyUlpRVzl5WVZWWFNYaHhTMDVVZUhGaVlqZzJZbDg1UWs5dVRTMU1NVEZPYVU1Mlh6WjBXa3hEYzFsMlZtNUljbUppWVVSSVdUVXhXbGh2VkZORlYxOVhVbVZ6VVVkQ2FXbEZMV3h6Tm5kTmNGUndRWFZ2VjB0RFVrOVJXVUp1UVhKRFVWODBRVEUzVm5nd1FVZDZXRzEzWWxrM1kxcGlNSEF4VnpGTE5sOW5iVE5WUW1OUVVITjVkbE54VjNKRk1VOXhRbkJXVERkbVFreHRRVVJuZERoTWFFcDNSbmxDVkV4WmVXUjVOREF0VHpWbE5IZ3liVjkwZFZac1QyWTBTa3RvV0ZKQ01IZHFhREpEWVhwMFQzaGpjR1ZxV2xsTU4wdEhSRFpVWlVoNFgwRmhSMkYxWjBKUllXZHJkVnBpTTBsVlpXOWtXV0k0ZUMxME1VbEZkM2RQTlhacE5VeHRhV1paYUdoSVZVMXZaemxqUkU1UlNVZFdXbTloUnlKOVhYMCIsImNpcGhlcnRleHQiOiJDaFZkMnRnMVBVajZkQ2hPOXQ4a2VuNUtFOGMtYlpYMEczcHFxdk1FU3pNZEd1ZllQejM1amYtODBWYlRXTzlBZ29KQmpVZG1rREFrWG9reUd0ZkItSDhVS1VhcUFuY2hzbGVrdW1wdkNwMTNkTEZOc1NOQ1F0czE1U28wLUgwdDh5UWJRa2VtdXhXSGZ2dUZyNUREOHVqZDlnT2o3cWpzSXFFMkNsQjJSdlBBT3JidEJXOXJIcWYyRHhfV3lRODkxQUNSTlRjZ05WNFJXMUZudnFQOVp6VjVNZ1hkbmQzZGhvVGpBcHlUSm4wZ3VtdE5CcnplaE9zQ3VmcU9xaF9FUzBjMG16ZTNEVFJ5ZUFBWVVPMHpUUFRwelo0OHVlU1BXR0JjSmlBTnAybkVRV3NZT2NqbXk3VXN1aDVzNlA5WGFscEVjbWFBSm9oZTE3ZVhNS2gzanNUNVRlSnFwMnF0LVZ4Z3pOaXRFUU80aDZjUC1NaFUxN1cyUjNRemlVTEdveGsxeWlHZU1qekNrWDBNNFo0N0xRTk5VaWxwM3Q2MUNCSDIyMjFTZ2JtRGpBWEJxeXlzWkZrWVdmTnFUSUJ1bnhTTzN0aUxtaURkM2FPZUxqRnN0N1ltZmw3V2w4aHdudFA4X1NXWXBDVXREVk9uWEdjMTgtcjNYTkVCZXBJT05Fel81cUVraVhSUWNseW1NblVBTGFubTRjenVXSjV2cE5PM3F5eEhGT1NnWkNnbmdQTmFzTTRTQXNTSndTTU9oYXBjMFk3cUVJaUZPSVdGYkVpazdpY0ZMSFhPTm52aGFLRVdFcjhVZThvN21nZDBMeWNSTlVsUk0wdU4zb2ZVM19CT2tXZjB1YXg0QVdlNkhMM0pfcnpOYTdhRVFWVnAyaGZXNjc0ZW5WdVJpOFFzeFNQTjBIc01nbEYyaFJWTHltTVBDNEh2SWJEVHRObi1JUFNIRnFZbzd3VUZpbWpLeE5HSHdadnZnMkxvcUVXMlBaUGVLYzdmQnhNRUllc3FUeUw4THpoUmxFWmo4ZlA5Z1NPSnFORGpHY2tvQWxQX1k4NF93aENHbVlmWDBLNUlsc2tkMVEifQ.-vR1VXlS9OtrKlm1YuRx8PLtAQ72XwmZWZNZ0ARiFEuVxKiipLVvL7YPkxk1H_zYQxSwXuC9ta3v24Qs3LsqGw",
+         "summary": []
+        }
+       ],
+       "content": null
+      }
+     }
+    ],
+    "usage": {
+     "completion_tokens": 86,
+     "prompt_tokens": 11568,
+     "total_tokens": 11654,
+     "completion_tokens_details": {
+      "reasoning_tokens": 17
+     },
+     "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 11566,
+      "cache_creation_tokens": 11566
+     }
+    },
+    "frequency_penalty": 0.0,
+    "presence_penalty": 0.0,
+    "service_tier": "default"
+   },
+   "added_by": "freeze_split_choice_rows.py",
+   "oracle_versions": {
+    "openai": "3.58.0",
+    "langchain-openai": "1.7.2",
+    "langchain-core": "1.6.10"
+   },
+   "expected": {
+    "message": {
+     "type": "AIMessage",
+     "id": "lc_run--<run id>",
+     "name": null,
+     "tool_calls": [
+      {
+       "name": "respond_to_user",
+       "args": {
+        "final_response": "| ID | Agent | Host | User | Status |\n|---:|---|---|---|---|\n| 2 | apollo | WORKSTATION-A | lab.user | alive |",
+        "outcome": "completed"
+       },
+       "id": "call_fc2a7dd5be4e5b1fad16aa5a856e566e"
+      }
+     ],
+     "invalid_tool_calls": [],
+     "content_types": "str",
+     "text": "",
+     "sole_text": "",
+     "envelope_error": "",
+     "usage": {
+      "input_tokens": 11568,
+      "output_tokens": 86,
+      "total_tokens": 11654,
+      "reasoning_tokens": 17
+     },
+     "metadata": {
+      "model_name": "recorded-model-c",
+      "finish_reason": "tool_calls",
+      "id": "resp_qvqxpomw3hyxhokdplsyye62wpidocv7i6azltb6k3ppamqcd5oa"
+     },
+     "rendered": ""
+    },
+    "history": {
+     "responses_input": [
+      {
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "role": "user",
+       "type": "message"
+      },
+      {
+       "type": "message",
+       "role": "assistant",
+       "content": [
+        {
+         "type": "output_text",
+         "text": ".",
+         "annotations": []
+        }
+       ]
+      },
+      {
+       "type": "function_call",
+       "name": "respond_to_user",
+       "arguments": "{\"final_response\": \"| ID | Agent | Host | User | Status |\\n|---:|---|---|---|---|\\n| 2 | apollo | WORKSTATION-A | lab.user | alive |\", \"outcome\": \"completed\"}",
+       "call_id": "call_fc2a7dd5be4e5b1fad16aa5a856e566e"
+      },
+      {
+       "type": "function_call_output",
+       "output": "Synthetic tool result for the replay.",
+       "call_id": "call_fc2a7dd5be4e5b1fad16aa5a856e566e"
+      }
+     ],
+     "chat_completions": [
+      {
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "role": "user"
+      },
+      {
+       "content": ".",
+       "role": "assistant",
+       "tool_calls": [
+        {
+         "type": "function",
+         "id": "call_fc2a7dd5be4e5b1fad16aa5a856e566e",
+         "function": {
+          "name": "respond_to_user",
+          "arguments": "{\"final_response\": \"| ID | Agent | Host | User | Status |\\n|---:|---|---|---|---|\\n| 2 | apollo | WORKSTATION-A | lab.user | alive |\", \"outcome\": \"completed\"}"
+         }
+        }
+       ]
+      },
+      {
+       "content": "Synthetic tool result for the replay.",
+       "role": "tool",
+       "tool_call_id": "call_fc2a7dd5be4e5b1fad16aa5a856e566e"
+      }
+     ],
+     "sanitized": [
+      {
+       "type": "HumanMessage",
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "tool_calls": [],
+       "tool_call_id": null
+      },
+      {
+       "type": "AIMessage",
+       "content": ".",
+       "tool_calls": [
+        {
+         "name": "respond_to_user",
+         "args": {
+          "final_response": "| ID | Agent | Host | User | Status |\n|---:|---|---|---|---|\n| 2 | apollo | WORKSTATION-A | lab.user | alive |",
+          "outcome": "completed"
+         },
+         "id": "call_fc2a7dd5be4e5b1fad16aa5a856e566e"
+        }
+       ],
+       "tool_call_id": null
+      },
+      {
+       "type": "ToolMessage",
+       "content": "Synthetic tool result for the replay.",
+       "tool_calls": [],
+       "tool_call_id": "call_fc2a7dd5be4e5b1fad16aa5a856e566e"
+      }
+     ],
+     "sanitized_changed": true
+    },
+    "checkpoint": {
+     "type": "msgpack",
+     "base64": "k8eyBZS9bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMuaHVtYW6sSHVtYW5NZXNzYWdlhqdjb250ZW502SxTeW50aGV0aWMgcmVwbGF5IHByb21wdDogbGlzdCB0aGUgY2FsbGJhY2tzLrFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWlaHVtYW6kbmFtZcCiaWTAs21vZGVsX3ZhbGlkYXRlX2pzb27IBEgFlLpsYW5nY2hhaW5fY29yZS5tZXNzYWdlcy5haalBSU1lc3NhZ2WJp2NvbnRlbnSgsWFkZGl0aW9uYWxfa3dhcmdzgadyZWZ1c2FswLFyZXNwb25zZV9tZXRhZGF0YYirdG9rZW5fdXNhZ2WFsWNvbXBsZXRpb25fdG9rZW5zVq1wcm9tcHRfdG9rZW5zzS0wrHRvdGFsX3Rva2Vuc80thrljb21wbGV0aW9uX3Rva2Vuc19kZXRhaWxzhbphY2NlcHRlZF9wcmVkaWN0aW9uX3Rva2Vuc8CsYXVkaW9fdG9rZW5zwLByZWFzb25pbmdfdG9rZW5zEbpyZWplY3RlZF9wcmVkaWN0aW9uX3Rva2Vuc8CrdGV4dF90b2tlbnPAtXByb21wdF90b2tlbnNfZGV0YWlsc4asYXVkaW9fdG9rZW5zwLJjYWNoZV93cml0ZV90b2tlbnPNLS6tY2FjaGVkX3Rva2VucwCsaW1hZ2VfdG9rZW5zwKt0ZXh0X3Rva2Vuc8C1Y2FjaGVfY3JlYXRpb25fdG9rZW5zzS0urm1vZGVsX3Byb3ZpZGVypm9wZW5haaptb2RlbF9uYW1lsHJlY29yZGVkLW1vZGVsLWOyc3lzdGVtX2ZpbmdlcnByaW50wKJpZNk5cmVzcF9xdnF4cG9tdzNoeXhob2tkcGxzeXllNjJ3cGlkb2N2N2k2YXpsdGI2azNwcGFtcWNkNW9hrHNlcnZpY2VfdGllcqdkZWZhdWx0rWZpbmlzaF9yZWFzb26qdG9vbF9jYWxsc6hsb2dwcm9ic8CkdHlwZaJhaaRuYW1lwKJpZNkubGNfcnVuLS0wMWEyMThlOS05MmE2LTc2YjMtYTJhZC1hMzkxOTM4ZDIwOWItMKp0b29sX2NhbGxzkYSkbmFtZa9yZXNwb25kX3RvX3VzZXKkYXJnc4KuZmluYWxfcmVzcG9uc2XZbnwgSUQgfCBBZ2VudCB8IEhvc3QgfCBVc2VyIHwgU3RhdHVzIHwKfC0tLTp8LS0tfC0tLXwtLS18LS0tfAp8IDIgfCBhcG9sbG8gfCBXT1JLU1RBVElPTi1BIHwgbGFiLnVzZXIgfCBhbGl2ZSB8p291dGNvbWWpY29tcGxldGVkomlk2SVjYWxsX2ZjMmE3ZGQ1YmU0ZTViMWZhZDE2YWE1YTg1NmU1NjZlpHR5cGWpdG9vbF9jYWxssmludmFsaWRfdG9vbF9jYWxsc5CudXNhZ2VfbWV0YWRhdGGFrGlucHV0X3Rva2Vuc80tMK1vdXRwdXRfdG9rZW5zVqx0b3RhbF90b2tlbnPNLYazaW5wdXRfdG9rZW5fZGV0YWlsc4KqY2FjaGVfcmVhZACuY2FjaGVfY3JlYXRpb27NLS60b3V0cHV0X3Rva2VuX2RldGFpbHOBqXJlYXNvbmluZxGzbW9kZWxfdmFsaWRhdGVfanNvbsf1BZS8bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMudG9vbKtUb29sTWVzc2FnZYmnY29udGVudNklU3ludGhldGljIHRvb2wgcmVzdWx0IGZvciB0aGUgcmVwbGF5LrFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWkdG9vbKRuYW1lwKJpZMCsdG9vbF9jYWxsX2lk2SVjYWxsX2ZjMmE3ZGQ1YmU0ZTViMWZhZDE2YWE1YTg1NmU1NjZlqGFydGlmYWN0wKZzdGF0dXOnc3VjY2Vzc7Ntb2RlbF92YWxpZGF0ZV9qc29u"
+    }
+   }
+  },
+  {
+   "id": "r12_chat_completions_200_d_single_choice_list_callbacks",
+   "source": "recorded live check 1 of 2 (2026-11-26), request seq 13527",
+   "model": "recorded-model-d",
+   "route": {
+    "api": "chat_completions",
+    "reasoning_effort": ""
+   },
+   "status": 200,
+   "body": {
+    "id": "chatcmpl-EoIiT3uH5mBNqp6g0QscidjNv7UBp",
+    "object": "chat.completion",
+    "created": 1795657053,
+    "model": "recorded-model-d",
+    "choices": [
+     {
+      "index": 0,
+      "message": {
+       "role": "assistant",
+       "content": null,
+       "tool_calls": [
+        {
+         "id": "call_qujkjyNCjuyOoAyfMLNTVvby",
+         "type": "function",
+         "function": {
+          "name": "list_callbacks",
+          "arguments": "{}"
+         }
+        }
+       ],
+       "refusal": null,
+       "annotations": []
+      },
+      "logprobs": null,
+      "finish_reason": "tool_calls"
+     }
+    ],
+    "usage": {
+     "prompt_tokens": 11480,
+     "completion_tokens": 10,
+     "total_tokens": 11490,
+     "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "audio_tokens": 0
+     },
+     "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "audio_tokens": 0,
+      "accepted_prediction_tokens": 0,
+      "rejected_prediction_tokens": 0
+     }
+    },
+    "service_tier": "default",
+    "system_fingerprint": "fp_0c9884ecfa"
+   },
+   "added_by": "freeze_split_choice_rows.py",
+   "oracle_versions": {
+    "openai": "3.58.0",
+    "langchain-openai": "1.7.2",
+    "langchain-core": "1.6.10"
+   },
+   "expected": {
+    "message": {
+     "type": "AIMessage",
+     "id": "lc_run--<run id>",
+     "name": null,
+     "tool_calls": [
+      {
+       "name": "list_callbacks",
+       "args": {},
+       "id": "call_qujkjyNCjuyOoAyfMLNTVvby"
+      }
+     ],
+     "invalid_tool_calls": [],
+     "content_types": "str",
+     "text": "",
+     "sole_text": "",
+     "envelope_error": "",
+     "usage": {
+      "input_tokens": 11480,
+      "output_tokens": 10,
+      "total_tokens": 11490,
+      "reasoning_tokens": 0
+     },
+     "metadata": {
+      "model_name": "recorded-model-d",
+      "finish_reason": "tool_calls",
+      "id": "chatcmpl-EoIiT3uH5mBNqp6g0QscidjNv7UBp"
+     },
+     "rendered": ""
+    },
+    "history": {
+     "responses_input": [
+      {
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "role": "user",
+       "type": "message"
+      },
+      {
+       "type": "message",
+       "role": "assistant",
+       "content": [
+        {
+         "type": "output_text",
+         "text": ".",
+         "annotations": []
+        }
+       ]
+      },
+      {
+       "type": "function_call",
+       "name": "list_callbacks",
+       "arguments": "{}",
+       "call_id": "call_qujkjyNCjuyOoAyfMLNTVvby"
+      },
+      {
+       "type": "function_call_output",
+       "output": "Synthetic tool result for the replay.",
+       "call_id": "call_qujkjyNCjuyOoAyfMLNTVvby"
+      }
+     ],
+     "chat_completions": [
+      {
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "role": "user"
+      },
+      {
+       "content": ".",
+       "role": "assistant",
+       "tool_calls": [
+        {
+         "type": "function",
+         "id": "call_qujkjyNCjuyOoAyfMLNTVvby",
+         "function": {
+          "name": "list_callbacks",
+          "arguments": "{}"
+         }
+        }
+       ]
+      },
+      {
+       "content": "Synthetic tool result for the replay.",
+       "role": "tool",
+       "tool_call_id": "call_qujkjyNCjuyOoAyfMLNTVvby"
+      }
+     ],
+     "sanitized": [
+      {
+       "type": "HumanMessage",
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "tool_calls": [],
+       "tool_call_id": null
+      },
+      {
+       "type": "AIMessage",
+       "content": ".",
+       "tool_calls": [
+        {
+         "name": "list_callbacks",
+         "args": {},
+         "id": "call_qujkjyNCjuyOoAyfMLNTVvby"
+        }
+       ],
+       "tool_call_id": null
+      },
+      {
+       "type": "ToolMessage",
+       "content": "Synthetic tool result for the replay.",
+       "tool_calls": [],
+       "tool_call_id": "call_qujkjyNCjuyOoAyfMLNTVvby"
+      }
+     ],
+     "sanitized_changed": true
+    },
+    "checkpoint": {
+     "type": "msgpack",
+     "base64": "k8eyBZS9bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMuaHVtYW6sSHVtYW5NZXNzYWdlhqdjb250ZW502SxTeW50aGV0aWMgcmVwbGF5IHByb21wdDogbGlzdCB0aGUgY2FsbGJhY2tzLrFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWlaHVtYW6kbmFtZcCiaWTAs21vZGVsX3ZhbGlkYXRlX2pzb27IA4gFlLpsYW5nY2hhaW5fY29yZS5tZXNzYWdlcy5haalBSU1lc3NhZ2WJp2NvbnRlbnSgsWFkZGl0aW9uYWxfa3dhcmdzgadyZWZ1c2FswLFyZXNwb25zZV9tZXRhZGF0YYirdG9rZW5fdXNhZ2WFsWNvbXBsZXRpb25fdG9rZW5zCq1wcm9tcHRfdG9rZW5zzSzYrHRvdGFsX3Rva2Vuc80s4rljb21wbGV0aW9uX3Rva2Vuc19kZXRhaWxzhbphY2NlcHRlZF9wcmVkaWN0aW9uX3Rva2VucwCsYXVkaW9fdG9rZW5zALByZWFzb25pbmdfdG9rZW5zALpyZWplY3RlZF9wcmVkaWN0aW9uX3Rva2VucwCrdGV4dF90b2tlbnPAtXByb21wdF90b2tlbnNfZGV0YWlsc4WsYXVkaW9fdG9rZW5zALJjYWNoZV93cml0ZV90b2tlbnPArWNhY2hlZF90b2tlbnMArGltYWdlX3Rva2Vuc8CrdGV4dF90b2tlbnPArm1vZGVsX3Byb3ZpZGVypm9wZW5haaptb2RlbF9uYW1lsHJlY29yZGVkLW1vZGVsLWSyc3lzdGVtX2ZpbmdlcnByaW50rWZwXzBjOTg4NGVjZmGiaWTZJmNoYXRjbXBsLUVvSWlUM3VINW1CTnFwNmcwUXNjaWRqTnY3VUJwrHNlcnZpY2VfdGllcqdkZWZhdWx0rWZpbmlzaF9yZWFzb26qdG9vbF9jYWxsc6hsb2dwcm9ic8CkdHlwZaJhaaRuYW1lwKJpZNkubGNfcnVuLS0wMWEyMThlOS05MmIxLTc3ZmQtYTNiZC04ODlmYTYwNjJhNmUtMKp0b29sX2NhbGxzkYSkbmFtZa5saXN0X2NhbGxiYWNrc6RhcmdzgKJpZL1jYWxsX3F1amtqeU5DanV5T29BeWZNTE5UVnZieaR0eXBlqXRvb2xfY2FsbLJpbnZhbGlkX3Rvb2xfY2FsbHOQrnVzYWdlX21ldGFkYXRhhaxpbnB1dF90b2tlbnPNLNitb3V0cHV0X3Rva2VucwqsdG90YWxfdG9rZW5zzSzis2lucHV0X3Rva2VuX2RldGFpbHOCpWF1ZGlvAKpjYWNoZV9yZWFkALRvdXRwdXRfdG9rZW5fZGV0YWlsc4KlYXVkaW8AqXJlYXNvbmluZwCzbW9kZWxfdmFsaWRhdGVfanNvbsfsBZS8bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMudG9vbKtUb29sTWVzc2FnZYmnY29udGVudNklU3ludGhldGljIHRvb2wgcmVzdWx0IGZvciB0aGUgcmVwbGF5LrFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWkdG9vbKRuYW1lwKJpZMCsdG9vbF9jYWxsX2lkvWNhbGxfcXVqa2p5TkNqdXlPb0F5Zk1MTlRWdmJ5qGFydGlmYWN0wKZzdGF0dXOnc3VjY2Vzc7Ntb2RlbF92YWxpZGF0ZV9qc29u"
+    }
+   }
+  },
+  {
+   "id": "r13_chat_completions_200_d_single_choice_respond_to_user",
+   "source": "recorded live check 1 of 2 (2026-11-26), request seq 13595",
+   "model": "recorded-model-d",
+   "route": {
+    "api": "chat_completions",
+    "reasoning_effort": ""
+   },
+   "status": 200,
+   "body": {
+    "id": "chatcmpl-EoIiURoow5b0byR52BlGr1CD7Sl88",
+    "object": "chat.completion",
+    "created": 1795657054,
+    "model": "recorded-model-d",
+    "choices": [
+     {
+      "index": 0,
+      "message": {
+       "role": "assistant",
+       "content": null,
+       "tool_calls": [
+        {
+         "id": "call_HFxzjCrCr8OcTB9EOGexum0U",
+         "type": "function",
+         "function": {
+          "name": "respond_to_user",
+          "arguments": "{\"final_response\":\"### Active Mythic Callbacks\\n\\n| Callback ID | Agent  | Host        | User           | Status |\\n|------------|--------|-------------|----------------|--------|\\n| 2          | apollo | WORKSTATION-A | lab.user  | alive  |\\n\\n**Summary:**\\n- One callback is currently active in Mythic.\\n- Host: `WORKSTATION-A`\\n- User: `lab.user`\\n- Agent: `apollo`\\n- Status: alive\\n\\nThis table reflects the live state from Mythic. Let me know if you need further details, a process listing, or to issue a task to this callback.\",\"outcome\":\"completed\"}"
+         }
+        }
+       ],
+       "refusal": null,
+       "annotations": []
+      },
+      "logprobs": null,
+      "finish_reason": "tool_calls"
+     }
+    ],
+    "usage": {
+     "prompt_tokens": 11563,
+     "completion_tokens": 158,
+     "total_tokens": 11721,
+     "prompt_tokens_details": {
+      "cached_tokens": 10624,
+      "audio_tokens": 0
+     },
+     "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "audio_tokens": 0,
+      "accepted_prediction_tokens": 0,
+      "rejected_prediction_tokens": 0
+     }
+    },
+    "service_tier": "default",
+    "system_fingerprint": "fp_0c9884ecfa"
+   },
+   "added_by": "freeze_split_choice_rows.py",
+   "oracle_versions": {
+    "openai": "3.58.0",
+    "langchain-openai": "1.7.2",
+    "langchain-core": "1.6.10"
+   },
+   "expected": {
+    "message": {
+     "type": "AIMessage",
+     "id": "lc_run--<run id>",
+     "name": null,
+     "tool_calls": [
+      {
+       "name": "respond_to_user",
+       "args": {
+        "final_response": "### Active Mythic Callbacks\n\n| Callback ID | Agent  | Host        | User           | Status |\n|------------|--------|-------------|----------------|--------|\n| 2          | apollo | WORKSTATION-A | lab.user  | alive  |\n\n**Summary:**\n- One callback is currently active in Mythic.\n- Host: `WORKSTATION-A`\n- User: `lab.user`\n- Agent: `apollo`\n- Status: alive\n\nThis table reflects the live state from Mythic. Let me know if you need further details, a process listing, or to issue a task to this callback.",
+        "outcome": "completed"
+       },
+       "id": "call_HFxzjCrCr8OcTB9EOGexum0U"
+      }
+     ],
+     "invalid_tool_calls": [],
+     "content_types": "str",
+     "text": "",
+     "sole_text": "",
+     "envelope_error": "",
+     "usage": {
+      "input_tokens": 11563,
+      "output_tokens": 158,
+      "total_tokens": 11721,
+      "reasoning_tokens": 0
+     },
+     "metadata": {
+      "model_name": "recorded-model-d",
+      "finish_reason": "tool_calls",
+      "id": "chatcmpl-EoIiURoow5b0byR52BlGr1CD7Sl88"
+     },
+     "rendered": ""
+    },
+    "history": {
+     "responses_input": [
+      {
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "role": "user",
+       "type": "message"
+      },
+      {
+       "type": "message",
+       "role": "assistant",
+       "content": [
+        {
+         "type": "output_text",
+         "text": ".",
+         "annotations": []
+        }
+       ]
+      },
+      {
+       "type": "function_call",
+       "name": "respond_to_user",
+       "arguments": "{\"final_response\": \"### Active Mythic Callbacks\\n\\n| Callback ID | Agent  | Host        | User           | Status |\\n|------------|--------|-------------|----------------|--------|\\n| 2          | apollo | WORKSTATION-A | lab.user  | alive  |\\n\\n**Summary:**\\n- One callback is currently active in Mythic.\\n- Host: `WORKSTATION-A`\\n- User: `lab.user`\\n- Agent: `apollo`\\n- Status: alive\\n\\nThis table reflects the live state from Mythic. Let me know if you need further details, a process listing, or to issue a task to this callback.\", \"outcome\": \"completed\"}",
+       "call_id": "call_HFxzjCrCr8OcTB9EOGexum0U"
+      },
+      {
+       "type": "function_call_output",
+       "output": "Synthetic tool result for the replay.",
+       "call_id": "call_HFxzjCrCr8OcTB9EOGexum0U"
+      }
+     ],
+     "chat_completions": [
+      {
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "role": "user"
+      },
+      {
+       "content": ".",
+       "role": "assistant",
+       "tool_calls": [
+        {
+         "type": "function",
+         "id": "call_HFxzjCrCr8OcTB9EOGexum0U",
+         "function": {
+          "name": "respond_to_user",
+          "arguments": "{\"final_response\": \"### Active Mythic Callbacks\\n\\n| Callback ID | Agent  | Host        | User           | Status |\\n|------------|--------|-------------|----------------|--------|\\n| 2          | apollo | WORKSTATION-A | lab.user  | alive  |\\n\\n**Summary:**\\n- One callback is currently active in Mythic.\\n- Host: `WORKSTATION-A`\\n- User: `lab.user`\\n- Agent: `apollo`\\n- Status: alive\\n\\nThis table reflects the live state from Mythic. Let me know if you need further details, a process listing, or to issue a task to this callback.\", \"outcome\": \"completed\"}"
+         }
+        }
+       ]
+      },
+      {
+       "content": "Synthetic tool result for the replay.",
+       "role": "tool",
+       "tool_call_id": "call_HFxzjCrCr8OcTB9EOGexum0U"
+      }
+     ],
+     "sanitized": [
+      {
+       "type": "HumanMessage",
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "tool_calls": [],
+       "tool_call_id": null
+      },
+      {
+       "type": "AIMessage",
+       "content": ".",
+       "tool_calls": [
+        {
+         "name": "respond_to_user",
+         "args": {
+          "final_response": "### Active Mythic Callbacks\n\n| Callback ID | Agent  | Host        | User           | Status |\n|------------|--------|-------------|----------------|--------|\n| 2          | apollo | WORKSTATION-A | lab.user  | alive  |\n\n**Summary:**\n- One callback is currently active in Mythic.\n- Host: `WORKSTATION-A`\n- User: `lab.user`\n- Agent: `apollo`\n- Status: alive\n\nThis table reflects the live state from Mythic. Let me know if you need further details, a process listing, or to issue a task to this callback.",
+          "outcome": "completed"
+         },
+         "id": "call_HFxzjCrCr8OcTB9EOGexum0U"
+        }
+       ],
+       "tool_call_id": null
+      },
+      {
+       "type": "ToolMessage",
+       "content": "Synthetic tool result for the replay.",
+       "tool_calls": [],
+       "tool_call_id": "call_HFxzjCrCr8OcTB9EOGexum0U"
+      }
+     ],
+     "sanitized_changed": true
+    },
+    "checkpoint": {
+     "type": "msgpack",
+     "base64": "k8eyBZS9bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMuaHVtYW6sSHVtYW5NZXNzYWdlhqdjb250ZW502SxTeW50aGV0aWMgcmVwbGF5IHByb21wdDogbGlzdCB0aGUgY2FsbGJhY2tzLrFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWlaHVtYW6kbmFtZcCiaWTAs21vZGVsX3ZhbGlkYXRlX2pzb27IBagFlLpsYW5nY2hhaW5fY29yZS5tZXNzYWdlcy5haalBSU1lc3NhZ2WJp2NvbnRlbnSgsWFkZGl0aW9uYWxfa3dhcmdzgadyZWZ1c2FswLFyZXNwb25zZV9tZXRhZGF0YYirdG9rZW5fdXNhZ2WFsWNvbXBsZXRpb25fdG9rZW5zzJ6tcHJvbXB0X3Rva2Vuc80tK6x0b3RhbF90b2tlbnPNLcm5Y29tcGxldGlvbl90b2tlbnNfZGV0YWlsc4W6YWNjZXB0ZWRfcHJlZGljdGlvbl90b2tlbnMArGF1ZGlvX3Rva2VucwCwcmVhc29uaW5nX3Rva2VucwC6cmVqZWN0ZWRfcHJlZGljdGlvbl90b2tlbnMAq3RleHRfdG9rZW5zwLVwcm9tcHRfdG9rZW5zX2RldGFpbHOFrGF1ZGlvX3Rva2VucwCyY2FjaGVfd3JpdGVfdG9rZW5zwK1jYWNoZWRfdG9rZW5zzSmArGltYWdlX3Rva2Vuc8CrdGV4dF90b2tlbnPArm1vZGVsX3Byb3ZpZGVypm9wZW5haaptb2RlbF9uYW1lsHJlY29yZGVkLW1vZGVsLWSyc3lzdGVtX2ZpbmdlcnByaW50rWZwXzBjOTg4NGVjZmGiaWTZJmNoYXRjbXBsLUVvSWlVUm9vdzViMGJ5UjUyQmxHcjFDRDdTbDg4rHNlcnZpY2VfdGllcqdkZWZhdWx0rWZpbmlzaF9yZWFzb26qdG9vbF9jYWxsc6hsb2dwcm9ic8CkdHlwZaJhaaRuYW1lwKJpZNkubGNfcnVuLS0wMWEyMThlOS05MmJiLTc3ZWMtOTk3Ny1lOWRlMmJlOTUxMDAtMKp0b29sX2NhbGxzkYSkbmFtZa9yZXNwb25kX3RvX3VzZXKkYXJnc4KuZmluYWxfcmVzcG9uc2XaAfUjIyMgQWN0aXZlIE15dGhpYyBDYWxsYmFja3MKCnwgQ2FsbGJhY2sgSUQgfCBBZ2VudCAgfCBIb3N0ICAgICAgICB8IFVzZXIgICAgICAgICAgIHwgU3RhdHVzIHwKfC0tLS0tLS0tLS0tLXwtLS0tLS0tLXwtLS0tLS0tLS0tLS0tfC0tLS0tLS0tLS0tLS0tLS18LS0tLS0tLS18CnwgMiAgICAgICAgICB8IGFwb2xsbyB8IFdPUktTVEFUSU9OLUEgfCBsYWIudXNlciAgfCBhbGl2ZSAgfAoKKipTdW1tYXJ5OioqCi0gT25lIGNhbGxiYWNrIGlzIGN1cnJlbnRseSBhY3RpdmUgaW4gTXl0aGljLgotIEhvc3Q6IGBXT1JLU1RBVElPTi1BYAotIFVzZXI6IGBsYWIudXNlcmAKLSBBZ2VudDogYGFwb2xsb2AKLSBTdGF0dXM6IGFsaXZlCgpUaGlzIHRhYmxlIHJlZmxlY3RzIHRoZSBsaXZlIHN0YXRlIGZyb20gTXl0aGljLiBMZXQgbWUga25vdyBpZiB5b3UgbmVlZCBmdXJ0aGVyIGRldGFpbHMsIGEgcHJvY2VzcyBsaXN0aW5nLCBvciB0byBpc3N1ZSBhIHRhc2sgdG8gdGhpcyBjYWxsYmFjay6nb3V0Y29tZaljb21wbGV0ZWSiaWS9Y2FsbF9IRnh6akNyQ3I4T2NUQjlFT0dleHVtMFWkdHlwZal0b29sX2NhbGyyaW52YWxpZF90b29sX2NhbGxzkK51c2FnZV9tZXRhZGF0YYWsaW5wdXRfdG9rZW5zzS0rrW91dHB1dF90b2tlbnPMnqx0b3RhbF90b2tlbnPNLcmzaW5wdXRfdG9rZW5fZGV0YWlsc4KlYXVkaW8AqmNhY2hlX3JlYWTNKYC0b3V0cHV0X3Rva2VuX2RldGFpbHOCpWF1ZGlvAKlyZWFzb25pbmcAs21vZGVsX3ZhbGlkYXRlX2pzb27H7AWUvGxhbmdjaGFpbl9jb3JlLm1lc3NhZ2VzLnRvb2yrVG9vbE1lc3NhZ2WJp2NvbnRlbnTZJVN5bnRoZXRpYyB0b29sIHJlc3VsdCBmb3IgdGhlIHJlcGxheS6xYWRkaXRpb25hbF9rd2FyZ3OAsXJlc3BvbnNlX21ldGFkYXRhgKR0eXBlpHRvb2ykbmFtZcCiaWTArHRvb2xfY2FsbF9pZL1jYWxsX0hGeHpqQ3JDcjhPY1RCOUVPR2V4dW0wVahhcnRpZmFjdMCmc3RhdHVzp3N1Y2Nlc3OzbW9kZWxfdmFsaWRhdGVfanNvbg=="
+    }
+   }
+  },
+  {
+   "id": "r14_chat_completions_200_c_split_text_then_get_task_history_for_callback",
+   "source": "rebuilt from Phoenix LLM span 1515 (2026-11-26); raw body not captured",
+   "model": "recorded-model-c",
+   "route": {
+    "api": "chat_completions",
+    "reasoning_effort": ""
+   },
+   "status": 200,
+   "body": {
+    "id": "resp_plymxn6kxnekmqny6wz4vpidlcvkydykie6fgv7v5cv325ob5m5q",
+    "created": 1795655937,
+    "model": "recorded-model-c",
+    "object": "chat.completion",
+    "choices": [
+     {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+       "role": "assistant",
+       "content": "I’ll check callback 2’s task history first to avoid duplicating a settled `whoami` result, then use Apollo’s native `whoami` command if needed; it is the quietest identity check."
+      },
+      "logprobs": null
+     },
+     {
+      "finish_reason": "tool_calls",
+      "index": 1,
+      "message": {
+       "role": "assistant",
+       "tool_calls": [
+        {
+         "index": 0,
+         "function": {
+          "arguments": "{\"callback_display_id\": 2}",
+          "name": "get_task_history_for_callback"
+         },
+         "id": "call_d84591c240a050cd838108aea6e60dd9",
+         "type": "function"
+        }
+       ],
+       "content": null
+      },
+      "logprobs": null
+     }
+    ],
+    "usage": {
+     "completion_tokens": 111,
+     "prompt_tokens": 9724,
+     "total_tokens": 9835,
+     "completion_tokens_details": {
+      "reasoning_tokens": 36
+     },
+     "prompt_tokens_details": {
+      "cache_write_tokens": 9722,
+      "cached_tokens": 0,
+      "cache_creation_tokens": 9722
+     }
+    },
+    "service_tier": "default"
+   },
+   "added_by": "freeze_split_choice_rows.py",
+   "oracle_versions": {
+    "openai": "3.58.0",
+    "langchain-openai": "1.7.2",
+    "langchain-core": "1.6.10"
+   },
+   "rebuilt": "Body rebuilt from the span's recorded LLMResult (each generation's text, call ids, names and the raw argument strings; usage; response id) in the gateway's recorded single-choice envelope. Envelope fields the span does not record are omitted.",
+   "expected_from": "the same reply in one choice (text and every call in choices[0], in choice order)",
+   "expectation_reason": "this plan: one reply split by the gateway",
+   "expected": {
+    "message": {
+     "type": "AIMessage",
+     "id": "lc_run--<run id>",
+     "name": null,
+     "tool_calls": [
+      {
+       "name": "get_task_history_for_callback",
+       "args": {
+        "callback_display_id": 2
+       },
+       "id": "call_d84591c240a050cd838108aea6e60dd9"
+      }
+     ],
+     "invalid_tool_calls": [],
+     "content_types": "str",
+     "text": "I’ll check callback 2’s task history first to avoid duplicating a settled `whoami` result, then use Apollo’s native `whoami` command if needed; it is the quietest identity check.",
+     "sole_text": "I’ll check callback 2’s task history first to avoid duplicating a settled `whoami` result, then use Apollo’s native `whoami` command if needed; it is the quietest identity check.",
+     "envelope_error": "",
+     "usage": {
+      "input_tokens": 9724,
+      "output_tokens": 111,
+      "total_tokens": 9835,
+      "reasoning_tokens": 36
+     },
+     "metadata": {
+      "model_name": "recorded-model-c",
+      "finish_reason": "tool_calls",
+      "id": "resp_plymxn6kxnekmqny6wz4vpidlcvkydykie6fgv7v5cv325ob5m5q"
+     },
+     "rendered": "I’ll check callback 2’s task history first to avoid duplicating a settled `whoami` result, then use Apollo’s native `whoami` command if needed; it is the quietest identity check.\n"
+    },
+    "history": {
+     "responses_input": [
+      {
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "role": "user",
+       "type": "message"
+      },
+      {
+       "type": "message",
+       "role": "assistant",
+       "content": [
+        {
+         "type": "output_text",
+         "text": "I’ll check callback 2’s task history first to avoid duplicating a settled `whoami` result, then use Apollo’s native `whoami` command if needed; it is the quietest identity check.",
+         "annotations": []
+        }
+       ]
+      },
+      {
+       "type": "function_call",
+       "name": "get_task_history_for_callback",
+       "arguments": "{\"callback_display_id\": 2}",
+       "call_id": "call_d84591c240a050cd838108aea6e60dd9"
+      },
+      {
+       "type": "function_call_output",
+       "output": "Synthetic tool result for the replay.",
+       "call_id": "call_d84591c240a050cd838108aea6e60dd9"
+      }
+     ],
+     "chat_completions": [
+      {
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "role": "user"
+      },
+      {
+       "content": "I’ll check callback 2’s task history first to avoid duplicating a settled `whoami` result, then use Apollo’s native `whoami` command if needed; it is the quietest identity check.",
+       "role": "assistant",
+       "tool_calls": [
+        {
+         "type": "function",
+         "id": "call_d84591c240a050cd838108aea6e60dd9",
+         "function": {
+          "name": "get_task_history_for_callback",
+          "arguments": "{\"callback_display_id\": 2}"
+         }
+        }
+       ]
+      },
+      {
+       "content": "Synthetic tool result for the replay.",
+       "role": "tool",
+       "tool_call_id": "call_d84591c240a050cd838108aea6e60dd9"
+      }
+     ],
+     "sanitized": [
+      {
+       "type": "HumanMessage",
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "tool_calls": [],
+       "tool_call_id": null
+      },
+      {
+       "type": "AIMessage",
+       "content": "I’ll check callback 2’s task history first to avoid duplicating a settled `whoami` result, then use Apollo’s native `whoami` command if needed; it is the quietest identity check.",
+       "tool_calls": [
+        {
+         "name": "get_task_history_for_callback",
+         "args": {
+          "callback_display_id": 2
+         },
+         "id": "call_d84591c240a050cd838108aea6e60dd9"
+        }
+       ],
+       "tool_call_id": null
+      },
+      {
+       "type": "ToolMessage",
+       "content": "Synthetic tool result for the replay.",
+       "tool_calls": [],
+       "tool_call_id": "call_d84591c240a050cd838108aea6e60dd9"
+      }
+     ],
+     "sanitized_changed": false
+    },
+    "checkpoint": {
+     "type": "msgpack",
+     "base64": "k8eyBZS9bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMuaHVtYW6sSHVtYW5NZXNzYWdlhqdjb250ZW502SxTeW50aGV0aWMgcmVwbGF5IHByb21wdDogbGlzdCB0aGUgY2FsbGJhY2tzLrFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWlaHVtYW6kbmFtZcCiaWTAs21vZGVsX3ZhbGlkYXRlX2pzb27IBJMFlLpsYW5nY2hhaW5fY29yZS5tZXNzYWdlcy5haalBSU1lc3NhZ2WJp2NvbnRlbnTZuEnigJlsbCBjaGVjayBjYWxsYmFjayAy4oCZcyB0YXNrIGhpc3RvcnkgZmlyc3QgdG8gYXZvaWQgZHVwbGljYXRpbmcgYSBzZXR0bGVkIGB3aG9hbWlgIHJlc3VsdCwgdGhlbiB1c2UgQXBvbGxv4oCZcyBuYXRpdmUgYHdob2FtaWAgY29tbWFuZCBpZiBuZWVkZWQ7IGl0IGlzIHRoZSBxdWlldGVzdCBpZGVudGl0eSBjaGVjay6xYWRkaXRpb25hbF9rd2FyZ3OBp3JlZnVzYWzAsXJlc3BvbnNlX21ldGFkYXRhiKt0b2tlbl91c2FnZYWxY29tcGxldGlvbl90b2tlbnNvrXByb21wdF90b2tlbnPNJfysdG90YWxfdG9rZW5zzSZruWNvbXBsZXRpb25fdG9rZW5zX2RldGFpbHOFumFjY2VwdGVkX3ByZWRpY3Rpb25fdG9rZW5zwKxhdWRpb190b2tlbnPAsHJlYXNvbmluZ190b2tlbnMkunJlamVjdGVkX3ByZWRpY3Rpb25fdG9rZW5zwKt0ZXh0X3Rva2Vuc8C1cHJvbXB0X3Rva2Vuc19kZXRhaWxzhqxhdWRpb190b2tlbnPAsmNhY2hlX3dyaXRlX3Rva2Vuc80l+q1jYWNoZWRfdG9rZW5zAKxpbWFnZV90b2tlbnPAq3RleHRfdG9rZW5zwLVjYWNoZV9jcmVhdGlvbl90b2tlbnPNJfqubW9kZWxfcHJvdmlkZXKmb3BlbmFpqm1vZGVsX25hbWWwcmVjb3JkZWQtbW9kZWwtY7JzeXN0ZW1fZmluZ2VycHJpbnTAomlk2TlyZXNwX3BseW14bjZreG5la21xbnk2d3o0dnBpZGxjdmt5ZHlraWU2Zmd2N3Y1Y3YzMjVvYjVtNXGsc2VydmljZV90aWVyp2RlZmF1bHStZmluaXNoX3JlYXNvbqp0b29sX2NhbGxzqGxvZ3Byb2JzwKR0eXBlomFppG5hbWXAomlk2S5sY19ydW4tLTAxYTIxOGU5LTkyZmYtNzVjMC1iNzQ3LTM2YmY1NDYzNTFmMi0wqnRvb2xfY2FsbHORhKRuYW1lvWdldF90YXNrX2hpc3RvcnlfZm9yX2NhbGxiYWNrpGFyZ3OBs2NhbGxiYWNrX2Rpc3BsYXlfaWQComlk2SVjYWxsX2Q4NDU5MWMyNDBhMDUwY2Q4MzgxMDhhZWE2ZTYwZGQ5pHR5cGWpdG9vbF9jYWxssmludmFsaWRfdG9vbF9jYWxsc5CudXNhZ2VfbWV0YWRhdGGFrGlucHV0X3Rva2Vuc80l/K1vdXRwdXRfdG9rZW5zb6x0b3RhbF90b2tlbnPNJmuzaW5wdXRfdG9rZW5fZGV0YWlsc4KqY2FjaGVfcmVhZACuY2FjaGVfY3JlYXRpb27NJfq0b3V0cHV0X3Rva2VuX2RldGFpbHOBqXJlYXNvbmluZySzbW9kZWxfdmFsaWRhdGVfanNvbsf1BZS8bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMudG9vbKtUb29sTWVzc2FnZYmnY29udGVudNklU3ludGhldGljIHRvb2wgcmVzdWx0IGZvciB0aGUgcmVwbGF5LrFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWkdG9vbKRuYW1lwKJpZMCsdG9vbF9jYWxsX2lk2SVjYWxsX2Q4NDU5MWMyNDBhMDUwY2Q4MzgxMDhhZWE2ZTYwZGQ5qGFydGlmYWN0wKZzdGF0dXOnc3VjY2Vzc7Ntb2RlbF92YWxpZGF0ZV9qc29u"
+    }
+   }
+  },
+  {
+   "id": "r15_chat_completions_200_c_split_text_then_get_ttp_guidance_get_task_history_for_callback_get_all_command_args_for_payloadtype",
+   "source": "rebuilt from Phoenix LLM span 1537 (2026-11-26); raw body not captured",
+   "model": "recorded-model-c",
+   "route": {
+    "api": "chat_completions",
+    "reasoning_effort": ""
+   },
+   "status": 200,
+   "body": {
+    "id": "resp_tmhyt3zu3rlgklq4mbuat4mkpblxl6hsm6xlc4i6js7ekbt67hya",
+    "created": 1795655940,
+    "model": "recorded-model-c",
+    "object": "chat.completion",
+    "choices": [
+     {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+       "role": "assistant",
+       "content": "I’ll use Apollo’s native `whoami` because it directly reports the callback’s current thread identity with the lowest footprint. I’m first checking callback 2’s prior tasks and the command’s exact schema so I don’t repeat a settled result or send an invalid parameter blob."
+      },
+      "logprobs": null
+     },
+     {
+      "finish_reason": "tool_calls",
+      "index": 1,
+      "message": {
+       "role": "assistant",
+       "tool_calls": [
+        {
+         "index": 0,
+         "function": {
+          "arguments": "{\"goal\": \"identify the current callback execution identity\", \"callback_display_id\": 2}",
+          "name": "get_ttp_guidance"
+         },
+         "id": "call_b488a73695805fc0904224cc6860382c",
+         "type": "function"
+        },
+        {
+         "index": 1,
+         "function": {
+          "arguments": "{\"callback_display_id\": 2}",
+          "name": "get_task_history_for_callback"
+         },
+         "id": "call_ecd8bf3c576255ea8eec2163abad4774",
+         "type": "function"
+        },
+        {
+         "index": 2,
+         "function": {
+          "arguments": "{\"payload\": \"apollo\", \"command\": \"whoami\", \"callback_display_id\": 2}",
+          "name": "get_all_command_args_for_payloadtype"
+         },
+         "id": "call_75155f1bebb35a1792215217e376bd55",
+         "type": "function"
+        }
+       ],
+       "content": null
+      },
+      "logprobs": null
+     }
+    ],
+    "usage": {
+     "completion_tokens": 277,
+     "prompt_tokens": 10137,
+     "total_tokens": 10414,
+     "completion_tokens_details": {
+      "reasoning_tokens": 115
+     },
+     "prompt_tokens_details": {
+      "cache_write_tokens": 10135,
+      "cached_tokens": 0,
+      "cache_creation_tokens": 10135
+     }
+    },
+    "service_tier": "default"
+   },
+   "added_by": "freeze_split_choice_rows.py",
+   "oracle_versions": {
+    "openai": "3.58.0",
+    "langchain-openai": "1.7.2",
+    "langchain-core": "1.6.10"
+   },
+   "rebuilt": "Body rebuilt from the span's recorded LLMResult (each generation's text, call ids, names and the raw argument strings; usage; response id) in the gateway's recorded single-choice envelope. Envelope fields the span does not record are omitted.",
+   "expected_from": "the same reply in one choice (text and every call in choices[0], in choice order)",
+   "expectation_reason": "this plan: one reply split by the gateway",
+   "expected": {
+    "message": {
+     "type": "AIMessage",
+     "id": "lc_run--<run id>",
+     "name": null,
+     "tool_calls": [
+      {
+       "name": "get_ttp_guidance",
+       "args": {
+        "goal": "identify the current callback execution identity",
+        "callback_display_id": 2
+       },
+       "id": "call_b488a73695805fc0904224cc6860382c"
+      },
+      {
+       "name": "get_task_history_for_callback",
+       "args": {
+        "callback_display_id": 2
+       },
+       "id": "call_ecd8bf3c576255ea8eec2163abad4774"
+      },
+      {
+       "name": "get_all_command_args_for_payloadtype",
+       "args": {
+        "payload": "apollo",
+        "command": "whoami",
+        "callback_display_id": 2
+       },
+       "id": "call_75155f1bebb35a1792215217e376bd55"
+      }
+     ],
+     "invalid_tool_calls": [],
+     "content_types": "str",
+     "text": "I’ll use Apollo’s native `whoami` because it directly reports the callback’s current thread identity with the lowest footprint. I’m first checking callback 2’s prior tasks and the command’s exact schema so I don’t repeat a settled result or send an invalid parameter blob.",
+     "sole_text": "I’ll use Apollo’s native `whoami` because it directly reports the callback’s current thread identity with the lowest footprint. I’m first checking callback 2’s prior tasks and the command’s exact schema so I don’t repeat a settled result or send an invalid parameter blob.",
+     "envelope_error": "",
+     "usage": {
+      "input_tokens": 10137,
+      "output_tokens": 277,
+      "total_tokens": 10414,
+      "reasoning_tokens": 115
+     },
+     "metadata": {
+      "model_name": "recorded-model-c",
+      "finish_reason": "tool_calls",
+      "id": "resp_tmhyt3zu3rlgklq4mbuat4mkpblxl6hsm6xlc4i6js7ekbt67hya"
+     },
+     "rendered": "I’ll use Apollo’s native `whoami` because it directly reports the callback’s current thread identity with the lowest footprint. I’m first checking callback 2’s prior tasks and the command’s exact schema so I don’t repeat a settled result or send an invalid parameter blob.\n"
+    },
+    "history": {
+     "responses_input": [
+      {
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "role": "user",
+       "type": "message"
+      },
+      {
+       "type": "message",
+       "role": "assistant",
+       "content": [
+        {
+         "type": "output_text",
+         "text": "I’ll use Apollo’s native `whoami` because it directly reports the callback’s current thread identity with the lowest footprint. I’m first checking callback 2’s prior tasks and the command’s exact schema so I don’t repeat a settled result or send an invalid parameter blob.",
+         "annotations": []
+        }
+       ]
+      },
+      {
+       "type": "function_call",
+       "name": "get_ttp_guidance",
+       "arguments": "{\"goal\": \"identify the current callback execution identity\", \"callback_display_id\": 2}",
+       "call_id": "call_b488a73695805fc0904224cc6860382c"
+      },
+      {
+       "type": "function_call",
+       "name": "get_task_history_for_callback",
+       "arguments": "{\"callback_display_id\": 2}",
+       "call_id": "call_ecd8bf3c576255ea8eec2163abad4774"
+      },
+      {
+       "type": "function_call",
+       "name": "get_all_command_args_for_payloadtype",
+       "arguments": "{\"payload\": \"apollo\", \"command\": \"whoami\", \"callback_display_id\": 2}",
+       "call_id": "call_75155f1bebb35a1792215217e376bd55"
+      },
+      {
+       "type": "function_call_output",
+       "output": "Synthetic tool result for the replay.",
+       "call_id": "call_b488a73695805fc0904224cc6860382c"
+      },
+      {
+       "type": "function_call_output",
+       "output": "Synthetic tool result for the replay.",
+       "call_id": "call_ecd8bf3c576255ea8eec2163abad4774"
+      },
+      {
+       "type": "function_call_output",
+       "output": "Synthetic tool result for the replay.",
+       "call_id": "call_75155f1bebb35a1792215217e376bd55"
+      }
+     ],
+     "chat_completions": [
+      {
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "role": "user"
+      },
+      {
+       "content": "I’ll use Apollo’s native `whoami` because it directly reports the callback’s current thread identity with the lowest footprint. I’m first checking callback 2’s prior tasks and the command’s exact schema so I don’t repeat a settled result or send an invalid parameter blob.",
+       "role": "assistant",
+       "tool_calls": [
+        {
+         "type": "function",
+         "id": "call_b488a73695805fc0904224cc6860382c",
+         "function": {
+          "name": "get_ttp_guidance",
+          "arguments": "{\"goal\": \"identify the current callback execution identity\", \"callback_display_id\": 2}"
+         }
+        },
+        {
+         "type": "function",
+         "id": "call_ecd8bf3c576255ea8eec2163abad4774",
+         "function": {
+          "name": "get_task_history_for_callback",
+          "arguments": "{\"callback_display_id\": 2}"
+         }
+        },
+        {
+         "type": "function",
+         "id": "call_75155f1bebb35a1792215217e376bd55",
+         "function": {
+          "name": "get_all_command_args_for_payloadtype",
+          "arguments": "{\"payload\": \"apollo\", \"command\": \"whoami\", \"callback_display_id\": 2}"
+         }
+        }
+       ]
+      },
+      {
+       "content": "Synthetic tool result for the replay.",
+       "role": "tool",
+       "tool_call_id": "call_b488a73695805fc0904224cc6860382c"
+      },
+      {
+       "content": "Synthetic tool result for the replay.",
+       "role": "tool",
+       "tool_call_id": "call_ecd8bf3c576255ea8eec2163abad4774"
+      },
+      {
+       "content": "Synthetic tool result for the replay.",
+       "role": "tool",
+       "tool_call_id": "call_75155f1bebb35a1792215217e376bd55"
+      }
+     ],
+     "sanitized": [
+      {
+       "type": "HumanMessage",
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "tool_calls": [],
+       "tool_call_id": null
+      },
+      {
+       "type": "AIMessage",
+       "content": "I’ll use Apollo’s native `whoami` because it directly reports the callback’s current thread identity with the lowest footprint. I’m first checking callback 2’s prior tasks and the command’s exact schema so I don’t repeat a settled result or send an invalid parameter blob.",
+       "tool_calls": [
+        {
+         "name": "get_ttp_guidance",
+         "args": {
+          "goal": "identify the current callback execution identity",
+          "callback_display_id": 2
+         },
+         "id": "call_b488a73695805fc0904224cc6860382c"
+        },
+        {
+         "name": "get_task_history_for_callback",
+         "args": {
+          "callback_display_id": 2
+         },
+         "id": "call_ecd8bf3c576255ea8eec2163abad4774"
+        },
+        {
+         "name": "get_all_command_args_for_payloadtype",
+         "args": {
+          "payload": "apollo",
+          "command": "whoami",
+          "callback_display_id": 2
+         },
+         "id": "call_75155f1bebb35a1792215217e376bd55"
+        }
+       ],
+       "tool_call_id": null
+      },
+      {
+       "type": "ToolMessage",
+       "content": "Synthetic tool result for the replay.",
+       "tool_calls": [],
+       "tool_call_id": "call_b488a73695805fc0904224cc6860382c"
+      },
+      {
+       "type": "ToolMessage",
+       "content": "Synthetic tool result for the replay.",
+       "tool_calls": [],
+       "tool_call_id": "call_ecd8bf3c576255ea8eec2163abad4774"
+      },
+      {
+       "type": "ToolMessage",
+       "content": "Synthetic tool result for the replay.",
+       "tool_calls": [],
+       "tool_call_id": "call_75155f1bebb35a1792215217e376bd55"
+      }
+     ],
+     "sanitized_changed": false
+    },
+    "checkpoint": {
+     "type": "msgpack",
+     "base64": "lceyBZS9bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMuaHVtYW6sSHVtYW5NZXNzYWdlhqdjb250ZW502SxTeW50aGV0aWMgcmVwbGF5IHByb21wdDogbGlzdCB0aGUgY2FsbGJhY2tzLrFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWlaHVtYW6kbmFtZcCiaWTAs21vZGVsX3ZhbGlkYXRlX2pzb27IBj4FlLpsYW5nY2hhaW5fY29yZS5tZXNzYWdlcy5haalBSU1lc3NhZ2WJp2NvbnRlbnTaAR5J4oCZbGwgdXNlIEFwb2xsb+KAmXMgbmF0aXZlIGB3aG9hbWlgIGJlY2F1c2UgaXQgZGlyZWN0bHkgcmVwb3J0cyB0aGUgY2FsbGJhY2vigJlzIGN1cnJlbnQgdGhyZWFkIGlkZW50aXR5IHdpdGggdGhlIGxvd2VzdCBmb290cHJpbnQuIEnigJltIGZpcnN0IGNoZWNraW5nIGNhbGxiYWNrIDLigJlzIHByaW9yIHRhc2tzIGFuZCB0aGUgY29tbWFuZOKAmXMgZXhhY3Qgc2NoZW1hIHNvIEkgZG9u4oCZdCByZXBlYXQgYSBzZXR0bGVkIHJlc3VsdCBvciBzZW5kIGFuIGludmFsaWQgcGFyYW1ldGVyIGJsb2IusWFkZGl0aW9uYWxfa3dhcmdzgadyZWZ1c2FswLFyZXNwb25zZV9tZXRhZGF0YYirdG9rZW5fdXNhZ2WFsWNvbXBsZXRpb25fdG9rZW5zzQEVrXByb21wdF90b2tlbnPNJ5msdG90YWxfdG9rZW5zzSiuuWNvbXBsZXRpb25fdG9rZW5zX2RldGFpbHOFumFjY2VwdGVkX3ByZWRpY3Rpb25fdG9rZW5zwKxhdWRpb190b2tlbnPAsHJlYXNvbmluZ190b2tlbnNzunJlamVjdGVkX3ByZWRpY3Rpb25fdG9rZW5zwKt0ZXh0X3Rva2Vuc8C1cHJvbXB0X3Rva2Vuc19kZXRhaWxzhqxhdWRpb190b2tlbnPAsmNhY2hlX3dyaXRlX3Rva2Vuc80nl61jYWNoZWRfdG9rZW5zAKxpbWFnZV90b2tlbnPAq3RleHRfdG9rZW5zwLVjYWNoZV9jcmVhdGlvbl90b2tlbnPNJ5eubW9kZWxfcHJvdmlkZXKmb3BlbmFpqm1vZGVsX25hbWWwcmVjb3JkZWQtbW9kZWwtY7JzeXN0ZW1fZmluZ2VycHJpbnTAomlk2TlyZXNwX3RtaHl0M3p1M3JsZ2tscTRtYnVhdDRta3BibHhsNmhzbTZ4bGM0aTZqczdla2J0NjdoeWGsc2VydmljZV90aWVyp2RlZmF1bHStZmluaXNoX3JlYXNvbqp0b29sX2NhbGxzqGxvZ3Byb2JzwKR0eXBlomFppG5hbWXAomlk2S5sY19ydW4tLTAxYTIxOGU5LTkzMGEtNzQ3MS1iMjU4LWE0ZGI4NmVjNjRkMS0wqnRvb2xfY2FsbHOThKRuYW1lsGdldF90dHBfZ3VpZGFuY2WkYXJnc4KkZ29hbNkwaWRlbnRpZnkgdGhlIGN1cnJlbnQgY2FsbGJhY2sgZXhlY3V0aW9uIGlkZW50aXR5s2NhbGxiYWNrX2Rpc3BsYXlfaWQComlk2SVjYWxsX2I0ODhhNzM2OTU4MDVmYzA5MDQyMjRjYzY4NjAzODJjpHR5cGWpdG9vbF9jYWxshKRuYW1lvWdldF90YXNrX2hpc3RvcnlfZm9yX2NhbGxiYWNrpGFyZ3OBs2NhbGxiYWNrX2Rpc3BsYXlfaWQComlk2SVjYWxsX2VjZDhiZjNjNTc2MjU1ZWE4ZWVjMjE2M2FiYWQ0Nzc0pHR5cGWpdG9vbF9jYWxshKRuYW1l2SRnZXRfYWxsX2NvbW1hbmRfYXJnc19mb3JfcGF5bG9hZHR5cGWkYXJnc4OncGF5bG9hZKZhcG9sbG+nY29tbWFuZKZ3aG9hbWmzY2FsbGJhY2tfZGlzcGxheV9pZAKiaWTZJWNhbGxfNzUxNTVmMWJlYmIzNWExNzkyMjE1MjE3ZTM3NmJkNTWkdHlwZal0b29sX2NhbGyyaW52YWxpZF90b29sX2NhbGxzkK51c2FnZV9tZXRhZGF0YYWsaW5wdXRfdG9rZW5zzSeZrW91dHB1dF90b2tlbnPNARWsdG90YWxfdG9rZW5zzSius2lucHV0X3Rva2VuX2RldGFpbHOCqmNhY2hlX3JlYWQArmNhY2hlX2NyZWF0aW9uzSeXtG91dHB1dF90b2tlbl9kZXRhaWxzgalyZWFzb25pbmdzs21vZGVsX3ZhbGlkYXRlX2pzb27H9QWUvGxhbmdjaGFpbl9jb3JlLm1lc3NhZ2VzLnRvb2yrVG9vbE1lc3NhZ2WJp2NvbnRlbnTZJVN5bnRoZXRpYyB0b29sIHJlc3VsdCBmb3IgdGhlIHJlcGxheS6xYWRkaXRpb25hbF9rd2FyZ3OAsXJlc3BvbnNlX21ldGFkYXRhgKR0eXBlpHRvb2ykbmFtZcCiaWTArHRvb2xfY2FsbF9pZNklY2FsbF9iNDg4YTczNjk1ODA1ZmMwOTA0MjI0Y2M2ODYwMzgyY6hhcnRpZmFjdMCmc3RhdHVzp3N1Y2Nlc3OzbW9kZWxfdmFsaWRhdGVfanNvbsf1BZS8bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMudG9vbKtUb29sTWVzc2FnZYmnY29udGVudNklU3ludGhldGljIHRvb2wgcmVzdWx0IGZvciB0aGUgcmVwbGF5LrFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWkdG9vbKRuYW1lwKJpZMCsdG9vbF9jYWxsX2lk2SVjYWxsX2VjZDhiZjNjNTc2MjU1ZWE4ZWVjMjE2M2FiYWQ0Nzc0qGFydGlmYWN0wKZzdGF0dXOnc3VjY2Vzc7Ntb2RlbF92YWxpZGF0ZV9qc29ux/UFlLxsYW5nY2hhaW5fY29yZS5tZXNzYWdlcy50b29sq1Rvb2xNZXNzYWdliadjb250ZW502SVTeW50aGV0aWMgdG9vbCByZXN1bHQgZm9yIHRoZSByZXBsYXkusWFkZGl0aW9uYWxfa3dhcmdzgLFyZXNwb25zZV9tZXRhZGF0YYCkdHlwZaR0b29spG5hbWXAomlkwKx0b29sX2NhbGxfaWTZJWNhbGxfNzUxNTVmMWJlYmIzNWExNzkyMjE1MjE3ZTM3NmJkNTWoYXJ0aWZhY3TApnN0YXR1c6dzdWNjZXNzs21vZGVsX3ZhbGlkYXRlX2pzb24="
+    }
+   }
+  },
+  {
+   "id": "r16_chat_completions_200_c_split_text_then_get_ttp_guidance",
+   "source": "rebuilt from Phoenix LLM span 1602 (2026-11-26); raw body not captured",
+   "model": "recorded-model-c",
+   "route": {
+    "api": "chat_completions",
+    "reasoning_effort": ""
+   },
+   "status": 200,
+   "body": {
+    "id": "resp_v3pjeo3inwmuzf7rym5tgh2flidpndq5qfl3e75bg4zwnc3eh22a",
+    "created": 1795656801,
+    "model": "recorded-model-c",
+    "object": "chat.completion",
+    "choices": [
+     {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+       "role": "assistant",
+       "content": "I’m using Apollo’s built-in `whoami` because it directly reports the callback’s current execution identity with minimal footprint; prior results don’t replace this explicitly requested fresh run."
+      },
+      "logprobs": null
+     },
+     {
+      "finish_reason": "tool_calls",
+      "index": 1,
+      "message": {
+       "role": "assistant",
+       "tool_calls": [
+        {
+         "index": 0,
+         "function": {
+          "arguments": "{\"goal\": \"report current execution identity\", \"callback_display_id\": 2}",
+          "name": "get_ttp_guidance"
+         },
+         "id": "call_eb055b0026265af1a75f26570793d262",
+         "type": "function"
+        }
+       ],
+       "content": null
+      },
+      "logprobs": null
+     }
+    ],
+    "usage": {
+     "completion_tokens": 103,
+     "prompt_tokens": 14120,
+     "total_tokens": 14223,
+     "completion_tokens_details": {
+      "reasoning_tokens": 28
+     },
+     "prompt_tokens_details": {
+      "cache_write_tokens": 14118,
+      "cached_tokens": 0,
+      "cache_creation_tokens": 14118
+     }
+    },
+    "service_tier": "default"
+   },
+   "added_by": "freeze_split_choice_rows.py",
+   "oracle_versions": {
+    "openai": "3.58.0",
+    "langchain-openai": "1.7.2",
+    "langchain-core": "1.6.10"
+   },
+   "rebuilt": "Body rebuilt from the span's recorded LLMResult (each generation's text, call ids, names and the raw argument strings; usage; response id) in the gateway's recorded single-choice envelope. Envelope fields the span does not record are omitted.",
+   "expected_from": "the same reply in one choice (text and every call in choices[0], in choice order)",
+   "expectation_reason": "this plan: one reply split by the gateway",
+   "expected": {
+    "message": {
+     "type": "AIMessage",
+     "id": "lc_run--<run id>",
+     "name": null,
+     "tool_calls": [
+      {
+       "name": "get_ttp_guidance",
+       "args": {
+        "goal": "report current execution identity",
+        "callback_display_id": 2
+       },
+       "id": "call_eb055b0026265af1a75f26570793d262"
+      }
+     ],
+     "invalid_tool_calls": [],
+     "content_types": "str",
+     "text": "I’m using Apollo’s built-in `whoami` because it directly reports the callback’s current execution identity with minimal footprint; prior results don’t replace this explicitly requested fresh run.",
+     "sole_text": "I’m using Apollo’s built-in `whoami` because it directly reports the callback’s current execution identity with minimal footprint; prior results don’t replace this explicitly requested fresh run.",
+     "envelope_error": "",
+     "usage": {
+      "input_tokens": 14120,
+      "output_tokens": 103,
+      "total_tokens": 14223,
+      "reasoning_tokens": 28
+     },
+     "metadata": {
+      "model_name": "recorded-model-c",
+      "finish_reason": "tool_calls",
+      "id": "resp_v3pjeo3inwmuzf7rym5tgh2flidpndq5qfl3e75bg4zwnc3eh22a"
+     },
+     "rendered": "I’m using Apollo’s built-in `whoami` because it directly reports the callback’s current execution identity with minimal footprint; prior results don’t replace this explicitly requested fresh run.\n"
+    },
+    "history": {
+     "responses_input": [
+      {
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "role": "user",
+       "type": "message"
+      },
+      {
+       "type": "message",
+       "role": "assistant",
+       "content": [
+        {
+         "type": "output_text",
+         "text": "I’m using Apollo’s built-in `whoami` because it directly reports the callback’s current execution identity with minimal footprint; prior results don’t replace this explicitly requested fresh run.",
+         "annotations": []
+        }
+       ]
+      },
+      {
+       "type": "function_call",
+       "name": "get_ttp_guidance",
+       "arguments": "{\"goal\": \"report current execution identity\", \"callback_display_id\": 2}",
+       "call_id": "call_eb055b0026265af1a75f26570793d262"
+      },
+      {
+       "type": "function_call_output",
+       "output": "Synthetic tool result for the replay.",
+       "call_id": "call_eb055b0026265af1a75f26570793d262"
+      }
+     ],
+     "chat_completions": [
+      {
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "role": "user"
+      },
+      {
+       "content": "I’m using Apollo’s built-in `whoami` because it directly reports the callback’s current execution identity with minimal footprint; prior results don’t replace this explicitly requested fresh run.",
+       "role": "assistant",
+       "tool_calls": [
+        {
+         "type": "function",
+         "id": "call_eb055b0026265af1a75f26570793d262",
+         "function": {
+          "name": "get_ttp_guidance",
+          "arguments": "{\"goal\": \"report current execution identity\", \"callback_display_id\": 2}"
+         }
+        }
+       ]
+      },
+      {
+       "content": "Synthetic tool result for the replay.",
+       "role": "tool",
+       "tool_call_id": "call_eb055b0026265af1a75f26570793d262"
+      }
+     ],
+     "sanitized": [
+      {
+       "type": "HumanMessage",
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "tool_calls": [],
+       "tool_call_id": null
+      },
+      {
+       "type": "AIMessage",
+       "content": "I’m using Apollo’s built-in `whoami` because it directly reports the callback’s current execution identity with minimal footprint; prior results don’t replace this explicitly requested fresh run.",
+       "tool_calls": [
+        {
+         "name": "get_ttp_guidance",
+         "args": {
+          "goal": "report current execution identity",
+          "callback_display_id": 2
+         },
+         "id": "call_eb055b0026265af1a75f26570793d262"
+        }
+       ],
+       "tool_call_id": null
+      },
+      {
+       "type": "ToolMessage",
+       "content": "Synthetic tool result for the replay.",
+       "tool_calls": [],
+       "tool_call_id": "call_eb055b0026265af1a75f26570793d262"
+      }
+     ],
+     "sanitized_changed": false
+    },
+    "checkpoint": {
+     "type": "msgpack",
+     "base64": "k8eyBZS9bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMuaHVtYW6sSHVtYW5NZXNzYWdlhqdjb250ZW502SxTeW50aGV0aWMgcmVwbGF5IHByb21wdDogbGlzdCB0aGUgY2FsbGJhY2tzLrFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWlaHVtYW6kbmFtZcCiaWTAs21vZGVsX3ZhbGlkYXRlX2pzb27IBMEFlLpsYW5nY2hhaW5fY29yZS5tZXNzYWdlcy5haalBSU1lc3NhZ2WJp2NvbnRlbnTZy0nigJltIHVzaW5nIEFwb2xsb+KAmXMgYnVpbHQtaW4gYHdob2FtaWAgYmVjYXVzZSBpdCBkaXJlY3RseSByZXBvcnRzIHRoZSBjYWxsYmFja+KAmXMgY3VycmVudCBleGVjdXRpb24gaWRlbnRpdHkgd2l0aCBtaW5pbWFsIGZvb3RwcmludDsgcHJpb3IgcmVzdWx0cyBkb27igJl0IHJlcGxhY2UgdGhpcyBleHBsaWNpdGx5IHJlcXVlc3RlZCBmcmVzaCBydW4usWFkZGl0aW9uYWxfa3dhcmdzgadyZWZ1c2FswLFyZXNwb25zZV9tZXRhZGF0YYirdG9rZW5fdXNhZ2WFsWNvbXBsZXRpb25fdG9rZW5zZ61wcm9tcHRfdG9rZW5zzTcorHRvdGFsX3Rva2Vuc803j7ljb21wbGV0aW9uX3Rva2Vuc19kZXRhaWxzhbphY2NlcHRlZF9wcmVkaWN0aW9uX3Rva2Vuc8CsYXVkaW9fdG9rZW5zwLByZWFzb25pbmdfdG9rZW5zHLpyZWplY3RlZF9wcmVkaWN0aW9uX3Rva2Vuc8CrdGV4dF90b2tlbnPAtXByb21wdF90b2tlbnNfZGV0YWlsc4asYXVkaW9fdG9rZW5zwLJjYWNoZV93cml0ZV90b2tlbnPNNyatY2FjaGVkX3Rva2VucwCsaW1hZ2VfdG9rZW5zwKt0ZXh0X3Rva2Vuc8C1Y2FjaGVfY3JlYXRpb25fdG9rZW5zzTcmrm1vZGVsX3Byb3ZpZGVypm9wZW5haaptb2RlbF9uYW1lsHJlY29yZGVkLW1vZGVsLWOyc3lzdGVtX2ZpbmdlcnByaW50wKJpZNk5cmVzcF92M3BqZW8zaW53bXV6ZjdyeW01dGdoMmZsaWRwbmRxNXFmbDNlNzViZzR6d25jM2VoMjJhrHNlcnZpY2VfdGllcqdkZWZhdWx0rWZpbmlzaF9yZWFzb26qdG9vbF9jYWxsc6hsb2dwcm9ic8CkdHlwZaJhaaRuYW1lwKJpZNkubGNfcnVuLS0wMWEyMThlOS05MzE1LTcyYTMtYmZlYy0xODk0NDU1YjBjMzgtMKp0b29sX2NhbGxzkYSkbmFtZbBnZXRfdHRwX2d1aWRhbmNlpGFyZ3OCpGdvYWzZIXJlcG9ydCBjdXJyZW50IGV4ZWN1dGlvbiBpZGVudGl0ebNjYWxsYmFja19kaXNwbGF5X2lkAqJpZNklY2FsbF9lYjA1NWIwMDI2MjY1YWYxYTc1ZjI2NTcwNzkzZDI2MqR0eXBlqXRvb2xfY2FsbLJpbnZhbGlkX3Rvb2xfY2FsbHOQrnVzYWdlX21ldGFkYXRhhaxpbnB1dF90b2tlbnPNNyitb3V0cHV0X3Rva2Vuc2esdG90YWxfdG9rZW5zzTePs2lucHV0X3Rva2VuX2RldGFpbHOCqmNhY2hlX3JlYWQArmNhY2hlX2NyZWF0aW9uzTcmtG91dHB1dF90b2tlbl9kZXRhaWxzgalyZWFzb25pbmccs21vZGVsX3ZhbGlkYXRlX2pzb27H9QWUvGxhbmdjaGFpbl9jb3JlLm1lc3NhZ2VzLnRvb2yrVG9vbE1lc3NhZ2WJp2NvbnRlbnTZJVN5bnRoZXRpYyB0b29sIHJlc3VsdCBmb3IgdGhlIHJlcGxheS6xYWRkaXRpb25hbF9rd2FyZ3OAsXJlc3BvbnNlX21ldGFkYXRhgKR0eXBlpHRvb2ykbmFtZcCiaWTArHRvb2xfY2FsbF9pZNklY2FsbF9lYjA1NWIwMDI2MjY1YWYxYTc1ZjI2NTcwNzkzZDI2MqhhcnRpZmFjdMCmc3RhdHVzp3N1Y2Nlc3OzbW9kZWxfdmFsaWRhdGVfanNvbg=="
+    }
+   }
+  },
+  {
+   "id": "r17_chat_completions_200_c_split_text_then_issue_task_and_waitfor_task_output",
+   "source": "rebuilt from Phoenix LLM span 1639 (2026-11-26); raw body not captured",
+   "model": "recorded-model-c",
+   "route": {
+    "api": "chat_completions",
+    "reasoning_effort": ""
+   },
+   "status": 200,
+   "body": {
+    "id": "resp_u6rrlveo2nmjs7iyayhh66wbwaujr75klbwx77djyakvsier4ndq",
+    "created": 1795656810,
+    "model": "recorded-model-c",
+    "object": "chat.completion",
+    "choices": [
+     {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+       "role": "assistant",
+       "content": "I’m using Apollo’s built-in `whoami` because it directly reports the callback’s current execution identities without spawning a process. Prior history contains older checks, but this explicit request authorizes a fresh check."
+      },
+      "logprobs": null
+     },
+     {
+      "finish_reason": "tool_calls",
+      "index": 1,
+      "message": {
+       "role": "assistant",
+       "tool_calls": [
+        {
+         "index": 0,
+         "function": {
+          "arguments": "{\"command\": \"whoami\", \"parameters\": {}, \"callback_display_id\": 2}",
+          "name": "issue_task_and_waitfor_task_output"
+         },
+         "id": "call_d74080728db35b488a4629810a5c6470",
+         "type": "function"
+        }
+       ],
+       "content": null
+      },
+      "logprobs": null
+     }
+    ],
+    "usage": {
+     "completion_tokens": 109,
+     "prompt_tokens": 14737,
+     "total_tokens": 14846,
+     "completion_tokens_details": {
+      "reasoning_tokens": 24
+     },
+     "prompt_tokens_details": {
+      "cache_write_tokens": 14735,
+      "cached_tokens": 0,
+      "cache_creation_tokens": 14735
+     }
+    },
+    "service_tier": "default"
+   },
+   "added_by": "freeze_split_choice_rows.py",
+   "oracle_versions": {
+    "openai": "3.58.0",
+    "langchain-openai": "1.7.2",
+    "langchain-core": "1.6.10"
+   },
+   "rebuilt": "Body rebuilt from the span's recorded LLMResult (each generation's text, call ids, names and the raw argument strings; usage; response id) in the gateway's recorded single-choice envelope. Envelope fields the span does not record are omitted.",
+   "expected_from": "the same reply in one choice (text and every call in choices[0], in choice order)",
+   "expectation_reason": "this plan: one reply split by the gateway",
+   "expected": {
+    "message": {
+     "type": "AIMessage",
+     "id": "lc_run--<run id>",
+     "name": null,
+     "tool_calls": [
+      {
+       "name": "issue_task_and_waitfor_task_output",
+       "args": {
+        "command": "whoami",
+        "parameters": {},
+        "callback_display_id": 2
+       },
+       "id": "call_d74080728db35b488a4629810a5c6470"
+      }
+     ],
+     "invalid_tool_calls": [],
+     "content_types": "str",
+     "text": "I’m using Apollo’s built-in `whoami` because it directly reports the callback’s current execution identities without spawning a process. Prior history contains older checks, but this explicit request authorizes a fresh check.",
+     "sole_text": "I’m using Apollo’s built-in `whoami` because it directly reports the callback’s current execution identities without spawning a process. Prior history contains older checks, but this explicit request authorizes a fresh check.",
+     "envelope_error": "",
+     "usage": {
+      "input_tokens": 14737,
+      "output_tokens": 109,
+      "total_tokens": 14846,
+      "reasoning_tokens": 24
+     },
+     "metadata": {
+      "model_name": "recorded-model-c",
+      "finish_reason": "tool_calls",
+      "id": "resp_u6rrlveo2nmjs7iyayhh66wbwaujr75klbwx77djyakvsier4ndq"
+     },
+     "rendered": "I’m using Apollo’s built-in `whoami` because it directly reports the callback’s current execution identities without spawning a process. Prior history contains older checks, but this explicit request authorizes a fresh check.\n"
+    },
+    "history": {
+     "responses_input": [
+      {
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "role": "user",
+       "type": "message"
+      },
+      {
+       "type": "message",
+       "role": "assistant",
+       "content": [
+        {
+         "type": "output_text",
+         "text": "I’m using Apollo’s built-in `whoami` because it directly reports the callback’s current execution identities without spawning a process. Prior history contains older checks, but this explicit request authorizes a fresh check.",
+         "annotations": []
+        }
+       ]
+      },
+      {
+       "type": "function_call",
+       "name": "issue_task_and_waitfor_task_output",
+       "arguments": "{\"command\": \"whoami\", \"parameters\": {}, \"callback_display_id\": 2}",
+       "call_id": "call_d74080728db35b488a4629810a5c6470"
+      },
+      {
+       "type": "function_call_output",
+       "output": "Synthetic tool result for the replay.",
+       "call_id": "call_d74080728db35b488a4629810a5c6470"
+      }
+     ],
+     "chat_completions": [
+      {
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "role": "user"
+      },
+      {
+       "content": "I’m using Apollo’s built-in `whoami` because it directly reports the callback’s current execution identities without spawning a process. Prior history contains older checks, but this explicit request authorizes a fresh check.",
+       "role": "assistant",
+       "tool_calls": [
+        {
+         "type": "function",
+         "id": "call_d74080728db35b488a4629810a5c6470",
+         "function": {
+          "name": "issue_task_and_waitfor_task_output",
+          "arguments": "{\"command\": \"whoami\", \"parameters\": {}, \"callback_display_id\": 2}"
+         }
+        }
+       ]
+      },
+      {
+       "content": "Synthetic tool result for the replay.",
+       "role": "tool",
+       "tool_call_id": "call_d74080728db35b488a4629810a5c6470"
+      }
+     ],
+     "sanitized": [
+      {
+       "type": "HumanMessage",
+       "content": "Synthetic replay prompt: list the callbacks.",
+       "tool_calls": [],
+       "tool_call_id": null
+      },
+      {
+       "type": "AIMessage",
+       "content": "I’m using Apollo’s built-in `whoami` because it directly reports the callback’s current execution identities without spawning a process. Prior history contains older checks, but this explicit request authorizes a fresh check.",
+       "tool_calls": [
+        {
+         "name": "issue_task_and_waitfor_task_output",
+         "args": {
+          "command": "whoami",
+          "parameters": {},
+          "callback_display_id": 2
+         },
+         "id": "call_d74080728db35b488a4629810a5c6470"
+        }
+       ],
+       "tool_call_id": null
+      },
+      {
+       "type": "ToolMessage",
+       "content": "Synthetic tool result for the replay.",
+       "tool_calls": [],
+       "tool_call_id": "call_d74080728db35b488a4629810a5c6470"
+      }
+     ],
+     "sanitized_changed": false
+    },
+    "checkpoint": {
+     "type": "msgpack",
+     "base64": "k8eyBZS9bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMuaHVtYW6sSHVtYW5NZXNzYWdlhqdjb250ZW502SxTeW50aGV0aWMgcmVwbGF5IHByb21wdDogbGlzdCB0aGUgY2FsbGJhY2tzLrFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWlaHVtYW6kbmFtZcCiaWTAs21vZGVsX3ZhbGlkYXRlX2pzb27IBOMFlLpsYW5nY2hhaW5fY29yZS5tZXNzYWdlcy5haalBSU1lc3NhZ2WJp2NvbnRlbnTZ50nigJltIHVzaW5nIEFwb2xsb+KAmXMgYnVpbHQtaW4gYHdob2FtaWAgYmVjYXVzZSBpdCBkaXJlY3RseSByZXBvcnRzIHRoZSBjYWxsYmFja+KAmXMgY3VycmVudCBleGVjdXRpb24gaWRlbnRpdGllcyB3aXRob3V0IHNwYXduaW5nIGEgcHJvY2Vzcy4gUHJpb3IgaGlzdG9yeSBjb250YWlucyBvbGRlciBjaGVja3MsIGJ1dCB0aGlzIGV4cGxpY2l0IHJlcXVlc3QgYXV0aG9yaXplcyBhIGZyZXNoIGNoZWNrLrFhZGRpdGlvbmFsX2t3YXJnc4GncmVmdXNhbMCxcmVzcG9uc2VfbWV0YWRhdGGIq3Rva2VuX3VzYWdlhbFjb21wbGV0aW9uX3Rva2Vuc22tcHJvbXB0X3Rva2Vuc805kax0b3RhbF90b2tlbnPNOf65Y29tcGxldGlvbl90b2tlbnNfZGV0YWlsc4W6YWNjZXB0ZWRfcHJlZGljdGlvbl90b2tlbnPArGF1ZGlvX3Rva2Vuc8CwcmVhc29uaW5nX3Rva2Vucxi6cmVqZWN0ZWRfcHJlZGljdGlvbl90b2tlbnPAq3RleHRfdG9rZW5zwLVwcm9tcHRfdG9rZW5zX2RldGFpbHOGrGF1ZGlvX3Rva2Vuc8CyY2FjaGVfd3JpdGVfdG9rZW5zzTmPrWNhY2hlZF90b2tlbnMArGltYWdlX3Rva2Vuc8CrdGV4dF90b2tlbnPAtWNhY2hlX2NyZWF0aW9uX3Rva2Vuc805j65tb2RlbF9wcm92aWRlcqZvcGVuYWmqbW9kZWxfbmFtZbByZWNvcmRlZC1tb2RlbC1jsnN5c3RlbV9maW5nZXJwcmludMCiaWTZOXJlc3BfdTZycmx2ZW8ybm1qczdpeWF5aGg2Nndid2F1anI3NWtsYnd4Nzdkanlha3ZzaWVyNG5kcaxzZXJ2aWNlX3RpZXKnZGVmYXVsdK1maW5pc2hfcmVhc29uqnRvb2xfY2FsbHOobG9ncHJvYnPApHR5cGWiYWmkbmFtZcCiaWTZLmxjX3J1bi0tMDFhMjE4ZTktOTMyMC03MTUyLTlkODMtNzVjMmQyYjZjNWU1LTCqdG9vbF9jYWxsc5GEpG5hbWXZImlzc3VlX3Rhc2tfYW5kX3dhaXRmb3JfdGFza19vdXRwdXSkYXJnc4OnY29tbWFuZKZ3aG9hbWmqcGFyYW1ldGVyc4CzY2FsbGJhY2tfZGlzcGxheV9pZAKiaWTZJWNhbGxfZDc0MDgwNzI4ZGIzNWI0ODhhNDYyOTgxMGE1YzY0NzCkdHlwZal0b29sX2NhbGyyaW52YWxpZF90b29sX2NhbGxzkK51c2FnZV9tZXRhZGF0YYWsaW5wdXRfdG9rZW5zzTmRrW91dHB1dF90b2tlbnNtrHRvdGFsX3Rva2Vuc805/rNpbnB1dF90b2tlbl9kZXRhaWxzgqpjYWNoZV9yZWFkAK5jYWNoZV9jcmVhdGlvbs05j7RvdXRwdXRfdG9rZW5fZGV0YWlsc4GpcmVhc29uaW5nGLNtb2RlbF92YWxpZGF0ZV9qc29ux/UFlLxsYW5nY2hhaW5fY29yZS5tZXNzYWdlcy50b29sq1Rvb2xNZXNzYWdliadjb250ZW502SVTeW50aGV0aWMgdG9vbCByZXN1bHQgZm9yIHRoZSByZXBsYXkusWFkZGl0aW9uYWxfa3dhcmdzgLFyZXNwb25zZV9tZXRhZGF0YYCkdHlwZaR0b29spG5hbWXAomlkwKx0b29sX2NhbGxfaWTZJWNhbGxfZDc0MDgwNzI4ZGIzNWI0ODhhNDYyOTgxMGE1YzY0NzCoYXJ0aWZhY3TApnN0YXR1c6dzdWNjZXNzs21vZGVsX3ZhbGlkYXRlX2pzb24="
     }
    }
   }
