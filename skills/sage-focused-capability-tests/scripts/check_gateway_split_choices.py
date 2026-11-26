@@ -3,10 +3,11 @@
 
 Some OpenAI-compatible gateways send one reply's text and its tool call as separate choices. Sage's OpenAI adapter
 folds such a reply into one message before LangChain keeps the first choice. This check runs two steps against the
-lab gateway with the feature deployed in container mode, and reads each provider response from Sage's own metered
-capture, each first generation from Phoenix, and the cards and tasks from Mythic.
+lab gateway with the feature deployed in container mode. It reads each provider response, and the message Sage sends
+back for it in the next request, from Sage's own metered capture, and the cards, effects and tasks from Mythic. Phoenix
+holds no content while the capture is armed, so no rule reads it; it gives only span counts.
 
-  S  a new supervised channel, LiteLLM Gateway, the gateway model, max 8 steps: "Run whoami on callback N."
+  S  a new supervised channel, LiteLLM Gateway, the gateway model, max 16 steps: "Run whoami on callback N."
      The first card is accepted and any later card rejected.
   K  a new Conversation channel, Custom (OpenAI-compatible) at the same gateway, the gateway model:
      "List the callbacks Mythic has right now, with host and user."
@@ -24,8 +25,10 @@ and need the operator's authorization.
       ``GET /models`` lists the gateway model. Names, booleans, ids and status codes only. Verdict:
       ``deployment_required``, ``capture_required``, ``ready_for_live`` or ``not_ready``.
   arm --run-file F --authorized-by TEXT
-      Starts the private wire receiver, writes the resource budget, saves the installed ``.env`` and ``.env.local``
-      (owner-only), adds a marked capture block to the installed ``.env`` and recreates the Sage container.
+      Starts the private wire receiver, writes the resource budget (provider requests and tokens, control requests,
+      and payload task attempts limited to the one target task; readiness checks it once armed), saves the installed
+      ``.env`` and ``.env.local`` (owner-only), adds a marked capture block to the installed ``.env`` and recreates
+      the Sage container.
   run --run-file F --route-file R --phoenix-db P --authorized-by TEXT
       Step S, then step K, each terminal before the next and each after Mythic shows the container running and Sage
       has answered Mythic's on-start. Stops on more than one target task, a wrong route or model, or a limit; always
@@ -34,21 +37,28 @@ and need the operator's authorization.
       Cancels this run's open requests, restores the installed ``.env.local`` and ``.env`` byte for byte, recreates
       the container, stops the receiver and confirms no open requests. Safe to repeat.
   verify --run-file F --phoenix-db P
-      Applies the frozen pass rules once (``evaluate``):
-      G   at least one captured gateway response in S or K has more than one choice, with a tool call in one of
-          them. Otherwise the check did not run (``not_run``, not an attempt).
-      R1  for every split response, the Phoenix LLM span for that response has one generation, carrying every call
-          of every choice (id, name, arguments) in choice order and the choices' text.
-      R2  every split call's id returns as a tool message in a later captured request in the same channel, or,
-          for a Sage control call whose result Sage never sends back within the turn, its effect carries on: a
-          handoff's instruction (its title when it has none) reaches a later request in the step that no longer
-          offers that handoff, a handback is followed by a request that offers ``respond_to_user``, and a finish's
+      Applies the frozen pass rules once (``evaluate``). A reply with a tool call is delivered when
+      (a) a later captured request in the same step carries one assistant message with exactly its calls in index
+          order: ids and names equal, arguments equal once parsed (Sage's prepared arguments for a guarded call are
+          read by R3), and the choices' text joined in index order, or "." when there was none; or
+      (b) none of its call ids appears later, and the step ended at that reply on a Sage effect naming one of its
+          calls: a control call's effect (below), or, for a guarded call, Sage's step boundary: a Mythic
+          ``[step-boundary]`` message and the Supervisor's next request carrying a ``[step outcome]``.
+      The step's last reply, when Sage then halted at its step limit, is not judged and is reported.
+      G   at least one split gateway reply with a tool call is captured and judged. Otherwise the check did not run
+          (``not_run``, not an attempt).
+      R1  every split reply with a tool call is delivered.
+      R2  every split call's id returns as a tool message in a later captured request in the same step, or, for a
+          Sage control call whose result Sage never sends back within the turn, its effect carries on: a handoff's
+          instruction (its title when it has none) reaches a later request in the step that no longer offers that
+          handoff, a handback is followed by a request that offers ``respond_to_user``, and a finish's
           ``final_response`` (a continuation's summary) appears in the step's Mythic messages; a reused worker
-          answer counts when the step's last answer is not the reply's own text.
-      R3  if S's issue call came split: exactly one card for that call, accepted, and exactly one new Mythic task on
-          callback N with the command and parameters the call names. If it came in one choice, R3 is an observation.
-      R4  every single-choice gateway response's Phoenix first generation carries exactly its text and calls, and
-          no captured request sets ``n``.
+          answer counts when the step's last answer is not the reply's own text. A guarded call refused by the
+          step boundary counts as returned.
+      R3  if an issue call came split: exactly one card for it or the step boundary. An accepted card leads to
+          exactly one new Mythic task on callback N with the command and prepared parameters its replay shows; a
+          rejected card leads to none. If no issue call came split, R3 is an observation.
+      R4  every single-choice gateway reply with a tool call is delivered, and no captured request sets ``n``.
       L   at most 30 provider calls, 400,000 tokens, 30 minutes and 1 target task; no step re-sent; the installed
           files restored and the capture removed.
 
@@ -63,13 +73,12 @@ import asyncio
 import importlib.util
 import json
 import os
-import sqlite3
 import stat
 import sys
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import urlsplit
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 _SPLIT_PATH = REPO_ROOT / "skills/sage-focused-capability-tests/scripts/check_provider_split.py"
@@ -101,10 +110,30 @@ LIST = "List the callbacks Mythic has right now, with host and user."
 # (step, channel, prompt, answers cards)
 STEPS = (("S", "S", WHOAMI, True), ("K", "K", LIST, False))
 # channel -> (provider, mode, max steps)
-CHANNELS = {"S": ("litellm", "supervised", 8), "K": ("openai_compatible", "conversation", 4)}
+# S ran out of steps before a later request could carry its last reply (raised so the oracle exists; L still binds).
+CHANNELS = {"S": ("litellm", "supervised", 16), "K": ("openai_compatible", "conversation", 4)}
 LIMITS = {"provider_calls": 30, "provider_tokens": 400_000, "active_seconds": 30 * 60, "target_tasks": 1}
 split.LIMITS = {**split.LIMITS, "provider_calls": LIMITS["provider_calls"],
                 "provider_tokens": LIMITS["provider_tokens"]}
+BUDGET_RESOURCES = ("provider_requests", "provider_tokens", "control_requests", "payload_task_attempts")
+_PROVIDER_SPLIT_BUDGET = split.budget_config
+
+
+def budget_config() -> dict[str, Any]:
+    """The provider-split budget plus the task resource Sage's admission reserves, limited to L's one target task, so
+    Sage itself refuses a second task. Installed in this check's copy only, where its arm writes ``budget.json``."""
+    config = _PROVIDER_SPLIT_BUDGET()
+    config["resources"]["payload_task_attempts"] = {"limit": LIMITS["target_tasks"], "cleanup_reserve": 0}
+    return config
+
+
+split.budget_config = budget_config
+# Sage's own words for the effects the rules read (model.py: the step boundary, its step outcome, the step-limit halt)
+# and the marker Sage puts on a guarded call's prepared arguments (mythic_tools.py, the supervised issue action).
+STEP_BOUNDARY = "[step-boundary]"
+STEP_OUTCOME = "[step outcome]"
+STEP_LIMIT_HALT = "Halted: step budget exhausted"
+PREPARED_MARKER = "_sage_prepared_action"
 STEP_TIMEOUT = 600
 SETTLE_SECONDS = 3
 CHANGED_FILES = (
@@ -222,35 +251,104 @@ def is_split(item: dict[str, Any]) -> bool:
     return len(reply.get("choices") or []) > 1 and bool(reply_calls(reply))
 
 
-def phoenix_generations(db: Path, after: int, until: int | None = None) -> dict[str, dict[str, Any]]:
-    """LLM spans in (after, until], by provider response id: the span id and each generation's text and calls."""
-    query = ("SELECT id, attributes FROM spans WHERE id > ? AND span_kind = 'LLM'"
-             + (" AND id <= ?" if until else "") + " ORDER BY id")
-    connection = sqlite3.connect(f"file:{quote(str(db.resolve()), safe='/:')}?mode=ro", uri=True)
-    try:
-        rows = connection.execute(query, (after, until) if until else (after,)).fetchall()
-    finally:
-        connection.close()
-    found: dict[str, dict[str, Any]] = {}
-    for span_id, attributes in rows:
-        try:
-            attrs = json.loads(attributes) if isinstance(attributes, str) else (attributes or {})
-            result = json.loads(((attrs.get("output") or {}).get("value")) or "{}")
-        except (TypeError, ValueError):
-            continue
-        response_id = str(((result.get("llm_output") or {}).get("id")) or "")
-        if not response_id:
-            continue
-        generations = []
-        for generation in ((result.get("generations") or [[]])[0] or []):
-            kwargs = ((generation.get("message") or {}).get("kwargs")) or {}
-            content = kwargs.get("content")
-            generations.append({
-                "text": content if isinstance(content, str) else str(generation.get("text") or ""),
-                "tool_calls": [{"id": str(c.get("id") or ""), "name": str(c.get("name") or ""), "args": c.get("args")}
-                               for c in kwargs.get("tool_calls") or []]})
-        found[response_id] = {"span": int(span_id), "generations": generations}
-    return found
+def _message_calls(message: dict[str, Any]) -> list[dict[str, Any]]:
+    """The tool calls a replayed assistant message carries, in order: ``{"id", "name", "args"}``."""
+    calls = []
+    for call in message.get("tool_calls") or []:
+        if isinstance(call, dict):
+            function = call.get("function") or {}
+            calls.append({"id": str(call.get("id") or ""), "name": str(function.get("name") or ""),
+                          "args": _arguments(function.get("arguments"))})
+    return calls
+
+
+def _prepared(args: Any) -> bool:
+    """Whether Sage prepared these arguments for a guarded call before replaying them."""
+    visibility = args.get("visibility_context") if isinstance(args, dict) else None
+    return isinstance(visibility, dict) and visibility.get(PREPARED_MARKER) is True
+
+
+def replay_of(reply: dict[str, Any], later: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The assistant message a later request in the step replays for this reply: the first that carries any of its
+    call ids (Chat Completions sends the kept message back before its tool results)."""
+    ids = {call["id"] for call in reply_calls(reply)}
+    for item in later:
+        for entry in item["input"] if isinstance(item["input"], list) else []:
+            if (isinstance(entry, dict) and entry.get("role") == "assistant"
+                    and ids & {call["id"] for call in _message_calls(entry)}):
+                return entry
+    return None
+
+
+def replay_problem(reply: dict[str, Any], message: dict[str, Any]) -> str:
+    """"" when the replayed message carries exactly the reply, else what differs. Ids and names must match in
+    order; arguments must be equal once parsed, except Sage's prepared arguments for a guarded call (R3 reads those);
+    the text must be the choices' text joined in index order, or "." when there was none."""
+    want, got = reply_calls(reply), _message_calls(message)
+    if [(c["id"], c["name"]) for c in want] != [(c["id"], c["name"]) for c in got]:
+        return "the replayed calls differ (id, name or order)"
+    changed = [w["id"] for w, g in zip(want, got) if not _prepared(g["args"]) and w["args"] != g["args"]]
+    if changed:
+        return "the replayed arguments differ for " + ", ".join(changed)
+    text, content = reply_text(reply), message.get("content")
+    if not (content == text or (not text and content == ".")):
+        return "the replayed text differs from the choices' text"
+    return ""
+
+
+def ids_reappear(reply: dict[str, Any], later: list[dict[str, Any]]) -> bool:
+    """Whether any of the reply's call ids appears in a later request of the step, as a call or a result."""
+    ids = {call["id"] for call in reply_calls(reply)}
+    return any(ids & (set(found["calls"]) | set(found["results"]))
+               for found in (split.replayed(item) for item in later))
+
+
+def _texts(rows: dict[str, Any]) -> list[str]:
+    return [str(m.get("message") or "") for m in rows.get("messages") or []]
+
+
+def boundary_refused(call: dict[str, Any], position: int, items: list[dict[str, Any]], rows: dict[str, Any],
+                     offered: dict[str, list[str]]) -> str:
+    """How Sage's step boundary shows for a guarded call it removed, or "" (pure). Both effects must name the call:
+    a Mythic ``[step-boundary]`` message, and the next captured request is the Supervisor's (it offers
+    ``respond_to_user``) carrying a ``[step outcome]``."""
+    named = f"`{call['name']}`"
+    if not any(STEP_BOUNDARY in text and named in text for text in _texts(rows)):
+        return ""
+    if position + 1 >= len(items):
+        return ""
+    after = items[position + 1]
+    if FINISH_TOOL not in offered.get(str(after["request_id"]), []):
+        return ""
+    entries = after["input"] if isinstance(after["input"], list) else []
+    outcomes = [str(entry.get("content") or "") for entry in entries if isinstance(entry, dict)]
+    if not any(STEP_OUTCOME in text and named in text for text in outcomes):
+        return ""
+    return "Sage's step boundary refused it and the Supervisor ran next"
+
+
+def halted_after(position: int, items: list[dict[str, Any]], rows: dict[str, Any]) -> bool:
+    """Whether this is the step's last reply and Sage then halted at its step limit (the reply is not judged)."""
+    return position == len(items) - 1 and any(STEP_LIMIT_HALT in text for text in _texts(rows))
+
+
+def delivery(position: int, items: list[dict[str, Any]], rows: dict[str, Any],
+             offered: dict[str, list[str]]) -> dict[str, Any]:
+    """Whether a reply with a tool call reached Sage (pure): (a) a later request replays it exactly, or (b) none of
+    its ids appears later and the step ended on a Sage effect naming one of its calls."""
+    reply, later = items[position]["reply"], items[position + 1:]
+    message = replay_of(reply, later)
+    if message is not None:
+        problem = replay_problem(reply, message)
+        return {"delivered": not problem, "how": "" if problem else "replayed", "problem": problem}
+    if ids_reappear(reply, later):
+        return {"delivered": False, "how": "", "problem": "an id reappears without its replayed message"}
+    for call in reply_calls(reply):
+        effect = (carried_on(call, reply, later, offered, rows)
+                  or boundary_refused(call, position, items, rows, offered))
+        if effect:
+            return {"delivered": True, "how": effect, "problem": ""}
+    return {"delivered": False, "how": "", "problem": "no replay, and no Sage effect names its calls"}
 
 
 def requests_setting_n(records: list[dict[str, Any]]) -> int:
@@ -340,90 +438,116 @@ def same_parameters(called: Any, issued: Any) -> bool:
 # Pass rules (pure, tested offline)
 # --------------------------------------------------------------------------------------------------
 
-def evaluate(run: dict[str, Any], wire: dict[str, list[dict[str, Any]]], generations: dict[str, dict[str, Any]],
-             rows: dict[str, dict[str, Any]], tasks: list[dict[str, Any]], totals: dict[str, Any],
-             offered: dict[str, list[str]]) -> dict[str, Any]:
-    """The frozen rules, read once. ``wire`` holds each step's captured exchanges in request order."""
-    route = run.get("route_summary") or {}
+def _issue_r3(step: str, items: list[dict[str, Any]], rows: dict[str, Any], offered: dict[str, list[str]],
+              tasks: list[dict[str, Any]], callback: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """R3 for one step's split issue calls (pure). Sage raises one card per issue call that reaches the approval gate,
+    in order, so after the calls the step boundary removed, the k-th remaining issue call pairs with the k-th card."""
+    calls = []
+    for position, item in enumerate(items):
+        reply, later = item["reply"], items[position + 1:]
+        message = replay_of(reply, later)
+        prepared = {call["id"]: call["args"] for call in _message_calls(message)} if message else {}
+        absent = message is None and not ids_reappear(reply, later)
+        for call in reply_calls(reply):
+            if call["name"] != ISSUE_TOOL:
+                continue
+            calls.append({"call": call, "split": is_split(item), "judged": not halted_after(position, items, rows),
+                          "prepared": prepared.get(call["id"]),
+                          "refused": boundary_refused(call, position, items, rows, offered) if absent else ""})
+    gated = [entry for entry in calls if not entry["refused"]]
+    issue_cards = [card for card in cards(rows) if (card.get("data") or {}).get("tool_name") == ISSUE_TOOL]
+    accepted = sum(1 for card in issue_cards if card.get("status") == "accepted")
+    counts = {"issue_calls": len(calls), "split_issue_calls": sum(1 for entry in calls if entry["split"]),
+              "refused_by_step_boundary": len(calls) - len(gated), "issue_cards": len(issue_cards),
+              "accepted_issue_cards": accepted}
+    entries = []
+    for entry in calls:
+        if not (entry["split"] and entry["judged"]):
+            continue
+        call = entry["call"]
+        result: dict[str, Any] = {"step": step, "call": call["id"]}
+        if entry["refused"]:
+            result.update(outcome="step boundary", pass_=True)
+        else:
+            index = gated.index(entry)
+            card = issue_cards[index] if len(issue_cards) == len(gated) else None
+            shown = ((card or {}).get("data") or {}).get("arguments") or {}
+            args = entry["prepared"] if entry["prepared"] is not None else shown
+            one_card = card is not None and (
+                shown == entry["prepared"] if entry["prepared"] is not None
+                else (isinstance(call["args"], dict) and shown.get("command") == call["args"].get("command")
+                      and shown.get("callback_display_id") == call["args"].get("callback_display_id")))
+            status = str((card or {}).get("status") or "")
+            if status == "accepted":
+                effect = (len(tasks) == 1 and int((tasks[0].get("callback") or {}).get("display_id") or 0) == callback
+                          and tasks[0].get("command_name") == args.get("command")
+                          and same_parameters(args.get("parameters"), tasks[0].get("params")))
+            elif status == "rejected":
+                effect = len(tasks) <= accepted
+            else:
+                effect = False
+            result.update(outcome=f"card {status or 'unresolved'}", one_card_for_the_call=one_card,
+                          task_effect_matches=effect, pass_=one_card and effect)
+        result["pass"] = result.pop("pass_")
+        entries.append(result)
+    return entries, counts
+
+
+def evaluate(run: dict[str, Any], wire: dict[str, list[dict[str, Any]]], rows: dict[str, dict[str, Any]],
+             tasks: list[dict[str, Any]], totals: dict[str, Any], offered: dict[str, list[str]]) -> dict[str, Any]:
+    """The frozen rules, read once. ``wire`` holds each step's captured exchanges in request order. Every rule reads
+    the capture and Mythic; none reads Phoenix, which holds no content while the capture is armed."""
     callback = int(run["callback"])
-    split_items = {step: [item for item in items if is_split(item)] for step, items in wire.items()}
     criteria: dict[str, dict[str, Any]] = {}
+    judged: list[tuple[str, int, dict[str, Any], dict[str, Any]]] = []  # (step, position, item, delivery)
+    not_judged = []
+    for step, items in wire.items():
+        step_rows = rows.get(step) or {}
+        for position, item in enumerate(items):
+            if not reply_calls(item["reply"]):
+                continue
+            if halted_after(position, items, step_rows):
+                not_judged.append({"step": step, "response": item["reply"].get("id"), "split": is_split(item),
+                                   "reason": "Sage halted at its step limit directly after this reply"})
+                continue
+            judged.append((step, position, item, delivery(position, items, step_rows, offered)))
+    criteria["not_judged"] = {"replies": not_judged}
 
-    count = sum(len(items) for items in split_items.values())
-    criteria["G"] = {"pass": count > 0, "split_responses": count}
+    split_judged = [entry for entry in judged if is_split(entry[2])]
+    criteria["G"] = {"pass": bool(split_judged), "split_responses": len(split_judged)}
 
-    r1 = []
-    for step, items in split_items.items():
-        for item in items:
-            reply = item["reply"]
-            found = generations.get(str(reply.get("id") or ""))
-            want = {"tool_calls": reply_calls(reply), "text": reply_text(reply)}
-            ok = bool(found) and len(found["generations"]) == 1 and found["generations"][0] == want
-            r1.append({"step": step, "response": reply.get("id"), "span": (found or {}).get("span"),
-                       "generations": len((found or {}).get("generations") or []), "pass": ok})
-    criteria["R1"] = {"pass": bool(r1) and all(entry["pass"] for entry in r1), "responses": r1}
+    r1 = [{"step": step, "response": item["reply"].get("id"), **found}
+          for step, _position, item, found in split_judged]
+    criteria["R1"] = {"pass": bool(r1) and all(entry["delivered"] for entry in r1), "responses": r1}
 
     r2 = []
-    for step, items in wire.items():
-        for index, item in enumerate(items):
-            if not is_split(item):
-                continue
-            later_items = items[index + 1:]
-            later = [split.replayed(entry)["results"] for entry in later_items]
-            for call in reply_calls(item["reply"]):
-                returned = any(call["id"] in results for results in later)
-                carried = "" if returned else carried_on(call, item["reply"], later_items, offered,
-                                                         rows.get(step) or {})
-                r2.append({"step": step, "call": call["id"], "name": call["name"], "returned": returned,
-                           "carried_on": carried})
+    for step, position, item, _found in split_judged:
+        items, step_rows = wire[step], rows.get(step) or {}
+        later = items[position + 1:]
+        for call in reply_calls(item["reply"]):
+            returned = any(call["id"] in split.replayed(entry)["results"] for entry in later)
+            carried = "" if returned else (carried_on(call, item["reply"], later, offered, step_rows)
+                                           or boundary_refused(call, position, items, step_rows, offered))
+            r2.append({"step": step, "call": call["id"], "name": call["name"], "returned": returned,
+                       "carried_on": carried})
     criteria["R2"] = {"pass": bool(r2) and all(entry["returned"] or entry["carried_on"] for entry in r2),
                       "calls": r2}
 
-    # Sage raises one card per guarded call it receives, in order, so the k-th issue card answers the k-th issue call
-    # in S's replies (split or not). The check accepts only the first card of the step.
-    s_items = wire.get("S") or []
-    received = [(call, is_split(item)) for item in s_items for call in reply_calls(item["reply"])
-                if call["name"] == ISSUE_TOOL]
-    s_cards = cards(rows.get("S") or {})
-    issue_cards = [index for index, card in enumerate(s_cards)
-                   if (card.get("data") or {}).get("tool_name") == ISSUE_TOOL]
-    s_info = (run.get("steps") or {}).get("S") or {}
-    first_split = next((position for position, (_call, came_split) in enumerate(received) if came_split), None)
-    r3: dict[str, Any] = {"applies": first_split is not None, "issue_calls": len(received),
-                          "split_issue_calls": sum(1 for _call, came_split in received if came_split),
-                          "cards": len(s_cards), "issue_cards": len(issue_cards),
-                          "cards_accepted": s_info.get("cards_accepted", 0),
-                          "cards_rejected": s_info.get("cards_rejected", 0), "new_tasks": len(tasks)}
-    if first_split is not None:
-        call = received[first_split][0]
-        args = call["args"] if isinstance(call["args"], dict) else {}
-        card = s_cards[issue_cards[first_split]] if first_split < len(issue_cards) else {}
-        shown = (card.get("data") or {}).get("arguments") or {}
-        one_card = (len(issue_cards) == len(received) and shown.get("command") == args.get("command")
-                    and shown.get("callback_display_id") == args.get("callback_display_id"))
-        accepted = (one_card and issue_cards[first_split] == 0 and s_info.get("cards_accepted") == 1
-                    and str(card.get("status") or "accepted") == "accepted")
-        task_ok = (len(tasks) == 1 and int((tasks[0].get("callback") or {}).get("display_id") or 0) == callback
-                   and tasks[0].get("command_name") == args.get("command")
-                   and same_parameters(args.get("parameters"), tasks[0].get("params")))
-        r3.update(call=call["id"], one_card_for_the_call=one_card, card_accepted=accepted, task_matches=task_ok,
-                  call_on_callback=args.get("callback_display_id") == callback)
-        r3["pass"] = one_card and accepted and task_ok and args.get("callback_display_id") == callback
+    r3: dict[str, Any] = {"calls": [], "steps": {}}
+    for step, items in wire.items():
+        entries, counts = _issue_r3(step, items, rows.get(step) or {}, offered, tasks, callback)
+        r3["calls"] += entries
+        r3["steps"][step] = counts
+    r3["applies"] = bool(r3["calls"])
+    r3["new_tasks"] = len(tasks)
+    if r3["applies"]:
+        r3["pass"] = all(entry["pass"] for entry in r3["calls"])
     criteria["R3"] = r3
 
-    r4 = []
-    for step, items in wire.items():
-        for item in items:
-            reply = item["reply"]
-            if item["api"] != "chat_completions" or len(reply.get("choices") or []) != 1:
-                continue
-            found = generations.get(str(reply.get("id") or ""))
-            content = ((reply["choices"][0] or {}).get("message") or {}).get("content")
-            want = {"tool_calls": reply_calls(reply), "text": content if isinstance(content, str) else ""}
-            first = (found or {}).get("generations") or [{}]
-            r4.append({"step": step, "response": reply.get("id"), "span": (found or {}).get("span"),
-                       "pass": bool(found) and first[0] == want})
-    criteria["R4"] = {"pass": all(entry["pass"] for entry in r4) and totals.get("requests_setting_n") == 0,
+    r4 = [{"step": step, "response": item["reply"].get("id"), **found}
+          for step, _position, item, found in judged
+          if item["api"] == "chat_completions" and len(item["reply"].get("choices") or []) == 1]
+    criteria["R4"] = {"pass": all(entry["delivered"] for entry in r4) and totals.get("requests_setting_n") == 0,
                       "responses": r4, "requests_setting_n": totals.get("requests_setting_n")}
 
     files = run.get("files_after_cleanup") or {}
@@ -442,7 +566,7 @@ def evaluate(run: dict[str, Any], wire: dict[str, list[dict[str, Any]]], generat
     if stopped and not run.get("steps"):
         not_run_reason = f"stopped before the first step: {stopped.get('reason')}"
     elif not criteria["G"]["pass"]:
-        not_run_reason = "no captured gateway response was split"
+        not_run_reason = "no split gateway reply with a tool call was captured and judged"
     if not_run_reason:
         verdict = "not_run"
     else:
@@ -543,6 +667,10 @@ async def cmd_readiness(client: Any, run: dict[str, Any], args: argparse.Namespa
         blockers.append("a channel configuration sets a key, endpoint, OpenAI API or retry policy")
     blockers += split.default_path_blockers(report["default_channel_path"])
     capture = report["capture"]
+    report["budget"] = budget_state(run)
+    if capture.get("armed") and not report["budget"]["valid"]:
+        blockers.append("the installed budget.json does not declare " + ", ".join(BUDGET_RESOURCES)
+                        + " with one target task")
     if not report["parity"]["ready"] or report["settings_error"]:
         verdict = "deployment_required"
         if report["settings_error"]:
@@ -561,6 +689,22 @@ async def cmd_readiness(client: Any, run: dict[str, Any], args: argparse.Namespa
     run.setdefault("readiness_history", []).append({"at": time.time(), "verdict": verdict, "blockers": blockers})
     run["readiness"] = report
     return report
+
+
+def budget_state(run: dict[str, Any]) -> dict[str, Any]:
+    """Once armed: whether the installed ``budget.json`` declares exactly this check's four resources, with the task
+    resource limited to L's one target task (Sage's admission reserves it; an undeclared resource is refused)."""
+    capture = run.get("capture") or {}
+    if not capture:
+        return {"armed": False, "valid": False}
+    try:
+        resources = json.loads((Path(capture["host_dir"]) / "budget.json").read_text())["resources"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return {"armed": True, "valid": False, "resources": []}
+    task = resources.get("payload_task_attempts") if isinstance(resources, dict) else None
+    valid = (isinstance(resources, dict) and set(resources) == set(BUDGET_RESOURCES)
+             and task == {"limit": LIMITS["target_tasks"], "cleanup_reserve": 0})
+    return {"armed": True, "valid": valid, "resources": sorted(resources) if isinstance(resources, dict) else []}
 
 
 async def cmd_arm(client: Any, run: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
@@ -675,9 +819,8 @@ async def cmd_verify(client: Any, run: dict[str, Any], args: argparse.Namespace)
     everything = split.exchanges(records)
     totals = {"provider_calls": len(everything), "provider_tokens": sum(split.usage_tokens(i) for i in everything),
               "requests_setting_n": requests_setting_n(records), "unattributed": len(unattributed)}
-    phoenix = Path(args.phoenix_db)
-    generations = phoenix_generations(phoenix, int(run.get("phoenix_start") or 0), run.get("phoenix_end"))
-    result = evaluate(run, wire, generations, rows, tasks, totals, request_tools(records))
+    phoenix = Path(args.phoenix_db)  # span counts only (an observation); no rule reads Phoenix
+    result = evaluate(run, wire, rows, tasks, totals, request_tools(records))
     result["observations"] = {
         "split_responses_by_step": {step: sum(1 for i in items if is_split(i)) for step, items in wire.items()},
         "split_tools": {step: [c["name"] for i in items if is_split(i) for c in reply_calls(i["reply"])]
