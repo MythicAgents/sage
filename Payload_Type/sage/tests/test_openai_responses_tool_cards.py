@@ -1,9 +1,8 @@
 """Tool cards are the same on Chat Completions and Responses for the same calling agent.
 
 Regression check for the OpenAI Responses line (plan revision 2): which agent runs a tool is the model's
-routing choice, and native chat renders a card for a specialist's tool call but not for one the Supervisor runs
-itself. This holds identically on both APIs, so the live check records cards as an observation and this test
-keeps the rendering from diverging between APIs.
+routing choice, and native chat renders one card for the tool call either way, a specialist's or one the Supervisor
+runs itself. This holds identically on both APIs, and this test keeps the rendering from diverging between APIs.
 
 Drives the real HeadlessSageChat handler, Model, graph, base-model factory and installed ChatOpenAI through
 ``tests.openai_responses_harness``; provider replies are synthetic and scripted per API (wiring only).
@@ -86,7 +85,7 @@ def _turn(monkeypatch, api: str, routed: bool, channel: int) -> dict:
             "terminal": [e["kind"] for e in terminal]}
 
 
-@pytest.mark.parametrize(("routed", "expected_cards"), [(False, 0), (True, 2)])
+@pytest.mark.parametrize(("routed", "expected_cards"), [(False, 1), (True, 2)])
 def test_tool_card_rows_follow_the_calling_agent_identically_on_both_apis(monkeypatch, routed, expected_cards):
     base = 80 + (10 if routed else 0)
     chat_completions = _turn(monkeypatch, "chat_completions", routed, base + 1)

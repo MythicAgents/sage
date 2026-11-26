@@ -3716,8 +3716,8 @@ class _ExplicitCollectionRouteMiddleware(AgentMiddleware):
         self._model = model
 
     async def _announce(self, message: AIMessage) -> None:
-        """Give Sage's call to the Supervisor's capture callback, as a model's response would be. It carries no usage,
-        and, like every Supervisor call, opens no tool card."""
+        """Give Sage's call to the Supervisor's capture callback, as a model's response would be. It carries no usage;
+        like every Supervisor call, its tool card opens when the tool runs."""
         capture = getattr(self._model, "_capture_callbacks", {}).get("Supervisor")
         if capture is None:
             return
@@ -6365,7 +6365,7 @@ class MessageCaptureCallback(AsyncCallbackHandler):
                             # The Supervisor is an internal orchestration component — users
                             # interact with specialist agents only. Without this, the Supervisor's
                             # AIMessage (which contains both text AND tool_calls like respond_to_user)
-                            # would leak duplicate content to the user.
+                            # would leak duplicate content to the user. Its tool cards open in on_tool_start.
                             should_stream = True
                             if self.agent_name == "Supervisor":
                                 logger.debug(f"📨 [Callback:Supervisor] Suppressing Supervisor message from streaming (internal orchestrator)")
@@ -6430,6 +6430,37 @@ class MessageCaptureCallback(AsyncCallbackHandler):
         except Exception as e:
             logger.warning(f"⚠️  [Callback:{self.agent_name}] Error in on_llm_end: {e}", exc_info=True)
 
+    async def on_tool_start(self, serialized: dict[str, Any], input_str: str, *, run_id: UUID,
+                            inputs: dict[str, Any] | None = None, **kwargs: Any) -> None:
+        """Open the Supervisor's tool card when its tool actually runs.
+
+        Workers open theirs at on_llm_end, before an approval. Supervisor tools are never guarded, and a call that
+        middleware answers without running the tool fires no tool callback, so it never leaves a card open.
+        """
+        tool_call_id = str(kwargs.get("tool_call_id") or "").strip()
+        tool_name = str((serialized or {}).get("name") or "").strip()
+        if self.agent_name != "Supervisor" or self._tool_use_func is None or not (tool_call_id and tool_name):
+            return
+        self._tool_call_to_name.setdefault(tool_call_id, tool_name)
+        arguments = self._tool_call_to_args.setdefault(tool_call_id, inputs)
+        if _is_control_tool(tool_name) or (
+            self._tool_source_func is not None and self._tool_source_func(tool_name) == "mcp"
+        ):
+            return
+        try:
+            await self._tool_use_func(
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                status="started",
+                complete=False,
+                arguments_present=bool(arguments),
+                arguments=arguments,
+                delegation_id=self.delegation_id,
+                delegation_name=self.delegation_name,
+            )
+        except Exception as e:
+            logger.debug(f"tool_use started card failed (non-fatal): {e}")
+
     async def on_tool_end(
         self,
         output: Any,
@@ -6457,7 +6488,6 @@ class MessageCaptureCallback(AsyncCallbackHandler):
 
                 if (
                     self._tool_use_func
-                    and self.agent_name != "Supervisor"
                     and not _is_control_tool(output.name)
                     and not (
                         self._tool_source_func is not None
@@ -6537,7 +6567,7 @@ class MessageCaptureCallback(AsyncCallbackHandler):
     ) -> None:
         """Terminalize a raised tool call when the provider exposes its call identity."""
         tool_call_id = str(kwargs.get("tool_call_id") or "").strip()
-        if not tool_call_id or self._tool_use_func is None or self.agent_name == "Supervisor":
+        if not tool_call_id or self._tool_use_func is None:
             return
         # Empty when this callback never saw the call (a resume): the card owner resolves it from the ledger.
         tool_name = self._tool_call_to_name.get(tool_call_id, "")

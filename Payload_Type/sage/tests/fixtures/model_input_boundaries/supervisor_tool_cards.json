@@ -1,0 +1,271 @@
+{
+ "provenance": {
+  "kind": "recorded model output (real provider, real adapter normalization)",
+  "description": "Supervisor-direct list_callbacks calls. Row responses_gpt6_cyber reuses responses_round_trips.json:supervisor_tool_round_trip (gpt-6-cyber, OpenAI Responses, 2026-11-20). The other rows are the Supervisor LLM span's serialized AIMessage and its list_callbacks TOOL span output from a Phoenix backup taken 2026-11-26 before a live check, recorded on 2026-11-26 between 01:18 and 01:36 UTC.",
+  "substitutions": "The three Phoenix rows were recorded on the Mythic SDK rc10 deployment (langchain-core 1.8.4, langchain-openai 1.8.5), not on this branch's adapters, so they are provider shapes as that deployment normalized them. Lab host and user renamed to WORKSTATION-A and lab.user; the Bedrock thinking block's opaque signature replaced with a placeholder; provider ids, call ids, arguments and usage otherwise unchanged.",
+  "gap": "Every recorded call has empty arguments; calls with arguments are covered only by synthetic tests."
+ },
+ "rows": [
+  {
+   "id": "responses_gpt6_cyber",
+   "from": "responses_round_trips.json#supervisor_tool_round_trip",
+   "expected": {
+    "preview_contains": "WORKSTATION-A"
+   }
+  },
+  {
+   "id": "gateway_chat_completions",
+   "route": "LiteLLM gateway, Chat Completions, gpt-5.6-cyber",
+   "phoenix_spans": "1483/1486",
+   "recorded_at": "2026-11-26 01:18:47Z",
+   "prompt": "List the callbacks Mythic has right now, with host and user.",
+   "call": {
+    "lc": 1,
+    "type": "constructor",
+    "id": [
+     "langchain",
+     "schema",
+     "messages",
+     "AIMessage"
+    ],
+    "kwargs": {
+     "content": "",
+     "additional_kwargs": {
+      "refusal": null
+     },
+     "response_metadata": {
+      "token_usage": {
+       "completion_tokens": 14,
+       "prompt_tokens": 11477,
+       "total_tokens": 11491,
+       "completion_tokens_details": {
+        "accepted_prediction_tokens": null,
+        "audio_tokens": null,
+        "reasoning_tokens": 0,
+        "rejected_prediction_tokens": null,
+        "text_tokens": null
+       },
+       "prompt_tokens_details": {
+        "audio_tokens": null,
+        "cache_write_tokens": 11475,
+        "cached_tokens": 0,
+        "image_tokens": null,
+        "text_tokens": null,
+        "cache_creation_tokens": 11475
+       }
+      },
+      "model_provider": "openai",
+      "model_name": "gpt-5.6-cyber",
+      "system_fingerprint": null,
+      "id": "resp_p767o22b7ivi4hq362bwa5ue2ysgiwte72getgzedrc5vab72mha",
+      "service_tier": "default",
+      "finish_reason": "tool_calls",
+      "logprobs": null,
+      "normalized_finish_reason": "tool_call"
+     },
+     "type": "ai",
+     "name": "Supervisor",
+     "id": "lc_run--01a2156f-0824-76ef-8480-76828edcc78e-0",
+     "tool_calls": [
+      {
+       "name": "list_callbacks",
+       "args": {},
+       "id": "call_b5281c4089445a82a9a45938dab27d6d",
+       "type": "tool_call"
+      }
+     ],
+     "usage_metadata": {
+      "input_tokens": 11477,
+      "output_tokens": 14,
+      "total_tokens": 11491,
+      "input_token_details": {
+       "cache_read": 0,
+       "cache_creation": 11475
+      },
+      "output_token_details": {
+       "reasoning": 0
+      }
+     },
+     "invalid_tool_calls": []
+    }
+   },
+   "tool_result": "[{\"agent\": \"apollo\", \"host\": \"WORKSTATION-A\", \"id\": 2, \"integrity\": 2, \"secs_since_checkin\": 0.681435, \"status\": \"alive\", \"user\": \"lab.user\"}]",
+   "expected": {
+    "preview_contains": "WORKSTATION-A"
+   }
+  },
+  {
+   "id": "anthropic_tool_use",
+   "route": "Anthropic Messages API, claude-haiku-5-5",
+   "phoenix_spans": "1666/1669",
+   "recorded_at": "2026-11-26 01:34:27Z",
+   "prompt": "List the callbacks Mythic has right now, with host and user.",
+   "call": {
+    "lc": 1,
+    "type": "constructor",
+    "id": [
+     "langchain",
+     "schema",
+     "messages",
+     "AIMessage"
+    ],
+    "kwargs": {
+     "content": [
+      {
+       "id": "toolu_015bBXfYuhDaYFqfpqHwjEhr",
+       "caller": {
+        "type": "direct"
+       },
+       "input": {},
+       "name": "list_callbacks",
+       "type": "tool_use",
+       "toolset_name": null
+      }
+     ],
+     "response_metadata": {
+      "id": "msg_011ChQgPAfyeLtwsLyQXCH9B",
+      "container": null,
+      "diagnostics": null,
+      "model": "claude-haiku-5-5",
+      "stop_details": null,
+      "stop_reason": "tool_use",
+      "stop_sequence": null,
+      "usage": {
+       "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+       },
+       "cache_creation_input_tokens": 0,
+       "cache_read_input_tokens": 0,
+       "inference_geo": "global",
+       "input_tokens": 19281,
+       "output_tokens": 29,
+       "output_tokens_details": {
+        "thinking_tokens": 0
+       },
+       "server_tool_use": null,
+       "service_tier": "standard",
+       "speed": "standard"
+      },
+      "model_name": "claude-haiku-5-5",
+      "model_provider": "anthropic",
+      "finish_reason": "tool_use",
+      "normalized_finish_reason": "tool_call",
+      "finish_state": "complete"
+     },
+     "type": "ai",
+     "name": "Supervisor",
+     "id": "lc_run--01a2157d-5d3f-7599-a71e-1073f48560a0-0",
+     "tool_calls": [
+      {
+       "name": "list_callbacks",
+       "args": {},
+       "id": "toolu_015bBXfYuhDaYFqfpqHwjEhr",
+       "type": "tool_call"
+      }
+     ],
+     "usage_metadata": {
+      "input_tokens": 19281,
+      "output_tokens": 29,
+      "total_tokens": 19310,
+      "input_token_details": {
+       "cache_read": 0,
+       "cache_creation": 0,
+       "ephemeral_5m_input_tokens": 0,
+       "ephemeral_1h_input_tokens": 0
+      },
+      "output_token_details": {
+       "reasoning": 0
+      }
+     },
+     "invalid_tool_calls": []
+    }
+   },
+   "tool_result": "[{\"agent\": \"apollo\", \"host\": \"WORKSTATION-A\", \"id\": 2, \"integrity\": 2, \"secs_since_checkin\": 1.604464, \"status\": \"alive\", \"user\": \"lab.user\"}]",
+   "expected": {
+    "preview_contains": "WORKSTATION-A"
+   }
+  },
+  {
+   "id": "bedrock_tool_use",
+   "route": "Amazon Bedrock Converse, us.anthropic.claude-haiku-5-5",
+   "phoenix_spans": "1704/1707",
+   "recorded_at": "2026-11-26 01:35:16Z",
+   "prompt": "List the callbacks Mythic has right now, with host and user.",
+   "call": {
+    "lc": 1,
+    "type": "constructor",
+    "id": [
+     "langchain",
+     "schema",
+     "messages",
+     "AIMessage"
+    ],
+    "kwargs": {
+     "content": [
+      {
+       "type": "thinking",
+       "thinking": "",
+       "signature": "signature-redacted"
+      },
+      {
+       "type": "tool_use",
+       "id": "toolu_bdrk_01DMHcTPSTio19gNG5UhcXQV",
+       "name": "list_callbacks",
+       "input": {}
+      }
+     ],
+     "additional_kwargs": {
+      "usage": {
+       "prompt_tokens": 19287,
+       "completion_tokens": 176,
+       "cache_read_input_tokens": 0,
+       "cache_write_input_tokens": 0,
+       "total_tokens": 19463
+      },
+      "stop_reason": "tool_use",
+      "model_id": "us.anthropic.claude-haiku-5-5"
+     },
+     "response_metadata": {
+      "usage": {
+       "prompt_tokens": 19287,
+       "completion_tokens": 176,
+       "cache_read_input_tokens": 0,
+       "cache_write_input_tokens": 0,
+       "total_tokens": 19463
+      },
+      "stop_reason": "tool_use",
+      "model_id": "us.anthropic.claude-haiku-5-5",
+      "model_provider": "bedrock",
+      "model_name": "us.anthropic.claude-haiku-5-5"
+     },
+     "type": "ai",
+     "name": "Supervisor",
+     "id": "lc_run--01a2157e-1d51-707f-9fcf-f7fb1bfbea7e-0",
+     "tool_calls": [
+      {
+       "name": "list_callbacks",
+       "args": {},
+       "id": "toolu_bdrk_01DMHcTPSTio19gNG5UhcXQV",
+       "type": "tool_call"
+      }
+     ],
+     "usage_metadata": {
+      "input_tokens": 19287,
+      "output_tokens": 176,
+      "total_tokens": 19463,
+      "input_token_details": {
+       "cache_creation": 0,
+       "cache_read": 0
+      }
+     },
+     "invalid_tool_calls": []
+    }
+   },
+   "tool_result": "[{\"agent\": \"apollo\", \"host\": \"WORKSTATION-A\", \"id\": 2, \"integrity\": 2, \"secs_since_checkin\": 2.927665, \"status\": \"alive\", \"user\": \"lab.user\"}]",
+   "expected": {
+    "preview_contains": "WORKSTATION-A"
+   }
+  }
+ ]
+}

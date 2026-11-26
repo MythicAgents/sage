@@ -1152,8 +1152,11 @@ def test_sages_routing_calls_are_paired_with_their_results_and_fabricate_no_card
     # answers the handoff call.
     assert [row["id"] for row in json.loads(run.route_results[1][inventory])] == [5]
     assert handoff in run.shared_tool_call_ids
-    # Supervisor calls open no tool card; the one card event is the worker's pending guarded proposal.
-    assert [(phase, name) for phase, name, _ in run.tool_events] == [("started", "execute_capability")]
+    # Sage's inventory call shows its tool card when it runs; the handoff opens none; then the worker's pending
+    # guarded proposal opens its card.
+    assert [(phase, name, call) for phase, name, call in run.tool_events][:2] == [
+        ("started", "list_callbacks", inventory), ("completed", "list_callbacks", inventory)]
+    assert [(phase, name) for phase, name, _ in run.tool_events][2:] == [("started", "execute_capability")]
     # Sage-generated, without provider usage, and no provider call before the card.
     assert [m.additional_kwargs.get("_sage_generated") for m in run.route_messages] == [
         "explicit_collection_inventory", "explicit_collection_handoff"]
