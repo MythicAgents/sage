@@ -52,8 +52,13 @@ def _reply(response_id: str, *choices: dict) -> dict:
             "usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110}}
 
 
-def _pair(rid: str, sent: int, messages: list, reply: dict, **extra) -> list[dict]:
-    body = {"model": "gpt-5.6-cyber", "messages": messages, **extra}
+SUPERVISOR_TOOLS = ("respond_to_user", "transfer_to_Mythic_Operator")
+WORKER_TOOLS = (check.ISSUE_TOOL, "summarize_and_handback")
+
+
+def _pair(rid: str, sent: int, messages: list, reply: dict, *, tools: tuple = (), **extra) -> list[dict]:
+    body = {"model": "gpt-5.6-cyber", "messages": messages, **extra,
+            "tools": [{"type": "function", "function": {"name": name}} for name in tools]}
     return [{"kind": "model_request", "record": {"time_ns": sent, "payload": {
                 "request_id": rid, "url": URL, "body_base64": _b64(body)}}},
             {"kind": "model_response", "record": {"time_ns": sent + 5, "payload": {
@@ -123,7 +128,8 @@ def _evaluate(run=None, records=None, generations=None, rows=None, tasks=None):
               "provider_tokens": sum(check.split.usage_tokens(i) for i in everything),
               "requests_setting_n": check.requests_setting_n(records)}
     return check.evaluate(run, wire, generations if generations is not None else GENERATIONS,
-                          rows if rows is not None else ROWS, tasks if tasks is not None else TASKS, totals)
+                          rows if rows is not None else ROWS, tasks if tasks is not None else TASKS, totals,
+                          check.request_tools(records))
 
 
 def test_a_correct_run_passes_every_rule():
@@ -268,3 +274,68 @@ def test_the_route_and_channels_carry_no_credential_and_only_the_gateway_model(t
 def test_the_capture_block_names_this_check():
     block = check.split.env_block("/Mythic/x", "/Mythic/x/fifo")
     assert block.startswith("# >>> gateway split-choices check") and "provider-split" not in block
+
+
+# R2 for Sage's control calls, whose acknowledgement never reaches the provider within the turn.
+
+def _control_records(transfer_reply: dict, worker_messages: list, finish_reply: dict) -> list[dict]:
+    return (_pair("q1", 110, [], transfer_reply, tools=SUPERVISOR_TOOLS)
+            + _pair("q2", 120, worker_messages, REPLIES["r2"], tools=WORKER_TOOLS)
+            + _pair("q3", 130, [_tool("call_i")], REPLIES["r3"], tools=WORKER_TOOLS)
+            + _pair("q4", 140, [], finish_reply, tools=SUPERVISOR_TOOLS)
+            + _pair("q5", 210, [], REPLIES["r5"]) + _pair("q6", 220, [_tool("call_l")], REPLIES["r6"]))
+
+
+INSTRUCTION = "Run whoami on callback 2 and report the identity."
+SPLIT_TRANSFER = _call("call_t", "transfer_to_Mythic_Operator", {"handoff_title": "Run whoami",
+                                                                 "handoff_instruction": INSTRUCTION})
+FINAL = "Callback 2 runs as lab.user."
+SPLIT_FINISH = _call("call_f", "respond_to_user", {"final_response": FINAL, "outcome": "completed"})
+
+
+def _control_case(*, worker_messages=None, finish_args=None, mythic_answer=FINAL):
+    finish = SPLIT_FINISH if finish_args is None else _call("call_f", "respond_to_user", finish_args)
+    replies = {"r1": _reply("r1", _choice(0, text="I'll hand this to the operator."), _choice(1, calls=(SPLIT_TRANSFER,))),
+               "r4": _reply("r4", _choice(0, text="Here is the result."), _choice(1, calls=(finish,)))}
+    records = _control_records(replies["r1"], worker_messages if worker_messages is not None else
+                               [{"role": "user", "content": INSTRUCTION}], replies["r4"])
+    generations = {**GENERATIONS,
+                   "r1": {"span": 1, "generations": [_generation("I'll hand this to the operator.", (SPLIT_TRANSFER,))]},
+                   "r4": {"span": 4, "generations": [_generation("Here is the result.", (finish,))]}}
+    rows = copy.deepcopy(ROWS)
+    rows["S"]["messages"].append({"id": 3, "message": mythic_answer, "metadata": {}})
+    return _evaluate(records=records, generations=generations, rows=rows)
+
+
+def test_a_split_handoff_and_finish_carry_on_where_sage_sends_no_result():
+    result = _control_case()
+
+    assert result["verdict"] == "pass", json.dumps(result["criteria"]["R2"], indent=1)
+    carried = {entry["name"]: entry["carried_on"] for entry in result["criteria"]["R2"]["calls"]}
+    assert carried["transfer_to_Mythic_Operator"] == "the handoff's worker received it"
+    assert carried["respond_to_user"] == "Mythic shows its final_response"
+
+
+def test_a_handoff_whose_worker_never_ran_fails_r2():
+    result = _control_case(worker_messages=[{"role": "user", "content": "something else"}])
+    assert result["verdict"] == "fail"
+    assert [e["name"] for e in result["criteria"]["R2"]["calls"] if not (e["returned"] or e["carried_on"])] == [
+        "transfer_to_Mythic_Operator"]
+
+
+def test_a_finish_whose_answer_never_reached_mythic_fails_r2():
+    result = _control_case(mythic_answer="Here is the result.")
+    assert result["verdict"] == "fail"
+    assert [e["name"] for e in result["criteria"]["R2"]["calls"] if not (e["returned"] or e["carried_on"])] == [
+        "respond_to_user"]
+
+
+def test_a_reused_worker_answer_counts_only_when_it_is_not_the_replys_own_text():
+    reuse = {"final_response": "", "reuse_latest_worker_answer": True, "outcome": "completed"}
+    assert _control_case(finish_args=reuse, mythic_answer="Worker: callback 2 is lab.user.")["verdict"] == "pass"
+    assert _control_case(finish_args=reuse, mythic_answer="Here is the result.")["verdict"] == "fail"
+
+
+def test_an_ordinary_call_is_never_excused_by_a_control_reading():
+    call = {"id": "call_x", "name": "list_callbacks", "args": {}}
+    assert check.carried_on(call, REPLIES["r5"], [], {}, ROWS["K"]) == ""

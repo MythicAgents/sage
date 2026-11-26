@@ -39,7 +39,12 @@ and need the operator's authorization.
           them. Otherwise the check did not run (``not_run``, not an attempt).
       R1  for every split response, the Phoenix LLM span for that response has one generation, carrying every call
           of every choice (id, name, arguments) in choice order and the choices' text.
-      R2  every split call's id returns as a tool message in a later captured request in the same channel.
+      R2  every split call's id returns as a tool message in a later captured request in the same channel, or,
+          for a Sage control call whose result Sage never sends back within the turn, its effect carries on: a
+          handoff's instruction (its title when it has none) reaches a later request in the step that no longer
+          offers that handoff, a handback is followed by a request that offers ``respond_to_user``, and a finish's
+          ``final_response`` (a continuation's summary) appears in the step's Mythic messages; a reused worker
+          answer counts when the step's last answer is not the reply's own text.
       R3  if S's issue call came split: exactly one card for that call, accepted, and exactly one new Mythic task on
           callback N with the command and parameters the call names. If it came in one choice, R3 is an observation.
       R4  every single-choice gateway response's Phoenix first generation carries exactly its text and calls, and
@@ -86,6 +91,11 @@ split.ENV_END = "# <<< gateway split-choices check"
 
 GATEWAY_MODEL = "gpt-5.6-cyber"
 ISSUE_TOOL = "issue_task_and_waitfor_task_output"
+# Sage control calls whose acknowledgement never reaches the provider within the turn (recorded: every delivered
+# handoff and finish call in a supervised and a Conversation run); R2 reads their effect instead.
+HANDBACK_TOOLS = ("summarize_and_handback", "handback_to_supervisor")
+FINISH_TOOL = "respond_to_user"
+CONTINUATION_TOOL = "request_continuation"
 WHOAMI = "Run whoami on callback {callback}."
 LIST = "List the callbacks Mythic has right now, with host and user."
 # (step, channel, prompt, answers cards)
@@ -255,6 +265,54 @@ def requests_setting_n(records: list[dict[str, Any]]) -> int:
     return count
 
 
+def request_tools(records: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """Captured request id -> the tool names that request offered."""
+    offered: dict[str, list[str]] = {}
+    for record in records:
+        if record.get("kind") != "model_request":
+            continue
+        payload = (record.get("record") or {}).get("payload") or {}
+        body = split._body(payload.get("body_base64"))
+        tools = body.get("tools") if isinstance(body, dict) else None
+        offered[str(payload.get("request_id"))] = [
+            str(((tool.get("function") or {}).get("name")) or tool.get("name") or "")
+            for tool in tools or [] if isinstance(tool, dict)]
+    return offered
+
+
+def _carries(item: dict[str, Any], text: str) -> bool:
+    dumped = json.dumps(item.get("input") or [], ensure_ascii=False)
+    return text in dumped or json.dumps(text, ensure_ascii=False)[1:-1] in dumped
+
+
+def carried_on(call: dict[str, Any], reply: dict[str, Any], later: list[dict[str, Any]],
+               offered: dict[str, list[str]], rows: dict[str, Any]) -> str:
+    """How a delivered control call's effect shows, or "" when it does not (pure)."""
+    name, args = call["name"], call["args"] if isinstance(call["args"], dict) else {}
+    if name.startswith("transfer_to_"):
+        needle = str(args.get("handoff_instruction") or "").strip() or str(args.get("handoff_title") or "").strip()
+        if needle and any(_carries(item, needle) and name not in offered.get(str(item["request_id"]), [name])
+                          for item in later):
+            return "the handoff's worker received it"
+        return ""
+    if name in HANDBACK_TOOLS:
+        return ("the Supervisor ran next" if any(FINISH_TOOL in offered.get(str(item["request_id"]), [])
+                                                 for item in later) else "")
+    messages = [str(m.get("message") or "") for m in rows.get("messages") or []]
+    if name == FINISH_TOOL:
+        final = str(args.get("final_response") or "").strip()
+        answers = split.native_answers(rows)
+        if final:
+            return "Mythic shows its final_response" if any(final in text for text in messages) else ""
+        if args.get("reuse_latest_worker_answer") and answers and answers[-1].strip() != reply_text(reply).strip():
+            return "Mythic shows the reused worker answer"
+        return ""
+    if name == CONTINUATION_TOOL:
+        summary = str(args.get("summary") or "").strip()
+        return "Mythic shows its summary" if summary and any(summary in text for text in messages) else ""
+    return ""
+
+
 def cards(rows: dict[str, Any]) -> list[dict[str, Any]]:
     """Every approval card in a Mythic request's messages, in order, resolved or not."""
     nc = split._runner()
@@ -283,7 +341,8 @@ def same_parameters(called: Any, issued: Any) -> bool:
 # --------------------------------------------------------------------------------------------------
 
 def evaluate(run: dict[str, Any], wire: dict[str, list[dict[str, Any]]], generations: dict[str, dict[str, Any]],
-             rows: dict[str, dict[str, Any]], tasks: list[dict[str, Any]], totals: dict[str, Any]) -> dict[str, Any]:
+             rows: dict[str, dict[str, Any]], tasks: list[dict[str, Any]], totals: dict[str, Any],
+             offered: dict[str, list[str]]) -> dict[str, Any]:
     """The frozen rules, read once. ``wire`` holds each step's captured exchanges in request order."""
     route = run.get("route_summary") or {}
     callback = int(run["callback"])
@@ -309,11 +368,16 @@ def evaluate(run: dict[str, Any], wire: dict[str, list[dict[str, Any]]], generat
         for index, item in enumerate(items):
             if not is_split(item):
                 continue
-            later = [split.replayed(entry)["results"] for entry in items[index + 1:]]
+            later_items = items[index + 1:]
+            later = [split.replayed(entry)["results"] for entry in later_items]
             for call in reply_calls(item["reply"]):
-                r2.append({"step": step, "call": call["id"], "name": call["name"],
-                           "returned": any(call["id"] in results for results in later)})
-    criteria["R2"] = {"pass": bool(r2) and all(entry["returned"] for entry in r2), "calls": r2}
+                returned = any(call["id"] in results for results in later)
+                carried = "" if returned else carried_on(call, item["reply"], later_items, offered,
+                                                         rows.get(step) or {})
+                r2.append({"step": step, "call": call["id"], "name": call["name"], "returned": returned,
+                           "carried_on": carried})
+    criteria["R2"] = {"pass": bool(r2) and all(entry["returned"] or entry["carried_on"] for entry in r2),
+                      "calls": r2}
 
     # Sage raises one card per guarded call it receives, in order, so the k-th issue card answers the k-th issue call
     # in S's replies (split or not). The check accepts only the first card of the step.
@@ -613,7 +677,7 @@ async def cmd_verify(client: Any, run: dict[str, Any], args: argparse.Namespace)
               "requests_setting_n": requests_setting_n(records), "unattributed": len(unattributed)}
     phoenix = Path(args.phoenix_db)
     generations = phoenix_generations(phoenix, int(run.get("phoenix_start") or 0), run.get("phoenix_end"))
-    result = evaluate(run, wire, generations, rows, tasks, totals)
+    result = evaluate(run, wire, generations, rows, tasks, totals, request_tools(records))
     result["observations"] = {
         "split_responses_by_step": {step: sum(1 for i in items if is_split(i)) for step, items in wire.items()},
         "split_tools": {step: [c["name"] for i in items if is_split(i) for c in reply_calls(i["reply"])]
