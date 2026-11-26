@@ -14,6 +14,7 @@ operator-facing text is ever produced by stringifying a non-string exception pay
 from __future__ import annotations
 
 import re
+import time
 
 SUPPRESSED_SUFFIX = "internal error (details suppressed from chat; see Sage logs)"
 
@@ -297,6 +298,20 @@ def _provider_message(exc: BaseException) -> tuple[str, str]:
     return (f"HTTP {status}" if status else ""), operator_error_text(exc)
 
 
+def _route_used(profile) -> str:
+    """The route a notice names: provider, model value and its source, endpoint origin. Never a credential."""
+    def value(name: str, default: str = "") -> str:
+        return str(getattr(profile, name, default) or default) if profile is not None else default
+
+    getter = getattr(profile, "source_for", None)
+    source = str(getter("model")) if callable(getter) else "unknown"
+    return (f"Route used: provider {value('provider', 'unknown')} · model `{value('model')}` ({source}) · "
+            f"endpoint {_endpoint_origin(value('api_endpoint'))}.")
+
+
+_UNPROVEN_KEEPS = "This chat is still usable and keeps its conversation; nothing was run."
+
+
 def unproven_model_notice(exc: BaseException, profile) -> str:
     """Operator-facing text for a failure before this chat's Model ever answered or ran anything, any provider.
 
@@ -304,19 +319,52 @@ def unproven_model_notice(exc: BaseException, profile) -> str:
     API key or other credentials.
     """
     status, message = _provider_message(exc)
-
-    def value(name: str, default: str = "") -> str:
-        return str(getattr(profile, name, default) or default) if profile is not None else default
-
-    def source(name: str) -> str:
-        getter = getattr(profile, "source_for", None)
-        return str(getter(name)) if callable(getter) else "unknown"
-
     details = f" ({status})" if status else ""
     return (
         f"The model provider rejected this chat's request before the model answered{details}: {message}\n\n"
-        f"Route used: provider {value('provider', 'unknown')} · model `{value('model')}` ({source('model')}) · "
-        f"endpoint {_endpoint_origin(value('api_endpoint'))}.\n\n"
+        f"{_route_used(profile)}\n\n"
         "To fix it, change **Model** to a model this provider and key can use, or run `/model <name>`, then send "
-        "your request again. This chat is still usable and keeps its conversation; nothing was run."
+        f"your request again. {_UNPROVEN_KEEPS}"
     )
+
+
+def provider_unanswered(exc: BaseException, pending=None) -> tuple[str, str] | None:
+    """``("unreachable", cause)`` for a connect-phase transport error; ``("no answer", detail)`` for a later client
+    timeout, or an idle node timeout while that node's own provider call (``pending``: agent, monotonic start) was
+    unanswered; else ``None``, which includes every HTTP status."""
+    import httpx
+    import httpx2
+    import openai
+    from langgraph.errors import NodeTimeoutError
+
+    if isinstance(exc, NodeTimeoutError):
+        mine = exc.kind == "idle" and pending and pending[0] == exc.node
+        return ("no answer", f"within {time.monotonic() - pending[1]:.0f} seconds") if mine else None
+    connect = (httpx.ConnectError, httpx.ConnectTimeout, httpx2.ConnectError, httpx2.ConnectTimeout)
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        cause = current.__cause__
+        if isinstance(current, openai.APIConnectionError) and not isinstance(cause, openai.APIConnectionError):
+            if isinstance(cause, connect):
+                return "unreachable", ": ".join(filter(None, (type(cause).__name__, operator_error_text(cause))))
+            late = f"before the client's {type(cause).__name__ if cause else 'timeout'} expired"
+            return ("no answer", late) if isinstance(current, openai.APITimeoutError) else None
+        current = cause or current.__context__
+    return None
+
+
+def provider_unanswered_notice(exc: BaseException, profile, pending=None, *, keeps: bool = False) -> str:
+    """The notice for a provider Sage could not reach or that never answered, else ``""``: the condition and the route,
+    never a credential, no rejection and no model advice. ``keeps``: the chat keeps its session."""
+    found = provider_unanswered(exc, pending)
+    if found is None:
+        return ""
+    kind, detail = found
+    condition, check = (
+        (f"The model provider's endpoint could not be reached ({detail}), so the request never reached it.",
+         "the endpoint is reachable from Sage (network, VPN or proxy)") if kind == "unreachable"
+        else (f"The model provider gave no answer {detail}, so Sage stopped waiting.", "the provider is answering"))
+    keep = f" {_UNPROVEN_KEEPS}" if keeps else ""
+    return f"{condition}\n\n{_route_used(profile)}\n\nTo fix it, check that {check}, then send your request again.{keep}"

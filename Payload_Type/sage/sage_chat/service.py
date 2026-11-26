@@ -198,6 +198,19 @@ def _unproven_model_text(error: BaseException, request: ChatRequest) -> str:
     return unproven_model_notice(error, profile)
 
 
+def _provider_unanswered_text(error: BaseException, request: ChatRequest, model: Any, keeps: bool) -> str:
+    """The notice for a provider Sage could not reach or that never answered, for any provider."""
+    try:
+        from ai.langgraph.operator_error import provider_unanswered_notice
+    except ImportError:  # pragma: no cover - packaged import fallback
+        from ..ai.langgraph.operator_error import provider_unanswered_notice  # type: ignore
+    try:
+        profile = resolve_llm_profile(request)
+    except Exception:
+        profile = None
+    return provider_unanswered_notice(error, profile, getattr(model, "_provider_call_pending", None), keeps=keeps)
+
+
 def _resource_budget_notice(error: BaseException) -> str:
     """Distinguish a locally refused reservation from a provider connection failure.
 
@@ -2604,6 +2617,7 @@ class SageChat(Chat):
                     )
                     return None
                 model._controller_resume_state = recovery_state
+            model._provider_call_pending = None  # a call cancelled in an earlier turn is never this turn's
             begin_visibility = getattr(model, "begin_visibility_turn", None)
             if callable(begin_visibility):
                 scope = f"chat:{request.ChannelID}:request:{request.RequestID}"
@@ -3092,6 +3106,7 @@ class SageChat(Chat):
                         error_text = (
                             _resource_budget_notice(error)
                             or _provider_configuration_text(error, request)
+                            or _provider_unanswered_text(error, request, model, configuration_rejected)
                             or (_unproven_model_text(error, request) if configuration_rejected else "")
                             or operator_error_text(error)
                             or "Sage request failed."

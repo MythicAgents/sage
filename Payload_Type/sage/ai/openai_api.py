@@ -33,6 +33,8 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
+import httpx
+
 API_ENV = "SAGE_OPENAI_API"
 ACCESS_PROGRAM_ENV = "SAGE_OPENAI_ACCESS_PROGRAM"
 SAFETY_IDENTIFIER_ENV = "SAGE_OPENAI_SAFETY_IDENTIFIER"
@@ -211,7 +213,8 @@ def validate_route(
 
 def adapter_options(route: OpenAIRoute) -> dict[str, Any]:
     """``ChatOpenAI`` keyword arguments for a validated family route. Every route pins the API."""
-    options: dict[str, Any] = {}
+    # Bound only the connect phase (langchain-openai otherwise sends no timeout); the node watchdog owns "no answer".
+    options: dict[str, Any] = {"timeout": httpx.Timeout(None, connect=10.0)}
     extra_body: dict[str, Any] = {}
     if route.effective_api == RESPONSES:
         options.update(

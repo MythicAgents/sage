@@ -47,6 +47,8 @@ def test_absent_shared_budget_preserves_native_init_arguments(monkeypatch):
         "model_provider": "openai", "model": "configured-model",
         "api_key": "configured-key", "base_url": "https://configured.invalid/v1",
         "use_responses_api": False,  # blank OpenAI API pins Chat Completions (operator decision 2026-11-24)
+        # Changed expectation (provider no-answer): the client bounds only its connect phase, at 10 s.
+        "timeout": httpx.Timeout(None, connect=10.0),
     }]
 
 

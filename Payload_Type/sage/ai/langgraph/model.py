@@ -65,7 +65,7 @@ from .turn_authority import (
 )
 from .request_events import RequestEventLedger, exported_content_digest, stable_event_id
 from .decision_record import seal_request_decision_record
-from .operator_error import operator_error_text, provider_configuration_rejection
+from .operator_error import operator_error_text, provider_configuration_rejection, provider_unanswered
 from . import engagement_ledger
 from . import worker_outcome as _worker_outcome
 from . import catalog_binding as _catalog_binding
@@ -2932,9 +2932,10 @@ class _MessageSanitizerMiddleware(AgentMiddleware):
     required by Anthropic/Bedrock and harmless for valid OpenAI-style transcripts. Fail-open: a sanitizer error
     must never abort a model call.
     """
-    def __init__(self, model: "Model"):
+    def __init__(self, model: "Model", agent_name: str = ""):
         super().__init__()
         self._model = model
+        self._agent_name = agent_name
 
     def _sanitize(self, request):
         try:
@@ -2958,6 +2959,7 @@ class _MessageSanitizerMiddleware(AgentMiddleware):
 
     def _record_answer(self, response):
         """Mark each answer with the model Sage had configured for it, and this Model as having answered."""
+        self._model._provider_call_pending = None
         try:
             configured = str(getattr(self._model, "model", "") or "")
             messages = getattr(response, "result", None)
@@ -2970,10 +2972,20 @@ class _MessageSanitizerMiddleware(AgentMiddleware):
         return response
 
     def wrap_model_call(self, request, handler):
-        return self._record_answer(handler(self._sanitize(request)))
+        self._model._provider_call_pending = (self._agent_name, time.monotonic())
+        try:
+            return self._record_answer(handler(self._sanitize(request)))
+        except Exception:
+            self._model._provider_call_pending = None
+            raise
 
     async def awrap_model_call(self, request, handler):
-        return self._record_answer(await handler(self._sanitize(request)))
+        self._model._provider_call_pending = (self._agent_name, time.monotonic())
+        try:
+            return self._record_answer(await handler(self._sanitize(request)))
+        except Exception:
+            self._model._provider_call_pending = None
+            raise
 
 
 def _bound_call_id(request_id: str, delegation_seq: int) -> str:
@@ -6712,6 +6724,9 @@ class Model:
         # and cancelled so a stop interrupts long awaits inside tools before they can issue delayed
         # follow-up tasks.
         self._stop_requested = False
+        # (agent, monotonic start) of the provider call an agent awaits: set and cleared around each call by
+        # `_MessageSanitizerMiddleware` and left set by a cancellation, so a node timeout can name a silent provider.
+        self._provider_call_pending: tuple[str, float] | None = None
         # WHY the stop was requested. `_stop_requested` alone is a boolean with no provenance, so
         # three different halts — an operator pressing stop, the no-progress backstop, the
         # loop-breaker's terminal blocker — would all reach the same emitter and tell the operator
@@ -16727,7 +16742,7 @@ class Model:
         # final request (after engagement-state injection) on every model call inside create_agent's react loop,
         # for ALL providers. This is the create_agent-internal-loop counterpart to the channel-path
         # `_sanitize_messages`; together they close the empty-`system`/blank-block class on every code path.
-        mw.append(_MessageSanitizerMiddleware(self))
+        mw.append(_MessageSanitizerMiddleware(self, agent_name))
         return mw
     
     # Agent definitions
@@ -18939,9 +18954,10 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         except Exception as e:
             # Catch any other errors (API errors, context limit exceeded, etc.)
             logger.error(f"Error during graph execution: {e}", exc_info=True)
-            if provider_configuration_rejection(e) is not None:
-                # The provider refused this route (model, API, access program, key). The native service
-                # reports it once with the configuration action and keeps the channel; generic "partial
+            if (provider_configuration_rejection(e) is not None
+                    or provider_unanswered(e, getattr(self, "_provider_call_pending", None)) is not None):
+                # The provider refused this route (model, API, access program, key), or was unreachable or silent.
+                # The native service reports it once with the matching notice; generic "partial
                 # work / try a different model" advice and a rewritten local state would both be wrong.
                 raise
 

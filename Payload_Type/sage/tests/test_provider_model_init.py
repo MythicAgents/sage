@@ -1,5 +1,6 @@
 """Static provider-construction coverage for Sage's supported LLM routes."""
 
+import httpx
 import pytest
 
 from ai.langgraph import model as model_module
@@ -17,6 +18,9 @@ DIRECT_OPENAI_RESPONSES = {
     "include": ["reasoning.encrypted_content"],
     "extra_body": {"access_programs": {"cyber": "standard"}},
 }
+
+# Changed expectation (provider no-answer): every OpenAI-family client bounds only its connect phase, at 10 s.
+CONNECT_BOUND = {"timeout": httpx.Timeout(None, connect=10.0)}
 
 
 @pytest.fixture(autouse=True)
@@ -49,7 +53,8 @@ def _model(provider, configurable):
             "openai",
             {"api_key": "openai-key", "base_url": "http://openai.test/v1"},
             # A blank OpenAI API pins Chat Completions (operator decision 2026-11-24): the adapter never chooses Responses.
-            {"api_key": "openai-key", "base_url": "http://openai.test/v1", "use_responses_api": False},
+            {"api_key": "openai-key", "base_url": "http://openai.test/v1", "use_responses_api": False,
+             **CONNECT_BOUND},
         ),
     ],
 )
@@ -112,6 +117,7 @@ def test_eval_max_output_tokens_is_applied_to_shipping_model(monkeypatch):
         "model": "test-model",
         "max_tokens": 8192,
         **DIRECT_OPENAI_RESPONSES,
+        **CONNECT_BOUND,
     }]
 
 
@@ -137,7 +143,7 @@ def test_explicit_openai_reasoning_effort_reaches_model_constructor(monkeypatch,
     # Changed expectation (provider split): no endpoint is OpenAI's own, where a blank OpenAI API means Responses.
     # The adapter still never chooses the API itself.
     assert calls == [{"model_provider": "openai", "model": "test-model", "reasoning_effort": effort,
-                      **DIRECT_OPENAI_RESPONSES}]
+                      **DIRECT_OPENAI_RESPONSES, **CONNECT_BOUND}]
 
 
 @pytest.mark.parametrize("provider", ["anthropic", "bedrock", "ollama"])
