@@ -43,7 +43,8 @@ and need the operator's authorization.
           read by R3), and the choices' text joined in index order, or "." when there was none; or
       (b) none of its call ids appears later, and the step ended at that reply on a Sage effect naming one of its
           calls: a control call's effect (below), or, for a guarded call, Sage's step boundary: a Mythic
-          ``[step-boundary]`` message and the Supervisor's next request carrying a ``[step outcome]``.
+          ``[step-boundary]`` message and the Supervisor's next request carrying a new ``[step outcome]`` (one its
+          previous request in the step did not carry; Sage keeps earlier outcomes in the Supervisor's history).
       The step's last reply, when Sage then halted at its step limit, is not judged and is reported.
       G   at least one split gateway reply with a tool call is captured and judged. Otherwise the check did not run
           (``not_run``, not an attempt).
@@ -76,6 +77,7 @@ import os
 import stat
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -307,11 +309,19 @@ def _texts(rows: dict[str, Any]) -> list[str]:
     return [str(m.get("message") or "") for m in rows.get("messages") or []]
 
 
+def _outcomes_naming(item: dict[str, Any] | None, named: str) -> Counter:
+    """The ``[step outcome]`` messages a request carries that name the call, counted by text."""
+    entries = (item or {}).get("input")
+    texts = [str(entry.get("content") or "") for entry in entries or [] if isinstance(entry, dict)]
+    return Counter(text for text in texts if STEP_OUTCOME in text and named in text)
+
+
 def boundary_refused(call: dict[str, Any], position: int, items: list[dict[str, Any]], rows: dict[str, Any],
                      offered: dict[str, list[str]]) -> str:
-    """How Sage's step boundary shows for a guarded call it removed, or "" (pure). Both effects must name the call:
-    a Mythic ``[step-boundary]`` message, and the next captured request is the Supervisor's (it offers
-    ``respond_to_user``) carrying a ``[step outcome]``."""
+    """How Sage's step boundary shows for a guarded call it removed at this reply, or "" (pure). Both effects must
+    name the call: a Mythic ``[step-boundary]`` message, and the next captured request is the Supervisor's (it offers
+    ``respond_to_user``) carrying a ``[step outcome]`` its previous request in the step did not. Sage keeps step
+    outcomes in the Supervisor's history, so an earlier refusal's outcome is never this reply's."""
     named = f"`{call['name']}`"
     if not any(STEP_BOUNDARY in text and named in text for text in _texts(rows)):
         return ""
@@ -320,9 +330,9 @@ def boundary_refused(call: dict[str, Any], position: int, items: list[dict[str, 
     after = items[position + 1]
     if FINISH_TOOL not in offered.get(str(after["request_id"]), []):
         return ""
-    entries = after["input"] if isinstance(after["input"], list) else []
-    outcomes = [str(entry.get("content") or "") for entry in entries if isinstance(entry, dict)]
-    if not any(STEP_OUTCOME in text and named in text for text in outcomes):
+    previous = next((items[index] for index in range(position, -1, -1)
+                     if FINISH_TOOL in offered.get(str(items[index]["request_id"]), [])), None)
+    if not _outcomes_naming(after, named) - _outcomes_naming(previous, named):
         return ""
     return "Sage's step boundary refused it and the Supervisor ran next"
 

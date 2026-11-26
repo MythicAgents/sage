@@ -314,6 +314,93 @@ def test_a_step_boundary_needs_both_effects_naming_the_call(change):
     assert "r3" in [entry["response"] for entry in _failing(result, "R1")]
 
 
+def test_a_dropped_split_issue_call_after_an_earlier_refusal_is_not_delivered():
+    """Synthetic: after a real step-boundary refusal, the Supervisor re-delegates and the worker's next reply splits an
+    issue call that is dropped (no replay, no card, no task). Sage keeps step outcomes in the Supervisor's history, so
+    its next request still carries the earlier outcome; that stale outcome must not stand for this reply."""
+    replies = {**REPLIES, "r3": _reply("r3", _choice(0, text="Retrying."), _choice(1, calls=(ISSUE_AGAIN,))),
+               "r5b": _reply("r5b", _choice(0, calls=(TRANSFER,))),
+               "r6b": _reply("r6b", _choice(0, text="Retrying once more."),
+                             _choice(1, calls=(_call("call_m", check.ISSUE_TOOL, WHOAMI),))),
+               "r7b": _reply("r7b", _choice(0, text="The retry did not run."))}
+    first = [DELEGATED, _user(PROMPT_S)]
+    supervisor = [_user(PROMPT_S), _user(OUTCOME)]
+    records = (_pair("s1", 110, [_user(PROMPT_S)], replies["r1"])
+               + _pair("s2", 120, first, replies["r2"], tools=WORKER_TOOLS)
+               + _pair("s3", 130, first + [_replay("I'm using whoami.", ISSUE, prepared=PREPARED), _tool("call_i")],
+                       replies["r3"], tools=WORKER_TOOLS)
+               + _pair("s4", 140, supervisor, replies["r5b"])
+               + _pair("s5", 150, first, replies["r6b"], tools=WORKER_TOOLS)
+               + _pair("s6", 160, supervisor + [_user("specialist return: Retrying once more.")], replies["r7b"])
+               + _k_records())
+    rows = copy.deepcopy(ROWS)
+    rows["S"]["messages"].append({"id": 3, "message": BOUNDARY, "metadata": {}})
+
+    result = _evaluate(records=records, rows=rows)
+
+    assert result["verdict"] == "fail"
+    assert [entry["response"] for entry in _failing(result, "R1")] == ["r6b"]
+    assert [entry["call"] for entry in _failing(result, "R2")] == ["call_m"]
+    r3 = {entry["call"]: (entry["outcome"], entry["pass"]) for entry in result["criteria"]["R3"]["calls"]}
+    assert r3["call_j"] == ("step boundary", True) and r3["call_m"][1] is False
+
+
+def test_a_repeated_identical_step_outcome_still_counts_for_its_own_refusal():
+    """Synthetic: two refusals whose outcomes render identically (same worker, counts and seconds) each add one."""
+    supervisor = [_user(PROMPT_S), _user(OUTCOME)]
+    items = [{"request_id": "w", "input": [], "reply": REPLIES["r3"]},
+             {"request_id": "s", "input": supervisor + [_user(OUTCOME)], "reply": REPLIES["r4"]}]
+    earlier = {"request_id": "p", "input": supervisor, "reply": REPLIES["r1"]}
+    offered = {"p": list(SUPERVISOR_TOOLS), "w": list(WORKER_TOOLS), "s": list(SUPERVISOR_TOOLS)}
+    rows = {"messages": [{"id": 3, "message": BOUNDARY, "metadata": {}}]}
+    call = {"id": "call_j", "name": check.ISSUE_TOOL, "args": WHOAMI}
+
+    assert check.boundary_refused(call, 1, [earlier] + items, rows, offered)
+    stale = [earlier, items[0], {**items[1], "input": supervisor}]
+    assert check.boundary_refused(call, 1, stale, rows, offered) == ""
+
+
+def _recorded_with_a_later_dropped_issue_call():
+    """Recorded S[0..6] and Mythic rows; synthetic (labelled): the step-limit halt removed (the cap is now 16), the
+    worker's next reply (recorded S[7]'s text) splits an issue call that is dropped, and the Supervisor runs next with
+    its recorded history (which keeps S[5]'s step outcome) plus the worker's text."""
+    fixture = json.loads(RECORDED.read_text())
+    records = copy.deepcopy(fixture["records"])
+    decode = lambda record: json.loads(base64.b64decode(record["record"]["payload"]["body_base64"]))  # noqa: E731
+    request7, response7 = records[14], records[15]
+    reply = decode(response7)
+    reply["id"] = "resp_synthetic_dropped_issue"
+    reply["choices"][1]["message"]["tool_calls"] = [_call("call_synthetic_m", check.ISSUE_TOOL, WHOAMI)]
+    response7["record"]["payload"]["body_base64"] = _b64(reply)
+    supervisor = decode(records[12])
+    worker_text = reply["choices"][0]["message"]["content"]
+    supervisor["messages"].append(_user("[Sage record x · specialist return]\n" + worker_text))
+    final = _reply("resp_synthetic_final", _choice(0, text="The whoami retry did not run."))
+    sent = response7["record"]["time_ns"]
+    records += [{"kind": "model_request", "record": {"time_ns": sent + 1000, "payload": {
+                    "request_id": "synthetic8", "url": request7["record"]["payload"]["url"],
+                    "body_base64": _b64(supervisor)}}},
+                {"kind": "model_response", "record": {"time_ns": sent + 2000, "payload": {
+                    "request_id": "synthetic8", "status_code": 200, "outcome": "returned",
+                    "body_base64": _b64(final)}}}]
+    rows = copy.deepcopy(fixture["rows"]["S"])
+    rows["messages"] = [m for m in rows["messages"] if check.STEP_LIMIT_HALT not in m["message"]]
+    wire, unattributed = check.split.attribute(records, fixture["steps"])
+    assert unattributed == []
+    return wire["S"], rows, check.request_tools(records)
+
+
+def test_a_recorded_refusal_does_not_excuse_a_later_dropped_issue_call():
+    items, rows, offered = _recorded_with_a_later_dropped_issue_call()
+    position = next(i for i, item in enumerate(items) if item["reply"]["id"] == "resp_synthetic_dropped_issue")
+
+    assert check.delivery(position, items, rows, offered)["delivered"] is False
+    assert check.delivery(5, items, rows, offered)["how"].startswith("Sage's step boundary")
+    entries, _counts = check._issue_r3("S", items, rows, offered, [], 2)
+    assert [(entry["outcome"], entry["pass"]) for entry in entries] == [("step boundary", True),
+                                                                         ("card unresolved", False)]
+
+
 # Not judged: the step's last reply when Sage then halted at its step limit.
 
 def test_the_last_reply_before_a_step_limit_halt_is_not_judged():
