@@ -67,10 +67,10 @@ Pass rules (frozen with the plan's live check; read once):
       order and decoded as Sage decodes the SDK's return, equal the full stored output of the task's lifecycle card
       `mythic-task:N:<task>`; the formatted result the follow-up LLM span carried for the one task call (Phoenix input
       messages) equals that call's own card (inline up to 4,000 characters, lazy above); and it is the task's identity
-      and state prefix, the raw value exactly, then only Sage's known notes. Gate: when S's window has LLM spans, all on SUPERVISED_MODEL and none errored, and
-      no first generation (what LangChain hands the agent; Phoenix's recorded LLMResult) holds an
-      `issue_task_and_waitfor_task_output` call, valid or invalid, M2 did not run. A call only in a later generation
-      does not count. An empty window, another model or an errored span is judged by the rule above.
+      and state prefix, the raw value exactly, then only Sage's known notes. When S's LLM spans are all on
+      SUPERVISED_MODEL, none errored, and no first generation (what LangChain hands the agent; Phoenix's recorded
+      LLMResult) holds an `issue_task_and_waitfor_task_output` call, M2 fails and the missing call is recorded as its
+      reason (`detail.no_tool_call`). A call only in a later generation does not count.
   M3  `/watcher scan` completes in the owner channel after `/watcher resume`: zero pending deliveries, state `running`
       with no error, or `degraded` only with one of rc11 L5's completed-degraded codes, a scan count above the
       `/watcher status` before the resume, and no denial. `/watcher pause` then completes and shows `paused`. The
@@ -105,13 +105,12 @@ Pass rules (frozen with the plan's live check; read once):
       `domain_info` and `cypher_query` each appear exactly once.
   L   Containment: at most 40 provider calls and 500,000 tokens across the set, one target task, 60 active minutes,
       every request sent once, no stop by the check, and both installed files restored byte for byte.
-Did not run: a criterion is recorded as not run (null), never as passed, when M2's gate above did not open, or when
-its gate step (W1 first request, W3, W4, A1n first, B1 first) had the right route, or a model that answered, but made no tool call; or when the check
-itself stopped the set (a phase's credential proof or container readiness failed, or the check hit its own error):
+Did not run: a criterion is recorded as not run (null), never as passed, only when the check itself stopped the set (a phase's credential proof or container readiness failed, or the check hit its own error):
 every criterion with a step never sent, or sent but cut off before Sage finished it (Mythic's rows show it neither
 complete nor error), P1 if only its later probes are missing, and L if the set stayed contained. A step Sage finished
 is judged from Mythic's rows as usual; a cut-off step's Phoenix window is left out of P2. The verdict is `fail` if any criterion that ran failed, else
-`not_run` (not an attempt) if any did not run, else `pass`. A wrong route or a provider failure is a failure.
+`not_run` (not an attempt) if any did not run, else `pass`. A wrong route, a provider failure, or a correctly sent step
+whose model answered without the required tool call is a failure.
 Observations, not pass criteria: tokens and wall time per step, thinking blocks seen, how the notice renders, M2's
 LLM span count and any later-generation calls in its window.
 """
@@ -595,9 +594,8 @@ def m2_generations(db: Path, after: int, until: int) -> list[dict[str, Any]]:
 
 
 def m2_gate(spans: list[dict[str, Any]], model: str) -> dict[str, Any]:
-    """M2's gate: did the supervised model, on its route and without a provider error, put the task call in a first
-    generation? ``answered`` is false for an empty window, another model or an errored span: those are judged, never
-    "not run"."""
+    """Did the supervised model, on its route and without a provider error, put the task call in a first generation?
+    ``answered`` with no first-generation call records M2's failure reason; it never makes M2 "not run"."""
     first = [calls for span in spans for calls in (span.get("generations") or [[]])[:1]]
     return {"llm_spans": len(spans),
             "answered": bool(spans) and all(s.get("model") == model and s.get("status") != "ERROR" for s in spans),
@@ -700,15 +698,17 @@ def evaluate(run: dict[str, Any], observed: dict[str, Any], route: dict[str, str
                 problems.append("responses fields on chat completions")
         return problems
 
-    # M2's gate: the change's effect starts at the task call Sage receives. A supervised model that answered on its
-    # route without that call in a first generation never reached the card, so M2 did not run.
+    # The model seam is each row's pass condition, never an observation: a correctly sent step whose model answered on
+    # its route without the required tool call fails its row (the row's own rule needs the call). Only a step the check
+    # never sent or cut off is "not run". The missing call is recorded beside the failure.
+    no_call: dict[str, str] = {}
     gate_m2 = m2_gate((observed.get("generations") or {}).get("M2") or [], route["SUPERVISED_MODEL"])
     if "M2" in requests and "M2" not in not_run and gate_m2["answered"] and not gate_m2["first_generation_call"]:
-        not_run["M2"] = "M2 made no task call in a first generation"
+        no_call["M2"] = "M2 made no task call in a first generation"
 
     routes = {step: route_problems(step) or "ok" for step in WIRE_STEPS if step in requests}
-    # A gate step whose route was right (or whose model answered) but made no tool call never exercised the round
-    # trip: the check did not run. A wrong route or a provider failure is a failure of the change, whatever it called.
+    # A gate step whose route was right (or whose model answered) but made no tool call fails its row like a wrong
+    # route or a provider failure; the missing call is recorded as the reason.
     for gate in GATE_STEPS:
         if gate not in requests:
             continue
@@ -718,7 +718,7 @@ def evaluate(run: dict[str, Any], observed: dict[str, Any], route: dict[str, str
             trip = span_round_trip(spans.get(gate, []), channel_model(route, "A" if gate.startswith("A") else "B"))
             exercised = trip["model_spans"] == 0 or bool(trip["calls"])
         if not exercised:
-            not_run.setdefault(GATE_CRITERION[gate], f"{gate} made no tool call")
+            no_call.setdefault(GATE_CRITERION[gate], f"{gate} made no tool call")
 
     detail: dict[str, Any] = {}
     criteria: dict[str, bool] = {}
@@ -875,6 +875,7 @@ def evaluate(run: dict[str, Any], observed: dict[str, Any], route: dict[str, str
     for name in not_run:
         criteria[name] = None
     detail["not_run"] = not_run
+    detail["no_tool_call"] = {name: reason for name, reason in no_call.items() if name not in not_run}
     values = list(criteria.values())
     verdict = "fail" if any(v is False for v in values) else ("not_run" if any(v is None for v in values) else "pass")
     result = {"criteria": criteria, "detail": detail, "verdict": verdict}

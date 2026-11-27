@@ -341,7 +341,9 @@ def test_each_falsifier_fails_its_rule(failing, mutate):
 
 
 @pytest.mark.parametrize("gate", check.GATE_STEPS)
-def test_a_gate_step_without_a_tool_call_did_not_run(gate):
+def test_a_correctly_sent_step_whose_model_made_no_tool_call_fails_its_row(gate):
+    """The model seam is the row's pass condition: a model that answered on its route without the call fails the row
+    (it does not make the attempt "not run"), and the missing call is recorded as the reason."""
     run, observed = _passing()
     if gate in check.WIRE_STEPS:
         for item in observed["wire"][gate]:
@@ -351,8 +353,9 @@ def test_a_gate_step_without_a_tool_call_did_not_run(gate):
         for span in observed["spans"][gate]:
             span["produced_calls"] = []
     result = check.evaluate(run, observed, ROUTE)
-    assert result["verdict"] == "not_run" and gate in result["reason"]
-    assert result["criteria"][check.GATE_CRITERION[gate]] is None
+    assert result["verdict"] == "fail"
+    assert result["criteria"][check.GATE_CRITERION[gate]] is False
+    assert gate in result["detail"]["no_tool_call"][check.GATE_CRITERION[gate]]
     assert all(value is True for name, value in result["criteria"].items() if name != check.GATE_CRITERION[gate])
 
 
@@ -383,14 +386,14 @@ def test_a_failed_phase_proof_before_its_first_request_did_not_run():
 
 
 def test_a_failure_that_ran_is_never_hidden_by_a_step_that_did_not_run():
-    # Phase N's M2 failed, then B1's first request made no tool call: the attempt failed.
+    # Phase N's M2 failed, then B1's first request made no tool call: both rows failed.
     run, observed = _passing()
     observed["tasks"] = []
     for span in observed["spans"]["B1_1"]:
         span["produced_calls"] = []
     result = check.evaluate(run, observed, ROUTE)
     assert result["verdict"] == "fail"
-    assert result["criteria"]["M2"] is False and result["criteria"]["B1"] is None
+    assert result["criteria"]["M2"] is False and result["criteria"]["B1"] is False
     # Phase N's P3 failed, then phase A's proof failed before its first request: still a failure.
     run, observed = _passing()
     observed["notice"] = {"warnings": 0, "leaks": False}
@@ -728,7 +731,7 @@ def test_the_window_reader_reads_llm_spans_in_place_within_the_window(tmp_path):
     assert read == _recorded_generations("attempt1_m2")
 
 
-def test_attempt_1s_supervised_window_did_not_run_m2():
+def test_attempt_1s_supervised_window_fails_m2_with_its_missing_call_recorded():
     run, observed = _passing()
     run["requests"]["M2"].update(cards_seen=0, cards_accepted=0)
     observed["tasks"] = []
@@ -737,8 +740,8 @@ def test_attempt_1s_supervised_window_did_not_run_m2():
     observed["generations"]["M2"] = [dict(span, model=ROUTE["SUPERVISED_MODEL"])
                                      for span in _recorded_generations("attempt1_m2")]
     result = check.evaluate(run, observed, ROUTE)
-    assert result["verdict"] == "not_run" and result["criteria"]["M2"] is None
-    assert "M2" in result["reason"]
+    assert result["verdict"] == "fail" and result["criteria"]["M2"] is False
+    assert "first generation" in result["detail"]["no_tool_call"]["M2"]
     assert result["detail"]["M2"]["later_generation_calls"] == [["get_ttp_guidance"], [check.TASK_TOOL]]
     assert all(value is True for name, value in result["criteria"].items() if name != "M2")
 
@@ -754,10 +757,10 @@ def test_a_recorded_task_call_without_a_card_fails_m2_and_with_its_card_passes()
 
 @pytest.mark.parametrize("change, expected", [
     # Another tool's call in the first generation: the model answered on the right route and never called the task.
-    (lambda spans: [dict(s, generations=[["get_ttp_guidance"]]) for s in spans], None),
-    # The task call only in a later generation (the split): not run.
-    (lambda spans: [dict(s, generations=[[], [check.TASK_TOOL]]) for s in spans], None),
-    # A provider error, another model, or no LLM span at all: a failure, never "not run".
+    (lambda spans: [dict(s, generations=[["get_ttp_guidance"]]) for s in spans], False),
+    # The task call only in a later generation (the split): Sage never received it, so M2 fails.
+    (lambda spans: [dict(s, generations=[[], [check.TASK_TOOL]]) for s in spans], False),
+    # A provider error, another model, or no LLM span at all: also a failure.
     (lambda spans: [dict(s, generations=[[]], status="ERROR") for s in spans], False),
     (lambda spans: [dict(s, generations=[[]], model="gpt-5.6-cyber") for s in spans], False),
     (lambda spans: [], False),
