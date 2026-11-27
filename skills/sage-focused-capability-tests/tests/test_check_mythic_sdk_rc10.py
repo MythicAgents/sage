@@ -896,3 +896,580 @@ def test_cleanup_pauses_the_watcher_again_only_when_its_stored_profile_is_not_pa
     result = asyncio.run(check.repause_watcher(None, {"owner_channel_id": OWNER, "paused": False}))
     assert sent == [(OWNER, "/watcher pause")] and result == {"request_id": 77, "status": "complete"}
     assert asyncio.run(check.repause_watcher(None, {"owner_channel_id": None, "paused": False})) is None
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# M2's recorded baseline: Mythic's own task row, the stored cards and the follow-up, through M2's readers
+# (fixtures/mythic_sdk_rc10_baseline_request85.json, provenance inside; every mutation below is synthetic)
+# ---------------------------------------------------------------------------------------------------------------
+
+BASELINE85 = json.loads((ROOT / "skills/sage-focused-capability-tests/tests/fixtures/mythic_sdk_rc10_baseline_request85.json")
+                        .read_text())
+PREREQ = json.loads((ROOT / "skills/sage-focused-capability-tests/tests/fixtures/mythic_sdk_rc10_prerequisites_recorded.json")
+                    .read_text())
+# Read on 2026-11-27 from Mythic's own rows: the transport reader decodes response rows with validate=True and rejects
+# Mythic's base64, which Mythic wraps at 76 columns; the SDK's waitfor_for_task_output decodes it leniently. Changing a
+# frozen reader is the operator's scope decision, taken before the live attempt.
+WRAPPED_BASE64 = ("scope decision pending: the frozen transport reader rejects Mythic's 76-column base64 rows, which "
+                  "the SDK decodes")
+
+
+def _baseline_inputs(record: dict | None = None):
+    record = copy.deepcopy(record or BASELINE85)
+    return record["binding"], record["task"], record["rows"], {int(seq): r for seq, r in record["wire"].items()}
+
+
+def _lifecycle_output() -> str:
+    return next(m["tool_output"] for m in BASELINE85["rows"]["messages"]
+                if m["metadata"]["tool_use"]["tool_call_id"] == "mythic-task:2:22")
+
+
+def test_the_baseline_record_is_mythics_own_task_row_in_mythics_representation():
+    binding, task, rows, wire = _baseline_inputs()
+    original = BASELINE85["original"]
+    assert binding == check.BASELINE
+    assert [row["id"] for row in task["responses"]] == [25] and task["subtask_count"] == 0
+    assert task["completed"] is True and task["status"] == "success" and task["callback"]["display_id"] == 2
+    # Mythic's response row as Mythic returns it: base64 wrapped at 76 columns (the original had its line break at 76).
+    assert original["response 25"]["newlines_at"] == [76] and "\n" in task["responses"][0]["response_text"]
+    # The SDK's own decode (base64.b64decode per row, mythic.waitfor_for_task_output) yields the lifecycle card's value.
+    assert base64.b64decode(task["responses"][0]["response_text"]).decode() == _lifecycle_output()
+    # Independent sources agreed before redaction: Mythic's row, the stored card and the wire emission.
+    assert (original["response 25"]["sha256"] == original["stored 873 tool_output"]["sha256"]
+            == original["wire 13534 output"]["sha256"])
+    assert original["stored 869 result_preview"]["sha256"] == original["wire 13588 tool message"]["sha256"]
+
+
+def test_the_baseline_binds_every_input_to_its_request_channel_task_and_call():
+    problems, formatted, correlation = check.baseline_bind(*_baseline_inputs())
+    assert problems == []
+    assert {name: correlation[name]["message_id"] for name in ("lifecycle", "call")} == {"lifecycle": 873, "call": 869}
+    assert formatted.endswith(_lifecycle_output()) and formatted.startswith("[Mythic task issuance identity]")
+
+
+def test_presentation_and_annotation_hold_on_the_recorded_baseline():
+    positive = check.baseline_report(*_baseline_inputs())["positive"]
+    assert positive["bind"]["holds"] and positive["presentation"]["holds"] and positive["annotation"]["holds"]
+    assert positive["presentation"]["storage"] == "inline"
+
+
+@pytest.mark.xfail(strict=True, reason=WRAPPED_BASE64)
+def test_the_recorded_baseline_holds_through_all_three_readers():
+    report = check.baseline_report(*_baseline_inputs())
+    assert report["positive"]["transport"]["holds"], report["positive"]["transport"]["reasons"]
+    assert report["holds"]
+
+
+def test_the_frozen_transport_reader_holds_only_on_an_unwrapped_copy_of_the_recorded_row():
+    """Synthetic: the recorded row re-encoded without Mythic's line wrapping. Documents the mismatch above."""
+    binding, task, rows, wire = _baseline_inputs()
+    assert check.baseline_holds(binding, task, rows, wire)["transport"]["reasons"] == ["response 25 is not base64"]
+    task["responses"][0]["response_text"] = task["responses"][0]["response_text"].replace("\n", "")
+    assert check.baseline_holds(binding, task, rows, wire)["holds"]
+
+
+@pytest.mark.parametrize("name, owner", [(name, owner) for name, owner, _mutate in check.BASELINE_CONTROLS])
+def test_each_baseline_control_fails_at_its_owner(name, owner, request):
+    if owner == "transport":
+        request.applymarker(pytest.mark.xfail(strict=True, reason=WRAPPED_BASE64))
+    control = next(c for c in check.baseline_report(*_baseline_inputs())["controls"] if c["control"] == name)
+    assert control["rejected"], control
+
+
+def test_a_control_never_counts_when_its_owner_already_rejects_the_original():
+    binding, task, rows, wire = _baseline_inputs()
+    task["responses"][0]["response_text"] = task["responses"][0]["response_text"].replace("\n", "")
+    healthy = {c["control"]: c["rejected"] for c in check.baseline_report(binding, task, rows, wire)["controls"]}
+    assert all(healthy.values())  # every control rejected by its owner on the (synthetic) unwrapped row
+    task["responses"] = []
+    broken = check.baseline_report(binding, task, rows, wire)
+    assert broken["holds"] is False
+    assert {c["control"] for c in broken["controls"] if not c["rejected"]} == {
+        name for name, owner, _m in check.BASELINE_CONTROLS if owner == "transport"}
+
+
+def _receiver_file(path: Path, record: dict | None = None) -> Path:
+    """The fixture's three records in the receiver's format (bodies re-encoded; the fixture holds them decoded)."""
+    record = record or BASELINE85
+    with path.open("w") as handle:
+        handle.write(json.dumps({"seq": 1, "kind": "process_start", "record": {"payload": {}}}) + "\n")
+        for seq, item in record["wire"].items():
+            payload = {"body_base64": base64.b64encode(json.dumps(item["body"]).encode()).decode()}
+            payload.update({k: item[k] for k in ("routing_key", "url") if item.get(k)})
+            handle.write(json.dumps({"seq": int(seq), "kind": item["kind"], "record": {"payload": payload}}) + "\n")
+    return path
+
+
+def test_the_baseline_reads_the_receivers_records_from_their_bytes(tmp_path):
+    wire = check.wire_bodies(_receiver_file(tmp_path / "wire.jsonl"), (13534, 13540, 13588, 99))
+    assert sorted(wire) == [13534, 13540, 13588]
+    expected = _baseline_inputs()[3]
+    assert {seq: (r["kind"], r["body"]) for seq, r in wire.items()} == {
+        seq: (r["kind"], r["body"]) for seq, r in expected.items()}
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# M2's prerequisites through Sage's own readers (recorded inputs from fixtures/mythic_sdk_rc10_prerequisites_recorded.json;
+# a fresh check-in time and every other mutation is synthetic)
+# ---------------------------------------------------------------------------------------------------------------
+
+import datetime as _dt  # noqa: E402
+import os  # noqa: E402
+import re  # noqa: E402
+
+_MYTHIC_SDK = sys.modules[check._base().nc.mythic.__name__]
+SYNTHETIC_KEY = "synthetic-test-key"
+
+
+def _fresh(seconds_ago: float = 5) -> str:
+    return (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=seconds_ago)).replace(tzinfo=None).isoformat()
+
+
+class FakeMythic:
+    """Mythic's GraphQL answered from recorded rows by operation name; every call is kept. Tests change ``state``."""
+
+    def __init__(self, **changes):
+        self.calls: list[tuple[str, dict]] = []
+        self.state = {"active": True, "exists": True, "last_checkin": _fresh(), "list_last_checkin": None,
+                      "payload": "apollo", "whoami": True, "channel": copy.deepcopy(PREREQ["channel"]),
+                      "token": copy.deepcopy(PREREQ["token"]), "container": copy.deepcopy(PREREQ["container"]),
+                      "baseline": copy.deepcopy(BASELINE85), "created": []}
+        self.state.update(changes)
+
+    def _callback_row(self, last_checkin):
+        row = copy.deepcopy(PREREQ["callback_row"])
+        row.update(last_checkin=last_checkin, active=self.state["active"],
+                   payload={"payloadtype": {"name": self.state["payload"]}})
+        return row
+
+    async def execute_custom_query(self, _client, query, variables=None, **_kwargs):
+        name = re.search(r"(?:query|mutation)\s+(\w+)", query).group(1)
+        variables = variables or {}
+        self.calls.append((name, variables))
+        s = self.state
+        row = self._callback_row(s["last_checkin"])
+        listed = self._callback_row(s["list_last_checkin"] or s["last_checkin"])
+        answers = {
+            "SageRc10Callback": lambda: {"callback": [{"display_id": 2, "active": s["active"]}] if s["exists"] else []},
+            "cbinfo": lambda: {"callback": [row] if s["exists"] else []},
+            "slimcb": lambda: {"callback": [{**listed, "user": "lab.user", "host": "WORKSTATION-A",
+                                             "integrity_level": 2}] if s["exists"] and s["active"] else []},
+            "SageRc10LoadedCommand": lambda: {"loadedcommands": [{"id": 7}] if s["whoami"] else []},
+            "SageRc10Channel": lambda: {"chat_channel_by_pk": copy.deepcopy(s["channel"])
+                                        if variables.get("id") == s["channel"]["id"] else
+                                        {"id": variables.get("id"), "ai_metadata": {"config": {}}}},
+            "SageRc10Token": lambda: {"apitokens_by_pk": copy.deepcopy(s["token"])
+                                      if variables.get("id") == s["token"]["id"] else None},
+            "SageOperationBot": lambda: {"operation_by_pk": PREREQ["operation"], "operator": [PREREQ["bot"]]},
+            "SageChatReadiness": lambda: {"consuming_container": [s["container"]], "apitokens": [s["token"]]},
+            "CreateSageChannel": lambda: (s["created"].append(variables["name"])
+                                          or {"chatCreateChannel": {"status": "success", "channel_id": (
+                                              s["channel"]["id"] if variables["name"].endswith(" S")
+                                              else 60 + len(s["created"]))}}),
+            "SageRc10BaselineTask": lambda: {"task": [s["baseline"]["task"]]},
+            "SageRc10Subtasks": lambda: {"task": []},
+            "SageRc10BaselineRows": lambda: {"chat_message": s["baseline"]["rows"]["messages"],
+                                             "chat_request_by_pk": s["baseline"]["rows"]["request"]},
+            "SageOpenAICheckMaxTask": lambda: {"task": [{"display_id": 22}]},
+            "SageRc10Tasks": lambda: {"task": []},
+        }
+        return copy.deepcopy(answers[name]())
+
+
+def _probe_root(tmp_path: Path, endpoint: str = GATEWAY) -> Path:
+    """Synthetic installed files: the LiteLLM block only, with a synthetic key."""
+    root = tmp_path / "installed"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / ".env").write_text("")
+    (root / ".env.local").write_text(f"# LiteLLM\nAPI_ENDPOINT={endpoint}\nAPI_KEY={SYNTHETIC_KEY}\n")
+    return root
+
+
+def run_probe_here(script: str, argv: list[str], root: Path, *, status: int = 200, models=None,
+                   environ: dict | None = None) -> dict:
+    """Run a container probe's own script in this process against a synthetic installed root. Sage's real dotenv
+    loader, build_model_kwargs, resolve_llm_profile and TraceConfig run; only the keyed listing's HTTP answer is
+    instrumented (it records the URL and the key it was sent)."""
+    import contextlib
+    import io
+
+    import httpx
+
+    sent = []
+
+    class Response:
+        status_code = status
+
+        def json(self):
+            return {"data": [{"id": model} for model in (models if models is not None else [ROUTE["SUPERVISED_MODEL"]])]}
+
+    def get(url, headers=None, **_kwargs):
+        sent.append((url, (headers or {}).get("Authorization")))
+        return Response()
+
+    saved = (dict(os.environ), list(sys.path), list(sys.argv), httpx.get)
+    out = io.StringIO()
+    try:
+        for name in ("API_KEY", "OPENAI_API_KEY", "API_ENDPOINT", "OPENAI_API_BASE", "OPENAI_BASE_URL", "provider",
+                     "model", "SAGE_OBSERVATION_DIRECTORY", "mode", "max_steps", "autonomous_solve"):
+            os.environ.pop(name, None)
+        os.environ.update(environ or {})
+        os.environ["SAGE_RC10_PROBE_ROOT"] = str(root)
+        sys.argv, httpx.get = ["-c", *argv], get
+        with contextlib.redirect_stdout(out):
+            exec(compile(script, "<probe>", "exec"), {"__name__": "__main__"})  # noqa: S102 - the probe under test
+    finally:
+        os.environ.clear()
+        os.environ.update(saved[0])
+        sys.path[:], sys.argv, httpx.get = saved[1], saved[2], saved[3]
+    result = json.loads(out.getvalue().strip().splitlines()[-1])
+    result["_sent"] = sent
+    return result
+
+
+def test_the_s_route_probe_resolves_s_through_sages_own_profile_and_lists_with_that_key(tmp_path):
+    root = _probe_root(tmp_path)
+    config = PREREQ["channel"]["ai_metadata"]["config"]
+    probe = run_probe_here(check._S_ROUTE_PROBE, [json.dumps(config), GATEWAY, ROUTE["SUPERVISED_MODEL"]], root)
+    sent = probe.pop("_sent")
+    recorded = {k: v for k, v in PREREQ["s_probe"].items()}
+    assert probe == recorded  # the same projection the deployed container reported for channel 53
+    assert sent == [(GATEWAY + "/models", "Bearer " + SYNTHETIC_KEY)]
+    # Sage's own normalizers decide; a near-match in S's settings changes what they resolve.
+    unsafe = {**config, "mode": "auto", "max_steps": "4", "provider": "openai"}
+    changed = run_probe_here(check._S_ROUTE_PROBE, [json.dumps(unsafe), GATEWAY, ROUTE["SUPERVISED_MODEL"]], root)
+    assert changed["effective"]["mode"] == "auto" and changed["effective"]["autonomous_solve"] is True
+    assert changed["effective"]["max_steps"] == 4 and changed["effective"]["provider"] == "openai"
+    assert check.effective_policy_reasons(changed, ROUTE)
+    other = run_probe_here(check._S_ROUTE_PROBE, [json.dumps(config), GATEWAY, ROUTE["SUPERVISED_MODEL"]],
+                           _probe_root(tmp_path / "x", endpoint="https://elsewhere.invalid"))
+    assert other["effective"]["endpoint_is_gateway"] is False
+
+
+def test_the_observation_probe_reads_tracing_as_sage_would_start_it(tmp_path):
+    root = _probe_root(tmp_path)
+    normal = run_probe_here(check._OBSERVATION_PROBE, list(check.TRACE_INPUT_FLAGS), root)
+    normal.pop("_sent")
+    assert normal == PREREQ["observation"]
+    hidden = run_probe_here(check._OBSERVATION_PROBE, list(check.TRACE_INPUT_FLAGS), root,
+                            environ={"OPENINFERENCE_HIDE_INPUT_MESSAGES": "true"})
+    assert hidden["hidden"]["hide_input_messages"] is True
+    (root / ".env.local").write_text((root / ".env.local").read_text() + "SAGE_OBSERVATION_DIRECTORY=/tmp/obs\n")
+    capture = run_probe_here(check._OBSERVATION_PROBE, list(check.TRACE_INPUT_FLAGS), root)
+    assert capture["capture_mode"] is True
+    for probe in (hidden, capture):
+        assert check.result_holds({"holds": True}, {"span": 1, "text": True}, probe)["holds"] is False
+    assert check.result_holds({"holds": True}, {"span": 1, "text": True}, normal)["holds"] is True
+
+
+def _callback(monkeypatch, **changes):
+    fake = FakeMythic(**changes)
+    monkeypatch.setattr(_MYTHIC_SDK, "execute_custom_query", fake.execute_custom_query)
+    return asyncio_run(check.read_callback(object(), 2))
+
+
+def asyncio_run(coroutine):
+    import asyncio
+
+    return asyncio.run(coroutine)
+
+
+def test_the_recorded_dead_callback_fails_although_mythic_marks_it_active(monkeypatch):
+    result = _callback(monkeypatch, last_checkin=PREREQ["callback_row"]["last_checkin"])
+    assert result["observed"]["active"] is True  # the old active-only admission let this callback through
+    assert result["holds"] is False
+    assert result["observed"]["detailed"]["status"] == "dead" and result["observed"]["listed"]["status"] == "dead"
+    assert result["observed"]["detailed"]["threshold_seconds"] == 180
+    # Attempt 1's request 88: the model-visible list said dead for the same callback.
+    assert check.callback_holds(2, [{"display_id": 2, "active": True}], {"display_id": 2, "status": "alive",
+                                "alive": True}, PREREQ["request_88_list_result"])["holds"] is False
+
+
+@pytest.mark.parametrize("changes, fragment", [
+    ({}, None),  # synthetic fresh check-in: both readers call it alive
+    ({"exists": False}, "not active"),
+    ({"active": False}, "not active"),
+    ({"last_checkin": "yesterday-ish"}, "reports uncertain"),
+    ({"last_checkin": None}, "reports uncertain"),
+    ({"payload": "sage"}, "reports taskable"),
+    ({"list_last_checkin": PREREQ["callback_row"]["last_checkin"]}, "list_callbacks reports dead"),
+])
+def test_the_callback_condition_needs_both_of_sages_readers_to_call_it_alive(monkeypatch, changes, fragment):
+    result = _callback(monkeypatch, **changes)
+    if fragment is None:
+        assert result["holds"] is True, result
+        assert result["observed"]["detailed"]["status"] == result["observed"]["listed"]["status"] == "alive"
+    else:
+        assert result["holds"] is False and any(fragment in reason for reason in result["reasons"]), result
+
+
+def test_the_callback_condition_reads_the_exact_selected_callback_only():
+    alive = {"display_id": 3, "status": "alive", "alive": True}
+    listed = [{"id": 3, "status": "alive"}]
+    assert check.callback_holds(2, [{"display_id": 3, "active": True}], alive, listed)["holds"] is False
+    assert check.callback_holds(2, [], {}, {"status": "unchanged", "note": "re-read"})["holds"] is False
+    assert check.callback_holds(2, [{"display_id": 2, "active": True}], {**alive, "display_id": 2},
+                                [{"id": 2, "status": "alive"}, {"id": 2, "status": "alive"}])["holds"] is False
+
+
+def test_the_command_condition_needs_whoami_loaded():
+    assert check.command_holds(2, [{"id": 7}])["holds"] is True
+    assert check.command_holds(2, [])["holds"] is False
+    assert check.command_holds(2, None)["holds"] is False
+
+
+def _channel(**changes):
+    channel, token = copy.deepcopy(PREREQ["channel"]), copy.deepcopy(PREREQ["token"])
+    probe = copy.deepcopy(PREREQ["s_probe"])
+    for path, value in changes.items():
+        target, key = {"channel": channel, "token": token, "config": channel["ai_metadata"]["config"],
+                       "effective": probe["effective"]}[path.split(".")[0]], path.split(".")[1]
+        target[key] = value
+    return check.channel_holds(channel, token, PREREQ["bot"], PREREQ["container"], 1, token.get("active") is True
+                               and token.get("deleted") is False, probe, ROUTE)
+
+
+@pytest.mark.parametrize("change", [
+    {"channel.operation_id": 2}, {"channel.chat_container_id": 9}, {"channel.locked": False},
+    {"channel.chat_model": "Sage Watcher"}, {"channel.apitokens_id": 32}, {"config.provider": "openai"},
+    {"config.model": ROUTE["GATEWAY_MODEL"]}, {"config.mode": "auto"}, {"config.autonomous_solve": True},
+    {"config.max_steps": 4}, {"config.API_KEY": "inline"}, {"token.active": False}, {"token.deleted": True},
+    {"token.operator_id": 1}, {"token.operation_id": 2}, {"token.scopes": ["chat-ai.read"]},
+    {"effective.mode": "conversation"}, {"effective.max_steps": 200},
+])
+def test_the_actual_s_and_its_token_hold_only_as_created(change):
+    assert _channel()["holds"] is True  # attempt 1's actual S (channel 53) and token 31, read back from Mythic
+    result = _channel(**change)
+    assert result["holds"] is False, change
+
+
+def test_readiness_can_only_report_s_as_pending():
+    intended = check.intended_channel(PREREQ["s_probe"], ROUTE)
+    assert intended["holds"] is None and intended["pending"] is True
+    bad = copy.deepcopy(PREREQ["s_probe"])
+    bad["effective"]["mode"] = "conversation"
+    assert check.intended_channel(bad, ROUTE)["holds"] is False
+
+
+@pytest.mark.parametrize("part, change", [
+    (None, None),
+    ("probe", {"sources": {**PREREQ["s_probe"]["sources"], "model": "user-secret"}}),
+    ("probe", {"sources": {**PREREQ["s_probe"]["sources"], "api_key": "default"}}),
+    ("probe", {"effective": {**PREREQ["s_probe"]["effective"], "endpoint_is_gateway": False}}),
+    ("probe", {"effective": {**PREREQ["s_probe"]["effective"], "model": ROUTE["GATEWAY_MODEL"]}}),
+    ("probe", {"status": 401, "listed": False}),
+    ("probe", {"container_env": ["API_KEY"]}),
+    ("probe", {"error": "ImportError", "effective": None}),
+    ("secrets", {"names": ["API_KEY"]}),
+    ("secrets", {"resolved": False}),
+    ("local", {"credentials": [{"name": "API_KEY", "block": "OpenAI"}]}),
+    ("gateway", {"status": 401}),
+])
+def test_the_route_condition_follows_s_to_its_effective_gateway_and_key(part, change):
+    parts = {"local": copy.deepcopy(PREREQ["installed_local"]), "gateway": copy.deepcopy(PREREQ["gateway_probe"]),
+             "probe": copy.deepcopy(PREREQ["s_probe"]), "secrets": copy.deepcopy(PREREQ["secrets"])}
+    if part:
+        parts[part].update(change)
+    result = check.route_holds(parts["local"], parts["gateway"], parts["probe"], parts["secrets"], ROUTE)
+    assert result["holds"] is (part is None), result["reasons"]
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Preflight to send: cmd_run with Mythic, the container, sage-line and cleanup replaced by recorded answers, STEPS cut to
+# M1 and M2, and the send instrumented. The admission code and Sage's readers stay real.
+# ---------------------------------------------------------------------------------------------------------------
+
+# Synthetic for wiring only: the recorded row re-encoded without Mythic's line wrap, so the result condition can hold
+# while the frozen reader's mismatch (WRAPPED_BASE64) awaits its scope decision. The recorded row is used below to show
+# that the mismatch alone keeps M2 unsent.
+UNWRAPPED85 = copy.deepcopy(BASELINE85)
+UNWRAPPED85["task"]["responses"][0]["response_text"] = UNWRAPPED85["task"]["responses"][0]["response_text"].replace(
+    "\n", "")
+
+
+class Harness:
+    def __init__(self, monkeypatch, tmp_path, **state):
+        import argparse
+        import sqlite3
+        import uuid
+
+        tmp_path = tmp_path / uuid.uuid4().hex[:8]
+        tmp_path.mkdir()
+        self.evidence = tmp_path / "evidence"
+        self.fake = FakeMythic(baseline=copy.deepcopy(UNWRAPPED85), **state)
+        self.sent: list[tuple[str, int, str]] = []
+        self.root = _probe_root(tmp_path)
+        self.probe_status = 200
+        self.trace_env: dict = {}
+        phoenix = tmp_path / "phoenix.db"
+        with sqlite3.connect(phoenix) as conn:
+            conn.execute("CREATE TABLE spans (id INTEGER PRIMARY KEY, span_kind TEXT, status_code TEXT, events TEXT, "
+                         "attributes TEXT, llm_token_count_prompt INTEGER, llm_token_count_completion INTEGER)")
+            span = {"llm": {"model_name": "m", "input_messages": [
+                {"message": {"role": "tool", "tool_call_id": "call_x", "content": "a recorded result"}}]}}
+            conn.execute("INSERT INTO spans VALUES (1, 'LLM', 'OK', '[]', ?, 1, 1)", (json.dumps(span),))
+        self.args = argparse.Namespace(
+            callback=2, bloodhound_channel=3, phoenix_db=str(phoenix), phoenix_url="http://127.0.0.1:6006",
+            route_file="route", plan="plan.md", authorized_by="test", pip_audit="pip-audit",
+            baseline_wire=str(_receiver_file(tmp_path / "wire.jsonl", UNWRAPPED85)))
+        self.run = {"readiness": {"verdict": "ready_for_preparation"}, "evidence_dir": str(tmp_path / "evidence")}
+        nc = check._base().nc
+        monkeypatch.setattr(_MYTHIC_SDK, "execute_custom_query", self.fake.execute_custom_query)
+        monkeypatch.setattr(nc, "_read_env_defaults", lambda path=None: {})
+        monkeypatch.setattr(check, "STEPS", check.STEPS[:2])
+        monkeypatch.setattr(check, "read_route", lambda _path: dict(ROUTE))
+        monkeypatch.setattr(check, "_container_json", self._container)
+        monkeypatch.setattr(check, "gateway_probe", lambda _route: copy.deepcopy(PREREQ["gateway_probe"]))
+        monkeypatch.setattr(check._split(), "_operator_secret_names",
+                            lambda _client: _value(copy.deepcopy(PREREQ["secrets"])))
+        monkeypatch.setattr(check._deployment(), "_installed_service_dir", lambda: str(self.root))
+        monkeypatch.setattr(check, "record_a1", lambda _bin: {})
+        monkeypatch.setattr(check, "ss_listeners", lambda: {})
+        monkeypatch.setattr(check, "graphql_unauthenticated", lambda _url: 401)
+        monkeypatch.setattr(check, "http_status", lambda *_a, **_k: 200)
+        monkeypatch.setattr(check, "watcher_profile", lambda _op: {"owner_channel_id": OWNER, "paused": True})
+        monkeypatch.setattr(check, "_totals", lambda _run, _db: {"provider_calls": 0, "provider_tokens": 0})
+        monkeypatch.setattr(check, "cmd_cleanup", lambda *_a: _value({"cleaned": True}))
+        monkeypatch.setattr(check.subprocess, "run", self._subprocess)
+        monkeypatch.setattr(check, "_send", self._send)
+        monkeypatch.setattr(check._base(), "phoenix_mark", lambda _db: 1)
+        self.before_send: dict = {}
+
+    def _container(self, script, *argv, timeout=90):
+        if script == check._S_ROUTE_PROBE:
+            return run_probe_here(script, list(argv), self.root, status=self.probe_status)
+        return run_probe_here(script, list(argv), self.root, environ=self.trace_env)
+
+    def _subprocess(self, command, **_kwargs):
+        assert command[:2] == ["sage-line", "check-attempt"], command  # nothing else may run a process here
+        return type("Done", (), {"returncode": 0, "stdout": "allowed", "stderr": ""})()
+
+    async def _send(self, client, run, name, channel_id, prompt, *, cards, timeout):
+        self.sent.append((name, channel_id, prompt))
+        entry = {"channel_id": channel_id, "request_id": 100 + len(self.sent), "sends": 1, "sent_ns": 1}
+        run["requests"][name] = entry
+        for key, value in self.before_send.get(name, {}).items():  # a change after this step, before the next
+            self.fake.state[key] = value
+        return entry
+
+    def cmd_run(self):
+        client = type("Client", (), {"current_operation_id": 1})()
+        return asyncio_run(check.cmd_run(client, self.run, self.args))
+
+
+async def _async_value(value):
+    return value
+
+
+def _value(value):
+    return _async_value(value)
+
+
+def _stages(run):
+    return [(entry["stage"], entry["condition"], entry["holds"]) for entry in run.get("prerequisites", [])]
+
+
+def test_valid_prerequisites_reach_both_sends_and_record_each_condition(monkeypatch, tmp_path):
+    h = Harness(monkeypatch, tmp_path)
+    h.cmd_run()
+    assert [name for name, *_ in h.sent] == ["M1", "M2"]
+    assert h.sent[1] == ("M2", PREREQ["channel"]["id"], "Run whoami on callback 2.")
+    assert h.run["preparation"]["verdict"] == "ready_for_live" and not h.run.get("stopped")
+    assert _stages(h.run) == ([("run_entry", "callback", True)]
+                              + [("preparation", c, True) for c in check.PREREQUISITES]
+                              + [("before_M2", c, True) for c in check.PREREQUISITES])
+    for entry in h.run["prerequisites"]:
+        assert entry["reader"] and isinstance(entry["observed_at"], float) and "observed" in entry
+    assert h.fake.state["created"] == ["rc10 live check S", "rc10 live check C"]  # S once, in preparation
+    assert h.sent[0][1] != h.sent[1][1] and h.run["channels"]["S"] == PREREQ["channel"]["id"]
+    assert json.dumps(h.run, default=str).count(SYNTHETIC_KEY) == 0
+
+
+@pytest.mark.parametrize("condition, change", [
+    ("callback", {"list_last_checkin": PREREQ["callback_row"]["last_checkin"]}),
+    ("command", {"whoami": False}),
+    ("channel", {"channel": {**PREREQ["channel"], "locked": False}}),
+    ("route", "probe_status"),
+    ("result", "trace_env"),
+    ("result", {"baseline": copy.deepcopy(BASELINE85)}),  # the recorded row: the frozen reader's mismatch alone
+])
+def test_each_failed_prerequisite_at_preparation_sends_nothing(monkeypatch, tmp_path, condition, change):
+    h = Harness(monkeypatch, tmp_path)
+    if change == "probe_status":
+        h.probe_status = 401
+    elif change == "trace_env":
+        h.trace_env = {"OPENINFERENCE_HIDE_INPUT_MESSAGES": "true"}
+    else:
+        h.fake.state.update(copy.deepcopy(change))
+    if condition == "callback":
+        # the list reader alone disagrees at preparation: the run-entry read happened before this point
+        h.fake.state["list_last_checkin"] = None
+        original = check.check_prerequisites
+
+        async def flip_after_entry(client, run, args, route, stage, channel_id=None):
+            if stage == "preparation":
+                h.fake.state["list_last_checkin"] = PREREQ["callback_row"]["last_checkin"]
+            return await original(client, run, args, route, stage, channel_id)
+
+        monkeypatch.setattr(check, "check_prerequisites", flip_after_entry)
+    with pytest.raises(SystemExit, match="preparation: .*no prompt was sent"):
+        h.cmd_run()
+    assert h.sent == []
+    assert h.run["preparation"]["verdict"] == "not_ready" and "requests" not in h.run
+    assert not list(h.evidence.glob("installed.env*"))  # nothing backed up, nothing changed
+    failed = [entry["condition"] for entry in h.run["prerequisites"] if entry["holds"] is False]
+    assert failed == [condition]
+
+
+def test_a_saved_green_readiness_with_a_dead_callback_refuses_at_entry(monkeypatch, tmp_path):
+    h = Harness(monkeypatch, tmp_path, last_checkin=PREREQ["callback_row"]["last_checkin"])
+    with pytest.raises(SystemExit, match="run entry: callback: .*nothing was changed or sent"):
+        h.cmd_run()
+    assert h.sent == [] and h.fake.state["created"] == [] and "preparation" not in h.run
+    assert _stages(h.run) == [("run_entry", "callback", False)]
+
+
+@pytest.mark.parametrize("condition, change", [
+    ("callback", {"last_checkin": PREREQ["callback_row"]["last_checkin"]}),
+    ("command", {"whoami": False}),
+    ("channel", {"channel": {**PREREQ["channel"], "locked": False}}),
+    ("channel", {"token": {**PREREQ["token"], "deleted": True}}),
+    ("route", {"channel": {**PREREQ["channel"], "ai_metadata": {"config": {
+        **PREREQ["channel"]["ai_metadata"]["config"], "model": "gpt-5.6-cyber"}}}}),
+])
+def test_a_change_after_preparation_leaves_m2_unsent_and_m2_not_run(monkeypatch, tmp_path, condition, change):
+    h = Harness(monkeypatch, tmp_path)
+    h.before_send = {"M1": copy.deepcopy(change)}
+    h.cmd_run()
+    assert [name for name, *_ in h.sent] == ["M1"]
+    assert h.run["stopped"]["step"] == "M2"
+    assert h.run["stopped"]["reason"].startswith("phase N not ready: before M2: ")
+    assert condition in [e["condition"] for e in h.run["prerequisites"] if e["stage"] == "before_M2" and not e["holds"]]
+    # The existing disposition: a check-side stop leaves the unsent row not run; M2 can never pass this way.
+    verdict = check.evaluate(h.run, {"rows": {"M1": _rows("M1")}}, ROUTE)
+    assert verdict["criteria"]["M2"] is None and verdict["verdict"] != "pass"
+
+
+def test_the_run_refuses_a_run_file_without_a_preparation_ready_readiness(monkeypatch, tmp_path):
+    for verdict in ("ready_for_live", "not_ready", None):  # the old aggregate verdict is not accepted either
+        h = Harness(monkeypatch, tmp_path)
+        h.run["readiness"] = {"verdict": verdict}
+        with pytest.raises(SystemExit, match="ready_for_preparation"):
+            h.cmd_run()
+        assert h.sent == [] and h.fake.calls == []
+    h = Harness(monkeypatch, tmp_path)
+    h.run["preparation"] = {"verdict": "not_ready"}
+    with pytest.raises(SystemExit, match="already holds"):
+        h.cmd_run()
+
+
+def test_readiness_reads_every_prerequisite_and_leaves_s_pending(monkeypatch, tmp_path):
+    h = Harness(monkeypatch, tmp_path)
+    failing = asyncio_run(check.check_prerequisites(type("Client", (), {"current_operation_id": 1})(), h.run, h.args,
+                                                    dict(ROUTE), "readiness"))
+    assert failing == []
+    entries = {e["condition"]: e for e in h.run["prerequisites"]}
+    assert list(entries) == list(check.PREREQUISITES)
+    assert entries["channel"]["holds"] is None and entries["channel"]["pending"] is True
+    assert all(entries[c]["holds"] is True for c in ("callback", "command", "route", "result"))
+    assert h.fake.state["created"] == []  # readiness creates no channel

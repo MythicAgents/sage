@@ -1,0 +1,157 @@
+{
+ "bot": {
+  "account_type": "bot",
+  "active": true,
+  "current_operation_id": 1,
+  "deleted": false,
+  "id": 2,
+  "username": "operation-chimera-bot"
+ },
+ "callback_row": {
+  "active": true,
+  "c2profileparametersinstances": [],
+  "display_id": 2,
+  "last_checkin": "2026-11-26T21:27:34.213766",
+  "payload": {
+   "payloadtype": {
+    "name": "apollo"
+   }
+  },
+  "tasks": []
+ },
+ "callback_row_observed_at": "2026-11-27T12:44:03.499754+00:00",
+ "channel": {
+  "ai_metadata": {
+   "config": {
+    "autonomous_solve": false,
+    "max_steps": 8,
+    "mode": "supervised",
+    "model": "bedrock-claude-4-6-sonnet",
+    "provider": "litellm"
+   }
+  },
+  "apitokens_id": 31,
+  "chat_container_id": 1,
+  "chat_model": "Sage",
+  "id": 53,
+  "locked": true,
+  "operation_id": 1
+ },
+ "container": {
+  "container_running": true,
+  "deleted": false,
+  "id": 1,
+  "name": "sage",
+  "type": "chat"
+ },
+ "gateway_probe": {
+  "container_env": [],
+  "custom_bundle": true,
+  "endpoints_after_dotenv": [
+   "API_ENDPOINT"
+  ],
+  "models": {
+   "bedrock-claude-4-6-sonnet": true,
+   "gpt-5.6-cyber": true
+  },
+  "source": ".env.local:API_KEY",
+  "status": 200,
+  "tls_verified": true
+ },
+ "installed_local": {
+  "api_endpoint_is_gateway": true,
+  "credentials": [
+   {
+    "block": "LiteLLM",
+    "name": "API_KEY"
+   }
+  ],
+  "endpoints": [
+   "API_ENDPOINT"
+  ],
+  "provider_keys": [
+   "provider",
+   "model",
+   "API_ENDPOINT",
+   "API_KEY"
+  ]
+ },
+ "observation": {
+  "attribute_limit": "Sage default (131072)",
+  "capture_mode": false,
+  "hidden": {
+   "hide_input_messages": false,
+   "hide_input_text": false,
+   "hide_inputs": false
+  }
+ },
+ "operation": {
+  "id": 1,
+  "name": "Operation Chimera"
+ },
+ "provenance": "Recorded M2 prerequisite inputs, names, identifiers, booleans and status codes only. callback_row: the retained timing row of callback 2 read from Mythic on 2026-11-27 12:44 UTC (_CALLBACK_LIVENESS_QUERY; only sleep tasks kept, there were none; Sage's readers called it dead). request_88_list_result: what the model-visible list_callbacks returned in attempt 1's request 88 (Phoenix span 299), host and user replaced by neutral names. channel, token, bot, container: attempt 1's actual channel S (53), its backing token (31), the operation bot (2) and the chat container (1), read back from Mythic on 2026-11-27. s_probe, gateway_probe, installed_local, secrets, observation: the check's own readers run against the deployed Sage container on 2026-11-27 for channel 53's settings. Alive callbacks, and every mutation of these shapes in the tests, are synthetic and labelled where used.",
+ "request_88_list_result": [
+  {
+   "agent": "apollo",
+   "host": "WORKSTATION-A",
+   "id": 2,
+   "integrity": 2,
+   "secs_since_checkin": 51521.206504,
+   "status": "dead",
+   "user": "lab.user"
+  }
+ ],
+ "s_probe": {
+  "container_env": [],
+  "effective": {
+   "api_key_present": true,
+   "autonomous_solve": false,
+   "endpoint_is_gateway": true,
+   "max_steps": 8,
+   "mode": "supervised",
+   "model": "bedrock-claude-4-6-sonnet",
+   "provider": "litellm"
+  },
+  "listed": true,
+  "sources": {
+   "api_endpoint": "environment",
+   "api_key": "environment",
+   "model": "ui-config",
+   "provider": "ui-config"
+  },
+  "status": 200,
+  "tls_verified": true
+ },
+ "secrets": {
+  "names": [],
+  "operator": 1,
+  "resolved": true
+ },
+ "token": {
+  "active": true,
+  "deleted": false,
+  "id": 31,
+  "operation_id": 1,
+  "operator_id": 2,
+  "scopes": [
+   "apitoken.read",
+   "apitoken.write",
+   "callback.read",
+   "chat-ai.read",
+   "chat-ai.write",
+   "credential.read",
+   "credential.write",
+   "eventlog.read",
+   "eventlog.write",
+   "file.read",
+   "file.write",
+   "operation.read",
+   "operator.read",
+   "payload.read",
+   "payload.write",
+   "response.read",
+   "task.read",
+   "task.write"
+  ]
+ }
+}

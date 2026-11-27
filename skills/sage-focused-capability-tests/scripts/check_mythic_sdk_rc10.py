@@ -9,6 +9,14 @@ behind its sign-in. One run file (JSON, owner-only) carries every stage. Credent
       owner-only file under the run's evidence directory (rollback: the `dev` image plus that copy), records the
       store's trace ids (count and digest) and the highest Mythic event-log id, and refuses if an unresolved
       `sage_on_start` warning exists (it would absorb P3's warning as a count).
+  baseline --run-file F [--baseline-wire W]
+      Read-only. M2's recorded baseline: retained request 85 (channel 50, callback 2, task 22, its task call), read from
+      Mythic's own rows (the task's response rows, terminal state and subtasks; the request's stored cards) and from the
+      receiver records 13534/13540 (the two card emissions) and 13588 (the follow-up carrying the formatted result),
+      original bytes. Binds every input to those IDs, correlates the emissions with the stored rows by request, call
+      and event ID, runs M2's three readers exactly as `evaluate` calls them, and runs the labelled controls (wrong
+      request, task, callback or call; the result on a sibling card; a missing response; a changed byte), each of which
+      must fail at its owning selector or reader. Inputs and report are kept owner-only in the evidence directory.
   readiness --run-file F --route-file R --phoenix-db P --callback N --bloodhound-channel C
       Read-only, after the deploy. Deployment parity; Sage consuming; no open requests; the container's installed set
       equals this branch's constraints; the Watcher's owner channel is bound to an active API token (Mythic refuses
@@ -24,12 +32,32 @@ behind its sign-in. One run file (JSON, owner-only) carries every stage. Credent
       with the Watcher's own key lists SAGE_WATCHER_MODEL, and Sage's own Watcher connect and scan reads succeed in
       the container; the repo .env.local's `# OpenAI`, `# Anthropic` and `# Bedrock`
       blocks hold their keys, and each is proved from this host (OpenAI and Anthropic: keyed verified-TLS model list;
-      Bedrock: ListInferenceProfiles names BEDROCK_MODEL). Verdict: ready_for_live, deployment_required or not_ready.
+      Bedrock: ListInferenceProfiles names BEDROCK_MODEL). M2's five prerequisites, each read afresh and recorded
+      with its reader, stage, time and result (`run["prerequisites"]`):
+        callback  active, and Sage's detailed liveness reader and its model-visible list_callbacks both report the
+                  exact callback N `alive` (never another callback in its place);
+        command   `whoami` is loaded on callback N;
+        channel   S as Mythic holds it (operation, running chat container, locked Sage channel, LiteLLM,
+                  SUPERVISED_MODEL, supervised, no autonomous solve, 8 steps) with its backing token active, undeleted
+                  and the operation bot's with Sage's channel scopes, and the same settings as Sage's own
+                  build_model_kwargs reads them in the deployed process;
+        route     the installed LiteLLM block is the only active one, S resolves through Sage's resolve_llm_profile to
+                  the gateway and key from the installed environment, a keyed GET /models there names SUPERVISED_MODEL,
+                  and no user secret shadows it;
+        result    the recorded baseline holds, Phoenix's newest tool-result span records text, and the deployed Sage
+                  traces in normal mode without hiding input messages.
+      S does not exist yet, so its channel condition is pending (its intended settings are checked). Verdict:
+      ready_for_preparation, deployment_required or not_ready; readiness never reports ready_for_live.
   run --run-file F --route-file R --phoenix-db P --callback N --bloodhound-channel C --plan PLAN
       --authorized-by TEXT --pip-audit BIN
-      Runs `sage-line check-attempt PLAN` and refuses on failure. Records A1 and the P1 probes, then the phases below,
+      Runs `sage-line check-attempt PLAN` and refuses on failure. Reads the callback again and refuses, changing and
+      sending nothing, unless it is still alive. Preparation then creates S, reads it back and reads all five
+      prerequisites on it; ready_for_live is recorded only when every one holds, otherwise the run refuses before any
+      prompt. Before M2 is sent all five are read again on the bound state; any failure leaves M2 unsent and stops the
+      set as a phase N readiness failure (`phase N not ready: before M2: ...`). Records A1 and the P1 probes, then the phases below,
       each request terminal before the next. Before each phase's first request the check waits until Mythic shows
-      the Sage container running and an on-start event from Sage newer than the phase's start. Stops on a second
+      the Sage container running and an on-start event from Sage newer than the phase's start (phase N's
+      container is the deployed one, so its readiness is the prerequisite reads above). Stops on a second
       target task, a limit, a wrong model or a failed phase proof; always restores and cleans up. No retries.
         N (normal mode, installed files as found): M1 C "List the callbacks..."; M2 S (SUPERVISED_MODEL) "Run whoami
           on callback N." (8 steps; first card accepted, any later card rejected); MCP1 `/bloodhound` then
@@ -105,7 +133,7 @@ Pass rules (frozen with the plan's live check; read once):
       `domain_info` and `cypher_query` each appear exactly once.
   L   Containment: at most 40 provider calls and 500,000 tokens across the set, one target task, 60 active minutes,
       every request sent once, no stop by the check, and both installed files restored byte for byte.
-Did not run: a criterion is recorded as not run (null), never as passed, only when the check itself stopped the set (a phase's credential proof or container readiness failed, or the check hit its own error):
+Did not run: a criterion is recorded as not run (null), never as passed, only when the check itself stopped the set (a phase's credential proof or container readiness failed, M2's prerequisites read before its send among them, or the check hit its own error):
 every criterion with a step never sent, or sent but cut off before Sage finished it (Mythic's rows show it neither
 complete nor error), P1 if only its later probes are missing, and L if the set stayed contained. A step Sage finished
 is judged from Mythic's rows as usual; a cut-off step's Phoenix window is left out of P2. The verdict is `fail` if any criterion that ran failed, else
@@ -119,6 +147,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import copy
 import hashlib
 import importlib.util
 import json
@@ -178,6 +208,16 @@ def _readers():
 
 def _deployment():
     return _module("sage_rc10_check_deployment", _DEPLOYMENT_PATH)
+
+
+def _mythic_tools():
+    """Sage's own callback liveness owners (``assess_callback_liveness``, ``MythicTools.list_callbacks``)."""
+    for path in (RUNTIME, RUNTIME / "ai" / "langgraph"):
+        if str(path) not in sys.path:
+            sys.path.insert(0, str(path))
+    import mythic_tools  # noqa: PLC0415 - the runtime is importable only once its paths are on sys.path
+
+    return mythic_tools
 
 
 # --------------------------------------------------------------------------------------------------
@@ -279,6 +319,23 @@ PHASE_HEADER = "# {block} (Mythic SDK rc10 check, phase {phase}; restored by the
 SHADOWING_SECRETS = ("API_KEY", "API_ENDPOINT", "provider", "model", "SAGE_OPENAI_API", "SAGE_REASONING_EFFORT",
                      "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_DEFAULT_REGION",
                      "SAGE_WATCHER_PROVIDER", "SAGE_WATCHER_MODEL", "SAGE_WATCHER_API_ENDPOINT", "SAGE_WATCHER_API_KEY")
+# M2's recorded baseline: retained request 85 of the gateway split-choices live check (2026-11-26), its task, the task's
+# two cards and the follow-up that carried the call's formatted result. M2's readers must hold on these originals, and
+# reject each labelled control, before a live M2 is read with them.
+BASELINE = {"request": 85, "channel": 50, "callback": 2, "task": 22, "call": "call_5f601fe4e27854b5b162eafadf25b743",
+            "lifecycle_seq": 13534, "card_seq": 13540, "follow_up_seq": 13588}
+BASELINE_WIRE = (REPO_ROOT / ".sage_history/2026/11/diagnostics/gateway-split-choices/20261126T210803Z-live-check"
+                 / "wire.jsonl")
+BASELINE_OWNERS = ("bind", "transport", "presentation", "annotation")
+# M2's prerequisites, each read afresh at its stage and recorded; preparation records ready_for_live only when all hold.
+PREREQUISITES = ("callback", "command", "channel", "route", "result")
+PREREQUISITE_STAGES = {"readiness": PREREQUISITES, "run_entry": ("callback",), "preparation": PREREQUISITES,
+                       "before_M2": PREREQUISITES}
+# Steps whose send waits on a fresh read of every prerequisite.
+PRECHECKED_STEPS = ("M2",)
+LIVENESS_FIELDS = ("display_id", "status", "alive", "seconds_since_checkin", "threshold_seconds", "sleep_source",
+                   "effective_sleep_seconds")
+TRACE_INPUT_FLAGS = ("hide_inputs", "hide_input_messages", "hide_input_text")
 
 CALLBACK_QUERY = """
 query SageRc10Callback($cb: Int!) { callback(where: {display_id: {_eq: $cb}}) { display_id active } }
@@ -317,9 +374,32 @@ query SageRc10OpenWarnings {
 }
 """
 MAX_EVENT_QUERY = "query SageRc10MaxEvent { operationeventlog(order_by: {id: desc}, limit: 1) { id } }"
-CHANNEL_QUERY = ("query SageRc10Channel($id: Int!) { chat_channel_by_pk(id: $id) { id chat_model locked ai_metadata "
-                 "apitokens_id } }")
-TOKEN_QUERY = "query SageRc10Token($id: Int!) { apitokens_by_pk(id: $id) { id active deleted } }"
+CHANNEL_QUERY = ("query SageRc10Channel($id: Int!) { chat_channel_by_pk(id: $id) { id operation_id chat_container_id "
+                 "chat_model locked ai_metadata apitokens_id } }")
+TOKEN_QUERY = ("query SageRc10Token($id: Int!) { apitokens_by_pk(id: $id) { id active deleted operator_id operation_id "
+               "scopes } }")
+# The command M2 asks for must be loaded on the selected callback (sage-live-runner chat_restoration_check's pattern).
+LOADED_COMMAND_QUERY = """
+query SageRc10LoadedCommand($cb: Int!) {
+  loadedcommands(where: {callback: {display_id: {_eq: $cb}}, command: {cmd: {_eq: "whoami"}}}) { id }
+}
+"""
+BASELINE_TASK_QUERY = """
+query SageRc10BaselineTask($task: Int!) {
+  task(where: {display_id: {_eq: $task}}) {
+    id display_id command_name completed status callback { display_id }
+    responses(order_by: {id: asc}) { id response_text }
+  }
+}
+"""
+BASELINE_ROWS_QUERY = """
+query SageRc10BaselineRows($rid: Int!) {
+  chat_message(where: {chat_request_id: {_eq: $rid}}, order_by: {id: asc}) {
+    id chat_request_id channel_id author_type message metadata tool_output
+  }
+  chat_request_by_pk(id: $rid) { id status channel_id }
+}
+"""
 
 
 # --------------------------------------------------------------------------------------------------
@@ -572,6 +652,347 @@ def phoenix_tool_result_blockers(result: dict[str, Any] | None) -> list[str]:
     if (result or {}).get("text") is True:
         return []
     return ["Phoenix's newest tool-result span does not record the result's text, so M2 cannot be read"]
+
+
+# --------------------------------------------------------------------------------------------------
+# M2's recorded baseline (pure; the same functions read the live record and its redacted offline copy)
+# --------------------------------------------------------------------------------------------------
+
+def wire_bodies(path: Path, sequences: Any) -> dict[int, dict[str, Any]]:
+    """The receiver's named records with each payload body decoded from its original bytes (read in place)."""
+    wanted, found = {int(seq) for seq in sequences}, {}
+    with path.open() as handle:
+        for line in handle:
+            record = json.loads(line)
+            if record.get("seq") not in wanted:
+                continue
+            payload = (record.get("record") or {}).get("payload") or {}
+            body = base64.b64decode(str(payload.get("body_base64") or ""))
+            found[int(record["seq"])] = {"kind": record.get("kind"), "routing_key": payload.get("routing_key"),
+                                         "url": payload.get("url"), "body_sha256": _sha256(body),
+                                         "body": json.loads(body)}
+    return found
+
+
+def _stored_cards(messages: list[dict[str, Any]], call_id: str) -> list[dict[str, Any]]:
+    return [m for m in messages if (_tool_card(m) or {}).get("tool_call_id") == call_id]
+
+
+def baseline_bind(binding: dict[str, Any], task: dict[str, Any], rows: dict[str, Any],
+                  wire: dict[int, dict[str, Any]]) -> tuple[list[str], str | None, dict[str, Any]]:
+    """The baseline's selector: every input belongs to the named request, channel, callback, task and call, and the
+    card emissions on the wire are the rows Mythic stored. Returns the problems, the formatted value the follow-up
+    carried for the call (``None`` when absent) and the correlation (identifiers and digests only)."""
+    readers = _readers()
+    request, channel, callback, task_id, call = (binding[k] for k in ("request", "channel", "callback", "task", "call"))
+    problems: list[str] = []
+    if task.get("display_id") != task_id:
+        problems.append(f"the task row is task {task.get('display_id')}, not {task_id}")
+    if (task.get("callback") or {}).get("display_id") != callback:
+        problems.append(f"the task ran on callback {(task.get('callback') or {}).get('display_id')}, not {callback}")
+    head = rows.get("request") or {}
+    if head.get("id") != request or head.get("channel_id") != channel:
+        problems.append(f"the request row is not request {request} on channel {channel}")
+    messages = rows.get("messages") or []
+    strays = [m.get("id") for m in messages if m.get("chat_request_id") != request or m.get("channel_id") != channel]
+    if not messages or strays:
+        problems.append(f"{len(strays)} of {len(messages)} stored row(s) belong to another request or channel")
+    correlation: dict[str, Any] = {}
+    lifecycle_id = f"mythic-task:{callback}:{task_id}"
+    for name, seq, card_id, field in (("lifecycle", binding["lifecycle_seq"], lifecycle_id, "output"),
+                                      ("call", binding["card_seq"], call, "result_preview")):
+        record = wire.get(seq) or {}
+        emitted = ((record.get("body") or {}).get("metadata") or {}).get("tool_use") or {}
+        if record.get("kind") != "control_request" or record.get("routing_key") != "chat_response":
+            problems.append(f"wire record {seq} is not a chat response")
+            continue
+        if (record.get("body") or {}).get("request_id") != request:
+            problems.append(f"wire record {seq} belongs to request {(record.get('body') or {}).get('request_id')}")
+        if emitted.get("tool_call_id") != card_id:
+            problems.append(f"wire record {seq} is not the {name} card {card_id}")
+        stored = _stored_cards(messages, card_id)
+        if len(stored) != 1:
+            problems.append(f"{len(stored)} stored {name} card(s) for {card_id}")
+            continue
+        card = _tool_card(stored[0]) or {}
+        if card.get("event_id") != emitted.get("event_id"):
+            problems.append(f"the stored {name} card is not wire record {seq}'s emission")
+        stored_value = stored[0].get("tool_output") if field == "output" else card.get("result_preview")
+        emitted_value = emitted.get(field)
+        if not isinstance(emitted_value, str) or stored_value != emitted_value:
+            problems.append(f"the stored {name} card's {field} differs from wire record {seq}")
+        correlation[name] = {"seq": seq, "message_id": stored[0].get("id"), "event_id": emitted.get("event_id"),
+                             **readers.digest(emitted_value if isinstance(emitted_value, str) else "")}
+    formatted = None
+    follow = wire.get(binding["follow_up_seq"]) or {}
+    tool_messages = [m for m in ((follow.get("body") or {}).get("messages") or [])
+                     if isinstance(m, dict) and m.get("role") == "tool" and m.get("tool_call_id") == call]
+    if follow.get("kind") != "model_request":
+        problems.append(f"wire record {binding['follow_up_seq']} is not a model request")
+    elif len(tool_messages) != 1 or not isinstance(tool_messages[0].get("content"), str):
+        problems.append(f"{len(tool_messages)} text tool message(s) for {call} in the follow-up")
+    else:
+        formatted = tool_messages[0]["content"]
+        correlation["follow_up"] = {"seq": binding["follow_up_seq"], **readers.digest(formatted)}
+    return problems, formatted, correlation
+
+
+def baseline_holds(binding: dict[str, Any], task: dict[str, Any], rows: dict[str, Any],
+                   wire: dict[int, dict[str, Any]]) -> dict[str, Any]:
+    """The bound record through M2's three readers, called exactly as ``evaluate`` calls them."""
+    readers = _readers()
+    problems, formatted, correlation = baseline_bind(binding, task, rows, wire)
+    reader_rows = {"messages": rows.get("messages") or [], "status": (rows.get("request") or {}).get("status")}
+    callback = binding["callback"]
+    result = {"bind": {"holds": not problems, "reasons": problems}, "correlation": correlation,
+              "transport": readers.transport_holds(task, reader_rows, callback=callback),
+              "presentation": readers.presentation_holds(formatted, reader_rows, str(binding["call"])),
+              "annotation": readers.annotation_holds(formatted, reader_rows, task, callback=callback)}
+    result["holds"] = all(result[owner]["holds"] for owner in BASELINE_OWNERS)
+    return result
+
+
+def _changed_byte(data: bytes) -> bytes:
+    middle = len(data) // 2
+    return data[:middle] + bytes([data[middle] ^ 0x01]) + data[middle + 1:] if data else b"\x00"
+
+
+def _control_wrong_request(b, t, r, w):
+    b["request"] += 1
+
+
+def _control_wrong_task(b, t, r, w):
+    b["task"] += 1
+
+
+def _control_another_task(b, t, r, w):
+    t["display_id"] += 1
+
+
+def _control_wrong_callback(b, t, r, w):
+    b["callback"] += 1
+
+
+def _control_wrong_call(b, t, r, w):
+    b["call"] = b["call"][:-1] + ("0" if b["call"][-1] != "0" else "1")
+
+
+def _control_sibling_copy(b, t, r, w):
+    """The formatted value on a sibling card while the call's own card carries something else."""
+    formatted = next(m["content"] for m in w[b["follow_up_seq"]]["body"]["messages"]
+                     if m.get("role") == "tool" and m.get("tool_call_id") == b["call"])
+    own = _stored_cards(r["messages"], b["call"])[0]
+    sibling = next(m for m in r["messages"] if _tool_card(m) and m is not own
+                   and not str(_tool_card(m).get("tool_call_id") or "").startswith("mythic-task:"))
+    _tool_card(sibling)["result_preview"], sibling["tool_output"] = formatted, ""
+    _tool_card(own)["result_preview"] = formatted[:-1]
+
+
+def _control_missing_response(b, t, r, w):
+    t["responses"] = []
+
+
+def _control_changed_row_byte(b, t, r, w):
+    row = t["responses"][0]
+    row["response_text"] = base64.b64encode(_changed_byte(base64.b64decode(row["response_text"]))).decode()
+
+
+def _control_changed_follow_up_byte(b, t, r, w):
+    message = next(m for m in w[b["follow_up_seq"]]["body"]["messages"]
+                   if m.get("role") == "tool" and m.get("tool_call_id") == b["call"])
+    message["content"] = _changed_byte(message["content"].encode()).decode("utf-8", "replace")
+
+
+# (name, the selector or reader that must reject it, mutation): every mutation is synthetic, applied to a copy.
+BASELINE_CONTROLS = (
+    ("wrong request", "bind", _control_wrong_request),
+    ("wrong task", "bind", _control_wrong_task),
+    ("another task's row", "transport", _control_another_task),
+    ("wrong callback", "transport", _control_wrong_callback),
+    ("wrong call", "presentation", _control_wrong_call),
+    ("identical output on a sibling card", "presentation", _control_sibling_copy),
+    ("missing response", "transport", _control_missing_response),
+    ("changed byte in a response row", "transport", _control_changed_row_byte),
+    ("changed byte in the follow-up", "presentation", _control_changed_follow_up_byte),
+)
+
+
+def baseline_report(binding: dict[str, Any], task: dict[str, Any], rows: dict[str, Any],
+                    wire: dict[int, dict[str, Any]]) -> dict[str, Any]:
+    """The recorded positive and its labelled controls. Holds only when all three readers hold on the bound originals
+    and every control fails at its owning selector or reader, which accepted the original (a reader that already
+    rejects the original proves nothing by rejecting a mutation of it)."""
+    positive = baseline_holds(binding, task, rows, wire)
+    controls = []
+    for name, owner, mutate in BASELINE_CONTROLS:
+        b, t, r, w = (copy.deepcopy(item) for item in (binding, task, rows, wire))
+        try:
+            mutate(b, t, r, w)
+            result = baseline_holds(b, t, r, w)
+            failing = [o for o in BASELINE_OWNERS if not result[o]["holds"]]
+            controls.append({"control": name, "owner": owner, "failing": failing,
+                             "rejected": not result["holds"] and owner in failing and positive[owner]["holds"]})
+        except (KeyError, IndexError, StopIteration, TypeError, ValueError) as error:
+            controls.append({"control": name, "owner": owner, "failing": [], "rejected": False,
+                             "error": f"could not apply ({type(error).__name__})"})
+    return {"binding": dict(binding), "positive": positive, "controls": controls,
+            "holds": positive["holds"] and all(c["rejected"] for c in controls)}
+
+
+# --------------------------------------------------------------------------------------------------
+# M2's prerequisites (pure evaluators; the readers that feed them are below)
+# --------------------------------------------------------------------------------------------------
+
+def callback_holds(callback: int, rows: Any, detailed: Any, listed: Any) -> dict[str, Any]:
+    """The selected callback is active and both of Sage's liveness readers call it alive: the detailed reader
+    (check_callback_alive's ``assess_callback_liveness``) and the model-visible ``list_callbacks``. A Sage service
+    callback (``taskable``), ``uncertain``, ``dead``, ``likely_crashed``, absence or disagreement fails."""
+    rows = [row for row in (rows or []) if isinstance(row, dict) and row.get("display_id") == callback]
+    detailed = detailed if isinstance(detailed, dict) else {}
+    entries = [e for e in listed if isinstance(e, dict) and e.get("id") == callback] if isinstance(listed, list) else []
+    reasons = []
+    if len(rows) != 1 or rows[0].get("active") is not True:
+        reasons.append(f"callback {callback} is not active in Mythic")
+    if detailed.get("display_id") != callback or detailed.get("status") != "alive" or detailed.get("alive") is not True:
+        reasons.append(f"the detailed liveness reader reports {detailed.get('status') or 'nothing'}")
+    listed_status = entries[0].get("status") if len(entries) == 1 else None
+    if listed_status != "alive":
+        reasons.append(f"list_callbacks reports {listed_status or 'no single row'} for callback {callback}")
+    observed = {"callback": callback, "active": rows[0].get("active") if len(rows) == 1 else None,
+                "detailed": {key: detailed.get(key) for key in LIVENESS_FIELDS},
+                "listed": {"status": listed_status,
+                           "secs_since_checkin": entries[0].get("secs_since_checkin") if len(entries) == 1 else None,
+                           "unchanged": isinstance(listed, dict) and listed.get("status") == "unchanged"}}
+    return {"holds": not reasons, "reasons": reasons, "observed": observed}
+
+
+def command_holds(callback: int, rows: Any) -> dict[str, Any]:
+    count = len(rows) if isinstance(rows, list) else None
+    return {"holds": bool(count), "reasons": [] if count else [f"whoami is not loaded on callback {callback}"],
+            "observed": {"callback": callback, "loaded_whoami": count}}
+
+
+def s_config_reasons(config: Any, route: dict[str, str]) -> list[str]:
+    """S's stored settings as Mythic holds them: the supervised route, no autonomy, room for its card, no key."""
+    config = config if isinstance(config, dict) else {}
+    reasons = []
+    if str(config.get("provider") or "").strip().casefold() != "litellm":
+        reasons.append(f"S's provider is {config.get('provider')!r}, not 'litellm'")
+    if config.get("model") != route["SUPERVISED_MODEL"]:
+        reasons.append(f"S's model is {config.get('model')!r}, not SUPERVISED_MODEL")
+    if str(config.get("mode") or "").strip().casefold() != "supervised":
+        reasons.append(f"S's mode is {config.get('mode')!r}, not 'supervised'")
+    if config.get("autonomous_solve") is not False:
+        reasons.append("S's autonomous_solve is not false")
+    if config.get("max_steps") != SUPERVISED_MAX_STEPS:
+        reasons.append(f"S's max_steps is {config.get('max_steps')!r}, not {SUPERVISED_MAX_STEPS}")
+    if any(config.get(key) for key in ("API_KEY", "API_ENDPOINT", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")):
+        reasons.append("S carries a provider key or endpoint")
+    return reasons
+
+
+def effective_policy_reasons(probe: dict[str, Any] | None, route: dict[str, str]) -> list[str]:
+    """What Sage's own ``build_model_kwargs`` makes of S's settings in the deployed process."""
+    effective = (probe or {}).get("effective") if isinstance((probe or {}).get("effective"), dict) else {}
+    if not effective:
+        return [f"Sage could not resolve S's settings ({(probe or {}).get('error') or 'no report'})"]
+    expected = {"provider": "litellm", "model": route["SUPERVISED_MODEL"], "mode": "supervised",
+                "autonomous_solve": False, "max_steps": SUPERVISED_MAX_STEPS}
+    return [f"Sage resolves S's {key} to {effective.get(key)!r}, not {value!r}"
+            for key, value in expected.items() if effective.get(key) != value]
+
+
+def channel_holds(channel: dict[str, Any], token: dict[str, Any], bot: dict[str, Any], container: dict[str, Any],
+                  operation_id: Any, token_active: Any, probe: dict[str, Any] | None,
+                  route: dict[str, str]) -> dict[str, Any]:
+    """The actual S read back from Mythic, its backing token and Sage's effective reading of its settings."""
+    nc = _base().nc
+    metadata = channel.get("ai_metadata") if isinstance(channel.get("ai_metadata"), dict) else {}
+    reasons = []
+    if not channel.get("id"):
+        reasons.append("S was not found in Mythic")
+    if channel.get("operation_id") != operation_id:
+        reasons.append("S is not in the check's operation")
+    if channel.get("chat_container_id") != (container or {}).get("id"):
+        reasons.append("S is not bound to the running Sage chat container")
+    if channel.get("chat_model") != "Sage" or channel.get("locked") is not True:
+        reasons.append("S is not a locked Sage channel")
+    reasons += s_config_reasons(metadata.get("config"), route)
+    if token_active is not True:
+        reasons.append("S's backing token is not active and undeleted")
+    usable = nc.usable_bot_tokens([token] if token else [], operator_id=(bot or {}).get("id"), operation_id=operation_id)
+    if not token or token.get("id") != channel.get("apitokens_id") or not usable:
+        reasons.append("S's backing token is not the operation bot's token with Sage's channel scopes")
+    reasons += effective_policy_reasons(probe, route)
+    observed = {"channel": channel.get("id"), "operation": channel.get("operation_id"),
+                "container": channel.get("chat_container_id"), "running_container": (container or {}).get("id"),
+                "chat_model": channel.get("chat_model"), "locked": channel.get("locked"),
+                "token": token.get("id") if token else None, "token_operator": (token or {}).get("operator_id"),
+                "token_operation": (token or {}).get("operation_id"), "token_active": token_active,
+                "bot": (bot or {}).get("id"), "scopes": sorted(nc._scopes(token)) if token else [],
+                "effective": (probe or {}).get("effective")}
+    return {"holds": not reasons, "reasons": reasons, "observed": observed}
+
+
+def intended_channel(probe: dict[str, Any] | None, route: dict[str, str]) -> dict[str, Any]:
+    """Readiness, before S exists: the settings the run will create S with, read as Sage reads them. Pending, never
+    holding: only the actual S read back during the run's preparation can make M2 ready_for_live."""
+    reasons = s_config_reasons(channel_config(route, "S")["config"], route) + effective_policy_reasons(probe, route)
+    return {"holds": False if reasons else None, "pending": not reasons, "reasons": reasons,
+            "observed": {"intended": True, "effective": (probe or {}).get("effective")}}
+
+
+def route_holds(local: dict[str, Any], gateway: dict[str, Any], probe: dict[str, Any] | None,
+                secrets: dict[str, Any], route: dict[str, str]) -> dict[str, Any]:
+    """S's effective provider route in the deployed process: the installed LiteLLM block is the only active one and the
+    gateway lists both models with its key (the existing proof), S resolves to that gateway and key through Sage's
+    ``resolve_llm_profile`` with its own provider and model, its keyed listing names SUPERVISED_MODEL, and no user
+    secret shadows any of it. Source labels, names and status codes only."""
+    probe = probe or {}
+    sources = probe.get("sources") if isinstance(probe.get("sources"), dict) else {}
+    effective = probe.get("effective") if isinstance(probe.get("effective"), dict) else {}
+    reasons = gateway_blockers(local, gateway, route)
+    if probe.get("error") or not effective:
+        reasons.append(f"S's route was not resolved in the deployed process ({probe.get('error') or 'no report'})")
+    if probe.get("container_env"):
+        reasons.append("the container environment sets a key or endpoint")
+    if effective.get("provider") != "litellm" or effective.get("model") != route["SUPERVISED_MODEL"]:
+        reasons.append("S does not resolve to the LiteLLM provider and SUPERVISED_MODEL")
+    if sources.get("provider") != "ui-config" or sources.get("model") != "ui-config":
+        reasons.append("S's provider or model does not come from its own settings")
+    if effective.get("endpoint_is_gateway") is not True or sources.get("api_endpoint") != "environment":
+        reasons.append("S's endpoint is not the route's gateway from the installed environment")
+    if effective.get("api_key_present") is not True or sources.get("api_key") != "environment":
+        reasons.append("S's key does not come from the installed environment")
+    if probe.get("status") != 200 or probe.get("listed") is not True or probe.get("tls_verified") is not True:
+        reasons.append("S's keyed model listing did not return 200 with SUPERVISED_MODEL")
+    if not secrets.get("resolved"):
+        reasons.append("the run operator's user secrets could not be resolved")
+    elif set(secrets.get("names") or []) & set(SHADOWING_SECRETS):
+        reasons.append("a user secret would shadow S's provider settings")
+    observed = {"sources": sources, "effective": effective, "status": probe.get("status"),
+                "listed": probe.get("listed"), "gateway_status": gateway.get("status"),
+                "installed_credentials": [c.get("name") for c in local.get("credentials") or []],
+                "secret_names": secrets.get("names")}
+    return {"holds": not reasons, "reasons": reasons, "observed": observed}
+
+
+def result_holds(baseline: dict[str, Any] | None, tool_results: dict[str, Any] | None,
+                 observation: dict[str, Any] | None) -> dict[str, Any]:
+    """M2's result can be observed: the recorded baseline holds, Phoenix's newest tool-result span records text, and
+    the deployed Sage traces in normal mode without hiding the follow-up's input messages."""
+    observation = observation or {}
+    hidden = observation.get("hidden") if isinstance(observation.get("hidden"), dict) else {}
+    reasons = [] if (baseline or {}).get("holds") is True else ["the recorded baseline does not hold"]
+    reasons += phoenix_tool_result_blockers(tool_results)
+    if observation.get("error") or observation.get("capture_mode") is not False:
+        reasons.append("the deployed Sage would trace in capture mode, which keeps no span content")
+    if set(hidden) != set(TRACE_INPUT_FLAGS) or any(hidden.values()):
+        reasons.append("the deployed Sage's tracing would hide the follow-up's input messages")
+    observed = {"baseline_holds": (baseline or {}).get("holds"), "tool_result_span": (tool_results or {}).get("span"),
+                "capture_mode": observation.get("capture_mode"), "hidden": hidden,
+                "attribute_limit": observation.get("attribute_limit")}
+    return {"holds": not reasons, "reasons": reasons, "observed": observed}
 
 
 def m2_generations(db: Path, after: int, until: int) -> list[dict[str, Any]]:
@@ -1262,6 +1683,234 @@ def record_a1(pip_audit: str) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------------------------------
+# M2's prerequisites and recorded baseline (read-only readers)
+# --------------------------------------------------------------------------------------------------
+
+# Inside the container with Sage's own dotenv loader: what Sage's ``build_model_kwargs`` and ``resolve_llm_profile`` make
+# of S's settings (argv[1], no secret values), and a keyed, non-inference listing at the endpoint with the key they
+# resolve. Names, booleans, source labels and the status code only.
+_S_ROUTE_PROBE = r"""
+import json, os, ssl, sys
+ROOT = os.environ.get("SAGE_RC10_PROBE_ROOT") or "/Mythic"
+sys.path.insert(0, ROOT)
+NAMES = ("API_KEY", "OPENAI_API_KEY", "API_ENDPOINT", "OPENAI_API_BASE", "OPENAI_BASE_URL", "LANGSMITH_GATEWAY")
+out = {"container_env": sorted(n for n in NAMES if os.environ.get(n)), "status": None, "listed": False,
+       "tls_verified": False}
+try:
+    from dotenv_bootstrap import load_sage_dotenv
+    load_sage_dotenv(ROOT)
+    from mythic_container.ChatBase import ChatRequest
+    from sage_chat.config import build_model_kwargs, resolve_llm_profile
+    config, gateway, model = json.loads(sys.argv[1]), sys.argv[2], sys.argv[3]
+    request = ChatRequest(config=config, secrets={})
+    profile, kwargs = resolve_llm_profile(request), build_model_kwargs(request)
+    sources = dict(profile.sources)
+    out["effective"] = {"provider": kwargs["provider"], "model": kwargs["model"], "mode": kwargs["mode"],
+                        "autonomous_solve": kwargs["autonomous_solve"], "max_steps": kwargs["max_steps"],
+                        "endpoint_is_gateway": profile.api_endpoint.rstrip("/") == gateway.rstrip("/"),
+                        "api_key_present": bool(profile.api_key)}
+    out["sources"] = {f: sources.get(f, "default") for f in ("provider", "model", "api_endpoint", "api_key")}
+    if profile.api_endpoint and profile.api_key:
+        import httpx
+        from ssl_bootstrap import configure_sage_ssl_cert_file
+        bundle = configure_sage_ssl_cert_file()
+        context = ssl.create_default_context(cafile=bundle) if bundle else ssl.create_default_context()
+        response = httpx.get(profile.api_endpoint.rstrip("/") + "/models", timeout=20, verify=context,
+                             headers={"Authorization": "Bearer " + profile.api_key})
+        out["status"] = response.status_code
+        listed = {row.get("id") for row in (response.json().get("data") or [])} if response.status_code == 200 else set()
+        out["listed"], out["tls_verified"] = model in listed, True
+except Exception as error:
+    out["error"] = type(error).__name__
+print(json.dumps(out))
+"""
+
+# Inside the container with Sage's own dotenv loader: whether Sage would trace in capture mode (main.py: a set
+# SAGE_OBSERVATION_DIRECTORY hides every span's content) and what OpenInference's default TraceConfig, which normal mode
+# instruments with, would hide from inputs. Names and booleans only.
+_OBSERVATION_PROBE = r"""
+import json, os, sys
+ROOT = os.environ.get("SAGE_RC10_PROBE_ROOT") or "/Mythic"
+sys.path.insert(0, ROOT)
+out = {}
+try:
+    from dotenv_bootstrap import load_sage_dotenv
+    load_sage_dotenv(ROOT)
+    out["capture_mode"] = bool(os.environ.get("SAGE_OBSERVATION_DIRECTORY"))
+    out["attribute_limit"] = os.environ.get("OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT") or "Sage default (131072)"
+    from openinference.instrumentation import TraceConfig
+    config = TraceConfig()
+    out["hidden"] = {name: bool(getattr(config, name)) for name in sys.argv[1:]}
+except Exception as error:
+    out["error"] = type(error).__name__
+print(json.dumps(out))
+"""
+
+
+def _container_json(script: str, *argv: str, timeout: int = 90) -> dict[str, Any]:
+    completed = subprocess.run(["docker", "exec", "-w", "/Mythic", "sage", "python3", "-c", script, *argv],
+                               capture_output=True, text=True, timeout=timeout)
+    try:
+        return json.loads(completed.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {"error": "probe did not report", "returncode": completed.returncode}
+
+
+def s_route_probe(config: dict[str, Any], route: dict[str, str]) -> dict[str, Any]:
+    return _container_json(_S_ROUTE_PROBE, json.dumps(config), route["GATEWAY_ENDPOINT"], route["SUPERVISED_MODEL"])
+
+
+def observation_probe() -> dict[str, Any]:
+    return _container_json(_OBSERVATION_PROBE, *TRACE_INPUT_FLAGS, timeout=60)
+
+
+async def read_callback(client: Any, callback: int) -> dict[str, Any]:
+    tools = _mythic_tools()
+    rows = (await _base()._query(client, CALLBACK_QUERY, cb=callback)).get("callback") or []
+    detailed = await tools.assess_callback_liveness(client, callback)
+    reader = tools.MythicTools()  # a fresh reader: list_callbacks' re-read guard counts per instance
+    reader.client = client
+    listed = json.loads(await reader.list_callbacks())
+    return callback_holds(callback, rows, detailed, listed)
+
+
+async def read_command(client: Any, callback: int) -> dict[str, Any]:
+    return command_holds(callback, (await _base()._query(client, LOADED_COMMAND_QUERY, cb=callback)).get(
+        "loadedcommands"))
+
+
+async def read_channel(client: Any, channel_id: int) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any],
+                                                               dict[str, Any], Any]:
+    """S, its backing token, the operation bot and the running chat container, as Mythic holds them now."""
+    base = _base()
+    channel = (await base._query(client, CHANNEL_QUERY, id=int(channel_id))).get("chat_channel_by_pk") or {}
+    token = ((await base._query(client, TOKEN_QUERY, id=int(channel["apitokens_id"]))).get("apitokens_by_pk") or {}
+             if channel.get("apitokens_id") else {})
+    bot = await base.nc.resolve_operation_bot(client)
+    container = base.nc.select_chat_container(await base._query(client, base.nc.READINESS_QUERY))
+    return channel, token, bot, container, await channel_token_active(client, channel)
+
+
+async def collect_baseline(client: Any, run: dict[str, Any], wire_path: Path,
+                           binding: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Read the baseline's originals in place (Mythic's task rows and stored cards, the receiver's records), keep them
+    owner-only under the run's evidence directory, and return the report (identifiers and digests only)."""
+    base, binding = _base(), dict(binding or BASELINE)
+    observed_at = time.time()
+    tasks = (await base._query(client, BASELINE_TASK_QUERY, task=binding["task"])).get("task") or []
+    task = tasks[0] if len(tasks) == 1 else {}
+    if type(task.get("id")) is int:
+        subtasks = (await base._query(client, SUBTASKS_QUERY, task_id=task["id"])).get("task")
+        task["subtask_count"] = len(subtasks) if isinstance(subtasks, list) else None
+    data = await base._query(client, BASELINE_ROWS_QUERY, rid=binding["request"])
+    rows = {"messages": data.get("chat_message") or [], "request": data.get("chat_request_by_pk") or {}}
+    sequences = (binding["lifecycle_seq"], binding["card_seq"], binding["follow_up_seq"])
+    wire = wire_bodies(wire_path, sequences) if wire_path.is_file() else {}
+    report = baseline_report(binding, task, rows, wire)
+    report.update(observed_at=observed_at, wire=str(wire_path), wire_records=sorted(wire), tasks_found=len(tasks),
+                  stored_rows=[m.get("id") for m in rows["messages"]])
+    follow = wire.get(binding["follow_up_seq"]) or {}
+    kept = {"binding": binding, "observed_at": observed_at,
+            "queries": ["SageRc10BaselineTask", "SageRc10Subtasks", "SageRc10BaselineRows"], "task": task,
+            "rows": rows, "wire": str(wire_path),
+            "wire_records": {seq: record for seq, record in wire.items() if seq != binding["follow_up_seq"]},
+            "follow_up": {"body_sha256": follow.get("body_sha256"), "url": follow.get("url"),
+                          "tool_messages": [m for m in ((follow.get("body") or {}).get("messages") or [])
+                                            if isinstance(m, dict) and m.get("tool_call_id") == binding["call"]]},
+            "report": report}
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(observed_at))
+    target = evidence_dir(run) / f"baseline-{stamp}.json"
+    target.write_text(json.dumps(kept, indent=2, sort_keys=True, default=str) + "\n")
+    os.chmod(target, 0o600)
+    report["evidence"] = str(target)
+    return report
+
+
+async def check_prerequisites(client: Any, run: dict[str, Any], args: argparse.Namespace, route: dict[str, str],
+                              stage: str, channel_id: int | None = None) -> list[str]:
+    """Read each of the stage's prerequisites afresh, record condition, reader, stage, time and result in
+    ``run["prerequisites"]``, and return the failing ones' reasons (empty when every one holds or, at readiness, is
+    pending). A reader that raises is a failed condition, never a pass. No prompt, task or channel change."""
+    callback = int(args.callback)
+    record = run.setdefault("prerequisites", [])
+    failing: list[str] = []
+    channel: dict[str, Any] = {}
+
+    async def read(condition: str, reader: str, produce) -> dict[str, Any]:
+        observed_at = time.time()
+        try:
+            result = await produce()
+        except Exception as error:  # noqa: BLE001 - an unreadable prerequisite blocks; it never passes
+            result = {"holds": False, "reasons": [f"{reader} failed ({type(error).__name__})"]}
+        entry = {"stage": stage, "condition": condition, "reader": reader, "observed_at": observed_at, **result}
+        record.append(entry)
+        if entry.get("holds") is False:
+            failing.append(f"{condition}: {'; '.join(entry.get('reasons') or ['failed'])}")
+        return entry
+
+    conditions = PREREQUISITE_STAGES[stage]
+    if "callback" in conditions:
+        await read("callback", "assess_callback_liveness + list_callbacks", lambda: read_callback(client, callback))
+    if "command" in conditions:
+        await read("command", "loadedcommands", lambda: read_command(client, callback))
+    if "channel" in conditions:
+        async def channel_condition() -> dict[str, Any]:
+            if channel_id is None:
+                return intended_channel(s_route_probe(channel_config(route, "S")["config"], route), route)
+            channel["row"], token, bot, container, active = await read_channel(client, channel_id)
+            channel["probe"] = s_route_probe(((channel["row"].get("ai_metadata") or {}).get("config")) or {}, route)
+            return channel_holds(channel["row"], token, bot, container, client.current_operation_id, active,
+                                 channel["probe"], route)
+
+        await read("channel", "chat_channel + apitokens + build_model_kwargs", channel_condition)
+    if "route" in conditions:
+        async def route_condition() -> dict[str, Any]:
+            installed = Path(_deployment()._installed_service_dir()) / ".env.local"
+            local = _split().dotenv_state(installed.read_text() if installed.exists() else "",
+                                          route["GATEWAY_ENDPOINT"])
+            probe = channel.get("probe")
+            if probe is None:  # readiness: S's intended settings; the run reads S's own
+                probe = s_route_probe(channel_config(route, "S")["config"], route)
+            return route_holds(local, gateway_probe(route), probe, await _split()._operator_secret_names(client),
+                               route)
+
+        await read("route", "resolve_llm_profile + keyed model listing", route_condition)
+    if "result" in conditions:
+        async def result_condition() -> dict[str, Any]:
+            baseline = await collect_baseline(client, run, Path(args.baseline_wire))
+            run["baseline"] = baseline
+            phoenix = Path(args.phoenix_db)
+            tool_results = (phoenix_records_tool_results(phoenix) if phoenix.is_file()
+                            else {"span": None, "text": False})
+            return result_holds(baseline, tool_results, observation_probe())
+
+        await read("result", "baseline + Phoenix tool-result span + TraceConfig", result_condition)
+    return failing
+
+
+async def prepare_live(client: Any, run: dict[str, Any], args: argparse.Namespace, route: dict[str, str]) -> str:
+    """The run's preparation: create S, read it back, and read every prerequisite on it. Records ready_for_live only
+    when all hold; otherwise returns why, and the run sends nothing."""
+    run["preparation"] = {"started_at": time.time()}
+    try:
+        created = await _base().nc.create_locked_channel(
+            client, name="rc10 live check S", description="Sage Mythic SDK rc10 live check",
+            metadata=channel_config(route, "S"))
+        run.setdefault("channels", {})["S"] = int(created["chat_channel_id"])
+    except Exception as error:  # noqa: BLE001 - recorded; nothing is sent
+        run["preparation"].update(verdict="not_ready", error=type(error).__name__)
+        return f"preparation: channel S was not created ({type(error).__name__})"
+    failing = await check_prerequisites(client, run, args, route, "preparation", channel_id=run["channels"]["S"])
+    run["preparation"].update(finished_at=time.time(), verdict="not_ready" if failing else "ready_for_live")
+    return ("preparation: " + "; ".join(failing)) if failing else ""
+
+
+async def cmd_baseline(client: Any, run: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    run["baseline"] = await collect_baseline(client, run, Path(args.baseline_wire))
+    return run["baseline"]
+
+
+# --------------------------------------------------------------------------------------------------
 # Stages
 # --------------------------------------------------------------------------------------------------
 
@@ -1351,8 +2000,12 @@ async def cmd_readiness(client: Any, run: dict[str, Any], args: argparse.Namespa
         blockers.append("open chat requests")
     if report["container_packages"]["differing_from_constraints"]:
         blockers.append("container packages differ from this branch's constraints")
-    if not report["callback_active"]:
-        blockers.append("the callback is not active")
+    # M2's prerequisites, each read afresh (the callback by Sage's own liveness readers, not the active flag alone).
+    # S does not exist yet, so its channel condition stays pending and readiness can report only
+    # ready_for_preparation; the run's preparation creates S and must find every condition holding on it.
+    blockers += [f"prerequisite {reason}" for reason in
+                 await check_prerequisites(client, run, args, route, "readiness")]
+    report["prerequisites"] = [entry for entry in run["prerequisites"] if entry["stage"] == "readiness"][-5:]
     watcher = report["watcher"]
     if not (watcher.get("profile_present") and watcher.get("paused") is True
             and watcher.get("owner_channel_model") == "Sage Watcher" and watcher.get("owner_locked")):
@@ -1379,7 +2032,8 @@ async def cmd_readiness(client: Any, run: dict[str, Any], args: argparse.Namespa
         blockers.append("the run operator's user secrets could not be resolved")
     elif set(secrets.get("names") or []) & set(SHADOWING_SECRETS):
         blockers.append("a user secret would shadow the installed provider settings")
-    verdict = "deployment_required" if not report["parity"]["ready"] else ("not_ready" if blockers else "ready_for_live")
+    verdict = ("deployment_required" if not report["parity"]["ready"]
+               else ("not_ready" if blockers else "ready_for_preparation"))
     report["blockers"], report["verdict"] = blockers, verdict
     run.setdefault("readiness_history", []).append({"at": time.time(), "verdict": verdict, "blockers": blockers})
     run["readiness"] = report
@@ -1604,16 +2258,24 @@ async def cmd_cleanup(client: Any, run: dict[str, Any], args: argparse.Namespace
 
 
 async def cmd_run(client: Any, run: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
-    if (run.get("readiness") or {}).get("verdict") != "ready_for_live":
-        raise SystemExit("readiness has not reported ready_for_live in this run file")
-    if run.get("requests"):
-        raise SystemExit("this run file already holds an attempt; a new attempt needs a new run file")
+    if (run.get("readiness") or {}).get("verdict") != "ready_for_preparation":
+        raise SystemExit("readiness has not reported ready_for_preparation in this run file")
+    if run.get("requests") or run.get("preparation"):
+        raise SystemExit("this run file already holds an attempt or a preparation; a new attempt needs a new run file")
     gate = subprocess.run(["sage-line", "check-attempt", args.plan], capture_output=True, text=True)
     if gate.returncode != 0:
         raise SystemExit(f"sage-line check-attempt refused: {gate.stdout.strip()} {gate.stderr.strip()}".strip())
     base = _base()
     route = read_route(Path(args.route_file))
     phoenix = Path(args.phoenix_db)
+    # A saved green readiness is not reused: the selected callback is read again before anything changes or is sent.
+    failing = await check_prerequisites(client, run, args, route, "run_entry")
+    if failing:
+        raise SystemExit(f"run entry: {'; '.join(failing)}; nothing was changed or sent")
+    # Preparation: S is created and read back, and every prerequisite is read on it, before any provider prompt.
+    failure = await prepare_live(client, run, args, route)
+    if failure:
+        raise SystemExit(f"{failure}; no prompt was sent")
     installed = Path(_deployment()._installed_service_dir())
     evidence = evidence_dir(run)
     backups = {}
@@ -1630,7 +2292,7 @@ async def cmd_run(client: Any, run: dict[str, Any], args: argparse.Namespace) ->
     run.update(authorized_by=args.authorized_by, callback=int(args.callback),
                bloodhound_channel=int(args.bloodhound_channel), started_at=time.time(),
                task_baseline=await base._max_task(client), phoenix_start=base.phoenix_mark(phoenix),
-               requests={}, channels={}, phases=[], a1=record_a1(args.pip_audit),
+               requests={}, channels=dict(run.get("channels") or {}), phases=[], a1=record_a1(args.pip_audit),
                p1={"listeners": ss_listeners(), "graphql_unauthenticated": graphql_unauthenticated(args.phoenix_url),
                    "healthz": [http_status(args.phoenix_url.rstrip("/") + "/healthz")]})
     profile = watcher_profile(client.current_operation_id)
@@ -1661,6 +2323,14 @@ async def cmd_run(client: Any, run: dict[str, Any], args: argparse.Namespace) ->
                             metadata=channel_config(route, key, bloodhound if key == "H" else None))
                         run["channels"][key] = int(created["chat_channel_id"])
                     channel_id = run["channels"][key]
+                if name in PRECHECKED_STEPS:
+                    # Every prerequisite is read again on the bound state; any change leaves the step unsent.
+                    failing = await check_prerequisites(client, run, args, route, f"before_{name}",
+                                                        channel_id=channel_id)
+                    if failing:
+                        run["stopped"] = {"step": name,
+                                          "reason": f"phase {step_phase} not ready: before {name}: {'; '.join(failing)}"}
+                        break
                 await _send(client, run, name, channel_id, prompt.format(callback=int(args.callback)),
                             cards=cards, timeout=timeout)
             except Exception as error:  # noqa: BLE001 - the check's own failure is recorded, not raised past cleanup
@@ -1769,8 +2439,8 @@ async def _main(args: argparse.Namespace) -> int:
     run_file = Path(args.run_file)
     run = _load(run_file)
     client = await _base().nc.login()
-    handlers = {"snapshot": cmd_snapshot, "readiness": cmd_readiness, "run": cmd_run, "cleanup": cmd_cleanup,
-                "verify": cmd_verify}
+    handlers = {"snapshot": cmd_snapshot, "baseline": cmd_baseline, "readiness": cmd_readiness, "run": cmd_run,
+                "cleanup": cmd_cleanup, "verify": cmd_verify}
     try:
         result = await handlers[args.command](client, run, args)
     finally:
@@ -1782,7 +2452,7 @@ async def _main(args: argparse.Namespace) -> int:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("snapshot", "readiness", "run", "cleanup", "verify", "_receive"):
+    for name in ("snapshot", "baseline", "readiness", "run", "cleanup", "verify", "_receive"):
         command = sub.add_parser(name)
         if name == "_receive":
             command.add_argument("--record", required=True)
@@ -1799,6 +2469,9 @@ def _parser() -> argparse.ArgumentParser:
             command.add_argument("--bloodhound-channel", required=True, type=int)
         if name in ("readiness", "run", "cleanup"):
             command.add_argument("--phoenix-url", default="http://127.0.0.1:6006")
+        if name in ("baseline", "readiness", "run"):
+            command.add_argument("--baseline-wire", default=str(BASELINE_WIRE),
+                                 help="the receiver record holding M2's recorded baseline (request 85)")
         if name == "run":
             command.add_argument("--plan", required=True)
             command.add_argument("--authorized-by", required=True)

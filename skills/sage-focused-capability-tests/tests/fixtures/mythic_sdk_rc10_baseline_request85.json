@@ -1,0 +1,406 @@
+{
+ "binding": {
+  "call": "call_5f601fe4e27854b5b162eafadf25b743",
+  "callback": 2,
+  "card_seq": 13540,
+  "channel": 50,
+  "follow_up_seq": 13588,
+  "lifecycle_seq": 13534,
+  "request": 85,
+  "task": 22
+ },
+ "original": {
+  "response 25": {
+   "bytes": 81,
+   "newlines_at": [
+    76
+   ],
+   "response_text_chars": 109,
+   "sha256": "063c546e0b40bc0a8fc4fb46bdc04476a835c841b1ebee06a0c62c3b5ef3f952"
+  },
+  "stored 869 result_preview": {
+   "bytes": 263,
+   "sha256": "d8170cf44e87e2d5420f162e714f5f2c9a9d7ceb0e8f3bc84d9e40ea07c81ee2"
+  },
+  "stored 869 tool_output": {
+   "bytes": 0,
+   "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "stored 873 result_preview": {
+   "bytes": 81,
+   "sha256": "063c546e0b40bc0a8fc4fb46bdc04476a835c841b1ebee06a0c62c3b5ef3f952"
+  },
+  "stored 873 tool_output": {
+   "bytes": 81,
+   "sha256": "063c546e0b40bc0a8fc4fb46bdc04476a835c841b1ebee06a0c62c3b5ef3f952"
+  },
+  "wire 13534 body": {
+   "sha256": "14a3286d863ede7ceab780f9590af92eb11dc6f904ff67056c34d419cc3a820f"
+  },
+  "wire 13534 output": {
+   "bytes": 81,
+   "sha256": "063c546e0b40bc0a8fc4fb46bdc04476a835c841b1ebee06a0c62c3b5ef3f952"
+  },
+  "wire 13534 result_preview": {
+   "bytes": 81,
+   "sha256": "063c546e0b40bc0a8fc4fb46bdc04476a835c841b1ebee06a0c62c3b5ef3f952"
+  },
+  "wire 13540 body": {
+   "sha256": "221b4c2a206f3a0f81e2c299578bdd96d9647c4ee355f1b74066d5de89a0a964"
+  },
+  "wire 13540 result_preview": {
+   "bytes": 263,
+   "sha256": "d8170cf44e87e2d5420f162e714f5f2c9a9d7ceb0e8f3bc84d9e40ea07c81ee2"
+  },
+  "wire 13588 body": {
+   "sha256": "d4cbdf12a0324f4e5d00e55c84d7411bd8667b0eb36ca6b5a3df16f25b23da50"
+  },
+  "wire 13588 tool message": {
+   "bytes": 263,
+   "sha256": "d8170cf44e87e2d5420f162e714f5f2c9a9d7ceb0e8f3bc84d9e40ea07c81ee2"
+  }
+ },
+ "provenance": "M2's recorded baseline, reduced from Sage's private baseline evidence of 1795786952 (epoch seconds), read in place from Mythic (queries SageRc10BaselineTask, SageRc10Subtasks, SageRc10BaselineRows: task 22's own response rows, state and subtask count; request 85's stored chat_message rows) and from the gateway split-choices live check capture of 2026-11-26 (receiver records 13534, 13540, 13588, original bytes). The response row is Mythic's, not rebuilt from a card. Transformations: the lab account name is replaced everywhere by LAB\\lab.user, keeping every stage's relation; the response row is re-encoded as Mythic returns it (base64 wrapped at 76 characters); sibling tool cards keep their identity, status and event fields with neutral bodies; text rows are dropped; the follow-up keeps only the call's tool message and a neutral gateway host. Original lengths and SHA-256 of each compared value are under 'original'.",
+ "rows": {
+  "messages": [
+   {
+    "author_type": "ai",
+    "channel_id": 50,
+    "chat_request_id": 85,
+    "id": 856,
+    "message": "Tool `list_callbacks` finished.",
+    "metadata": {
+     "chat_request_id": 85,
+     "chat_response_key": "event:tool:90f408e691a4202e02a54c86a9eda9e10a650e9031a60d5e159a7e4149ecca7e",
+     "container_metadata": null,
+     "error": "",
+     "event_id": "tool:90f408e691a4202e02a54c86a9eda9e10a650e9031a60d5e159a7e4149ecca7e",
+     "eventing_user_interaction": null,
+     "refresh": null,
+     "refreshed_at": "",
+     "source": "",
+     "source_id": "",
+     "special_message_version": 0,
+     "special_type": "tool_use",
+     "tool_use": {
+      "arguments_present": false,
+      "event_id": "tool:90f408e691a4202e02a54c86a9eda9e10a650e9031a60d5e159a7e4149ecca7e",
+      "result_preview": "(sibling result_preview replaced)",
+      "status": "completed",
+      "tool_call_id": "call_c92f0d4880ef579b9e82f7f562a6fa1f",
+      "tool_name": "list_callbacks",
+      "tool_source": "mythic"
+     },
+     "updated_at": "",
+     "updated_by": "",
+     "updated_by_operator_id": 0
+    },
+    "tool_output": ""
+   },
+   {
+    "author_type": "ai",
+    "channel_id": 50,
+    "chat_request_id": 85,
+    "id": 859,
+    "message": "Request: get_task_history_for_callback({\"callback_display_id\": 2})",
+    "metadata": {
+     "chat_request_id": 85,
+     "chat_response_key": "event:tool:8d528c6a2f896163ce1eb43f7ef423d63d01cb76d7b65e8ef5e8b046c65fd42f",
+     "container_metadata": null,
+     "delegation_id": "mythic_operator:chat:50:request:85:1",
+     "delegation_name": "Mythic_Operator",
+     "error": "",
+     "event_id": "tool:8d528c6a2f896163ce1eb43f7ef423d63d01cb76d7b65e8ef5e8b046c65fd42f",
+     "eventing_user_interaction": null,
+     "refresh": null,
+     "refreshed_at": "",
+     "source": "",
+     "source_id": "",
+     "special_message_version": 0,
+     "special_type": "tool_use",
+     "tool_use": {
+      "arguments": "(sibling arguments replaced)",
+      "arguments_present": true,
+      "delegation_id": "mythic_operator:chat:50:request:85:1",
+      "delegation_name": "Mythic_Operator",
+      "event_id": "tool:8d528c6a2f896163ce1eb43f7ef423d63d01cb76d7b65e8ef5e8b046c65fd42f",
+      "output_available": true,
+      "output_size": 25,
+      "result_preview": "(sibling result_preview replaced)",
+      "status": "completed",
+      "tool_call_id": "call_96f43cfb4b3958199804d6cb6ac1409e",
+      "tool_name": "get_task_history_for_callback",
+      "tool_source": "mythic"
+     },
+     "updated_at": "",
+     "updated_by": "",
+     "updated_by_operator_id": 0
+    },
+    "tool_output": "(sibling output replaced)"
+   },
+   {
+    "author_type": "ai",
+    "channel_id": 50,
+    "chat_request_id": 85,
+    "id": 861,
+    "message": "Request: get_ttp_guidance({\"goal\": \"report the current thread identity using whoami\", \"callback_display_id\": 2})",
+    "metadata": {
+     "chat_request_id": 85,
+     "chat_response_key": "event:tool:6b794a2b7debb4d2e30bbc964865b8aadcba08a783d8da99aee2182c8e5dc9dd",
+     "container_metadata": null,
+     "delegation_id": "mythic_operator:chat:50:request:85:1",
+     "delegation_name": "Mythic_Operator",
+     "error": "",
+     "event_id": "tool:6b794a2b7debb4d2e30bbc964865b8aadcba08a783d8da99aee2182c8e5dc9dd",
+     "eventing_user_interaction": null,
+     "refresh": null,
+     "refreshed_at": "",
+     "source": "",
+     "source_id": "",
+     "special_message_version": 0,
+     "special_type": "tool_use",
+     "tool_use": {
+      "arguments": "(sibling arguments replaced)",
+      "arguments_present": true,
+      "delegation_id": "mythic_operator:chat:50:request:85:1",
+      "delegation_name": "Mythic_Operator",
+      "event_id": "tool:6b794a2b7debb4d2e30bbc964865b8aadcba08a783d8da99aee2182c8e5dc9dd",
+      "result_preview": "(sibling result_preview replaced)",
+      "status": "completed",
+      "tool_call_id": "call_81e1430f0bdf590fabf09be775058bfa",
+      "tool_name": "get_ttp_guidance",
+      "tool_source": "mythic"
+     },
+     "updated_at": "",
+     "updated_by": "",
+     "updated_by_operator_id": 0
+    },
+    "tool_output": ""
+   },
+   {
+    "author_type": "ai",
+    "channel_id": 50,
+    "chat_request_id": 85,
+    "id": 866,
+    "message": "Request: get_all_command_args_for_payloadtype({\"payload\": \"apollo\", \"command\": \"whoami\", \"callback_display_id\": 2})",
+    "metadata": {
+     "chat_request_id": 85,
+     "chat_response_key": "event:tool:73bca103deb3fb2e4578bb1a2469898f49516bda8377eb53e933065003411c73",
+     "container_metadata": null,
+     "delegation_id": "mythic_operator:chat:50:request:85:1",
+     "delegation_name": "Mythic_Operator",
+     "error": "",
+     "event_id": "tool:73bca103deb3fb2e4578bb1a2469898f49516bda8377eb53e933065003411c73",
+     "eventing_user_interaction": null,
+     "refresh": null,
+     "refreshed_at": "",
+     "source": "",
+     "source_id": "",
+     "special_message_version": 0,
+     "special_type": "tool_use",
+     "tool_use": {
+      "arguments": "(sibling arguments replaced)",
+      "arguments_present": true,
+      "delegation_id": "mythic_operator:chat:50:request:85:1",
+      "delegation_name": "Mythic_Operator",
+      "event_id": "tool:73bca103deb3fb2e4578bb1a2469898f49516bda8377eb53e933065003411c73",
+      "result_preview": "(sibling result_preview replaced)",
+      "status": "completed",
+      "tool_call_id": "call_3fec1e47a9b658f7b059baa7a2d382b1",
+      "tool_name": "get_all_command_args_for_payloadtype",
+      "tool_source": "mythic"
+     },
+     "updated_at": "",
+     "updated_by": "",
+     "updated_by_operator_id": 0
+    },
+    "tool_output": ""
+   },
+   {
+    "author_type": "ai",
+    "channel_id": 50,
+    "chat_request_id": 85,
+    "id": 869,
+    "message": "Tool `issue_task_and_waitfor_task_output` finished.",
+    "metadata": {
+     "chat_request_id": 85,
+     "chat_response_key": "event:tool:2ccd933b094a76c8ad36a590f605682685fa82833d1440beae61d044d2224371",
+     "container_metadata": null,
+     "delegation_id": "mythic_operator:chat:50:request:85:1",
+     "delegation_name": "Mythic_Operator",
+     "error": "",
+     "event_id": "tool:2ccd933b094a76c8ad36a590f605682685fa82833d1440beae61d044d2224371",
+     "eventing_user_interaction": null,
+     "refresh": null,
+     "refreshed_at": "",
+     "source": "",
+     "source_id": "",
+     "special_message_version": 0,
+     "special_type": "tool_use",
+     "tool_use": {
+      "arguments_present": false,
+      "delegation_id": "mythic_operator:chat:50:request:85:1",
+      "delegation_name": "Mythic_Operator",
+      "event_id": "tool:2ccd933b094a76c8ad36a590f605682685fa82833d1440beae61d044d2224371",
+      "result_preview": "[Mythic task issuance identity] task_display_id=22 callback_display_id=2 requested_command=whoami\n[Mythic task state] task_completed=true task_status=\"success\" observation=observed\n\nPrimary Identity: LAB\\lab.user\nImpersonation Identity: LAB\\lab.user",
+      "status": "completed",
+      "tool_call_id": "call_5f601fe4e27854b5b162eafadf25b743",
+      "tool_name": "issue_task_and_waitfor_task_output",
+      "tool_source": "mythic"
+     },
+     "updated_at": "",
+     "updated_by": "",
+     "updated_by_operator_id": 0
+    },
+    "tool_output": ""
+   },
+   {
+    "author_type": "ai",
+    "channel_id": 50,
+    "chat_request_id": 85,
+    "id": 873,
+    "message": "Request: whoami({\"callback_id\": 2, \"parameters\": \"\", \"task_id\": 22})",
+    "metadata": {
+     "chat_request_id": 85,
+     "chat_response_key": "event:tool:979aa2dcf7cb7a23a466ffa6eaa7d4ba3ccea891bff94958aa44007c16904b36",
+     "container_metadata": null,
+     "delegation_id": "mythic_operator:chat:50:request:85:1",
+     "delegation_name": "Mythic_Operator",
+     "error": "",
+     "event_id": "tool:979aa2dcf7cb7a23a466ffa6eaa7d4ba3ccea891bff94958aa44007c16904b36",
+     "eventing_user_interaction": null,
+     "refresh": null,
+     "refreshed_at": "",
+     "source": "",
+     "source_id": "",
+     "special_message_version": 0,
+     "special_type": "tool_use",
+     "tool_use": {
+      "arguments": "{\"callback_id\": 2, \"parameters\": \"\", \"task_id\": 22}",
+      "arguments_present": true,
+      "delegation_id": "mythic_operator:chat:50:request:85:1",
+      "delegation_name": "Mythic_Operator",
+      "event_id": "tool:979aa2dcf7cb7a23a466ffa6eaa7d4ba3ccea891bff94958aa44007c16904b36",
+      "output_available": true,
+      "output_size": 81,
+      "result_preview": "Primary Identity: LAB\\lab.user\nImpersonation Identity: LAB\\lab.user",
+      "status": "completed",
+      "tool_call_id": "mythic-task:2:22",
+      "tool_name": "whoami",
+      "tool_source": "mythic"
+     },
+     "updated_at": "",
+     "updated_by": "",
+     "updated_by_operator_id": 0
+    },
+    "tool_output": "Primary Identity: LAB\\lab.user\nImpersonation Identity: LAB\\lab.user"
+   }
+  ],
+  "request": {
+   "channel_id": 50,
+   "id": 85,
+   "status": "complete"
+  }
+ },
+ "task": {
+  "callback": {
+   "display_id": 2
+  },
+  "command_name": "whoami",
+  "completed": true,
+  "display_id": 22,
+  "id": 22,
+  "responses": [
+   {
+    "id": 25,
+    "response_text": "UHJpbWFyeSBJZGVudGl0eTogTEFCXGxhYi51c2VyCkltcGVyc29uYXRpb24gSWRlbnRpdHk6IExB\nQlxsYWIudXNlcg=="
+   }
+  ],
+  "status": "success",
+  "subtask_count": 0
+ },
+ "wire": {
+  "13534": {
+   "body": {
+    "complete": true,
+    "complete_request": false,
+    "content": "Request: whoami({\"callback_id\": 2, \"parameters\": \"\", \"task_id\": 22})",
+    "error": "",
+    "is_delta": false,
+    "metadata": {
+     "delegation_id": "mythic_operator:chat:50:request:85:1",
+     "delegation_name": "Mythic_Operator",
+     "event_id": "tool:979aa2dcf7cb7a23a466ffa6eaa7d4ba3ccea891bff94958aa44007c16904b36",
+     "special_type": "tool_use",
+     "tool_use": {
+      "arguments": "{\"callback_id\": 2, \"parameters\": \"\", \"task_id\": 22}",
+      "arguments_present": true,
+      "delegation_id": "mythic_operator:chat:50:request:85:1",
+      "delegation_name": "Mythic_Operator",
+      "event_id": "tool:979aa2dcf7cb7a23a466ffa6eaa7d4ba3ccea891bff94958aa44007c16904b36",
+      "output": "Primary Identity: LAB\\lab.user\nImpersonation Identity: LAB\\lab.user",
+      "result_preview": "Primary Identity: LAB\\lab.user\nImpersonation Identity: LAB\\lab.user",
+      "status": "completed",
+      "tool_call_id": "mythic-task:2:22",
+      "tool_name": "whoami",
+      "tool_source": "mythic"
+     }
+    },
+    "operation_id": 1,
+    "request_id": 85,
+    "response_key": "event:tool:979aa2dcf7cb7a23a466ffa6eaa7d4ba3ccea891bff94958aa44007c16904b36",
+    "status": "complete"
+   },
+   "kind": "control_request",
+   "routing_key": "chat_response",
+   "url": null
+  },
+  "13540": {
+   "body": {
+    "complete": true,
+    "complete_request": false,
+    "content": "Tool `issue_task_and_waitfor_task_output` finished.",
+    "error": "",
+    "is_delta": false,
+    "metadata": {
+     "delegation_id": "mythic_operator:chat:50:request:85:1",
+     "delegation_name": "Mythic_Operator",
+     "event_id": "tool:2ccd933b094a76c8ad36a590f605682685fa82833d1440beae61d044d2224371",
+     "special_type": "tool_use",
+     "tool_use": {
+      "arguments_present": false,
+      "delegation_id": "mythic_operator:chat:50:request:85:1",
+      "delegation_name": "Mythic_Operator",
+      "event_id": "tool:2ccd933b094a76c8ad36a590f605682685fa82833d1440beae61d044d2224371",
+      "result_preview": "[Mythic task issuance identity] task_display_id=22 callback_display_id=2 requested_command=whoami\n[Mythic task state] task_completed=true task_status=\"success\" observation=observed\n\nPrimary Identity: LAB\\lab.user\nImpersonation Identity: LAB\\lab.user",
+      "status": "completed",
+      "tool_call_id": "call_5f601fe4e27854b5b162eafadf25b743",
+      "tool_name": "issue_task_and_waitfor_task_output",
+      "tool_source": "mythic"
+     }
+    },
+    "operation_id": 1,
+    "request_id": 85,
+    "response_key": "event:tool:2ccd933b094a76c8ad36a590f605682685fa82833d1440beae61d044d2224371",
+    "status": "complete"
+   },
+   "kind": "control_request",
+   "routing_key": "chat_response",
+   "url": null
+  },
+  "13588": {
+   "body": {
+    "messages": [
+     {
+      "content": "[Mythic task issuance identity] task_display_id=22 callback_display_id=2 requested_command=whoami\n[Mythic task state] task_completed=true task_status=\"success\" observation=observed\n\nPrimary Identity: LAB\\lab.user\nImpersonation Identity: LAB\\lab.user",
+      "role": "tool",
+      "tool_call_id": "call_5f601fe4e27854b5b162eafadf25b743"
+     }
+    ]
+   },
+   "kind": "model_request",
+   "routing_key": null,
+   "url": "https://gateway.invalid/chat/completions"
+  }
+ }
+}
