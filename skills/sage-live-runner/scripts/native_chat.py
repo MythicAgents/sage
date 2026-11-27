@@ -53,7 +53,10 @@ ARTIFACT_RETENTION_PATH = (
     / "artifact_retention.py"
 )
 TERMINAL_STATUSES = {"completed", "complete", "error", "failed", "cancelled", "canceled"}
-APPROVABLE_INPUT_REQUEST_STATUS = "streaming"
+# Mythic's active request statuses, exactly as it writes them: the busy guard (chat_webhook.go), the stock UI's
+# active request and its Stop button all use this pair. A Supervisor card that is the first row of its request
+# leaves the parent `pending` (recv_chat_response.go moves it only on a streaming or terminal row).
+ACTIVE_REQUEST_STATUSES = frozenset({"pending", "streaming"})
 REQUIRED_TOKEN_SCOPES = {"apitoken.write", "chat-ai.write"}
 # The channel's backing token carries Sage's declared channel scopes. Mythic d8a94943+ refuses "*" in an
 # active token, and stores each write's read alongside it, so a usable token holds a superset of this set.
@@ -1166,6 +1169,11 @@ def _pending_input_requested_messages(messages: list[dict[str, Any]]) -> list[di
     return pending
 
 
+def _request_is_active(request: dict[str, Any]) -> bool:
+    status = request.get("status")
+    return isinstance(status, str) and status in ACTIVE_REQUEST_STATUSES
+
+
 def _require_exact_int(value: Any, label: str) -> int:
     if type(value) is not int:
         raise RuntimeError(f"{label} must be an exact integer.")
@@ -1268,15 +1276,16 @@ async def _respond_to_pending_input_card(
     "accept"->"accepted" and "reject"->"rejected", and :572 maps accept->approve, else->deny.
 
     This does NOT bypass HITL for either decision — it submits the same mutation the Mythic UI
-    submits. Every fail-closed precondition is identical for accept and reject on purpose: exactly
-    `streaming` status, exactly one unresolved card, and exact message/request id echo. A reject is
-    an operator decision with the same weight as an approve, so it gets the same gates.
+    submits. Every fail-closed precondition is identical for accept and reject on purpose: an active
+    request (exactly `pending` or `streaming`, as Mythic writes them), exactly one unresolved card,
+    and exact message/request id echo. A reject is an operator decision with the same weight as an
+    approve, so it gets the same gates.
     """
     snapshot = await fetch_request_snapshot(client, request_id)
     request = snapshot["request"]
-    if request.get("status") != APPROVABLE_INPUT_REQUEST_STATUS:
+    if not _request_is_active(request):
         raise RuntimeError(
-            "Selected Mythic chat request is not in the exact active streaming status."
+            "Selected Mythic chat request is not in an active status (exactly pending or streaming)."
         )
     pending = _pending_input_requested_messages(snapshot["messages"])
     if len(pending) != 1:
@@ -1776,8 +1785,7 @@ def build_request_snapshot_export(snapshot: dict[str, Any]) -> dict[str, Any]:
         "schema": "sage-native-chat-request-snapshot-v1",
         "capture_state": (
             "pending_operator_input"
-            if str(request.get("status") or "").casefold() == APPROVABLE_INPUT_REQUEST_STATUS
-            and _has_input_requested(messages)
+            if _request_is_active(request) and _has_input_requested(messages)
             else "request_snapshot"
         ),
         "request": request,

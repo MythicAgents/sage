@@ -1117,8 +1117,11 @@ def test_approve_pending_input_card_fails_closed_on_ambiguous_cards(monkeypatch)
         asyncio.run(native_chat.approve_pending_input_card(object(), 77))
 
 
-@pytest.mark.parametrize("status", ["completed", "", None, "pending", "unknown"])
-def test_approve_pending_input_card_rejects_nonstreaming_request_before_mutation(
+# "pending" moved out of this list: Mythic treats exactly pending and streaming as active, and a Supervisor
+# card that is its request's first row leaves the parent pending. tests/test_native_chat_pending_card_decisions.py
+# covers both active states.
+@pytest.mark.parametrize("status", ["completed", "", None, "Pending", "unknown"])
+def test_approve_pending_input_card_rejects_inactive_request_before_mutation(
     monkeypatch, status
 ):
     async def fake_snapshot(client, request_id):
@@ -1139,7 +1142,7 @@ def test_approve_pending_input_card_rejects_nonstreaming_request_before_mutation
     monkeypatch.setattr(native_chat, "fetch_request_snapshot", fake_snapshot)
     monkeypatch.setattr(native_chat.mythic, "execute_custom_query", forbidden_query)
 
-    with pytest.raises(RuntimeError, match="exact active streaming status"):
+    with pytest.raises(RuntimeError, match="not in an active status"):
         asyncio.run(native_chat.approve_pending_input_card(object(), 77))
 
 

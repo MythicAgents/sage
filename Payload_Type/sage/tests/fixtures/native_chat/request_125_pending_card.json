@@ -1,0 +1,65 @@
+{
+  "provenance": {
+    "kind": "recorded Mythic rows (real deployment, read through native_chat.py request-snapshot)",
+    "recorded_at": "2026-11-27T19:49:01Z",
+    "description": "Worker request 125 on supervised channel 74 while its Sandbox approval card 1032 was pending, from the native helper's request-snapshot export. The 19:49:08 export of the same request has identical rows.",
+    "reduction": "Identity, status, deletion and card fields only. Message text, timestamps, response keys and the rest of each row's metadata are removed; nothing is renamed.",
+    "gap": "No recorded snapshot of a pending Supervisor-level request exists on this host (the reset database has no request 177). The pending parent is a labelled mutation in the tests."
+  },
+  "request": {
+    "id": 125,
+    "channel_id": 74,
+    "request_message_id": 1028,
+    "status": "streaming",
+    "error": ""
+  },
+  "messages": [
+    {
+      "id": 1028,
+      "author_type": "operator",
+      "channel_id": 74,
+      "chat_request_id": null,
+      "deleted": false,
+      "status": "complete",
+      "metadata": {}
+    },
+    {
+      "id": 1029,
+      "author_type": "ai",
+      "channel_id": 74,
+      "chat_request_id": 125,
+      "deleted": false,
+      "status": "streaming",
+      "metadata": {
+        "special_type": "subagent"
+      }
+    },
+    {
+      "id": 1030,
+      "author_type": "ai",
+      "channel_id": 74,
+      "chat_request_id": 125,
+      "deleted": false,
+      "status": "streaming",
+      "metadata": {
+        "special_type": "tool_use"
+      }
+    },
+    {
+      "id": 1032,
+      "author_type": "ai",
+      "channel_id": 74,
+      "chat_request_id": 125,
+      "deleted": false,
+      "status": "complete",
+      "metadata": {
+        "special_type": "input_requested",
+        "input_requested": {
+          "status": "pending",
+          "input_type": "approval",
+          "title": "Approve: sandbox_exec"
+        }
+      }
+    }
+  ]
+}
