@@ -1,0 +1,84 @@
+{
+ "provenance": "Reduced from the gateway split-choices live check capture of 2026-11-26 (Sage container; Mythic chat request 85, channel 50, callback 2, task 22), read in place. Kept as recorded: the two pre-storage card emissions (sequences 13534 and 13540: request id, response key, status, content and metadata with tool_use) and the same call's tool message in the next provider request (sequence 13588: role, tool_call_id, content). Changed: the lab account name in the task output, replaced everywhere it occurs by LAB\\\\lab.user so every stage keeps its relation to the others; the original byte counts and SHA-256 of each value are under 'original'. The capture has no Mythic server response bodies, so tests that need the task's rows build them from the raw value and label them synthetic.",
+ "request_id": 85,
+ "channel_id": 50,
+ "callback": 2,
+ "task": 22,
+ "call_id": "call_5f601fe4e27854b5b162eafadf25b743",
+ "original": {
+  "13534.result_preview": {
+   "bytes": 81,
+   "sha256": "063c546e0b40bc0a8fc4fb46bdc04476a835c841b1ebee06a0c62c3b5ef3f952"
+  },
+  "13534.output": {
+   "bytes": 81,
+   "sha256": "063c546e0b40bc0a8fc4fb46bdc04476a835c841b1ebee06a0c62c3b5ef3f952"
+  },
+  "13540.result_preview": {
+   "bytes": 263,
+   "sha256": "d8170cf44e87e2d5420f162e714f5f2c9a9d7ceb0e8f3bc84d9e40ea07c81ee2"
+  },
+  "13588.content": {
+   "bytes": 263,
+   "sha256": "d8170cf44e87e2d5420f162e714f5f2c9a9d7ceb0e8f3bc84d9e40ea07c81ee2"
+  }
+ },
+ "cards": [
+  {
+   "sequence": 13534,
+   "request_id": 85,
+   "response_key": "event:tool:979aa2dcf7cb7a23a466ffa6eaa7d4ba3ccea891bff94958aa44007c16904b36",
+   "status": "complete",
+   "content": "Request: whoami({\"callback_id\": 2, \"parameters\": \"\", \"task_id\": 22})",
+   "metadata": {
+    "special_type": "tool_use",
+    "event_id": "tool:979aa2dcf7cb7a23a466ffa6eaa7d4ba3ccea891bff94958aa44007c16904b36",
+    "delegation_id": "mythic_operator:chat:50:request:85:1",
+    "delegation_name": "Mythic_Operator",
+    "tool_use": {
+     "status": "completed",
+     "tool_name": "whoami",
+     "tool_source": "mythic",
+     "arguments_present": true,
+     "tool_call_id": "mythic-task:2:22",
+     "arguments": "{\"callback_id\": 2, \"parameters\": \"\", \"task_id\": 22}",
+     "result_preview": "Primary Identity: LAB\\lab.user\nImpersonation Identity: LAB\\lab.user",
+     "output": "Primary Identity: LAB\\lab.user\nImpersonation Identity: LAB\\lab.user",
+     "event_id": "tool:979aa2dcf7cb7a23a466ffa6eaa7d4ba3ccea891bff94958aa44007c16904b36",
+     "delegation_id": "mythic_operator:chat:50:request:85:1",
+     "delegation_name": "Mythic_Operator"
+    }
+   }
+  },
+  {
+   "sequence": 13540,
+   "request_id": 85,
+   "response_key": "event:tool:2ccd933b094a76c8ad36a590f605682685fa82833d1440beae61d044d2224371",
+   "status": "complete",
+   "content": "Tool `issue_task_and_waitfor_task_output` finished.",
+   "metadata": {
+    "special_type": "tool_use",
+    "event_id": "tool:2ccd933b094a76c8ad36a590f605682685fa82833d1440beae61d044d2224371",
+    "delegation_id": "mythic_operator:chat:50:request:85:1",
+    "delegation_name": "Mythic_Operator",
+    "tool_use": {
+     "status": "completed",
+     "tool_name": "issue_task_and_waitfor_task_output",
+     "tool_source": "mythic",
+     "arguments_present": false,
+     "tool_call_id": "call_5f601fe4e27854b5b162eafadf25b743",
+     "result_preview": "[Mythic task issuance identity] task_display_id=22 callback_display_id=2 requested_command=whoami\n[Mythic task state] task_completed=true task_status=\"success\" observation=observed\n\nPrimary Identity: LAB\\lab.user\nImpersonation Identity: LAB\\lab.user",
+     "event_id": "tool:2ccd933b094a76c8ad36a590f605682685fa82833d1440beae61d044d2224371",
+     "delegation_id": "mythic_operator:chat:50:request:85:1",
+     "delegation_name": "Mythic_Operator"
+    }
+   }
+  }
+ ],
+ "follow_up": {
+  "sequence": 13588,
+  "role": "tool",
+  "tool_call_id": "call_5f601fe4e27854b5b162eafadf25b743",
+  "content": "[Mythic task issuance identity] task_display_id=22 callback_display_id=2 requested_command=whoami\n[Mythic task state] task_completed=true task_status=\"success\" observation=observed\n\nPrimary Identity: LAB\\lab.user\nImpersonation Identity: LAB\\lab.user"
+ }
+}

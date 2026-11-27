@@ -189,9 +189,38 @@ def test_the_span_reader_extracts_calls_and_results_from_phoenix_attributes(tmp_
         conn.execute("INSERT INTO spans VALUES (2, 'CHAIN', 'ERROR', ?, '{}', NULL, NULL)",
                      (json.dumps([{"name": "exception", "attributes": {"exception.type": "openai.APIConnectionError"}}]),))
     window = check.spans(db, 0, 2)
+    assert "consumed_content" not in window[0]
     assert window[0] == {"id": 1, "kind": "LLM", "status": "OK", "exceptions": [], "model": MODEL,
                          "prompt_tokens": 120, "completion_tokens": 7, "produced_calls": ["call_b"],
                          "input_calls": ["call_a"], "consumed_results": ["call_a"]}
     assert window[1]["exceptions"] == ["openai.APIConnectionError"]
     assert check.TRANSPORT_EXCEPTION.search(window[1]["exceptions"][0])
     assert not check.TRANSPORT_EXCEPTION.search("langgraph.errors.GraphInterrupt")
+
+
+def test_the_span_reader_returns_only_the_named_calls_tool_result_text(tmp_path):
+    """The input message shape is the one Phoenix recorded for a tool result (role, name, tool_call_id, content; read
+    from the container's store on 2026-11-26). Texts and ids are synthetic."""
+    db = tmp_path / "phoenix.db"
+    tool = "issue_task_and_waitfor_task_output"
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE spans (id INTEGER PRIMARY KEY, span_kind TEXT, status_code TEXT, events TEXT, "
+                     "attributes TEXT, llm_token_count_prompt INTEGER, llm_token_count_completion INTEGER)")
+        follow_up = {"llm": {"model_name": MODEL, "input_messages": [
+            {"message": {"role": "assistant", "tool_calls": [{"tool_call": {"id": "call_c"}},
+                                                             {"tool_call": {"id": "call_d"}}]}},
+            {"message": {"role": "tool", "name": tool, "tool_call_id": "call_c", "content": "result of c\n"}},
+            {"message": {"role": "tool", "name": tool, "tool_call_id": "call_d", "content": "result of d"}}]}}
+        parts = {"llm": {"model_name": MODEL, "input_messages": [
+            {"message": {"role": "tool", "tool_call_id": "call_c", "contents": [
+                {"message_content": {"type": "text", "text": "result "}},
+                {"message_content": {"type": "text", "text": "of c\n"}}]}}]}}
+        other = {"llm": {"model_name": MODEL, "input_messages": [
+            {"message": {"role": "tool", "tool_call_id": "call_d", "content": "result of d"}}]}}
+        for span_id, attributes in ((1, follow_up), (2, parts), (3, other)):
+            conn.execute("INSERT INTO spans VALUES (?, 'LLM', 'OK', '[]', ?, 1, 1)", (span_id, json.dumps(attributes)))
+    window = check.spans(db, 0, 3, result_for="call_c")
+    assert window[0]["consumed_content"] == ["result of c\n"]
+    assert window[1]["consumed_content"] == ["result of c\n"]
+    assert "consumed_content" not in window[2]
+    assert all("consumed_content" not in span for span in check.spans(db, 0, 3))

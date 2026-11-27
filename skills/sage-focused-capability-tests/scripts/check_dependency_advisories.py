@@ -240,9 +240,26 @@ def phoenix_health(url: str) -> int | None:
 # Phoenix spans (read-only, in place)
 # --------------------------------------------------------------------------------------------------
 
-def spans(db: Path, after: int, until: int) -> list[dict[str, Any]]:
+def _message_text(message: dict[str, Any]) -> str | None:
+    """An OpenInference message's text: ``message.content``, or its ``message.contents`` text parts joined."""
+    if isinstance(message.get("content"), str):
+        return message["content"]
+    parts = message.get("contents")
+    if isinstance(parts, list):
+        texts = [((part.get("message_content") or {}).get("text") if isinstance(part, dict) else None)
+                 for part in parts]
+        if texts and all(isinstance(text, str) for text in texts):
+            return "".join(texts)
+    return None
+
+
+def spans(db: Path, after: int, until: int, *, result_for: str | None = None) -> list[dict[str, Any]]:
     """Every span in (after, until]: kind, status, exception types, and for LLM spans the model, tokens, the tool call
-    ids the output produced, and the tool call ids and tool-result ids the input carried."""
+    ids the output produced, and the tool call ids and tool-result ids the input carried.
+
+    ``result_for`` names one tool call: an LLM span whose input carries that call's tool result also gets
+    ``consumed_content``, the list of that result's texts as the span recorded them. Off by default, so no other
+    tool result's content enters a check's evidence."""
     base = _base()
     with base._phoenix(db) as conn:
         rows = conn.execute(
@@ -273,6 +290,12 @@ def spans(db: Path, after: int, until: int) -> list[dict[str, Any]]:
             entry.update(model=str(llm.get("model_name") or ""), prompt_tokens=int(prompt),
                          completion_tokens=int(completion), produced_calls=sorted(produced),
                          input_calls=sorted(input_calls), consumed_results=sorted(results))
+            if result_for and result_for in results:
+                messages = [item.get("message") for item in llm.get("input_messages") or []
+                            if isinstance(item, dict)]
+                entry["consumed_content"] = [_message_text(message) for message in messages
+                                             if isinstance(message, dict)
+                                             and message.get("tool_call_id") == result_for]
         result.append(entry)
     return result
 
