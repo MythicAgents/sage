@@ -1,0 +1,189 @@
+{
+ "provenance": "Recorded inputs for the Mythic SDK rc10 live check's revision-3 rules, read 2026-11-25. Phoenix: LLM spans of the container's store, read in place (read-only). attempt1_m2 is attempt 1's channel S window (spans (1565, 1662], gpt-5.6-cyber through the LiteLLM Gateway, 2026-11-26T01:33Z); rc11_l2 is the shipped rc11 check's supervised whoami window on dev (spans (1230, 1291], bedrock-claude-4-6-sonnet through the same gateway, task 20). Each output_value keeps the recorded LLMResult structure (generations, finish reasons, tool-call names, ids and types); message text, call arguments and usage are dropped. Mythic: chat rows of requests 16 and 17 (the shipped MCP check: /bloodhound, /mcp tools BloodHound), 29 (rc11 L5 /watcher scan on a running Watcher), 30 (an operator /watcher pause), 46 (attempt 1 /mcp tools BloodHound), 47 and 48 (attempt 1 /watcher status and /watcher scan on a paused Watcher); author type and text verbatim, metadata dropped.",
+ "phoenix": {
+  "attempt1_m2": {
+   "window": [
+    1565,
+    1662
+   ],
+   "spans": [
+    {
+     "id": 1569,
+     "span_kind": "LLM",
+     "status_code": "OK",
+     "model": "gpt-5.6-cyber",
+     "output_value": "{\"generations\": [[{\"type\": \"ChatGeneration\", \"generation_info\": {\"finish_reason\": \"tool_calls\"}, \"message\": {\"lc\": 1, \"type\": \"constructor\", \"id\": [\"langchain\", \"schema\", \"messages\", \"AIMessage\"], \"kwargs\": {\"type\": \"ai\", \"tool_calls\": [{\"name\": \"list_callbacks\", \"id\": \"call_1946a9ef2c095955a2ae0ee7de57a026\", \"type\": \"tool_call\"}], \"invalid_tool_calls\": []}}}]], \"type\": \"LLMResult\"}"
+    },
+    {
+     "id": 1578,
+     "span_kind": "LLM",
+     "status_code": "OK",
+     "model": "gpt-5.6-cyber",
+     "output_value": "{\"generations\": [[{\"type\": \"ChatGeneration\", \"generation_info\": {\"finish_reason\": \"tool_calls\"}, \"message\": {\"lc\": 1, \"type\": \"constructor\", \"id\": [\"langchain\", \"schema\", \"messages\", \"AIMessage\"], \"kwargs\": {\"type\": \"ai\", \"tool_calls\": [{\"name\": \"transfer_to_Mythic_Operator\", \"id\": \"call_e42eb2f8cc5059e4a8124a20216b6c2f\", \"type\": \"tool_call\"}], \"invalid_tool_calls\": []}}}]], \"type\": \"LLMResult\"}"
+    },
+    {
+     "id": 1591,
+     "span_kind": "LLM",
+     "status_code": "OK",
+     "model": "gpt-5.6-cyber",
+     "output_value": "{\"generations\": [[{\"type\": \"ChatGeneration\", \"generation_info\": {\"finish_reason\": \"tool_calls\"}, \"message\": {\"lc\": 1, \"type\": \"constructor\", \"id\": [\"langchain\", \"schema\", \"messages\", \"AIMessage\"], \"kwargs\": {\"type\": \"ai\", \"tool_calls\": [{\"name\": \"get_task_history_for_callback\", \"id\": \"call_c821974972f65c4db2c5b53fd45f20f2\", \"type\": \"tool_call\"}], \"invalid_tool_calls\": []}}}]], \"type\": \"LLMResult\"}"
+    },
+    {
+     "id": 1602,
+     "span_kind": "LLM",
+     "status_code": "OK",
+     "model": "gpt-5.6-cyber",
+     "output_value": "{\"generations\": [[{\"type\": \"ChatGeneration\", \"generation_info\": {\"finish_reason\": \"stop\"}, \"message\": {\"lc\": 1, \"type\": \"constructor\", \"id\": [\"langchain\", \"schema\", \"messages\", \"AIMessage\"], \"kwargs\": {\"type\": \"ai\", \"tool_calls\": [], \"invalid_tool_calls\": []}}}, {\"type\": \"ChatGeneration\", \"generation_info\": {\"finish_reason\": \"tool_calls\"}, \"message\": {\"lc\": 1, \"type\": \"constructor\", \"id\": [\"langchain\", \"schema\", \"messages\", \"AIMessage\"], \"kwargs\": {\"type\": \"ai\", \"tool_calls\": [{\"name\": \"get_ttp_guidance\", \"id\": \"call_eb055b0026265af1a75f26570793d262\", \"type\": \"tool_call\"}], \"invalid_tool_calls\": []}}}]], \"type\": \"LLMResult\"}"
+    },
+    {
+     "id": 1611,
+     "span_kind": "LLM",
+     "status_code": "OK",
+     "model": "gpt-5.6-cyber",
+     "output_value": "{\"generations\": [[{\"type\": \"ChatGeneration\", \"generation_info\": {\"finish_reason\": \"tool_calls\"}, \"message\": {\"lc\": 1, \"type\": \"constructor\", \"id\": [\"langchain\", \"schema\", \"messages\", \"AIMessage\"], \"kwargs\": {\"type\": \"ai\", \"tool_calls\": [{\"name\": \"transfer_to_Mythic_Operator\", \"id\": \"call_5edb98017b835ded8d97e7d6f36296c9\", \"type\": \"tool_call\"}], \"invalid_tool_calls\": []}}}]], \"type\": \"LLMResult\"}"
+    },
+    {
+     "id": 1624,
+     "span_kind": "LLM",
+     "status_code": "OK",
+     "model": "gpt-5.6-cyber",
+     "output_value": "{\"generations\": [[{\"type\": \"ChatGeneration\", \"generation_info\": {\"finish_reason\": \"tool_calls\"}, \"message\": {\"lc\": 1, \"type\": \"constructor\", \"id\": [\"langchain\", \"schema\", \"messages\", \"AIMessage\"], \"kwargs\": {\"type\": \"ai\", \"tool_calls\": [{\"name\": \"get_ttp_guidance\", \"id\": \"call_981e244eaa4d55cf80ea26100dae1dd5\", \"type\": \"tool_call\"}, {\"name\": \"get_task_history_for_callback\", \"id\": \"call_d08a9e6d9fbe5d7597d1a99dceaf13f0\", \"type\": \"tool_call\"}, {\"name\": \"get_all_command_args_for_payloadtype\", \"id\": \"call_a39a70ce50cf5953bd8f22696a0fdee4\", \"type\": \"tool_call\"}], \"invalid_tool_calls\": []}}}]], \"type\": \"LLMResult\"}"
+    },
+    {
+     "id": 1639,
+     "span_kind": "LLM",
+     "status_code": "OK",
+     "model": "gpt-5.6-cyber",
+     "output_value": "{\"generations\": [[{\"type\": \"ChatGeneration\", \"generation_info\": {\"finish_reason\": \"stop\"}, \"message\": {\"lc\": 1, \"type\": \"constructor\", \"id\": [\"langchain\", \"schema\", \"messages\", \"AIMessage\"], \"kwargs\": {\"type\": \"ai\", \"tool_calls\": [], \"invalid_tool_calls\": []}}}, {\"type\": \"ChatGeneration\", \"generation_info\": {\"finish_reason\": \"tool_calls\"}, \"message\": {\"lc\": 1, \"type\": \"constructor\", \"id\": [\"langchain\", \"schema\", \"messages\", \"AIMessage\"], \"kwargs\": {\"type\": \"ai\", \"tool_calls\": [{\"name\": \"issue_task_and_waitfor_task_output\", \"id\": \"call_d74080728db35b488a4629810a5c6470\", \"type\": \"tool_call\"}], \"invalid_tool_calls\": []}}}]], \"type\": \"LLMResult\"}"
+    },
+    {
+     "id": 1648,
+     "span_kind": "LLM",
+     "status_code": "OK",
+     "model": "gpt-5.6-cyber",
+     "output_value": "{\"generations\": [[{\"type\": \"ChatGeneration\", \"generation_info\": {\"finish_reason\": \"tool_calls\"}, \"message\": {\"lc\": 1, \"type\": \"constructor\", \"id\": [\"langchain\", \"schema\", \"messages\", \"AIMessage\"], \"kwargs\": {\"type\": \"ai\", \"tool_calls\": [{\"name\": \"transfer_to_Mythic_Operator\", \"id\": \"call_bec310acde8950eb9801b24d1e041401\", \"type\": \"tool_call\"}], \"invalid_tool_calls\": []}}}]], \"type\": \"LLMResult\"}"
+    }
+   ]
+  },
+  "rc11_l2": {
+   "window": [
+    1230,
+    1291
+   ],
+   "spans": [
+    {
+     "id": 1239,
+     "span_kind": "LLM",
+     "status_code": "OK",
+     "model": "bedrock-claude-4-6-sonnet",
+     "output_value": "{\"generations\": [[{\"type\": \"ChatGeneration\", \"generation_info\": {\"finish_reason\": \"tool_calls\"}, \"message\": {\"lc\": 1, \"type\": \"constructor\", \"id\": [\"langchain\", \"schema\", \"messages\", \"AIMessage\"], \"kwargs\": {\"type\": \"ai\", \"tool_calls\": [{\"name\": \"transfer_to_Mythic_Operator\", \"id\": \"tooluse_BoCgdOzqpa8Gclykt1tucG\", \"type\": \"tool_call\"}], \"invalid_tool_calls\": []}}}]], \"type\": \"LLMResult\"}"
+    },
+    {
+     "id": 1252,
+     "span_kind": "LLM",
+     "status_code": "OK",
+     "model": "bedrock-claude-4-6-sonnet",
+     "output_value": "{\"generations\": [[{\"type\": \"ChatGeneration\", \"generation_info\": {\"finish_reason\": \"tool_calls\"}, \"message\": {\"lc\": 1, \"type\": \"constructor\", \"id\": [\"langchain\", \"schema\", \"messages\", \"AIMessage\"], \"kwargs\": {\"type\": \"ai\", \"tool_calls\": [{\"name\": \"get_all_command_args_for_payloadtype\", \"id\": \"tooluse_Gwu1OiHuagnaC44rYsx01Y\", \"type\": \"tool_call\"}], \"invalid_tool_calls\": []}}}]], \"type\": \"LLMResult\"}"
+    },
+    {
+     "id": 1263,
+     "span_kind": "LLM",
+     "status_code": "OK",
+     "model": "bedrock-claude-4-6-sonnet",
+     "output_value": "{\"generations\": [[{\"type\": \"ChatGeneration\", \"generation_info\": {\"finish_reason\": \"tool_calls\"}, \"message\": {\"lc\": 1, \"type\": \"constructor\", \"id\": [\"langchain\", \"schema\", \"messages\", \"AIMessage\"], \"kwargs\": {\"type\": \"ai\", \"tool_calls\": [{\"name\": \"issue_task_and_waitfor_task_output\", \"id\": \"tooluse_VE4QPTxFogGu5o7Gs6hyYx\", \"type\": \"tool_call\"}], \"invalid_tool_calls\": []}}}]], \"type\": \"LLMResult\"}"
+    },
+    {
+     "id": 1278,
+     "span_kind": "LLM",
+     "status_code": "OK",
+     "model": "bedrock-claude-4-6-sonnet",
+     "output_value": "{\"generations\": [[{\"type\": \"ChatGeneration\", \"generation_info\": {\"finish_reason\": \"stop\"}, \"message\": {\"lc\": 1, \"type\": \"constructor\", \"id\": [\"langchain\", \"schema\", \"messages\", \"AIMessage\"], \"kwargs\": {\"type\": \"ai\", \"tool_calls\": [], \"invalid_tool_calls\": []}}}]], \"type\": \"LLMResult\"}"
+    },
+    {
+     "id": 1287,
+     "span_kind": "LLM",
+     "status_code": "OK",
+     "model": "bedrock-claude-4-6-sonnet",
+     "output_value": "{\"generations\": [[{\"type\": \"ChatGeneration\", \"generation_info\": {\"finish_reason\": \"tool_calls\"}, \"message\": {\"lc\": 1, \"type\": \"constructor\", \"id\": [\"langchain\", \"schema\", \"messages\", \"AIMessage\"], \"kwargs\": {\"type\": \"ai\", \"tool_calls\": [{\"name\": \"respond_to_user\", \"id\": \"tooluse_QutBcTIjgSzRLjOuZarwer\", \"type\": \"tool_call\"}], \"invalid_tool_calls\": []}}}]], \"type\": \"LLMResult\"}"
+    }
+   ]
+  }
+ },
+ "mythic": {
+  "16": {
+   "status": "complete",
+   "messages": [
+    {
+     "author_type": "ai",
+     "message": "Sage restarted; this channel's conversation was restored from its saved session.",
+     "metadata": {}
+    },
+    {
+     "author_type": "ai",
+     "message": "**Connection:** BloodHound MCP already connected.\n\n**Ingest:** Ready. The connected BloodHound MCP answered an exact-job ingest status read.",
+     "metadata": {}
+    }
+   ]
+  },
+  "17": {
+   "status": "complete",
+   "messages": [
+    {
+     "author_type": "ai",
+     "message": "**BloodHound** — 13 tool(s)\n- `domain_info` — Query domain level data from BloodHound\n- `user_info` — Query user data from BloodHound\n- `group_info` — Query group data from BloodHound.\n- `computer_info` — Query computer data from BloodHound.\n- `ou_info` — Query OU data from BloodHound.\n- `gpo_info` — Query GPO data from BloodHound.\n- `graph_analysis` — Perform graph analysis operations in BloodHound\n- `adcs_info` — QUery AD Certificate Services data from BloodHound\n- `cypher_query` — Execute and manage Cypher queries in BloodHound.\n- `data_quality` — Query data quality and collection statistics from BloodHound\n- `custom_nodes` — Manage OpenGraph custom node display configs and v9 extension schemas.\n- `asset_groups` — Manage Asset isolation groups and tages in BloodHound\n- `file_upload` — Upload SharpHound/AzureHound collection files to BloodHound CE for ingest.",
+     "metadata": {}
+    }
+   ]
+  },
+  "29": {
+   "status": "complete",
+   "messages": [
+    {
+     "author_type": "ai",
+     "message": "**Sage findings watcher — operation `1`**\n\n| State | Owner | Generation | Route | Bot | Last successful scan | Findings | Pending | Interval |\n|---|---|---:|---|---|---|---:|---:|---:|\n| `running` | `rc11 live check (Sage Watcher)` (`11`) | 2 | `openai/bedrock-claude-4-6-sonnet` | `operation-chimera-bot` | `2026-11-25T04:06:23.322766Z` | 0 | 0 | 300s |\n\nManaged channel: `#sage-findings` (ID `2`) · scans: 2 · last error: `-`\n\nRemedy: No recovery action is required while the scheduler remains healthy.\n\nControls from the exact locked owner: `/watcher apply`, `/watcher scan`, `/watcher pause`, `/watcher resume`, `/watcher interval <seconds>`, `/watcher interval default`.",
+     "metadata": {}
+    }
+   ]
+  },
+  "30": {
+   "status": "complete",
+   "messages": [
+    {
+     "author_type": "ai",
+     "message": "**Sage findings watcher — operation `1`**\n\n| State | Owner | Generation | Route | Bot | Last successful scan | Findings | Pending | Interval |\n|---|---|---:|---|---|---|---:|---:|---:|\n| `paused` | `rc11 live check (Sage Watcher)` (`11`) | 2 | `openai/bedrock-claude-4-6-sonnet` | `operation-chimera-bot` | `2026-11-25T17:04:58.575762Z` | 0 | 0 | 300s |\n\nManaged channel: `#sage-findings` (ID `2`) · scans: 3 · last error: `-`\n\nRemedy: Run `/watcher resume` from the exact locked owner.\n\nControls from the exact locked owner: `/watcher apply`, `/watcher scan`, `/watcher pause`, `/watcher resume`, `/watcher interval <seconds>`, `/watcher interval default`.",
+     "metadata": {}
+    }
+   ]
+  },
+  "46": {
+   "status": "complete",
+   "messages": [
+    {
+     "author_type": "ai",
+     "message": "No MCP servers connected.",
+     "metadata": {}
+    }
+   ]
+  },
+  "47": {
+   "status": "complete",
+   "messages": [
+    {
+     "author_type": "ai",
+     "message": "**Sage findings watcher — operation `1`**\n\n| State | Owner | Generation | Route | Bot | Last successful scan | Findings | Pending | Interval |\n|---|---|---:|---|---|---|---:|---:|---:|\n| `paused` | `rc11 live check (Sage Watcher)` (`11`) | 2 | `openai/bedrock-claude-4-6-sonnet` | `-` | `-` | 0 | 0 | 300s |\n\nManaged channel: `#sage-findings` (ID `2`) · scans: 0 · last error: `-`\n\nRemedy: Run `/watcher resume` from the exact locked owner.\n\nControls from the exact locked owner: `/watcher apply`, `/watcher scan`, `/watcher pause`, `/watcher resume`, `/watcher interval <seconds>`, `/watcher interval default`.",
+     "metadata": {}
+    }
+   ]
+  },
+  "48": {
+   "status": "complete",
+   "messages": [
+    {
+     "author_type": "ai",
+     "message": "**Sage findings watcher — operation `1`**\n\n| State | Owner | Generation | Route | Bot | Last successful scan | Findings | Pending | Interval |\n|---|---|---:|---|---|---|---:|---:|---:|\n| `paused` | `rc11 live check (Sage Watcher)` (`11`) | 2 | `openai/bedrock-claude-4-6-sonnet` | `-` | `-` | 0 | 0 | 300s |\n\nManaged channel: `#sage-findings` (ID `2`) · scans: 0 · last error: `-`\n\nRemedy: Run `/watcher resume` from the exact locked owner.\n\nControls from the exact locked owner: `/watcher apply`, `/watcher scan`, `/watcher pause`, `/watcher resume`, `/watcher interval <seconds>`, `/watcher interval default`.",
+     "metadata": {}
+    }
+   ]
+  }
+ }
+}
