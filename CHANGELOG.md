@@ -84,7 +84,11 @@ between minor releases.
   context overflow) changes in two ways. For OpenAI it shows the status and the provider's message without the
   error code and parameter, because the OpenAI SDK changed how it words its errors. For OpenAI and Anthropic its
   title names LangChain's error class, for example `OpenAIInvalidRequestError` rather than `BadRequestError`.
-  Sage's own notices are unchanged.
+  Sage's own notices are unchanged. The error code and parameter are in Sage's container log instead
+  (`./mythic-cli logs sage`): each failed OpenAI or Anthropic request logs one line,
+  `Provider request failed: sdk=<openai|anthropic> status=<status> type=<type> code=<code> param=<param>` (`-` when
+  the provider sent none), read from the SDK's error fields however the SDK words its error. The line never carries
+  the API key, the request or the provider's message.
 - Sage's MCP client moves from the retired `langchain-mcp-adapters` to `langchain.mcp` on MCP 2 and FastMCP, for
   BloodHound and for servers added with `/mcp connect`. Tools, results and the BloodHound ingest-status read behave
   as before. HTTP MCP servers now connect through httpx2 with the same TLS trust (`certs/bundle.pem` or

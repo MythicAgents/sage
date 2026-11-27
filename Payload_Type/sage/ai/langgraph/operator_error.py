@@ -14,7 +14,11 @@ operator-facing text is ever produced by stringifying a non-string exception pay
 from __future__ import annotations
 
 import re
+import sys
 import time
+
+from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.language_models import BaseLanguageModel
 
 SUPPRESSED_SUFFIX = "internal error (details suppressed from chat; see Sage logs)"
 
@@ -90,30 +94,93 @@ def _supported_efforts(message: str) -> list[str]:
     return [_EFFORT_LABELS[word] for word in dict.fromkeys(words) if word in _EFFORT_LABELS and word != "none"]
 
 
-def _status_error(exc: BaseException):
-    try:
-        import openai
-    except ImportError:  # pragma: no cover - openai ships with the runtime
-        return None
+def _provider_status_error(exc: BaseException, sdks: tuple[str, ...] = ("openai", "anthropic")):
+    """``(sdk, error)`` for the first ``APIStatusError`` of one of ``sdks`` in ``exc``'s cause chain, else ``None``.
+
+    An SDK that was never imported cannot have raised, so its module is looked up, not imported.
+    """
+    classes = [(name, getattr(sys.modules[name], "APIStatusError", None)) for name in sdks if name in sys.modules]
+    classes = [(name, cls) for name, cls in classes if isinstance(cls, type)]
     seen: set[int] = set()
     current: BaseException | None = exc
     while current is not None and id(current) not in seen:
         seen.add(id(current))
-        if isinstance(current, openai.APIStatusError):
-            return current
+        for name, cls in classes:
+            if isinstance(current, cls):
+                return name, current
         current = current.__cause__ or current.__context__
     return None
 
 
-def _error_fields(error) -> tuple[int, str, str, str]:
+def _status_error(exc: BaseException):
+    """The OpenAI status error in ``exc``'s cause chain: the only SDK the configuration classifier reads."""
+    found = _provider_status_error(exc, ("openai",))
+    return found[1] if found else None
+
+
+def _error_body(error) -> dict:
+    """The error object of a status error's body: OpenAI's SDK keeps it, Anthropic's keeps the whole envelope."""
     body = getattr(error, "body", None)
     if isinstance(body, dict) and isinstance(body.get("error"), dict):
         body = body["error"]
-    body = body if isinstance(body, dict) else {}
+    return body if isinstance(body, dict) else {}
+
+
+def _error_fields(error) -> tuple[int, str, str, str]:
+    body = _error_body(error)
     code = str(getattr(error, "code", None) or body.get("code") or "")
     param = str(getattr(error, "param", None) or body.get("param") or "")
     message = str(body.get("message") or getattr(error, "message", "") or "")
     return int(getattr(error, "status_code", 0) or 0), code, param, message
+
+
+# --------------------------------------------------------------------------------------------------
+# Provider error fields in the container log (OpenAI and Anthropic), read from the SDK's typed error.
+# --------------------------------------------------------------------------------------------------
+
+PROVIDER_ERROR_LOG_PREFIX = "Provider request failed:"
+_LOG_TOKEN_UNSAFE = re.compile(r"[^A-Za-z0-9._:/\[\]-]")  # also CR/LF, spaces and "=": one line, one value per key
+_LOG_TOKEN_BOUND = 64
+
+
+def _log_token(value: object) -> str:
+    return _LOG_TOKEN_UNSAFE.sub("_", str(value or ""))[:_LOG_TOKEN_BOUND] or "-"
+
+
+def provider_error_log_line(exc: BaseException) -> str | None:
+    """One container-log line with the provider error's status, type, code and parameter, or ``None`` when ``exc``
+    carries no OpenAI or Anthropic status error. Never the message, body, headers, key or request content."""
+    found = _provider_status_error(exc)
+    if found is None:
+        return None
+    sdk, error = found
+    status, code, param, _message = _error_fields(error)
+    error_type = getattr(error, "type", None) or _error_body(error).get("type")
+    return (f"{PROVIDER_ERROR_LOG_PREFIX} sdk={sdk} status={status} type={_log_token(error_type)} "
+            f"code={_log_token(code)} param={_log_token(param)}")
+
+
+class ProviderErrorLogHandler(BaseCallbackHandler):
+    """Logs one fields line for each failed request of the chat model it is attached to."""
+
+    run_inline = True
+
+    def on_llm_error(self, error: BaseException, **kwargs) -> None:
+        line = provider_error_log_line(error)
+        if line is not None:
+            from mythic_container.logging import logger
+
+            logger.error(line)
+
+
+def with_provider_error_log(llm):
+    """Attach the fields handler to a chat model Sage built (once) and return the model. Only a LangChain model
+    has callbacks; anything else is returned as it is."""
+    if isinstance(llm, BaseLanguageModel):
+        handlers = list(llm.callbacks or [])
+        if not any(isinstance(handler, ProviderErrorLogHandler) for handler in handlers):
+            llm.callbacks = [*handlers, ProviderErrorLogHandler()]
+    return llm
 
 
 def provider_configuration_rejection(exc: BaseException):

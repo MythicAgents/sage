@@ -65,7 +65,12 @@ from .turn_authority import (
 )
 from .request_events import RequestEventLedger, exported_content_digest, stable_event_id
 from .decision_record import seal_request_decision_record
-from .operator_error import operator_error_text, provider_configuration_rejection, provider_unanswered
+from .operator_error import (
+    operator_error_text,
+    provider_configuration_rejection,
+    provider_unanswered,
+    with_provider_error_log,
+)
 from . import engagement_ledger
 from . import worker_outcome as _worker_outcome
 from . import catalog_binding as _catalog_binding
@@ -10015,7 +10020,7 @@ class Model:
         # actually reaches create_agent's internal react loop for ALL providers is `_MessageSanitizerMiddleware`
         # (added in `_context_middleware`); this patch is retained only as belt-and-suspenders for the proxy path.
         if llm is not None:
-            llm = _patch_model_for_bedrock(llm)
+            llm = with_provider_error_log(_patch_model_for_bedrock(llm))
         return llm
 
     def _on_provider_retry_event(self, event: dict[str, Any]) -> None:

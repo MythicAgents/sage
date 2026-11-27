@@ -5,8 +5,9 @@ recorded on 2026-11-22 together with what the pre-upgrade SDK and adapter (``pro
 it, projected onto what Sage's consumers read (``tests/provider_wire_replay.py``). The installed SDK and adapter must
 produce the same projections on both client paths Sage uses, and a checkpoint saved under the oracle versions must
 restore to the same history. Rows added later (``added_by``, with ``provenance.additions``) name the versions they were
-frozen under; a rebuilt row says what it was rebuilt from and why its expectation is the folded message. Stand-ins,
-labelled: the network transport (answers with the recorded body), the replay prompt and the tool result.
+frozen under; a rebuilt row says what it was rebuilt from and why its expectation is the folded message. Rejected rows
+also freeze the provider-error fields line the container log receives (``log_fields``, added later with its reason).
+Stand-ins, labelled: the network transport (answers with the recorded body), the replay prompt and the tool result.
 """
 
 from __future__ import annotations
@@ -97,6 +98,11 @@ def test_provenance_names_its_oracle_substitutions_and_gaps():
             assert set(added) == {"finish_reason"}, row["id"]
             assert "finish_reason" not in row["expected"]["message"]["metadata"], row["id"]
             assert added["finish_reason"].casefold() not in replay.DECIDED_FINISH_REASONS, row["id"]
+    # The container-log fields view was added after the freeze, for every rejected row, with the plan's reason.
+    for row in ROWS:
+        assert ("log_fields" in row["expected"]) is ("error" in row["expected"]), row["id"]
+        if "log_fields" in row["expected"]:
+            assert row["log_fields_reason"].startswith("this plan: a failed provider request logs"), row["id"]
 
 
 @pytest.mark.parametrize("path", replay.PATHS)
@@ -110,15 +116,18 @@ def test_recorded_body_produces_the_frozen_consumer_view(row, path):
         assert type(client) is httpx.Client
         assert isinstance(client._transport, provider_retry.RetryingHTTPTransport)
 
-    result = replay.outcome(llm)
+    with replay.captured_log() as logged:
+        result = replay.outcome(llm)
 
     assert requests == [_expected_request_path(row)]
     expected = row["expected"]
     if "error" in expected:
         assert isinstance(result, openai.APIStatusError), repr(result)
         assert replay.error_view(result, row) == _accepted(row, "error")
+        assert replay.log_fields_view(logged) == _accepted(row, "log_fields")
     else:
         assert isinstance(result, AIMessage), repr(result)
+        assert replay.log_fields_view(logged) == {"lines": []}
         assert replay.message_view(result) == _accepted(row, "message")
         assert replay.history_view(replay.history(result), configured_model=row["model"]) == expected["history"]
 
@@ -147,9 +156,13 @@ def _row(predicate) -> dict:
     return next(row for row in ROWS if predicate(row))
 
 
-def _replay_body(row: dict, body: dict):
+def _replay_body(row: dict, body: dict, logged: list[str] | None = None):
     llm, _client, _requests = replay.build_model(row, "default", body=json.dumps(body).encode())
-    return replay.outcome(llm)
+    with replay.captured_log() as messages:
+        result = replay.outcome(llm)
+    if logged is not None:
+        logged.extend(messages)
+    return result
 
 
 def test_a_changed_call_id_fails_its_row():
@@ -176,5 +189,7 @@ def test_a_changed_rejection_parameter_fails_its_row():
     row = _row(lambda r: "error" in r["expected"] and r["route"]["api"] == "responses")
     body = copy.deepcopy(row["body"])
     body["error"]["param"] = "reasoning.summary"
+    logged: list[str] = []
 
-    assert replay.error_view(_replay_body(row, body), row) != _accepted(row, "error")
+    assert replay.error_view(_replay_body(row, body, logged), row) != _accepted(row, "error")
+    assert replay.log_fields_view(logged) != _accepted(row, "log_fields")

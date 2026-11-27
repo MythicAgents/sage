@@ -378,7 +378,9 @@ def init_chat_model_from_profile(profile: ResolvedLLMProfile) -> Any:
                 "Bedrock model configuration is missing: " + ", ".join(missing)
             )
         kwargs.setdefault("region", "us-east-1")
-    return init_chat_model(**kwargs)
+    from ai.langgraph.operator_error import with_provider_error_log
+
+    return with_provider_error_log(init_chat_model(**kwargs))
 
 
 def build_bloodhound_env(request: ChatRequest) -> dict[str, str]:

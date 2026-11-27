@@ -593,6 +593,11 @@
      "operator_text": "Error code: 400 - {'error': {'message': \"Function tools with reasoning_effort are not supported for recorded-model-a in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.\", 'type': 'invalid_request_error', 'param': 'reasoning_effort', 'code': None}}",
      "configuration_notice": "The model provider rejected this request (HTTP 400, param `reasoning_effort`): Function tools with reasoning_effort are not supported for recorded-model-a in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.\n\nRoute used: provider openai · model `recorded-model-a` · OpenAI API: Chat Completions (chat configuration) · OpenAI Daybreak: not sent (Chat Completions or adapter route) · OpenAI Safety Identifier: not configured · Reasoning Effort: Low (chat configuration) · endpoint https://provider.invalid/v1.\n\nTo fix it, set **OpenAI API** to **Responses** in this chat's configuration (or the SAGE_OPENAI_API user secret or environment value), then send your request again; Responses keeps reasoning and tools. Setting **Reasoning Effort** to **None** also avoids this error, but only on models that accept None, and it turns reasoning off. This chat is still usable and keeps its conversation: changing the model (**Model** or `/model <name>`), OpenAI API, OpenAI Daybreak, OpenAI Safety Identifier or Reasoning Effort continues it. Sage did not change the model, provider or endpoint.",
      "unproven_notice": "The model provider rejected this chat's request before the model answered (HTTP 400): Function tools with reasoning_effort are not supported for recorded-model-a in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.\n\nRoute used: provider openai · model `recorded-model-a` (chat configuration) · endpoint https://provider.invalid/v1.\n\nTo fix it, change **Model** to a model this provider and key can use, or run `/model <name>`, then send your request again. This chat is still usable and keeps its conversation; nothing was run."
+    },
+    "log_fields": {
+     "lines": [
+      "Provider request failed: sdk=openai status=400 type=invalid_request_error code=- param=reasoning_effort"
+     ]
     }
    },
    "accepted_differences": {
@@ -606,7 +611,8 @@
      "message": "Error code: 400 - Function tools with reasoning_effort are not supported for recorded-model-a in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.",
      "operator_text": "Error code: 400 - Function tools with reasoning_effort are not supported for recorded-model-a in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'."
     }
-   }
+   },
+   "log_fields_reason": "this plan: a failed provider request logs its status, type, code and parameter as fields in the container log; the line is taken from the recorded body's error object and was added after the pre-upgrade freeze"
   },
   {
    "id": "r04_responses_200_a_function_call_list_callbacks",
@@ -1579,6 +1585,11 @@
      "operator_text": "Error code: 400 - {'error': {'code': 'unsupported_value', 'message': \"Unsupported value: 'none' is not supported with the 'recorded-model-b' model. Supported values are: 'low', 'medium', 'high', 'xhigh', and 'max'.\", 'param': 'reasoning.effort', 'type': 'invalid_request_error'}}",
      "configuration_notice": "The model provider rejected this request (HTTP 400, code `unsupported_value`, param `reasoning.effort`): Unsupported value: 'none' is not supported with the 'recorded-model-b' model. Supported values are: 'low', 'medium', 'high', 'xhigh', and 'max'.\n\nRoute used: provider openai · model `recorded-model-b` · OpenAI API: Responses (chat configuration) · OpenAI Daybreak: Off (Sage default) · OpenAI Safety Identifier: not configured · Reasoning Effort: None (chat configuration) · endpoint https://provider.invalid/v1.\n\nTo fix it, set **Reasoning Effort** to a supported value in this chat's configuration (one of the values the provider lists: Low, Medium, High, Extra high or Maximum), then send your request again. Leaving the field blank inherits the SAGE_REASONING_EFFORT user secret, then the environment, then the provider's default for the model; it is not the same as **None**, which Sage sends as an explicit value. This chat is still usable and keeps its conversation: changing the model (**Model** or `/model <name>`), OpenAI API, OpenAI Daybreak, OpenAI Safety Identifier or Reasoning Effort continues it. Sage did not change the model, provider or endpoint.",
      "unproven_notice": "The model provider rejected this chat's request before the model answered (HTTP 400): Unsupported value: 'none' is not supported with the 'recorded-model-b' model. Supported values are: 'low', 'medium', 'high', 'xhigh', and 'max'.\n\nRoute used: provider openai · model `recorded-model-b` (chat configuration) · endpoint https://provider.invalid/v1.\n\nTo fix it, change **Model** to a model this provider and key can use, or run `/model <name>`, then send your request again. This chat is still usable and keeps its conversation; nothing was run."
+    },
+    "log_fields": {
+     "lines": [
+      "Provider request failed: sdk=openai status=400 type=invalid_request_error code=unsupported_value param=reasoning.effort"
+     ]
     }
    },
    "accepted_differences": {
@@ -1592,7 +1603,8 @@
      "message": "Error code: 400 - Unsupported value: 'none' is not supported with the 'recorded-model-b' model. Supported values are: 'low', 'medium', 'high', 'xhigh', and 'max'.",
      "operator_text": "Error code: 400 - Unsupported value: 'none' is not supported with the 'recorded-model-b' model. Supported values are: 'low', 'medium', 'high', 'xhigh', and 'max'."
     }
-   }
+   },
+   "log_fields_reason": "this plan: a failed provider request logs its status, type, code and parameter as fields in the container log; the line is taken from the recorded body's error object and was added after the pre-upgrade freeze"
   },
   {
    "id": "r09_responses_200_b_message",

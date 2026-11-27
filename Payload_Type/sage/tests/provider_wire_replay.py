@@ -17,7 +17,9 @@ The replay prompt and tool result below are synthetic; the provider bodies are r
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
+import logging
 from types import SimpleNamespace
 from typing import Any, Callable
 
@@ -222,6 +224,42 @@ def error_view(error: BaseException, row: dict) -> dict[str, Any]:
         "configuration_notice": provider_configuration_notice(error, profile),
         "unproven_notice": unproven_model_notice(error, profile),
     }
+
+
+FIELDS_PREFIX = "Provider request failed:"
+
+
+@contextlib.contextmanager
+def captured_log():
+    """Messages the mythic logger (the container log, ``./mythic-cli logs sage``) receives inside the block."""
+    from mythic_container.logging import logger
+
+    class _Capture(logging.Handler):
+        def __init__(self):
+            super().__init__(level=logging.DEBUG)
+            self.messages: list[str] = []
+
+        def emit(self, record):
+            self.messages.append(record.getMessage())
+
+    capture = _Capture()
+    level = logger.level
+    logger.addHandler(capture)
+    logger.setLevel(logging.DEBUG)
+    try:
+        yield capture.messages
+    finally:
+        logger.removeHandler(capture)
+        logger.setLevel(level)
+
+
+def fields_lines(messages: list[str]) -> list[str]:
+    return [message for message in messages if message.startswith(FIELDS_PREFIX)]
+
+
+def log_fields_view(messages: list[str]) -> dict[str, Any]:
+    """The provider-error fields lines a replay wrote to the container log."""
+    return {"lines": fields_lines(messages)}
 
 
 def outcome(llm) -> AIMessage | BaseException:
