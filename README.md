@@ -131,7 +131,7 @@ changes with no Python edit and no restart. This is how you ship your own playbo
 | BloodHound | Attack-graph lifecycle — collects, ingests, and analyzes BloodHound facts |
 | MCP_Manager | Bridges arbitrary third-party MCP servers |
 | Generalist | General Q&A with no Mythic, TTP, or tool access |
-| Sandbox | Local-only isolated shell/Python snippets for scratch computation |
+| Sandbox | Local-only isolated shell/Python snippets for scratch computation, offered only where a [Sandbox executor](#sandbox-executors) exists |
 
 See [`prompts/README.md`](Payload_Type/sage/prompts/README.md) for the prompt format and the editing workflow.
 
@@ -453,7 +453,7 @@ the token has no read scope for.
 | `/stop` | Cooperatively stop the running agent on this channel |
 | `/bloodhound [force] [dir]` | Connect, report, or rebind the BloodHound MCP — see [BloodHound](#bloodhound) |
 | `/mcp <list\|tools\|call\|connect\|disconnect\|policy>` | Manage MCP servers — see [Connecting other MCP servers](#connecting-other-mcp-servers) |
-| `/sandbox [shell\|python] <code>` | Run an isolated local snippet (no network or host mounts; needs no Mythic scope) |
+| `/sandbox [shell\|python] <code>` | Run an isolated local snippet (no network or host mounts; needs no Mythic scope). Replies `unavailable`, with the reason, where no [Sandbox executor](#sandbox-executors) exists |
 | `/acp [status\|connect codex\|models\|model <id>\|disconnect]` | Connect this channel to an optional, separately deployed Codex worker and choose its model; configuration only, no prompt is sent — set up the worker with [`container/codex/SETUP.md`](Payload_Type/sage/container/codex/SETUP.md) |
 
 `/state` is available in conversation, supervised and auto modes. Its ledger is shared across
@@ -535,6 +535,21 @@ a payload's commands does not establish support for every automated capability o
 See [payload adapters and command discovery](docs/reference/TOOLS_AND_CAPABILITIES.md#payload-adapters-and-command-discovery)
 for the profile mappings and approval/alias boundary. An implemented profile is separate from live validation;
 live qualification has used Apollo only (see [Limitations](#limitations)).
+
+### Sandbox executors
+
+`sandbox_exec`, which the Sandbox agent and `/sandbox` use, runs on the first executor available where Sage runs:
+
+| Executor | When | Isolation |
+|---|---|---|
+| `container` | Sage reaches a Docker engine, as when it runs as a local process on a Docker host | A throwaway `sage-sandbox` container: no network or mounts, read-only root, dropped capabilities, memory and process caps, a non-root user and a hard timeout |
+| `local` | No Docker engine, and the kernel has Landlock ABI 6 or later (Linux 6.12 or later). This is the case when Sage runs as Mythic's `sage` container, which has no Docker socket | A confined child process of Sage in a fresh private scratch folder, with an empty environment. Landlock limits it to the system libraries and that folder, and blocks TCP, signals and abstract sockets. A seccomp filter denies sockets, `ptrace`, `io_uring`, `bpf`, the keyring and leaving its process group. CPU time, memory, file size, open files and processes are limited, with a hard timeout |
+| none | Neither | The Supervisor does not offer the Sandbox, `sandbox_exec` is withheld, and `/sandbox` replies `unavailable` with the reason. Sage logs one warning |
+
+Each result names its `executor`. The `local` executor shares the host kernel and has no cgroup limits, so it is
+weaker than a container or a virtual machine. It has no network, so it cannot install packages, and it does not run
+while Sage runs as root. Sage never mounts the Docker socket into its container to reach the `container` executor.
+Sandbox output is diagnostic only, never engagement evidence.
 
 The complete tool and capability reference is in
 [docs/reference/TOOLS_AND_CAPABILITIES.md](docs/reference/TOOLS_AND_CAPABILITIES.md). Because the exposed set is
@@ -1207,6 +1222,10 @@ Sage 0.4 is deliberately narrow, and its live validation lags its code:
   reported as "not terminal" or as errors when a task's completion function failed or a delegation was interrupted,
   the internal delegation envelope appearing in the transcript, a ledger that records only verifier-proven gains, and
   an experimental coding-agent connection whose worker settings a Sage reinstall deletes.
+- **Sandbox.** When Sage runs as Mythic's container, the Sandbox uses the confined `local` executor, which needs
+  Linux 6.12 or later on the Docker host and shares its kernel. On older kernels, including the general-availability
+  kernels of Ubuntu 22.04 and 24.04 and of Debian 12, the Sandbox is unavailable there. See
+  [Sandbox executors](#sandbox-executors).
 - **Erasure.** Operation-memory erasure removes Sage-derived state for one operation but deliberately leaves
   authoritative Mythic records unchanged. It does not erase separate LangGraph checkpoints, Phoenix traces,
   LiteLLM/provider retention, native Mythic messages, or Slack workspace records; each owner must apply its own

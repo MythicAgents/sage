@@ -194,6 +194,43 @@ def test_explicit_collection_routing_is_built_only_for_the_supervised_supervisor
                for name, middleware in captured.items() if name != "Supervisor" for item in middleware)
 
 
+@pytest.mark.parametrize("available", [True, False], ids=["executor", "no_executor"])
+def test_supervisor_offers_the_sandbox_only_while_an_executor_exists(available, monkeypatch, tmp_path):
+    """E5: the real availability producer feeds the real supervised build; no executor means no Sandbox handoff."""
+    from ai.langgraph import sandbox_executor
+    from ai.langgraph.mythic_tools import MythicTools
+
+    monkeypatch.setenv("DOCKER_HOST", f"unix://{tmp_path}/absent.sock")
+    if not available:
+        monkeypatch.setattr(sandbox_executor, "REQUIRED_LANDLOCK_ABI", sandbox_executor.landlock_abi() + 1)
+    elif sandbox_executor.landlock_abi() < sandbox_executor.REQUIRED_LANDLOCK_ABI:
+        pytest.skip("host lacks Landlock ABI 6, so no executor can be available here")
+    sandbox_executor.select_executor.cache_clear()
+    producer = MythicTools(agent_task_id=1)
+    asyncio.run(producer.apply_sandbox_availability())
+    sandbox_executor.select_executor.cache_clear()
+
+    original = model_module.create_agent
+    offered = []
+
+    def capture_agent(*args, **kwargs):
+        if kwargs.get("name") == "Supervisor":
+            offered.extend(tool.name for tool in kwargs["tools"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(model_module, "create_agent", capture_agent)
+
+    async def body():
+        instance = _hermetic_model(mode="supervised")
+        instance.mythic_client.disabled_tools = producer.disabled_tools
+        instance._rebuild_graph()
+        return instance.graph
+
+    assert asyncio.run(body()) is not None
+    assert ("transfer_to_Sandbox" in offered) is available
+    assert "transfer_to_MCP_Manager" in offered
+
+
 def test_the_hermetic_fixture_never_reaches_the_network():
     """The control: prove this file is testing Sage, not the operator's connectivity.
 

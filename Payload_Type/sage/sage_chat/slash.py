@@ -1021,6 +1021,12 @@ def _render_sandbox_result(language: str, raw: str) -> str:
         payload = {"status": "error", "error": str(payload)}
 
     status = str(payload.get("status") or "error")
+    if status == "unavailable":
+        return (
+            "**Sandbox unavailable**\n\n"
+            f"{payload.get('reason') or 'No sandbox executor is available here.'}\n\n"
+            "See “Sandbox executors” in Sage's README for the deployments that can run the Sandbox."
+        )
     if status != "ok":
         return (
             "**Sandbox result**\n\n"
@@ -1035,6 +1041,7 @@ def _render_sandbox_result(language: str, raw: str) -> str:
         "|---|---|",
         f"| Status | `{status}` |",
         f"| Language | `{language}` |",
+        f"| Executor | `{payload.get('executor')}` |",
         f"| Exit code | `{payload.get('exit_code')}` |",
         f"| Timed out | `{bool(payload.get('timed_out'))}` |",
         f"| Truncated | `{bool(payload.get('truncated'))}` |",

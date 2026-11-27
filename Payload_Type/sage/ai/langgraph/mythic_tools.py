@@ -690,6 +690,11 @@ except ImportError:  # allow running this module directly for manual testing
     import staged_tools
 
 try:
+    from . import sandbox_executor
+except ImportError:  # allow running this module directly for manual testing
+    import sandbox_executor
+
+try:
     from . import command_builder
 except ImportError:  # allow running this module directly for manual testing
     import command_builder
@@ -2175,6 +2180,8 @@ class MythicTools:
         # Guarded tools disabled by scope preflight. Populated by apply_scope_gating()
         # after login when the channel bot token's granted scopes are known; empty otherwise (no gating).
         self.disabled_tools: set[str] = set()
+        # Tools disabled because nothing can execute them here (no Sandbox executor). Scope gating keeps these.
+        self._availability_disabled_tools: set[str] = set()
         # Circuit breaker for repeated identical task failures. Keyed by
         # (command, callback_display_id, normalized_params); incremented on each failed
         # issue_task_and_waitfor_task_output, reset on success. Prevents the agent from
@@ -4123,14 +4130,21 @@ class MythicTools:
 
     def apply_scope_gating(self, granted_scopes: "set[str] | list[str] | None") -> set[str]:
         """Set `self.disabled_tools` from the token's granted scopes (see `tools_missing_scope`)."""
-        self.disabled_tools = tools_missing_scope(granted_scopes)
+        self.disabled_tools = tools_missing_scope(granted_scopes) | getattr(self, "_availability_disabled_tools", set())
         if self.disabled_tools:
             logger.info(
                 f"Scope preflight: disabling {len(self.disabled_tools)} guarded tool(s) lacking a granted "
                 f"scope: {sorted(self.disabled_tools)}"
             )
         return self.disabled_tools
-    
+
+    async def apply_sandbox_availability(self) -> str:
+        """Disable `sandbox_exec` for this session when no Sandbox executor exists; return the reason, or ''."""
+        executor, reason = await asyncio.to_thread(sandbox_executor.select_executor)
+        self._availability_disabled_tools = set() if executor else {"sandbox_exec"}
+        self.disabled_tools = (set(self.disabled_tools) - {"sandbox_exec"}) | self._availability_disabled_tools
+        return reason
+
     def get_tools(self, method_names: list[str]) -> list[StructuredTool]:
         """Get Mythic tools by method names and return them as LangChain StructuredTool instances.
 
@@ -24273,12 +24287,12 @@ class MythicTools:
         language: Annotated[str, "'shell' (sh -c) or 'python' (python3 -c). Default 'shell'."] = "shell",
         timeout: Annotated[int | None, "Wall-clock timeout in seconds; default 30, clamped to 1-120."] = None,
     ) -> str:
-        """Run untrusted code in an isolated, ephemeral sandbox container, returning stdout/stderr/exit.
+        """Run untrusted code in Sage's isolated, ephemeral sandbox, returning stdout/stderr/exit.
 
-        The code runs in a throwaway `sage-sandbox` container with NO access to the Sage container's
-        filesystem (Mythic tokens, sage.db, TTP files), NO host mounts, NO network, dropped capabilities,
-        a read-only rootfs + small tmpfs work dir, memory/pid caps, a non-root user, and a hard timeout.
-        Use this for ad-hoc parsing/scripting that should NOT run in the Sage container or on the host.
+        The sandbox is a throwaway `sage-sandbox` container when Sage can reach a Docker engine, otherwise a
+        confined local process (Landlock, seccomp and resource limits) in a fresh scratch folder. Either way the
+        code has NO access to Sage's files (Mythic tokens, sage.db, TTP files), NO network, and a hard timeout.
+        Use this for ad-hoc parsing/scripting that should NOT run in Sage's own process or on the host.
 
         # HITL: guarded  (code execution — supervised mode must gate this)
 
@@ -24287,17 +24301,17 @@ class MythicTools:
             language: 'shell' or 'python'.
             timeout: Seconds (default 30, max 120).
         Returns:
-            str: JSON {status, exit_code, stdout, stderr, timed_out, truncated} or {status:error,...}.
+            str: JSON {status, executor, exit_code, stdout, stderr, timed_out, truncated}, {status:error,...},
+            or {status:unavailable, reason} when no sandbox executor exists here.
         """
         self._require_request_contract_effect("sandbox_exec", {
             "code_or_command": code_or_command,
             "language": language,
             "timeout": timeout,
         })
-        try:
-            import docker  # noqa: F401  (lazy: module must import even when the SDK is absent)
-        except ImportError:
-            return json.dumps({"status": "error", "error": "docker SDK not installed in the Sage container; add 'docker' to requirements and rebuild."}, sort_keys=True)
+        executor, reason = await asyncio.to_thread(sandbox_executor.select_executor)
+        if executor is None:
+            return json.dumps({"status": "unavailable", "reason": reason}, sort_keys=True)
 
         timeout = 30 if timeout is None else max(1, min(int(timeout), 120))
         if language == "python":
@@ -24307,12 +24321,16 @@ class MythicTools:
         else:
             return json.dumps({"status": "error", "error": f"unsupported language '{language}'; use 'shell' or 'python'."}, sort_keys=True)
 
-        logger.debug(f"🛠️ Calling sandbox_exec (language={language}, timeout={timeout}s)")
+        logger.debug(f"🛠️ Calling sandbox_exec (executor={executor}, language={language}, timeout={timeout}s)")
         try:
-            result = await asyncio.to_thread(
-                self._run_sandbox_sync, command, "sage-sandbox:latest", timeout, "512m", 256, "128m"
-            )
+            if executor == "container":
+                result = await asyncio.to_thread(
+                    self._run_sandbox_sync, command, "sage-sandbox:latest", timeout, "512m", 256, "128m"
+                )
+            else:
+                result = await asyncio.to_thread(sandbox_executor.run_local, language, code_or_command, timeout)
             result["status"] = "ok"
+            result["executor"] = executor
             return json.dumps(result, sort_keys=True)
         except Exception as e:
             return json.dumps({"status": "error", "error": f"sandbox execution failed: {e}"}, sort_keys=True)

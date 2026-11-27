@@ -1,0 +1,13 @@
+{
+  "arguments": {
+    "code_or_command": "\nimport hashlib\n\n# SHA-256 of \"sage-sandbox-check\"\ndigest = hashlib.sha256(\"sage-sandbox-check\".encode(\"utf-8\")).hexdigest()\nprint(f\"SHA-256('sage-sandbox-check'): {digest}\")\n\n# 25th Fibonacci number, F(1)=1, F(2)=1\na, b = 1, 1\nfor _ in range(23):          # already have F(1) and F(2); need 23 more steps to reach F(25)\n    a, b = b, a + b\nprint(f\"F(25): {b}\")\n",
+    "language": "python"
+  },
+  "provenance": {
+    "extracted_from": "the accepted sandbox_exec approval card's action arguments",
+    "producer": "Sandbox agent model via LiteLLM bedrock-claude-4-6-sonnet, supervised mode",
+    "source": "native Mythic chat, channel 74, request 125, 2026-11-27 (pre-activation probe of the Sandbox delegation path)",
+    "transformations": "none; arguments copied verbatim"
+  },
+  "tool_name": "sandbox_exec"
+}

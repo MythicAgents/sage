@@ -70,7 +70,7 @@ the token has no read scope for.
 | `create_payload` | Create a new Mythic payload/agent | `payload.write` |
 | `delete_payload` | Soft-delete a junk payload after verifying it has no callbacks | `payload.write` |
 | `download_tool` | Download a tool binary from its pinned, sha256-verified source into the drop zone | None (local only; `ensure_tool_uploaded` needs `file.write`) |
-| `sandbox_exec` | Run untrusted code in an isolated ephemeral sandbox container | None (local only) |
+| `sandbox_exec` | Run untrusted code in Sage's isolated, ephemeral sandbox: a throwaway container where a Docker engine is reachable, otherwise a confined local process; unavailable where neither exists (see [Sandbox executors](../../README.md#sandbox-executors)) | None (local only) |
 
 For a direct `issue_task_and_waitfor_task_output` proposal in native supervised chat, Sage resolves
 deterministic command aliases, parameter names, defaults, and supported context before it displays the

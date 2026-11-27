@@ -11785,6 +11785,12 @@ class Model:
         except Exception as e:
             logger.debug(f"Scope preflight skipped during initialization: {e}")
         try:
+            # No Sandbox executor here (no Docker engine and no confined local executor): withhold the tool and
+            # the Supervisor's Sandbox handoff instead of failing at run time.
+            await self.mythic_client.apply_sandbox_availability()
+        except Exception as e:
+            logger.debug(f"Sandbox availability check skipped during initialization: {e}")
+        try:
             await self.mythic_client._ensure_engagement_key()
         except Exception as e:
             logger.debug(f"Engagement ledger key resolution skipped during initialization: {e}")
@@ -17133,7 +17139,7 @@ class Model:
         assign_to_sandbox_agent = _create_handoff_tool(
                 agent_name="Sandbox",
                 **handoff_context,
-                description="Assign to the Sandbox agent for isolated LOCAL scratch execution only: run shell/Python snippets, parse/transform text, test regexes, or perform ad-hoc computation in a throwaway container. Do NOT use this for Mythic, BloodHound, target-facing actions, payload work, or proof.",
+                description="Assign to the Sandbox agent for isolated LOCAL scratch execution only: run shell/Python snippets, parse/transform text, test regexes, or perform ad-hoc computation in Sage's isolated sandbox (a throwaway container, or a confined local process). Do NOT use this for Mythic, BloodHound, target-facing actions, payload work, or proof.",
                 autonomous_redirect=self._autonomous_handoff_step_redirect,
                 worker_outcome_lookup=self._latest_admitted_worker_handoff,
                 subgoal_scheduler=self._schedule_subgoal_transition,
@@ -17155,10 +17161,12 @@ class Model:
             respond_to_user_tool,
             request_continuation_tool,
         ]
-        if not self._autonomous_execution_enabled_for_turn():
-            tools.insert(4, assign_to_sandbox_agent)
-            tools.insert(4, assign_to_mcp_manager_agent)
         mythic_client = getattr(self, "mythic_client", None)
+        if not self._autonomous_execution_enabled_for_turn():
+            # Offer the Sandbox only while something can run its code (see apply_sandbox_availability).
+            if "sandbox_exec" not in (getattr(mythic_client, "disabled_tools", None) or set()):
+                tools.insert(4, assign_to_sandbox_agent)
+            tools.insert(4, assign_to_mcp_manager_agent)
         if self.mode != "auto" and mythic_client is not None:
             # Read-only callback listing lets the Supervisor answer callback questions and name a step's callback
             # and targets in the delegation brief without first delegating a lookup.

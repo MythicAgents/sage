@@ -47,6 +47,11 @@ between minor releases.
   OpenAI Daybreak, OpenAI Safety Identifier, resource metering and the strict task-tool schema apply to all three
   providers. Existing `provider: openai` chats that point at a gateway keep working unchanged; switching one to
   LiteLLM Gateway starts a new chat.
+- **The Sandbox works when Sage runs as Mythic's container.** That container has no Docker socket, so the Sandbox
+  agent and `/sandbox` used to fail at run time. Where no Docker engine is reachable, `sandbox_exec` now runs a
+  confined local process instead (Landlock, seccomp and resource limits; Linux 6.12 or later). Where neither
+  executor exists, Sage withholds the Sandbox and `/sandbox` says why. Each result names its `executor`. See
+  "Sandbox executors" in the README.
 
 ### Changed
 
