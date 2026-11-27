@@ -1103,8 +1103,9 @@ def run_probe_here(script: str, argv: list[str], root: Path, *, status: int = 20
     out = io.StringIO()
     try:
         for name in ("API_KEY", "OPENAI_API_KEY", "API_ENDPOINT", "OPENAI_API_BASE", "OPENAI_BASE_URL", "provider",
-                     "model", "SAGE_OBSERVATION_DIRECTORY", "mode", "max_steps", "autonomous_solve"):
-            os.environ.pop(name, None)
+                     "model", "SAGE_OBSERVATION_DIRECTORY", "mode", "max_steps", "autonomous_solve",
+                     "OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT", *[n for n in os.environ if n.startswith("OPENINFERENCE_")]):
+            os.environ.pop(name, None)  # what other tests in this process may have set; the probe reads a clean start
         os.environ.update(environ or {})
         os.environ["SAGE_RC10_PROBE_ROOT"] = str(root)
         sys.argv, httpx.get = ["-c", *argv], get
