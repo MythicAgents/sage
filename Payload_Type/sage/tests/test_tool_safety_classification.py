@@ -26,6 +26,7 @@ def _public_tool_methods() -> list[str]:
     lifecycle) are excluded — they're called by the kernel, not by the model."""
     skip = {
         "active_for",
+        "apply_sandbox_availability",
         "apply_scope_gating",
         "authentication_context",
         "begin_operator_turn",
