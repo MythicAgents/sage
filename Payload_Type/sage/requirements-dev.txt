@@ -46,3 +46,8 @@ pyasn1==0.6.5
 # exporter to assert spans are emitted and nested. That needs the SDK, not just the API that the
 # product imports; the SDK is a test-only dependency and belongs here rather than in requirements.txt.
 opentelemetry-sdk==1.45.2
+
+# `skills/sage-focused-capability-tests/scripts/check_mythic_sdk_rc10.py` proves the operator's Bedrock credential with
+# a keyed, non-inference ListInferenceProfiles call before a live check. boto3 already resolves through langchain-aws
+# at this version; declared here because a skill imports it directly.
+boto3==1.43.115

@@ -39,6 +39,7 @@ from mythic_container.ChatBase import (
 from mythic_container.logging import logger
 
 from _version import agent_version
+from ai import phoenix_auth
 
 from .config import (
     OPENAI_ROUTE_FIELDS,
@@ -655,13 +656,25 @@ class SageChat(Chat):
             await self._reconcile_open_requests(message)
         except Exception as exc:
             logger.warning("Open-request reconciliation failed (%s)", type(exc).__name__)
+        # Mythic posts EventLogErrorMessage as a warning in every operation's event log, without an API token.
+        # The Phoenix default-password check runs at the first on-start only (ai/phoenix_auth.py).
+        warnings: list[str] = []
+        if watcher_error is not None:
+            warnings.append(
+                "Sage findings watcher startup failed before scheduling: "
+                f"{type(watcher_error).__name__}."
+            )
+        try:
+            phoenix_notice = await phoenix_auth.default_password_notice()
+        except Exception as exc:
+            phoenix_notice = None
+            logger.warning("Phoenix default-password check failed (%s)", type(exc).__name__)
+        if phoenix_notice:
+            warnings.append(phoenix_notice)
         if watcher_error is not None:
             return ContainerOnStartMessageResponse(
                 ContainerName=self.name,
-                EventLogErrorMessage=(
-                    "Sage findings watcher startup failed before scheduling: "
-                    f"{type(watcher_error).__name__}."
-                ),
+                EventLogErrorMessage="\n\n".join(warnings),
             )
         return ContainerOnStartMessageResponse(
             ContainerName=self.name,
@@ -669,6 +682,7 @@ class SageChat(Chat):
                 "Sage Watcher startup profile reconciliation completed for operation "
                 f"{message.OperationID}; use /watcher status to inspect the exact state."
             ),
+            EventLogErrorMessage="\n\n".join(warnings),
         )
 
     async def _onstart_client(self, message: ContainerOnStartMessage) -> Any:

@@ -120,7 +120,12 @@ def test_phoenix_answers_and_receives_sage_spans_with_sage_tracing(tmp_path):
     assert report["trace_counts"].get("Sage", 0) >= 1
 
 
-def test_probe_detects_the_deadlock_of_a_global_synchronous_provider(tmp_path):
+def test_the_pre_fix_global_registration_no_longer_deadlocks_phoenix_22(tmp_path):
+    """Measured 2026-11-25 on Phoenix 22.0.1: the pre-fix registration (Sage's synchronous exporter as the global
+    provider) answers too. Phoenix 20 deadlocked here, which this probe showed (`health` None); Phoenix 22 traces its
+    GraphQL server only through a provider of its own, so there is no deadlock left to show. Sage still keeps its
+    provider out of the global slot (the test above). If this starts failing with `health` None after a Phoenix
+    upgrade, the deadlock is back and the global-slot rule is load-bearing again."""
     report = _run("global", tmp_path)
 
-    assert report["health"] is None
+    assert report["health"] == 200

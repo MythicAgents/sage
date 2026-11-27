@@ -50,6 +50,10 @@ def _accepted(row: dict, view: str) -> dict:
     assert accepted["reason"].startswith("Operator decision"), row["id"]
     if {name: version(name) for name in accepted["versions"]} != accepted["versions"]:
         return row["expected"][view]
+    if view == "message":
+        frozen = row["expected"]["message"]
+        added = accepted.get("message", {}).get("metadata", {})
+        return {**frozen, "metadata": {**frozen["metadata"], **added}}
     return {**row["expected"][view], **accepted.get(view, {})}
 
 
@@ -77,12 +81,22 @@ def test_provenance_names_its_oracle_substitutions_and_gaps():
             assert len(row["body"]["choices"]) > 1, row["id"]
     assert any("reasoning" in row["expected"]["message"]["content_types"] for row in ANSWERED)
     assert any(row["expected"]["message"]["content_types"] == ["text"] for row in ANSWERED)
-    # An accepted difference may only replace the SDK's own error text, never what Sage's consumers decide on.
+    # An accepted difference may only replace the SDK's own error text, or add a finish_reason whose value no Sage
+    # consumer decides on; never what Sage's consumers decide on.
     for row in ROWS:
         accepted = row.get("accepted_differences")
-        if accepted:
+        if not accepted:
+            continue
+        if "error" in accepted:
             assert set(accepted) == {"reason", "versions", "error"} and set(accepted["error"]) <= {
                 "message", "operator_text"}, row["id"]
+        else:
+            assert set(accepted) == {"reason", "versions", "message"}, row["id"]
+            assert set(accepted["message"]) == {"metadata"}, row["id"]
+            added = accepted["message"]["metadata"]
+            assert set(added) == {"finish_reason"}, row["id"]
+            assert "finish_reason" not in row["expected"]["message"]["metadata"], row["id"]
+            assert added["finish_reason"].casefold() not in replay.DECIDED_FINISH_REASONS, row["id"]
 
 
 @pytest.mark.parametrize("path", replay.PATHS)
@@ -105,7 +119,7 @@ def test_recorded_body_produces_the_frozen_consumer_view(row, path):
         assert replay.error_view(result, row) == _accepted(row, "error")
     else:
         assert isinstance(result, AIMessage), repr(result)
-        assert replay.message_view(result) == expected["message"]
+        assert replay.message_view(result) == _accepted(row, "message")
         assert replay.history_view(replay.history(result), configured_model=row["model"]) == expected["history"]
 
 

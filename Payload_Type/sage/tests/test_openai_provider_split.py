@@ -54,12 +54,11 @@ ENV = (
 def _clean(monkeypatch):
     for name in ENV:
         monkeypatch.delenv(name, raising=False)
-    # The adapter caches its own client per endpoint; a swapped transport must not outlive its test.
+    # The adapter caches its sync client per endpoint (from langchain-openai 1.8 it builds a fresh async client per
+    # model); a swapped transport must not outlive its test.
     _client_utils._cached_sync_httpx_client.cache_clear()
-    _client_utils._cached_async_httpx_client.cache_clear()
     yield
     _client_utils._cached_sync_httpx_client.cache_clear()
-    _client_utils._cached_async_httpx_client.cache_clear()
 
 
 class Capture:

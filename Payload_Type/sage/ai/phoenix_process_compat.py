@@ -1,8 +1,9 @@
-"""Capture-only compatibility shim for Phoenix's process launcher.
+"""Capture-only shim for Phoenix's process launcher.
 
-Phoenix 19.19.0 builds ``main.py FLAGS serve`` even though its entry parser
-requires ``main.py serve FLAGS``.  Keep Phoenix's ProcessSession and service
-lifecycle, changing only that command ordering while capture is active.
+Capture runs Phoenix as a child through Phoenix's own ProcessSession and service lifecycle. The shim checks the
+command Phoenix builds (``main.py serve --database-url URL --port N``, with the host in the child's environment since
+Phoenix 22), runs it under ``python -P`` so the server directory cannot shadow the standard library, keeps the child
+on loopback, and gives it Sage's environment without the Phoenix secrets (``ai.phoenix_auth.child_environment``).
 """
 from __future__ import annotations
 
@@ -23,7 +24,9 @@ class PhoenixProcessStartupError(RuntimeError):
         self.diagnostic = diagnostic
 
 
-_EXPECTED_FLAGS = ("--database-url", "--host", "--port")
+_EXPECTED_FLAGS = ("--database-url", "--port")
+# Capture Phoenix never leaves this host, so its authentication stays off.
+CAPTURE_HOST = "127.0.0.1"
 _MAX_DIAGNOSTIC_BYTES = 64 * 1024
 # The runtime root holds `ai/`: `Payload_Type/sage` in a checkout, `/Mythic` in the Sage container. Frames are
 # named relative to the checkout root when there is one, else to the runtime root.
@@ -118,17 +121,13 @@ def project_child_output(output: bytes, returncode: int | None) -> dict[str, Any
 
 
 def compatible_command(command: Sequence[str]) -> list[str]:
-    """Move an exact trailing ``serve`` before Phoenix's existing flags."""
+    """Accept exactly ``python main.py serve --database-url URL --port N`` and run it under ``python -P``."""
     value = list(command)
-    if len(value) == 9 and value[1] == "main.py":
+    if len(value) == 7 and value[1] == "main.py":
         value.insert(1, "-P")
-    if len(value) != 10 or value[1:3] != ["-P", "main.py"]:
+    if len(value) != 8 or value[1:4] != ["-P", "main.py", "serve"] or tuple(value[4::2]) != _EXPECTED_FLAGS:
         raise PhoenixProcessStartupError("capture Phoenix command shape is unsupported")
-    if value[3] == "serve" and tuple(value[4::2]) == _EXPECTED_FLAGS:
-        return value
-    if value[-1] == "serve" and tuple(value[3:-1:2]) == _EXPECTED_FLAGS:
-        return value[:3] + ["serve"] + value[3:-1]
-    raise PhoenixProcessStartupError("capture Phoenix command shape is unsupported")
+    return value
 
 
 class _ChildOutput:
@@ -242,6 +241,7 @@ def launch_capture_phoenix(px: Any) -> Any:
     import phoenix.services as services
     import phoenix.session.session as session_module
     from ai.observation_channel import emit
+    from ai.phoenix_auth import child_environment
 
     diagnostic: dict[str, Any] | None = None
 
@@ -249,6 +249,10 @@ def launch_capture_phoenix(px: Any) -> Any:
         @property
         def command(self) -> list[str]:
             return compatible_command(super().command)
+
+        @property
+        def environment(self) -> dict[str, str]:
+            return child_environment({**super().environment, "PHOENIX_HOST": CAPTURE_HOST})
 
         def start(self) -> Any:
             try:
@@ -264,7 +268,7 @@ def launch_capture_phoenix(px: Any) -> Any:
             child = services.psutil.Popen(
                 self.command, cwd=self.working_dir, stdout=services.subprocess.PIPE,
                 stderr=services.subprocess.STDOUT, bufsize=1, text=True,
-                env={**services.os.environ},
+                env=self.environment,
             )
             child_pid = getattr(child, "pid", None)
             if type(child_pid) is int and child_pid > 0:

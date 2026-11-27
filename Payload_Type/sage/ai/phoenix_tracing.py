@@ -15,8 +15,12 @@ from __future__ import annotations
 from typing import Any
 
 
-def register_sage_tracing() -> Any:
-    """Register Sage's exporting tracer provider and attach Sage's instrumentation to it."""
+def register_sage_tracing(api_key: str | None = None) -> Any:
+    """Register Sage's exporting tracer provider and attach Sage's instrumentation to it.
+
+    ``api_key`` is the bearer token the exporter sends (Phoenix's admin secret from ``ai.phoenix_auth``). Passing it
+    explicitly keeps an unrelated ``PHOENIX_API_KEY`` in the environment from being used in its place.
+    """
     from openinference.instrumentation.langchain import LangChainInstrumentor
     from phoenix.otel import register
 
@@ -27,6 +31,7 @@ def register_sage_tracing() -> Any:
         auto_instrument=False,  # LangChain is instrumented explicitly below
         batch=False,
         set_global_tracer_provider=False,
+        api_key=api_key,
     )
     LangChainInstrumentor().instrument(tracer_provider=tracer_provider)
     kernel_tracing.use_tracer_provider(tracer_provider)

@@ -1435,7 +1435,8 @@ def _apply_bedrock_patch():
                         logger.debug(f"BEDROCK_FIX: Replaced blank text block with '.' in {role} message")
         return result
 
-    # Patch the module-level function
+    # Patch the module-level function. `__wrapped__` lets `inspect.unwrap` recover the adapter's own function.
+    _patched_convert_message_to_dict.__wrapped__ = original_convert
     openai_base._convert_message_to_dict = _patched_convert_message_to_dict
     _bedrock_patch_applied = True
     logger.info("Applied Bedrock empty content fix to _convert_message_to_dict")
@@ -19050,10 +19051,12 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             # langchain-anthropic raise provider subclasses of `ContextOverflowError`
             # (`OpenAIContextOverflowError`, `AnthropicContextOverflowError`), so this is live on the
             # LiteLLM-proxy path and the native Anthropic path alike. Measured across all
-            # six installed providers: openai and anthropic translate; langchain-aws, -groq, -ollama
-            # and -xai do not, so a context error on those falls through to the generic guidance
-            # below — correct rather than misleading. `test_context_overflow_reporting.py` pins that
-            # split so it cannot drift unnoticed in either direction.
+            # six installed providers: openai and anthropic translate; langchain-groq, -ollama and -xai
+            # do not, and langchain-aws does only on its Converse and Mantle clients, not on the
+            # ChatBedrock that Sage's `bedrock` provider builds (Claude models go through InvokeModel;
+            # only Nova models use Converse). A context error on those falls through to the generic
+            # guidance below — correct rather than misleading. `test_context_overflow_reporting.py`
+            # pins that split so it cannot drift unnoticed in either direction.
             #
             # Worth distinguishing because the generic advice ("adjust your approach") is unactionable
             # here: the operator needs to know the input outgrew the model, not that something failed.

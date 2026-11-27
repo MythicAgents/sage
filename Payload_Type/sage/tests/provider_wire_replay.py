@@ -48,6 +48,9 @@ RUN_ID = "lc_run--<run id>"
 # response_metadata keys Sage's consumers read (model.py model-name check, finish/stop reason checks,
 # sage_chat/service.py model identity on restore).
 READ_METADATA_KEYS = ("model_name", "model", "model_id", "finish_reason", "stop_reason", "status", "id", "refusal")
+# finish_reason/stop_reason values a Sage consumer acts on: the provider-filter check (model.py
+# _is_provider_filtered_message) and the tool-call skip in the intent and continuation classifiers.
+DECIDED_FINISH_REASONS = frozenset({"content_filter", "tool_use", "tool_calls", "function_call"})
 
 
 def base_url(row_id: str, path: str) -> str:

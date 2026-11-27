@@ -1,18 +1,19 @@
 # The `mcp` extra brings `langchain.mcp`, the successor to the retired langchain-mcp-adapters. Sage's MCP
 # clients (`ai/mcp.py`, `ai/hillclimb/bare_bloodhound.py`, the reset readiness probe) convert tools with it.
-langchain[mcp]==1.4.6
-langchain-core==1.6.10
+langchain[mcp]==1.5.2
+langchain-core==1.8.5
 # Direct runtime imports of the MCP client stack (`ai/mcp.py`): the protocol types and errors, FastMCP's
 # client and transports, and the httpx2 client the HTTP transports take. Declared rather than borrowed
 # from langchain[mcp], for the same reason as the direct-import entries further down.
 mcp==2.3.0
-fastmcp-slim[client]==4.1.8
+fastmcp-slim[client]==4.2.6
 httpx2==2.15.1
-langchain-anthropic==1.7.7
-langchain-aws==1.7.0
-langchain-openai==1.7.2
-# mythic 0.3.0rc8 (Mythic v4) pulls gql 4.0.0 + websockets 15 + aiohttp 3.14 transitively.
-# langchain-google-genai stays disabled: google-genai caps websockets<15.1.0, which the v4 SDK line exceeds.
+langchain-anthropic==1.7.13
+langchain-aws==1.10.0
+langchain-openai==1.8.5
+# mythic 0.3.0rc10 (Mythic v4) allows gql>=4.0,<5 and pulls gql, websockets and aiohttp transitively. It leaves
+# TLS verification off unless a caller passes verify_ssl; Sage passes nothing, so Mythic TLS behaves as before.
+# langchain-google-genai stays disabled: it would cap arize-phoenix at 21.0.0.
 #langchain-google-genai==4.1.3
 langchain-groq==1.1.3
 langchain-ollama==1.1.0
@@ -23,23 +24,24 @@ langchain-xai==1.3.0
 langgraph==1.2.24
 langgraph-prebuilt==1.1.3
 langgraph-checkpoint-sqlite==3.1.1
-langsmith==0.10.16
-mythic==0.3.0rc8
+langsmith==0.16.2
+mythic==0.3.0rc10
 mythic-container==0.7.0rc11
 # mythic-container 0.7.0rc1's generated gRPC stubs require grpcio>=1.78.0 (its metadata leaves grpcio
 # unpinned). Pin both so the container build is deterministic and doesn't regress to 1.76.x.
 grpcio==1.83.0
 grpcio-tools==1.83.0
-# Pinned for deterministic image builds — these are pulled transitively by mythic 0.3.0rc8 (Mythic v4).
-# websockets stays at 15.x: mythic 0.3.0rc8 pins gql[aiohttp,websockets]==4.0, and gql 4.0.0 declares
-# websockets<16. Blocked until mythic ships a release allowing gql 4.1+.
-gql==4.0.0
-websockets==15.0.1
+# Pinned for deterministic image builds — these are pulled transitively by mythic 0.3.0rc10 (Mythic v4).
+# websockets 17.4 needs langgraph-sdk 0.4.14 and google-genai 2.34.0 or later (constraints.txt), whose earlier
+# releases declare websockets<17.
+gql==4.4.0
+websockets==17.4
 aiohttp==3.14.4
 aiosqlite==0.22.1
-# Phoenix 20.21.0 is the newest release whose graphql-core range (<3.3) the Mythic SDK's gql 4.0.0 allows; it
-# requires anthropic>=1,<2, which sets anthropic at 1.17.0.
-arize-phoenix==20.21.0
+# Phoenix 22 listens on PHOENIX_HOST (Sage's .env ships 0.0.0.0) and turns authentication on for any non-loopback
+# address; main.py gives Sage's exporters the admin secret (ai/phoenix_auth.py). It requires anthropic>=1,<2, which
+# holds anthropic at 1.17.0.
+arize-phoenix==22.1.0
 arize-phoenix-evals==3.10.0
 openinference-instrumentation-langchain==0.1.90
 docker==7.2.0

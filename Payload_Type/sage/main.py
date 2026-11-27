@@ -111,7 +111,16 @@ if _observation_capture:
     if _phoenix_session is None or _phoenix_session.active is not True:
         raise RuntimeError("capture Phoenix process did not become active")
 else:
+    # Phoenix listens on PHOENIX_HOST (.env ships 0.0.0.0, with authentication on). Its secrets must be in this
+    # process's environment before it starts; Sage's exporters authenticate with the admin secret.
+    from ai.phoenix_auth import apply_phoenix_defaults, enable_default_password_check, ensure_phoenix_secrets
+
+    _phoenix_defaults = apply_phoenix_defaults()
+    if _phoenix_defaults:
+        logger.info(f"Phoenix settings from Sage's defaults (names only): {_phoenix_defaults}")
+    _phoenix_admin_secret = ensure_phoenix_secrets(Path(os.environ["PHOENIX_WORKING_DIR"]))
     px.launch_app(use_temp_dir=False)
+    enable_default_password_check()
 
 # Initialize global LangChain instrumentation for Phoenix tracing.  Captured
 # measurements construct the same Phoenix-selected transport, but every exported
@@ -147,7 +156,7 @@ else:
     # request spans cannot deadlock its server. See ai/phoenix_tracing.py.
     from ai.phoenix_tracing import register_sage_tracing
 
-    tracer_provider = register_sage_tracing()
+    tracer_provider = register_sage_tracing(api_key=_phoenix_admin_secret)
 
 # Logged at WARNING so it shows at Mythic's default log level: which span processors export Sage's spans,
 # and whether Sage's provider is the process-global one that Phoenix's own server spans also use.

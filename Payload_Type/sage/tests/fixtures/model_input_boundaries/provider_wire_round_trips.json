@@ -272,6 +272,19 @@
      "type": "msgpack",
      "base64": "k8eyBZS9bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMuaHVtYW6sSHVtYW5NZXNzYWdlhqdjb250ZW502SxTeW50aGV0aWMgcmVwbGF5IHByb21wdDogbGlzdCB0aGUgY2FsbGJhY2tzLrFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWlaHVtYW6kbmFtZcCiaWTAs21vZGVsX3ZhbGlkYXRlX2pzb27ICmIFlLpsYW5nY2hhaW5fY29yZS5tZXNzYWdlcy5haalBSU1lc3NhZ2WJp2NvbnRlbnSShaJpZNk1cnNfMDU0ZDMzMjgzMmFiNjk4NDAxNmIwMzQ0OTkwZjg4ODdkMTlkYWExOWNkZWRiOTk3NzGnc3VtbWFyeZCkdHlwZalyZWFzb25pbmenY29udGVudJCxZW5jcnlwdGVkX2NvbnRlbnTaBrhnQUFBQUFCckEwU1pJNjZRbnF6X2VTcnZMZGVBSTktY1F2RmpyYmlVekhUTUZZcTFpLURXM1hJc3ZMNFhpVjdRY3p4Q1FCQWpFMWU1YzdtcDJXalRvbW9raGM4bFVLclFuelhJcGNNSzZ2Tm54Sm9xWVZsMnNhVGNib2tvbEh0QWZvRlNleDFfUTlJSFI2YWozOWJIQUUxcWktZTJPUktsWGZQQTJsT0xUSWxNSndCZmFKczJBeHhDY3hOSjNob2YtdmtWM3NpVC14OVg3Zk9IYVlxcXh0XzR0eDRKU1VJb0dkZ01TZEZpUmVlMDRhRzRCTmU4d3R3Yjhmb2tOeFdQNi1XWG5fNlI0bnhDYllIVWg1TzF3MTF4N3lvMERnWndQek5OTVMyX0k1dkJMUlVEZElFX0ZFaF9Sa0VzQ3pKVU1HbFN2TWxfMjBER0lJQU84STJPSk5wR2VXeTY5VGpjOGNOSTFwdHRZVHFQSmdyVGFvLXJxUjRnSy1hcl81TzlHRkN4dkh3NldRZWNOZHVKdzh0RzhpdFFZSjhTbkx5ZUpCMER2a2F4R1VRTEQ0Zm5uS3pIc19mWGFkdl8tSGwyVkQ0Zk1SX1l1d0w2RWlpZUhqYWN5aEFjNVFUc3c1bmxHWV9xSnJScEhQYzFrdVpyZ096NUJKdkdIMFhGbnJxMU5wN1I3bXVuNy1HTDB5aHc2SENta2s2M0RlaXBWZzNURW9sSGNlcVgyRTJ3S0dTeTVUSEpGOHRobS0zWjhlRDFnWU0tbjhKYmVMb1QtWnE4OXloaXZ3LWZSQ1owSEpvZzY4MG9OWkZqYVgtcU5mTW5CbVlHZFJRanVjWHVvRkl1QjFFSjVrTkY5LWhQNWw3Z3MyZXMwcDBnZVNxbVktYm4taG1iRXdkQ2ExTlpYUllvb2JNdm5FQ21oemlxR3pIOVlWcGFsNWdmbTlBWDZFa3RvdTk5SFMxWldUVm9mM2RmSEJ4c1BTZnZ4clh4b1NVNnpIUnpEY3RxUDBBd1RPelZVd3BLS1FkREV0UjRDaGhEQ1FnVUY0WVNLTWI4X1MxS3pNSmpyOWJJUThpNDFsWU9HaWtzTWh1aXEtMmJQZHBTUmpIYzJvTERFUENOeHROWm9vcnBFX0ZzQjMzY2xKWEJTaUd4MUJaVE0yaG5wR0xVZmJla1MwSG1HMTR4bkNvSVFTWVNYbUI3MkVVUFBfWnBZX0R4R2dRYm1DUkFCNmpWOFBBb0p6TXpvbGthYjFUdXN2UWxQZWQtSWRfSWh4eUR1b1lXdU1kNF9pMUlleE5OakJLcEpXalYyQVhDbEJiYVhmZDhQUlFLTGJ6RWVWRC1qWmVFajIwa1gwMnhpdjBvVl85dlczWlRGT0RuM19VQ29PNVlZd1EtQ1pNX2std3N5bHd1bTBfMWhmaGk5dGltWWV2Z1g4dzJwS2ZZLUZXVWhOV3hDc3g3R2xTUnBGcmwxUnBxY1k0SzlScWRQN0E5VlpTaVBmMEc1NHFiOXh0R1dlbmxMa0w2WjRnLWRzeXNFZTJTNEMwWkpzcVhFRnFPTUc4UEotNU5FWjFVbGhfYjc2dmxrY0RLQUlmanJYUG9VZ1BFSFlHblphZWpzQkxBNVdTU1UtaExIMGdRYkNkM3BlMWdnY1RvajZSUEFFR21EaF9MY2EwdGI4NllOTDE2X245andwWmI1STlmV1Q5MXcwWjBncGE5WlRBM3FRZDRWWmdlYVM3TkQzc3BNNXE1aDNscUNEN0M2N1J6MmZZbDFFb2liSkpNSkRNMmNhUUo3Qms4cHNtT0JjREhyd25KYWNLb19OZ01kUThiN0NDMkFud2gzMkRsaC1xTkdPMHVDalZaSHlVMWwtSWRzUFdFTld0YmcyT2RXTWJxNU9RYm1Na0loUjhGZE5WbnlZbnVOVEpGUnBQS1I1ODFJREIxN0VGalVqRVpHXzdzanlqWW4zN1Rxam96M2ZWZkxJbU1UTEtacjY3SllETWxOdnJwcEM4VHNwa2RzM3Z4U1JZbXJMakR1Y1k0WTluMEl2d19pamFCNTRDTzJ1bllwT3VpUGxnbkxmdFZxMWJJOUlWdllkd0xJcUtmdWxnT2g1V2Y5WTFfX2xHelNxOUNEa2xwTGZ4aE9Bd0RoTkFKd2p6RUxRSm9yQkt5ZGtqNHZIWnNGZ3BsNGZQMEtzZUhQYWJpR0JoeVNGUGljNTFYT3NVdVFrZmYzMHlFUmFiV1cyblBFX1J5dDhldnowZ0p2SGlrcENLb2VodFh2a2ZUQzBha21hQVpyNkU9hqlhcmd1bWVudHOie32nY2FsbF9pZNklY2FsbF84ZjhhNGZkYTlhYjU0NWY3OGFmYzg1MWNhNWE3NjdjZKRuYW1lrmxpc3RfY2FsbGJhY2tzpHR5cGWtZnVuY3Rpb25fY2FsbKJpZNk1ZmNfMDU0ZDMzMjgzMmFiNjk4NDAxNmIwMzQ0OTkyMDU0ODdkMThlZjA1ZjM2NzMyZTc5NTamc3RhdHVzqWNvbXBsZXRlZLFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGIomlk2TdyZXNwXzA1NGQzMzI4MzJhYjY5ODQwMTZiMDM0NDk3Yjg5Yzg3ZDE5Yzk1ZDk2MTIxNjAzODI0qmNyZWF0ZWRfYXTLQdrA0SYAAAClbW9kZWywcmVjb3JkZWQtbW9kZWwtYaZvYmplY3SocmVzcG9uc2Wsc2VydmljZV90aWVyp2RlZmF1bHSmc3RhdHVzqWNvbXBsZXRlZK5tb2RlbF9wcm92aWRlcqZvcGVuYWmqbW9kZWxfbmFtZbByZWNvcmRlZC1tb2RlbC1hpHR5cGWiYWmkbmFtZcCiaWTZN3Jlc3BfMDU0ZDMzMjgzMmFiNjk4NDAxNmIwMzQ0OTdiODljODdkMTljOTVkOTYxMjE2MDM4MjSqdG9vbF9jYWxsc5GEpG5hbWWubGlzdF9jYWxsYmFja3OkYXJnc4CiaWTZJWNhbGxfOGY4YTRmZGE5YWI1NDVmNzhhZmM4NTFjYTVhNzY3Y2SkdHlwZal0b29sX2NhbGyyaW52YWxpZF90b29sX2NhbGxzkK51c2FnZV9tZXRhZGF0YYWsaW5wdXRfdG9rZW5zzSy8rW91dHB1dF90b2tlbnMarHRvdGFsX3Rva2Vuc80s1rNpbnB1dF90b2tlbl9kZXRhaWxzgq5jYWNoZV9jcmVhdGlvbs0suapjYWNoZV9yZWFkALRvdXRwdXRfdG9rZW5fZGV0YWlsc4GpcmVhc29uaW5nCrNtb2RlbF92YWxpZGF0ZV9qc29ux/UFlLxsYW5nY2hhaW5fY29yZS5tZXNzYWdlcy50b29sq1Rvb2xNZXNzYWdliadjb250ZW502SVTeW50aGV0aWMgdG9vbCByZXN1bHQgZm9yIHRoZSByZXBsYXkusWFkZGl0aW9uYWxfa3dhcmdzgLFyZXNwb25zZV9tZXRhZGF0YYCkdHlwZaR0b29spG5hbWXAomlkwKx0b29sX2NhbGxfaWTZJWNhbGxfOGY4YTRmZGE5YWI1NDVmNzhhZmM4NTFjYTVhNzY3Y2SoYXJ0aWZhY3TApnN0YXR1c6dzdWNjZXNzs21vZGVsX3ZhbGlkYXRlX2pzb24="
     }
+   },
+   "accepted_differences": {
+    "reason": "Operator decision 2026-11-25 (an earlier dependency line), re-proved 2026-11-26 for this line: accept langchain-openai 1.8's finish_reason on Responses messages. The adapter copies the response status into response_metadata.finish_reason ('completed', 'incomplete' or 'failed'). Sage decides on finish_reason only for 'content_filter' (model.py _is_provider_filtered_message) and 'tool_use'/'tool_calls'/'function_call' (the intent and continuation classifiers); the gateway choice fold reads raw Chat Completions choices, not these messages, and the policy's backend-provenance record only stores the value. No decision changes.",
+    "versions": {
+     "openai": "3.58.0",
+     "langchain-openai": "1.8.5",
+     "langchain-core": "1.8.5"
+    },
+    "message": {
+     "metadata": {
+      "finish_reason": "completed"
+     }
+    }
    }
   },
   {
@@ -526,6 +539,19 @@
      "type": "msgpack",
      "base64": "k8eyBZS9bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMuaHVtYW6sSHVtYW5NZXNzYWdlhqdjb250ZW502SxTeW50aGV0aWMgcmVwbGF5IHByb21wdDogbGlzdCB0aGUgY2FsbGJhY2tzLrFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWlaHVtYW6kbmFtZcCiaWTAs21vZGVsX3ZhbGlkYXRlX2pzb27IDwoFlLpsYW5nY2hhaW5fY29yZS5tZXNzYWdlcy5haalBSU1lc3NhZ2WJp2NvbnRlbnSShaJpZNk1cnNfMDU0ZDMzMjgzMmFiNjk4NDAxNmIwMzQ0OWMyZTljODdkMWFjYTY3MWQ5ZTkzMjMxMTenc3VtbWFyeZCkdHlwZalyZWFzb25pbmenY29udGVudJCxZW5jcnlwdGVkX2NvbnRlbnTaByRnQUFBQUFCckEwU2N0MTFjWnRzYWpjWVlSSVRaUm56dmZJRWtPRDRQb3hTdEh4VUlhZ2p6QmIzaHRuY0V2WUd1Ni1Ja1YxRnF5ZlYwYlNuU1VwbHpEWnA5T2RHNlQ5QnZGd1k2NGlzVzBZaHJBcmZuVTVWcEVPTFZwTXAxVWduVFJZMndCNzhxcjVuU2JnM1RSZXhEMlhIR2xYWk1nOVppWV80dmcweDU5amE5cDBXRnd6X0VRX01mb191VUtoMmtpOEtkUEJ6YktCTEpFSUJDdG1nWVNIM0RhOWI0a29wNU55LTJXMFRndHZfTjNkVnFDYk85bVZLVEpXd1FDc3pWX1JCYTRqMVVVSnZTaWpyeEZTMkc2bVkyV1MxNnZiNGs5Vi1VX3ltWm91d3lJeGNkU0VRSUZOTmE5V0ZjNXE2ektQR1dDem1hdUVnemxKZFgxcXZHc3hTUGFza1dpOVU5SExxZm42TUtoRnV6VjlqQlFzeDM2VzlNeFRXMmVoc0drZVBjeDh0UXRaNWVnNnJnYnQ4QTlYUnI3dXE3cXZaYmNOU196R0V3MmkyZmVBN2U3bGwwTy1iQWloN2F5YXRsMHExUFBxWHJyMVpNN3c3SGdBRUpHS2RFNFR5NEJFUWFMdGFnNFZ6QU1fR0ZxWUtwUHIyQkM4dHJ4SS1lQzFWZ0ZDQ1pibmdtN1BfbExfekhTdkhRdzRNRDBwVVkwakF1a05TdTJoSnVnMkRnWVd0akw4MzI2Szk2YmdDTHRkeFNpZ0JmS29wZ1pJYm1MVHhUNnotU25QN01vZ1hqYVZ6aEV5WWFoRGVYRDd4S1UtSS1CcU1aaVI5YVNHRlVCSTZsOFNJRE0zTmhxS0I5UU9qQWVOZDdwT1VBWWkxQ0NORDhWRVlPcWJWVk1fRm9kTjVUSGNDVGJYcXNOYWsxNUFuR3RERllJRmc0OFBTVW0wNkZSWG5LRG5OektQb0NxRFo0RGhOMHhmejczRzRELUxYekR6U2I5VDhHRThFNkMzSW01SVd2YVdVR0hxeVFKaTFJdE9XV2xFcXJJSlJsaUJKckdMTE1HYlJKekk3bFQ2QzE5N0cwYzZyRWMzUG1JQkUxODFlakpWZ2U1dTdPenAtdEdWTFVtY0dhVE1IeFItcnFwVjdvY1dJa2Y1VXE0VGpOVzlGZElfTWswdmpVS2s4WVlFSFhRQ0hDVjZEd0RhMFg0SUZBM0dubDBORl9FQkdfWWFMMmJCdHRzX0NkU2hDdVNVV2U1S3lHbS1jUWFZVVpHWmZCMkhBcExCMW5FMGkzRk4wdFFDU1pydFhKTFNmMnJFQllIbXNzZVRNWFBpSFViMjFycEZKRDJGV3RxS2Fxa2J4N1ZXR1BOZ3labE9NN0lQaWNBaVV3VUZZcFhRMnBNRi1haXlvOWNhS0tIb0NIR3dwdTE5ZEx2X0QyczV2WE55eGxmbkhUZDRiX3U0V01YOTRGVHloX1JEN1NIX2I4RDduN1loNHF6UW9EWXE1RWl0M1RoY0VqTHdQNmdjX25ldjhLWlBNMUJMYXMzNkpNY1BwalNEbHRZX3phXzBCT28wU0w5aGRDMFRIc1g4RkxtTFVBVmJnS01jUE1rUHp4UjNXczBtbXZ3dENsY3ItZ1BsNVA5V0RzaUVZaVJ2RnJOM0hKYThqYWF0dThRa0tDUWtpdzVhenVDbWR3RE5GWC1obWRCVGJRZmd1RlBzY1ViMVEtakVib0V0WGtlZWNzcmE3OHowdTB3YVlka1pzcmtlLXQ3em9NOGVyMUpwT2kzVVB6dnJuOEVyT2EzdFJzSkVORHJ5MS00Mzh6T2JDRG1iQ3NSWGphekhUQktFOVN0R19EcjlBNzBfZXJwMWJNX3d4TmpabG0wZGJheFI5T014bW03S0l0Y2ZXYkE5WnRXbkVhWGxuVU8tM19ZN1ZNYnJ2YmtqeFJPY3ZDNEI5RS1sYnY0MUF0cnhXMTRYSlNKRDJlcXBNdVZpcTZiRHlTdHcxU2o0ZEtFM3kwSDRwV0xRcmpzaTVTejdFMDRwNHMxZzI0cmlmaWp4ZmxYd0RhandKQUI2TjFjT19ZVVZneW1oYjFVUmEyOTVhNU5uNzdOR0pybXhhV1RZdHhtS1RzSUF2cmZkbElvUzFOZ1hEd3dlY3FGcGhNelVCbHJyMTZGTGY5aVRYeklOdzVpNmd6bzRJS0R2TUhZeEhnamFwOU1KQURKNUhnekQ4azJXSkVENzVKTi1PZjFnTWFvUUNKc2ZvSkJxbGFpTzRSYklhOE9BREFXcnJEbkVGZGdDNkdQRFBFcVdzNjM5R294bzRNQkZibU5CVzZhRTFmaXdYeGJEa1dwTEdjZ0tNQjJncE54VWthbWhvN0x1LXVETXMwWHFseElmSXgySU9KNUNTTjhxRzQtNVZteWNub3FXVGdvdz09hqlhcmd1bWVudHPaAiZ7ImZpbmFsX3Jlc3BvbnNlIjoiKipMYWJlbDoqKiBgYW1iZXItc2V2ZW5gXG5cbnwgQ2FsbGJhY2sgfCBBZ2VudCB8IEhvc3QgfCBVc2VyIHwgSW50ZWdyaXR5IHwgU3RhdHVzIHwgTGFzdCBjaGVjay1pbiB8XG58LS0tOnwtLS18LS0tfC0tLXwtLS06fC0tLXwtLS06fFxufCAyIHwgYXBvbGxvIHwgV09SS1NUQVRJT04tQSB8IGxhYi51c2VyIHwgMiB8ICoqZGVhZCoqIHwgfjg5LDc5NCBzZWNvbmRzIGFnbyAofjI0aCA1N20pIHxcbnwgMyB8IGFwb2xsbyB8IFdPUktTVEFUSU9OLUEgfCBsYWIudXNlciB8IDMgfCAqKmFsaXZlKiogfCB+MC45MyBzZWNvbmRzIGFnbyB8XG5cblRoZXJlIGFyZSAqKjIgY2FsbGJhY2tzKio6IG9uZSBhbGl2ZSAoKiojMyoqKSBhbmQgb25lIGRlYWQgKCoqIzIqKiksIGJvdGggb24gYFdPUktTVEFUSU9OLUFgIGFzIGBsYWIudXNlcmAuIFRoaXMgd2FzIGEgcmVhZC1vbmx5IHN0YXR1cyBjaGVjazsgKipubyB0YXNrcyB3ZXJlIHJ1bioqLiIsInJldXNlX2xhdGVzdF93b3JrZXJfYW5zd2VyIjpmYWxzZSwib3V0Y29tZSI6ImNvbXBsZXRlZCJ9p2NhbGxfaWTZJWNhbGxfZTZiZmRmNDRlODM5NGM0MmE2MzZmOTRiNzhkNWQ3NjKkbmFtZa9yZXNwb25kX3RvX3VzZXKkdHlwZa1mdW5jdGlvbl9jYWxsomlk2TVmY18wNTRkMzMyODMyYWI2OTg0MDE2YjAzNDQ5YzMxMDQ4N2QxOWQyZjcxNjEyOWQ4ZTgwYqZzdGF0dXOpY29tcGxldGVksWFkZGl0aW9uYWxfa3dhcmdzgLFyZXNwb25zZV9tZXRhZGF0YYiiaWTZN3Jlc3BfMDU0ZDMzMjgzMmFiNjk4NDAxNmIwMzQ0OWIzOTFjODdkMWFmOTI0YjhkOTE3Mjk5YmOqY3JlYXRlZF9hdMtB2sDRJsAAAKVtb2RlbLByZWNvcmRlZC1tb2RlbC1hpm9iamVjdKhyZXNwb25zZaxzZXJ2aWNlX3RpZXKnZGVmYXVsdKZzdGF0dXOpY29tcGxldGVkrm1vZGVsX3Byb3ZpZGVypm9wZW5haaptb2RlbF9uYW1lsHJlY29yZGVkLW1vZGVsLWGkdHlwZaJhaaRuYW1lwKJpZNk3cmVzcF8wNTRkMzMyODMyYWI2OTg0MDE2YjAzNDQ5YjM5MWM4N2QxYWY5MjRiOGQ5MTcyOTliY6p0b29sX2NhbGxzkYSkbmFtZa9yZXNwb25kX3RvX3VzZXKkYXJnc4OuZmluYWxfcmVzcG9uc2XaAdEqKkxhYmVsOioqIGBhbWJlci1zZXZlbmAKCnwgQ2FsbGJhY2sgfCBBZ2VudCB8IEhvc3QgfCBVc2VyIHwgSW50ZWdyaXR5IHwgU3RhdHVzIHwgTGFzdCBjaGVjay1pbiB8CnwtLS06fC0tLXwtLS18LS0tfC0tLTp8LS0tfC0tLTp8CnwgMiB8IGFwb2xsbyB8IFdPUktTVEFUSU9OLUEgfCBsYWIudXNlciB8IDIgfCAqKmRlYWQqKiB8IH44OSw3OTQgc2Vjb25kcyBhZ28gKH4yNGggNTdtKSB8CnwgMyB8IGFwb2xsbyB8IFdPUktTVEFUSU9OLUEgfCBsYWIudXNlciB8IDMgfCAqKmFsaXZlKiogfCB+MC45MyBzZWNvbmRzIGFnbyB8CgpUaGVyZSBhcmUgKioyIGNhbGxiYWNrcyoqOiBvbmUgYWxpdmUgKCoqIzMqKikgYW5kIG9uZSBkZWFkICgqKiMyKiopLCBib3RoIG9uIGBXT1JLU1RBVElPTi1BYCBhcyBgbGFiLnVzZXJgLiBUaGlzIHdhcyBhIHJlYWQtb25seSBzdGF0dXMgY2hlY2s7ICoqbm8gdGFza3Mgd2VyZSBydW4qKi66cmV1c2VfbGF0ZXN0X3dvcmtlcl9hbnN3ZXLCp291dGNvbWWpY29tcGxldGVkomlk2SVjYWxsX2U2YmZkZjQ0ZTgzOTRjNDJhNjM2Zjk0Yjc4ZDVkNzYypHR5cGWpdG9vbF9jYWxssmludmFsaWRfdG9vbF9jYWxsc5CudXNhZ2VfbWV0YWRhdGGFrGlucHV0X3Rva2Vuc80tUK1vdXRwdXRfdG9rZW5zzNesdG90YWxfdG9rZW5zzS4ns2lucHV0X3Rva2VuX2RldGFpbHOCrmNhY2hlX2NyZWF0aW9uzQOFqmNhY2hlX3JlYWTNKci0b3V0cHV0X3Rva2VuX2RldGFpbHOBqXJlYXNvbmluZxGzbW9kZWxfdmFsaWRhdGVfanNvbsf1BZS8bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMudG9vbKtUb29sTWVzc2FnZYmnY29udGVudNklU3ludGhldGljIHRvb2wgcmVzdWx0IGZvciB0aGUgcmVwbGF5LrFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWkdG9vbKRuYW1lwKJpZMCsdG9vbF9jYWxsX2lk2SVjYWxsX2U2YmZkZjQ0ZTgzOTRjNDJhNjM2Zjk0Yjc4ZDVkNzYyqGFydGlmYWN0wKZzdGF0dXOnc3VjY2Vzc7Ntb2RlbF92YWxpZGF0ZV9qc29u"
     }
+   },
+   "accepted_differences": {
+    "reason": "Operator decision 2026-11-25 (an earlier dependency line), re-proved 2026-11-26 for this line: accept langchain-openai 1.8's finish_reason on Responses messages. The adapter copies the response status into response_metadata.finish_reason ('completed', 'incomplete' or 'failed'). Sage decides on finish_reason only for 'content_filter' (model.py _is_provider_filtered_message) and 'tool_use'/'tool_calls'/'function_call' (the intent and continuation classifiers); the gateway choice fold reads raw Chat Completions choices, not these messages, and the policy's backend-provenance record only stores the value. No decision changes.",
+    "versions": {
+     "openai": "3.58.0",
+     "langchain-openai": "1.8.5",
+     "langchain-core": "1.8.5"
+    },
+    "message": {
+     "metadata": {
+      "finish_reason": "completed"
+     }
+    }
    }
   },
   {
@@ -570,11 +596,11 @@
     }
    },
    "accepted_differences": {
-    "reason": "Operator decision 2026-11-24 (dependency advisories line): accept openai 3's error text. The SDK now renders 'Error code: <status> - <provider message>' instead of the error body's repr, so the error code and parameter no longer appear in the exception's text or in operator_error_text. Status, code, param, body, classification and both Sage notices are unchanged. Restoring code and parameter in Sage's error log is a separate follow-up.",
+    "reason": "Operator decision 2026-11-24 (dependency advisories line): accept openai 3's error text. The SDK now renders 'Error code: <status> - <provider message>' instead of the error body's repr, so the error code and parameter no longer appear in the exception's text or in operator_error_text. Status, code, param, body, classification and both Sage notices are unchanged. Restoring code and parameter in Sage's error log is a separate follow-up. Re-pinned 2026-11-26 (SDK and runtime compatibility line): langchain-openai 1.8.5 and langchain-core 1.8.5 produce the same text on both client paths.",
     "versions": {
      "openai": "3.58.0",
-     "langchain-openai": "1.7.2",
-     "langchain-core": "1.6.10"
+     "langchain-openai": "1.8.5",
+     "langchain-core": "1.8.5"
     },
     "error": {
      "message": "Error code: 400 - Function tools with reasoning_effort are not supported for recorded-model-a in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.",
@@ -795,6 +821,19 @@
     "checkpoint": {
      "type": "msgpack",
      "base64": "k8eyBZS9bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMuaHVtYW6sSHVtYW5NZXNzYWdlhqdjb250ZW502SxTeW50aGV0aWMgcmVwbGF5IHByb21wdDogbGlzdCB0aGUgY2FsbGJhY2tzLrFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWlaHVtYW6kbmFtZcCiaWTAs21vZGVsX3ZhbGlkYXRlX2pzb27IAzkFlLpsYW5nY2hhaW5fY29yZS5tZXNzYWdlcy5haalBSU1lc3NhZ2WJp2NvbnRlbnSRhqlhcmd1bWVudHOie32nY2FsbF9pZNklY2FsbF9lZTFlZDAwYjg1YjE0MzMzODE3MjI5YTQyM2ZjM2Q4OKRuYW1lrmxpc3RfY2FsbGJhY2tzpHR5cGWtZnVuY3Rpb25fY2FsbKJpZNk1ZmNfMDlhMzdlMWEyNWM3YzExMzAxNmIwMzQ0YWI4YzZjODdkMTg3N2NjZmI4OWQxOGZhNGGmc3RhdHVzqWNvbXBsZXRlZLFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGIomlk2TdyZXNwXzA5YTM3ZTFhMjVjN2MxMTMwMTZiMDM0NGE5ZTE2NDg3ZDE4YWM2NTcyMDI4YmMzZjMyqmNyZWF0ZWRfYXTLQdrA0SqAAAClbW9kZWywcmVjb3JkZWQtbW9kZWwtYaZvYmplY3SocmVzcG9uc2Wsc2VydmljZV90aWVyp2RlZmF1bHSmc3RhdHVzqWNvbXBsZXRlZK5tb2RlbF9wcm92aWRlcqZvcGVuYWmqbW9kZWxfbmFtZbByZWNvcmRlZC1tb2RlbC1hpHR5cGWiYWmkbmFtZcCiaWTZN3Jlc3BfMDlhMzdlMWEyNWM3YzExMzAxNmIwMzQ0YTllMTY0ODdkMThhYzY1NzIwMjhiYzNmMzKqdG9vbF9jYWxsc5GEpG5hbWWubGlzdF9jYWxsYmFja3OkYXJnc4CiaWTZJWNhbGxfZWUxZWQwMGI4NWIxNDMzMzgxNzIyOWE0MjNmYzNkODikdHlwZal0b29sX2NhbGyyaW52YWxpZF90b29sX2NhbGxzkK51c2FnZV9tZXRhZGF0YYWsaW5wdXRfdG9rZW5zzS5mrW91dHB1dF90b2tlbnMOrHRvdGFsX3Rva2Vuc80udLNpbnB1dF90b2tlbl9kZXRhaWxzgq5jYWNoZV9jcmVhdGlvbs0uY6pjYWNoZV9yZWFkALRvdXRwdXRfdG9rZW5fZGV0YWlsc4GpcmVhc29uaW5nALNtb2RlbF92YWxpZGF0ZV9qc29ux/UFlLxsYW5nY2hhaW5fY29yZS5tZXNzYWdlcy50b29sq1Rvb2xNZXNzYWdliadjb250ZW502SVTeW50aGV0aWMgdG9vbCByZXN1bHQgZm9yIHRoZSByZXBsYXkusWFkZGl0aW9uYWxfa3dhcmdzgLFyZXNwb25zZV9tZXRhZGF0YYCkdHlwZaR0b29spG5hbWXAomlkwKx0b29sX2NhbGxfaWTZJWNhbGxfZWUxZWQwMGI4NWIxNDMzMzgxNzIyOWE0MjNmYzNkODioYXJ0aWZhY3TApnN0YXR1c6dzdWNjZXNzs21vZGVsX3ZhbGlkYXRlX2pzb24="
+    }
+   },
+   "accepted_differences": {
+    "reason": "Operator decision 2026-11-25 (an earlier dependency line), re-proved 2026-11-26 for this line: accept langchain-openai 1.8's finish_reason on Responses messages. The adapter copies the response status into response_metadata.finish_reason ('completed', 'incomplete' or 'failed'). Sage decides on finish_reason only for 'content_filter' (model.py _is_provider_filtered_message) and 'tool_use'/'tool_calls'/'function_call' (the intent and continuation classifiers); the gateway choice fold reads raw Chat Completions choices, not these messages, and the policy's backend-provenance record only stores the value. No decision changes.",
+    "versions": {
+     "openai": "3.58.0",
+     "langchain-openai": "1.8.5",
+     "langchain-core": "1.8.5"
+    },
+    "message": {
+     "metadata": {
+      "finish_reason": "completed"
+     }
     }
    }
   },
@@ -1020,6 +1059,19 @@
      "type": "msgpack",
      "base64": "k8eyBZS9bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMuaHVtYW6sSHVtYW5NZXNzYWdlhqdjb250ZW502SxTeW50aGV0aWMgcmVwbGF5IHByb21wdDogbGlzdCB0aGUgY2FsbGJhY2tzLrFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWlaHVtYW6kbmFtZcCiaWTAs21vZGVsX3ZhbGlkYXRlX2pzb27IA+AFlLpsYW5nY2hhaW5fY29yZS5tZXNzYWdlcy5haalBSU1lc3NhZ2WJp2NvbnRlbnSRhqlhcmd1bWVudHPZW3siZmluYWxfcmVzcG9uc2UiOiJgYW1iZXItc2V2ZW5gIiwicmV1c2VfbGF0ZXN0X3dvcmtlcl9hbnN3ZXIiOmZhbHNlLCJvdXRjb21lIjoiY29tcGxldGVkIn2nY2FsbF9pZNklY2FsbF82NTY1ZmQ3NWQ0Y2Y0MjY1YmUyYjVjOWQzMWQ4N2JlN6RuYW1lr3Jlc3BvbmRfdG9fdXNlcqR0eXBlrWZ1bmN0aW9uX2NhbGyiaWTZNWZjXzA3ZDkxYjAyOWFmMWRiYmYwMTZiMDM0NGI4ZmQ0ODg3ZDFhYzg2ZDcwZjE2ZDA3MDgzpnN0YXR1c6ljb21wbGV0ZWSxYWRkaXRpb25hbF9rd2FyZ3OAsXJlc3BvbnNlX21ldGFkYXRhiKJpZNk3cmVzcF8wN2Q5MWIwMjlhZjFkYmJmMDE2YjAzNDRiODQ3Yzg4N2QxYWMxMzhkY2NkZWE1M2Y4Y6pjcmVhdGVkX2F0y0HawNEuAAAApW1vZGVssHJlY29yZGVkLW1vZGVsLWGmb2JqZWN0qHJlc3BvbnNlrHNlcnZpY2VfdGllcqdkZWZhdWx0pnN0YXR1c6ljb21wbGV0ZWSubW9kZWxfcHJvdmlkZXKmb3BlbmFpqm1vZGVsX25hbWWwcmVjb3JkZWQtbW9kZWwtYaR0eXBlomFppG5hbWXAomlk2TdyZXNwXzA3ZDkxYjAyOWFmMWRiYmYwMTZiMDM0NGI4NDdjODg3ZDFhYzEzOGRjY2RlYTUzZjhjqnRvb2xfY2FsbHORhKRuYW1lr3Jlc3BvbmRfdG9fdXNlcqRhcmdzg65maW5hbF9yZXNwb25zZa1gYW1iZXItc2V2ZW5gunJldXNlX2xhdGVzdF93b3JrZXJfYW5zd2VywqdvdXRjb21lqWNvbXBsZXRlZKJpZNklY2FsbF82NTY1ZmQ3NWQ0Y2Y0MjY1YmUyYjVjOWQzMWQ4N2JlN6R0eXBlqXRvb2xfY2FsbLJpbnZhbGlkX3Rvb2xfY2FsbHOQrnVzYWdlX21ldGFkYXRhhaxpbnB1dF90b2tlbnPNLxutb3V0cHV0X3Rva2VucyOsdG90YWxfdG9rZW5zzS8+s2lucHV0X3Rva2VuX2RldGFpbHOCrmNhY2hlX2NyZWF0aW9uzS8YqmNhY2hlX3JlYWQAtG91dHB1dF90b2tlbl9kZXRhaWxzgalyZWFzb25pbmcAs21vZGVsX3ZhbGlkYXRlX2pzb27H9QWUvGxhbmdjaGFpbl9jb3JlLm1lc3NhZ2VzLnRvb2yrVG9vbE1lc3NhZ2WJp2NvbnRlbnTZJVN5bnRoZXRpYyB0b29sIHJlc3VsdCBmb3IgdGhlIHJlcGxheS6xYWRkaXRpb25hbF9rd2FyZ3OAsXJlc3BvbnNlX21ldGFkYXRhgKR0eXBlpHRvb2ykbmFtZcCiaWTArHRvb2xfY2FsbF9pZNklY2FsbF82NTY1ZmQ3NWQ0Y2Y0MjY1YmUyYjVjOWQzMWQ4N2JlN6hhcnRpZmFjdMCmc3RhdHVzp3N1Y2Nlc3OzbW9kZWxfdmFsaWRhdGVfanNvbg=="
     }
+   },
+   "accepted_differences": {
+    "reason": "Operator decision 2026-11-25 (an earlier dependency line), re-proved 2026-11-26 for this line: accept langchain-openai 1.8's finish_reason on Responses messages. The adapter copies the response status into response_metadata.finish_reason ('completed', 'incomplete' or 'failed'). Sage decides on finish_reason only for 'content_filter' (model.py _is_provider_filtered_message) and 'tool_use'/'tool_calls'/'function_call' (the intent and continuation classifiers); the gateway choice fold reads raw Chat Completions choices, not these messages, and the policy's backend-provenance record only stores the value. No decision changes.",
+    "versions": {
+     "openai": "3.58.0",
+     "langchain-openai": "1.8.5",
+     "langchain-core": "1.8.5"
+    },
+    "message": {
+     "metadata": {
+      "finish_reason": "completed"
+     }
+    }
    }
   },
   {
@@ -1235,6 +1287,19 @@
     "checkpoint": {
      "type": "msgpack",
      "base64": "k8eyBZS9bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMuaHVtYW6sSHVtYW5NZXNzYWdlhqdjb250ZW502SxTeW50aGV0aWMgcmVwbGF5IHByb21wdDogbGlzdCB0aGUgY2FsbGJhY2tzLrFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWlaHVtYW6kbmFtZcCiaWTAs21vZGVsX3ZhbGlkYXRlX2pzb27IAzkFlLpsYW5nY2hhaW5fY29yZS5tZXNzYWdlcy5haalBSU1lc3NhZ2WJp2NvbnRlbnSRhqlhcmd1bWVudHOie32nY2FsbF9pZNklY2FsbF8zMTYwNWE3YzMxNGI0YjIwYjQ5MzIwMjQ5MWIyNzgxMaRuYW1lrmxpc3RfY2FsbGJhY2tzpHR5cGWtZnVuY3Rpb25fY2FsbKJpZNk1ZmNfMDcwYjI3NGRhYTg4NTA0ZDAxNmIwMzQ0Yzg1MGI4ODdkMWJhMTlkMjQ2NDY1YjAwNjCmc3RhdHVzqWNvbXBsZXRlZLFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGIomlk2TdyZXNwXzA3MGIyNzRkYWE4ODUwNGQwMTZiMDM0NGJlYmFkNDg3ZDE4NTViZDAxYmVlOTExM2ZhqmNyZWF0ZWRfYXTLQdrA0S+AAAClbW9kZWywcmVjb3JkZWQtbW9kZWwtYqZvYmplY3SocmVzcG9uc2Wsc2VydmljZV90aWVyp2RlZmF1bHSmc3RhdHVzqWNvbXBsZXRlZK5tb2RlbF9wcm92aWRlcqZvcGVuYWmqbW9kZWxfbmFtZbByZWNvcmRlZC1tb2RlbC1ipHR5cGWiYWmkbmFtZcCiaWTZN3Jlc3BfMDcwYjI3NGRhYTg4NTA0ZDAxNmIwMzQ0YmViYWQ0ODdkMTg1NWJkMDFiZWU5MTEzZmGqdG9vbF9jYWxsc5GEpG5hbWWubGlzdF9jYWxsYmFja3OkYXJnc4CiaWTZJWNhbGxfMzE2MDVhN2MzMTRiNGIyMGI0OTMyMDI0OTFiMjc4MTGkdHlwZal0b29sX2NhbGyyaW52YWxpZF90b29sX2NhbGxzkK51c2FnZV9tZXRhZGF0YYWsaW5wdXRfdG9rZW5zzS1zrW91dHB1dF90b2tlbnMOrHRvdGFsX3Rva2Vuc80tgbNpbnB1dF90b2tlbl9kZXRhaWxzgq5jYWNoZV9jcmVhdGlvbs0tcKpjYWNoZV9yZWFkALRvdXRwdXRfdG9rZW5fZGV0YWlsc4GpcmVhc29uaW5nALNtb2RlbF92YWxpZGF0ZV9qc29ux/UFlLxsYW5nY2hhaW5fY29yZS5tZXNzYWdlcy50b29sq1Rvb2xNZXNzYWdliadjb250ZW502SVTeW50aGV0aWMgdG9vbCByZXN1bHQgZm9yIHRoZSByZXBsYXkusWFkZGl0aW9uYWxfa3dhcmdzgLFyZXNwb25zZV9tZXRhZGF0YYCkdHlwZaR0b29spG5hbWXAomlkwKx0b29sX2NhbGxfaWTZJWNhbGxfMzE2MDVhN2MzMTRiNGIyMGI0OTMyMDI0OTFiMjc4MTGoYXJ0aWZhY3TApnN0YXR1c6dzdWNjZXNzs21vZGVsX3ZhbGlkYXRlX2pzb24="
+    }
+   },
+   "accepted_differences": {
+    "reason": "Operator decision 2026-11-25 (an earlier dependency line), re-proved 2026-11-26 for this line: accept langchain-openai 1.8's finish_reason on Responses messages. The adapter copies the response status into response_metadata.finish_reason ('completed', 'incomplete' or 'failed'). Sage decides on finish_reason only for 'content_filter' (model.py _is_provider_filtered_message) and 'tool_use'/'tool_calls'/'function_call' (the intent and continuation classifiers); the gateway choice fold reads raw Chat Completions choices, not these messages, and the policy's backend-provenance record only stores the value. No decision changes.",
+    "versions": {
+     "openai": "3.58.0",
+     "langchain-openai": "1.8.5",
+     "langchain-core": "1.8.5"
+    },
+    "message": {
+     "metadata": {
+      "finish_reason": "completed"
+     }
     }
    }
   },
@@ -1460,6 +1525,19 @@
      "type": "msgpack",
      "base64": "k8eyBZS9bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMuaHVtYW6sSHVtYW5NZXNzYWdlhqdjb250ZW502SxTeW50aGV0aWMgcmVwbGF5IHByb21wdDogbGlzdCB0aGUgY2FsbGJhY2tzLrFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWlaHVtYW6kbmFtZcCiaWTAs21vZGVsX3ZhbGlkYXRlX2pzb27IBq8FlLpsYW5nY2hhaW5fY29yZS5tZXNzYWdlcy5haalBSU1lc3NhZ2WJp2NvbnRlbnSRhqlhcmd1bWVudHPaAcN7ImZpbmFsX3Jlc3BvbnNlIjoiKipMYWJlbDogYW1iZXItc2V2ZW4qKlxuXG58IENhbGxiYWNrIHwgQWdlbnQgfCBIb3N0IHwgVXNlciB8IEludGVncml0eSB8IFN0YXR1cyB8IExhc3QgY2hlY2staW4gfFxufC0tLXwtLS18LS0tfC0tLXwtLS18LS0tfC0tLXxcbnwgMiB8IGFwb2xsbyB8IFdPUktTVEFUSU9OLUEgfCBsYWIudXNlciB8IDIgfCBEZWFkIHwgfjI1IGhvdXJzIGFnbyB8XG58IDMgfCBhcG9sbG8gfCBXT1JLU1RBVElPTi1BIHwgbGFiLnVzZXIgfCAzIHwgQWxpdmUgfCB+MS42IHNlY29uZHMgYWdvIHxcblxuVHdvIGNhbGxiYWNrcyByZXR1cm5lZDogKipvbmUgYWxpdmUsIG9uZSBkZWFkKiouIENhbGxlZCBgbGlzdF9jYWxsYmFja3NgIG9uY2U7IG5vIHRhc2tzIHdlcmUgcnVuLiIsInJldXNlX2xhdGVzdF93b3JrZXJfYW5zd2VyIjpmYWxzZSwib3V0Y29tZSI6ImNvbXBsZXRlZCJ9p2NhbGxfaWTZJWNhbGxfM2QwZjdhYTc3YWZjNDkxYmJkZjAzYThjNGJlNGQ0MGKkbmFtZa9yZXNwb25kX3RvX3VzZXKkdHlwZa1mdW5jdGlvbl9jYWxsomlk2TVmY18wNzBiMjc0ZGFhODg1MDRkMDE2YjAzNDRkNTBlZjg4N2QxOWM5NjNjNzM1OWM4Mjc5YaZzdGF0dXOpY29tcGxldGVksWFkZGl0aW9uYWxfa3dhcmdzgLFyZXNwb25zZV9tZXRhZGF0YYiiaWTZN3Jlc3BfMDcwYjI3NGRhYTg4NTA0ZDAxNmIwMzQ0YzhkMDIwODdkMWEwYTRiNDYxZDdlNDgzMTCqY3JlYXRlZF9hdMtB2sDRMkAAAKVtb2RlbLByZWNvcmRlZC1tb2RlbC1ipm9iamVjdKhyZXNwb25zZaxzZXJ2aWNlX3RpZXKnZGVmYXVsdKZzdGF0dXOpY29tcGxldGVkrm1vZGVsX3Byb3ZpZGVypm9wZW5haaptb2RlbF9uYW1lsHJlY29yZGVkLW1vZGVsLWKkdHlwZaJhaaRuYW1lwKJpZNk3cmVzcF8wNzBiMjc0ZGFhODg1MDRkMDE2YjAzNDRjOGQwMjA4N2QxYTBhNGI0NjFkN2U0ODMxMKp0b29sX2NhbGxzkYSkbmFtZa9yZXNwb25kX3RvX3VzZXKkYXJnc4OuZmluYWxfcmVzcG9uc2XaAW4qKkxhYmVsOiBhbWJlci1zZXZlbioqCgp8IENhbGxiYWNrIHwgQWdlbnQgfCBIb3N0IHwgVXNlciB8IEludGVncml0eSB8IFN0YXR1cyB8IExhc3QgY2hlY2staW4gfAp8LS0tfC0tLXwtLS18LS0tfC0tLXwtLS18LS0tfAp8IDIgfCBhcG9sbG8gfCBXT1JLU1RBVElPTi1BIHwgbGFiLnVzZXIgfCAyIHwgRGVhZCB8IH4yNSBob3VycyBhZ28gfAp8IDMgfCBhcG9sbG8gfCBXT1JLU1RBVElPTi1BIHwgbGFiLnVzZXIgfCAzIHwgQWxpdmUgfCB+MS42IHNlY29uZHMgYWdvIHwKClR3byBjYWxsYmFja3MgcmV0dXJuZWQ6ICoqb25lIGFsaXZlLCBvbmUgZGVhZCoqLiBDYWxsZWQgYGxpc3RfY2FsbGJhY2tzYCBvbmNlOyBubyB0YXNrcyB3ZXJlIHJ1bi66cmV1c2VfbGF0ZXN0X3dvcmtlcl9hbnN3ZXLCp291dGNvbWWpY29tcGxldGVkomlk2SVjYWxsXzNkMGY3YWE3N2FmYzQ5MWJiZGYwM2E4YzRiZTRkNDBipHR5cGWpdG9vbF9jYWxssmludmFsaWRfdG9vbF9jYWxsc5CudXNhZ2VfbWV0YWRhdGGFrGlucHV0X3Rva2Vuc80t+61vdXRwdXRfdG9rZW5zzJqsdG90YWxfdG9rZW5zzS6Vs2lucHV0X3Rva2VuX2RldGFpbHOCrmNhY2hlX2NyZWF0aW9uzQQ8qmNhY2hlX3JlYWTNKby0b3V0cHV0X3Rva2VuX2RldGFpbHOBqXJlYXNvbmluZwCzbW9kZWxfdmFsaWRhdGVfanNvbsf1BZS8bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMudG9vbKtUb29sTWVzc2FnZYmnY29udGVudNklU3ludGhldGljIHRvb2wgcmVzdWx0IGZvciB0aGUgcmVwbGF5LrFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWkdG9vbKRuYW1lwKJpZMCsdG9vbF9jYWxsX2lk2SVjYWxsXzNkMGY3YWE3N2FmYzQ5MWJiZGYwM2E4YzRiZTRkNDBiqGFydGlmYWN0wKZzdGF0dXOnc3VjY2Vzc7Ntb2RlbF92YWxpZGF0ZV9qc29u"
     }
+   },
+   "accepted_differences": {
+    "reason": "Operator decision 2026-11-25 (an earlier dependency line), re-proved 2026-11-26 for this line: accept langchain-openai 1.8's finish_reason on Responses messages. The adapter copies the response status into response_metadata.finish_reason ('completed', 'incomplete' or 'failed'). Sage decides on finish_reason only for 'content_filter' (model.py _is_provider_filtered_message) and 'tool_use'/'tool_calls'/'function_call' (the intent and continuation classifiers); the gateway choice fold reads raw Chat Completions choices, not these messages, and the policy's backend-provenance record only stores the value. No decision changes.",
+    "versions": {
+     "openai": "3.58.0",
+     "langchain-openai": "1.8.5",
+     "langchain-core": "1.8.5"
+    },
+    "message": {
+     "metadata": {
+      "finish_reason": "completed"
+     }
+    }
    }
   },
   {
@@ -1504,11 +1582,11 @@
     }
    },
    "accepted_differences": {
-    "reason": "Operator decision 2026-11-24 (dependency advisories line): accept openai 3's error text. The SDK now renders 'Error code: <status> - <provider message>' instead of the error body's repr, so the error code and parameter no longer appear in the exception's text or in operator_error_text. Status, code, param, body, classification and both Sage notices are unchanged. Restoring code and parameter in Sage's error log is a separate follow-up.",
+    "reason": "Operator decision 2026-11-24 (dependency advisories line): accept openai 3's error text. The SDK now renders 'Error code: <status> - <provider message>' instead of the error body's repr, so the error code and parameter no longer appear in the exception's text or in operator_error_text. Status, code, param, body, classification and both Sage notices are unchanged. Restoring code and parameter in Sage's error log is a separate follow-up. Re-pinned 2026-11-26 (SDK and runtime compatibility line): langchain-openai 1.8.5 and langchain-core 1.8.5 produce the same text on both client paths.",
     "versions": {
      "openai": "3.58.0",
-     "langchain-openai": "1.7.2",
-     "langchain-core": "1.6.10"
+     "langchain-openai": "1.8.5",
+     "langchain-core": "1.8.5"
     },
     "error": {
      "message": "Error code: 400 - Unsupported value: 'none' is not supported with the 'recorded-model-b' model. Supported values are: 'low', 'medium', 'high', 'xhigh', and 'max'.",
@@ -1709,6 +1787,19 @@
     "checkpoint": {
      "type": "msgpack",
      "base64": "kseyBZS9bGFuZ2NoYWluX2NvcmUubWVzc2FnZXMuaHVtYW6sSHVtYW5NZXNzYWdlhqdjb250ZW502SxTeW50aGV0aWMgcmVwbGF5IHByb21wdDogbGlzdCB0aGUgY2FsbGJhY2tzLrFhZGRpdGlvbmFsX2t3YXJnc4CxcmVzcG9uc2VfbWV0YWRhdGGApHR5cGWlaHVtYW6kbmFtZcCiaWTAs21vZGVsX3ZhbGlkYXRlX2pzb27IAq0FlLpsYW5nY2hhaW5fY29yZS5tZXNzYWdlcy5haalBSU1lc3NhZ2WJp2NvbnRlbnSRhaR0eXBlpHRleHSkdGV4dKthbWJlci1zZXZlbqthbm5vdGF0aW9uc5CiaWTZNm1zZ18wZDE5ZmMzNDQzOWNlODI2MDE2YjAzNDRlNmY0NzQ4N2QxOGI5Yjg3YzlkNTVjNjUzYaVwaGFzZaxmaW5hbF9hbnN3ZXKxYWRkaXRpb25hbF9rd2FyZ3OAsXJlc3BvbnNlX21ldGFkYXRhiKJpZNk3cmVzcF8wZDE5ZmMzNDQzOWNlODI2MDE2YjAzNDRlNWYwNzQ4N2QxODFkNzkzZWNjNjEzZGQwM6pjcmVhdGVkX2F0y0HawNE5gAAApW1vZGVssHJlY29yZGVkLW1vZGVsLWKmb2JqZWN0qHJlc3BvbnNlrHNlcnZpY2VfdGllcqdkZWZhdWx0pnN0YXR1c6ljb21wbGV0ZWSubW9kZWxfcHJvdmlkZXKmb3BlbmFpqm1vZGVsX25hbWWwcmVjb3JkZWQtbW9kZWwtYqR0eXBlomFppG5hbWXAomlk2TdyZXNwXzBkMTlmYzM0NDM5Y2U4MjYwMTZiMDM0NGU1ZjA3NDg3ZDE4MWQ3OTNlY2M2MTNkZDAzqnRvb2xfY2FsbHOQsmludmFsaWRfdG9vbF9jYWxsc5CudXNhZ2VfbWV0YWRhdGGFrGlucHV0X3Rva2Vuc80uwq1vdXRwdXRfdG9rZW5zBqx0b3RhbF90b2tlbnPNLsizaW5wdXRfdG9rZW5fZGV0YWlsc4KuY2FjaGVfY3JlYXRpb27NLr+qY2FjaGVfcmVhZAC0b3V0cHV0X3Rva2VuX2RldGFpbHOBqXJlYXNvbmluZwCzbW9kZWxfdmFsaWRhdGVfanNvbg=="
+    }
+   },
+   "accepted_differences": {
+    "reason": "Operator decision 2026-11-25 (an earlier dependency line), re-proved 2026-11-26 for this line: accept langchain-openai 1.8's finish_reason on Responses messages. The adapter copies the response status into response_metadata.finish_reason ('completed', 'incomplete' or 'failed'). Sage decides on finish_reason only for 'content_filter' (model.py _is_provider_filtered_message) and 'tool_use'/'tool_calls'/'function_call' (the intent and continuation classifiers); the gateway choice fold reads raw Chat Completions choices, not these messages, and the policy's backend-provenance record only stores the value. No decision changes.",
+    "versions": {
+     "openai": "3.58.0",
+     "langchain-openai": "1.8.5",
+     "langchain-core": "1.8.5"
+    },
+    "message": {
+     "metadata": {
+      "finish_reason": "completed"
+     }
     }
    }
   },

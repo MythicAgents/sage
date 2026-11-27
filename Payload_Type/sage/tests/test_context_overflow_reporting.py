@@ -66,7 +66,8 @@ def _translates_context_overflow(module_name: str) -> bool:
 def test_provider_coverage_is_exactly_what_model_py_claims():
     """Pins which of the six installed providers actually translate, so the claim cannot go stale.
 
-    Measured 2026-08-10: openai and anthropic do; aws, groq, ollama and xai do not. The covered pair
+    Measured 2026-08-10: openai and anthropic do; aws, groq, ollama and xai do not. Re-measured 2026-11-25 on
+    langchain-aws 1.10: it translates only on its Converse and Mantle clients, not on ChatBedrock. The covered pair
     is what matters in practice — Sage's configured path is provider `openai` pointed at a LiteLLM
     proxy, and native Anthropic is the other real one. The four uncovered providers fall through to
     the generic guidance, which is correct behaviour rather than a bug, but it must stay written down.
@@ -75,7 +76,7 @@ def test_provider_coverage_is_exactly_what_model_py_claims():
     subclasses, they would fail rather than letting the "not covered" half read as reassuring.
     """
     covered = {"langchain_openai", "langchain_anthropic"}
-    uncovered = {"langchain_aws", "langchain_groq", "langchain_ollama", "langchain_xai"}
+    uncovered = {"langchain_groq", "langchain_ollama", "langchain_xai"}
 
     for name in sorted(covered):
         assert _translates_context_overflow(name), (
@@ -88,6 +89,19 @@ def test_provider_coverage_is_exactly_what_model_py_claims():
             f"{name} now translates context overflows; model.py's comment listing it as uncovered is "
             "stale and the guidance should be widened"
         )
+
+    # langchain-aws 1.9 and later translate on ChatBedrockConverse and its OpenAI-compatible (Mantle) client only.
+    # Sage's `bedrock` provider builds ChatBedrock, which sends Claude models through InvokeModel (only Nova models go
+    # through Converse), so a Claude-on-Bedrock overflow still reaches the generic guidance, as model.py says.
+    import importlib
+
+    aws = Path(importlib.import_module("langchain_aws").__file__).parent / "chat_models"
+    translating = sorted(path.name for path in aws.glob("*.py")
+                         if "ContextOverflowError)" in path.read_text(encoding="utf-8", errors="ignore"))
+    assert translating == ["bedrock_converse.py", "openai.py"], translating
+    from langchain.chat_models.base import _BUILTIN_PROVIDERS
+
+    assert _BUILTIN_PROVIDERS["bedrock"][:2] == ("langchain_aws", "ChatBedrock")
 
 
 def _invoke_handler_source() -> str:

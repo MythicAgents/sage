@@ -29,7 +29,7 @@ def _installed_command() -> list[str]:
     return service.command
 
 
-def test_installed_producer_rejects_and_compatible_command_reaches_real_parser(monkeypatch):
+def test_installed_command_runs_isolated_and_reaches_the_real_parser(monkeypatch):
     from phoenix.server import main as entry
     from phoenix.server.cli.commands import serve
 
@@ -39,19 +39,20 @@ def test_installed_producer_rejects_and_compatible_command_reaches_real_parser(m
     monkeypatch.setattr(serve, "run", lambda args: reached.append(args))
     original = _installed_command()
 
-    monkeypatch.setattr(sys, "argv", original[1:])
-    with pytest.raises(SystemExit, match="2"):
-        entry.main()
-    assert reached == []
-
     corrected = compatible_command(original)
+    assert corrected == [original[0], "-P", *original[1:]]
+    assert corrected[2:4] == ["main.py", "serve"]
     monkeypatch.setattr(sys, "argv", corrected[corrected.index("main.py"):])
     entry.main()
     assert len(reached) == 1
 
     assert compatible_command(corrected) == corrected
+    # Shapes Phoenix 22 does not build are refused rather than guessed at: the 20.x flag set with --host, and a
+    # command with anything appended.
     with pytest.raises(PhoenixProcessStartupError, match="shape is unsupported"):
-        compatible_command(original[:-1] + ["trace-fixture"])
+        compatible_command(original[:-2] + ["--host", "127.0.0.1"] + original[-2:])
+    with pytest.raises(PhoenixProcessStartupError, match="shape is unsupported"):
+        compatible_command(original + ["trace-fixture"])
 
 
 class _StubProcess:
@@ -105,6 +106,11 @@ def test_launch_uses_installed_process_session_and_stop_lifecycle(monkeypatch):
     import phoenix as px
     import phoenix.session.session as session_module
 
+    # Sage's own Phoenix listens on the network with its secrets in Sage's environment; the capture child gets
+    # neither the secrets nor the network address.
+    monkeypatch.setenv("PHOENIX_HOST", "0.0.0.0")
+    monkeypatch.setenv("PHOENIX_SECRET", "fixture-phoenix-secret-0123456789abcdef")
+    monkeypatch.setenv("PHOENIX_ADMIN_SECRET", "fixture-phoenix-admin-0123456789abcdef")
     process = _StubProcess(active=True)
     popen_calls = _stub_process_effect(monkeypatch, process)
     installed = session_module.AppService
@@ -114,7 +120,12 @@ def test_launch_uses_installed_process_session_and_stop_lifecycle(monkeypatch):
     argv = popen_calls[0][0][0]
     assert argv[1:4] == ["-P", "main.py", "serve"] and argv[-2:] == ["--port", "6006"]
     assert popen_calls[0][1]["cwd"] == installed.working_dir
-    assert popen_calls[0][1]["env"] == dict(__import__("os").environ)
+    expected_env = {
+        key: value for key, value in __import__("os").environ.items()
+        if key not in {"PHOENIX_SECRET", "PHOENIX_ADMIN_SECRET"}
+    }
+    expected_env["PHOENIX_HOST"] = "127.0.0.1"
+    assert popen_calls[0][1]["env"] == expected_env
     session.end()
     assert process.running is False
 

@@ -33,7 +33,16 @@ DOTENV = SAGE_ROOT / ".env"
 #
 # This is an allowlist, not a relaxation: the value is pinned exactly, so a second uncommented
 # variable, a different value for this one, or any credential still fails.
-DOTENV_ALLOWED_ACTIVE = {"LANGGRAPH_STRICT_MSGPACK": "true"}
+#
+# Operator decision 2026-11-25 (Phoenix exposure): Phoenix keeps listening on the network, which Phoenix 21 and later
+# allow only with sign-in on, so the bind address and a documented default admin password ship active. The password
+# is published on purpose, like Phoenix's own "admin"; Sage warns in Mythic's event log while it still works
+# (ai/phoenix_auth.py). Order follows the file.
+DOTENV_ALLOWED_ACTIVE = {
+    "PHOENIX_HOST": "0.0.0.0",
+    "PHOENIX_DEFAULT_ADMIN_INITIAL_PASSWORD": "sage-phoenix-change-me",
+    "LANGGRAPH_STRICT_MSGPACK": "true",
+}
 
 
 def test_existing_environment_wins():

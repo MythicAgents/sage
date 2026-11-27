@@ -1034,7 +1034,10 @@ This gives you:
 
 - **See exactly what ran and why.** Open the Phoenix UI (by default `http://localhost:6006`) and walk a run span
   by span: which agent or kernel step ran, what it sent the model, what came back, which tools fired, and where a
-  step failed.
+  step failed. Phoenix listens on the network (`PHOENIX_HOST=0.0.0.0` in Sage's `.env`) with sign-in on: sign in as
+  `admin@localhost` with `sage-phoenix-change-me` the first time and change the password in Phoenix. Sage warns in
+  Mythic's event log while the shipped password still works. Set `PHOENIX_HOST=127.0.0.1` to keep Phoenix on the
+  Sage host, which also turns the sign-in off.
 
 - **Token accounting** per run and per step — how you catch a context blow-up or a runaway loop before it burns
   your budget. An autonomous run is a single trace rooted at `sage.kernel.episode`, so summing

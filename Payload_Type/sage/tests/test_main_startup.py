@@ -37,6 +37,11 @@ def test_main_creates_absolute_phoenix_working_dir_before_launch(
         monkeypatch.delenv("SAGE_RESOURCE_BUDGET_CONFIG", raising=False)
         monkeypatch.delenv("SAGE_RESOURCE_BUDGET_LEDGER", raising=False)
     monkeypatch.delenv("SAGE_OBSERVATION_DIRECTORY", raising=False)
+    monkeypatch.delenv("PHOENIX_SECRET", raising=False)
+    monkeypatch.delenv("PHOENIX_ADMIN_SECRET", raising=False)
+    # An upgraded install keeps its own .env, which predates these settings: Sage's defaults must still apply.
+    monkeypatch.delenv("PHOENIX_HOST", raising=False)
+    monkeypatch.delenv("PHOENIX_DEFAULT_ADMIN_INITIAL_PASSWORD", raising=False)
     runtime_root = tmp_path / "sage-runtime"
     runtime_root.mkdir()
     runtime_main = runtime_root / "main.py"
@@ -77,6 +82,17 @@ def test_main_creates_absolute_phoenix_working_dir_before_launch(
         assert configured.is_absolute()
         assert configured.is_dir()
         assert sage_db.is_file()
+        # Phoenix's secrets are in this process's environment before Phoenix starts, and kept owner-only beside
+        # its database so a restart reuses them.
+        environment = __import__("os").environ
+        stored = configured / "sage-phoenix-secrets.json"
+        assert stored.stat().st_mode & 0o777 == 0o600
+        assert __import__("json").loads(stored.read_text()) == {
+            key: environment[key] for key in ("PHOENIX_SECRET", "PHOENIX_ADMIN_SECRET")
+        }
+        assert environment["PHOENIX_SECRET"] != environment["PHOENIX_ADMIN_SECRET"]
+        assert environment["PHOENIX_HOST"] == "0.0.0.0"
+        assert environment["PHOENIX_DEFAULT_ADMIN_INITIAL_PASSWORD"] == "sage-phoenix-change-me"
         raise _PhoenixReached
 
     phoenix.launch_app = launch_app
@@ -109,7 +125,7 @@ def test_main_creates_absolute_phoenix_working_dir_before_launch(
                 runpy.run_path(str(runtime_main), run_name="__main__")
     finally:
         if expected.exists():
-            expected.rmdir()
+            shutil.rmtree(expected)
 
 
 @pytest.mark.parametrize("notification_configured", [False, True])

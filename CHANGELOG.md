@@ -22,6 +22,20 @@ between minor releases.
   choice to LangChain's OpenAI adapter, which picks Responses on its own for some models (`-pro` and `codex` models,
   `gpt-5.6-sol`, and any `gpt-6` model with tools) and would send none of Sage's Responses settings.
 
+- **Phoenix now asks you to sign in.** Sage moves to Phoenix 22.1.0, which turns its sign-in on whenever it listens
+  beyond this host. Sage keeps Phoenix listening on every address (`PHOENIX_HOST=0.0.0.0`), so the trace UI stays
+  reachable on port 6006 as before, and sign-in is on: the account is `admin@localhost` with the password
+  `sage-phoenix-change-me` (`PHOENIX_DEFAULT_ADMIN_INITIAL_PASSWORD`). Both are Sage's defaults whenever the
+  environment and `.env` leave them unset, so an upgraded install that keeps its own `.env` gets them too; the shipped
+  `.env` lists them. **Change the password in Phoenix after you first sign in**; changing the setting later has no
+  effect. While the shipped password still works, Sage posts one warning in Mythic's event log each time it starts;
+  the warning never contains the password. To keep Phoenix on this host instead, set `PHOENIX_HOST=127.0.0.1`, which
+  also turns the sign-in off. Sage's own trace exporters sign in with Phoenix's admin secret, which Sage generates once
+  with `PHOENIX_SECRET` and keeps owner-only in `.phoenix/sage-phoenix-secrets.json`; set either in the container
+  environment to use your own. Neither value is passed to the MCP servers or into the artifact-inspection sandbox.
+  Phoenix upgrades its database on first start and the upgrade cannot be undone, so **back up `.phoenix/phoenix.db`
+  before upgrading** if you may need to roll back, and restore it together with the matching Sage image.
+
 ### Added
 
 - **LiteLLM Gateway** and **Custom (OpenAI-compatible)** providers, for Sage and the Sage Watcher. Choose LiteLLM
@@ -79,6 +93,18 @@ between minor releases.
 - LangGraph moves from 1.2.22 to 1.2.24 and `langgraph-prebuilt` from 1.1.0 to 1.1.3, the current releases. In
   supervised mode, a step handed to the same specialist as the step before it still starts with only its own step
   and your request, and the earlier step's result still reaches the Supervisor.
+- Sage moves to the Mythic SDK 0.3.0rc10, which unblocks gql (4.0.0 to 4.4.0), graphql-core (3.2.14 to 3.3.2) and
+  websockets (15.0.1 to 17.4). Sage's Mythic queries, task-output waits and subscriptions behave as before, and its
+  TLS handling of Mythic is unchanged: the SDK's new certificate verification stays off unless asked for, and Sage
+  does not ask. The LangChain family moves to its current releases: langchain 1.5.2, langchain-core 1.8.5,
+  langchain-openai 1.8.5, langchain-anthropic 1.7.13, langchain-aws 1.10.0, langsmith 0.16.2 and fastmcp 4.2.6.
+  `anthropic` stays at 1.17.0 because Phoenix 22 requires a 1.x release.
+- **Bedrock token counts include cached tokens.** langchain-aws 1.10 counts prompt-cache reads and writes in the
+  Bedrock model's input tokens, so token totals for a native Bedrock chat with cached prompts are higher than before
+  for the same requests.
+- Each model response on OpenAI's Responses API now records its status (`completed`, `incomplete` or `failed`) as
+  its finish reason, and Sage keeps that value with the model and provider it records for each decision. No Sage
+  behaviour depends on it.
 
 ### Security
 
@@ -92,6 +118,8 @@ between minor releases.
   newest 1.x release. LangChain moves to 1.4.6 and LangGraph to 1.2.22.
 - The last two advisories are cleared: `dynaconf` moves from 3.2.5 to 3.2.13 and `ujson` from 5.9.0 to 5.13.0,
   through mythic-container 0.7.0rc11 (from 0.7.0rc9).
+- Phoenix moves from 20.21.0 to 22.1.0 and strawberry-graphql from 0.327.7 to 0.341.2, bringing every Phoenix and
+  Strawberry fix since. Phoenix 22 needs pydantic-ai-slim 2.75.0 (from 2.67.0).
 
 ## [0.4.0] - 2026-11-23
 
