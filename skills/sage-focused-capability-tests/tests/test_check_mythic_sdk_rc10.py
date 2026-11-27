@@ -907,11 +907,6 @@ BASELINE85 = json.loads((ROOT / "skills/sage-focused-capability-tests/tests/fixt
                         .read_text())
 PREREQ = json.loads((ROOT / "skills/sage-focused-capability-tests/tests/fixtures/mythic_sdk_rc10_prerequisites_recorded.json")
                     .read_text())
-# Read on 2026-11-27 from Mythic's own rows: the transport reader decodes response rows with validate=True and rejects
-# Mythic's base64, which Mythic wraps at 76 columns; the SDK's waitfor_for_task_output decodes it leniently. Changing a
-# frozen reader is the operator's scope decision, taken before the live attempt.
-WRAPPED_BASE64 = ("scope decision pending: the frozen transport reader rejects Mythic's 76-column base64 rows, which "
-                  "the SDK decodes")
 
 
 def _baseline_inputs(record: dict | None = None):
@@ -953,34 +948,31 @@ def test_presentation_and_annotation_hold_on_the_recorded_baseline():
     assert positive["presentation"]["storage"] == "inline"
 
 
-@pytest.mark.xfail(strict=True, reason=WRAPPED_BASE64)
 def test_the_recorded_baseline_holds_through_all_three_readers():
     report = check.baseline_report(*_baseline_inputs())
     assert report["positive"]["transport"]["holds"], report["positive"]["transport"]["reasons"]
     assert report["holds"]
 
 
-def test_the_frozen_transport_reader_holds_only_on_an_unwrapped_copy_of_the_recorded_row():
-    """Synthetic: the recorded row re-encoded without Mythic's line wrapping. Documents the mismatch above."""
+def test_the_transport_reader_reads_mythics_wrapped_row_as_the_sdk_does():
+    """The recorded row as Mythic returns it (wrapped at 76 columns), and a synthetic unwrapped copy, decode alike."""
     binding, task, rows, wire = _baseline_inputs()
-    assert check.baseline_holds(binding, task, rows, wire)["transport"]["reasons"] == ["response 25 is not base64"]
+    wrapped = check.baseline_holds(binding, task, rows, wire)["transport"]
+    assert wrapped["holds"] and wrapped["rows"][0]["id"] == 25, wrapped["reasons"]
     task["responses"][0]["response_text"] = task["responses"][0]["response_text"].replace("\n", "")
-    assert check.baseline_holds(binding, task, rows, wire)["holds"]
+    assert check.baseline_holds(binding, task, rows, wire)["transport"]["rows"] == wrapped["rows"]
 
 
 @pytest.mark.parametrize("name, owner", [(name, owner) for name, owner, _mutate in check.BASELINE_CONTROLS])
-def test_each_baseline_control_fails_at_its_owner(name, owner, request):
-    if owner == "transport":
-        request.applymarker(pytest.mark.xfail(strict=True, reason=WRAPPED_BASE64))
+def test_each_baseline_control_fails_at_its_owner(name, owner):
     control = next(c for c in check.baseline_report(*_baseline_inputs())["controls"] if c["control"] == name)
     assert control["rejected"], control
 
 
 def test_a_control_never_counts_when_its_owner_already_rejects_the_original():
     binding, task, rows, wire = _baseline_inputs()
-    task["responses"][0]["response_text"] = task["responses"][0]["response_text"].replace("\n", "")
     healthy = {c["control"]: c["rejected"] for c in check.baseline_report(binding, task, rows, wire)["controls"]}
-    assert all(healthy.values())  # every control rejected by its owner on the (synthetic) unwrapped row
+    assert all(healthy.values())  # every control rejected by its owner on the recorded record
     task["responses"] = []
     broken = check.baseline_report(binding, task, rows, wire)
     assert broken["holds"] is False
@@ -1279,12 +1271,9 @@ def test_the_route_condition_follows_s_to_its_effective_gateway_and_key(part, ch
 # M1 and M2, and the send instrumented. The admission code and Sage's readers stay real.
 # ---------------------------------------------------------------------------------------------------------------
 
-# Synthetic for wiring only: the recorded row re-encoded without Mythic's line wrap, so the result condition can hold
-# while the frozen reader's mismatch (WRAPPED_BASE64) awaits its scope decision. The recorded row is used below to show
-# that the mismatch alone keeps M2 unsent.
-UNWRAPPED85 = copy.deepcopy(BASELINE85)
-UNWRAPPED85["task"]["responses"][0]["response_text"] = UNWRAPPED85["task"]["responses"][0]["response_text"].replace(
-    "\n", "")
+# Synthetic: the recorded baseline without its task's response row (the baseline then fails, so M2 must stay unsent).
+WITHOUT_ROW85 = copy.deepcopy(BASELINE85)
+WITHOUT_ROW85["task"]["responses"] = []
 
 
 class Harness:
@@ -1296,7 +1285,7 @@ class Harness:
         tmp_path = tmp_path / uuid.uuid4().hex[:8]
         tmp_path.mkdir()
         self.evidence = tmp_path / "evidence"
-        self.fake = FakeMythic(baseline=copy.deepcopy(UNWRAPPED85), **state)
+        self.fake = FakeMythic(**state)
         self.sent: list[tuple[str, int, str]] = []
         self.root = _probe_root(tmp_path)
         self.probe_status = 200
@@ -1311,7 +1300,7 @@ class Harness:
         self.args = argparse.Namespace(
             callback=2, bloodhound_channel=3, phoenix_db=str(phoenix), phoenix_url="http://127.0.0.1:6006",
             route_file="route", plan="plan.md", authorized_by="test", pip_audit="pip-audit",
-            baseline_wire=str(_receiver_file(tmp_path / "wire.jsonl", UNWRAPPED85)))
+            baseline_wire=str(_receiver_file(tmp_path / "wire.jsonl")))
         self.run = {"readiness": {"verdict": "ready_for_preparation"}, "evidence_dir": str(tmp_path / "evidence")}
         nc = check._base().nc
         monkeypatch.setattr(_MYTHIC_SDK, "execute_custom_query", self.fake.execute_custom_query)
@@ -1391,7 +1380,7 @@ def test_valid_prerequisites_reach_both_sends_and_record_each_condition(monkeypa
     ("channel", {"channel": {**PREREQ["channel"], "locked": False}}),
     ("route", "probe_status"),
     ("result", "trace_env"),
-    ("result", {"baseline": copy.deepcopy(BASELINE85)}),  # the recorded row: the frozen reader's mismatch alone
+    ("result", {"baseline": copy.deepcopy(WITHOUT_ROW85)}),
 ])
 def test_each_failed_prerequisite_at_preparation_sends_nothing(monkeypatch, tmp_path, condition, change):
     h = Harness(monkeypatch, tmp_path)

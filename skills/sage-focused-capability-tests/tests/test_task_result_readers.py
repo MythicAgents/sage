@@ -104,6 +104,18 @@ def test_transport_holds_for_the_recorded_lifecycle_card_and_its_rows():
     assert result["card_preview_equal"] is True
 
 
+def test_transport_decodes_mythics_wrapped_rows_as_the_sdk_does():
+    """Mythic returns ``response_text`` as base64 wrapped at 76 columns (recorded: task 22's own row had its line break
+    at 76) and the SDK decodes it with ``base64.b64decode``. Synthetic: the recorded raw value as one row in that form."""
+    encoded = base64.b64encode(RAW.encode()).decode()
+    wrapped = "\n".join(encoded[i:i + 76] for i in range(0, len(encoded), 76))
+    assert "\n" in wrapped
+    result = readers.transport_holds(_task(responses=[{"id": 25, "response_text": wrapped}]), _rows(), callback=CALLBACK)
+    assert result["holds"], result["reasons"]
+    truncated = _task(responses=[{"id": 25, "response_text": encoded[:-1]}])  # the SDK refuses it too (padding)
+    assert readers.transport_holds(truncated, _rows(), callback=CALLBACK)["reasons"] == ["response 25 is not base64"]
+
+
 def _set_lifecycle_output(value):
     def mutate(task, rows):
         _lifecycle(rows)["tool_output"] = value

@@ -60,8 +60,10 @@ def _cards(rows: dict[str, Any], call_id: str) -> list[tuple[dict[str, Any], dic
 def decode_task_rows(responses: list[dict[str, Any]]) -> tuple[str | None, list[dict[str, Any]], str]:
     """Mythic's response rows in id order, each base64-decoded, joined as bytes and decoded once.
 
-    The SDK joins the decoded rows as bytes and Sage decodes the whole blob as UTF-8 with replacement
-    (``mythic_tools._task_output_text``); decoding row by row would differ on a character split across rows.
+    Each row is decoded exactly as the SDK's ``waitfor_for_task_output`` decodes it (``base64.b64decode``, which skips
+    the line breaks Mythic puts every 76 characters in ``response_text``). The SDK joins the decoded rows as bytes and
+    Sage decodes the whole blob as UTF-8 with replacement (``mythic_tools._task_output_text``); decoding row by row
+    would differ on a character split across rows.
     """
     rows = []
     for response in responses or []:
@@ -69,7 +71,7 @@ def decode_task_rows(responses: list[dict[str, Any]]) -> tuple[str | None, list[
         if type(response_id) is not int:
             return None, [], "a response row has no id"
         try:
-            data = base64.b64decode(str(response.get("response_text") or ""), validate=True)
+            data = base64.b64decode(str(response.get("response_text") or ""))
         except (binascii.Error, ValueError):
             return None, [], f"response {response_id} is not base64"
         rows.append((response_id, data))
