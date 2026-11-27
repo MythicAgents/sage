@@ -392,7 +392,7 @@ def _save(path: Path, run: dict[str, Any]) -> None:
 def evidence_dir(run: dict[str, Any]) -> Path:
     if not run.get("evidence_dir"):
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-        run["evidence_dir"] = str(REPO_ROOT / ".sage_history/2026/11/diagnostics/mythic-sdk-rc10"
+        run["evidence_dir"] = str(REPO_ROOT / ".sage_history/2026/11/diagnostics/sdk-runtime-compatibility"
                                   / f"{stamp}-live-check")
     path = Path(run["evidence_dir"])
     path.mkdir(parents=True, exist_ok=True)
