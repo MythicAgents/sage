@@ -108,7 +108,8 @@ jobs:
           tags: ${{ steps.gate.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # A failed cache write (for example a GitHub cache outage) must not fail the build or its publish.
+          cache-to: type=gha,mode=max,ignore-error=true
 
   verify-release:
     name: Verify the published release image (no rebuild)

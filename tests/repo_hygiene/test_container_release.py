@@ -1,11 +1,13 @@
 """Container release decisions: which references a build publishes, and how a release tag verifies the image.
 
 Runs the real `.github/scripts/release_image.py`, and the workflow's own `run:` blocks, against a throwaway git
-repository (with an `origin/main`) and a stand-in `docker` that serves fixture registry contents. Nothing here
-touches a registry or the user's git configuration.
+repository (with an `origin/main`) and a stand-in `docker` that serves fixture registry contents. It also reads the
+image build's cache inputs the way the build action, buildx and BuildKit read them. Nothing here touches a registry
+or the user's git configuration.
 """
 from __future__ import annotations
 
+import csv
 import json
 import os
 from pathlib import Path
@@ -271,8 +273,8 @@ def test_a_release_tag_fails_without_changing_any_reference(fx, tmp_path, case, 
 
 # --- the workflow's own commands ----------------------------------------------------------------------------
 
-def _steps(job: str) -> dict[str, dict]:
-    workflow = yaml.safe_load(WORKFLOW.read_text())
+def _steps(job: str, workflow: dict | None = None) -> dict[str, dict]:
+    workflow = workflow if workflow is not None else yaml.safe_load(WORKFLOW.read_text())
     return {step.get("id") or step["name"]: step for step in workflow["jobs"][job]["steps"]}
 
 
@@ -337,3 +339,113 @@ def test_the_tag_job_stops_before_the_alias_on_a_digest_mismatch(fx, tmp_path):
 
     assert result.returncode != 0 and "not the qualified" in result.stderr
     assert "minor_alias" not in values  # the alias step's condition stays false
+
+
+# --- the image build's cache --------------------------------------------------------------------------------
+
+BUILD_ACTION = "docker/build-push-action@"
+PUBLISH_GATE = "${{ steps.gate.outputs.publish == 'true' }}"
+# BuildKit reads ignore-error with Go's strconv.ParseBool and silently skips any other spelling.
+PARSEBOOL_TRUE = {"1", "t", "T", "TRUE", "true", "True"}
+
+
+def _cache_entries(value: str | None) -> list[tuple[str, dict[str, str]]]:
+    """(type, attrs) for each --cache-from/--cache-to entry, read as the build action and buildx read them.
+
+    The action passes each input line as one entry, commas intact. Buildx splits the entry as CSV, lower-cases the
+    keys and takes `type` verbatim; an entry without `=` is a registry reference, one per field.
+    """
+    entries = []
+    for line in (value or "").splitlines():
+        if not line.strip():
+            continue
+        fields = next(csv.reader([line.strip()]))
+        if "=" not in line:
+            entries += [("registry", {"ref": field}) for field in fields]
+            continue
+        kind, attrs = "", {}
+        for field in fields:
+            key, _, val = field.partition("=")
+            if key.lower() == "type":
+                kind = val
+            else:
+                attrs[key.lower()] = val
+        entries.append((kind, attrs))
+    return entries
+
+
+def _cache_policy_problems(workflow: dict) -> list[str]:
+    builds = [s for s in _steps("image", workflow).values() if s.get("uses", "").startswith(BUILD_ACTION)]
+    if len(builds) != 1:
+        return [f"expected one {BUILD_ACTION} step in the image job, found {len(builds)}"]
+    build = builds[0]
+    inputs = build.get("with") or {}
+    imports, exports = _cache_entries(inputs.get("cache-from")), _cache_entries(inputs.get("cache-to"))
+    problems = []
+    if [kind for kind, _ in imports] != ["gha"]:
+        problems.append(f"cache-from must import the GHA cache exactly once: {imports}")
+    if [kind for kind, _ in exports] != ["gha"]:
+        problems.append(f"cache-to must export to the GHA cache exactly once: {exports}")
+    else:
+        attrs = exports[0][1]
+        if attrs.get("mode") != "max":
+            problems.append(f"cache-to must keep mode=max so repeat builds reuse every stage: {attrs}")
+        if attrs.get("ignore-error") not in PARSEBOOL_TRUE:
+            problems.append(f"cache-to must set ignore-error=true so a failed cache write cannot fail the build: {attrs}")
+        if imports and imports[0][1].get("scope") != attrs.get("scope"):
+            problems.append(f"cache-from and cache-to must share a GHA scope: {imports[0][1]} vs {attrs}")
+    if inputs.get("push") != PUBLISH_GATE:
+        problems.append(f"push must stay the publish gate's decision: {inputs.get('push')!r}")
+    for where, holder in (("image job", workflow["jobs"]["image"]), ("build step", build)):
+        if "continue-on-error" in holder:
+            problems.append(f"continue-on-error on the {where} would also hide image and push failures")
+    return problems
+
+
+def test_a_failed_cache_write_does_not_fail_the_image_build_or_its_publish():
+    assert _cache_policy_problems(yaml.safe_load(WORKFLOW.read_text())) == []
+
+
+def _with_build_change(cache_from=None, cache_to=None, push=None, step_extra=None, job_extra=None) -> dict:
+    """The real workflow with one synthetic change to the image build."""
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    build = next(s for s in workflow["jobs"]["image"]["steps"] if s.get("uses", "").startswith(BUILD_ACTION))
+    for key, value in (("cache-from", cache_from), ("cache-to", cache_to), ("push", push)):
+        if value is not None:
+            build["with"][key] = value
+    build.update(step_extra or {})
+    workflow["jobs"]["image"].update(job_extra or {})
+    return workflow
+
+
+@pytest.mark.parametrize("cache_to", [
+    "mode=max,ignore-error=true,type=gha",
+    "type=gha,Ignore-Error=True,mode=max",
+    "type=gha,mode=max,ignore-error=1",
+    "\ntype=gha,mode=max,ignore-error=true\n",
+])
+def test_equivalent_cache_export_spellings_are_accepted(cache_to):
+    assert _cache_policy_problems(_with_build_change(cache_to=cache_to)) == []
+
+
+@pytest.mark.parametrize("change, expected", [
+    ({"cache_to": "type=gha,mode=max"}, "ignore-error"),
+    ({"cache_from": "type=gha,ignore-error=true", "cache_to": "type=gha,mode=max"}, "ignore-error"),
+    ({"cache_to": "type=gha,mode=max,ignore-error=false"}, "ignore-error"),
+    ({"cache_to": "type=gha,mode=max,ignore-error=yes"}, "ignore-error"),
+    ({"cache_to": "type=gha,mode=max,ignore-errors=true"}, "ignore-error"),
+    ({"cache_to": "type=gha,mode=max,ignore_error=true"}, "ignore-error"),
+    ({"cache_to": "type=gha,ignore-error=true"}, "mode=max"),
+    ({"cache_to": "type=gha,mode=MAX,ignore-error=true"}, "mode=max"),
+    ({"cache_to": "type=GHA,mode=max,ignore-error=true"}, "cache-to must export"),
+    ({"cache_to": "gha"}, "cache-to must export"),
+    ({"cache_to": "type=gha,mode=max,ignore-error=true\ntype=gha,mode=max"}, "cache-to must export"),
+    ({"cache_from": "gha"}, "cache-from must import"),
+    ({"cache_to": "type=gha,mode=max,ignore-error=true,scope=other"}, "scope"),
+    ({"push": "true"}, "push"),
+    ({"step_extra": {"continue-on-error": True}}, "continue-on-error on the build step"),
+    ({"job_extra": {"continue-on-error": True}}, "continue-on-error on the image job"),
+])
+def test_near_miss_cache_settings_are_rejected(change, expected):
+    problems = _cache_policy_problems(_with_build_change(**change))
+    assert any(expected in problem for problem in problems), problems
