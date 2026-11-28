@@ -70,10 +70,16 @@ agent-client-protocol==1.0.0
 # `ai/openai_api.py`, `ai/provider_retry.py`, `ai/resource_http.py`, `ai/phoenix_auth.py`. openai:
 # `ai/langgraph/operator_error.py`. pydantic: `ai/langgraph/executable_contracts.py`, `ai/langgraph/mythic_tools.py`.
 # anyio: `ai/mcp.py`. aiormq: `ai/resource_rpc.py` (wraps `Channel.basic_publish`). requests:
-# `ai/resource_clients.py`, `ai/langgraph/mythic_tools.py`.
+# `ai/resource_clients.py`, `ai/langgraph/mythic_tools.py`. opentelemetry-sdk: `ai/observation_tracing.py`.
+# arize-phoenix-otel: `main.py`, `ai/phoenix_tracing.py`. openinference-instrumentation: `main.py`,
+# `ai/langgraph/credential_review_llm.py`. langgraph-checkpoint: `ai/langgraph/sqlite_checkpointer.py`.
 httpx==0.28.1
 openai==3.58.0
 pydantic==2.13.4
 anyio==4.15.1
 aiormq==6.8.1
 requests==2.34.2
+opentelemetry-sdk==1.45.2
+arize-phoenix-otel==0.17.3
+openinference-instrumentation==0.1.83
+langgraph-checkpoint==4.3.0

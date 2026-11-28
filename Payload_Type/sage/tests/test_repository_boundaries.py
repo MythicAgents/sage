@@ -68,20 +68,49 @@ def _machine_path_violations(paths: list[Path]) -> list[str]:
     return violations
 
 
-def _imports(path: Path) -> list[tuple[str, int, int]]:
-    """Return ``(module, line, level)`` for every import; ``from . import x`` has module ``""``."""
+def _imports(path: Path) -> list[tuple[str, int, int, tuple[str, ...]]]:
+    """Return ``(module, line, level, names)`` for every import.
+
+    ``names`` holds a ``from`` import's imported names (empty for ``import x``); ``from . import x`` has module ``""``.
+    """
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    imported: list[tuple[str, int, int]] = []
+    imported: list[tuple[str, int, int, tuple[str, ...]]] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            imported.extend((alias.name, node.lineno, 0) for alias in node.names)
+            imported.extend((alias.name, node.lineno, 0, ()) for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
-            imported.append((node.module or "", node.lineno, node.level))
+            imported.append((node.module or "", node.lineno, node.level, tuple(a.name for a in node.names)))
     return imported
 
 
 def _canonical_distribution(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _installed_module_owners() -> dict[str, set[str]]:
+    """Map each installed module's dotted name to the distributions whose RECORD lists its file.
+
+    Owning files, not top-level names: ``opentelemetry``, ``phoenix``, ``openinference`` and ``langgraph`` are each
+    shared by several distributions, so declaring one of them says nothing about the others.
+    """
+    owners: dict[str, set[str]] = {}
+    for distribution in importlib.metadata.distributions():
+        name = _canonical_distribution(distribution.metadata["Name"])
+        for file in distribution.files or ():
+            path = file.as_posix()
+            if path.startswith(".."):
+                continue
+            if path.endswith("/__init__.py"):
+                module = path[: -len("/__init__.py")]
+            elif path.endswith(".py"):
+                module = path[:-3]
+            elif path.endswith((".so", ".pyd")):
+                head, _, last = path.rpartition("/")
+                module = f"{head}/{last.split('.', 1)[0]}" if head else last.split(".", 1)[0]
+            else:
+                continue
+            owners.setdefault(module.replace("/", "."), set()).add(name)
+    return owners
 
 
 def _shipped_runtime_python_files() -> list[Path]:
@@ -140,7 +169,7 @@ def test_product_runtime_does_not_import_development_or_range_packages():
     forbidden = ("ai.hillclimb", "evals", "skills", "ludus", "Plans")
     violations: list[str] = []
     for path in _product_python_files():
-        for module, _line, _level in _imports(path):
+        for module, _line, _level, _names in _imports(path):
             if module == forbidden or any(module == prefix or module.startswith(prefix + ".") for prefix in forbidden):
                 violations.append(f"{path.relative_to(REPO_ROOT)} imports {module}")
     assert violations == []
@@ -150,9 +179,11 @@ def test_shipped_runtime_imports_are_declared():
     """A shipped import must name the stdlib, Sage's own code, or a distribution in requirements.txt.
 
     A package that arrives only transitively (or only as a constraints.txt pin) can vanish on any upstream bump and
-    break the image at import time. Guarded imports count: the image must not rely on a fallback. A name an
-    installed distribution provides is third-party even when a same-named local module exists (``ai/mcp.py``,
-    ``ai/langgraph/``), because ``ai/`` is never on the runtime ``sys.path``.
+    break the image at import time. Guarded imports count: the image must not rely on a fallback. Each import
+    resolves to the distribution owning its most specific module file (``from phoenix.otel import x`` belongs to
+    arize-phoenix-otel, not arize-phoenix). A module an installed distribution provides is third-party even when a
+    same-named local module exists (``ai/mcp.py``, ``ai/langgraph/``), because ``ai/`` is never on the runtime
+    ``sys.path``.
     """
     files = _shipped_runtime_python_files()
     relative = {path.relative_to(SAGE_ROOT).as_posix() for path in files}
@@ -164,20 +195,24 @@ def test_shipped_runtime_imports_are_declared():
         line = raw.split("#", 1)[0].strip()
         if line and not line.startswith("-"):
             declared.add(_canonical_distribution(re.split(r"[\[<>=!~;\s]", line, maxsplit=1)[0]))
-    providers = importlib.metadata.packages_distributions()
+    owners = _installed_module_owners()
 
-    undeclared: dict[str, list[str]] = {}
+    undeclared: dict[str, set[str]] = {}
     for path in files:
-        for module, line, level in _imports(path):
+        for module, line, level, names in _imports(path):
             top = module.split(".", 1)[0]
             if level or top in sys.stdlib_module_names:
                 continue
-            distributions = providers.get(top, [])
-            if not distributions and _resolves_to_local_module(top, path):
-                continue
-            if not any(_canonical_distribution(name) in declared for name in distributions):
-                undeclared.setdefault(top, []).append(f"{path.relative_to(SAGE_ROOT).as_posix()}:{line}")
-    assert undeclared == {}
+            for imported in [f"{module}.{name}" for name in names] or [module]:
+                parts = imported.split(".")
+                prefixes = (".".join(parts[:end]) for end in range(len(parts), 0, -1))
+                owner = next((owners[prefix] for prefix in prefixes if prefix in owners), set())
+                if not owner and _resolves_to_local_module(top, path):
+                    continue
+                if not owner & declared:
+                    key = ", ".join(sorted(owner)) or f"{top} (no installed distribution)"
+                    undeclared.setdefault(key, set()).add(f"{path.relative_to(SAGE_ROOT).as_posix()}:{line}")
+    assert {key: sorted(sites) for key, sites in undeclared.items()} == {}
 
 
 def test_reset_and_bootstrap_helpers_do_not_use_callback_task_apis():
