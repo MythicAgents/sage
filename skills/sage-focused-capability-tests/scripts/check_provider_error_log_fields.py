@@ -30,6 +30,8 @@ Pass rules (frozen with the plan's live check; read once):
   L3 Each such fields line is exactly `Provider request failed: sdk=… status=… type=… code=… param=…` with bounded
      tokens, and contains neither PLACEHOLDER nor PROMPT, so it carries no provider message text.
   L4 Each case's window still holds Sage's existing `Error during graph execution` line.
+  L5 Each case's window holds exactly one `Error during graph execution` line: one record is written to the container
+     log once, however many Mythic clients Sage has built since start (plan r2, claim 2).
 Not run: if a case's window holds no graph-error line for HTTP 401, its request never reached the provider and the
 check did not run. Observations, not pass criteria: the chat card text, the model debug line's provider and base_url,
 other fields lines in the window, wall time.
@@ -143,7 +145,7 @@ def _fields_text(line: str) -> str:
 
 
 def window_outcome(case: str, lines: list[str], oracle: dict[str, Any]) -> dict[str, Any]:
-    """Apply L1/L2, L3 and L4 to one case's container-log window."""
+    """Apply L1/L2, L3, L4 and L5 to one case's container-log window."""
     expected = expected_fields(case, oracle)
     fields = [_fields_text(line) for line in lines if "Provider request failed:" in line]
     matched = [(text, FIELDS_LINE.fullmatch(text)) for text in fields]
@@ -153,7 +155,7 @@ def window_outcome(case: str, lines: list[str], oracle: dict[str, Any]) -> dict[
     clean = bool(case_lines) and all(PLACEHOLDER not in text and PROMPT not in text for text, _ in case_lines)
     graph = [line for line in lines if GRAPH_ERROR in line]
     debug = [found.groupdict() for found in (DEBUG_LINE.search(line) for line in lines) if found]
-    return {"fields": fields_ok, "clean": clean, "graph_error": bool(graph),
+    return {"fields": fields_ok, "clean": clean, "graph_error": bool(graph), "graph_error_once": len(graph) == 1,
             "ran": any("401" in line for line in graph),
             "detail": {"expected": expected, "case_lines": [text for text, _ in case_lines],
                        "other_fields_lines": [text for text, found in matched if (text, found) not in case_lines],
@@ -163,7 +165,8 @@ def window_outcome(case: str, lines: list[str], oracle: dict[str, Any]) -> dict[
 def verdict(outcomes: dict[str, dict[str, Any]]) -> dict[str, Any]:
     criteria = {"L1": outcomes["O"]["fields"], "L2": outcomes["A"]["fields"],
                 "L3": outcomes["O"]["clean"] and outcomes["A"]["clean"],
-                "L4": outcomes["O"]["graph_error"] and outcomes["A"]["graph_error"]}
+                "L4": outcomes["O"]["graph_error"] and outcomes["A"]["graph_error"],
+                "L5": outcomes["O"]["graph_error_once"] and outcomes["A"]["graph_error_once"]}
     not_run = [case for case, outcome in outcomes.items() if not outcome["ran"]]
     return {"verdict": "not_run" if not_run else ("pass" if all(criteria.values()) else "fail"),
             "criteria": criteria, "not_run": not_run}

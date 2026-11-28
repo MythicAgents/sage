@@ -101,7 +101,7 @@ def test_each_channel_carries_the_placeholder_key_and_its_own_route():
 
 def test_lines_from_sages_handler_pass_every_rule():
     result = check.verdict(_outcomes(_window("O"), _window("A")))
-    assert result == {"verdict": "pass", "criteria": {"L1": True, "L2": True, "L3": True, "L4": True},
+    assert result == {"verdict": "pass", "criteria": {"L1": True, "L2": True, "L3": True, "L4": True, "L5": True},
                       "not_run": []}
 
 
@@ -160,6 +160,33 @@ def test_a_graph_error_that_is_not_a_401_did_not_run():
     graph = "ERROR 2026-11-28 10:00:01,000 invoke 19015: Error during graph execution: Connection error."
     result = check.verdict(_outcomes(_window("O", graph=graph), _window("A")))
     assert result["verdict"] == "not_run" and result["not_run"] == ["O"]
+
+
+GRAPH_401 = "ERROR 2026-11-28 10:00:01,000 invoke 19015: Error during graph execution: Error code: 401 - provider text"
+
+
+def test_one_graph_error_line_per_window_passes_l5():
+    outcomes = _outcomes(_window("O"), _window("A"))
+    assert outcomes["O"]["detail"]["graph_error_lines"] == 1 and outcomes["A"]["detail"]["graph_error_lines"] == 1
+    assert check.verdict(outcomes)["criteria"]["L5"] is True
+
+
+@pytest.mark.parametrize("copies", [2, 6])
+def test_a_graph_error_line_repeated_in_one_window_fails_l5(copies):
+    """Synthetic: one record written once per handler, as attempt 1's container log showed (5 for O, 6 for A)."""
+    window = _window("A") + [GRAPH_401] * (copies - 1)
+    result = check.verdict(_outcomes(_window("O"), window))
+    assert result["verdict"] == "fail" and result["not_run"] == []
+    assert result["criteria"]["L5"] is False
+    assert result["criteria"]["L4"] is True  # the line is still there; it is only repeated
+
+
+def test_repeated_fields_and_graph_lines_fail_both_l2_and_l5():
+    """Synthetic: a whole record repeated by duplicate handlers fails the fields count and the graph-error count."""
+    line = _handler_line("A")
+    window = _window("A", fields=[line, line]) + [GRAPH_401]
+    criteria = check.verdict(_outcomes(_window("O"), window))["criteria"]
+    assert criteria["L2"] is False and criteria["L5"] is False
 
 
 def test_readiness_requires_a_401_with_an_error_type_at_each_endpoint():
