@@ -2,18 +2,21 @@
 
 import asyncio
 import importlib.util
+import inspect
 import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import mythic_container
+import pytest
 from mythic_container import ChatBase, chat_utils, mythic_service
 
 from ai.langgraph.model import Model
 from ai.langgraph.request_events import stable_event_id
 from sage_chat.streaming import ChatStreamEmitter
 from sage_chat.service import SageChat, _CHANNEL_TURN_LOCKS
-from sage_chat.session import get_channel_session, put_channel_session
+from sage_chat.cancel_adapter import install_paused_cancel_handler
+from sage_chat.session import drop_channel_session, get_channel_session, put_channel_session
 from sage_chat.headless import HeadlessSageChat
 
 
@@ -379,3 +382,114 @@ def test_sdk_releases_paused_service_task_then_cancel_reaches_session(monkeypatc
 
     assert asyncio.run(scenario()) is None
     assert model.stops == ["operator", "cancelled"]
+
+
+# Cancel bytes are not recorded anywhere; these shapes derive from Mythic's Go encoder
+# (rabbitmq/send_chat_request.go ChatContainerCancelRequestMessage, encoding/json): it escapes <, > and &,
+# writes UTF-8 and never writes leading zeros. A request id above 2^64 cannot address a request, so that
+# shape rides in an unknown extra field.
+_PAUSED_IDS = {"operation_id": 991, "channel_id": 992, "request_id": 993, "apitokens_id": 994}
+_ADDRESS = b'"container_name":"sage","operation_id":991,"channel_id":992,"request_id":993'
+_ACCEPTED_CANCEL_SHAPES = {
+    "go_marshal_full": b"{" + _ADDRESS + b',"reason":"operator","cancelled_by":1}',
+    "go_html_escaped_reason": b"{" + _ADDRESS + b',"reason":"stop \\u003cnow\\u003e \\u0026 exit","cancelled_by":1}',
+    "non_ascii_reason": b"{" + _ADDRESS + ',"reason":"arrêt — \U0001F6D1","cancelled_by":1}'.encode(),
+    "reordered_missing_optional": b'{"request_id":993,"channel_id":992,"operation_id":991,"container_name":"sage"}',
+    "unknown_extra_field": b"{" + _ADDRESS + b',"reason":"","cancelled_by":0,"new_field":[1,2]}',
+    "integer_above_2_64": b"{" + _ADDRESS + b',"trace":18446744073709551616}',
+    "whitespace": b' {\n "container_name" : "sage", "operation_id":991, "channel_id":992, "request_id":993 }\n',
+}
+_REJECTED_CANCEL_SHAPES = {
+    "not_json": b"cancel 993",
+    "truncated": b'{"container_name":"sage",',
+    "empty": b"",
+    "invalid_utf8": b"{" + _ADDRESS + b',"reason":"\xff"}',
+    "leading_zero": b'{"container_name":"sage","operation_id":991,"channel_id":992,"request_id":0993}',
+    "list": b"[1,2]",
+    "number": b"993",
+    "null": b"null",
+}
+
+
+def _paused_sage_session(monkeypatch):
+    responses = []
+
+    async def capture(response):
+        responses.append(response)
+
+    monkeypatch.setattr(ChatBase, "SendMythicRPCChatResponse", capture)
+    monkeypatch.setattr(ChatBase, "chatServices", {"sage": SageChat()})
+    monkeypatch.setattr(ChatBase, "chatRequestTasks", {})
+    monkeypatch.setattr(ChatBase, "chatCancelledRequests", set())
+    request = ChatBase.ChatRequest(container_name="sage", **_PAUSED_IDS)
+    model = _model(ChatStreamEmitter(ChatBase.chatServices["sage"], request), "request:paused")
+    model.operation_id = request.OperationID
+    model.channel_id = request.ChannelID
+    model.apitoken_id = request.APITokenID
+    model.task_id = 0
+    model.provider = "offline"
+    model.model = "offline"
+    model._running_tasks = set()
+    model._request_contract = SimpleNamespace(request_id="request:paused", digest="bound-digest")
+    model._pending_approval_context = {
+        "request_id": "request:paused", "request_contract_digest": "bound-digest",
+        "operation_id": "991", "apitoken_id": "994",
+    }
+    model._hitl_card_pending = True
+    model._controller_hitl_pending = None
+    return request, model, responses
+
+
+def _wrapper_around_counted_sdk_handler(monkeypatch):
+    """Install the real Sage wrapper around the real SDK handler, counting the SDK calls."""
+    sdk_handler = inspect.getclosurevars(chat_utils.ChatCancelHandler).nonlocals["previous"]
+    assert (sdk_handler.__module__, sdk_handler.__name__) == ("mythic_container.chat_utils", "ChatCancelHandler")
+    calls = []
+
+    async def counted(msg):
+        calls.append(msg)
+        await sdk_handler(msg)
+
+    monkeypatch.setattr(chat_utils, "ChatCancelHandler", counted)
+    install_paused_cancel_handler()
+    wrapper = chat_utils.ChatCancelHandler
+    assert wrapper is not counted and wrapper._sage_paused_cancel_wrapper is True
+    return wrapper, calls
+
+
+@pytest.mark.parametrize("message", _ACCEPTED_CANCEL_SHAPES.values(), ids=_ACCEPTED_CANCEL_SHAPES.keys())
+def test_inactive_cancel_in_every_go_encoder_form_closes_paused_request(monkeypatch, message):
+    request, model, responses = _paused_sage_session(monkeypatch)
+    wrapper, sdk_calls = _wrapper_around_counted_sdk_handler(monkeypatch)
+
+    async def scenario():
+        await put_channel_session(request, model)
+        await wrapper(message)
+        return await get_channel_session(request)
+
+    assert asyncio.run(scenario()) is None
+    assert sdk_calls == [message]
+    assert ChatBase.chatCancelledRequests == {993}
+    assert model._pending_approval_context is None
+    assert model._hitl_card_pending is False
+    assert model._stop_reason == "operator"
+    assert [(r.Status, r.Complete, r.CompleteRequest) for r in responses] == [("cancelled", True, False)]
+
+
+@pytest.mark.parametrize("message", _REJECTED_CANCEL_SHAPES.values(), ids=_REJECTED_CANCEL_SHAPES.keys())
+def test_malformed_cancel_runs_sdk_handler_once_and_keeps_paused_request(monkeypatch, message):
+    request, model, responses = _paused_sage_session(monkeypatch)
+    wrapper, sdk_calls = _wrapper_around_counted_sdk_handler(monkeypatch)
+
+    async def scenario():
+        await put_channel_session(request, model)
+        await wrapper(message)
+        kept = await get_channel_session(request)
+        await drop_channel_session(request, expected_model=model)
+        return kept
+
+    assert asyncio.run(scenario()) is model
+    assert sdk_calls == [message]
+    assert model._hitl_card_pending is True
+    assert model._pending_approval_context is not None
+    assert responses == []

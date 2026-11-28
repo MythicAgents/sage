@@ -7,7 +7,7 @@ keeping its model and request ledger in Sage, so a later cancel needs this narro
 from __future__ import annotations
 
 import asyncio
-import ujson
+import json
 
 from mythic_container import ChatBase, chat_utils
 from mythic_container.logging import logger
@@ -25,7 +25,7 @@ def install_paused_cancel_handler() -> None:
     async def sage_cancel_handler(msg: bytes) -> None:
         # Preserve the SDK's task cancel / tombstone behavior for every message.
         try:
-            parsed = ujson.loads(msg)
+            parsed = json.loads(msg)
             request = ChatBase.ChatCancelRequest(**parsed)
             task = ChatBase.chatRequestTasks.get(request.RequestID)
             inactive = task is None or task.done()

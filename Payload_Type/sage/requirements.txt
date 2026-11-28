@@ -65,3 +65,15 @@ cryptography==50.0.2
 # Direct runtime import (`ai/acp_connections.py`): the official Agent Client Protocol SDK for `/acp` coding-agent
 # connections. It supplies JSON-RPC routing and the protocol's schema models; it negotiates ACP protocol 1.
 agent-client-protocol==1.0.0
+# Direct runtime imports that otherwise arrive only transitively; declared for the same reason as the entries
+# above, each at its constraints.txt pin. httpx: `ai/langgraph/model.py`, `ai/langgraph/operator_error.py`,
+# `ai/openai_api.py`, `ai/provider_retry.py`, `ai/resource_http.py`, `ai/phoenix_auth.py`. openai:
+# `ai/langgraph/operator_error.py`. pydantic: `ai/langgraph/executable_contracts.py`, `ai/langgraph/mythic_tools.py`.
+# anyio: `ai/mcp.py`. aiormq: `ai/resource_rpc.py` (wraps `Channel.basic_publish`). requests:
+# `ai/resource_clients.py`, `ai/langgraph/mythic_tools.py`.
+httpx==0.28.1
+openai==3.58.0
+pydantic==2.13.4
+anyio==4.15.1
+aiormq==6.8.1
+requests==2.34.2

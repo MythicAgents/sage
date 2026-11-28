@@ -37,8 +37,7 @@ from mythic_container.MythicRPC import (
     MythicRPCTaskUpdateMessage,
     SendMythicRPCTaskUpdate
 )
-from typing import Annotated, Any, Awaitable, Callable, Iterable, Literal
-from typing_extensions import NotRequired
+from typing import Annotated, Any, Awaitable, Callable, Iterable, Literal, NotRequired
 from uuid import UUID, uuid4
 from .mythic_tools import (
     MythicTools,
