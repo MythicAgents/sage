@@ -115,6 +115,12 @@ between minor releases.
   its finish reason, and Sage keeps that value with the model and provider it records for each decision. No Sage
   behaviour depends on it.
 
+### Fixed
+
+- Sage's container log (`./mythic-cli logs sage`) writes each line once. Every Mythic login added another copy of
+  the log's output, so after a container start and a few chats each line appeared five or six times in a row. Log
+  content, format and level are unchanged.
+
 ### Security
 
 - Four of the six dependency advisories listed under 0.4.0's known issues are cleared. `dnspython` moves from 2.9.0

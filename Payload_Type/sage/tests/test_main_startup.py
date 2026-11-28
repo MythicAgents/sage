@@ -18,6 +18,14 @@ class _PhoenixReached(RuntimeError):
     pass
 
 
+def _stub_log_guard(monkeypatch, calls: list) -> None:
+    """Record the Mythic client log guard's install; the real guard would patch the installed client class for the
+    rest of this process (its behavior is tested in ``test_mythic_client_log_guard.py``)."""
+    module = ModuleType("ai.langgraph.logging_fix")
+    module.install_mythic_client_log_guard = lambda: calls.append("log-guard")
+    monkeypatch.setitem(sys.modules, "ai.langgraph.logging_fix", module)
+
+
 @pytest.mark.parametrize("database", ["nested", "unusable"])
 @pytest.mark.parametrize("phoenix_override", [False, True])
 @pytest.mark.parametrize("metered", [False, True])
@@ -72,10 +80,12 @@ def test_main_creates_absolute_phoenix_working_dir_before_launch(
     logging_module.logger = logging.getLogger("test-main-startup")
     monkeypatch.setitem(sys.modules, "mythic_container.logging", logging_module)
     monkeypatch.setitem(sys.modules, "sage_chat", ModuleType("sage_chat"))
+    _stub_log_guard(monkeypatch, meter_calls)
     phoenix = ModuleType("phoenix")
 
     def launch_app(*, use_temp_dir):
-        assert meter_calls == (["http-installed", "rpc-installed"] if metered else [])
+        # The log guard is installed after the metering hooks and before anything can log in to Mythic.
+        assert meter_calls == (["http-installed", "rpc-installed"] if metered else []) + ["log-guard"]
         assert use_temp_dir is False
         configured = Path(__import__("os").environ["PHOENIX_WORKING_DIR"])
         assert configured == expected
@@ -151,6 +161,7 @@ def test_capture_installs_audit_before_clients_and_uses_sanitized_provider(monke
     monkeypatch.setitem(sys.modules, "mythic_container", mythic)
     log = ModuleType("mythic_container.logging"); log.logger = logging.getLogger("capture-main")
     monkeypatch.setitem(sys.modules, "mythic_container.logging", log)
+    _stub_log_guard(monkeypatch, calls)
     monkeypatch.setitem(sys.modules, "sage_chat", ModuleType("sage_chat"))
     slack = ModuleType("sage_chat.findings_slack")
     slack.SLACK_FINDINGS_WEBHOOK_ENV = "SAGE_FINDINGS_SLACK_WEBHOOK_URL"
@@ -192,7 +203,7 @@ def test_capture_installs_audit_before_clients_and_uses_sanitized_provider(monke
 
     monkeypatch.setattr("ssl_bootstrap.configure_sage_ssl_cert_file", lambda **_kw: None)
     runpy.run_path(str(SAGE_ROOT / "main.py"), run_name="__main__")
-    assert calls[:4] == ["audit", "http", "rpc", ("notification", "config_snapshot", {
+    assert calls[:5] == ["audit", "http", "rpc", "log-guard", ("notification", "config_snapshot", {
         "event": "effective_notification_config", "webhook_present": notification_configured,
         "channel_present": notification_configured,
     })]
@@ -220,6 +231,7 @@ def test_capture_refuses_inactive_phoenix_before_mythic_service(monkeypatch, tmp
     monkeypatch.setitem(sys.modules, "mythic_container", mythic)
     log = ModuleType("mythic_container.logging"); log.logger = logging.getLogger("capture-main-fail")
     monkeypatch.setitem(sys.modules, "mythic_container.logging", log)
+    _stub_log_guard(monkeypatch, calls)
     sage_chat = ModuleType("sage_chat"); monkeypatch.setitem(sys.modules, "sage_chat", sage_chat)
     slack = ModuleType("sage_chat.findings_slack")
     slack.SLACK_FINDINGS_WEBHOOK_ENV = "WEBHOOK"; slack.SLACK_FINDINGS_CHANNEL_ID_ENV = "CHANNEL"
@@ -242,4 +254,4 @@ def test_capture_refuses_inactive_phoenix_before_mythic_service(monkeypatch, tmp
     monkeypatch.setattr("ssl_bootstrap.configure_sage_ssl_cert_file", lambda **_kw: None)
     with pytest.raises(RuntimeError, match="Phoenix process did not become active"):
         runpy.run_path(str(SAGE_ROOT / "main.py"), run_name="__main__")
-    assert calls == [("phoenix", {"use_temp_dir": False, "run_in_thread": False})]
+    assert calls == ["log-guard", ("phoenix", {"use_temp_dir": False, "run_in_thread": False})]

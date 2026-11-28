@@ -29,6 +29,11 @@ import signal
 
 import mythic_container
 from mythic_container.logging import logger
+from ai.langgraph.logging_fix import install_mythic_client_log_guard
+
+# Each Mythic scripting client would otherwise add its own stdout handler to the `mythic` logger on every login,
+# so every container-log line would repeat once per login since start. Installed before the first login.
+install_mythic_client_log_guard()
 
 # `kill -USR1 <pid>` (or `docker kill -s USR1 sage`) writes every thread's Python stack to stderr, so a
 # hung Phoenix server or a stuck request can be located from the container logs without a debugger.
